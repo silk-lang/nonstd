@@ -66,6 +66,12 @@ pub union CliError {
     /// The argument as given.
     pub token: String
   },
+  /// The command line chose a subcommand whose field had `none` in the defaults. Give every
+  /// subcommand field `Option.some(defaults)`.
+  NoDefaults {
+    /// The subcommand path, such as `remote.add`.
+    pub command: string<'static>
+  },
   /// An argument is not valid UTF-8.
   InvalidText {
     /// The position of the argument; 0 is the program name.
@@ -81,7 +87,11 @@ pub union Parsed<T> {
     pub value: T
   },
   /// The command line asked for the help text.
-  Help,
+  Help {
+    /// The subcommand path whose help was asked for, such as `remote.add`. Empty for the root
+    /// command. Give it to [`Cli.writeHelp`].
+    pub command: string<'static>
+  },
   /// The command line asked for the version.
   Version,
   /// The command line was not accepted.
@@ -106,136 +116,8 @@ impl Cli {
   pub effect fn parse<T>(static command: Command, defaults: T, arguments: &[string]) -> Parsed<T>
     ! OutOfMemoryError
     ? &mut Allocator {
-    static if Reflect.typeKind(Reflect.typeOf<T>()) != namedKind {
-      compileError("Cli.parse needs a struct with named fields")
-    }
-    static if !Command.validate<T>(command) {
-      compileError("the command description does not match its struct")
-    }
-    let mut value = move defaults
-    let mut seen = [false; 64]
-    let mut positionalOnly = false
-    let mut positional: usize = 0
-    let mut index: usize = 1
-    while index < arguments.length {
-      let token = arguments[index]
-      index = index + 1
-      if !positionalOnly && token == "--" {
-        positionalOnly = true
-        continue
-      }
-      if !positionalOnly && (token == "--help" || token == "-h") {
-        return Parsed<T>.Help
-      }
-      static if command.version != "" {
-        if !positionalOnly && token == "--version" {
-          return Parsed<T>.Version
-        }
-      }
-      if !positionalOnly && String.startsWith(token, "-") && token != "-" {
-        let mut name = token
-        let mut hasInline = false
-        let mut inline = ""
-        if String.startsWith(token, "--") {
-          match String.find(token, "=") {
-            Option.Some { value: at } => {
-              name = String.slice(token, 0, at)
-              let rest = String.byteLength(token) - at - 1
-              hasInline = true
-              inline = String.slice(token, at + 1, rest)
-            }
-            Option.None => {}
-          }
-        }
-        let mut matched = false
-        static for field in Reflect.fields<T>() {
-          let static option = Command.find(command, Reflect.fieldLabel(field))
-          static if !option.positional {
-            let static long = Command.longFlag(option)
-            let static short = Command.shortFlag(option)
-            let flag: string<'static> = long
-            let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
-            if !matched && (name == long || (short != "" && name == short)) {
-              matched = true
-              seen[slot] = true
-              let place = fieldMut(&mut value, field)
-              if takesValue(field) {
-                let mut text = inline
-                if !hasInline {
-                  if index >= arguments.length {
-                    return Parsed<T>.Failed { error: CliError.MissingValue { option: flag } }
-                  }
-                  text = arguments[index]
-                  index = index + 1
-                }
-                let accepted = run ArgValue.accept(&mut place, text)
-                if !accepted {
-                  let copied = run String.copy(text)
-                  return Parsed<T>.Failed {
-                    error: CliError.InvalidValue { option: flag, token: move copied }
-                  }
-                }
-              } else {
-                if hasInline {
-                  return Parsed<T>.Failed { error: CliError.UnexpectedValue { option: flag } }
-                }
-                let flagged = run ArgValue.accept(&mut place, "")
-              }
-            }
-          }
-        }
-        if !matched {
-          let copied = run String.copy(token)
-          return Parsed<T>.Failed { error: CliError.UnknownOption { token: move copied } }
-        }
-        continue
-      }
-      let mut taken = false
-      static for field in Reflect.fields<T>() {
-        let static option = Command.find(command, Reflect.fieldLabel(field))
-        static if option.positional {
-          let static at = Command.position(command, option.field)
-          let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
-          if !taken && (positional == at || (repeats(field) && positional > at)) {
-            taken = true
-            seen[slot] = true
-            let place = fieldMut(&mut value, field)
-            let accepted = run ArgValue.accept(&mut place, token)
-            if !accepted {
-              let copied = run String.copy(token)
-              let static name = Command.placeholder(option)
-              let label: string<'static> = name
-              return Parsed<T>.Failed {
-                error: CliError.InvalidValue { option: label, token: move copied }
-              }
-            }
-          }
-        }
-      }
-      if !taken {
-        let copied = run String.copy(token)
-        return Parsed<T>.Failed { error: CliError.UnexpectedArgument { token: move copied } }
-      }
-      positional = positional + 1
-    }
-    static for field in Reflect.fields<T>() {
-      let static option = Command.find(command, Reflect.fieldLabel(field))
-      static if option.required {
-        let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
-        if !seen[slot] {
-          static if option.positional {
-            let static name = Command.placeholder(option)
-            let label: string<'static> = name
-            return Parsed<T>.Failed { error: CliError.MissingRequired { option: label } }
-          } else {
-            let static name = Command.longFlag(option)
-            let label: string<'static> = name
-            return Parsed<T>.Failed { error: CliError.MissingRequired { option: label } }
-          }
-        }
-      }
-    }
-    return Parsed<T>.Run { value: move value }
+    let step = run parseFrom<T>(command, "", move defaults, arguments, 1)
+    return run descend0<T>(command, "", move step, arguments)
   }
 
   /// Reads the process arguments and parses them with [`Cli.parse`].
@@ -264,73 +146,16 @@ impl Cli {
     return run Cli.parse(command, move defaults, List<string>.asSlice(&texts))
   }
 
-  /// Writes the help text of `command` for the struct `T`.
+  /// Writes the help text of the command or subcommand at `path` (from [`Parsed.Help`]; empty
+  /// for the root command) of `command`, for the struct `T`.
   ///
   /// # Errors
   ///
   /// - `WriterError` if the `Writer` fails.
-  pub effect fn writeHelp<T>(static command: Command) -> ()
+  pub effect fn writeHelp<T>(static command: Command, path: string) -> ()
     ! WriterError
     ? &mut Writer {
-    let static usage = usageLine<T>(command)
-    run Writer.writeString(usage)
-    static if command.description != "" {
-      run Writer.writeString("\n")
-      run Writer.writeString(command.description)
-      run Writer.writeString("\n")
-    }
-    run Writer.writeString("\nOptions:\n")
-    static for field in Reflect.fields<T>() {
-      let static option = Command.find(command, Reflect.fieldLabel(field))
-      static if !option.positional {
-        let static short = Command.shortFlag(option)
-        let static long = Command.longFlag(option)
-        let mut width: usize = 6 + String.byteLength(long)
-        static if short != "" {
-          run Writer.writeString("  ")
-          run Writer.writeString(short)
-          run Writer.writeString(", ")
-        } else {
-          run Writer.writeString("      ")
-        }
-        run Writer.writeString(long)
-        if takesValue(field) {
-          run Writer.writeString(" <value>")
-          width = width + 8
-        }
-        run pad(width, optionColumn<T>(command))
-        run Writer.writeString(option.description)
-        static if option.required {
-          run Writer.writeString(" (required)")
-        }
-        run Writer.writeString("\n")
-      }
-    }
-    run Writer.writeString("  -h, --help")
-    run pad(12, optionColumn<T>(command))
-    run Writer.writeString("Print this help\n")
-    static if command.version != "" {
-      run Writer.writeString("      --version")
-      run pad(15, optionColumn<T>(command))
-      run Writer.writeString("Print the version\n")
-    }
-    static if Command.positionalCount(command) != 0 {
-      run Writer.writeString("\nArguments:\n")
-      static for field in Reflect.fields<T>() {
-        let static option = Command.find(command, Reflect.fieldLabel(field))
-        static if option.positional {
-          let static name = Command.placeholder(option)
-          run Writer.writeString("  ")
-          run Writer.writeString(name)
-          run pad(2 + String.byteLength(name), optionColumn<T>(command))
-          run Writer.writeString(option.description)
-          static if option.required {
-            run Writer.writeString(" (required)")
-          }
-          run Writer.writeString("\n")
-        }
-      }
-    }
+    return run writeHelpAt0<T>(command, "", path)
   }
 
   /// Writes `command`'s version and a line break.
@@ -383,11 +208,565 @@ impl Cli {
         run Writer.writeString("unexpected argument ")
         run Writer.writeString(String.view(&token))
       }
+      CliError.NoDefaults { command } => {
+        run Writer.writeString("the defaults have no value for the subcommand ")
+        run Writer.writeString(command)
+      }
       CliError.InvalidText { index: _ } => {
         run Writer.writeString("an argument is not valid UTF-8")
       }
     }
     run Writer.writeString("\n")
+  }
+}
+
+effect fn parseFrom<T>(
+  static command: Command,
+  static path: string<'static>,
+  defaults: T,
+  arguments: &[string],
+  start: usize,
+) -> Step<T>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Reflect.typeKind(Reflect.typeOf<T>()) != namedKind {
+    compileError("Cli.parse needs a struct with named fields")
+  }
+  static if !Command.validate<T>(command) {
+    compileError("the command description does not match its struct")
+  }
+  let mut value = move defaults
+  let mut seen = [false; 64]
+  let mut positionalOnly = false
+  let mut positional: usize = 0
+  let mut index = start
+  while index < arguments.length {
+    let token = arguments[index]
+    index = index + 1
+    if !positionalOnly && token == "--" {
+      positionalOnly = true
+      continue
+    }
+    if !positionalOnly && (token == "--help" || token == "-h") {
+      let asked: string<'static> = path
+      return finished(Parsed<T>.Help { command: asked })
+    }
+    static if command.version != "" {
+      if !positionalOnly && token == "--version" {
+        return finished(Parsed<T>.Version)
+      }
+    }
+    if !positionalOnly && String.startsWith(token, "-") && token != "-" {
+      let mut name = token
+      let mut hasInline = false
+      let mut inline = ""
+      if String.startsWith(token, "--") {
+        match String.find(token, "=") {
+          Option.Some { value: at } => {
+            name = String.slice(token, 0, at)
+            let rest = String.byteLength(token) - at - 1
+            hasInline = true
+            inline = String.slice(token, at + 1, rest)
+          }
+          Option.None => {}
+        }
+      }
+      let mut matched = false
+      static for field in Reflect.fields<T>() {
+        let static option = Command.find(command, Reflect.fieldLabel(field))
+        static if !option.positional && !option.subcommand {
+          let static long = Command.longFlag(option)
+          let static short = Command.shortFlag(option)
+          let flag: string<'static> = long
+          let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
+          if !matched && (name == long || (short != "" && name == short)) {
+            matched = true
+            seen[slot] = true
+            let place = fieldMut(&mut value, field)
+            if takesValue(field) {
+              let mut text = inline
+              if !hasInline {
+                if index >= arguments.length {
+                  return finished(
+                    Parsed<T>.Failed { error: CliError.MissingValue { option: flag } }
+                  )
+                }
+                text = arguments[index]
+                index = index + 1
+              }
+              let accepted = run ArgValue.accept(&mut place, text)
+              if !accepted {
+                let copied = run String.copy(text)
+                return finished(
+                  Parsed<T>.Failed {
+                    error: CliError.InvalidValue { option: flag, token: move copied }
+                  }
+                )
+              }
+            } else {
+              if hasInline {
+                return finished(
+                  Parsed<T>.Failed { error: CliError.UnexpectedValue { option: flag } }
+                )
+              }
+              let flagged = run ArgValue.accept(&mut place, "")
+            }
+          }
+        }
+      }
+      if !matched {
+        let copied = run String.copy(token)
+        return finished(Parsed<T>.Failed { error: CliError.UnknownOption { token: move copied } })
+      }
+      continue
+    }
+    static if Command.subcommandCount(command) != 0 {
+      static for field in Reflect.fields<T>() {
+        let static option = Command.find(command, Reflect.fieldLabel(field))
+        static if option.subcommand {
+          let static name = option.long
+          if token == name {
+            let missing = run missingRequired<T>(command, &seen)
+            match move missing {
+              Option.Some { value: error } => {
+                return finished(Parsed<T>.Failed { error: move error })
+              }
+              Option.None => {}
+            }
+            static for other in Reflect.fields<T>() {
+              let static sibling = Command.find(command, Reflect.fieldLabel(other))
+              static if sibling.subcommand && sibling.field != option.field {
+                clearSubcommand(&mut value, other)
+              }
+            }
+            let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
+            let chosen: usize = slot
+            return Step<T>.Descend { value: move value, slot: chosen, next: index }
+          }
+        }
+      }
+    }
+    let mut taken = false
+    static for field in Reflect.fields<T>() {
+      let static option = Command.find(command, Reflect.fieldLabel(field))
+      static if option.positional {
+        let static at = Command.position(command, option.field)
+        let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
+        if !taken && (positional == at || (repeats(field) && positional > at)) {
+          taken = true
+          seen[slot] = true
+          let place = fieldMut(&mut value, field)
+          let accepted = run ArgValue.accept(&mut place, token)
+          if !accepted {
+            let copied = run String.copy(token)
+            let static name = Command.placeholder(option)
+            let label: string<'static> = name
+            return finished(
+              Parsed<T>.Failed {
+                error: CliError.InvalidValue { option: label, token: move copied }
+              }
+            )
+          }
+        }
+      }
+    }
+    if !taken {
+      let copied = run String.copy(token)
+      return finished(
+        Parsed<T>.Failed { error: CliError.UnexpectedArgument { token: move copied } }
+      )
+    }
+    positional = positional + 1
+  }
+  let missing = run missingRequired<T>(command, &seen)
+  match move missing {
+    Option.Some { value: error } => {
+      return finished(Parsed<T>.Failed { error: move error })
+    }
+    Option.None => {}
+  }
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if option.subcommand {
+      clearSubcommand(&mut value, field)
+    }
+  }
+  return finished(Parsed<T>.Run { value: move value })
+}
+
+effect fn missingRequired<T>(static command: Command, seen: &[bool; 64]) -> Option<CliError> {
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if option.required {
+      let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
+      if !seen[slot] {
+        static if option.positional {
+          let static name = Command.placeholder(option)
+          let label: string<'static> = name
+          return Option<CliError>.some(CliError.MissingRequired { option: label })
+        } else {
+          let static name = Command.longFlag(option)
+          let label: string<'static> = name
+          return Option<CliError>.some(CliError.MissingRequired { option: label })
+        }
+      }
+    }
+  }
+  return Option<CliError>.none()
+}
+
+// Finishes a parse step at depth 0: a finished result as it is, or the chosen subcommand.
+effect fn descend0<T>(
+  static command: Command,
+  static path: string<'static>,
+  step: Step<T>,
+  arguments: &[string],
+) -> Parsed<T>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move step {
+    Step.Finished { parsed } => {
+      return move parsed
+    }
+    Step.Descend { value, slot, next } => {
+      static for field in Reflect.fields<T>() {
+        let static option = Command.find(command, Reflect.fieldLabel(field))
+        static if option.subcommand {
+          let static here = fieldIndex<T>(Reflect.fieldLabel(field))
+          if slot == here {
+            return run enter1(command, path, field, move value, arguments, next)
+          }
+        }
+      }
+      return Parsed<T>.Run { value: move value }
+    }
+  }
+}
+
+// Parses the rest of the command line into the subcommand in `field` at depth 1, and puts the
+// parsed subcommand back into `owner`.
+effect fn enter1<Owner, Sub>(
+  static command: Command,
+  static path: string<'static>,
+  static field: Intrinsic.Field<Owner, Option<Sub>>,
+  owner: Owner,
+  arguments: &[string],
+  start: usize,
+) -> Parsed<Owner>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let static label = Reflect.fieldLabel(field)
+  let static subPath = joinPath(path, label)
+  let mut value = move owner
+  let place = fieldMut(&mut value, field)
+  let defaults = Intrinsic.replace(place.*, Option<Sub>.none())
+  match move defaults {
+    Option.None => {
+      let name: string<'static> = subPath
+      return Parsed<Owner>.Failed { error: CliError.NoDefaults { command: name } }
+    }
+    Option.Some { value: subDefaults } => {
+      let step = run parseFrom<Sub>(
+        Command.scoped(command, label),
+        subPath,
+        move subDefaults,
+        arguments,
+        start
+      )
+      let parsed = run descend1<Sub>(Command.scoped(command, label), subPath, move step, arguments)
+      match move parsed {
+        Parsed.Run { value: sub } => {
+          let slot = fieldMut(&mut value, field)
+          slot.* = Option<Sub>.some(move sub)
+          return Parsed<Owner>.Run { value: move value }
+        }
+        Parsed.Help { command: asked } => {
+          return Parsed<Owner>.Help { command: asked }
+        }
+        Parsed.Version => {
+          return Parsed<Owner>.Version
+        }
+        Parsed.Failed { error } => {
+          return Parsed<Owner>.Failed { error: move error }
+        }
+      }
+    }
+  }
+}
+
+// Finishes a parse step at depth 1: a finished result as it is, or the chosen subcommand.
+effect fn descend1<T>(
+  static command: Command,
+  static path: string<'static>,
+  step: Step<T>,
+  arguments: &[string],
+) -> Parsed<T>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move step {
+    Step.Finished { parsed } => {
+      return move parsed
+    }
+    Step.Descend { value, slot, next } => {
+      static for field in Reflect.fields<T>() {
+        let static option = Command.find(command, Reflect.fieldLabel(field))
+        static if option.subcommand {
+          let static here = fieldIndex<T>(Reflect.fieldLabel(field))
+          if slot == here {
+            return run enter2(command, path, field, move value, arguments, next)
+          }
+        }
+      }
+      return Parsed<T>.Run { value: move value }
+    }
+  }
+}
+
+// Parses the rest of the command line into the subcommand in `field` at depth 2, and puts the
+// parsed subcommand back into `owner`.
+effect fn enter2<Owner, Sub>(
+  static command: Command,
+  static path: string<'static>,
+  static field: Intrinsic.Field<Owner, Option<Sub>>,
+  owner: Owner,
+  arguments: &[string],
+  start: usize,
+) -> Parsed<Owner>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let static label = Reflect.fieldLabel(field)
+  let static subPath = joinPath(path, label)
+  let mut value = move owner
+  let place = fieldMut(&mut value, field)
+  let defaults = Intrinsic.replace(place.*, Option<Sub>.none())
+  match move defaults {
+    Option.None => {
+      let name: string<'static> = subPath
+      return Parsed<Owner>.Failed { error: CliError.NoDefaults { command: name } }
+    }
+    Option.Some { value: subDefaults } => {
+      let step = run parseFrom<Sub>(
+        Command.scoped(command, label),
+        subPath,
+        move subDefaults,
+        arguments,
+        start
+      )
+      let parsed = run descend2<Sub>(Command.scoped(command, label), subPath, move step, arguments)
+      match move parsed {
+        Parsed.Run { value: sub } => {
+          let slot = fieldMut(&mut value, field)
+          slot.* = Option<Sub>.some(move sub)
+          return Parsed<Owner>.Run { value: move value }
+        }
+        Parsed.Help { command: asked } => {
+          return Parsed<Owner>.Help { command: asked }
+        }
+        Parsed.Version => {
+          return Parsed<Owner>.Version
+        }
+        Parsed.Failed { error } => {
+          return Parsed<Owner>.Failed { error: move error }
+        }
+      }
+    }
+  }
+}
+
+// Finishes a parse step at depth 2: a finished result as it is, or the chosen subcommand.
+effect fn descend2<T>(
+  static command: Command,
+  static path: string<'static>,
+  step: Step<T>,
+  arguments: &[string],
+) -> Parsed<T>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move step {
+    Step.Finished { parsed } => {
+      return move parsed
+    }
+    Step.Descend { value, slot, next } => {
+      static if Command.subcommandCount(command) != 0 {
+        compileError("subcommands nest at most two levels deep")
+      }
+      return Parsed<T>.Run { value: move value }
+    }
+  }
+}
+
+// One level of parsing ends with a result or with the subcommand that takes the rest. The
+// levels are separate functions because the compiler refuses recursion that changes a type
+// argument, even when it descends into a field type.
+union Step<T> {
+  Finished { parsed: Parsed<T> },
+  Descend { value: T, slot: usize, next: usize }
+}
+
+fn finished<T>(parsed: Parsed<T>) -> Step<T> {
+  return Step<T>.Finished { parsed: move parsed }
+}
+
+fn clearSubcommand<Owner, Sub>(
+  owner: &mut Owner,
+  static field: Intrinsic.Field<Owner, Option<Sub>>
+) -> () {
+  let place = fieldMut(&mut owner, field)
+  place.* = Option<Sub>.none()
+}
+
+static fn joinPath(path: string<'static>, label: string<'static>) -> string<'static> {
+  if path == "" {
+    return label
+  }
+  return StaticText.concat(StaticText.concat(path, "."), label)
+}
+
+effect fn writeHelpAt0<T>(static command: Command, static at: string<'static>, path: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  if path == at {
+    return run writeCommandHelp<T>(command)
+  }
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if option.subcommand {
+      let static below = joinPath(at, option.field)
+      if path == below || String.startsWith(path, StaticText.concat(below, ".")) {
+        return run writeSubcommandHelp1(command, below, field, path)
+      }
+    }
+  }
+  return run writeCommandHelp<T>(command)
+}
+
+effect fn writeSubcommandHelp1<Owner, Sub>(
+  static command: Command,
+  static at: string<'static>,
+  static field: Intrinsic.Field<Owner, Option<Sub>>,
+  path: string,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  return run writeHelpAt1<Sub>(Command.scoped(command, Reflect.fieldLabel(field)), at, path)
+}
+
+effect fn writeHelpAt1<T>(static command: Command, static at: string<'static>, path: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  if path == at {
+    return run writeCommandHelp<T>(command)
+  }
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if option.subcommand {
+      let static below = joinPath(at, option.field)
+      if path == below || String.startsWith(path, StaticText.concat(below, ".")) {
+        return run writeSubcommandHelp2(command, below, field, path)
+      }
+    }
+  }
+  return run writeCommandHelp<T>(command)
+}
+
+effect fn writeSubcommandHelp2<Owner, Sub>(
+  static command: Command,
+  static at: string<'static>,
+  static field: Intrinsic.Field<Owner, Option<Sub>>,
+  path: string,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  return run writeHelpAt2<Sub>(Command.scoped(command, Reflect.fieldLabel(field)), at, path)
+}
+
+effect fn writeHelpAt2<T>(static command: Command, static at: string<'static>, path: string) -> ()
+  ! WriterError
+  ? &mut Writer {
+  if path == at {
+    return run writeCommandHelp<T>(command)
+  }
+  return run writeCommandHelp<T>(command)
+}
+
+effect fn writeCommandHelp<T>(static command: Command) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let static usage = usageLine<T>(command)
+  run Writer.writeString(usage)
+  static if command.description != "" {
+    run Writer.writeString("\n")
+    run Writer.writeString(command.description)
+    run Writer.writeString("\n")
+  }
+  run Writer.writeString("\nOptions:\n")
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if !option.positional && !option.subcommand {
+      let static short = Command.shortFlag(option)
+      let static long = Command.longFlag(option)
+      let mut width: usize = 6 + String.byteLength(long)
+      static if short != "" {
+        run Writer.writeString("  ")
+        run Writer.writeString(short)
+        run Writer.writeString(", ")
+      } else {
+        run Writer.writeString("      ")
+      }
+      run Writer.writeString(long)
+      if takesValue(field) {
+        run Writer.writeString(" <value>")
+        width = width + 8
+      }
+      run pad(width, optionColumn<T>(command))
+      run Writer.writeString(option.description)
+      static if option.required {
+        run Writer.writeString(" (required)")
+      }
+      run Writer.writeString("\n")
+    }
+  }
+  run Writer.writeString("  -h, --help")
+  run pad(12, optionColumn<T>(command))
+  run Writer.writeString("Print this help\n")
+  static if command.version != "" {
+    run Writer.writeString("      --version")
+    run pad(15, optionColumn<T>(command))
+    run Writer.writeString("Print the version\n")
+  }
+  static if Command.positionalCount(command) != 0 {
+    run Writer.writeString("\nArguments:\n")
+    static for field in Reflect.fields<T>() {
+      let static option = Command.find(command, Reflect.fieldLabel(field))
+      static if option.positional {
+        let static name = Command.placeholder(option)
+        run Writer.writeString("  ")
+        run Writer.writeString(name)
+        run pad(2 + String.byteLength(name), optionColumn<T>(command))
+        run Writer.writeString(option.description)
+        static if option.required {
+          static if option.description == "" {
+            run Writer.writeString("(required)")
+          } else {
+            run Writer.writeString(" (required)")
+          }
+        }
+        run Writer.writeString("\n")
+      }
+    }
+  }
+  static if Command.subcommandCount(command) != 0 {
+    run Writer.writeString("\nCommands:\n")
+    static for field in Reflect.fields<T>() {
+      let static option = Command.find(command, Reflect.fieldLabel(field))
+      static if option.subcommand {
+        run Writer.writeString("  ")
+        run Writer.writeString(option.long)
+        run pad(2 + String.byteLength(option.long), optionColumn<T>(command))
+        run Writer.writeString(option.description)
+        run Writer.writeString("\n")
+      }
+    }
   }
 }
 
@@ -449,7 +828,13 @@ static fn optionColumn<T>(command: Command) -> usize {
   let mut widest: usize = 15
   static for field in Reflect.fields<T>() {
     let option = Command.find(command, Reflect.fieldLabel(field))
-    let width = 6 + StaticText.byteLength(Command.longFlag(option)) + 8
+    let mut width = 6 + StaticText.byteLength(Command.longFlag(option)) + 8
+    if option.subcommand {
+      width = 2 + StaticText.byteLength(option.long)
+    }
+    if option.positional {
+      width = 2 + StaticText.byteLength(Command.placeholder(option))
+    }
     if width > widest {
       widest = width
     }
@@ -464,6 +849,9 @@ static fn usageLine<T>(command: Command) -> string<'static> {
     if option.positional {
       line = StaticText.concat(StaticText.concat(line, " "), Command.placeholder(option))
     }
+  }
+  if Command.subcommandCount(command) != 0 {
+    line = StaticText.concat(line, " <command>")
   }
   return StaticText.concat(line, "\n")
 }

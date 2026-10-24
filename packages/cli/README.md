@@ -28,7 +28,8 @@ static fn greet() -> Command {
 // Parsed.Version, or Parsed.Failed { error }.
 ```
 
-See [`examples/greet`](../../examples/greet/src/main.silk) for a complete program.
+See [`examples/greet`](../../examples/greet/src/main.silk) and
+[`examples/git`](../../examples/git/src/main.silk) for complete programs.
 
 ## What it supports
 
@@ -41,17 +42,23 @@ See [`examples/greet`](../../examples/greet/src/main.silk) for a complete progra
 - Defaults are the struct value you pass in. `Opt.required` and `Arg.required` make a value
   mandatory.
 - `--help` and `-h`, and `--version` when the command has a version.
+- Subcommands, nested up to two levels: a field of type `Option<Sub>` added with
+  `Command.subcommand(command, "field", subDescription)`. Give it `Option.some(defaults)`; after
+  parsing only the chosen subcommand is present. `Parsed.Help { command }` names the subcommand
+  path whose help was asked for, and `Cli.writeHelp<T>(spec, command)` prints it.
 - Compile errors for a description that names a missing field, repeats a field, name, or alias, or
   for a field type without `ArgValue`.
 
 ## Not yet
 
-- Subcommands (planned as `Option<Sub>` fields).
+- Subcommands deeper than two levels.
 - Environment variable fallbacks, choices, and shell completions.
 - Grouped short flags such as `-abc`.
 
 ## Known rough edges
 
 - Builders are nested calls, because `|>` and method calls do not work in a `static fn` yet.
+- Each subcommand level is its own function (`descend0`, `enter1`, ...), because the compiler
+  refuses generic recursion that changes a type argument (SEM0053), even into a field's type.
 - Field writes go through one unsafe helper in `parse.silk`, because `silk.reflect` has no mutable
   field projection yet.
