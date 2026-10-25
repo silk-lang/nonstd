@@ -16,12 +16,11 @@ struct Greet {
 }
 
 static fn greet() -> Command {
-  let mut command = Command.make("greet", "Say hello to someone")
-  command = Command.withVersion(command, "0.1.0")
-  command = Command.option(command, Opt.alias(Opt.describe(Opt.named("name"), "Who to greet"), "n"))
-  command = Command.option(command, Opt.describe(Opt.named("times"), "How many times"))
-  command = Command.arg(command, Arg.describe(Arg.named("files"), "Files to mention"))
-  return command
+  return Command.make("greet", "Say hello to someone")
+    |> Command.withVersion("0.1.0")
+    |> Command.option(Opt.named("name") |> Opt.describe("Who to greet") |> Opt.alias("n"))
+    |> Command.option(Opt.named("times") |> Opt.describe("How many times"))
+    |> Command.arg(Arg.named("files") |> Arg.describe("Files to mention"))
 }
 
 // In main: run Cli.fromHost(greet(), move defaults) gives Parsed.Run { value }, Parsed.Help,
@@ -43,7 +42,7 @@ See [`examples/greet`](../../examples/greet/src/main.silk) and
   mandatory.
 - `--help` and `-h`, and `--version` when the command has a version.
 - Subcommands, nested up to two levels: a field of type `Option<Sub>` added with
-  `Command.subcommand(command, "field", subDescription)`. Give it `Option.some(defaults)`; after
+  `command |> Command.subcommand("field", subDescription)`. Give it `Option.some(defaults)`; after
   parsing only the chosen subcommand is present. `Parsed.Help { command }` names the subcommand
   path whose help was asked for, and `Cli.writeHelp<T>(spec, command)` prints it.
 - Compile errors for a description that names a missing field, repeats a field, name, or alias, or
@@ -57,8 +56,8 @@ See [`examples/greet`](../../examples/greet/src/main.silk) and
 
 ## Known rough edges
 
-- Builders are nested calls, because `|>` and method calls do not work in a `static fn` yet.
 - Each subcommand level is its own function (`descend0`, `enter1`, ...), because the compiler
-  refuses generic recursion that changes a type argument (SEM0053), even into a field's type.
+  refuses generic recursion that changes a type argument (SEM0053), even into a field's type
+  ([silk#2347](https://github.com/silk-lang/silk/issues/2347)).
 - Field writes go through one unsafe helper in `parse.silk`, because `silk.reflect` has no mutable
-  field projection yet.
+  field projection yet ([silk#2347](https://github.com/silk-lang/silk/issues/2347)).
