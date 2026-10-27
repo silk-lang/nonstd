@@ -27,15 +27,24 @@ static fn greet() -> Command {
 // Parsed.Version, or Parsed.Failed { error }.
 ```
 
-See [`examples/greet`](../../examples/greet/src/main.silk) and
-[`examples/git`](../../examples/git/src/main.silk) for complete programs.
+See [`examples/greet`](../../examples/greet/src/main.silk),
+[`examples/git`](../../examples/git/src/main.silk) (subcommands), and
+[`examples/serve`](../../examples/serve/src/main.silk) (choices, environment variables, grouped
+flags) for complete programs.
 
 ## What it supports
 
 - Field types choose the reader through `ArgValue`: `String`, the integer types, `bool` (a flag),
   `Option<T>` (present when given), and `List<T>` (every occurrence, or every remaining
   positional argument). Implement `FromArg` or `ArgValue` for your own types.
-- `--name value`, `--name=value`, `-n value`, flags, positional arguments, and `--`.
+- `--name value`, `--name=value`, `-n value`, `-n5`, flags, grouped one-letter flags such as
+  `-vq`, positional arguments, and `--`.
+- Choices: `Opt.choice("json") |> Opt.choice("text")` (or `Arg.choice`) limits a value to
+  those words, and the help text lists them.
+- Environment fallbacks: `Opt.env("PORT")` reads `PORT` when the command line does not give
+  `--port`. The command line wins over the environment, which wins over the defaults. A flag is
+  set unless its variable is empty, `0`, or `false`. `Cli.fromHost` reads the variables, and
+  `Cli.parseWith` takes them as a slice of `Variable` (handy in tests).
 - Fields the description does not mention are options named after the field, in kebab-case
   (`nickName` is `--nick-name`).
 - Defaults are the struct value you pass in. `Opt.required` and `Arg.required` make a value
@@ -50,8 +59,7 @@ See [`examples/greet`](../../examples/greet/src/main.silk) and
 
 ## Not yet
 
-- Environment variable fallbacks, choices, and shell completions.
-- Grouped short flags such as `-abc`.
+- Shell completions.
 
 ## Known rough edges
 

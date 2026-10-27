@@ -9,8 +9,9 @@
 //! loop over the struct fields is expanded during compilation too, so the parser that runs only
 //! compares each argument with the option names and calls the reader of the matching field type.
 //!
-//! The parser accepts `--name value`, `--name=value`, `-n value`, flags such as `--loud`, positional
-//! arguments, and `--`, after which every argument is positional. `--help` and `-h` give
+//! The parser accepts `--name value`, `--name=value`, `-n value`, `-n5`, flags such as `--loud`,
+//! grouped one-letter flags such as `-abc`, positional arguments, and `--`, after which every
+//! argument is positional. `--help` and `-h` give
 //! [`Parsed.Help`], and `--version` gives [`Parsed.Version`] when the command has a version.
 //!
 //! # Gotchas
@@ -25,9 +26,11 @@ import silk.bytes { Bytes }
 import silk.host_input { HostInput, HostInputError }
 import silk.list { List }
 import silk.option { Option }
+import silk.ownership { Copy }
 import silk.pointer { Pointer }
 import silk.reflect { Reflect, labeledFieldKind, namedKind }
 import silk.result { Result }
+import silk.static_sequence { StaticSequence }
 import silk.static_text { StaticText }
 import silk.string { String }
 import silk.writer { Writer, WriterError }
@@ -43,6 +46,15 @@ pub union CliError {
   MissingValue {
     /// The option, such as `--name`.
     pub option: string<'static>
+  },
+  /// The value of an option or positional argument is not one of its choices.
+  NotAChoice {
+    /// The option, such as `--format`, or the positional argument, such as `<format>`.
+    pub option: string<'static>,
+    /// The value as given.
+    pub token: String,
+    /// The choices, separated by commas, such as `json, text`.
+    pub choices: string<'static>
   },
   /// The value of an option or positional argument is not valid for its field type.
   InvalidValue {
@@ -101,6 +113,16 @@ pub union Parsed<T> {
   }
 }
 
+/// One environment variable, for [`Cli.parseWith`].
+pub struct Variable<'a> {
+  /// The variable name, such as `HOME`.
+  pub name: string<'a>,
+  /// The variable value.
+  pub value: string<'a>,
+}
+
+impl<'a> Copy for Variable<'a> {}
+
 /// The owner type of the parser. It has no fields and is never constructed.
 pub struct Cli {}
 
@@ -116,10 +138,26 @@ impl Cli {
   pub effect fn parse<T>(static command: Command, defaults: T, arguments: &[string]) -> Parsed<T>
     ! OutOfMemoryError
     ? &mut Allocator {
-    return run parseFrom<T>(command, "", move defaults, arguments, 1)
+    let environment: [Variable<'static>; 0] = []
+    return run parseFrom<T>(command, "", move defaults, arguments, &environment, 1)
   }
 
-  /// Reads the process arguments and parses them with [`Cli.parse`].
+  /// Parses like [`Cli.parse`], and reads an option that the command line does not give from
+  /// `environment` when the option names a variable with `Opt.env`. The command line wins over the
+  /// environment, and the environment wins over `defaults`.
+  pub effect fn parseWith<T>(
+    static command: Command,
+    defaults: T,
+    arguments: &[string],
+    environment: &[Variable],
+  ) -> Parsed<T>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run parseFrom<T>(command, "", move defaults, arguments, environment, 1)
+  }
+
+  /// Reads the process arguments, and the environment variables that `command` names, and parses
+  /// them with [`Cli.parseWith`].
   ///
   /// # Errors
   ///
@@ -142,7 +180,35 @@ impl Cli {
       }
       index = index + 1
     }
-    return run Cli.parse(command, move defaults, List<string>.asSlice(&texts))
+    let mut names = List<string>.make()
+    let mut found = List<Bytes>.make()
+    static for name in environmentNames(command) {
+      match run HostInput.variableNamed(name) {
+        Option.Some { value: bytes } => {
+          run List<string>.append(&mut names, name)
+          run List<Bytes>.append(&mut found, move bytes)
+        }
+        Option.None => {}
+      }
+    }
+    let mut environment = List<Variable>.make()
+    let mut at: usize = 0
+    while at < List<Bytes>.length(&found) {
+      match HostInput.text(Bytes.asSlice(&List<Bytes>.asSlice(&found)[at])) {
+        Result.Success { value: text } => {
+          let variable = Variable { name: List<string>.asSlice(&names)[at], value: text }
+          run List<Variable>.append(&mut environment, variable)
+        }
+        Result.Failure { error: _ } => {}
+      }
+      at = at + 1
+    }
+    return run Cli.parseWith(
+      command,
+      move defaults,
+      List<string>.asSlice(&texts),
+      List<Variable>.asSlice(&environment),
+    )
   }
 
   /// Writes the help text of the command or subcommand at `path` (from [`Parsed.Help`]; empty
@@ -189,6 +255,15 @@ impl Cli {
         run Writer.writeString(option)
         run Writer.writeString(" needs a value")
       }
+      CliError.NotAChoice { option, token, choices } => {
+        run Writer.writeString("invalid value '")
+        run Writer.writeString(String.view(&token))
+        run Writer.writeString("' for ")
+        run Writer.writeString(option)
+        run Writer.writeString(" (choose from ")
+        run Writer.writeString(choices)
+        run Writer.writeString(")")
+      }
       CliError.InvalidValue { option, token } => {
         run Writer.writeString("invalid value '")
         run Writer.writeString(String.view(&token))
@@ -224,6 +299,7 @@ effect fn parseFrom<T>(
   static path: string<'static>,
   defaults: T,
   arguments: &[string],
+  environment: &[Variable],
   start: usize,
 ) -> Parsed<T>
   ! OutOfMemoryError
@@ -255,57 +331,84 @@ effect fn parseFrom<T>(
       }
     }
     if !positionalOnly && String.startsWith(token, "-") && token != "-" {
-      let mut name = token
-      let mut hasInline = false
-      let mut inline = ""
-      if String.startsWith(token, "--") {
-        match String.find(token, "=") {
-          Option.Some { value: at } => {
-            name = String.slice(token, 0, at)
-            let rest = String.byteLength(token) - at - 1
-            hasInline = true
-            inline = String.slice(token, at + 1, rest)
+      if String.startsWith(token, "--") || String.byteLength(token) == 2 {
+        let mut name = token
+        let mut hasInline = false
+        let mut inline = ""
+        if String.startsWith(token, "--") {
+          match String.find(token, "=") {
+            Option.Some { value: at } => {
+              name = String.slice(token, 0, at)
+              hasInline = true
+              inline = String.slice(token, at + 1, String.byteLength(token) - at - 1)
+            }
+            Option.None => {}
           }
-          Option.None => {}
         }
-      }
-      let mut matched = false
-      static for field in Reflect.fields<T>() {
-        let static option = Command.find(command, Reflect.fieldLabel(field))
-        static if !option.positional && !option.subcommand {
-          let static long = Command.longFlag(option)
-          let static short = Command.shortFlag(option)
-          let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
-          if !matched && (name == long || (short != "" && name == short)) {
-            matched = true
-            seen[slot] = true
-            let place = fieldMut(&mut value, field)
-            if takesValue(field) {
-              let mut text = inline
-              if !hasInline {
-                if index >= arguments.length {
-                  return Parsed<T>.Failed { error: CliError.MissingValue { option: long } }
-                }
-                text = arguments[index]
-                index = index + 1
-              }
-              let accepted = run ArgValue.accept(&mut place, text)
-              if !accepted {
-                return Parsed<T>.Failed {
-                  error: CliError.InvalidValue { option: long, token: run String.copy(text) }
-                }
-              }
-            } else {
-              if hasInline {
-                return Parsed<T>.Failed { error: CliError.UnexpectedValue { option: long } }
-              }
-              let flagged = run ArgValue.accept(&mut place, "")
+        let applied = run applyOption<T>(
+          command,
+          &mut value,
+          &mut seen,
+          name,
+          false,
+          inline,
+          hasInline,
+          arguments,
+          &mut index,
+        )
+        match move applied {
+          Applied.Unknown => {
+            return Parsed<T>.Failed {
+              error: CliError.UnknownOption { token: run String.copy(token) }
             }
           }
+          Applied.Failed { error } => {
+            return Parsed<T>.Failed { error: move error }
+          }
+          _ => {}
         }
+        continue
       }
-      if !matched {
-        return Parsed<T>.Failed { error: CliError.UnknownOption { token: run String.copy(token) } }
+
+      // A group of one-letter options, such as `-abc`. An option that takes a value takes the rest
+      // of the group, such as `-n5`, or else the next argument.
+      let length = String.byteLength(token)
+      let mut at: usize = 1
+      while at < length {
+        if String.utf8Bytes(token)[at] >= 128 {
+          return Parsed<T>.Failed {
+            error: CliError.UnknownOption { token: run String.copy(token) }
+          }
+        }
+        let letter = String.slice(token, at, 1)
+        let rest = String.slice(token, at + 1, length - at - 1)
+        let applied = run applyOption<T>(
+          command,
+          &mut value,
+          &mut seen,
+          letter,
+          true,
+          rest,
+          rest != "",
+          arguments,
+          &mut index,
+        )
+        match move applied {
+          Applied.Flag => {
+            at = at + 1
+          }
+          Applied.Value => {
+            at = length
+          }
+          Applied.Unknown => {
+            return Parsed<T>.Failed {
+              error: CliError.UnknownOption { token: run String.copy(token) }
+            }
+          }
+          Applied.Failed { error } => {
+            return Parsed<T>.Failed { error: move error }
+          }
+        }
       }
       continue
     }
@@ -315,6 +418,18 @@ effect fn parseFrom<T>(
         static if option.subcommand {
           let static name = option.long
           if token == name {
+            let fromEnvironment = run applyEnvironment<T>(
+              command,
+              &mut value,
+              &mut seen,
+              environment,
+            )
+            match move fromEnvironment {
+              Option.Some { value: error } => {
+                return Parsed<T>.Failed { error: move error }
+              }
+              Option.None => {}
+            }
             let missing = run missingRequired<T>(command, &seen)
             match move missing {
               Option.Some { value: error } => {
@@ -328,7 +443,7 @@ effect fn parseFrom<T>(
                 clearSubcommand(&mut value, other)
               }
             }
-            return run enter(command, path, field, move value, arguments, index)
+            return run enter(command, path, field, move value, arguments, environment, index)
           }
         }
       }
@@ -342,6 +457,18 @@ effect fn parseFrom<T>(
         if !taken && (positional == at || (repeats(field) && positional > at)) {
           taken = true
           seen[slot] = true
+          static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+            if !isChoice(option, token) {
+              let static name = Command.placeholder(option)
+              return Parsed<T>.Failed {
+                error: CliError.NotAChoice {
+                  option: name,
+                  token: run String.copy(token),
+                  choices: choiceList(option),
+                }
+              }
+            }
+          }
           let place = fieldMut(&mut value, field)
           let accepted = run ArgValue.accept(&mut place, token)
           if !accepted {
@@ -360,6 +487,13 @@ effect fn parseFrom<T>(
     }
     positional = positional + 1
   }
+  let fromEnvironment = run applyEnvironment<T>(command, &mut value, &mut seen, environment)
+  match move fromEnvironment {
+    Option.Some { value: error } => {
+      return Parsed<T>.Failed { error: move error }
+    }
+    Option.None => {}
+  }
   let missing = run missingRequired<T>(command, &seen)
   match move missing {
     Option.Some { value: error } => {
@@ -374,6 +508,188 @@ effect fn parseFrom<T>(
     }
   }
   return Parsed<T>.Run { value: move value }
+}
+
+// How one option of a command line was applied.
+union Applied {
+  Flag,
+  Value,
+  Unknown,
+  Failed { error: CliError }
+}
+
+// Applies the option `name` to `value`: a long name or an alias with its dash, or with `letter`, an
+// alias letter alone. `attached` is the text after `=` or after the letter, if any.
+effect fn applyOption<T>(
+  static command: Command,
+  value: &mut T,
+  seen: &mut [bool; 64],
+  name: string,
+  letter: bool,
+  attached: string,
+  hasAttached: bool,
+  arguments: &[string],
+  index: &mut usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if !option.positional && !option.subcommand {
+      let static long = Command.longFlag(option)
+      let static short = Command.shortFlag(option)
+      let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
+      let mut hit = false
+      if letter {
+        hit = option.short != "" && name == option.short
+      } else {
+        hit = name == long || (short != "" && name == short)
+      }
+      if hit {
+        seen[slot] = true
+        let place = fieldMut(&mut value, field)
+        if takesValue(field) {
+          let mut text = attached
+          if hasAttached {
+            if letter && String.startsWith(attached, "=") {
+              text = String.slice(attached, 1, String.byteLength(attached) - 1)
+            }
+          } else {
+            if index.* >= arguments.length {
+              return Applied.Failed { error: CliError.MissingValue { option: long } }
+            }
+            text = arguments[index.*]
+            index.* = index.* + 1
+          }
+          static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+            if !isChoice(option, text) {
+              return Applied.Failed {
+                error: CliError.NotAChoice {
+                  option: long,
+                  token: run String.copy(text),
+                  choices: choiceList(option),
+                },
+              }
+            }
+          }
+          let accepted = run ArgValue.accept(&mut place, text)
+          if !accepted {
+            return Applied.Failed {
+              error: CliError.InvalidValue { option: long, token: run String.copy(text) },
+            }
+          }
+          return Applied.Value
+        }
+        if hasAttached && !letter {
+          return Applied.Failed { error: CliError.UnexpectedValue { option: long } }
+        }
+        let flagged = run ArgValue.accept(&mut place, "")
+        return Applied.Flag
+      }
+    }
+  }
+  return Applied.Unknown
+}
+
+// Reads every option that the command line did not give and that names an environment variable
+// from `environment`. A flag is set unless its variable is empty, `0`, or `false`.
+effect fn applyEnvironment<T>(
+  static command: Command,
+  value: &mut T,
+  seen: &mut [bool; 64],
+  environment: &[Variable],
+) -> Option<CliError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static for field in Reflect.fields<T>() {
+    let static option = Command.find(command, Reflect.fieldLabel(field))
+    static if option.env != "" && !option.positional && !option.subcommand {
+      let static long = Command.longFlag(option)
+      let static slot = fieldIndex<T>(Reflect.fieldLabel(field))
+      let mut at: usize = 0
+      while !seen[slot] && at < environment.length {
+        if environment[at].name == option.env {
+          let text = environment[at].value
+          let place = fieldMut(&mut value, field)
+          if takesValue(field) {
+            seen[slot] = true
+            static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+              if !isChoice(option, text) {
+                return Option<CliError>.some(
+                  CliError.NotAChoice {
+                    option: option.env,
+                    token: run String.copy(text),
+                    choices: choiceList(option),
+                  },
+                )
+              }
+            }
+            let accepted = run ArgValue.accept(&mut place, text)
+            if !accepted {
+              return Option<CliError>.some(
+                CliError.InvalidValue { option: option.env, token: run String.copy(text) },
+              )
+            }
+          } else {
+            if text != "" && text != "0" && text != "false" {
+              seen[slot] = true
+              let flagged = run ArgValue.accept(&mut place, "")
+            }
+          }
+        }
+        at = at + 1
+      }
+    }
+  }
+  return Option<CliError>.none()
+}
+
+fn isChoice(static option: OptionSpec, text: string) -> bool {
+  static for choice in option.choices {
+    if text == choice {
+      return true
+    }
+  }
+  return false
+}
+
+static fn choiceList(option: OptionSpec) -> string<'static> {
+  let mut list = ""
+  static for choice in option.choices {
+    if list != "" {
+      list = StaticText.concat(list, ", ")
+    }
+    list = StaticText.concat(list, choice)
+  }
+  return list
+}
+
+// The environment variables that `command` and its subcommands name, without repeats.
+static fn environmentNames(command: Command) -> Intrinsic.StaticSequence<string<'static>> {
+  let mut names = StaticSequence.empty<string<'static>>()
+  static for option in command.options {
+    if option.env != "" {
+      names = withName(names, option.env)
+    }
+  }
+  static for option in command.nested {
+    if option.env != "" {
+      names = withName(names, option.env)
+    }
+  }
+  return names
+}
+
+static fn withName(
+  names: Intrinsic.StaticSequence<string<'static>>,
+  name: string<'static>,
+) -> Intrinsic.StaticSequence<string<'static>> {
+  static for known in names {
+    if known == name {
+      return names
+    }
+  }
+  return StaticSequence.append<string<'static>>(names, name)
 }
 
 effect fn missingRequired<T>(static command: Command, seen: &[bool; 64]) -> Option<CliError> {
@@ -403,6 +719,7 @@ effect fn enter<Owner, Sub>(
   static field: Intrinsic.Field<Owner, Option<Sub>>,
   owner: Owner,
   arguments: &[string],
+  environment: &[Variable],
   start: usize,
 ) -> Parsed<Owner>
   ! OutOfMemoryError
@@ -422,6 +739,7 @@ effect fn enter<Owner, Sub>(
         subPath,
         move subDefaults,
         arguments,
+        environment,
         start,
       )
       match move parsed {
@@ -517,11 +835,14 @@ effect fn writeCommandHelp<T>(static command: Command) -> ()
         run Writer.writeString(" <value>")
         width = width + 8
       }
-      run pad(width, optionColumn<T>(command))
+      static if hasNotes(option) {
+        run pad(width, optionColumn<T>(command))
+      }
       run Writer.writeString(option.description)
       static if option.required {
         run Writer.writeString(" (required)")
       }
+      run writeNotes(option)
       run Writer.writeString("\n")
     }
   }
@@ -541,7 +862,9 @@ effect fn writeCommandHelp<T>(static command: Command) -> ()
         let static name = Command.placeholder(option)
         run Writer.writeString("  ")
         run Writer.writeString(name)
-        run pad(2 + String.byteLength(name), optionColumn<T>(command))
+        static if hasNotes(option) {
+          run pad(2 + String.byteLength(name), optionColumn<T>(command))
+        }
         run Writer.writeString(option.description)
         static if option.required {
           static if option.description == "" {
@@ -550,6 +873,7 @@ effect fn writeCommandHelp<T>(static command: Command) -> ()
             run Writer.writeString(" (required)")
           }
         }
+        run writeNotes(option)
         run Writer.writeString("\n")
       }
     }
@@ -566,6 +890,36 @@ effect fn writeCommandHelp<T>(static command: Command) -> ()
         run Writer.writeString("\n")
       }
     }
+  }
+}
+
+// Whether the help line of `option` has text after its name.
+static fn hasNotes(option: OptionSpec) -> bool {
+  return option.description != "" || option.required
+    || StaticSequence.length<string<'static>>(option.choices) != 0
+    || option.env != ""
+}
+
+// Writes the choices and the environment variable of `option` after its help text.
+effect fn writeNotes(static option: OptionSpec) -> ()
+  ! WriterError
+  ? &mut Writer {
+  static if StaticSequence.length<string<'static>>(option.choices) != 0 {
+    static if option.description != "" || option.required {
+      run Writer.writeString(" ")
+    }
+    run Writer.writeString("[choices: ")
+    run Writer.writeString(choiceList(option))
+    run Writer.writeString("]")
+  }
+  static if option.env != "" {
+    static if option.description != "" || option.required
+      || StaticSequence.length<string<'static>>(option.choices) != 0 {
+      run Writer.writeString(" ")
+    }
+    run Writer.writeString("[env: ")
+    run Writer.writeString(option.env)
+    run Writer.writeString("]")
   }
 }
 
