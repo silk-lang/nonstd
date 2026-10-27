@@ -41,7 +41,7 @@ See [`examples/greet`](../../examples/greet/src/main.silk) and
 - Defaults are the struct value you pass in. `Opt.required` and `Arg.required` make a value
   mandatory.
 - `--help` and `-h`, and `--version` when the command has a version.
-- Subcommands, nested up to two levels: a field of type `Option<Sub>` added with
+- Subcommands, nested to any depth: a field of type `Option<Sub>` added with
   `command |> Command.subcommand("field", subDescription)`. Give it `Option.some(defaults)`; after
   parsing only the chosen subcommand is present. `Parsed.Help { command }` names the subcommand
   path whose help was asked for, and `Cli.writeHelp<T>(spec, command)` prints it.
@@ -50,14 +50,10 @@ See [`examples/greet`](../../examples/greet/src/main.silk) and
 
 ## Not yet
 
-- Subcommands deeper than two levels.
 - Environment variable fallbacks, choices, and shell completions.
 - Grouped short flags such as `-abc`.
 
 ## Known rough edges
 
-- Each subcommand level is its own function (`descend0`, `enter1`, ...), because the compiler
-  refuses generic recursion that changes a type argument (SEM0053), even into a field's type
-  ([silk#2347](https://github.com/silk-lang/silk/issues/2347)).
 - Field writes go through one unsafe helper in `parse.silk`, because `silk.reflect` has no mutable
   field projection yet ([silk#2347](https://github.com/silk-lang/silk/issues/2347)).
