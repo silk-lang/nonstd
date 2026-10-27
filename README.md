@@ -11,10 +11,10 @@ Examples that use the packages are in [`examples`](examples).
 
 ## Working in the workspace
 
-The workspace and every member pin Silk `0.1.0-dev.17+1120049495d3`. Install it with:
+The workspace and every member pin Silk `0.1.0-dev.20+10a8c67813a1`. Install it with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | SILK_RELEASE='v0.1.0-dev.17+1120049495d3' sh
+curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | SILK_RELEASE='v0.1.0-dev.20+10a8c67813a1' sh
 ```
 
 Project commands run inside a member directory:
