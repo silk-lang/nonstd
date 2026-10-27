@@ -54,15 +54,12 @@ flags) for complete programs.
   `command |> Command.subcommand("field", subDescription)`. Give it `Option.some(defaults)`; after
   parsing only the chosen subcommand is present. `Parsed.Help { command }` names the subcommand
   path whose help was asked for, and `Cli.writeHelp<T>(spec, command)` prints it.
-- Shell completions: `Completion.writeBash<T>(spec)` and `Completion.writeZsh<T>(spec)` write a
-  script that completes subcommands, option names, and choices, and follows the subcommands
-  already typed. `examples/git --completions bash` shows one way to offer it.
+- Shell completions: `Completion.writeBash<T>(spec)`, `writeZsh`, and `writeFish` write a
+  script that completes subcommands, option names, and choices, follows the subcommands already
+  typed, and completes file names where a command takes positional arguments without choices.
+  `examples/git --completions bash` shows one way to offer it.
 - Compile errors for a description that names a missing field, repeats a field, name, or alias, or
   for a field type without `ArgValue`.
-
-## Not yet
-
-- Fish completions, and completing file names for positional arguments.
 
 ## Known rough edges
 
