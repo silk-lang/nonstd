@@ -8,6 +8,8 @@ import context { Input, ResolvedBox, resolveBox, resolveBoxEdges, resolves, with
 import block { layoutBlock, leafBlockInto }
 import flex { layoutFlex, emptyFlexSize, FlexScratch }
 import grid { layoutGrid }
+import grid_style { GridTrack, GridTrackKind, GridBreadthKind }
+import grid_placement { GridBounds }
 import positioned { positionTree, positionVisits, reachableLimits, addOverflow, propagatedOverflow, subtreeOverflow, absoluteContainingBlock }
 import bfc { BfcState }
 import silk.core.option { Option }
@@ -1719,6 +1721,32 @@ fn staticSubtree(nodes: &BoxTree, id: usize, seen: &mut usize) -> bool {
   return true
 }
 
+// Whether a box is a grid whose every track, implicit ones included, has a
+// fixed length (Grid §11.4 then reads no item's contribution). Its retained
+// placement may show it has no implicit tracks.
+fn fixedGrid(nodes: &BoxTree, cache: &LayoutCache, id: usize) -> bool {
+  if id == NO_NODE || nodes.node(id).kind != BoxKind.Grid { return false }
+  let template = &nodes.grids[nodes.style(id).grid]
+  if template.rows.subgrid || template.columns.subgrid || !fixedTracks(template.rows.tracks.asSlice()) || !fixedTracks(template.columns.tracks.asSlice()) { return false }
+  if template.autoRows.length() != 0 && fixedTracks(template.autoRows.asSlice()) && template.autoColumns.length() != 0 && fixedTracks(template.autoColumns.asSlice()) { return true }
+  if template.rows.repeats.length() != 0 || template.columns.repeats.length() != 0 { return false }
+  match cache.gridMemos.bounds(id) {
+    Option<GridBounds>.Some { value } => {
+      return value.rowOrigin == 0 && value.columnOrigin == 0 && value.rows <= template.rows.tracks.length() && value.columns <= template.columns.tracks.length()
+    }
+    Option<GridBounds>.None => { return false }
+  }
+}
+fn fixedTracks(tracks: &[GridTrack]) -> bool {
+  let mut at: usize = 0
+  while at < tracks.length {
+    let track = &tracks[at]
+    if track.kind == GridTrackKind.FitContent || track.min.kind != GridBreadthKind.Length || track.max.kind != GridBreadthKind.Length { return false }
+    at = at + 1
+  }
+  return true
+}
+
 // Whether a box is absolutely positioned in its parent, a block or flex box,
 // in one piece.
 fn placedAlone(nodes: &BoxTree, id: usize) -> bool {
@@ -1837,7 +1865,10 @@ effect fn cutoffCandidates(tree: &Tree, since: usize, nodes: &BoxTree, output: &
         // An absolutely positioned box is placed after its parent's layout,
         // which reads none of it: by itself, from its size, insets and
         // margins, and laid out alone when only its padding or border changed.
-        if !(placedAlone(nodes, id) && tree.placedChangedAt(changes[at - 1]) <= since) {
+        // So is an item of a grid whose tracks are all fixed: the grid sizes
+        // no track by its items, so it reads only their styles' placement,
+        // margins, sizes and alignment, and their layouts.
+        if !((placedAlone(nodes, id) || fixedGrid(nodes, &output.cache, nodes.node(id).parent)) && tree.placedChangedAt(changes[at - 1]) <= since) {
           id = cutoffAncestor(nodes, changes, boxes.asSlice(), id)
           if id == NO_NODE { continue }
         }
@@ -1975,12 +2006,23 @@ const CUTOFF_MISSES: usize = 32
 // block or flex container that aligns nothing by baseline and the box sits
 // between in-flow siblings that have baselines of their own, which the
 // parent's first and last baselines would come from instead.
-fn baselinesMatter(nodes: &BoxTree, fragments: &FragmentArena, id: usize, fragment: usize) -> bool {
+fn baselinesMatter(nodes: &BoxTree, cache: &LayoutCache, fragments: &FragmentArena, id: usize, fragment: usize) -> bool {
   let parent = nodes.node(id).parent
   if parent == NO_NODE { return true }
   // An absolutely positioned box gives its parent no baseline.
   if placedAlone(nodes, id) { return false }
   let kind = nodes.node(parent).kind
+  if kind == BoxKind.Grid {
+    // Neither is an item that shares no baseline, off the edge rows.
+    let style = nodes.style(id)
+    let grid = nodes.style(parent)
+    let mut block = style.alignSelf
+    if block == Align.Auto { block = grid.alignItems }
+    let mut inline = style.justifySelf
+    if inline == Align.Auto { inline = grid.justifyItems }
+    return block == Align.Baseline || block == Align.LastBaseline || inline == Align.Baseline || inline == Align.LastBaseline
+      || !cache.gridMemos.innerRow(parent, id)
+  }
   if kind != BoxKind.Block && kind != BoxKind.Flex { return true }
   let parentStyle = nodes.style(parent)
   let style = nodes.style(id)
@@ -2000,15 +2042,26 @@ fn baselinesMatter(nodes: &BoxTree, fragments: &FragmentArena, id: usize, fragme
 // it is the same as before, or, for an unmoved or absolutely positioned box
 // of a block or flex parent, both lie inside the parent's padding box,
 // which the parent's overflow covers anyway (see overflowGeometry).
-fn overflowStays(nodes: &BoxTree, output: &LayoutTree, id: usize, overflow: Rect, previous: Rect, moved: Point, size: Size) -> bool {
+fn overflowStays(nodes: &BoxTree, output: &LayoutTree, cache: &LayoutCache, id: usize, overflow: Rect, previous: Rect, moved: Point, size: Size) -> bool {
   let layout = &output.boxes.asSlice()[id]
   if moved.x == 0.0 && moved.y == 0.0 && sameSize(size, layout.size) && sameOverflow(overflow, previous, layout.size) { return true }
   let parent = nodes.node(id).parent
   if parent == NO_NODE { return false }
   let kind = nodes.node(parent).kind
-  if kind != BoxKind.Block && kind != BoxKind.Flex { return false }
   let padding = output.boxes.asSlice()[parent].paddingRect()
   let location = Point { x: layout.location.x + moved.x, y: layout.location.y + moved.y }
+  if kind == BoxKind.Grid {
+    // A fixed grid's normal-flow overflow starts as its content box and
+    // takes in its items' margin boxes (see overflowGeometry).
+    if !fixedGrid(nodes, cache, parent) || !unmoved(nodes.style(id)) { return false }
+    let content = output.boxes.asSlice()[parent].contentRect()
+    let margin = layout.usedMargin
+    let before = Rect { x: layout.location.x, y: layout.location.y, width: layout.size.width, height: layout.size.height }
+    let now = Rect { x: location.x, y: location.y, width: size.width, height: size.height }
+    return within(overflow.translated(location), padding) && within(previous.translated(layout.location), padding)
+      && within(before, content) && within(now, content) && within(outset(before, margin), content) && within(outset(now, margin), content)
+  }
+  if kind != BoxKind.Block && kind != BoxKind.Flex { return false }
   if unmoved(nodes.style(id)) {
     return within(overflow.translated(location), padding) && within(previous.translated(layout.location), padding)
   }
@@ -2024,6 +2077,9 @@ fn overflowStays(nodes: &BoxTree, output: &LayoutTree, id: usize, overflow: Rect
 }
 fn within(rect: Rect, area: Rect) -> bool {
   return rect.x >= area.x && rect.y >= area.y && rect.x + rect.width <= area.x + area.width && rect.y + rect.height <= area.y + area.height
+}
+fn outset(rect: Rect, by: ResolvedEdges) -> Rect {
+  return Rect { x: rect.x - by.left, y: rect.y - by.top, width: rect.width + by.left + by.right, height: rect.height + by.top + by.bottom }
 }
 // Whether a rectangle that `area`, a union holding `padding`, took in as
 // `before` leaves it as it was as `now`: each side of `now` lies inside
@@ -2050,7 +2106,11 @@ fn sideStays(now: f32, before: f32, padding: f32, area: f32, counted: bool, was:
 // size. An axis of unchanged size keeps its position; on another, exactly
 // one inset must apply, so the box keeps that side (Position 3 §4.1) and
 // its alignment and static position play no part.
-fn relocation(nodes: &BoxTree, id: usize, old: Size, new: Size, moved: &mut Point) -> bool {
+fn relocation(nodes: &BoxTree, cache: &LayoutCache, id: usize, old: Size, new: Size, moved: &mut Point) -> bool {
+  moved.* = Point { x: 0.0, y: 0.0 }
+  if fixedGrid(nodes, cache, nodes.node(id).parent) {
+    return (old.width == new.width || gridStart(nodes, id, true)) && (old.height == new.height || gridStart(nodes, id, false))
+  }
   if !placedAlone(nodes, id) { return false }
   let inset = nodes.style(id).inset
   let left = inset.left.kind != DimensionKind.Auto
@@ -2063,6 +2123,25 @@ fn relocation(nodes: &BoxTree, id: usize, old: Size, new: Size, moved: &mut Poin
   if right { moved.x = old.width - new.width }
   if bottom { moved.y = old.height - new.height }
   return true
+}
+
+// Whether an item of a fixed grid keeps its place on an axis whatever its
+// size there: aligned to the start of its area, horizontal and left to
+// right, without automatic margins (Grid §11.1, Box Alignment §6).
+fn gridStart(nodes: &BoxTree, id: usize, horizontal: bool) -> bool {
+  let grid = nodes.style(nodes.node(id).parent)
+  let style = nodes.style(id)
+  if grid.writingMode != WritingMode.HorizontalTb || grid.usedDirection() != Direction.Ltr || style.writingMode != WritingMode.HorizontalTb || style.usedDirection() != Direction.Ltr { return false }
+  if horizontal {
+    if style.margin.left.kind == DimensionKind.Auto || style.margin.right.kind == DimensionKind.Auto { return false }
+    let mut align = style.justifySelf
+    if align == Align.Auto { align = grid.justifyItems }
+    return align == Align.Start || align == Align.FlexStart || align == Align.Left
+  }
+  if style.margin.top.kind == DimensionKind.Auto || style.margin.bottom.kind == DimensionKind.Auto { return false }
+  let mut align = style.alignSelf
+  if align == Align.Auto { align = grid.alignItems }
+  return align == Align.Start || align == Align.FlexStart
 }
 
 // Whether a box placed alone, without insets on an axis, keeps its static
@@ -2130,7 +2209,7 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
   pass.viewportFrees = Intrinsic.replace(facts.viewportFree, List<bool>.make())
   pass.keyShapes = Intrinsic.replace(facts.keyShapes, List<u16>.make())
   pass.itemFlags = Intrinsic.replace(facts.itemFlags, List<u8>.make())
-  let baselines = baselinesMatter(nodes, &output.fragments, id, range.start)
+  let baselines = baselinesMatter(nodes, &pass.cache, &output.fragments, id, range.start)
   let mut moved = Point { x: 0.0, y: 0.0 }
   let mut resized = false
   let mut at = first
@@ -2157,7 +2236,7 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
       // A box placed alone only moves with its size; its parent reads
       // nothing else of it.
       let size = output.boxes.asSlice()[id].size
-      if relocation(nodes, id, size, pass.boxes[id].size, &mut moved) {
+      if relocation(nodes, &pass.cache, id, size, pass.boxes[id].size, &mut moved) {
         pass.boxes[id].size = size
         let values = pass.fragments.values.asMutSlice()
         values[0].size = size
@@ -2167,8 +2246,8 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
     same = same
       && Layout.sameBesideOverflow(&pass.boxes[id], &output.boxes.asSlice()[id], baselines)
       && (resized || Fragment.sameBesideOverflow(&pass.fragments.values.asSlice()[0], &output.fragments.values.asSlice()[range.start], baselines))
-      && overflowStays(nodes, &output, id, pass.boxes[id].scrollableOverflow, output.boxes.asSlice()[id].scrollableOverflow, moved, newSize)
-      && overflowStays(nodes, &output, id, pass.fragments.values.asSlice()[0].scrollableOverflow, output.fragments.values.asSlice()[range.start].scrollableOverflow, moved, newSize)
+      && overflowStays(nodes, &output, &pass.cache, id, pass.boxes[id].scrollableOverflow, output.boxes.asSlice()[id].scrollableOverflow, moved, newSize)
+      && overflowStays(nodes, &output, &pass.cache, id, pass.fragments.values.asSlice()[0].scrollableOverflow, output.fragments.values.asSlice()[range.start].scrollableOverflow, moved, newSize)
     if resized {
       pass.boxes[id].size = newSize
       let values = pass.fragments.values.asMutSlice()
