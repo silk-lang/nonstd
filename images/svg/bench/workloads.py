@@ -167,6 +167,28 @@ def generate_paintservers(config):
     return {"paintservers.svg": svg(size, shapes)}
 
 
+def generate_compositing(config):
+    """Overlapping layers exercise all blend modes and nested isolation/opacity."""
+    size, grid = config["size"], config["grid"]
+    step = size // grid
+    modes = ("normal", "multiply", "screen", "overlay", "darken", "lighten",
+             "color-dodge", "color-burn", "hard-light", "soft-light", "difference",
+             "exclusion", "hue", "saturation", "color", "luminosity")
+    shapes = [f'<rect width="{size}" height="{size}" fill="#315579"/>']
+    for row in range(grid):
+        for column in range(grid):
+            mode = modes[(row * grid + column) % len(modes)]
+            left, top = column * step, row * step
+            shapes.append(
+                f'<g style="isolation:isolate" opacity="0.8">'
+                f'<rect x="{left}" y="{top}" width="{step}" height="{step}" fill="#cc6633"/>'
+                f'<g style="mix-blend-mode:{mode}">'
+                f'<rect x="{left + 2}" y="{top + 2}" width="{step}" height="{step}" fill="#3399cc"/>'
+                f'<circle cx="{left + step // 2}" cy="{top + step // 2}" r="{step // 3}" fill="#99cc55"/>'
+                '</g></g>')
+    return {"compositing.svg": svg(size, shapes)}
+
+
 def verify_asset(data, spec):
     if hashlib.sha256(data).hexdigest() != spec["sha256"]:
         raise ValueError("Tiger SHA-256 mismatch; refusing unpinned content")
@@ -188,7 +210,7 @@ def normalize_tiger(data, config):
 def prepare(manifest, cache, fetch_tiger=False, selected=None):
     cache = Path(cache)
     result = {}
-    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers}
+    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing}
     for name, spec in manifest["workloads"].items():
         if selected is not None and name not in selected:
             continue
