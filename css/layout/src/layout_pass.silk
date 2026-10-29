@@ -1,0 +1,845 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.usize
+import context { Input, ResolvedBox, resolveBox, overflowForAxis, scrollbarGutter }
+import geometry { Layout, Point, Rect, OptionalSize, AvailableSpace, AvailableKind, ScrollbarMetrics, ResolvedEdges, Size, max }
+import style { Style, Overflow, ScrollbarWidth }
+import tree { Node, NO_NODE, LayoutStats }
+import bfc { FloatBox }
+import box_tree { BoxTree }
+import fragments { Fragment, FragmentArena, FragmentKind, one }
+import fragmentation { ResumeStore, ResumeCheckpoint, StaticAnchor, Fragmentainers, Fragmentainer, FragmentAncestor, FragmentationError }
+import breaks { ForcedBreaks, PageSide, BreakKinds }
+import inline_prepared { PreparedInline, KeptText }
+
+import flex { FlexScratch }
+pub import layout_cache { REUSE_INDEPENDENT, REUSE_IN_FLOW, CacheKind }
+import layout_cache { LayoutCache, Snapshot, FinalRange, BoxWrites, Placement, REUSE_LEVEL }
+
+struct ScrollbarSelection { horizontal: bool, vertical: bool }
+impl Copy for ScrollbarSelection {}
+struct LineLimit { frame: usize, count: usize }
+impl Copy for LineLimit {}
+struct FrameScrollbarSelection { frame: usize, horizontal: bool, vertical: bool }
+impl Copy for FrameScrollbarSelection {}
+struct ScrollbarSnapshot {
+  id: usize, frame: usize, fragment: usize,
+  metrics: ScrollbarMetrics, gutter: ResolvedEdges,
+}
+impl Copy for ScrollbarSnapshot {}
+fn frameSelectionIndex(entries: &[FrameScrollbarSelection], frame: usize) -> usize {
+  let mut start: usize = 0
+  let mut end = entries.length
+  while start < end {
+    let middle = start + (end - start) / 2
+    if entries[middle].frame < frame { start = middle + 1 } else { end = middle }
+  }
+  return start
+}
+pub struct FullBoxGeometry {
+  pub parent: OptionalSize, pub known: OptionalSize, pub content: OptionalSize,
+  pub minimum: Size,
+  pub gridContext: usize,
+}
+impl Copy for FullBoxGeometry {}
+pub struct PassCheckpoint {
+  fragments: usize, resume: ResumeCheckpoint,
+  frame: usize, parentFragment: usize,
+  roots: usize, fullBoxes: usize, fullIndices: usize,
+  scrollbars: usize, gridGeometry: usize,
+}
+impl Copy for PassCheckpoint {}
+// Size-only results go to `cache`; compute lends it the LayoutTree's cache so
+// clean entries survive between computes (see LayoutCache).
+pub struct LayoutPass<'a, 'source> {
+  pub boxes: &'a mut [Layout],
+  pub fragments: &'a mut FragmentArena,
+  pub fragmentParent: usize,
+  pub frame: usize,
+  pub resumes: ResumeStore,
+  pub frames: Fragmentainers<'a>,
+  pub frameRoots: List<usize>,
+  pub frameOffsets: List<f32>,
+  fullBoxes: List<FullBoxGeometry>,
+  fullIndices: List<usize>,
+  pub inlinePrepared: List<List<PreparedInline<'source>>>,
+  lineLimits: List<LineLimit>,
+  pub cache: LayoutCache,
+  // The previous compute's normal-flow result, the one being captured, and
+  // which boxes head subtrees that may be copied (see reuseFinal).
+  pub previous: Snapshot, pub next: Snapshot, pub reusable: List<u8>,
+  // Floats beside the in-flow box being reused or recorded (see layoutInFlow).
+  pub floatContext: List<FloatBox>,
+  // Boxes whose subtree never reads the initial containing block or the
+  // scrollport limits (see Incremental.markSubtrees).
+  pub viewportFrees: List<bool>,
+  pub visits: List<usize>,
+  // Which boxes are out of flow, filled from visits by positionTree so
+  // treeOverflow need not read every box's style.
+  // One bit per box.
+  pub outOfFlowBoxes: List<u64>,
+  // The box fragments published with scrollable overflow outside their
+  // border box, possibly repeated or since rolled back (see treeOverflow).
+  pub overflowEscapes: List<usize>,
+  pub overflowMarks: List<u64>,
+  pub relativeOffsets: List<Point>,
+  // The containing block whose children input absoluteInput and used box
+  // absoluteBox hold, and its padding rectangle absoluteRect, while
+  // positionTree places its absolutely positioned boxes.
+  pub absoluteInputOwner: usize, pub absoluteInput: Input, pub absoluteBox: ResolvedBox, pub absoluteRect: Rect,
+  // Its non-fixed limits, and the scrollport of absoluteScrollParent's nearest
+  // scroll container (absoluteScrolled when there is one).
+  pub absoluteLimits: ResolvedEdges, pub absoluteLimitsSet: bool,
+  pub absoluteScrollParent: usize, pub absoluteScrolled: bool, pub absoluteScrollport: Size,
+  // Each box's parent; see BoxWrites.below.
+  pub parents: List<usize>,
+  pub keyShapes: List<u16>,
+  // Each box's ITEM_* flags, when keyShapes covers it.
+  pub itemFlags: List<u8>,
+  // Set when `boxes` holds the previous compute's layouts of the same boxes,
+  // which reused subtrees keep: the first write of a box saves its previous
+  // layout in `writes` (see touch).
+  pub inPlace: bool, pub writes: BoxWrites,
+  // Whether this compute can reuse kept results, which need the writes
+  // tracked below (see restoreBoxes); a compute after the cache was
+  // cleared cannot.
+  pub tracking: bool,
+  anchors: List<StaticAnchor>,
+  selections: List<ScrollbarSelection>,
+  frameSelections: List<List<FrameScrollbarSelection>>,
+  scrollbarSnapshots: List<ScrollbarSnapshot>,
+  pub hasAutoScrollbars: bool, pub needsRelayout: bool,
+  pub stats: LayoutStats,
+  // Spare item and line lists for flex passes, reused instead of allocated per pass.
+  pub flexScratch: List<FlexScratch>,
+}
+impl<'a, 'source> LayoutPass<'a, 'source> {
+  pub effect fn make(boxes: &'a mut [Layout], fragments: &'a mut FragmentArena, sources: &'source [Node]) -> LayoutPass<'a, 'source> ! OutOfMemoryError ? &mut Allocator {
+    // The paragraph cache may borrow text from these source nodes.
+    drop sources
+    return LayoutPass { boxes: move boxes, fragments: move fragments, fragmentParent: NO_NODE, frame: NO_NODE, resumes: ResumeStore.make(), frames: Fragmentainers.empty(), frameRoots: List<usize>.make(), frameOffsets: List<f32>.make(), fullBoxes: List<FullBoxGeometry>.make(), fullIndices: List<usize>.make(), inlinePrepared: List<List<PreparedInline<'source>>>.make(), lineLimits: List<LineLimit>.make(), cache: LayoutCache.make(), previous: Snapshot.make(), next: Snapshot.make(), reusable: List<u8>.make(), floatContext: List<FloatBox>.make(), viewportFrees: List<bool>.make(), visits: List<usize>.make(), outOfFlowBoxes: List<u64>.make(), overflowEscapes: List<usize>.make(), overflowMarks: List<u64>.make(), relativeOffsets: List<Point>.make(), absoluteInputOwner: NO_NODE, absoluteInput: Input.make(OptionalSize.definite(0.0, 0.0)), absoluteBox: resolveBox(&Style.make(), &Input.make(OptionalSize.definite(0.0, 0.0))), absoluteRect: Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, absoluteLimits: ResolvedEdges.zero(), absoluteLimitsSet: false, absoluteScrollParent: NO_NODE, absoluteScrolled: false, absoluteScrollport: Size.zero(), parents: List<usize>.make(), keyShapes: List<u16>.make(), itemFlags: List<u8>.make(), inPlace: false, writes: BoxWrites.make(), tracking: true, anchors: List<StaticAnchor>.make(), selections: List<ScrollbarSelection>.make(), frameSelections: List<List<FrameScrollbarSelection>>.make(), scrollbarSnapshots: List<ScrollbarSnapshot>.make(), hasAutoScrollbars: false, needsRelayout: false, stats: LayoutStats.zero(), flexScratch: List<FlexScratch>.make() }
+  }
+  pub effect fn beginFrame(self: &mut Self, frame: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.frame == NO_NODE { run self.resumes.prepare(self.boxes.length) }
+    self.frame = frame
+  }
+  pub effect fn ensureInlinePrepared(self: &mut Self) ! OutOfMemoryError ? &mut Allocator {
+    if self.inlinePrepared.length() == self.boxes.length { return }
+    run self.inlinePrepared.reserveExact(self.boxes.length)
+    while self.inlinePrepared.length() < self.boxes.length {
+      run self.inlinePrepared.append(List<PreparedInline<'source>>.make())
+    }
+  }
+  pub effect fn ensureFrameRoot(self: &mut Self, index: usize) -> usize ! OutOfMemoryError | FragmentationError ? &mut Allocator {
+    while self.frameRoots.length() <= index {
+      let current = self.frameRoots.length()
+      let frame = run self.requiredFrame(current)
+      let mut offset: f32 = 0.0
+      if current != 0 {
+        let previous = run self.requiredFrame(current - 1)
+        offset = self.frameOffsets.get(current - 1) + previous.blockExtent
+      }
+      run self.frameOffsets.append(offset)
+      let mut fragment = Fragment.make(0, NO_NODE, FragmentKind.Box)
+      fragment.fragmentainer = current
+      fragment.location = Point { x: frame.rect.x, y: frame.rect.y }
+      fragment.size.width = frame.rect.width
+      fragment.size.height = frame.rect.height
+      fragment.contentRect = Rect { x: 0.0, y: 0.0, width: frame.rect.width, height: frame.rect.height }
+      fragment.paddingRect = fragment.contentRect
+      fragment.layoutBounds = fragment.contentRect
+      fragment.scrollableOverflow = fragment.contentRect
+      fragment.decorationEdges = 0
+      fragment.nonpainting = true
+      let emitted = run self.fragments.append(fragment)
+      run self.frameRoots.append(emitted.index)
+    }
+    return self.frameRoots.get(index)
+  }
+  pub fn fullBox(self: &Self, id: usize) -> Option<FullBoxGeometry> {
+    if self.frame == NO_NODE { return Option<FullBoxGeometry>.None }
+    let index = self.resumes.get(id).fullGeometry
+    if index == NO_NODE { return Option<FullBoxGeometry>.None }
+    return Option<FullBoxGeometry>.Some { value: self.fullBoxes.get(index) }
+  }
+  pub fn fragmentFullBox(self: &Self, fragment: usize) -> Option<FullBoxGeometry> {
+    if fragment >= self.fullIndices.length() { return Option<FullBoxGeometry>.None }
+    let index = self.fullIndices.get(fragment)
+    if index == NO_NODE { return Option<FullBoxGeometry>.None }
+    return Option<FullBoxGeometry>.Some { value: self.fullBoxes.get(index) }
+  }
+  pub effect fn rememberFullBox(self: &mut Self, id: usize, geometry: FullBoxGeometry) ! OutOfMemoryError ? &mut Allocator {
+    let fragment = self.publication(id)
+    if fragment != NO_NODE { run self.rememberFragmentBox(id, fragment, geometry) }
+  }
+  pub effect fn rememberFragmentBox(self: &mut Self, id: usize, fragment: usize, geometry: FullBoxGeometry) ! OutOfMemoryError ? &mut Allocator {
+    while self.fullIndices.length() <= fragment { run self.fullIndices.append(NO_NODE) }
+    if self.fullIndices.get(fragment) != NO_NODE { return }
+    let index = self.fullBoxes.length()
+    run self.fullBoxes.append(geometry)
+    self.fullIndices.set(fragment, index)
+    let mut state = self.resumes.get(id)
+    if state.fullGeometry == NO_NODE {
+      state.fullGeometry = index
+      run self.resumes.set(id, state)
+    }
+  }
+  pub effect fn requiredFrame(self: &Self, index: usize) -> Fragmentainer ! FragmentationError {
+    return match self.frames.get(index) {
+      Option<Fragmentainer>.Some { value } => value
+      Option<Fragmentainer>.None => {
+        fail FragmentationError { frame: index, message: "Fragmentainer geometry exhausted before all flows completed" }
+      }
+    }
+  }
+  pub effect fn nextFrame(self: &Self, requested: ForcedBreaks) -> usize ! FragmentationError {
+    let forced = requested.active(self.frames.activeKinds())
+    let mut target = self.frames.depth()
+    if forced.all { target = 0 }
+    else {
+      let mut seen = BreakKinds.none()
+      let mut depth = self.frames.depth() + 1
+      while depth > 0 {
+        depth = depth - 1
+        let kind = self.frames.contextKind(depth)
+        if forced.kinds.contains(kind) && !seen.contains(kind) {
+          target = depth
+          seen.add(kind)
+        }
+      }
+    }
+    let current = match self.frames.ancestor(self.frame, target) {
+      Option<FragmentAncestor>.Some { value } => value
+      Option<FragmentAncestor>.None => { fail FragmentationError { frame: self.frame, message: "Missing current fragment ancestry" } }
+    }
+    let mut index = self.frame + 1
+    while true {
+      let next = run self.requiredFrame(index)
+      let ancestor = match self.frames.ancestor(index, target) {
+        Option<FragmentAncestor>.Some { value } => value
+        Option<FragmentAncestor>.None => { fail FragmentationError { frame: index, message: "Fragment ancestry exhausted before requested break" } }
+      }
+      if ancestor.index != current.index
+        && (!forced.kinds.page || forced.side == PageSide.Any || next.side == forced.side) { return index }
+      if index == usize.MAX { fail FragmentationError { frame: index, message: "Fragment index exhausted" } }
+      index = index + 1
+    }
+  }
+  pub effect fn defer(self: &mut Self, id: usize, forced: ForcedBreaks) ! OutOfMemoryError | FragmentationError ? &mut Allocator {
+    let mut state = self.resumes.get(id)
+    state.notBeforeFrame = run self.nextFrame(forced)
+    state.requested = forced
+    state.beforeHandled = true
+    run self.resumes.set(id, state)
+  }
+  pub fn lineLimit(self: &Self, id: usize) -> usize {
+    if self.lineLimits.length() == 0 { return NO_NODE }
+    let limit = self.lineLimits.get(id)
+    if limit.frame != self.frame { return NO_NODE }
+    return limit.count
+  }
+  // Backtracking constraints survive restoring speculative layout state.
+  // They address only their actual frame, never the widow lookahead frame.
+  pub effect fn limitLines(self: &mut Self, id: usize, count: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.lineLimits.length() == 0 {
+      run self.lineLimits.reserveExact(self.boxes.length)
+      let mut index: usize = 0
+      while index < self.boxes.length {
+        run self.lineLimits.append(LineLimit { frame: NO_NODE, count: NO_NODE })
+        index = index + 1
+      }
+    }
+    self.lineLimits.set(id, LineLimit { frame: self.frame, count: count })
+  }
+  pub effect fn enqueuePending(self: &mut Self, owner: usize, child: usize) ! OutOfMemoryError ? &mut Allocator {
+    let mut item = self.resumes.get(child)
+    if item.pendingOwner == owner { return }
+    let mut parent = self.resumes.get(owner)
+    if parent.pendingLast != NO_NODE {
+      let mut previous = self.resumes.get(parent.pendingLast)
+      previous.nextPending = child
+      run self.resumes.set(parent.pendingLast, previous)
+    } else { parent.pendingFirst = child }
+    parent.pendingLast = child
+    item.pendingOwner = owner
+    item.nextPending = NO_NODE
+    run self.resumes.set(child, item)
+    run self.resumes.set(owner, parent)
+  }
+  pub effect fn popPending(self: &mut Self, owner: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let mut parent = self.resumes.get(owner)
+    let child = parent.pendingFirst
+    if child == NO_NODE { return NO_NODE }
+    let mut item = self.resumes.get(child)
+    parent.pendingFirst = item.nextPending
+    if parent.pendingFirst == NO_NODE { parent.pendingLast = NO_NODE }
+    item.nextPending = NO_NODE
+    item.pendingOwner = NO_NODE
+    run self.resumes.set(child, item)
+    run self.resumes.set(owner, parent)
+    return child
+  }
+  pub fn fragment(self: &Self, id: usize, source: usize, kind: FragmentKind) -> Fragment {
+    let mut result = Fragment.make(id, source, kind)
+    if self.frame != NO_NODE { result.fragmentainer = self.frame }
+    return result
+  }
+  pub effect fn beginPublication(self: &mut Self, id: usize, fragment: usize, emissionStart: usize) ! OutOfMemoryError ? &mut Allocator {
+    let mut state = self.resumes.get(id)
+    state.fragmentainer = self.frame
+    state.fragment = fragment
+    state.emissionStart = emissionStart
+    run self.resumes.set(id, state)
+  }
+  pub effect fn firstLine(self: &mut Self, id: usize, fragment: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.resumes.publication(id, self.frame) != NO_NODE { return }
+    let mut state = self.resumes.get(id)
+    state.fragment = fragment
+    run self.resumes.set(id, state)
+  }
+  pub fn publication(self: &Self, id: usize) -> usize {
+    if self.frame == NO_NODE { return self.fragments.first(id) }
+    return self.resumes.publication(id, self.frame)
+  }
+  // Normal-flow fitting checkpoints cover append publication, source anchors,
+  // content cursors, final grid geometry and scalar measurement scratch. Positioning follows fitting.
+  pub fn checkpoint(self: &mut Self) -> PassCheckpoint {
+    return PassCheckpoint { fragments: self.fragments.checkpoint(), resume: self.resumes.checkpoint(), frame: self.frame, parentFragment: self.fragmentParent, roots: self.frameRoots.length(), fullBoxes: self.fullBoxes.length(), fullIndices: self.fullIndices.length(), scrollbars: self.scrollbarSnapshots.length(), gridGeometry: self.cache.gridGeometry.checkpoint() }
+  }
+  pub fn restoreCheckpoint(self: &mut Self, checkpoint: PassCheckpoint) {
+    self.fragments.rollback(checkpoint.fragments)
+    self.resumes.restore(checkpoint.resume, &mut self.boxes)
+    self.cache.gridGeometry.restore(checkpoint.gridGeometry)
+    self.frameRoots.truncate(checkpoint.roots)
+    self.frameOffsets.truncate(checkpoint.roots)
+    self.fullIndices.truncate(checkpoint.fullIndices)
+    self.fullBoxes.truncate(checkpoint.fullBoxes)
+    self.scrollbarSnapshots.truncate(checkpoint.scrollbars)
+    self.frame = checkpoint.frame
+    self.fragmentParent = checkpoint.parentFragment
+  }
+  pub fn closeCheckpoint(self: &mut Self, checkpoint: PassCheckpoint) { self.resumes.close(checkpoint.resume) }
+  pub fn replaceCheckpoint(self: &Self, previous: PassCheckpoint, replacement: PassCheckpoint) -> PassCheckpoint {
+    let mut result = replacement
+    result.resume = replacement.resume.replacing(previous.resume)
+    return result
+  }
+  pub effect fn preserveLayout(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    if self.frame != NO_NODE { run self.preserveFrameLayout(id) }
+  }
+  effect fn preserveFrameLayout(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.resumes.needsLayoutSnapshot(id) {
+      run self.resumes.rememberLayout(id, self.boxes[id])
+    }
+  }
+  // Intrinsic probes update scalar sizing state only. Fragment geometry belongs
+  // to accepted full-layout passes, not to cached or speculative measurements.
+  // Marks a box's ancestors as having a descendant written or laid out again.
+  fn markAncestors(self: &mut Self, id: usize) with Intrinsic.inlineAlways() {
+    if id >= self.parents.length() || id >= self.writes.below.length() { return }
+    let mut box = self.parents.get(id)
+    while box != NO_NODE && self.writes.below.get(box) != self.writes.generation {
+      self.writes.below.set(box, self.writes.generation)
+      box = self.parents.get(box)
+    }
+  }
+  // A box and its subtree are laid out again, emitting fragments: it loses
+  // its kept range until it records one.
+  pub effect fn relayout(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator {
+    run self.cache.beginLayout(id)
+    if self.tracking && id < self.writes.relaid.length() && self.writes.relaid.get(id) != self.writes.generation {
+      self.writes.relaid.set(id, self.writes.generation)
+      self.markAncestors(id)
+    }
+    run self.touch(id)
+  }
+  // A box's layout is written: in an in-place compute its previous layout is
+  // saved before its first write.
+  pub effect fn touch(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    if self.tracking || self.inPlace { run self.touchTracked(id) }
+  }
+  effect fn touchTracked(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.tracking && id < self.writes.written.length() && self.writes.written.get(id) != self.writes.generation {
+      self.writes.written.set(id, self.writes.generation)
+      self.markAncestors(id)
+    }
+    if !self.inPlace { return }
+    if self.writes.stamps.get(id) == self.writes.generation {
+      if self.writes.partial.get(id) == self.writes.generation { run self.savePlaced(id) }
+      return
+    }
+    run self.writes.saved.appendSlice(one<Layout>(&self.boxes[id]))
+    self.writes.stamps.set(id, self.writes.generation)
+    self.writes.slots.set(id, self.writes.saved.length() - 1)
+  }
+  // touch for a write of only the box's placement (see Placement): an
+  // in-place compute saves just that.
+  effect fn touchPlacement(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    if self.tracking || self.inPlace { run self.touchPlacementTracked(id) }
+  }
+  effect fn touchPlacementTracked(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.tracking && id < self.writes.written.length() && self.writes.written.get(id) != self.writes.generation {
+      self.writes.written.set(id, self.writes.generation)
+      self.markAncestors(id)
+    }
+    if !self.inPlace || self.writes.stamps.get(id) == self.writes.generation { return }
+    run self.writes.placed.append(Placement.of(&self.boxes[id]))
+    self.writes.stamps.set(id, self.writes.generation)
+    self.writes.partial.set(id, self.writes.generation)
+    self.writes.slots.set(id, self.writes.placed.length() - 1)
+  }
+  // A box saved by placement is about to be written whole: saves its whole
+  // previous layout.
+  effect fn savePlaced(self: &mut Self, id: usize) ! OutOfMemoryError ? &mut Allocator {
+    run self.writes.saved.appendSlice(one<Layout>(&self.boxes[id]))
+    let last = self.writes.saved.length() - 1
+    self.writes.placed.asSlice()[self.writes.slots.get(id)].restore(&mut self.writes.saved.asMutSlice()[last])
+    self.writes.partial.set(id, 0)
+    self.writes.slots.set(id, self.writes.saved.length() - 1)
+  }
+  // Puts back a rewritten box's previous layout, or, for `top`, its location.
+  fn restoreSaved(self: &mut Self, id: usize, top: bool) {
+    let slot = self.writes.slots.get(id)
+    if self.writes.partial.get(id) == self.writes.generation {
+      let placed = self.writes.placed.asSlice()[slot]
+      if top { self.boxes[id].location = placed.location } else { placed.restore(&mut self.boxes[id]) }
+      return
+    }
+    let saved = &self.writes.saved.asSlice()[slot]
+    if top { self.boxes[id].location = saved.location } else { self.boxes[id] = saved.* }
+  }
+  pub effect fn store(self: &mut Self, id: usize, value: &Layout, publish: bool) ! OutOfMemoryError ? &mut Allocator {
+    run self.preserveLayout(id)
+    run self.touch(id)
+    if publish {
+      let first = self.publication(id)
+      if first != NO_NODE {
+        let kind = self.fragments.values.asSlice()[first].kind
+        if kind == FragmentKind.Box {
+          let overflow = value.scrollableOverflow
+          // Other parents already hold their children's overflow (see
+          // overflowGeometry); the root's children's still has to reach it.
+          if self.fragments.values.asSlice()[first].parent == 0 && (overflow.x < 0.0 || overflow.y < 0.0 || overflow.x + overflow.width > value.size.width || overflow.y + overflow.height > value.size.height) { run self.overflowEscapes.append(first) }
+          run self.fragments.edit(first)
+          let fragments = self.fragments.values.asMutSlice()
+          fragments[first].location = value.location
+          fragments[first].size = value.size
+          fragments[first].contentRect = value.contentRect()
+          fragments[first].paddingRect = value.paddingRect()
+          // Signed outer sizes remain in usedMargin for layout arithmetic;
+          // an inverted margin interval contributes no rectangular area.
+          fragments[first].layoutBounds = Rect { x: -value.usedMargin.left, y: -value.usedMargin.top, width: max(0.0, value.size.width + value.usedMargin.horizontal()), height: max(0.0, value.size.height + value.usedMargin.vertical()) }
+          fragments[first].scrollableOverflow = value.scrollableOverflow
+          fragments[first].usedMargin = value.usedMargin
+          fragments[first].firstBaselines = value.firstBaselines
+          fragments[first].lastBaselines = value.lastBaselines
+          fragments[first].hasFirstBaseline = value.hasFirstBaseline
+          fragments[first].hasLastBaseline = value.hasLastBaseline
+        } else if kind == FragmentKind.Line {
+          let delta = Point { x: value.location.x - self.boxes[id].location.x, y: value.location.y - self.boxes[id].location.y }
+          if delta.x != 0.0 || delta.y != 0.0 {
+            let mut current = first
+            while current != NO_NODE {
+              run self.fragments.edit(current)
+              let fragments = self.fragments.values.asMutSlice()
+              if fragments[current].kind == FragmentKind.Line {
+                fragments[current].location.x = fragments[current].location.x + delta.x
+                fragments[current].location.y = fragments[current].location.y + delta.y
+              }
+              current = fragments[current].nextForBox
+            }
+          }
+        }
+      }
+    }
+    self.boxes[id] = value.*
+  }
+  pub fn staticAnchor(self: &Self, id: usize) -> StaticAnchor {
+    if self.frame != NO_NODE { return self.resumes.anchor(id) }
+    if self.anchors.length() == 0 {
+      return StaticAnchor.none()
+    }
+    return self.anchors.get(id)
+  }
+  pub effect fn setStaticAnchor(self: &mut Self, id: usize, parentFragment: usize, rect: Rect, inlineLevel: bool) ! OutOfMemoryError ? &mut Allocator {
+    let anchor = StaticAnchor { parentFragment: parentFragment, rect: rect, inlineLevel: inlineLevel, valid: true }
+    if self.frame != NO_NODE {
+      let mut state = self.resumes.get(id)
+      state.anchor = anchor
+      run self.resumes.set(id, state)
+      return
+    }
+    if self.anchors.length() == 0 {
+      run self.anchors.reserveExact(self.boxes.length)
+      let mut index: usize = 0
+      while index < self.boxes.length {
+        run self.anchors.append(StaticAnchor.none())
+        index = index + 1
+      }
+    }
+    self.anchors.set(id, anchor)
+  }
+  pub fn selected(self: &Self, id: usize, horizontal: bool) -> bool {
+    if self.frame != NO_NODE {
+      if self.frameSelections.length() == 0 { return false }
+      let entries = self.frameSelections.asSlice()[id].asSlice()
+      let index = frameSelectionIndex(entries, self.frame)
+      if index == entries.length || entries[index].frame != self.frame { return false }
+      if horizontal { return entries[index].horizontal }
+      return entries[index].vertical
+    }
+    if self.selections.length() == 0 { return false }
+    let selection = self.selections.get(id)
+    if horizontal { return selection.horizontal }
+    return selection.vertical
+  }
+  pub effect fn rememberScrollbars(self: &mut Self, id: usize, metrics: ScrollbarMetrics, gutter: ResolvedEdges) ! OutOfMemoryError ? &mut Allocator {
+    let fragment = self.publication(id)
+    run self.scrollbarSnapshots.append(ScrollbarSnapshot { id: id, frame: self.frame, fragment: fragment, metrics: metrics, gutter: gutter })
+  }
+  effect fn selectFrameScrollbars(self: &mut Self, nodes: &BoxTree) ! OutOfMemoryError ? &mut Allocator {
+    if self.frameSelections.length() == 0 {
+      run self.frameSelections.reserveExact(self.boxes.length)
+      let mut id: usize = 0
+      while id < self.boxes.length {
+        run self.frameSelections.append(List<FrameScrollbarSelection>.make())
+        id = id + 1
+      }
+    }
+    let mut index: usize = 0
+    while index < self.scrollbarSnapshots.length() {
+      let snapshot = self.scrollbarSnapshots.get(index)
+      let style = nodes.style(snapshot.id)
+      let fragment = self.fragments.values.get(snapshot.fragment)
+      let port = fragment.paddingRect
+      let overflow = fragment.scrollableOverflow
+      let entries = &mut self.frameSelections.asMutSlice()[snapshot.id]
+      let selected = frameSelectionIndex(entries.asSlice(), snapshot.frame)
+      let mut value = FrameScrollbarSelection { frame: snapshot.frame, horizontal: false, vertical: false }
+      let exists = selected < entries.length() && entries.get(selected).frame == snapshot.frame
+      if exists { value = entries.get(selected) }
+      value.horizontal = value.horizontal || overflowForAxis(style, true) == Overflow.Scroll || (overflowForAxis(style, true) == Overflow.Auto && (overflow.x < port.x || overflow.x + overflow.width > port.x + port.width))
+      value.vertical = value.vertical || overflowForAxis(style, false) == Overflow.Scroll || (overflowForAxis(style, false) == Overflow.Auto && (overflow.y < port.y || overflow.y + overflow.height > port.y + port.height))
+      let gutter = scrollbarGutter(style, snapshot.metrics, value.horizontal, value.vertical)
+      self.needsRelayout = self.needsRelayout || gutter.top != snapshot.gutter.top || gutter.right != snapshot.gutter.right || gutter.bottom != snapshot.gutter.bottom || gutter.left != snapshot.gutter.left
+      if exists {
+        entries.set(selected, value)
+      } else {
+        run entries.append(value)
+        let mut cursor = entries.length() - 1
+        while cursor > selected {
+          let previous = entries.get(cursor - 1)
+          entries.set(cursor, previous)
+          cursor = cursor - 1
+        }
+        entries.set(selected, value)
+      }
+      if self.resumes.get(snapshot.id).fragment == snapshot.fragment {
+        self.boxes[snapshot.id].horizontalScrollbar = value.horizontal
+        self.boxes[snapshot.id].verticalScrollbar = value.vertical
+      }
+      index = index + 1
+    }
+  }
+  // Called after full unscrolled overflow, including absolute descendants.
+  // Selection only adds bars within a compute, so convergence is bounded by
+  // two additions per generated box, not an arbitrary retry count.
+  pub effect fn selectScrollbars(self: &mut Self, nodes: &BoxTree) ! OutOfMemoryError ? &mut Allocator {
+    if !self.hasAutoScrollbars { return }
+    if self.frame != NO_NODE {
+      run self.selectFrameScrollbars(nodes)
+      return
+    }
+    let mut id: usize = 0
+    while id < nodes.boxes.length() {
+      let layout = self.boxes[id]
+      let style = nodes.style(id)
+      if layout.hasBox() && layout.acceptsScrollbars() && style.scrollbarWidth != ScrollbarWidth.None {
+        let port = layout.paddingRect()
+        let overflow = layout.scrollableOverflow
+        let horizontal = layout.horizontalScrollbar || (overflowForAxis(style, true) == Overflow.Auto && (overflow.x < port.x || overflow.x + overflow.width > port.x + port.width))
+        let vertical = layout.verticalScrollbar || (overflowForAxis(style, false) == Overflow.Auto && (overflow.y < port.y || overflow.y + overflow.height > port.y + port.height))
+        if horizontal != layout.horizontalScrollbar || vertical != layout.verticalScrollbar {
+          let gutter = scrollbarGutter(style, layout.getScrollbarMetrics(), horizontal, vertical)
+          let previous = layout.scrollbarGutter
+          self.needsRelayout = self.needsRelayout || gutter.top != previous.top || gutter.right != previous.right || gutter.bottom != previous.bottom || gutter.left != previous.left
+          self.boxes[id].horizontalScrollbar = horizontal
+          self.boxes[id].verticalScrollbar = vertical
+        }
+      }
+      id = id + 1
+    }
+    if !self.needsRelayout { return }
+    if self.selections.length() == 0 {
+      run self.selections.reserveExact(nodes.boxes.length())
+      id = 0
+      while id < nodes.boxes.length() {
+        run self.selections.append(ScrollbarSelection { horizontal: false, vertical: false })
+        id = id + 1
+      }
+    }
+    id = 0
+    while id < nodes.boxes.length() {
+      self.selections.set(id, ScrollbarSelection { horizontal: self.boxes[id].horizontalScrollbar, vertical: self.boxes[id].verticalScrollbar })
+      id = id + 1
+    }
+  }
+  // Hands every paragraph prepared in this compute to the cache.
+  pub effect fn keepTexts(self: &mut Self) ! OutOfMemoryError ? &mut Allocator {
+    let mut id: usize = 0
+    while id < self.inlinePrepared.length() {
+      match self.inlinePrepared.asMutSlice()[id].pop() {
+        Option<PreparedInline<'source>>.Some { value } => {
+          run self.cache.keepText(id, KeptText { analysis: move value.analysis, offered: move value.offered, visual: move value.visual, barriers: move value.barriers, memo: move value.memo })
+        }
+        Option<PreparedInline<'source>>.None => {}
+      }
+      id = id + 1
+    }
+  }
+  pub fn restart(self: &mut Self) {
+    self.fragments.rollback(0)
+    self.fragments.restartFlow()
+    self.fragmentParent = NO_NODE
+    if self.frame != NO_NODE { self.resumes.reset() }
+    self.frameRoots.clear()
+    self.frameOffsets.clear()
+    self.fullIndices.clear()
+    self.fullBoxes.clear()
+    self.scrollbarSnapshots.clear()
+    self.lineLimits.clear()
+    self.anchors.clear()
+    // Entries computed before scrollbar selection changed are stale.
+    self.cache.clear()
+    let mut id: usize = 0
+    // The previous compute's layouts are gone, and with the cache nothing is reused.
+    self.inPlace = false
+    while id < self.boxes.length {
+      self.boxes[id] = Layout.zero()
+      id = id + 1
+    }
+    self.needsRelayout = false
+    self.hasAutoScrollbars = false
+  }
+  // Records the full layout of a reusable box that just emitted fragments
+  // [start, current end), if its own fragment opens the range.
+  // `beside` says the box was laid out beside the floats in floatContext.
+  pub effect fn recordFinal(self: &mut Self, id: usize, input: &Input, layout: &Layout, start: usize, beside: bool) ! OutOfMemoryError ? &mut Allocator {
+    if !self.cache.recording() { return }
+    let end = self.fragments.checkpoint()
+    if start >= end || self.fragments.first(id) != start { return }
+    let fragment = &self.fragments.values.asSlice()[start]
+    if fragment.box != id || fragment.kind != FragmentKind.Box { return }
+    if beside { run self.cache.recordFinal(id, input, layout, start, end, self.floatContext.asSlice(), true) }
+    else { run self.cache.recordFinal(id, input, layout, start, end, &[], false) }
+  }
+  // Restores the box records of a copied subtree's descendants and carries
+  // their kept ranges forward, moved to where the copy put their fragments.
+  // A subtree `kept` where it was (see FragmentArena.keepRange) needs only
+  // what this compute rewrote before keeping it restored: the boxes it
+  // wrote, and the whole subtrees it laid out again.
+  // `top` is the reused box itself, whose layout the caller stores anew:
+  // only its location, which store reads, is restored.
+  effect fn restoreBoxes(self: &mut Self, nodes: &BoxTree, id: usize, from: FinalRange, base: usize, kept: bool, top: bool) ! OutOfMemoryError ? &mut Allocator {
+    if kept && id < self.writes.relaid.length() && self.writes.relaid.get(id) != self.writes.generation {
+      let generation = self.writes.generation
+      if self.writes.written.get(id) == generation {
+        if self.writes.stamps.get(id) == generation { self.restoreSaved(id, top) }
+        self.cache.keepRange(id)
+      }
+      if self.writes.below.get(id) != generation { return }
+      let mut child = nodes.node(id).firstChild
+      while child != NO_NODE {
+        if self.writes.below.get(child) == generation || self.writes.written.get(child) == generation || self.writes.relaid.get(child) == generation {
+          run self.restoreBoxes(nodes, child, from, base, kept, false)
+        }
+        child = nodes.node(child).nextSibling
+      }
+      return
+    }
+    if !self.inPlace {
+      let previous = &self.previous.boxes.asSlice()[id]
+      if top { self.boxes[id].location = previous.location } else { self.boxes[id] = previous.* }
+    } else if self.writes.stamps.get(id) == self.writes.generation {
+      self.restoreSaved(id, top)
+    }
+    if kept {
+      self.fragments.keepBox(id, from.start, from.end)
+      self.cache.keepRange(id)
+    }
+    let mut child = nodes.node(id).firstChild
+    while child != NO_NODE {
+      if !kept {
+        let range = self.cache.keptRange(child)
+        if range.valid && range.start > from.start && range.end <= from.end {
+          run self.cache.carryFinal(child, range, range.start - from.start + base, range.end - from.start + base)
+        } else { run self.cache.beginLayout(child) }
+      }
+      run self.restoreBoxes(nodes, child, from, base, kept, false)
+      child = nodes.node(child).nextSibling
+    }
+  }
+  // Blink LayoutNG / Servo style result reuse: a clean box laid out with the
+  // same request as in the previous compute gets a copy of that compute's
+  // fragments and box records instead of a layout. `level` says which kind
+  // of subtree the caller can take (see Incremental.markSubtrees). Returns
+  // whether it did; the reused layout is then in boxes[id].
+  pub effect fn reuseFinal(self: &mut Self, nodes: &BoxTree, id: usize, input: &Input, level: u8, beside: bool) -> bool ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    // Without tracking, the compute follows a cache clear: nothing is kept.
+    if !self.tracking || self.frame != NO_NODE { return false }
+    return run self.reuseKept(nodes, id, input, level, beside)
+  }
+  effect fn reuseKept(self: &mut Self, nodes: &BoxTree, id: usize, input: &Input, level: u8, beside: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if id >= self.reusable.length() || (self.reusable.get(id) & REUSE_LEVEL) < level { return false }
+    let mut slot = self.cache.keptRange(id)
+    if !slot.valid || !LayoutCache.sameRequest(&self.cache.result(id).input, input) { return false }
+    if beside && !self.cache.sameFloats(slot, self.floatContext.asSlice()) { return false }
+    if !self.inPlace && id >= self.previous.boxes.length() { return false }
+    if !beside && slot.floatCount != 0 { return false }
+    let base = self.fragments.checkpoint()
+    let mut kept = false
+    if self.fragments.viewsPrevious() {
+      // The previous output is this arena's own, kept where it was when the
+      // range is still at the write position.
+      if !self.fragments.previousWhole() || slot.end > self.fragments.previousLength() || id >= self.fragments.boxCount() || self.fragments.previousFirst(id) != slot.start { return false }
+      // Else moved there first, with the rest of the previous output.
+      if slot.start != base && !self.fragments.canKeep(slot.start, slot.end) {
+        let shift = run self.fragments.shiftPrevious(slot.start)
+        if shift.by != 0 {
+          self.cache.shiftRanges(shift)
+          slot = self.cache.keptRange(id)
+        }
+      }
+      if self.fragments.canKeep(slot.start, slot.end) {
+        run self.fragments.keepRange(slot.start, slot.end, self.fragmentParent)
+        kept = true
+      } else if !run self.fragments.copyPrevious(slot.start, slot.end, self.fragmentParent) { return false }
+    } else {
+      if slot.end > self.previous.fragments.values.length() || id >= self.previous.fragments.boxCount() || self.previous.fragments.first(id) != slot.start || (!self.inPlace && self.previous.boxes.length() != self.boxes.length) { return false }
+      // Positioning appends after normal flow; no copied link may reach it.
+      if !run self.fragments.appendRange(&self.previous.fragments, slot.start, slot.end, self.fragmentParent) { return false }
+    }
+    // A box kept in place and not written yet this compute still holds its
+    // previous final layout, which differs from the recorded one only in what
+    // its parent's placement wrote.
+    let untouched = kept && self.inPlace && self.writes.stamps.get(id) != self.writes.generation
+    // A box kept in place that this compute neither wrote nor reached below
+    // has nothing to restore.
+    let generation = self.writes.generation
+    if !kept || id >= self.writes.relaid.length() || self.writes.relaid.asSlice()[id] == generation || self.writes.written.asSlice()[id] == generation || self.writes.below.asSlice()[id] == generation {
+      run self.restoreBoxes(nodes, id, slot, base, kept, true)
+    }
+    if untouched {
+      let record = self.cache.result(id)
+      let overflow = record.scrollableOverflow
+      let horizontal = record.horizontalScrollbar
+      let vertical = record.verticalScrollbar
+      // Its fragment and box, kept where they were, still hold its last
+      // placement; the parent writes and publishes the new one when it
+      // places the box.
+      self.boxes[id].scrollableOverflow = overflow
+      self.boxes[id].horizontalScrollbar = horizontal
+      self.boxes[id].verticalScrollbar = vertical
+    } else {
+      let layout = self.cache.result(id).layout(self.keptLayout(id))
+      run self.store(id, &layout, true)
+    }
+    run self.cache.carryFinal(id, slot, base, self.fragments.checkpoint())
+    self.stats.reusedLayouts = self.stats.reusedLayouts + 1
+    return true
+  }
+  // The box's layout at the end of the previous compute, but for its
+  // placement (see Placement), which FinalResult.layout replaces.
+  fn keptLayout(self: &Self, id: usize) -> &Layout {
+    if !self.inPlace { return &self.previous.boxes.asSlice()[id] }
+    if self.writes.stamps.get(id) == self.writes.generation && self.writes.partial.get(id) != self.writes.generation { return &self.writes.saved.asSlice()[self.writes.slots.get(id)] }
+    return &self.boxes[id]
+  }
+  // `store` for a box whose layout from this compute is already stored, after
+  // its parent placed it: only its location, used margins and clearance change,
+  // so they are written in place rather than copying the whole layout again.
+  pub effect fn place(self: &mut Self, id: usize, location: Point, usedMargin: ResolvedEdges, hasClearance: bool, publish: bool) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    run self.preserveLayout(id)
+    run self.touchPlacement(id)
+    if publish {
+      let first = self.publication(id)
+      if first != NO_NODE {
+        let kind = self.fragments.values.asSlice()[first].kind
+        if kind == FragmentKind.Box {
+          run self.fragments.editPosition(first)
+          let size = self.boxes[id].size
+          let fragments = self.fragments.values.asMutSlice()
+          fragments[first].location = location
+          fragments[first].layoutBounds = Rect { x: -usedMargin.left, y: -usedMargin.top, width: max(0.0, size.width + usedMargin.horizontal()), height: max(0.0, size.height + usedMargin.vertical()) }
+          fragments[first].usedMargin = usedMargin
+        } else if kind == FragmentKind.Line {
+          let delta = Point { x: location.x - self.boxes[id].location.x, y: location.y - self.boxes[id].location.y }
+          if delta.x != 0.0 || delta.y != 0.0 {
+            let mut current = first
+            while current != NO_NODE {
+              run self.fragments.edit(current)
+              let fragments = self.fragments.values.asMutSlice()
+              if fragments[current].kind == FragmentKind.Line {
+                fragments[current].location.x = fragments[current].location.x + delta.x
+                fragments[current].location.y = fragments[current].location.y + delta.y
+              }
+              current = fragments[current].nextForBox
+            }
+          }
+        }
+      }
+    }
+    self.boxes[id].location = location
+    self.boxes[id].usedMargin = usedMargin
+    self.boxes[id].hasClearance = hasClearance
+  }
+  // cacheKey's style facts for the box; without them (passes built by hand)
+  // the key keeps the full request.
+  pub fn keyShape(self: &Self, id: usize) -> u16 {
+    if id < self.keyShapes.length() { return self.keyShapes.get(id) }
+    return 1
+  }
+  pub fn viewportFree(self: &Self, id: usize) -> bool { return id < self.viewportFrees.length() && self.viewportFrees.get(id) }
+  pub fn lookup(self: &mut Self, id: usize, input: &Input, kind: CacheKind) -> Option<Layout> {
+    return self.cache.lookup(id, input, kind)
+  }
+  pub fn lookupSize(self: &mut Self, id: usize, input: &Input, kind: CacheKind) -> Option<Size> {
+    let index = self.cache.find(id, input, kind)
+    if index == usize.MAX { return Option<Size>.None }
+    return Option<Size>.Some { value: self.cache.layoutAt(index).size }
+  }
+  // Stores a cached intrinsic result (see store) straight from its cache entry
+  // and returns it, if the cache has one for this request.
+  pub effect fn storeCached(self: &mut Self, id: usize, input: &Input, kind: CacheKind) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let index = self.cache.find(id, input, kind)
+    if index == usize.MAX { return false }
+    run self.preserveLayout(id)
+    run self.touch(id)
+    self.boxes[id] = self.cache.layoutAt(index).*
+    self.stats.cacheHits = self.stats.cacheHits + 1
+    return true
+  }
+  // The cache entry answering a size probe of the box, or usize.MAX. A hit is
+  // read in place with `probed`, leaving boxes[id] as it was.
+  pub fn findProbe(self: &mut Self, id: usize, input: &Input, kind: CacheKind) -> usize {
+    let index = self.cache.find(id, input, kind)
+    if index != usize.MAX { self.stats.cacheHits = self.stats.cacheHits + 1 }
+    return index
+  }
+  // A probe's result: the cache entry `index` from findProbe, else the layout
+  // a fresh probe stored.
+  pub fn probed(self: &Self, id: usize, index: usize) -> &Layout {
+    if index == usize.MAX { return &self.boxes[id] }
+    return self.cache.layoutAt(index)
+  }
+  // Caches the layout last stored for the box.
+  pub effect fn rememberStored(self: &mut Self, id: usize, input: &Input, kind: CacheKind) ! OutOfMemoryError ? &mut Allocator {
+    run self.cache.remember(id, input, kind, &self.boxes[id])
+  }
+  pub effect fn remember(self: &mut Self, id: usize, input: &Input, kind: CacheKind, layout: &Layout) ! OutOfMemoryError ? &mut Allocator {
+    run self.cache.remember(id, input, kind, layout)
+  }
+}

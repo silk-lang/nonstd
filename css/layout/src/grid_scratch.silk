@@ -1,0 +1,219 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.num.usize
+import grid_placement { GridItem, GridBounds, PlacementScratch }
+import grid_tracks { TrackState, TrackContribution }
+import grid_lines { LineNames }
+import grid_template { ExpandedAxis }
+import grid_baselines { GridBaselines }
+import grid_fragment_scratch { GridFragmentScratch }
+import grid_style { GridArea }
+import grid_subgrid { SubgridPool }
+
+pub struct GridAxisScratch {
+  pub tracks: List<TrackState>,
+  pub contributions: List<TrackContribution>,
+  pub inherited: List<TrackState>,
+  pub members: List<GridItem>,
+}
+
+impl GridAxisScratch {
+  pub fn make() -> GridAxisScratch {
+    return GridAxisScratch {
+      tracks: List<TrackState>.make(),
+      contributions: List<TrackContribution>.make(),
+      inherited: List<TrackState>.make(),
+      members: List<GridItem>.make(),
+    }
+  }
+
+  pub fn clear(self: &mut Self) {
+    self.tracks.clear()
+    self.contributions.clear()
+    self.inherited.clear()
+    self.members.clear()
+  }
+}
+
+pub struct GridTemplateScratch {
+  pub columns: ExpandedAxis,
+  pub rows: ExpandedAxis,
+  pub columnNames: LineNames,
+  pub rowNames: LineNames,
+  pub collapsedColumns: List<usize>,
+  pub collapsedRows: List<usize>,
+  pub columnRepeat: usize,
+  pub rowRepeat: usize,
+  pub context: usize,
+  pub areas: List<GridArea>,
+  pub areaMasks: List<usize>,
+}
+
+impl GridTemplateScratch {
+  pub fn make() -> GridTemplateScratch {
+    return GridTemplateScratch {
+      columns: ExpandedAxis.make(),
+      rows: ExpandedAxis.make(),
+      columnNames: LineNames.make(),
+      rowNames: LineNames.make(),
+      collapsedColumns: List<usize>.make(),
+      collapsedRows: List<usize>.make(),
+      columnRepeat: 0,
+      rowRepeat: 0,
+      context: 0,
+      areas: List<GridArea>.make(),
+      areaMasks: List<usize>.make(),
+    }
+  }
+}
+
+// Placement survives computes while its box identity and styles remain valid.
+// Track sizes are request-dependent and initialized again before each sizing pass.
+pub struct GridScratch {
+  pub items: List<GridItem>,
+  pub bounds: GridBounds,
+  pub placement: PlacementScratch,
+  pub columns: GridAxisScratch,
+  pub rows: GridAxisScratch,
+  pub trackWork: List<usize>,
+  // Lazy zero-or-one payload: ordinary numeric grids need no expanded-template
+  // vectors, and leases do not move all those empty vectors on every probe.
+  pub template: List<GridTemplateScratch>,
+  pub baselines: List<GridBaselines>,
+  pub columnGap: f32,
+  pub rowGap: f32,
+}
+
+impl GridScratch {
+  pub fn make() -> GridScratch {
+    return GridScratch {
+      items: List<GridItem>.make(),
+      bounds: GridBounds.empty(),
+      placement: PlacementScratch.make(),
+      columns: GridAxisScratch.make(),
+      rows: GridAxisScratch.make(),
+      trackWork: List<usize>.make(),
+      template: List<GridTemplateScratch>.make(),
+      baselines: List<GridBaselines>.make(),
+      columnGap: 0.0,
+      rowGap: 0.0,
+    }
+  }
+}
+
+// Moving the list out lets recursive child layout borrow the pool independently.
+// A box must return its lease before taking that same box again.
+pub struct GridLease {
+  pub fresh: bool,
+  pub value: GridScratch,
+  slot: usize
+}
+
+struct GridMemoSlot {
+  valid: bool,
+  value: GridScratch,
+}
+
+// Cache-owned placement and pooled sizing storage share one lease: retaining
+// placement must not copy item lists or add a second set of scratch allocations.
+pub struct GridMemos {
+  index: List<usize>,
+  slots: List<GridMemoSlot>,
+  used: usize,
+  // A recursion-depth pool, separate from ordinary per-box sizing leases.
+  // Continuous layout neither allocates nor moves fragment-item vectors.
+  pub fragmentScratch: List<GridFragmentScratch>,
+}
+
+impl GridMemos {
+  pub fn make() -> GridMemos {
+    return GridMemos {
+      index: List<usize>.make(),
+      slots: List<GridMemoSlot>.make(),
+      used: 0,
+      fragmentScratch: List<GridFragmentScratch>.make(),
+    }
+  }
+
+  // A fresh cache or remapped box identity invalidates placement, not capacity.
+  pub fn clear(self: &mut Self) {
+    self.index.clear()
+    self.used = 0
+    let values = self.fragmentScratch.asMutSlice()
+    let mut at: usize = 0
+    while at < values.length {
+      let items = values[at].items.asMutSlice()
+      let mut item: usize = 0
+      while item < items.length { items[item].gridContext = 0
+        item = item + 1 }
+      at = at + 1
+    }
+  }
+
+  pub fn markContexts(self: &Self, pool: &mut SubgridPool) {
+    let mut at: usize = 0
+    while at < self.used {
+      let template = self.slots.asSlice()[at].value.template.asSlice()
+      if template.length != 0 { pool.mark(template[0].context) }
+      at = at + 1
+    }
+    at = 0
+    while at < self.fragmentScratch.length() {
+      let items = self.fragmentScratch.asSlice()[at].items.asSlice()
+      let mut item: usize = 0
+      while item < items.length { pool.mark(items[item].gridContext)
+        item = item + 1 }
+      at = at + 1
+    }
+  }
+
+  pub fn dropBox(self: &mut Self, id: usize) {
+    if id >= self.index.length() {
+      return
+    }
+    let slot = self.index.get(id)
+    if slot != usize.MAX {
+      let slots = self.slots.asMutSlice()
+      slots[slot].valid = false
+    }
+  }
+
+  pub effect fn take(self: &mut Self, boxId: usize, boxCount: usize) -> GridLease
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.index.length() < boxCount {
+      let additional = boxCount - self.index.length()
+      run self.index.appendRepeated(usize.MAX, additional)
+    }
+    let mut slot = self.index.get(boxId)
+    let mut fresh = slot == usize.MAX
+    if fresh {
+      slot = self.used
+      if slot == self.slots.length() {
+        run self.slots.append(GridMemoSlot { valid: false, value: GridScratch.make() })
+      }
+      self.used = self.used + 1
+      self.index.set(boxId, slot)
+    }
+    let slots = self.slots.asMutSlice()
+    fresh = fresh || !slots[slot].valid
+
+    // An abandoned lease cannot leave an empty slot marked as prepared.
+    slots[slot].valid = false
+    let mut value = Intrinsic.replace(slots[slot].value, GridScratch.make())
+    if fresh {
+      value.items.clear()
+      value.bounds = GridBounds.empty()
+      value.columns.clear()
+      value.rows.clear()
+    }
+    return GridLease { fresh: fresh, value: move value, slot: slot }
+  }
+
+  pub fn put(self: &mut Self, lease: GridLease) {
+    let slots = self.slots.asMutSlice()
+    let slot = lease.slot
+    slots[slot].value = move lease.value
+    slots[slot].valid = true
+  }
+}

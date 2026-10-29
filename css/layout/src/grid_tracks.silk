@@ -1,0 +1,927 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.num.i32
+import silk.num.usize
+import context { UNBOUNDED }
+import geometry { AvailableKind, AvailableSpace, max, min }
+import grid_style { GridBreadth, GridBreadthKind, GridTrack, GridTrackKind }
+
+// CSS Grid 2 §12.3–12.8. All scratch lives on the tracks or in the caller's
+// reusable index list; sizing neither measures items nor allocates per item.
+pub struct TrackState {
+  pub base: f32,
+  pub position: f32,
+  pub growthLimit: f32,
+  pub factor: f32,
+  pub cap: f32,
+  pub minimum: GridBreadthKind,
+  pub maximum: GridBreadthKind,
+  pub fitContent: bool,
+  pub collapsed: bool,
+  planned: f32,
+  incurred: f32,
+  frozen: bool,
+  infinitelyGrowable: bool,
+}
+
+impl Copy for TrackState {}
+
+impl TrackState {
+  pub fn fixed(size: f32) -> TrackState {
+    return TrackState {
+      base: max(0.0, size),
+      position: 0.0,
+      growthLimit: max(0.0, size),
+      factor: 0.0,
+      cap: max(0.0, size),
+      minimum: GridBreadthKind.Length,
+      maximum: GridBreadthKind.Length,
+      fitContent: false,
+      collapsed: false,
+      planned: 0.0,
+      incurred: 0.0,
+      frozen: false,
+      infinitelyGrowable: false,
+    }
+  }
+
+  pub fn flexible(minimum: f32, factor: f32) -> TrackState {
+    let mut result = TrackState.fixed(minimum)
+    result.minimum = GridBreadthKind.Auto
+    result.maximum = GridBreadthKind.Flex
+    result.growthLimit = UNBOUNDED
+    result.cap = UNBOUNDED
+    result.factor = max(0.0, factor)
+    return result
+  }
+}
+
+pub struct TrackContribution {
+  pub start: usize,
+  pub end: usize,
+  pub minimum: f32,
+  pub minContent: f32,
+  pub maxContent: f32,
+}
+
+impl Copy for TrackContribution {}
+
+impl TrackContribution {
+  pub fn make(
+    start: usize,
+    end: usize,
+    minimum: f32,
+    minContent: f32,
+    maxContent: f32,
+  ) -> TrackContribution {
+    return TrackContribution {
+      start: start,
+      end: end,
+      minimum: minimum,
+      minContent: minContent,
+      maxContent: maxContent,
+    }
+  }
+}
+
+fn normalized(value: GridBreadth, definite: bool) -> GridBreadthKind {
+  if value.kind == GridBreadthKind.Percent || value.kind == GridBreadthKind.Calc {
+    if definite {
+      return GridBreadthKind.Length
+    }
+    return GridBreadthKind.Auto
+  }
+  return value.kind
+}
+
+fn initialize(track: &GridTrack, basis: f32, definite: bool) -> TrackState {
+  let mut result = TrackState.fixed(0.0)
+  result.minimum = normalized(track.min, definite)
+  result.maximum = normalized(track.max, definite)
+  result.cap = UNBOUNDED
+  result.growthLimit = UNBOUNDED
+  if result.minimum == GridBreadthKind.Length {
+    result.base = max(0.0, track.min.length + track.min.percent * basis)
+  }
+  if result.maximum == GridBreadthKind.Length {
+    result.cap = max(0.0, track.max.length + track.max.percent * basis)
+    result.growthLimit = max(result.base, result.cap)
+  }
+  if track.kind == GridTrackKind.FitContent {
+    result.minimum = GridBreadthKind.Auto
+    result.maximum = GridBreadthKind.MaxContent
+    result.fitContent = true
+    result.growthLimit = UNBOUNDED
+  } else if result.maximum == GridBreadthKind.Flex {
+    result.factor = max(0.0, track.max.length)
+    if track.kind == GridTrackKind.Breadth {
+      result.minimum = GridBreadthKind.Auto
+    }
+  }
+  return result
+}
+
+pub effect fn initializeTracks(
+  explicit: &[GridTrack],
+  automatic: &[GridTrack],
+  origin: i32,
+  count: usize,
+  basis: f32,
+  definite: bool,
+  result: &mut List<TrackState>,
+)
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  result.clear()
+  let mut leading: usize = 0
+  let mut explicitStart: usize = 0
+  if origin < 0 {
+    // Avoid negating the minimum signed value before converting to usize.
+    leading = i32.toUsize(-(origin + 1)) + 1
+  } else {
+    explicitStart = i32.toUsize(origin)
+  }
+  let mut index: usize = 0
+  while index < count {
+    let mut state = TrackState.fixed(0.0)
+    state.minimum = GridBreadthKind.Auto
+    state.maximum = GridBreadthKind.Auto
+    state.growthLimit = UNBOUNDED
+    state.cap = UNBOUNDED
+    if index < leading {
+      if automatic.length > 0 {
+        let source = automatic.length - 1 - (leading - index - 1) % automatic.length
+        state = initialize(&automatic[source], basis, definite)
+      }
+    } else {
+      let source = index - leading + explicitStart
+      if source < explicit.length {
+        state = initialize(&explicit[source], basis, definite)
+      } else if automatic.length > 0 {
+        state = initialize(
+          &automatic[(source - explicit.length) % automatic.length],
+          basis,
+          definite,
+        )
+      }
+    }
+    run result.append(state)
+    index = index + 1
+  }
+}
+
+// Placement marks only empty auto-fit tracks. Any in-flow contribution spanning
+// a track keeps it occupied, so item-span gutter counts remain unchanged.
+pub fn collapseTracks(tracks: &mut [TrackState], collapsed: &[usize]) {
+  let mut index: usize = 0
+  while index < collapsed.length {
+    let track = &mut tracks[collapsed[index]]
+    track.* = TrackState.fixed(0.0)
+    track.collapsed = true
+    index = index + 1
+  }
+}
+
+fn gutters(count: usize, gap: f32) -> f32 {
+  if count == 0 {
+    return 0.0
+  }
+  return usize.toF32(count - 1) * gap
+}
+
+// §11.1: interior collapsed gutters coincide; leading/trailing ones disappear.
+// Refund these from whole-axis budgets without changing noncollapsed arithmetic
+// order or adding another scan over tracks.
+fn collapsedGutters(collapsed: usize, count: usize, gap: f32) -> f32 {
+  if collapsed == count {
+    return gutters(collapsed, gap)
+  }
+  return usize.toF32(collapsed) * gap
+}
+
+fn intrinsicKind(kind: GridBreadthKind) -> bool {
+  return kind == GridBreadthKind.Auto || kind == GridBreadthKind.MinContent
+    || kind == GridBreadthKind.MaxContent
+}
+
+fn maxContentKind(kind: GridBreadthKind) -> bool {
+  return kind == GridBreadthKind.Auto || kind == GridBreadthKind.MaxContent
+}
+
+enum IntrinsicStep {
+  Minimum,
+  ContentMinimum,
+  LimitedMaximum,
+  MaximumMinimum,
+  IntrinsicMaximum,
+  Maximum
+}
+
+fn growsLimit(step: IntrinsicStep) -> bool {
+  return step == IntrinsicStep.IntrinsicMaximum || step == IntrinsicStep.Maximum
+}
+
+fn affected(track: &TrackState, step: IntrinsicStep, flex: bool) -> bool {
+  if flex && track.maximum != GridBreadthKind.Flex {
+    return false
+  }
+  if step == IntrinsicStep.Minimum {
+    return intrinsicKind(track.minimum)
+  }
+  if step == IntrinsicStep.ContentMinimum {
+    return track.minimum == GridBreadthKind.MinContent
+      || track.minimum == GridBreadthKind.MaxContent
+  }
+  if step == IntrinsicStep.LimitedMaximum {
+    return maxContentKind(track.minimum)
+  }
+  if step == IntrinsicStep.MaximumMinimum {
+    return track.minimum == GridBreadthKind.MaxContent
+  }
+  if step == IntrinsicStep.IntrinsicMaximum {
+    return intrinsicKind(track.maximum)
+  }
+  return maxContentKind(track.maximum)
+}
+
+fn affectedSize(track: &TrackState, limit: bool) -> f32 {
+  if limit && track.growthLimit < UNBOUNDED {
+    return track.growthLimit
+  }
+  return track.base
+}
+
+fn distributionLimit(track: &TrackState, limit: bool) -> f32 {
+  if limit && (track.growthLimit >= UNBOUNDED || track.infinitelyGrowable) {
+    if track.fitContent {
+      return track.cap
+    }
+    return UNBOUNDED
+  }
+  if track.fitContent {
+    return min(track.growthLimit, track.cap)
+  }
+  return track.growthLimit
+}
+
+fn limitedContribution(
+  tracks: &[TrackState],
+  item: &TrackContribution,
+  value: f32,
+  gap: f32,
+) -> f32 {
+  let mut cap = gutters(item.end - item.start, gap)
+  let mut index = item.start
+  while index < item.end {
+    if tracks[index].cap >= UNBOUNDED {
+      return max(item.minimum, value)
+    }
+    cap = cap + tracks[index].cap
+    index = index + 1
+  }
+  return max(item.minimum, min(value, cap))
+}
+
+fn singleContribution(track: &mut TrackState, item: &TrackContribution, constraint: AvailableKind) {
+  let mut base = item.minimum
+  if track.minimum == GridBreadthKind.MinContent {
+    base = item.minContent
+  } else if track.minimum == GridBreadthKind.MaxContent {
+    base = item.maxContent
+  } else if constraint != AvailableKind.Definite {
+    base = max(item.minimum, min(item.minContent, track.cap))
+  }
+  if intrinsicKind(track.minimum) {
+    track.base = max(track.base, base)
+  }
+  if intrinsicKind(track.maximum) {
+    let mut limit = item.maxContent
+    if track.maximum == GridBreadthKind.MinContent {
+      limit = item.minContent
+    }
+    if track.fitContent {
+      limit = min(limit, track.cap)
+    }
+    if track.growthLimit >= UNBOUNDED {
+      track.growthLimit = track.base
+    }
+    track.growthLimit = max(track.growthLimit, limit)
+  }
+  track.growthLimit = max(track.growthLimit, track.base)
+}
+
+// §12.5.1: a fit-content maximum changes category as the item-incurred
+// increase reaches its cap, so beyond-limit eligibility is recomputed.
+fn preferredBeyond(track: &TrackState, step: IntrinsicStep) -> bool {
+  if track.fitContent && affectedSize(track, growsLimit(step)) + track.incurred >= track.cap {
+    return false
+  }
+  if step == IntrinsicStep.LimitedMaximum || step == IntrinsicStep.MaximumMinimum {
+    return maxContentKind(track.maximum)
+  }
+  return intrinsicKind(track.maximum)
+}
+
+// Distribute one item's remaining space. stage 0 affects selected tracks up to
+// limits, stage 1 uses non-affected capacity, stage 2 distributes beyond limits.
+fn distribute(
+  tracks: &mut [TrackState],
+  item: &TrackContribution,
+  step: IntrinsicStep,
+  flex: bool,
+  stage: usize,
+  space: f32,
+) -> f32 {
+  let limit = growsLimit(step)
+  let mut remaining = space
+  while remaining > 0.0 {
+    let mut preferred = false
+    let mut index = item.start
+    if stage == 2 {
+      while index < item.end {
+        if affected(&tracks[index], step, flex) && preferredBeyond(&tracks[index], step) {
+          preferred = true
+        }
+        index = index + 1
+      }
+    }
+    let mut count: usize = 0
+    let mut factors: f32 = 0.0
+    index = item.start
+    while index < item.end {
+      let track = &mut tracks[index]
+      let selected = affected(&track, step, flex)
+      let mut eligible = selected
+      if stage == 1 {
+        eligible = !selected && (!flex || track.maximum == GridBreadthKind.Flex)
+      }
+      if stage == 2 {
+        eligible = selected && ((!preferred && !limit) || preferredBeyond(&track, step))
+      } else {
+        eligible = eligible
+          && affectedSize(&track, limit) + track.incurred < distributionLimit(&track, limit)
+      }
+      track.frozen = !eligible
+      if eligible {
+        count = count + 1
+        factors = factors + track.factor
+      }
+      index = index + 1
+    }
+    if count == 0 {
+      return remaining
+    }
+    let equal = remaining / usize.toF32(count)
+    let mut consumed: f32 = 0.0
+    let mut froze = false
+    index = item.start
+    while index < item.end {
+      let track = &mut tracks[index]
+      if !track.frozen {
+        let mut share = equal
+        if flex {
+          if factors >= 1.0 {
+            share = remaining * track.factor / factors
+          } else {
+            share = remaining * track.factor + equal * (1.0 - factors)
+          }
+        }
+        let mut ceiling = distributionLimit(&track, limit)
+        if stage == 2 {
+          ceiling = UNBOUNDED
+          if track.fitContent && (preferred || limit) {
+            ceiling = track.cap
+          }
+        }
+        let room = max(0.0, ceiling - affectedSize(&track, limit) - track.incurred)
+        let increase = min(share, room)
+        if room <= share {
+          froze = true
+        }
+        track.incurred = track.incurred + increase
+        consumed = consumed + increase
+      }
+      index = index + 1
+    }
+
+    // All shares fit: mathematically the whole remainder was distributed.
+    // Do not iterate on a floating-point summation residue.
+    if !froze {
+      return 0.0
+    }
+    if consumed <= 0.0 {
+      return remaining
+    }
+    remaining = max(0.0, remaining - consumed)
+  }
+  return remaining
+}
+
+fn accommodate(
+  tracks: &mut [TrackState],
+  contributions: &[TrackContribution],
+  links: &[usize],
+  head: usize,
+  next: usize,
+  step: IntrinsicStep,
+  constraint: AvailableKind,
+  gap: f32,
+  flex: bool,
+) {
+  let limit = growsLimit(step)
+  let mut index: usize = 0
+  while index < tracks.length {
+    // -1 distinguishes an untouched infinite limit from a zero increase.
+    tracks[index].planned = -1.0
+    index = index + 1
+  }
+  let mut at = head
+  while at != usize.MAX {
+    let item = &contributions[at]
+    let mut contribution = item.minimum
+    if step == IntrinsicStep.Minimum && constraint != AvailableKind.Definite {
+      contribution = limitedContribution(&tracks, item, item.minContent, gap)
+    } else if step == IntrinsicStep.ContentMinimum || step == IntrinsicStep.IntrinsicMaximum {
+      contribution = item.minContent
+    } else if step == IntrinsicStep.LimitedMaximum {
+      contribution = limitedContribution(&tracks, item, item.maxContent, gap)
+    } else if step == IntrinsicStep.MaximumMinimum || step == IntrinsicStep.Maximum {
+      contribution = item.maxContent
+    }
+    let mut space = contribution - gutters(item.end - item.start, gap)
+    let mut any = false
+    index = item.start
+    while index < item.end {
+      let track = &mut tracks[index]
+      track.incurred = 0.0
+      space = space - affectedSize(&track, limit)
+      if affected(&track, step, flex) {
+        any = true
+        track.planned = max(0.0, track.planned)
+      }
+      index = index + 1
+    }
+    if any && space > 0.0 {
+      space = distribute(&mut tracks, item, step, flex, 0, space)
+      if space > 0.0 {
+        space = distribute(&mut tracks, item, step, flex, 1, space)
+      }
+      if space > 0.0 {
+        drop distribute(&mut tracks, item, step, flex, 2, space)
+      }
+      index = item.start
+      while index < item.end {
+        let track = &mut tracks[index]
+
+        // Include non-affected tracks that received capacity in stage 1.
+        if track.incurred > 0.0 {
+          track.planned = max(track.planned, track.incurred)
+        }
+        index = index + 1
+      }
+    }
+    at = links[next + at]
+  }
+  index = 0
+  while index < tracks.length {
+    let track = &mut tracks[index]
+    if track.planned >= 0.0 {
+      if limit {
+        let infinite = track.growthLimit >= UNBOUNDED
+        track.growthLimit = affectedSize(&track, true) + track.planned
+        if step == IntrinsicStep.IntrinsicMaximum && infinite {
+          track.infinitelyGrowable = true
+        }
+      } else {
+        track.base = track.base + track.planned
+      }
+    }
+    index = index + 1
+  }
+}
+
+fn spanGroup(
+  tracks: &mut [TrackState],
+  contributions: &[TrackContribution],
+  links: &[usize],
+  head: usize,
+  next: usize,
+  constraint: AvailableKind,
+  gap: f32,
+  flex: bool,
+) {
+  if head == usize.MAX {
+    return
+  }
+  accommodate(
+    &mut tracks,
+    contributions,
+    links,
+    head,
+    next,
+    IntrinsicStep.Minimum,
+    constraint,
+    gap,
+    flex,
+  )
+  accommodate(
+    &mut tracks,
+    contributions,
+    links,
+    head,
+    next,
+    IntrinsicStep.ContentMinimum,
+    constraint,
+    gap,
+    flex,
+  )
+  if constraint == AvailableKind.MaxContent {
+    accommodate(
+      &mut tracks,
+      contributions,
+      links,
+      head,
+      next,
+      IntrinsicStep.LimitedMaximum,
+      constraint,
+      gap,
+      flex,
+    )
+  }
+  accommodate(
+    &mut tracks,
+    contributions,
+    links,
+    head,
+    next,
+    IntrinsicStep.MaximumMinimum,
+    constraint,
+    gap,
+    flex,
+  )
+  let mut index: usize = 0
+  while index < tracks.length {
+    tracks[index].growthLimit = max(tracks[index].growthLimit, tracks[index].base)
+    index = index + 1
+  }
+  if !flex {
+    accommodate(
+      &mut tracks,
+      contributions,
+      links,
+      head,
+      next,
+      IntrinsicStep.IntrinsicMaximum,
+      constraint,
+      gap,
+      false,
+    )
+    accommodate(
+      &mut tracks,
+      contributions,
+      links,
+      head,
+      next,
+      IntrinsicStep.Maximum,
+      constraint,
+      gap,
+      false,
+    )
+  }
+  index = 0
+  while index < tracks.length {
+    tracks[index].infinitelyGrowable = false
+    index = index + 1
+  }
+}
+
+pub effect fn resolveIntrinsic(
+  tracks: &mut [TrackState],
+  contributions: &[TrackContribution],
+  constraint: AvailableKind,
+  gap: f32,
+  work: &mut List<usize>,
+)
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tracks.length == 0 {
+    return
+  }
+
+  // Prefix flex counts, heads indexed by span (0 is the combined flex group),
+  // and one next link per item. Grouping is O(tracks + items), without sorting
+  // or reordering the caller's contributions.
+  let heads = tracks.length + 1
+  let next = heads + tracks.length + 1
+  work.clear()
+  run work.appendRepeated(usize.MAX, next + contributions.length)
+  let links = work.asMutSlice()
+  links[0] = 0
+  let mut index: usize = 0
+  while index < tracks.length {
+    links[index + 1] = links[index]
+    if tracks[index].maximum == GridBreadthKind.Flex {
+      links[index + 1] = links[index + 1] + 1
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < contributions.length {
+    let item = &contributions[index]
+    let mut span = item.end - item.start
+    if links[item.end] != links[item.start] {
+      span = 0
+    }
+    if span == 1 {
+      singleContribution(&mut tracks[item.start], item, constraint)
+    } else {
+      links[next + index] = links[heads + span]
+      links[heads + span] = index
+    }
+    index = index + 1
+  }
+  let mut span: usize = 2
+  while span <= tracks.length {
+    spanGroup(&mut tracks, contributions, &links, links[heads + span], next, constraint, gap, false)
+    span = span + 1
+  }
+  spanGroup(&mut tracks, contributions, &links, links[heads], next, constraint, gap, true)
+  index = 0
+  while index < tracks.length {
+    if tracks[index].growthLimit >= UNBOUNDED {
+      tracks[index].growthLimit = tracks[index].base
+    }
+    index = index + 1
+  }
+}
+
+// §12.6: bounding the initial budget is equivalent to restarting from the
+// original bases after unconstrained maximization, without copying tracks.
+pub fn maximizeTracks(
+  tracks: &mut [TrackState],
+  available: AvailableSpace,
+  gap: f32,
+  maximum: f32,
+) {
+  if available.kind == AvailableKind.MinContent {
+    return
+  }
+  let mut target = maximum
+  if available.kind == AvailableKind.Definite {
+    target = min(target, available.value)
+  }
+  if target >= UNBOUNDED {
+    let mut index: usize = 0
+    while index < tracks.length {
+      tracks[index].base = max(tracks[index].base, tracks[index].growthLimit)
+      index = index + 1
+    }
+    return
+  }
+  let mut remaining = target - gutters(tracks.length, gap)
+  let mut collapsed: usize = 0
+  let mut index: usize = 0
+  while index < tracks.length {
+    remaining = remaining - tracks[index].base
+    if tracks[index].collapsed {
+      collapsed = collapsed + 1
+    }
+    index = index + 1
+  }
+  if collapsed != 0 {
+    remaining = remaining + collapsedGutters(collapsed, tracks.length, gap)
+  }
+  while remaining > 0.0 {
+    let mut count: usize = 0
+    index = 0
+    while index < tracks.length {
+      if tracks[index].base < tracks[index].growthLimit {
+        count = count + 1
+      }
+      index = index + 1
+    }
+    if count == 0 {
+      return
+    }
+    let share = remaining / usize.toF32(count)
+    let mut consumed: f32 = 0.0
+    let mut froze = false
+    index = 0
+    while index < tracks.length {
+      let track = &mut tracks[index]
+      let room = max(0.0, track.growthLimit - track.base)
+      if room > 0.0 {
+        if room <= share {
+          froze = true
+        }
+        let increase = min(room, share)
+        track.base = track.base + increase
+        consumed = consumed + increase
+      }
+      index = index + 1
+    }
+    if !froze || consumed <= 0.0 {
+      return
+    }
+    remaining = max(0.0, remaining - consumed)
+  }
+}
+
+// §12.7.1. Only frozen scratch changes during the search, allowing an
+// indefinite fraction to be bounded before any base is committed.
+fn findFraction(
+  tracks: &mut [TrackState],
+  start: usize,
+  end: usize,
+  available: f32,
+  gap: f32,
+) -> f32 {
+  let mut space = available - gutters(end - start, gap)
+  let mut collapsed: usize = 0
+  let mut index = start
+  while index < end {
+    let track = &mut tracks[index]
+    track.frozen = track.maximum != GridBreadthKind.Flex || track.factor == 0.0
+    if track.collapsed {
+      collapsed = collapsed + 1
+    }
+    index = index + 1
+  }
+  if collapsed != 0 {
+    space = space + collapsedGutters(collapsed, end - start, gap)
+  }
+  while true {
+    let mut remaining = space
+    let mut factors: f32 = 0.0
+    index = start
+    while index < end {
+      let track = &tracks[index]
+      if track.frozen {
+        remaining = remaining - track.base
+      } else {
+        factors = factors + track.factor
+      }
+      index = index + 1
+    }
+    if remaining <= 0.0 || factors == 0.0 {
+      return 0.0
+    }
+    let fraction = remaining / max(1.0, factors)
+    let mut restart = false
+    index = start
+    while index < end {
+      let track = &mut tracks[index]
+      if !track.frozen && fraction * track.factor < track.base {
+        track.frozen = true
+        restart = true
+      }
+      index = index + 1
+    }
+    if !restart {
+      return fraction
+    }
+  }
+}
+
+fn applyFraction(tracks: &mut [TrackState], fraction: f32) {
+  let mut index: usize = 0
+  while index < tracks.length {
+    let track = &mut tracks[index]
+    if track.maximum == GridBreadthKind.Flex {
+      track.base = max(track.base, fraction * track.factor)
+    }
+    index = index + 1
+  }
+}
+
+pub fn resolveFlexible(tracks: &mut [TrackState], available: f32, gap: f32) {
+  let count = tracks.length
+  let fraction = findFraction(&mut tracks, 0, count, available, gap)
+  applyFraction(&mut tracks, fraction)
+}
+
+pub fn expandFlexible(
+  tracks: &mut [TrackState],
+  contributions: &[TrackContribution],
+  available: AvailableSpace,
+  gap: f32,
+  minimum: f32,
+  maximum: f32,
+) {
+  if available.kind == AvailableKind.MinContent {
+    return
+  }
+  let bound = max(minimum, maximum)
+  if available.kind == AvailableKind.Definite {
+    resolveFlexible(&mut tracks, max(minimum, min(available.value, bound)), gap)
+    return
+  }
+  let mut fraction: f32 = 0.0
+  let mut any = false
+  let mut index: usize = 0
+  while index < tracks.length {
+    let track = &tracks[index]
+    if track.maximum == GridBreadthKind.Flex {
+      any = true
+      fraction = max(fraction, track.base / max(1.0, track.factor))
+    }
+    index = index + 1
+  }
+  if !any {
+    return
+  }
+  index = 0
+  while index < contributions.length {
+    let item = &contributions[index]
+
+    // findFraction returns zero for spans without flexible tracks.
+    fraction = max(fraction, findFraction(&mut tracks, item.start, item.end, item.maxContent, gap))
+    index = index + 1
+  }
+  let mut extent = gutters(tracks.length, gap)
+  let mut collapsed: usize = 0
+  index = 0
+  while index < tracks.length {
+    let track = &tracks[index]
+    let mut size = track.base
+    if track.maximum == GridBreadthKind.Flex {
+      size = max(size, fraction * track.factor)
+    }
+    extent = extent + size
+    if track.collapsed {
+      collapsed = collapsed + 1
+    }
+    index = index + 1
+  }
+  if collapsed != 0 {
+    extent = extent - collapsedGutters(collapsed, tracks.length, gap)
+  }
+  let count = tracks.length
+  if extent < minimum {
+    fraction = findFraction(&mut tracks, 0, count, minimum, gap)
+  } else if extent > bound {
+    fraction = findFraction(&mut tracks, 0, count, bound, gap)
+  }
+  applyFraction(&mut tracks, fraction)
+}
+
+// CSS Grid 2 §12.8. The caller decides whether content alignment permits stretch.
+pub fn stretchAuto(tracks: &mut [TrackState], available: f32, gap: f32) {
+  let mut remaining = available - gutters(tracks.length, gap)
+  let mut collapsed: usize = 0
+  let mut count: usize = 0
+  let mut index: usize = 0
+  while index < tracks.length {
+    remaining = remaining - tracks[index].base
+    if tracks[index].collapsed {
+      collapsed = collapsed + 1
+    }
+    if tracks[index].maximum == GridBreadthKind.Auto {
+      count = count + 1
+    }
+    index = index + 1
+  }
+  if collapsed != 0 {
+    remaining = remaining + collapsedGutters(collapsed, tracks.length, gap)
+  }
+  if remaining <= 0.0 || count == 0 {
+    return
+  }
+  let share = remaining / usize.toF32(count)
+  index = 0
+  while index < tracks.length {
+    let track = &mut tracks[index]
+    if track.maximum == GridBreadthKind.Auto {
+      track.base = track.base + share
+    }
+    index = index + 1
+  }
+}
+
+pub fn positionTracks(tracks: &mut [TrackState], gap: f32) -> f32 {
+  let mut extent: f32 = 0.0
+  let mut placed = false
+  let mut index: usize = 0
+  while index < tracks.length {
+    let track = &mut tracks[index]
+    if !track.collapsed {
+      if placed {
+        extent = extent + gap
+      }
+      track.position = extent
+      extent = extent + track.base
+      placed = true
+    } else {
+      track.position = extent
+    }
+    index = index + 1
+  }
+  return extent
+}
+
+// Positions must be current; the caller supplies a nonempty, in-range span.
+pub fn spanSize(tracks: &[TrackState], start: usize, end: usize) -> f32 {
+  let last = &tracks[end - 1]
+  return last.position - tracks[start].position + last.base
+}

@@ -1,0 +1,1234 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import geometry { Point, Size, Rect, ResolvedEdges, BaselineSet, sameSize, sameRect, sameEdges, sameBaselines, sameOverflow }
+import tree { NO_NODE }
+
+pub enum FragmentKind { Box, Inline, Text, Line }
+pub struct FragmentId { pub index: usize }
+impl Copy for FragmentId {}
+
+pub enum TextFragmentKind { Glyphs, Tab, SegmentBreak }
+pub struct TextFragment {
+  pub sourceStart: usize, pub sourceEnd: usize,
+  pub fontKey: usize, pub shapeKey: usize, pub bidiLevel: u8,
+  pub kind: TextFragmentKind,
+}
+impl Copy for TextFragment {}
+
+// `value` as a one-element slice, for List.appendSlice: it copies straight
+// from `value`, where List.append of a large value built in place copies it
+// through the stack first.
+pub fn one<T>(value: &T) -> &[T] with Intrinsic.inlineAlways() {
+  unsafe { return Pointer.borrowMany<T, T>(value, Pointer.assumeMany<T>(Pointer.fromRef<T>(value)), 1) }
+}
+
+pub struct Fragment {
+  // What resolveLocations reads and writes for every fragment comes first,
+  // in one cache line.
+  pub parent: usize,
+  // Normal physical geometry; rectangles are relative to the border origin.
+  pub location: Point, pub visualOffset: Point,
+  pub worldLocation: Point,
+  pub kind: FragmentKind,
+  pub box: usize, pub source: usize,
+  pub fragmentainer: usize,
+  pub firstChild: usize, pub lastChild: usize,
+  pub previousSibling: usize, pub nextSibling: usize,
+  pub previousForBox: usize, pub nextForBox: usize,
+  pub size: Size,
+  pub contentRect: Rect, pub paddingRect: Rect,
+  pub layoutBounds: Rect, pub scrollableOverflow: Rect,
+  // Logical block offsets in the owning box's writing mode.
+  pub firstBaselines: BaselineSet, pub lastBaselines: BaselineSet,
+  pub hasFirstBaseline: bool, pub hasLastBaseline: bool,
+  pub usedMargin: ResolvedEdges,
+  // Physical top=1, right=2, bottom=4, left=8.
+  pub decorationEdges: u8,
+  pub first: bool, pub last: bool,
+  pub phantom: bool, pub repeated: bool, pub overflowOnly: bool,
+  // No backgrounds, borders, shadows, or own scrollable overflow. Inline
+  // interruptions retain source/containing geometry; anonymous Line anchors
+  // only retain ancestry and pass through descendant overflow.
+  pub nonpainting: bool,
+  // An ancestry/containing-block carrier, not a generated source rectangle.
+  pub positioningShell: bool,
+  pub textData: usize,
+}
+impl Copy for Fragment {}
+impl Fragment {
+  // Whether two fragments are the same in what their ancestors read: all
+  // but their links, location, world location and content and padding rects.
+  pub fn sameOutside(a: &Fragment, b: &Fragment, baselines: bool) -> bool {
+    return a.box == b.box && a.source == b.source && a.kind == b.kind && a.fragmentainer == b.fragmentainer
+      && sameSize(a.size, b.size) && sameRect(a.layoutBounds, b.layoutBounds) && sameOverflow(a.scrollableOverflow, b.scrollableOverflow, a.size)
+      && a.visualOffset.x == b.visualOffset.x && a.visualOffset.y == b.visualOffset.y
+      && (!baselines || (sameBaselines(a.firstBaselines, b.firstBaselines) && sameBaselines(a.lastBaselines, b.lastBaselines)
+        && a.hasFirstBaseline == b.hasFirstBaseline && a.hasLastBaseline == b.hasLastBaseline)) && sameEdges(a.usedMargin, b.usedMargin)
+      && a.decorationEdges == b.decorationEdges && a.phantom == b.phantom && a.repeated == b.repeated && a.overflowOnly == b.overflowOnly
+      && a.nonpainting == b.nonpainting && a.positioningShell == b.positioningShell && (a.textData == NO_NODE) == (b.textData == NO_NODE)
+  }
+  pub fn make(box: usize, source: usize, kind: FragmentKind) -> Fragment {
+    return Fragment {
+      box: box, source: source, kind: kind, fragmentainer: 0,
+      parent: NO_NODE, firstChild: NO_NODE, lastChild: NO_NODE,
+      previousSibling: NO_NODE, nextSibling: NO_NODE,
+      previousForBox: NO_NODE, nextForBox: NO_NODE,
+      location: Point { x: 0.0, y: 0.0 }, size: Size.zero(),
+      contentRect: Rect.zero(), paddingRect: Rect.zero(),
+      layoutBounds: Rect.zero(), scrollableOverflow: Rect.zero(),
+      visualOffset: Point { x: 0.0, y: 0.0 },
+      worldLocation: Point { x: 0.0, y: 0.0 },
+      firstBaselines: BaselineSet.zero(), lastBaselines: BaselineSet.zero(),
+      hasFirstBaseline: false, hasLastBaseline: false,
+      usedMargin: ResolvedEdges.zero(), decorationEdges: 15,
+      first: true, last: true, phantom: false, repeated: false, overflowOnly: false,
+      nonpainting: false, positioningShell: false,
+      textData: NO_NODE,
+    }
+  }
+}
+
+// A range copied from the previous compute, whose fragments already hold
+// their final scrollable overflow: overflow propagation skips from its last
+// fragment to its first. `overflow` is the first fragment's final value.
+// The layout that copied it stored the first fragment's normal-flow value.
+// `kept` marks a range kept in place from the previous compute.
+pub struct SettledRange { pub start: usize, pub end: usize, pub overflow: Rect, pub kept: bool }
+impl Copy for SettledRange {}
+
+// A move of the previous output (see FragmentArena.shiftPrevious): indices
+// at or after `start` move `by` up or down.
+pub struct Shift { pub start: usize, pub up: bool, pub by: usize }
+impl Copy for Shift {}
+impl Shift {
+  fn between(from: usize, to: usize) -> Shift {
+    if to >= from { return Shift { start: from, up: true, by: to - from } }
+    return Shift { start: from, up: false, by: from - to }
+  }
+  pub fn apply(self: &Self, index: usize) -> usize {
+    if index == NO_NODE || index < self.start { return index }
+    if self.up { return index + self.by }
+    return index - self.by
+  }
+}
+
+// Adds up a fragment's location as resolveLocations does, from the root down.
+fn locate(values: &[Fragment], index: usize) -> Point {
+  let x = values[index].location.x + values[index].visualOffset.x
+  let y = values[index].location.y + values[index].visualOffset.y
+  let parent = values[index].parent
+  if parent == NO_NODE { return Point { x: x, y: y } }
+  let above = locate(values, parent)
+  return Point { x: x + above.x, y: y + above.y }
+}
+
+// Previous fragments edited in a compute that resolveLocations tracks.
+const EDITS_TRACKED: usize = 256
+// A fragment slot at or above this names a saved position, at the slot
+// less this, instead of a saved fragment.
+const PARTIAL_SLOT: usize = usize.MAX / 2 + 1
+
+// Where a fragment is: its tree and box links, which appending and keeping
+// fragments after it write, and the placement LayoutPass.place writes of a
+// box fragment. An in-place compute saves just this when such a write is
+// the fragment's first.
+struct FragmentPosition {
+  parent: usize, firstChild: usize, lastChild: usize,
+  previousSibling: usize, nextSibling: usize,
+  previousForBox: usize, nextForBox: usize,
+  location: Point, layoutBounds: Rect, usedMargin: ResolvedEdges,
+}
+impl Copy for FragmentPosition {}
+impl FragmentPosition {
+  fn of(value: &Fragment) -> FragmentPosition {
+    return FragmentPosition {
+      parent: value.parent, firstChild: value.firstChild, lastChild: value.lastChild,
+      previousSibling: value.previousSibling, nextSibling: value.nextSibling,
+      previousForBox: value.previousForBox, nextForBox: value.nextForBox,
+      location: value.location, layoutBounds: value.layoutBounds, usedMargin: value.usedMargin,
+    }
+  }
+  fn restore(self: &Self, value: &mut Fragment) {
+    value.parent = self.parent
+    value.firstChild = self.firstChild
+    value.lastChild = self.lastChild
+    value.previousSibling = self.previousSibling
+    value.nextSibling = self.nextSibling
+    value.previousForBox = self.previousForBox
+    value.nextForBox = self.nextForBox
+    value.location = self.location
+    value.layoutBounds = self.layoutBounds
+    value.usedMargin = self.usedMargin
+  }
+}
+
+// Times a compute may move the previous output (see shiftPrevious).
+const SHIFTS: usize = 4
+
+// Fragments appendRange checks, copies and relinks at a time.
+const RANGE_CHUNK: usize = 64
+
+// An arena of fragments in preorder, with each box's fragments chained.
+//
+// A compute of the same boxes as the previous one works in place (see
+// beginInPlace): the arena still holds the previous output, `count` and
+// `textCount` say how much of it this compute has written, and storage past
+// them keeps the previous output until written. A previous range at the
+// write position that nothing has overwritten is kept where it is instead
+// of copied (keepRange). The first write over a previous fragment, text or
+// box chain saves its previous value, stamped with `generation`, so the
+// previous output stays readable (previous, previousText, previousFirst)
+// for ranges that must be copied instead (copyPrevious).
+pub struct FragmentArena {
+  pub values: List<Fragment>,
+  pub texts: List<TextFragment>,
+  firstByBox: List<usize>, lastByBox: List<usize>,
+  // Ascending and disjoint.
+  pub settled: List<SettledRange>,
+  // How many texts precede each fragment.
+  textMarks: List<usize>,
+  count: usize, textCount: usize,
+  // Set from beginInPlace until close, after which writes append again and
+  // the previous output past `closedAt` is in tailFragments and tailTexts.
+  inPlace: bool, viewing: bool, closedAt: usize, closedTexts: usize,
+  // Set when an edit lost part of the previous output: nothing more of it is reused.
+  damaged: bool,
+  previousCount: usize, previousTexts: usize,
+  // Every index below these was written by this compute.
+  written: usize, textsWritten: usize,
+  generation: usize,
+  fragmentStamps: List<usize>, fragmentSlots: List<usize>, savedFragments: List<Fragment>, savedPositions: List<FragmentPosition>,
+  textStamps: List<usize>, textSlots: List<usize>, savedTexts: List<TextFragment>,
+  // A box whose stamp is current has chains of this compute; the others
+  // keep their previous chains, in kept ranges, or none (see first).
+  boxStamps: List<usize>, boxSlots: List<usize>, savedFirst: List<usize>, savedLast: List<usize>,
+  tailFragments: List<Fragment>, tailTexts: List<TextFragment>,
+  // Whether positioning may have given fragments visual offsets, and the
+  // normal-flow fragments it linked to fragments after the normal flow, in
+  // this and the previous compute; kept ranges must not contain the latter.
+  // `flowEnd` is where the normal flow ended (see endFlow).
+  offsets: bool,
+  // Whether every world location must be resolved again, else those of
+  // fragments outside unmoved kept ranges; and the previous fragments
+  // edited in this compute, at most EDITS_TRACKED of them.
+  resolveAll: bool, edited: List<usize>,
+  // Whether world locations and text first/last flags await
+  // resolveLocations (see deferLocations).
+  stale: bool,
+  afterFlow: bool, flowEnd: usize,
+  adopted: List<usize>, previousAdopted: List<usize>,
+  // How many times this compute moved the previous output.
+  shifts: usize,
+  // Whether every fragment, kept and copied ones included, is a box fragment
+  // of a box under the first one (see treeOverflow).
+  pub plain: bool,
+}
+impl FragmentArena {
+  pub fn make() -> FragmentArena {
+    return FragmentArena {
+      values: List<Fragment>.make(),
+      texts: List<TextFragment>.make(),
+      firstByBox: List<usize>.make(), lastByBox: List<usize>.make(),
+      settled: List<SettledRange>.make(),
+      textMarks: List<usize>.make(),
+      count: 0, textCount: 0,
+      inPlace: false, viewing: false, closedAt: 0, closedTexts: 0, damaged: false,
+      previousCount: 0, previousTexts: 0,
+      written: 0, textsWritten: 0,
+      generation: 0,
+      fragmentStamps: List<usize>.make(), fragmentSlots: List<usize>.make(), savedFragments: List<Fragment>.make(), savedPositions: List<FragmentPosition>.make(),
+      textStamps: List<usize>.make(), textSlots: List<usize>.make(), savedTexts: List<TextFragment>.make(),
+      boxStamps: List<usize>.make(), boxSlots: List<usize>.make(), savedFirst: List<usize>.make(), savedLast: List<usize>.make(),
+      tailFragments: List<Fragment>.make(), tailTexts: List<TextFragment>.make(),
+      offsets: false,
+      resolveAll: true, edited: List<usize>.make(),
+      stale: false,
+      afterFlow: false, flowEnd: 0, plain: true,
+      adopted: List<usize>.make(), previousAdopted: List<usize>.make(),
+      shifts: 0,
+    }
+  }
+
+  // A full reset invalidates every fragment ID and checkpoint, retaining capacity.
+  pub effect fn prepare(self: &mut Self, boxCount: usize) ! OutOfMemoryError ? &mut Allocator {
+    self.clear()
+    run self.firstByBox.reserveExact(boxCount)
+    run self.lastByBox.reserveExact(boxCount)
+    run self.firstByBox.appendRepeated(NO_NODE, boxCount)
+    run self.lastByBox.appendRepeated(NO_NODE, boxCount)
+  }
+
+  // Empties the arena, keeping its storage.
+  pub fn clear(self: &mut Self) {
+    self.values.clear()
+    self.texts.clear()
+    self.settled.clear()
+    self.firstByBox.clear()
+    self.lastByBox.clear()
+    self.textMarks.clear()
+    self.count = 0
+    self.textCount = 0
+    self.plain = true
+    self.inPlace = false
+    self.viewing = false
+    self.previousCount = 0
+    self.previousTexts = 0
+    self.offsets = false
+    self.resolveAll = true
+    self.edited.clear()
+    self.afterFlow = false
+    self.adopted.clear()
+    self.previousAdopted.clear()
+  }
+
+  // Starts a compute of the same `boxCount` boxes in place over the
+  // previous output, which must be complete.
+  pub effect fn beginInPlace(self: &mut Self, boxCount: usize) ! OutOfMemoryError ? &mut Allocator {
+    if self.firstByBox.length() != boxCount || self.count != self.values.length() || self.textCount != self.texts.length() {
+      run self.prepare(boxCount)
+      return
+    }
+    // The kept output stays plain if it was (see `plain`).
+    // Positioning applies visual offsets afresh.
+    if self.offsets {
+      let values = self.values.asMutSlice()
+      let mut at: usize = 0
+      while at < values.length {
+        values[at].visualOffset = Point { x: 0.0, y: 0.0 }
+        at = at + 1
+      }
+      self.offsets = false
+      self.resolveAll = true
+    }
+    // The edits of an unresolved compute are about to be forgotten.
+    if self.stale { self.resolveAll = true }
+    self.edited.clear()
+    self.afterFlow = false
+    self.shifts = 0
+    let adopted = Intrinsic.replace(self.previousAdopted, List<usize>.make())
+    self.previousAdopted = Intrinsic.replace(self.adopted, move adopted)
+    self.adopted.clear()
+    run self.previousAdopted.sort()
+    self.generation = self.generation + 1
+    self.previousCount = self.values.length()
+    self.previousTexts = self.texts.length()
+    self.count = 0
+    self.textCount = 0
+    self.written = 0
+    self.textsWritten = 0
+    self.inPlace = true
+    self.viewing = true
+    self.damaged = false
+    self.settled.clear()
+    self.savedFragments.clear()
+    self.savedPositions.clear()
+    self.savedTexts.clear()
+    self.savedFirst.clear()
+    self.savedLast.clear()
+    self.tailFragments.clear()
+    self.tailTexts.clear()
+    if self.fragmentStamps.length() < self.previousCount {
+      let missing = self.previousCount - self.fragmentStamps.length()
+      run self.fragmentStamps.appendRepeated(0, missing)
+      run self.fragmentSlots.appendRepeated(0, missing)
+    }
+    if self.textStamps.length() < self.previousTexts {
+      let missing = self.previousTexts - self.textStamps.length()
+      run self.textStamps.appendRepeated(0, missing)
+      run self.textSlots.appendRepeated(0, missing)
+    }
+    if self.boxStamps.length() < boxCount {
+      let missing = boxCount - self.boxStamps.length()
+      run self.boxStamps.appendRepeated(0, missing)
+      run self.boxSlots.appendRepeated(0, missing)
+    }
+  }
+
+  // Ends the normal flow. Writing in place ends too: later writes append,
+  // and the previous output past the write position stays readable.
+  pub effect fn endFlow(self: &mut Self) ! OutOfMemoryError ? &mut Allocator {
+    if self.afterFlow { return }
+    self.afterFlow = true
+    self.flowEnd = self.count
+    if !self.inPlace { return }
+    self.inPlace = false
+    self.closedAt = self.count
+    self.closedTexts = self.textCount
+    if self.count < self.values.length() {
+      let length = self.values.length() - self.count
+      run self.tailFragments.appendSlice(Slice.view(self.values.asSlice(), self.count, length))
+    }
+    if self.textCount < self.texts.length() {
+      let length = self.texts.length() - self.textCount
+      run self.tailTexts.appendSlice(Slice.view(self.texts.asSlice(), self.textCount, length))
+    }
+    self.values.truncate(self.count)
+    self.texts.truncate(self.textCount)
+    self.textMarks.truncate(self.count)
+  }
+
+  // Whether reused ranges come from this arena's previous output rather
+  // than another arena.
+  pub fn viewsPrevious(self: &Self) -> bool { return self.viewing }
+  pub fn previousWhole(self: &Self) -> bool { return !self.damaged }
+  pub fn previousLength(self: &Self) -> usize { return self.previousCount }
+
+  // The previous compute's fragment at `index`, below previousLength.
+  pub fn previous(self: &Self, index: usize) -> Fragment {
+    if index < self.fragmentStamps.length() && self.fragmentStamps.get(index) == self.generation {
+      let slot = self.fragmentSlots.get(index)
+      if slot < PARTIAL_SLOT { return self.savedFragments.get(slot) }
+      let mut value = self.values.get(index)
+      self.savedPositions.asSlice()[slot - PARTIAL_SLOT].restore(&mut value)
+      return value
+    }
+    if !self.inPlace && index >= self.closedAt { return self.tailFragments.get(index - self.closedAt) }
+    return self.values.get(index)
+  }
+  fn previousText(self: &Self, index: usize) -> TextFragment {
+    if index < self.textStamps.length() && self.textStamps.get(index) == self.generation { return self.savedTexts.get(self.textSlots.get(index)) }
+    if !self.inPlace && index >= self.closedTexts { return self.tailTexts.get(index - self.closedTexts) }
+    return self.texts.get(index)
+  }
+  // The previous compute's first fragment of a box.
+  pub fn previousFirst(self: &Self, box: usize) -> usize with Intrinsic.inlineAlways() {
+    if box < self.boxStamps.length() && self.boxStamps.get(box) == self.generation { return self.savedFirst.get(self.boxSlots.get(box)) }
+    return self.firstByBox.get(box)
+  }
+
+  // Saves what a write over fragment `index` would lose of the previous output.
+  // appendSlice copies the fragment straight across; append would stage it
+  // through the stack first.
+  effect fn saveFragment(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    if !self.inPlace || index >= self.previousCount { return }
+    if self.fragmentStamps.get(index) == self.generation {
+      if self.fragmentSlots.get(index) >= PARTIAL_SLOT { run self.savePlaced(index) }
+      return
+    }
+    run self.savedFragments.appendSlice(one<Fragment>(&self.values.asSlice()[index]))
+    run self.noteEdit(index)
+    self.fragmentStamps.set(index, self.generation)
+    self.fragmentSlots.set(index, self.savedFragments.length() - 1)
+  }
+  // A fragment saved by position is about to be written whole: saves its
+  // whole previous value.
+  effect fn savePlaced(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    run self.savedFragments.appendSlice(one<Fragment>(&self.values.asSlice()[index]))
+    let last = self.savedFragments.length() - 1
+    self.savedPositions.asSlice()[self.fragmentSlots.get(index) - PARTIAL_SLOT].restore(&mut self.savedFragments.asMutSlice()[last])
+    self.fragmentSlots.set(index, last)
+  }
+  // saveFragment for a write of only the fragment's position.
+  effect fn savePosition(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    if !self.inPlace || index >= self.previousCount || self.fragmentStamps.get(index) == self.generation { return }
+    run self.savedPositions.append(FragmentPosition.of(&self.values.asSlice()[index]))
+    run self.noteEdit(index)
+    self.fragmentStamps.set(index, self.generation)
+    self.fragmentSlots.set(index, self.savedPositions.length() - 1 + PARTIAL_SLOT)
+  }
+  effect fn saveText(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    if !self.inPlace || index >= self.previousTexts || self.textStamps.get(index) == self.generation { return }
+    run self.savedTexts.appendSlice(one<TextFragment>(&self.texts.asSlice()[index]))
+    self.textStamps.set(index, self.generation)
+    self.textSlots.set(index, self.savedTexts.length() - 1)
+  }
+  // Notes an edit of fragment `index` that cannot save its previous value:
+  // the previous output is no longer whole.
+  fn editUnsaved(self: &mut Self, index: usize) {
+    if !self.inPlace { return }
+    if index < self.previousCount && self.fragmentStamps.get(index) != self.generation { self.damaged = true }
+    if index + 1 > self.written { self.written = index + 1 }
+  }
+  // Prepares fragment `index` for an edit by the caller.
+  pub effect fn edit(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    // A fresh arena, writing over no previous output, saves and notes nothing.
+    if self.inPlace || self.viewing { run self.editPrevious(index) }
+  }
+  // edit for a write of only a fragment's links or a box fragment's
+  // placement (see FragmentPosition).
+  pub effect fn editPosition(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    // Most such writes are to fragments this compute already wrote.
+    if self.inPlace && index < self.written && (index >= self.previousCount || self.fragmentStamps.asSlice()[index] == self.generation) { return }
+    if self.inPlace || self.viewing { run self.editPositionPrevious(index) }
+  }
+  effect fn editPositionPrevious(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    run self.savePosition(index)
+    if self.inPlace && index + 1 > self.written { self.written = index + 1 }
+    else if self.viewing && !self.inPlace && index < self.previousCount { run self.noteEdit(index) }
+  }
+  effect fn editPrevious(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    run self.saveFragment(index)
+    if self.inPlace && index + 1 > self.written { self.written = index + 1 }
+    // Positioning edits after the flow, which saves nothing.
+    else if self.viewing && !self.inPlace && index < self.previousCount { run self.noteEdit(index) }
+  }
+  effect fn noteEdit(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    if self.resolveAll { return }
+    if self.edited.length() == EDITS_TRACKED {
+      self.resolveAll = true
+      return
+    }
+    run self.edited.append(index)
+  }
+  // Gives a box chains of this compute, saving its previous ones, before
+  // its fragment at `index` is linked to them: the previous ones if they are
+  // in a kept range before it, else none.
+  effect fn claimBox(self: &mut Self, box: usize, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    if !self.viewing || self.boxStamps.get(box) == self.generation { return }
+    let first = self.firstByBox.get(box)
+    let last = self.lastByBox.get(box)
+    run self.savedFirst.append(first)
+    run self.savedLast.append(last)
+    self.boxStamps.set(box, self.generation)
+    self.boxSlots.set(box, self.savedFirst.length() - 1)
+    if first >= index || last >= index || self.current(box, first) == NO_NODE || self.current(box, last) == NO_NODE {
+      self.firstByBox.set(box, NO_NODE)
+      self.lastByBox.set(box, NO_NODE)
+    }
+  }
+  // Gives a box of the kept range [start, end) back its previous chains if
+  // this compute claimed it before keeping the range.
+  pub fn keepBox(self: &mut Self, box: usize, start: usize, end: usize) {
+    if !self.viewing || self.boxStamps.get(box) != self.generation { return }
+    let slot = self.boxSlots.get(box)
+    let first = self.savedFirst.get(slot)
+    let last = self.savedLast.get(slot)
+    if first == NO_NODE || first < start || first >= end || last < start || last >= end || self.values.asSlice()[first].box != box { return }
+    self.firstByBox.set(box, first)
+    self.lastByBox.set(box, last)
+  }
+
+  // Writes a fragment at the write position.
+  effect fn put(self: &mut Self, value: Fragment) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let index = self.count
+    run self.saveFragment(index)
+    // Texts are in fragment order: a text fragment's is the next.
+    let mut mark = self.textCount
+    if value.textData != NO_NODE { mark = value.textData }
+    if index < self.values.length() {
+      self.values.set(index, value)
+      self.textMarks.set(index, mark)
+    } else {
+      run self.values.append(value)
+      run self.textMarks.append(mark)
+    }
+    self.count = index + 1
+    if self.inPlace && self.count > self.written { self.written = self.count }
+    return index
+  }
+  // put of Fragment.make(box, source, kind), written in its slot.
+  // appendBox in a fresh arena during normal flow: nothing to save, claim
+  // or adopt.
+  effect fn appendFresh(self: &mut Self, box: usize, source: usize, kind: FragmentKind, parent: usize, fragmentainer: usize, first: bool, last: bool) -> FragmentId ! OutOfMemoryError ? &mut Allocator {
+    let index = self.count
+    let mut previousSibling = NO_NODE
+    let mut previousForBox = NO_NODE
+    if parent != NO_NODE { previousSibling = self.values.asSlice()[parent].lastChild }
+    if box != NO_NODE { previousForBox = self.lastByBox.get(box) }
+    if index < self.values.length() {
+      let values = self.values.asMutSlice()
+      values[index] = Fragment.make(box, source, kind)
+      self.textMarks.set(index, self.textCount)
+    } else {
+      run self.values.append(Fragment.make(box, source, kind))
+      run self.textMarks.append(self.textCount)
+    }
+    self.count = index + 1
+    let values = self.values.asMutSlice()
+    values[index].fragmentainer = fragmentainer
+    values[index].parent = parent
+    values[index].first = first
+    values[index].last = last
+    values[index].previousSibling = previousSibling
+    values[index].previousForBox = previousForBox
+    return self.linkAppended(index, parent, box, previousSibling, previousForBox)
+  }
+  effect fn putMade(self: &mut Self, box: usize, source: usize, kind: FragmentKind) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let index = self.count
+    run self.saveFragment(index)
+    if index < self.values.length() {
+      let values = self.values.asMutSlice()
+      values[index] = Fragment.make(box, source, kind)
+      self.textMarks.set(index, self.textCount)
+    } else {
+      run self.values.append(Fragment.make(box, source, kind))
+      run self.textMarks.append(self.textCount)
+    }
+    self.count = index + 1
+    if self.inPlace && self.count > self.written { self.written = self.count }
+    return index
+  }
+  effect fn putText(self: &mut Self, value: TextFragment) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let index = self.textCount
+    run self.saveText(index)
+    if index < self.texts.length() { self.texts.set(index, value) }
+    else { run self.texts.append(value) }
+    self.textCount = index + 1
+    if self.inPlace && self.textCount > self.textsWritten { self.textsWritten = self.textCount }
+    return index
+  }
+
+  // The parent must already exist; box must be prepared or NO_NODE.
+  // Arena-owned links replace incoming links. Geometry and content remain authored values.
+  pub effect fn append(self: &mut Self, fragment: Fragment) -> FragmentId ! OutOfMemoryError ? &mut Allocator {
+    self.plain = false
+    let mut value = move fragment
+    let parent = value.parent
+    let box = value.box
+    let next = self.count
+    if box != NO_NODE { run self.claimBox(box, next) }
+    if parent != NO_NODE { run self.editPosition(parent) }
+    let mut previousSibling = NO_NODE
+    let mut previousForBox = NO_NODE
+    if parent != NO_NODE { previousSibling = self.values.asSlice()[parent].lastChild }
+    if box != NO_NODE { previousForBox = self.lastByBox.get(box) }
+    if previousSibling != NO_NODE { run self.editPosition(previousSibling) }
+    if previousForBox != NO_NODE { run self.editPosition(previousForBox) }
+    value.firstChild = NO_NODE
+    value.lastChild = NO_NODE
+    value.previousSibling = previousSibling
+    value.nextSibling = NO_NODE
+    value.previousForBox = previousForBox
+    value.nextForBox = NO_NODE
+    // Link only after allocation succeeds, leaving the arena unchanged on failure.
+    run self.adopting(parent, previousForBox)
+    let index = run self.put(move value)
+    return self.linkAppended(index, parent, box, previousSibling, previousForBox)
+  }
+  // append for a new box fragment, built in its slot instead of moved there.
+  pub effect fn appendBox(self: &mut Self, box: usize, source: usize, kind: FragmentKind, parent: usize, fragmentainer: usize, first: bool, last: bool) -> FragmentId ! OutOfMemoryError ? &mut Allocator {
+    if kind != FragmentKind.Box || box == NO_NODE || (parent == NO_NODE && self.count != 0) { self.plain = false }
+    if !self.inPlace && !self.viewing && !self.afterFlow { return run self.appendFresh(box, source, kind, parent, fragmentainer, first, last) }
+    let next = self.count
+    if box != NO_NODE { run self.claimBox(box, next) }
+    if parent != NO_NODE { run self.editPosition(parent) }
+    let mut previousSibling = NO_NODE
+    let mut previousForBox = NO_NODE
+    if parent != NO_NODE { previousSibling = self.values.asSlice()[parent].lastChild }
+    if box != NO_NODE { previousForBox = self.lastByBox.get(box) }
+    if previousSibling != NO_NODE { run self.editPosition(previousSibling) }
+    if previousForBox != NO_NODE { run self.editPosition(previousForBox) }
+    run self.adopting(parent, previousForBox)
+    let index = run self.putMade(box, source, kind)
+    let value = &mut self.values.asMutSlice()[index]
+    value.fragmentainer = fragmentainer
+    value.parent = parent
+    value.first = first
+    value.last = last
+    value.previousSibling = previousSibling
+    value.previousForBox = previousForBox
+    return self.linkAppended(index, parent, box, previousSibling, previousForBox)
+  }
+  fn linkAppended(self: &mut Self, index: usize, parent: usize, box: usize, previousSibling: usize, previousForBox: usize) -> FragmentId with Intrinsic.inlineAlways() {
+    let values = self.values.asMutSlice()
+    if parent != NO_NODE {
+      if previousSibling == NO_NODE { values[parent].firstChild = index }
+      else { values[previousSibling].nextSibling = index }
+      values[parent].lastChild = index
+    }
+    if box != NO_NODE {
+      if previousForBox == NO_NODE { self.firstByBox.set(box, index) }
+      else { values[previousForBox].nextForBox = index }
+      self.lastByBox.set(box, index)
+    }
+    return FragmentId { index: index }
+  }
+  // Records normal-flow fragments that a fragment appended after the
+  // normal flow links to.
+  effect fn adopting(self: &mut Self, parent: usize, previousForBox: usize) ! OutOfMemoryError ? &mut Allocator {
+    if !self.afterFlow { return }
+    if parent != NO_NODE && parent < self.flowEnd { run self.adopted.append(parent) }
+    if previousForBox != NO_NODE && previousForBox < self.flowEnd { run self.adopted.append(previousForBox) }
+  }
+  // Starts the normal flow over, after a rollback to the start.
+  pub fn restartFlow(self: &mut Self) {
+    self.afterFlow = false
+    self.adopted.clear()
+  }
+
+  pub effect fn appendText(self: &mut Self, fragment: Fragment, text: TextFragment) -> FragmentId ! OutOfMemoryError ? &mut Allocator {
+    // Reserve both arenas before publishing either half of the association.
+    run self.values.reserve(1)
+    run self.texts.reserve(1)
+    run self.textMarks.reserve(1)
+    let mut value = fragment
+    value.textData = run self.putText(text)
+    return run self.append(value)
+  }
+
+  pub fn checkpoint(self: &Self) -> usize { return self.count }
+  pub fn textCheckpoint(self: &Self) -> usize { return self.textCount }
+
+  // Undo appends in reverse order, including links held by surviving fragments.
+  // This does not undo caller edits to geometry of fragments before the checkpoint.
+  pub fn rollback(self: &mut Self, checkpoint: usize) {
+    let mut index = self.count
+    while index > checkpoint {
+      index = index - 1
+      let text = self.values.asSlice()[index].textData
+      if text != NO_NODE { self.textCount = text }
+      let parent = self.values.asSlice()[index].parent
+      let previousSibling = self.values.asSlice()[index].previousSibling
+      let box = self.values.asSlice()[index].box
+      let previousForBox = self.values.asSlice()[index].previousForBox
+      if parent != NO_NODE { self.editUnsaved(parent) }
+      if previousSibling != NO_NODE { self.editUnsaved(previousSibling) }
+      if previousForBox != NO_NODE { self.editUnsaved(previousForBox) }
+      let values = self.values.asMutSlice()
+      if parent != NO_NODE {
+        values[parent].lastChild = previousSibling
+        if previousSibling == NO_NODE { values[parent].firstChild = NO_NODE }
+        else { values[previousSibling].nextSibling = NO_NODE }
+      }
+      if box != NO_NODE {
+        self.lastByBox.set(box, previousForBox)
+        if previousForBox == NO_NODE { self.firstByBox.set(box, NO_NODE) }
+        else { values[previousForBox].nextForBox = NO_NODE }
+      }
+    }
+    self.count = checkpoint
+    if !self.inPlace {
+      self.values.truncate(checkpoint)
+      self.textMarks.truncate(checkpoint)
+      self.texts.truncate(self.textCount)
+    }
+    let mut kept = self.settled.length()
+    while kept > 0 && self.settled.get(kept - 1).end > checkpoint { kept = kept - 1 }
+    self.settled.truncate(kept)
+  }
+  // Records that positioning may have given fragments visual offsets.
+  pub fn offsetting(self: &mut Self) {
+    self.offsets = true
+    self.resolveAll = true
+  }
+  // Leaves world locations and text first/last flags to the first
+  // resolveLocations, so a compute whose output nobody reads in full skips
+  // a walk over every fragment.
+  pub fn deferLocations(self: &mut Self) { self.stale = true }
+  // A fragment's final location relative to the initial containing block,
+  // resolved or not.
+  pub fn worldLocation(self: &Self, index: usize) -> Point {
+    let values = self.values.asSlice()
+    if !self.stale { return values[index].worldLocation }
+    return locate(values, index)
+  }
+  // Parents precede children in the arena. Resolve final visual coordinates
+  // once, rather than repeatedly walking ancestors for source-bound queries.
+  // Readers of worldLocation, first or last call this first.
+  pub fn resolveLocations(self: &mut Self) {
+    self.stale = false
+    let all = self.resolveAll
+    self.resolveAll = false
+    // Sort the few edits, in place.
+    let edited = self.edited.asMutSlice()
+    let mut at: usize = 1
+    while at < edited.length {
+      let value = edited[at]
+      let mut to = at
+      while to > 0 && edited[to - 1] > value {
+        edited[to] = edited[to - 1]
+        to = to - 1
+      }
+      edited[to] = value
+      at = at + 1
+    }
+    let settled = self.settled.asSlice()
+    let values = self.values.asMutSlice()
+    let mut range: usize = 0
+    let mut edit: usize = 0
+    let mut index: usize = 0
+    while index < values.length {
+      // Text ownership is finalized from accepted links. Speculative emission
+      // must not clear a surviving earlier fragment's last flag.
+      if values[index].kind == FragmentKind.Text && values[index].box != NO_NODE {
+        values[index].first = values[index].previousForBox == NO_NODE
+        values[index].last = values[index].nextForBox == NO_NODE
+      }
+      let parent = values[index].parent
+      let mut x = values[index].location.x + values[index].visualOffset.x
+      let mut y = values[index].location.y + values[index].visualOffset.y
+      if parent != NO_NODE {
+        x = x + values[parent].worldLocation.x
+        y = y + values[parent].worldLocation.y
+      }
+      let moved = values[index].worldLocation.x != x || values[index].worldLocation.y != y
+      values[index].worldLocation = Point { x: x, y: y }
+      // A kept range whose root did not move and none of whose fragments
+      // were edited keeps its world locations.
+      if !all && !moved {
+        while range < settled.length && settled[range].start < index { range = range + 1 }
+        if range < settled.length && settled[range].start == index && settled[range].kept {
+          let end = settled[range].end
+          while edit < edited.length && edited[edit] <= index { edit = edit + 1 }
+          if edit == edited.length || edited[edit] >= end {
+            index = end
+            continue
+          }
+        }
+      }
+      index = index + 1
+    }
+  }
+
+
+  // Moves the previous output from fragment `start` on, and its texts, to
+  // the write position, so the previous ranges after a box that emitted more
+  // or fewer fragments than before can be kept in place (canKeep) rather
+  // than copied a fragment at a time. Previous indices at or after `start`
+  // move by the returned shift; the caller moves those it holds (see
+  // LayoutCache.shiftRanges). Returns a shift of 0 when it cannot.
+  pub effect fn shiftPrevious(self: &mut Self, start: usize) -> Shift ! OutOfMemoryError ? &mut Allocator {
+    let none = Shift { start: 0, up: false, by: 0 }
+    if !self.inPlace || self.damaged || self.afterFlow || self.shifts == SHIFTS || start == self.count || start >= self.previousCount { return none }
+    self.shifts = self.shifts + 1
+    let total = self.previousCount
+    // The first text of the moved fragments.
+    let mut textStart = self.previousTexts
+    let mut index = start
+    while index < total && textStart == self.previousTexts {
+      let data = self.previous(index).textData
+      if data != NO_NODE { textStart = data }
+      index = index + 1
+    }
+    let shift = Shift.between(start, self.count)
+    let textShift = Shift.between(textStart, self.textCount)
+    let texts = self.previousTexts
+    let movedTexts = texts - textStart
+    let newTexts = textShift.apply(texts)
+    if newTexts > self.texts.length() {
+      let filler = self.previousText(textStart)
+      let textsLength = self.texts.length()
+      run self.texts.appendRepeated(filler, newTexts - textsLength)
+    }
+    if newTexts > self.textStamps.length() {
+      let textStampsLength = self.textStamps.length()
+      run self.textStamps.appendRepeated(0, newTexts - textStampsLength)
+      let textSlotsLength = self.textSlots.length()
+      run self.textSlots.appendRepeated(0, newTexts - textSlotsLength)
+    }
+    let generation = self.generation
+    let mut step: usize = 0
+    while step < movedTexts {
+      let mut from = textStart + step
+      if textShift.up { from = texts - 1 - step }
+      let value = self.previousText(from)
+      let to = textShift.apply(from)
+      self.texts.set(to, value)
+      self.textStamps.set(to, 0)
+      step = step + 1
+    }
+    let moved = total - start
+    let newTotal = shift.apply(total)
+    if newTotal > self.values.length() {
+      let filler = self.previous(start)
+      let valuesLength = self.values.length()
+      run self.values.appendRepeated(filler, newTotal - valuesLength)
+      let textMarksLength = self.textMarks.length()
+      run self.textMarks.appendRepeated(0, newTotal - textMarksLength)
+    }
+    if newTotal > self.fragmentStamps.length() {
+      let fragmentStampsLength = self.fragmentStamps.length()
+      run self.fragmentStamps.appendRepeated(0, newTotal - fragmentStampsLength)
+      let fragmentSlotsLength = self.fragmentSlots.length()
+      run self.fragmentSlots.appendRepeated(0, newTotal - fragmentSlotsLength)
+    }
+    // In place, field by field: a moved fragment is copied once.
+    let values = self.values.asMutSlice()
+    let saved = self.savedFragments.asSlice()
+    let positions = self.savedPositions.asSlice()
+    let stamps = self.fragmentStamps.asMutSlice()
+    let slots = self.fragmentSlots.asSlice()
+    step = 0
+    while step < moved {
+      let mut from = start + step
+      if shift.up { from = total - 1 - step }
+      let to = shift.apply(from)
+      if stamps[from] == generation && slots[from] < PARTIAL_SLOT { values[to] = saved[slots[from]] }
+      else {
+        values[to] = values[from]
+        if stamps[from] == generation { positions[slots[from] - PARTIAL_SLOT].restore(&mut values[to]) }
+      }
+      stamps[to] = 0
+      let value = &mut values[to]
+      value.parent = shift.apply(value.parent)
+      value.firstChild = shift.apply(value.firstChild)
+      value.lastChild = shift.apply(value.lastChild)
+      value.previousSibling = shift.apply(value.previousSibling)
+      value.nextSibling = shift.apply(value.nextSibling)
+      value.previousForBox = shift.apply(value.previousForBox)
+      value.nextForBox = shift.apply(value.nextForBox)
+      value.textData = textShift.apply(value.textData)
+      step = step + 1
+    }
+    // Text marks of the moved fragments, in order.
+    let mut mark = self.textCount
+    index = self.count
+    while index < newTotal {
+      self.textMarks.set(index, mark)
+      if self.values.asSlice()[index].textData != NO_NODE { mark = mark + 1 }
+      index = index + 1
+    }
+    // Box chains that still name previous fragments.
+    let mut box: usize = 0
+    while box < self.firstByBox.length() {
+      if self.boxStamps.get(box) == self.generation {
+        let slot = self.boxSlots.get(box)
+        let savedFirstValue = shift.apply(self.savedFirst.get(slot))
+        self.savedFirst.set(slot, savedFirstValue)
+        let savedLastValue = shift.apply(self.savedLast.get(slot))
+        self.savedLast.set(slot, savedLastValue)
+      } else {
+        let firstByBoxValue = shift.apply(self.firstByBox.get(box))
+        self.firstByBox.set(box, firstByBoxValue)
+        let lastByBoxValue = shift.apply(self.lastByBox.get(box))
+        self.lastByBox.set(box, lastByBoxValue)
+      }
+      box = box + 1
+    }
+    let adopted = self.previousAdopted.asMutSlice()
+    index = 0
+    while index < adopted.length {
+      adopted[index] = shift.apply(adopted[index])
+      index = index + 1
+    }
+    self.previousCount = newTotal
+    self.previousTexts = newTexts
+    if !shift.up { self.values.truncate(newTotal) }
+    if !shift.up { self.textMarks.truncate(newTotal) }
+    if !textShift.up { self.texts.truncate(newTexts) }
+    // Past the write position lies only the previous output now.
+    self.written = self.count
+    self.textsWritten = self.textCount
+    return shift
+  }
+
+  // Whether the previous range [start, end) can stay where it is as the
+  // next fragments: it starts at the write position, nothing of it or its
+  // texts was overwritten, and nothing positioning appended links into it.
+  pub fn canKeep(self: &Self, start: usize, end: usize) -> bool with Intrinsic.inlineAlways() {
+    if !self.inPlace || self.damaged || start != self.count || start < self.written || end > self.previousCount || start >= end { return false }
+    let firstText = self.textMarks.get(start)
+    if firstText != self.textCount || firstText < self.textsWritten { return false }
+    // The first adopted fragment at or after start.
+    let adopted = self.previousAdopted.asSlice()
+    let mut low: usize = 0
+    let mut high = adopted.length
+    while low < high {
+      let middle = (low + high) / 2
+      if adopted[middle] < start { low = middle + 1 } else { high = middle }
+    }
+    return low == adopted.length || adopted[low] >= end
+  }
+  // Keeps the previous range [start, end) in place as the next fragments,
+  // under `parent`, recorded as settled; see canKeep.
+  pub effect fn keepRange(self: &mut Self, start: usize, end: usize, parent: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    run self.settled.reserve(1)
+    let overflow = self.values.asSlice()[start].scrollableOverflow
+    let mut texts = self.textMarks.get(end - 1)
+    if self.values.asSlice()[end - 1].textData != NO_NODE { texts = texts + 1 }
+    self.count = end
+    self.textCount = texts
+    run self.editPosition(start)
+    let values = self.values.asMutSlice()
+    values[start].parent = parent
+    run self.linkParent(start)
+    run self.settled.append(SettledRange { start: start, end: end, overflow: overflow, kept: true })
+  }
+  // Appends a copy of the previous range [start, end), as appendRange does
+  // from another arena.
+  pub effect fn copyPrevious(self: &mut Self, start: usize, end: usize, parent: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let base = self.count
+    run self.settled.reserve(1)
+    let mut index = start
+    while index < end {
+      let mut value = self.previous(index)
+      if (index > start && (value.parent < start || value.parent >= index)) || (value.lastChild != NO_NODE && value.lastChild >= end) {
+        self.rollback(base)
+        return false
+      }
+      if value.textData != NO_NODE {
+        let text = self.previousText(value.textData)
+        value.textData = run self.putText(text)
+      }
+      value.visualOffset = Point { x: 0.0, y: 0.0 }
+      value.worldLocation = Point { x: 0.0, y: 0.0 }
+      let at = base + (index - start)
+      if index == start { value.parent = parent }
+      else {
+        value.parent = base + (value.parent - start)
+        if value.previousSibling != NO_NODE { value.previousSibling = base + (value.previousSibling - start) }
+        if value.nextSibling != NO_NODE { value.nextSibling = base + (value.nextSibling - start) }
+      }
+      if value.firstChild != NO_NODE {
+        value.firstChild = base + (value.firstChild - start)
+        value.lastChild = base + (value.lastChild - start)
+      }
+      let put = run self.put(value)
+      if index == start { run self.linkParent(at) }
+      run self.linkBox(put)
+      index = index + 1
+    }
+    let overflow = self.previous(start).scrollableOverflow
+    let end = self.count
+    run self.settled.append(SettledRange { start: base, end: end, overflow: overflow, kept: false })
+    return true
+  }
+
+  // Appends a copy of the source's fragments [start, end), whose parents all
+  // lie inside the range except the first's, which becomes `parent`. Links
+  // are rebuilt as append would; visual offsets and world locations reset.
+  // The range is recorded as settled. Returns false, leaving the arena as it
+  // was, when a link leaves the range: positioning appended a child after
+  // the normal-flow fragments. Works in chunks small enough to stay cached
+  // between checking, copying and relinking them. Not for in-place computes.
+  pub effect fn appendRange(self: &mut Self, source: &FragmentArena, start: usize, end: usize, parent: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if !source.plain { self.plain = false }
+    let base = self.values.length()
+    let sourceValues = source.values.asSlice()
+    let sourceTexts = source.texts.asSlice()
+    run self.values.reserve(end - start)
+    run self.textMarks.reserve(end - start)
+    run self.settled.reserve(1)
+    let mut chunk = start
+    while chunk < end {
+      let mut stop = chunk + RANGE_CHUNK
+      if stop > end { stop = end }
+      // Text records of a laid-out range are usually contiguous: copy them in
+      // one piece and shift indices, else one by one.
+      let mut texts: usize = 0
+      let mut firstText = NO_NODE
+      let mut lastText: usize = 0
+      let mut ordered = true
+      let mut index = chunk
+      while index < stop {
+        let from = &sourceValues[index]
+        if (index > start && (from.parent < start || from.parent >= index)) || (from.lastChild != NO_NODE && from.lastChild >= end) {
+          self.rollback(base)
+          return false
+        }
+        let text = from.textData
+        if text != NO_NODE {
+          if firstText == NO_NODE { firstText = text }
+          else if text != lastText + 1 { ordered = false }
+          lastText = text
+          texts = texts + 1
+        }
+        index = index + 1
+      }
+      run self.texts.reserve(texts)
+      let at0 = self.values.length()
+      run self.values.appendSlice(Slice.view(sourceValues, chunk, stop - chunk))
+      let textBase = self.texts.length()
+      let bulk = texts != 0 && ordered
+      if bulk { run self.texts.appendSlice(Slice.view(sourceTexts, firstText, texts)) }
+      let mut at = at0
+      let last = at0 + (stop - chunk)
+      let mut seen: usize = 0
+      while at < last {
+        let values = self.values.asMutSlice()
+        values[at].visualOffset = Point { x: 0.0, y: 0.0 }
+        values[at].worldLocation = Point { x: 0.0, y: 0.0 }
+        if values[at].textData != NO_NODE {
+          if bulk {
+            run self.textMarks.append(textBase + seen)
+            values[at].textData = textBase + (values[at].textData - firstText)
+            seen = seen + 1
+          } else {
+            let text = sourceTexts[values[at].textData]
+            run self.textMarks.append(self.texts.length())
+            values[at].textData = self.texts.length()
+            run self.texts.append(text)
+          }
+        } else if bulk { run self.textMarks.append(textBase + seen) }
+        else { run self.textMarks.append(self.texts.length()) }
+        let linked = self.values.asMutSlice()
+        if at == base {
+          linked[at].parent = parent
+          if linked[at].firstChild != NO_NODE {
+            linked[at].firstChild = base + (linked[at].firstChild - start)
+            linked[at].lastChild = base + (linked[at].lastChild - start)
+          }
+          run self.linkParent(at)
+        } else {
+          // Every link but the root's own sibling links stays in the range.
+          linked[at].parent = base + (linked[at].parent - start)
+          if linked[at].firstChild != NO_NODE {
+            linked[at].firstChild = base + (linked[at].firstChild - start)
+            linked[at].lastChild = base + (linked[at].lastChild - start)
+          }
+          if linked[at].previousSibling != NO_NODE { linked[at].previousSibling = base + (linked[at].previousSibling - start) }
+          if linked[at].nextSibling != NO_NODE { linked[at].nextSibling = base + (linked[at].nextSibling - start) }
+        }
+        run self.linkBox(at)
+        at = at + 1
+      }
+      self.count = self.values.length()
+      self.textCount = self.texts.length()
+      chunk = stop
+    }
+    run self.settled.append(SettledRange { start: base, end: base + (end - start), overflow: sourceValues[start].scrollableOverflow, kept: false })
+    return true
+  }
+  // Links an appended range's first fragment after its parent's last child.
+  effect fn linkParent(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+    let parent = self.values.asSlice()[index].parent
+    let mut previousSibling = NO_NODE
+    if parent != NO_NODE {
+      run self.editPosition(parent)
+      previousSibling = self.values.asSlice()[parent].lastChild
+      if previousSibling != NO_NODE { run self.editPosition(previousSibling) }
+    }
+    let values = self.values.asMutSlice()
+    values[index].previousSibling = previousSibling
+    values[index].nextSibling = NO_NODE
+    if parent != NO_NODE {
+      if previousSibling == NO_NODE { values[parent].firstChild = index }
+      else { values[previousSibling].nextSibling = index }
+      values[parent].lastChild = index
+    }
+  }
+  // Appends a fragment to its box's fragment list.
+  effect fn linkBox(self: &mut Self, index: usize) ! OutOfMemoryError ? &mut Allocator {
+    let box = self.values.asSlice()[index].box
+    if box == NO_NODE {
+      let values = self.values.asMutSlice()
+      values[index].nextForBox = NO_NODE
+      values[index].previousForBox = NO_NODE
+      return
+    }
+    run self.claimBox(box, index)
+    let previousForBox = self.lastByBox.get(box)
+    if previousForBox != NO_NODE { run self.editPosition(previousForBox) }
+    let values = self.values.asMutSlice()
+    values[index].nextForBox = NO_NODE
+    values[index].previousForBox = previousForBox
+    if previousForBox == NO_NODE { self.firstByBox.set(box, index) }
+    else { values[previousForBox].nextForBox = index }
+    self.lastByBox.set(box, index)
+  }
+
+  // Renumbers the boxes fragments belong to: `toNew[old]` is a box's new
+  // index or NO_NODE, `toOld[new]` the reverse.
+  pub effect fn remapBoxes(self: &mut Self, toOld: &[usize], toNew: &[usize]) ! OutOfMemoryError ? &mut Allocator {
+    let values = self.values.asMutSlice()
+    let mut index: usize = 0
+    while index < values.length {
+      let box = values[index].box
+      if box != NO_NODE {
+        if box < toNew.length { values[index].box = toNew[box] } else { values[index].box = NO_NODE }
+      }
+      index = index + 1
+    }
+    let mut first = List<usize>.make()
+    let mut last = List<usize>.make()
+    run first.reserveExact(toOld.length)
+    run last.reserveExact(toOld.length)
+    let mut id: usize = 0
+    while id < toOld.length {
+      let from = toOld[id]
+      if from != NO_NODE && from < self.firstByBox.length() {
+        run first.append(self.firstByBox.get(from))
+        run last.append(self.lastByBox.get(from))
+      } else {
+        run first.append(NO_NODE)
+        run last.append(NO_NODE)
+      }
+      id = id + 1
+    }
+    self.firstByBox = move first
+    self.lastByBox = move last
+  }
+
+  pub fn boxCount(self: &Self) -> usize { return self.firstByBox.length() }
+  // Whether a whole output stands, with no visual offsets: between computes.
+  pub fn settledOutput(self: &Self) -> bool {
+    return !self.inPlace && !self.offsets && self.count == self.values.length() && self.textCount == self.texts.length()
+  }
+  // How many texts the fragments before `index` hold.
+  pub fn textsBefore(self: &Self, index: usize) -> usize {
+    if index < self.textMarks.length() { return self.textMarks.get(index) }
+    return self.texts.length()
+  }
+  // Replaces the output's fragments [start, end) with all of `source`'s, a
+  // layout of the same subtree alone that emitted as many fragments and
+  // texts. The first keeps its place among its siblings and its location;
+  // world locations follow from it. Between computes only (settledOutput).
+  pub fn spliceFrom(self: &mut Self, start: usize, end: usize, source: &FragmentArena) {
+    // Parents' world locations may be out of date.
+    if self.stale { self.resolveAll = true }
+    let firstText = self.textsBefore(start)
+    let values = self.values.asMutSlice()
+    let from = source.values.asSlice()
+    // The boxes of the old fragments lose their chains; the new ones set them.
+    let mut index = start
+    while index < end {
+      let box = values[index].box
+      if box != NO_NODE {
+        self.firstByBox.set(box, NO_NODE)
+        self.lastByBox.set(box, NO_NODE)
+      }
+      index = index + 1
+    }
+    let root = values[start]
+    index = start
+    while index < end {
+      let mut value = from[index - start]
+      if index == start {
+        value.parent = root.parent
+        value.previousSibling = root.previousSibling
+        value.nextSibling = root.nextSibling
+        value.location = root.location
+      } else {
+        value.parent = value.parent + start
+        if value.previousSibling != NO_NODE { value.previousSibling = value.previousSibling + start }
+        if value.nextSibling != NO_NODE { value.nextSibling = value.nextSibling + start }
+      }
+      if value.firstChild != NO_NODE {
+        value.firstChild = value.firstChild + start
+        value.lastChild = value.lastChild + start
+      }
+      if value.previousForBox != NO_NODE { value.previousForBox = value.previousForBox + start }
+      if value.nextForBox != NO_NODE { value.nextForBox = value.nextForBox + start }
+      if value.textData != NO_NODE { value.textData = value.textData + firstText }
+      if value.kind == FragmentKind.Text && value.box != NO_NODE {
+        value.first = value.previousForBox == NO_NODE
+        value.last = value.nextForBox == NO_NODE
+      }
+      let mut x = value.location.x + value.visualOffset.x
+      let mut y = value.location.y + value.visualOffset.y
+      if value.parent != NO_NODE {
+        x = x + values[value.parent].worldLocation.x
+        y = y + values[value.parent].worldLocation.y
+      }
+      value.worldLocation = Point { x: x, y: y }
+      if value.box != NO_NODE {
+        if value.previousForBox == NO_NODE { self.firstByBox.set(value.box, index) }
+        if value.nextForBox == NO_NODE { self.lastByBox.set(value.box, index) }
+      }
+      values[index] = value
+      self.textMarks.set(index, firstText + source.textMarks.get(index - start))
+      index = index + 1
+    }
+    let texts = self.texts.asMutSlice()
+    let fromTexts = source.texts.asSlice()
+    let mut text: usize = 0
+    while text < fromTexts.length {
+      texts[firstText + text] = fromTexts[text]
+      text = text + 1
+    }
+  }
+  // A box's first and last fragments of this compute so far, or NO_NODE.
+  // The chains of a box this compute has not reached still name previous
+  // fragments, which are not the box's unless kept.
+  pub fn first(self: &Self, box: usize) -> usize { return self.current(box, self.firstByBox.get(box)) }
+  pub fn last(self: &Self, box: usize) -> usize { return self.current(box, self.lastByBox.get(box)) }
+  fn current(self: &Self, box: usize, index: usize) -> usize {
+    if index == NO_NODE || index >= self.count || self.values.asSlice()[index].box != box { return NO_NODE }
+    return index
+  }
+  pub fn get(self: &Self, id: FragmentId) -> &Fragment { return &self.values.asSlice()[id.index] }
+}
