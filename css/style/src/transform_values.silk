@@ -1,0 +1,1177 @@
+//! Transform1/2 specified operations. Reference-box resolution and 4x4 composition
+//! belong to the geometry transforms module, never to computed-value conversion.
+import input { Input, TokenView }
+import tokens { Kind }
+import tokens
+import properties { Property }
+import value_cursor { Cursor }
+import dimensions { ExprId, Dimension, Unit }
+import dimensions
+import svg_geometry.geometry { Transform }
+import svg_geometry.transforms as transforms
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub enum Edge {
+  Start,
+  Center,
+  End
+}
+
+pub struct PositionAxis {
+  pub edge: Edge,
+  pub offset: ExprId
+}
+
+impl Copy for PositionAxis {}
+
+pub struct Position {
+  pub x: PositionAxis,
+  pub y: PositionAxis
+}
+
+impl Copy for Position {}
+
+pub enum ReferenceBox {
+  Content,
+  Border,
+  Fill,
+  Stroke,
+  View
+}
+
+pub enum TransformStyle {
+  Flat,
+  Preserve3d
+}
+
+pub enum Backface {
+  Visible,
+  Hidden
+}
+
+// Matrix components retain CSS column-major order, including projective terms.
+// threeD preserves the specified primitive family for interpolation.
+pub union Operation {
+  Matrix2 { pub components: [ExprId; 6] },
+  Matrix3 { pub components: [ExprId; 16] },
+  Translate { pub x: ExprId, pub y: ExprId, pub z: ExprId, pub threeD: bool },
+  Scale { pub x: ExprId, pub y: ExprId, pub z: ExprId, pub threeD: bool },
+  Rotate { pub x: ExprId, pub y: ExprId, pub z: ExprId, pub angle: ExprId, pub threeD: bool },
+  Skew { pub x: ExprId, pub y: ExprId },
+  Perspective { pub depth: Option<ExprId> },
+}
+
+pub union TransformValue {
+  None,
+  List { pub operations: List<Operation> },
+  Individual { pub operation: Operation },
+  Origin { pub position: Position, pub z: ExprId },
+  PerspectiveOrigin { pub position: Position },
+  Perspective { pub depth: ExprId },
+  Box { pub value: ReferenceBox },
+  Style { pub value: TransformStyle },
+  BackfaceVisibility { pub value: Backface },
+}
+
+enum Function {
+  Matrix,
+  Matrix3d,
+  Translate,
+  TranslateX,
+  TranslateY,
+  TranslateZ,
+  Translate3d,
+  Scale,
+  ScaleX,
+  ScaleY,
+  ScaleZ,
+  Scale3d,
+  Rotate,
+  RotateX,
+  RotateY,
+  RotateZ,
+  Rotate3d,
+  Skew,
+  SkewX,
+  SkewY,
+  Perspective,
+}
+
+fn functionName(name: &[u8]) -> Option<Function> {
+  if tokens.insensitive(name, b"matrix") {
+    return Option<Function>.some(Function.Matrix)
+  }
+  if tokens.insensitive(name, b"translate") {
+    return Option<Function>.some(Function.Translate)
+  }
+  if tokens.insensitive(name, b"scale") {
+    return Option<Function>.some(Function.Scale)
+  }
+  if tokens.insensitive(name, b"rotate") {
+    return Option<Function>.some(Function.Rotate)
+  }
+  if tokens.insensitive(name, b"skewX") {
+    return Option<Function>.some(Function.SkewX)
+  }
+  if tokens.insensitive(name, b"skewY") {
+    return Option<Function>.some(Function.SkewY)
+  }
+  if tokens.insensitive(name, b"matrix3d") {
+    return Option<Function>.some(Function.Matrix3d)
+  }
+  if tokens.insensitive(name, b"translate3d") {
+    return Option<Function>.some(Function.Translate3d)
+  }
+  if tokens.insensitive(name, b"translateZ") {
+    return Option<Function>.some(Function.TranslateZ)
+  }
+  if tokens.insensitive(name, b"scale3d") {
+    return Option<Function>.some(Function.Scale3d)
+  }
+  if tokens.insensitive(name, b"scaleZ") {
+    return Option<Function>.some(Function.ScaleZ)
+  }
+  if tokens.insensitive(name, b"rotate3d") {
+    return Option<Function>.some(Function.Rotate3d)
+  }
+  if tokens.insensitive(name, b"rotateX") {
+    return Option<Function>.some(Function.RotateX)
+  }
+  if tokens.insensitive(name, b"rotateY") {
+    return Option<Function>.some(Function.RotateY)
+  }
+  if tokens.insensitive(name, b"rotateZ") {
+    return Option<Function>.some(Function.RotateZ)
+  }
+  if tokens.insensitive(name, b"perspective") {
+    return Option<Function>.some(Function.Perspective)
+  }
+  if tokens.insensitive(name, b"translateX") {
+    return Option<Function>.some(Function.TranslateX)
+  }
+  if tokens.insensitive(name, b"translateY") {
+    return Option<Function>.some(Function.TranslateY)
+  }
+  if tokens.insensitive(name, b"scaleX") {
+    return Option<Function>.some(Function.ScaleX)
+  }
+  if tokens.insensitive(name, b"scaleY") {
+    return Option<Function>.some(Function.ScaleY)
+  }
+  if tokens.insensitive(name, b"skew") {
+    return Option<Function>.some(Function.Skew)
+  }
+  return Option<Function>.None
+}
+
+fn opener(input: &Input, cursor: &mut Cursor) -> Option<Function> {
+  let saved = cursor.position
+  cursor.skip(input)
+  if cursor.position >= cursor.end {
+    cursor.position = saved
+    return Option<Function>.None
+  }
+  let next = input.at(cursor.position)
+  match &next {
+    Option<TokenView>.Some { value } => {
+      match &value.token.kind {
+        Kind.Function { name } => {
+          let result = functionName(value.text(name))
+          match &result {
+            Option<Function>.Some { value: found } => {
+              cursor.position = cursor.position + 1
+              return Option<Function>.some(found)
+            }
+            _ => {}
+          }
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  cursor.position = saved
+  return Option<Function>.None
+}
+
+effect fn numeric(
+  numerics: &mut dimensions.Store,
+  input: &Input,
+  cursor: &mut Cursor,
+  expected: Dimension,
+) -> Option<ExprId>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let saved = cursor.position
+  cursor.skip(input)
+  let next = input.at(cursor.position)
+  if cursor.position < cursor.end {
+    match &next {
+      Option<TokenView>.Some { value } => match &value.token.kind {
+        Kind.Number { value: scalar, integer } => {
+          if expected == Dimension.Angle && scalar == 0.0 {
+            cursor.position = cursor.position + 1
+            return Option<ExprId>.some((run dimensions.literal(&mut numerics.*, scalar, Unit.Deg)))
+          }
+        }
+        _ => {}
+      }
+      _ => {}
+    }
+  }
+  cursor.position = saved
+  return (run dimensions.parse(&mut numerics.*, input, &mut cursor.*, expected, false))
+}
+
+fn argumentDimension(kind: Function, index: usize) -> Dimension {
+  if kind == Function.Translate || kind == Function.TranslateX || kind == Function.TranslateY
+    || kind == Function.Translate3d {
+    return if index == 2 {
+      Dimension.Length
+    } else {
+      Dimension.LengthPercentage
+    }
+  }
+  if kind == Function.TranslateZ || kind == Function.Perspective {
+    return Dimension.Length
+  }
+  if kind == Function.Scale || kind == Function.ScaleX || kind == Function.ScaleY
+    || kind == Function.ScaleZ
+    || kind == Function.Scale3d {
+    return Dimension.NumberPercentage
+  }
+  if kind == Function.Rotate3d {
+    return if index == 3 {
+      Dimension.Angle
+    } else {
+      Dimension.Number
+    }
+  }
+  if kind == Function.Rotate || kind == Function.RotateX || kind == Function.RotateY
+    || kind == Function.RotateZ
+    || kind == Function.Skew
+    || kind == Function.SkewX
+    || kind == Function.SkewY {
+    return Dimension.Angle
+  }
+  return Dimension.Number
+}
+
+effect fn operation(numerics: &mut dimensions.Store, input: &Input, cursor: &mut Cursor) -> Option<
+  Operation
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let found = opener(input, &mut cursor.*)
+  let kind = match &found {
+    Option<Function>.Some { value } => value
+    _ => {
+      return Option<Operation>.None
+    }
+  }
+  if kind == Function.Perspective && cursor.ident(input, b"none") {
+    if !cursor.close(input) {
+      return Option<Operation>.None
+    }
+    return Option<Operation>.some(Operation.Perspective { depth: Option<ExprId>.None })
+  }
+  let initial = (run numeric(&mut numerics.*, input, &mut cursor.*, argumentDimension(kind, 0)))
+  let first = match &initial {
+    Option<ExprId>.Some { value } => value
+    _ => {
+      return Option<Operation>.None
+    }
+  }
+  let mut arguments = [first; 16]
+  let mut count: usize = 1
+  let maximum: usize = if kind == Function.Matrix {
+    6
+  } else if kind == Function.Matrix3d {
+    16
+  } else if kind == Function.Rotate3d {
+    4
+  } else if kind == Function.Translate3d || kind == Function.Scale3d {
+    3
+  } else if kind == Function.Translate || kind == Function.Scale || kind == Function.Skew {
+    2
+  } else {
+    1
+  }
+  while !cursor.close(input) {
+    if count >= maximum || !cursor.comma(input) {
+      return Option<Operation>.None
+    }
+    let parsed = (run numeric(
+      &mut numerics.*,
+      input,
+      &mut cursor.*,
+      argumentDimension(kind, count),
+    ))
+    match &parsed {
+      Option<ExprId>.Some { value } => {
+        arguments[count] = value
+      }
+      _ => {
+        return Option<Operation>.None
+      }
+    }
+    count = count + 1
+  }
+  if (kind == Function.Matrix || kind == Function.Matrix3d || kind == Function.Rotate3d
+    || kind == Function.Translate3d
+    || kind == Function.Scale3d)
+    && count != maximum {
+    return Option<Operation>.None
+  }
+  if kind == Function.Matrix {
+    return Option<Operation>.some(
+      Operation.Matrix2 {
+        components: [
+          arguments[0],
+          arguments[1],
+          arguments[2],
+          arguments[3],
+          arguments[4],
+          arguments[5],
+        ],
+      },
+    )
+  }
+  if kind == Function.Matrix3d {
+    return Option<Operation>.some(Operation.Matrix3 { components: arguments })
+  }
+  if kind == Function.Perspective {
+    if dimensions.negativeLiteral(&numerics.*, first) {
+      return Option<Operation>.None
+    }
+    return Option<Operation>.some(Operation.Perspective { depth: Option<ExprId>.some(first) })
+  }
+  if kind == Function.Translate || kind == Function.TranslateX || kind == Function.TranslateY
+    || kind == Function.TranslateZ
+    || kind == Function.Translate3d {
+    let zero = (run dimensions.literal(&mut numerics.*, 0.0, Unit.Px))
+    let x = if kind == Function.TranslateY || kind == Function.TranslateZ {
+      zero
+    } else {
+      first
+    }
+    let y = if kind == Function.TranslateY {
+      first
+    } else if count > 1 {
+      arguments[1]
+    } else {
+      zero
+    }
+    let z = if kind == Function.TranslateZ {
+      first
+    } else if count > 2 {
+      arguments[2]
+    } else {
+      zero
+    }
+    return Option<Operation>.some(
+      Operation.Translate {
+        x: x,
+        y: y,
+        z: z,
+        threeD: kind == Function.TranslateZ || kind == Function.Translate3d,
+      },
+    )
+  }
+  if kind == Function.Scale || kind == Function.ScaleX || kind == Function.ScaleY
+    || kind == Function.ScaleZ
+    || kind == Function.Scale3d {
+    let one = (run dimensions.literal(&mut numerics.*, 1.0, Unit.Number))
+    let x = if kind == Function.ScaleY || kind == Function.ScaleZ {
+      one
+    } else {
+      first
+    }
+    let y = if kind == Function.ScaleY {
+      first
+    } else if count > 1 {
+      arguments[1]
+    } else if kind == Function.Scale {
+      first
+    } else {
+      one
+    }
+    let z = if kind == Function.ScaleZ {
+      first
+    } else if count > 2 {
+      arguments[2]
+    } else {
+      one
+    }
+    return Option<Operation>.some(
+      Operation.Scale {
+        x: x,
+        y: y,
+        z: z,
+        threeD: kind == Function.ScaleZ || kind == Function.Scale3d,
+      },
+    )
+  }
+  if kind == Function.Skew || kind == Function.SkewX || kind == Function.SkewY {
+    let zero = (run dimensions.literal(&mut numerics.*, 0.0, Unit.Deg))
+    return Option<Operation>.some(
+      Operation.Skew {
+        x: if kind == Function.SkewY {
+          zero
+        } else {
+          first
+        },
+        y: if kind == Function.SkewY {
+          first
+        } else if count > 1 {
+          arguments[1]
+        } else {
+          zero
+        },
+      },
+    )
+  }
+  if kind == Function.Rotate3d {
+    return Option<Operation>.some(
+      Operation.Rotate {
+        x: first,
+        y: arguments[1],
+        z: arguments[2],
+        angle: arguments[3],
+        threeD: true,
+      },
+    )
+  }
+  let zero = (run dimensions.literal(&mut numerics.*, 0.0, Unit.Number))
+  let one = (run dimensions.literal(&mut numerics.*, 1.0, Unit.Number))
+  return Option<Operation>.some(
+    Operation.Rotate {
+      x: if kind == Function.RotateX {
+        one
+      } else {
+        zero
+      },
+      y: if kind == Function.RotateY {
+        one
+      } else {
+        zero
+      },
+      z: if kind == Function.RotateX || kind == Function.RotateY {
+        zero
+      } else {
+        one
+      },
+      angle: first,
+      threeD: kind != Function.Rotate,
+    },
+  )
+}
+
+enum PartKind {
+  Left,
+  Right,
+  Top,
+  Bottom,
+  Center,
+  Numeric
+}
+
+struct Part {
+  kind: PartKind,
+  value: ExprId
+}
+
+impl Copy for Part {}
+
+effect fn part(
+  numerics: &mut dimensions.Store,
+  input: &Input,
+  cursor: &mut Cursor,
+  presentation: bool,
+) -> Option<Part>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut kind = PartKind.Numeric
+  if cursor.ident(input, b"left") {
+    kind = PartKind.Left
+  } else if cursor.ident(input, b"right") {
+    kind = PartKind.Right
+  } else if cursor.ident(input, b"top") {
+    kind = PartKind.Top
+  } else if cursor.ident(input, b"bottom") {
+    kind = PartKind.Bottom
+  } else if cursor.ident(input, b"center") {
+    kind = PartKind.Center
+  }
+  if kind != PartKind.Numeric {
+    return Option<Part>.some(
+      Part { kind: kind, value: (run dimensions.literal(&mut numerics.*, 0.0, Unit.Px)) },
+    )
+  }
+  let parsed = (run dimensions.parse(
+    &mut numerics.*,
+    input,
+    &mut cursor.*,
+    Dimension.LengthPercentage,
+    presentation,
+  ))
+  return match &parsed {
+    Option<ExprId>.Some { value } => Option<Part>.some(Part { kind: kind, value: value })
+    _ => Option<Part>.None
+  }
+}
+
+fn horizontal(kind: PartKind) -> bool {
+  return kind == PartKind.Left || kind == PartKind.Right
+}
+
+fn vertical(kind: PartKind) -> bool {
+  return kind == PartKind.Top || kind == PartKind.Bottom
+}
+
+fn axis(value: Part) -> PositionAxis {
+  return PositionAxis {
+    edge: if value.kind == PartKind.Center {
+      Edge.Center
+    } else if value.kind == PartKind.Right || value.kind == PartKind.Bottom {
+      Edge.End
+    } else {
+      Edge.Start
+    },
+    offset: value.value,
+  }
+}
+
+fn pair(first: Part, second: Part) -> Option<Position> {
+  if first.kind != PartKind.Numeric && second.kind != PartKind.Numeric {
+    if (vertical(first.kind) && (horizontal(second.kind) || second.kind == PartKind.Center))
+      || (first.kind == PartKind.Center && horizontal(second.kind)) {
+      return Option<Position>.some(Position { x: axis(second), y: axis(first) })
+    }
+  }
+  if !vertical(first.kind) && !horizontal(second.kind) {
+    return Option<Position>.some(Position { x: axis(first), y: axis(second) })
+  }
+  return Option<Position>.None
+}
+
+// Values4 #position deliberately excludes background-position's three-value form.
+pub effect fn parsePosition(
+  numerics: &mut dimensions.Store,
+  input: &Input,
+  cursor: &mut Cursor,
+  presentation: bool,
+) -> Option<Position>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let saved = cursor.position
+  let parsed = (run part(&mut numerics.*, input, &mut cursor.*, presentation))
+  let first = match &parsed {
+    Option<Part>.Some { value } => value
+    _ => {
+      return Option<Position>.None
+    }
+  }
+  let mut parts = [first; 4]
+  let mut count: usize = 1
+  while count < 4 {
+    let next = (run part(&mut numerics.*, input, &mut cursor.*, presentation))
+    match &next {
+      Option<Part>.Some { value } => {
+        parts[count] = value
+        count = count + 1
+      }
+      _ => {
+        break
+      }
+    }
+  }
+  if count == 1 {
+    let center = PositionAxis {
+      edge: Edge.Center,
+      offset: (run dimensions.literal(&mut numerics.*, 0.0, Unit.Px)),
+    }
+    return Option<Position>.some(
+      Position {
+        x: if vertical(first.kind) {
+          center
+        } else {
+          axis(first)
+        },
+        y: if vertical(first.kind) {
+          axis(first)
+        } else {
+          center
+        },
+      },
+    )
+  }
+  if count == 2 {
+    let result = pair(first, parts[1])
+    match &result {
+      Option<Position>.Some { value } => {
+        return Option<Position>.some(value)
+      }
+      _ => {}
+    }
+  }
+  if count == 4 && parts[1].kind == PartKind.Numeric && parts[3].kind == PartKind.Numeric {
+    let a = PositionAxis { edge: axis(first).edge, offset: parts[1].value }
+    let b = PositionAxis { edge: axis(parts[2]).edge, offset: parts[3].value }
+    if horizontal(first.kind) && vertical(parts[2].kind) {
+      return Option<Position>.some(Position { x: a, y: b })
+    }
+    if vertical(first.kind) && horizontal(parts[2].kind) {
+      return Option<Position>.some(Position { x: b, y: a })
+    }
+  }
+  cursor.position = saved
+  return Option<Position>.None
+}
+
+effect fn origin(
+  numerics: &mut dimensions.Store,
+  input: &Input,
+  cursor: &mut Cursor,
+  presentation: bool,
+) -> Option<TransformValue>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = (run part(&mut numerics.*, input, &mut cursor.*, presentation))
+  let first = match &parsed {
+    Option<Part>.Some { value } => value
+    _ => {
+      return Option<TransformValue>.None
+    }
+  }
+  let zero = (run dimensions.literal(&mut numerics.*, 0.0, Unit.Px))
+  let center = PositionAxis { edge: Edge.Center, offset: zero }
+  let next = (run part(&mut numerics.*, input, &mut cursor.*, presentation))
+  let second = match &next {
+    Option<Part>.Some { value } => value
+    _ => {
+      return Option<TransformValue>.some(
+        TransformValue.Origin {
+          position: Position {
+            x: if vertical(first.kind) {
+              center
+            } else {
+              axis(first)
+            },
+            y: if vertical(first.kind) {
+              axis(first)
+            } else {
+              center
+            },
+          },
+          z: zero,
+        },
+      )
+    }
+  }
+  let combined = pair(first, second)
+  let position = match &combined {
+    Option<Position>.Some { value } => value
+    _ => {
+      return Option<TransformValue>.None
+    }
+  }
+  let third = (run dimensions.parse(
+    &mut numerics.*,
+    input,
+    &mut cursor.*,
+    Dimension.Length,
+    presentation,
+  ))
+  let z = match &third {
+    Option<ExprId>.Some { value } => value
+    _ => zero
+  }
+  return Option<TransformValue>.some(TransformValue.Origin { position: position, z: z })
+}
+
+effect fn rotationAxis(
+  numerics: &mut dimensions.Store,
+  input: &Input,
+  cursor: &mut Cursor,
+) -> Option<[ExprId; 3]>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let saved = cursor.position
+  let mut selected: usize = 3
+  if cursor.ident(input, b"x") {
+    selected = 0
+  } else if cursor.ident(input, b"y") {
+    selected = 1
+  } else if cursor.ident(input, b"z") {
+    selected = 2
+  }
+  if selected < 3 {
+    let zero = (run dimensions.literal(&mut numerics.*, 0.0, Unit.Number))
+    let mut result = [zero; 3]
+    result[selected] = (run dimensions.literal(&mut numerics.*, 1.0, Unit.Number))
+    return Option<[ExprId; 3]>.some(result)
+  }
+  let initial = (run dimensions.parse(
+    &mut numerics.*,
+    input,
+    &mut cursor.*,
+    Dimension.Number,
+    false,
+  ))
+  let first = match &initial {
+    Option<ExprId>.Some { value } => value
+    _ => {
+      return Option<[ExprId; 3]>.None
+    }
+  }
+  let mut result = [first; 3]
+  let mut i: usize = 1
+  while i < 3 {
+    let next = (run dimensions.parse(
+      &mut numerics.*,
+      input,
+      &mut cursor.*,
+      Dimension.Number,
+      false,
+    ))
+    match &next {
+      Option<ExprId>.Some { value } => {
+        result[i] = value
+      }
+      _ => {
+        cursor.position = saved
+        return Option<[ExprId; 3]>.None
+      }
+    }
+    i = i + 1
+  }
+  return Option<[ExprId; 3]>.some(result)
+}
+
+effect fn individual(
+  numerics: &mut dimensions.Store,
+  property: Property,
+  input: &Input,
+  cursor: &mut Cursor,
+  presentation: bool,
+) -> Option<Operation>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if property == Property.Rotate {
+    let start = cursor.position
+    let leadingAxis = (run rotationAxis(&mut numerics.*, input, &mut cursor.*))
+    match &leadingAxis {
+      Option<[ExprId; 3]>.Some { value } => {
+        let parsedAngle = (run numeric(&mut numerics.*, input, &mut cursor.*, Dimension.Angle))
+        match &parsedAngle {
+          Option<ExprId>.Some { value: angle } => {
+            return Option<Operation>.some(
+              Operation.Rotate {
+                x: value[0],
+                y: value[1],
+                z: value[2],
+                angle: angle,
+                threeD: true,
+              },
+            )
+          }
+          _ => {
+            cursor.position = start
+          }
+        }
+      }
+      _ => {}
+    }
+    let parsedAngle = (run numeric(&mut numerics.*, input, &mut cursor.*, Dimension.Angle))
+    let angle = match &parsedAngle {
+      Option<ExprId>.Some { value } => value
+      _ => {
+        return Option<Operation>.None
+      }
+    }
+    let trailingAxis = (run rotationAxis(&mut numerics.*, input, &mut cursor.*))
+    match &trailingAxis {
+      Option<[ExprId; 3]>.Some { value } => {
+        return Option<Operation>.some(
+          Operation.Rotate { x: value[0], y: value[1], z: value[2], angle: angle, threeD: true },
+        )
+      }
+      _ => {}
+    }
+    let zero = (run dimensions.literal(&mut numerics.*, 0.0, Unit.Number))
+    let one = (run dimensions.literal(&mut numerics.*, 1.0, Unit.Number))
+    return Option<Operation>.some(
+      Operation.Rotate { x: zero, y: zero, z: one, angle: angle, threeD: false },
+    )
+  }
+  let expected = if property == Property.Translate {
+    Dimension.LengthPercentage
+  } else {
+    Dimension.NumberPercentage
+  }
+  let initial = (run dimensions.parse(
+    &mut numerics.*,
+    input,
+    &mut cursor.*,
+    expected,
+    presentation,
+  ))
+  let x = match &initial {
+    Option<ExprId>.Some { value } => value
+    _ => {
+      return Option<Operation>.None
+    }
+  }
+  let fallback = (run dimensions.literal(
+    &mut numerics.*,
+    if property == Property.Translate {
+      0.0
+    } else {
+      1.0
+    },
+    if property == Property.Translate {
+      Unit.Px
+    } else {
+      Unit.Number
+    },
+  ))
+  let second = (run dimensions.parse(&mut numerics.*, input, &mut cursor.*, expected, presentation))
+  let y = match &second {
+    Option<ExprId>.Some { value } => value
+    _ => if property == Property.Translate {
+      fallback
+    } else {
+      x
+    }
+  }
+  let mut z = fallback
+  let mut threeD = false
+  match &second {
+    Option<ExprId>.Some { value } => {
+      let third = (run dimensions.parse(
+        &mut numerics.*,
+        input,
+        &mut cursor.*,
+        if property == Property.Translate {
+          Dimension.Length
+        } else {
+          expected
+        },
+        presentation,
+      ))
+      match &third {
+        Option<ExprId>.Some { value: thirdValue } => {
+          z = thirdValue
+          threeD = true
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  if property == Property.Translate {
+    return Option<Operation>.some(Operation.Translate { x: x, y: y, z: z, threeD: threeD })
+  }
+  return Option<Operation>.some(Operation.Scale { x: x, y: y, z: z, threeD: threeD })
+}
+
+// Presentation transform syntax is parsed once, by the existing geometry parser.
+// Full source is required: token spans alone can omit leading/trailing comments,
+// and decoded identifier text must not grant SVG CSS escape syntax.
+effect fn presentationTransform(
+  numerics: &mut dimensions.Store,
+  input: &Input,
+  cursor: &mut Cursor,
+) -> Option<TransformValue>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if cursor.position != 0 || cursor.end != input.length() {
+    return Option<TransformValue>.None
+  }
+  let parsed = match &input.* {
+    Input.Contiguous { buffer, range } => {
+      if range.start != 0 || range.end != buffer.all().end {
+        return Option<TransformValue>.None
+      }
+      transforms.transform(buffer.source())
+    }
+    Input.Expanded { buffers, references } => {
+      return Option<TransformValue>.None
+    }
+  }
+  let affine = match &parsed {
+    Option<Transform>.Some { value } => value
+    _ => {
+      return Option<TransformValue>.None
+    }
+  }
+  let components = [
+    (run dimensions.literal(&mut numerics.*, affine.a, Unit.Number)),
+    (run dimensions.literal(&mut numerics.*, affine.b, Unit.Number)),
+    (run dimensions.literal(&mut numerics.*, affine.c, Unit.Number)),
+    (run dimensions.literal(&mut numerics.*, affine.d, Unit.Number)),
+    (run dimensions.literal(&mut numerics.*, affine.e, Unit.Number)),
+    (run dimensions.literal(&mut numerics.*, affine.f, Unit.Number)),
+  ]
+  let mut operations = List<Operation>.make()
+  run operations.append(Operation.Matrix2 { components: components })
+  cursor.position = cursor.end
+  return Option<TransformValue>.some(TransformValue.List { operations: move operations })
+}
+
+pub effect fn parse(
+  numerics: &mut dimensions.Store,
+  property: Property,
+  input: &Input,
+  cursor: &mut Cursor,
+  presentation: bool,
+) -> Option<TransformValue>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if property == Property.Transform {
+    if presentation {
+      return (run presentationTransform(&mut numerics.*, input, &mut cursor.*))
+    }
+    if cursor.ident(input, b"none") {
+      return Option<TransformValue>.some(TransformValue.None)
+    }
+    let mut operations = List<Operation>.make()
+    while true {
+      let parsed = (run operation(&mut numerics.*, input, &mut cursor.*))
+      match move parsed {
+        Option<Operation>.Some { value } => {
+          (run operations.append(move value))
+        }
+        _ => {
+          return Option<TransformValue>.None
+        }
+      }
+      if cursor.done(input) {
+        break
+      }
+    }
+    return Option<TransformValue>.some(TransformValue.List { operations: move operations })
+  }
+  if property == Property.TransformOrigin {
+    return (run origin(&mut numerics.*, input, &mut cursor.*, presentation))
+  }
+  if property == Property.PerspectiveOrigin {
+    let parsed = (run parsePosition(&mut numerics.*, input, &mut cursor.*, presentation))
+    return match &parsed {
+      Option<Position>.Some { value } => Option<TransformValue>.some(
+        TransformValue.PerspectiveOrigin { position: value },
+      )
+      _ => Option<TransformValue>.None
+    }
+  }
+  if property == Property.Translate || property == Property.Rotate || property == Property.Scale {
+    if cursor.ident(input, b"none") {
+      return Option<TransformValue>.some(TransformValue.None)
+    }
+    let parsed = (run individual(&mut numerics.*, property, input, &mut cursor.*, presentation))
+    return match move parsed {
+      Option<Operation>.Some { value } => Option<TransformValue>.some(
+        TransformValue.Individual { operation: move value },
+      )
+      _ => Option<TransformValue>.None
+    }
+  }
+  if property == Property.Perspective {
+    if cursor.ident(input, b"none") {
+      return Option<TransformValue>.some(TransformValue.None)
+    }
+    let parsed = (run dimensions.parse(
+      &mut numerics.*,
+      input,
+      &mut cursor.*,
+      Dimension.Length,
+      presentation,
+    ))
+    match &parsed {
+      Option<ExprId>.Some { value } => {
+        if !dimensions.negativeLiteral(&numerics.*, value) {
+          return Option<TransformValue>.some(TransformValue.Perspective { depth: value })
+        }
+      }
+      _ => {}
+    }
+  }
+  if property == Property.TransformBox {
+    if cursor.ident(input, b"content-box") {
+      return Option<TransformValue>.some(TransformValue.Box { value: ReferenceBox.Content })
+    }
+    if cursor.ident(input, b"border-box") {
+      return Option<TransformValue>.some(TransformValue.Box { value: ReferenceBox.Border })
+    }
+    if cursor.ident(input, b"fill-box") {
+      return Option<TransformValue>.some(TransformValue.Box { value: ReferenceBox.Fill })
+    }
+    if cursor.ident(input, b"stroke-box") {
+      return Option<TransformValue>.some(TransformValue.Box { value: ReferenceBox.Stroke })
+    }
+    if cursor.ident(input, b"view-box") {
+      return Option<TransformValue>.some(TransformValue.Box { value: ReferenceBox.View })
+    }
+  }
+  if property == Property.TransformStyle {
+    if cursor.ident(input, b"flat") {
+      return Option<TransformValue>.some(TransformValue.Style { value: TransformStyle.Flat })
+    }
+    if cursor.ident(input, b"preserve-3d") {
+      return Option<TransformValue>.some(TransformValue.Style { value: TransformStyle.Preserve3d })
+    }
+  }
+  if property == Property.BackfaceVisibility {
+    if cursor.ident(input, b"visible") {
+      return Option<TransformValue>.some(
+        TransformValue.BackfaceVisibility { value: Backface.Visible },
+      )
+    }
+    if cursor.ident(input, b"hidden") {
+      return Option<TransformValue>.some(
+        TransformValue.BackfaceVisibility { value: Backface.Hidden },
+      )
+    }
+  }
+  return Option<TransformValue>.None
+}
+
+pub effect fn computePosition(
+  value: &Position,
+  numerics: &mut dimensions.Store,
+  context: &dimensions.Context,
+) -> Position
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Position {
+    x: PositionAxis {
+      edge: value.x.edge,
+      offset: (run dimensions.compute(&mut numerics.*, value.x.offset, context)),
+    },
+    y: PositionAxis {
+      edge: value.y.edge,
+      offset: (run dimensions.compute(&mut numerics.*, value.y.offset, context)),
+    },
+  }
+}
+
+effect fn computedScale(
+  numerics: &mut dimensions.Store,
+  value: ExprId,
+  context: &dimensions.Context,
+) -> ExprId
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let computed = (run dimensions.compute(&mut numerics.*, value, context))
+  if !dimensions.containsPercentage(&numerics.*, computed) {
+    return computed
+  }
+  let scalar = dimensions.evaluate(&numerics.*, computed, 1.0)
+  return (run dimensions.literal(&mut numerics.*, scalar, Unit.Number))
+}
+
+pub effect fn computeOperation(
+  value: &Operation,
+  numerics: &mut dimensions.Store,
+  context: &dimensions.Context,
+) -> Operation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &value.* {
+    Operation.Matrix2 { components } => {
+      let mut result = components
+      let mut i: usize = 0
+      while i < 6 {
+        result[i] = (run dimensions.compute(&mut numerics.*, result[i], context))
+        i = i + 1
+      }
+      Operation.Matrix2 { components: result }
+    }
+    Operation.Matrix3 { components } => {
+      let mut result = components
+      let mut i: usize = 0
+      while i < 16 {
+        result[i] = (run dimensions.compute(&mut numerics.*, result[i], context))
+        i = i + 1
+      }
+      Operation.Matrix3 { components: result }
+    }
+    Operation.Translate { x, y, z, threeD } => Operation.Translate {
+      x: (run dimensions.compute(&mut numerics.*, x, context)),
+      y: (run dimensions.compute(&mut numerics.*, y, context)),
+      z: (run dimensions.compute(&mut numerics.*, z, context)),
+      threeD: threeD,
+    }
+    Operation.Scale { x, y, z, threeD } => Operation.Scale {
+      x: (run computedScale(&mut numerics.*, x, context)),
+      y: (run computedScale(&mut numerics.*, y, context)),
+      z: (run computedScale(&mut numerics.*, z, context)),
+      threeD: threeD,
+    }
+    Operation.Rotate { x, y, z, angle, threeD } => Operation.Rotate {
+      x: (run dimensions.compute(&mut numerics.*, x, context)),
+      y: (run dimensions.compute(&mut numerics.*, y, context)),
+      z: (run dimensions.compute(&mut numerics.*, z, context)),
+      angle: (run dimensions.compute(&mut numerics.*, angle, context)),
+      threeD: threeD,
+    }
+    Operation.Skew { x, y } => Operation.Skew {
+      x: (run dimensions.compute(&mut numerics.*, x, context)),
+      y: (run dimensions.compute(&mut numerics.*, y, context)),
+    }
+    Operation.Perspective { depth } => {
+      let converted = match &depth {
+        Option<ExprId>.Some { value: distance } => Option<ExprId>.some(
+          (run dimensions.compute(&mut numerics.*, distance, context)),
+        )
+        _ => Option<ExprId>.None
+      }
+      Operation.Perspective { depth: move converted }
+    }
+  }
+}
+
+pub effect fn compute(
+  value: &TransformValue,
+  numerics: &mut dimensions.Store,
+  context: &dimensions.Context,
+) -> TransformValue
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &value.* {
+    TransformValue.None => TransformValue.None
+    TransformValue.List { operations } => {
+      let mut result = List<Operation>.make()
+      let mut i: usize = 0
+      while i < operations.length() {
+        (run result.append(
+          (run computeOperation(&operations.asSlice()[i], &mut numerics.*, context)),
+        ))
+        i = i + 1
+      }
+      TransformValue.List { operations: move result }
+    }
+    TransformValue.Individual { operation: item } => TransformValue.Individual {
+      operation: (run computeOperation(&item, &mut numerics.*, context)),
+    }
+    TransformValue.Origin { position, z } => TransformValue.Origin {
+      position: (run computePosition(&position, &mut numerics.*, context)),
+      z: (run dimensions.compute(&mut numerics.*, z, context)),
+    }
+    TransformValue.PerspectiveOrigin { position } => TransformValue.PerspectiveOrigin {
+      position: (run computePosition(&position, &mut numerics.*, context)),
+    }
+    TransformValue.Perspective { depth } => TransformValue.Perspective {
+      depth: (run dimensions.compute(&mut numerics.*, depth, context)),
+    }
+    TransformValue.Box { value: reference } => TransformValue.Box { value: reference }
+    TransformValue.Style { value: style } => TransformValue.Style { value: style }
+    TransformValue.BackfaceVisibility { value: backface } => TransformValue.BackfaceVisibility {
+      value: backface,
+    }
+  }
+}

@@ -1,0 +1,290 @@
+import test_fonts
+import silk.collections.bytes { Bytes }
+import silk.system.filesystem { FileError }
+import silk.system.host_input { HostInputError }
+//! Callback regressions from upstream tests/font_funcs.rs, scaling.rs and advances.rs.
+import font { ShaperData, ConfiguredShaper, FontFuncs, NominalGlyphs, Advances }
+import shape { shapeWithFeatures, ShapeError }
+import buffer { Buffer, Glyph }
+import direction { Direction }
+import generated_fixtures as Fixtures
+import read_fonts.lib { FontRef, ReadError }
+import read_fonts.model.metrics { GlyphExtents }
+import font_types.lib { GlyphId }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.testing.testing { Testing, AssertionError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.concurrency.sync { Mutex, MutexGuard }
+
+struct Overrides {}
+
+impl FontFuncs for Overrides {
+  fn nominalGlyph(self: &Self, font: &ConfiguredShaper<Self>, cp: u32) -> Option<GlyphId> {
+    return Option<GlyphId>.some(GlyphId.new(0))
+  }
+
+  fn glyphHAdvance(self: &Self, font: &ConfiguredShaper<Self>, glyph: GlyphId) -> i32 {
+    return -123
+  }
+
+  fn glyphVAdvance(self: &Self, font: &ConfiguredShaper<Self>, glyph: GlyphId) -> i32 {
+    return 456
+  }
+
+  effect fn glyphExtents(self: &Self, font: &ConfiguredShaper<Self>, glyph: GlyphId) -> Option<
+    GlyphExtents<i32>
+  >
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Option<GlyphExtents<i32>>.some(
+      GlyphExtents<i32> { xBearing: 10, yBearing: 200, width: 50, height: -100 },
+    )
+  }
+}
+
+struct BatchOverrides {}
+
+impl FontFuncs for BatchOverrides {
+  fn nominalGlyph(self: &Self, font: &ConfiguredShaper<Self>, cp: u32) -> Option<GlyphId> {
+    return Option<GlyphId>.None
+  }
+
+  fn nominalGlyphs(
+    self: &Self,
+    font: &ConfiguredShaper<Self>,
+    glyphs: &mut NominalGlyphs,
+  ) -> usize {
+    let mut i: usize = 0
+    while i < NominalGlyphs.len(&glyphs.*) {
+      NominalGlyphs.set(&mut glyphs, i, 42)
+      i = i + 1
+    }
+    return i
+  }
+
+  fn glyphHAdvances(self: &Self, font: &ConfiguredShaper<Self>, advances: &mut Advances) -> () {
+    let mut i: usize = 0
+    while i < Advances.len(&advances.*) {
+      Advances.set(&mut advances, i, 777)
+      i = i + 1
+    }
+  }
+
+  fn variationGlyph(self: &Self, font: &ConfiguredShaper<Self>, cp: u32, selector: u32) -> Option<
+    GlyphId
+  > {
+    return Option<GlyphId>.some(GlyphId.new(43))
+  }
+
+  effect fn glyphVOrigin(self: &Self, font: &ConfiguredShaper<Self>, glyph: GlyphId) -> [i32; 2]
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return [31, 41]
+  }
+}
+
+effect fn cases() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError
+  ? &mut Allocator {
+  let source = match move FontRef.new(Fixtures.plannedFont()) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      run Testing.expect(false, "fixture font")
+      return
+    }
+  }
+  let data = ShaperData.new(&source)
+  let mut scalar = ConfiguredShaper<Overrides>.withFuncs(&data, Overrides {})
+  ConfiguredShaper.setScale(&mut scalar, 2000, 2000)
+  let mut buffer = Buffer.new()
+  run Buffer.pushStr(&mut buffer, "AB")
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&scalar, &mut buffer, &[])
+  run Testing.expect(
+    Buffer.len(&buffer) == 2,
+    "custom mapping bypasses default cmap and its ligature",
+  )
+  let first = List<Glyph>.get(&buffer.glyphs, 0)
+  run Testing.expect(
+    first.info.glyphId == 0 && first.position.xAdvance == -123,
+    "glyph zero is valid; signed callback metrics are not scaled",
+  )
+  let origin = run ConfiguredShaper.glyphVOrigin(&scalar, GlyphId.new(0))
+  run Testing.expect(
+    origin[0] == -61 && origin[1] == 1150,
+    "default origin consults custom advances and extents",
+  )
+  Buffer.clear(&mut buffer)
+  run Buffer.pushStr(&mut buffer, "A")
+  buffer.direction = Direction.TopToBottom
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&scalar, &mut buffer, &[])
+  let vertical = List<Glyph>.get(&buffer.glyphs, 0).position
+  run Testing.expect(
+    vertical.yAdvance == 456 && vertical.xOffset == 61 && vertical.yOffset == -1150,
+    "signed vertical callbacks and fallback origins are used during shaping",
+  )
+  let batch = ConfiguredShaper<BatchOverrides>.withFuncs(&data, BatchOverrides {})
+  Buffer.clear(&mut buffer)
+  run Buffer.pushStr(&mut buffer, "AB")
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&batch, &mut buffer, &[])
+  let mapped = List<Glyph>.get(&buffer.glyphs, 1)
+  run Testing.expect(
+    mapped.info.glyphId == 42 && mapped.position.xAdvance == 777,
+    "batch mapping and advance overrides are used",
+  )
+  Buffer.clear(&mut buffer)
+  run Buffer.pushStr(&mut buffer, "A\u{fe0f}")
+  buffer.direction = Direction.TopToBottom
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&batch, &mut buffer, &[])
+  let variant = List<Glyph>.get(&buffer.glyphs, 0)
+  run Testing.expect(
+    Buffer.len(&buffer) == 1 && variant.info.glyphId == 43 && variant.position.xOffset == -31
+      && variant.position.yOffset == -41,
+    "variation-selector and vertical-origin overrides are used",
+  )
+}
+
+test effect fn customFontFunctions() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cases() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct MaximumGlyph {}
+
+impl FontFuncs for MaximumGlyph {
+  fn nominalGlyph(self: &Self, font: &ConfiguredShaper<Self>, cp: u32) -> Option<GlyphId> {
+    return Option<GlyphId>.some(GlyphId.new(4294967295))
+  }
+
+  fn variationGlyph(self: &Self, font: &ConfiguredShaper<Self>, cp: u32, selector: u32) -> Option<
+    GlyphId
+  > {
+    return Option<GlyphId>.some(GlyphId.new(4294967295))
+  }
+}
+
+effect fn maximumCases() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError
+  ? &mut Allocator {
+  let robotoFontBytes = run test_fonts.read("benches/fonts/Roboto-Regular.ttf")
+  let source = match move FontRef.new(Bytes.asSlice(&robotoFontBytes)) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      run Testing.expect(false, "Roboto fixture")
+      return
+    }
+  }
+  let data = ShaperData.new(&source)
+  let custom = ConfiguredShaper<MaximumGlyph>.withFuncs(&data, MaximumGlyph {})
+  let mut buffer = Buffer.new()
+  run Buffer.pushStr(&mut buffer, "o\u{0301}")
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&custom, &mut buffer, &[])
+  run Testing.expect(
+    Buffer.len(&buffer) == 1 && List<Glyph>.get(&buffer.glyphs, 0).info.glyphId == 4294967295,
+    "MAX is a valid custom glyph through normalization",
+  )
+  Buffer.clear(&mut buffer)
+  run Buffer.pushStr(&mut buffer, "A\u{FE0F}")
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&custom, &mut buffer, &[])
+  run Testing.expect(
+    Buffer.len(&buffer) == 1 && List<Glyph>.get(&buffer.glyphs, 0).info.glyphId == 4294967295,
+    "MAX is a valid variation glyph",
+  )
+  let regular = ShaperData.shaper(&data)
+  Buffer.clear(&mut buffer)
+  Buffer.setNotFoundVariationSelectorGlyph(&mut buffer, Option<u32>.some(4294967295))
+  run Buffer.pushStr(&mut buffer, "A\u{FE0F}")
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&regular, &mut buffer, &[])
+  run Testing.expect(
+    Buffer.len(&buffer) == 2 && List<Glyph>.get(&buffer.glyphs, 1).info.glyphId == 4294967295,
+    "MAX is preserved as a missing-selector replacement",
+  )
+  Buffer.reset(&mut buffer)
+  Buffer.setInvisibleGlyph(&mut buffer, Option<GlyphId>.some(GlyphId.new(0)))
+  run Buffer.pushStr(&mut buffer, "A\u{200D}B")
+  Buffer.guessSegmentProperties(&mut buffer)
+  drop run shapeWithFeatures(&regular, &mut buffer, &[])
+  run Testing.expect(
+    Buffer.len(&buffer) == 3 && List<Glyph>.get(&buffer.glyphs, 1).info.glyphId == 0,
+    "an explicit invisible glyph zero is distinct from no override",
+  )
+}
+
+test effect fn fullRangeCustomGlyphIds() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run maximumCases() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct EmptyObserver {
+  calls: Mutex<usize>,
+}
+
+impl FontFuncs for EmptyObserver {
+  fn glyphHAdvances(self: &Self, font: &ConfiguredShaper<Self>, advances: &mut Advances) -> () {
+    let mut guard = Mutex<usize>.lock(&self.calls)
+    let value = MutexGuard.getMut(&mut guard)
+    value.* = value.* + 1
+  }
+}
+
+effect fn metricsCases() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError
+  ? &mut Allocator {
+  let bytes = run test_fonts.read(
+    "tests/fonts/in-house/ffa0f5d2d9025486d8469d8b1fdd983e7632499b.ttf",
+  )
+  let source = match move FontRef.new(Bytes.asSlice(&bytes)) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      run Testing.expect(false, "side bearing fixture")
+      return
+    }
+  }
+  let data = ShaperData.new(&source)
+  let font = ShaperData.shaper(&data)
+  run Testing.expect(
+    ConfiguredShaper.defaultGlyphHAdvance(&font, GlyphId.new(60000)) == 0,
+    "out-of-range glyphs have no advance",
+  )
+  let extents = match move (run ConfiguredShaper.defaultGlyphExtents(&font, GlyphId.new(6))) {
+    Option<GlyphExtents<i32>>.Some { value } => value
+    _ => {
+      run Testing.expect(false, "glyph has extents")
+      return
+    }
+  }
+  run Testing.expect(
+    extents.xBearing == 0 && extents.yBearing == 1505 && extents.width == 752
+      && extents.height == -264,
+    "extents start at the side bearing, not glyf xMin",
+  )
+  let observer = ConfiguredShaper<EmptyObserver>.withFuncs(
+    &data,
+    EmptyObserver { calls: run Mutex<usize>.make(0) },
+  )
+  let mut empty = Buffer.new()
+  empty.direction = Direction.LeftToRight
+  drop run shapeWithFeatures(&observer, &mut empty, &[])
+  let guard = Mutex<usize>.lock(&observer.funcs.calls)
+  run Testing.expect(
+    MutexGuard.get(&guard).* == 0 && Buffer.isEmpty(&empty),
+    "empty shaping never invokes batch advances",
+  )
+}
+
+test effect fn fontMetricBoundariesAndEmptyCallbacks() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run metricsCases() |> Effect.provideMut<Allocator>(&mut allocator)
+}

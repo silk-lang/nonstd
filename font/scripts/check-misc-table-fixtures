@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Compare BASE, bitmap, COLR, MATH and other table fields, offset arrays and malformed nested table views."""
+import argparse
+import ast
+from pathlib import Path
+import re
+import runpy
+import struct
+import tempfile
+import harness
+
+ROOT = Path(__file__).resolve().parents[2]
+helpers = runpy.run_path(str(ROOT / 'font/scripts/check-model-fixtures'))
+sfnt, tables = helpers['sfnt'], helpers['tables']
+
+
+def fixtures():
+    source = (ROOT / 'font/parse/src/generated_misc_table_fixtures.silk').read_text()
+    packed = {name: ast.literal_eval(literal) for name, literal in re.findall(
+        r"pub fn (\w+)\(\) -> &'static \[u8\] \{\s*return (b\"[^\"]*\")\s*\}", source)}
+    seeds = {b'MATH': packed['mathTable'], b'BASE': packed['baseTable'], b'meta': packed['simpleMeta'],
+             b'gasp': bytes.fromhex('0001000201940003ffff000c'),
+             b'hdmx': bytes.fromhex('0000000300000008080d0a0c0d00000010151214150000002034262834000000'),
+             b'CPAL': bytes.fromhex('00010001000100010000001a00000000001e0000002200000024010203040000000301010102'),
+             b'DSIG': bytes.fromhex('0000000100010001000000010000000c000000140000000000000004deadbeef')}
+    words = [0,0,10,0,0,3,1,3,0,38,0,10,6,7,0,48,0,6,9,9,0,38,0,10,1,0,0,0,1,2,0,0]
+    seeds[b'SVG '] = struct.pack('>32H', *words)
+    for name in ('cvarFont', 'gradientFont', 'embeddedBitmaps', 'cbdtFont', 'colrFont', 'variableColrFont', 'unclippedColrFont', 'varcCjkFont', 'varcConditionalsFont', 'varcStaticFont', 'varcDeltaPrecisionFont'):
+        yield name, packed[name]
+        seeds.update({tag: value for tag, value in tables(packed[name]).items()
+                      if tag in (b'cvar', b'CPAL', b'STAT', b'VARC')})
+    # The v1 palette exercises typed flag/name-id array offsets separately.
+    seeds[b'CPAL'] = bytes.fromhex('00010001000100010000001a00000000001e0000002200000024010203040000000301010102')
+    for tag, data in seeds.items():
+        required = {b'maxp': struct.pack('>IH', 0x5000, 3)}
+        cuts = sorted(set(range(len(data)+1 if tag == b'MATH' else min(64, len(data) + 1))) | {len(data) // 2, len(data) - 1, len(data)})
+        for cut in cuts:
+            yield f'{tag.hex()}-prefix-{cut}', sfnt({**required, tag: data[:cut]})
+        # Probe offsets/counts at both ends without changing the original fixtures.
+        for index in sorted({0, 2, 4, 8, 12, 16, 20, len(data)-4}):
+            if index < 0 or index + 4 > len(data):
+                continue
+            for value in (0, 0xffffffff):
+                changed = bytearray(data)
+                struct.pack_into('>I', changed, index, value)
+                yield f'{tag.hex()}-word-{index}-{value}', sfnt({**required, tag: bytes(changed)})
+    yield from bitmap_fixtures()
+    yield from colr_fixtures()
+    yield from varc_fixtures()
+    for tag, payload in [(b'dlng', b'en-latn, latn'), (b'slng', b'\xff, x'),
+                         (b'xxxx', b'\x00\xff\x01'), (b'dlng', b',,,')]:
+        meta = struct.pack('>IIII4sII', 1, 0, 0, 1, tag, 28, len(payload)) + payload
+        yield 'meta-' + tag.hex() + '-' + payload.hex(), sfnt({b'meta': meta})
+
+
+def bitmap_fixtures():
+    small = bytes([2, 3, 1, 2, 4])
+    big = bytes([2, 3, 1, 2, 4, 0, 0, 0])
+    components = struct.pack('>H', 2) + struct.pack('>HbbHbb', 8, -1, 2, 9, 3, -2)
+    payloads = {1: small+b'\xa0\x40', 2: small+b'\xa8', 5: b'\xa8',
+                6: big+b'\xa0\x40', 7: big+b'\xa8', 8: small+b'\0'+components,
+                9: big+components, 17: small+struct.pack('>I', 3)+b'png',
+                18: big+struct.pack('>I', 3)+b'png', 19: struct.pack('>I', 3)+b'png',
+                3: b'unsupported', 4: b'unsupported'}
+    for color in (False, True):
+        loc_tag, data_tag = (b'CBLC', b'CBDT') if color else (b'EBLC', b'EBDT')
+        major = 3 if color else 2
+        for index_format in range(1, 6):
+            for image_format, payload in payloads.items():
+                n = len(payload)
+                subtable = struct.pack('>HHI', index_format, image_format, 4)
+                if index_format == 1:
+                    subtable += struct.pack('>3I', 0, n, 2*n)
+                elif index_format == 2:
+                    subtable += struct.pack('>I', n) + big
+                elif index_format == 3:
+                    subtable += struct.pack('>3H', 0, n, 2*n)
+                elif index_format == 4:
+                    subtable += struct.pack('>I6H', 2, 0, 0, 1, n, 2, 2*n)
+                else:
+                    subtable += struct.pack('>I', n) + big + struct.pack('>I2H', 2, 0, 2)
+                last = 2 if index_format == 5 else 1
+                size = struct.pack('>IIII', 56, 8+len(subtable), 1, 0) + bytes(24)
+                size += struct.pack('>HHBBBB', 0, last, 16, 16, 1, 1)
+                location = struct.pack('>HHI', major, 0, 1) + size + struct.pack('>HHI', 0, last, 8) + subtable
+                image = struct.pack('>HH', major, 0) + payload*2
+                name = f'bitmap-{major}-{index_format}-{image_format}'
+                yield name, sfnt({loc_tag: location, data_tag: image})
+                for cut in sorted({0, 4, len(image)-1}):
+                    yield f'{name}-image-prefix-{cut}', sfnt({loc_tag: location, data_tag: image[:cut]})
+                for cut in sorted({56, 64, len(location)-1}):
+                    yield f'{name}-location-prefix-{cut}', sfnt({loc_tag: location[:cut], data_tag: image})
+                # Header and count corruption retains the paired data table.
+                for at in (8, 12, 16, 68):
+                    if at+4 <= len(location):
+                        changed = bytearray(location)
+                        struct.pack_into('>I', changed, at, 0xffffffff)
+                        yield f'{name}-offset-{at}', sfnt({loc_tag: bytes(changed), data_tag: image})
+    # Independent same-length glyph slices must not be treated as alias nodes.
+    glyph0 = struct.pack('>hh4s', -1, 2, b'png ') + b'abc'
+    glyph1 = struct.pack('>hh4s', 3, -4, b'dupe') + b'xyz'
+    strike = struct.pack('>HH3I', 16, 72, 16, 16+len(glyph0), 16+len(glyph0)+len(glyph1)) + glyph0+glyph1
+    for label, offsets in [('valid', (16, 27, 38)), ('empty', (16, 16, 16)),
+                           ('reversed', (27, 16, 38)), ('past-end', (1000, 1000, 2000))]:
+        changed = bytearray(strike)
+        struct.pack_into('>3I', changed, 4, *offsets)
+        table = struct.pack('>HHII', 1, 3, 1, 12) + changed
+        for cut in sorted({0, 8, 12, 16, len(table)-1, len(table)}):
+            yield f'sbix-{label}-prefix-{cut}', sfnt({b'sbix': table[:cut], b'maxp': struct.pack('>IH', 0x5000, 2)})
+
+def colr_fixtures():
+    grammar = (ROOT / 'font/parse/upstream/resources/codegen_inputs/colr.rs').read_text()
+    widths = {'u8': 1, 'u16': 2, 'i16': 2, 'u32': 4, 'FWord': 2, 'F2Dot14': 2,
+              'Fixed': 4, 'UfWord': 2, 'GlyphId16': 2, 'GlyphId24': 3, 'CompositeMode': 1}
+    header = struct.pack('>HHIIHIIIII', 1, 0, 0, 0, 0, 34, 0, 0, 0, 0)
+    records = struct.pack('>IHI', 1, 42, 10)
+    formats = 0
+    for name, body in re.findall(r'table (Paint\w+)\s*\{(.*?)\n\}', grammar, re.S):
+        format_match = re.search(r'#\[format = (\d+)\]', body)
+        if not format_match:
+            continue
+        number = int(format_match.group(1))
+        data = bytearray()
+        for field, typ in re.findall(r'^\s*(\w+):\s*([^,]+),', body, re.M):
+            if field == 'format':
+                data.append(number)
+                continue
+            if typ.startswith('Offset'):
+                width = int(re.match(r'Offset(\d+)', typ).group(1)) // 8
+                data.extend(bytes(width))
+            else:
+                data.extend(bytes([0x81]) * widths[typ])
+        formats += 1
+        for cut in range(len(data)+1):
+            yield f'colr-{name}-prefix-{cut}', sfnt({b'COLR': header+records+data[:cut]})
+        # A child offset to the last byte exercises a resolvable but short child.
+        bad = bytearray(data)
+        if len(bad) >= 4 and re.search(r'paint_offset:\s*Offset24', body):
+            bad[1:4] = (len(bad)-1).to_bytes(3, 'big')
+            yield f'colr-{name}-short-child', sfnt({b'COLR': header+records+bad})
+    assert formats == 33, formats
+    for unknown in (0,34,255):
+        yield f'colr-paint-unknown-{unknown}', sfnt({b'COLR': header+records+bytes([unknown])+bytes(32)})
+
+def varuint(value):
+    if value < 0x80:
+        return bytes([value])
+    if value < 0x4000:
+        return bytes([0x80 | (value >> 8), value & 255])
+    if value < 0x200000:
+        return bytes([0xc0 | (value >> 16)]) + (value & 0xffff).to_bytes(2, 'big')
+    if value < 0x10000000:
+        return bytes([0xe0 | (value >> 24)]) + (value & 0xffffff).to_bytes(3, 'big')
+    return b'\xf0' + value.to_bytes(4, 'big')
+
+
+def varc_fixtures():
+    def font(payload):
+        # Empty axis list at index 0, five packed indices at index 1.
+        axes = bytes.fromhex('0000000201010107040203040506')
+        coverage = struct.pack('>3H', 1, 1, 1)
+        header = struct.pack('>HH5I', 1, 0, 24, 0, 0, 30, 30+len(axes))
+        glyphs = struct.pack('>IBHH', 1, 2, 1, len(payload)+1) + payload
+        return sfnt({b'VARC': header+coverage+axes+glyphs})
+    cases = []
+    for flags in [0] + [1 << bit for bit in range(32)] + [0x7fff, 0xffffffff]:
+        data = bytearray(varuint(flags))
+        data.extend((0x123456 if flags & 4096 else 1).to_bytes(3 if flags & 4096 else 2, 'big'))
+        if flags & 128:
+            data.extend(varuint(0xfedcba98))
+        if flags & 2:
+            data.extend(b'\x01\x04\x01\xfe\x03\xfc\x05')
+        if flags & 4:
+            data.extend(varuint(0x12345))
+        if flags & 8:
+            data.extend(varuint(0x234567))
+        for flag, value in [(16,7), (32,-8), (64,1024), (256,2048), (512,3072),
+                            (8192,512), (16384,-1024), (1024,17), (2048,-19)]:
+            if flags & flag:
+                data.extend(struct.pack('>h', value))
+        for bit in range(15,32):
+            if flags & (1 << bit):
+                data.extend(varuint(0xffffffff-bit))
+        cases.append((f'flags-{flags}', bytes(data)))
+    for control, payload in [(4,bytes([1,2,3,4,5])), (68,struct.pack('>5h',1,-2,3,-4,5)),
+                             (196,struct.pack('>5i',100000,-200000,300000,-400000,500000)), (132,b'')]:
+        cases.append((f'axes-{control}', bytes([18,0,1,1,control])+payload+bytes([0,7])))
+    cases += [('empty-axes', bytes.fromhex('1600010081230006')),
+              ('bad-axis-index', bytes.fromhex('0200017f'))]
+    for value in [0x7f,0x80,0x3fff,0x4000,0x1fffff,0x200000,0xfffffff,0x10000000,0xffffffff]:
+        cases.append((f'condition-{value}',varuint(128)+bytes([0,1])+varuint(value)))
+    for name, data in cases:
+        for cut in range(len(data)+1):
+            yield f'varc-{name}-prefix-{cut}', font(data[:cut])
+        # Consecutive components exercise exact stream consumption.
+        yield f'varc-{name}-followed', font(data+bytes([0,0,2]))
+    # Malformed/degenerate sparse regions and missing high-numbered axes.
+    for index in [0,7,8,65535]:
+        for start,peak,end in [(0,16384,16384),(-16384,-16384,0),(-16384,0,16384),
+                               (8192,0,-8192),(8192,16384,0),(-16384,8192,16384),
+                               (-32768,-32768,-32768),(32767,32767,32767)]:
+            region = struct.pack('>HIHhhh',1,6,index,start,peak,end)
+            region_list = struct.pack('>II',1,8)+region
+            store = struct.pack('>HIH',1,8,0)+region_list
+            header = struct.pack('>HH5I',1,0,0,24,0,0,0)
+            yield f'varc-region-{index}-{start}-{peak}-{end}', sfnt({b'VARC':header+store})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference', type=Path, default=harness.REFERENCE)
+    parser.add_argument('--silk-dumper', type=Path)
+    parser.add_argument('--report', type=Path)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='font-misc-table-fixtures-') as temporary:
+        paths = []
+        for name, data in fixtures():
+            path = Path(temporary) / f'{name}.ttf'
+            path.write_bytes(data)
+            paths.append(path)
+        assert len(paths) == len(set(paths)), 'fixture names must be unique'
+        return harness.compare(paths, args.reference, args.silk_dumper or harness.silk_binary(), 120, args.report)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

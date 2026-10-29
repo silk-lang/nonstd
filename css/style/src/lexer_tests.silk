@@ -1,0 +1,397 @@
+//! CSS Syntax anchors verified in the pinned css-syntax-3 bytes.
+import lexer
+import tokens { Kind, Limits, TokenBuffer, CssError, CssErrorKind, equal }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.collections.bytes { Bytes }
+import silk.num.f64
+
+// https://www.w3.org/TR/css-syntax-3/#input-preprocessing
+// https://www.w3.org/TR/css-syntax-3/#consume-name
+test effect fn preprocessingAndUnicodeEscapes() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let data: [u8; 9] = [97, 13, 10, 98, 12, 0, 32, 255, 99]
+  let buffer = run lexer.tokenize(&data, &limits) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(buffer.source(), &[97, 10, 98, 10, 239, 191, 189, 32, 239, 191, 189, 99]),
+    "CRLF, FF, null and invalid UTF-8 normalize",
+  )
+  let escaped = run lexer.tokenize(b"\\66 oo \\1f600 \\0 \\d800 \\110000 ", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &escaped.tokens.asSlice()[0].kind {
+      Kind.Ident { text } => equal(escaped.text(text), b"foo") && text.start >= escaped.sourceLength
+      _ => false
+    },
+    "escaped names use the owned decoded-text arena",
+  )
+  run Testing.expect(
+    match &escaped.tokens.asSlice()[2].kind {
+      Kind.Ident { text } => equal(
+        escaped.text(text),
+        &[240, 159, 152, 128, 239, 191, 189, 239, 191, 189, 239, 191, 189],
+      )
+      _ => false
+    },
+    "hex terminators disappear and invalid escaped scalars become replacement characters",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-numeric-token
+// https://www.w3.org/TR/css-syntax-3/#consume-token
+test effect fn numericTypesAndHashFlags() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(b"+.5e2p\\78  -2% 1e+ #123 #\\31 ab --x", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ts = buffer.tokens.asSlice()
+  run Testing.expect(
+    match &ts[0].kind {
+      Kind.Dimension { value, integer, unit } => value == 50.0 && !integer
+        && equal(buffer.text(unit), b"px")
+      _ => false
+    },
+    "decimal exponent dimension and escaped unit",
+  )
+  run Testing.expect(
+    match &ts[2].kind {
+      Kind.Percentage { value, integer } => value == -2.0 && integer
+      _ => false
+    },
+    "percentage retains integer flag",
+  )
+  run Testing.expect(
+    match &ts[4].kind {
+      Kind.Dimension { value, integer, unit } => value == 1.0 && integer
+        && equal(buffer.text(unit), b"e")
+      _ => false
+    },
+    "incomplete exponent is a dimension then delimiter",
+  )
+  run Testing.expect(
+    match &ts[7].kind {
+      Kind.Hash { text, identifier } => !identifier
+      _ => false
+    },
+    "digit-leading hash is unrestricted",
+  )
+  run Testing.expect(
+    match &ts[9].kind {
+      Kind.Hash { text, identifier } => identifier && equal(buffer.text(text), b"1ab")
+      _ => false
+    },
+    "escaped digit-leading hash has id type",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-a-string-token
+// https://www.w3.org/TR/css-syntax-3/#consume-a-url-token
+// https://www.w3.org/TR/css-syntax-3/#consume-the-remnants-of-a-bad-url
+test effect fn stringAndUrlRecovery() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(b"'a\\\nb' 'bad\nurl(a\\)b) url(a b\\)c) url(  \"q\")", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ts = buffer.tokens.asSlice()
+  run Testing.expect(
+    match &ts[0].kind {
+      Kind.String { text } => equal(buffer.text(text), b"ab")
+      _ => false
+    },
+    "escaped newline contributes no string character",
+  )
+  run Testing.expect(
+    match &ts[2].kind {
+      Kind.BadString => true
+      _ => false
+    },
+    "newline returns bad string without consuming newline",
+  )
+  run Testing.expect(
+    match &ts[4].kind {
+      Kind.Url { text } => equal(buffer.text(text), b"a)b")
+      _ => false
+    },
+    "escaped URL close does not terminate URL",
+  )
+  run Testing.expect(
+    match &ts[6].kind {
+      Kind.BadUrl => true
+      _ => false
+    },
+    "bad URL consumes through escaped close to recovery close",
+  )
+  run Testing.expect(
+    match &ts[8].kind {
+      Kind.Function { name } => equal(buffer.text(name), b"url")
+      _ => false
+    },
+    "quoted URL is function, not URL token",
+  )
+  run Testing.expect(ts[8].matching == 11, "quoted URL function matches its close")
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-token
+// https://www.w3.org/TR/css-syntax-3/#consume-a-simple-block
+test effect fn commentsCdoAndImplicitClosures() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(b"a/**/b<!-- -->f([)]{x", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ts = buffer.tokens.asSlice()
+  run Testing.expect(
+    match &ts[0].kind {
+      Kind.Ident { text } => equal(buffer.text(text), b"a")
+      _ => false
+    },
+    "comment does not concatenate identifiers",
+  )
+  run Testing.expect(
+    match &ts[2].kind {
+      Kind.Cdo => true
+      _ => false
+    },
+    "CDO recognized before delimiter",
+  )
+  run Testing.expect(
+    match &ts[4].kind {
+      Kind.Cdc => true
+      _ => false
+    },
+    "CDC recognized before identifier",
+  )
+  run Testing.expect(
+    ts[5].matching == 11 && ts[6].matching == 8 && ts[9].matching == 11,
+    "mismatched closer stays literal and unclosed openers match EOF",
+  )
+  run Testing.expect(ts[7].matching == 7, "unmatched closer is not an implicit block closure")
+}
+
+effect fn limited(data: &[u8], limits: &Limits, expected: CssErrorKind) -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(
+    lexer.tokenize(data, limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &result {
+      Result<TokenBuffer, CssError | OutOfMemoryError>.Failure { error } => match &error {
+        CssError problem => problem.kind == expected
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "resource exhaustion reports its specific checked limit",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#tokenization
+// https://www.w3.org/TR/css-syntax-3/#consume-a-simple-block
+test effect fn lexerResourceBoundaries() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut limits = Limits.make()
+  limits.maxInputBytes = 1
+  run limited(b"ab", &limits, CssErrorKind.InputLimit)
+  limits = Limits.make()
+  limits.maxStorageBytes = 2
+  run limited(&[0], &limits, CssErrorKind.StorageLimit)
+  limits = Limits.make()
+  limits.maxTokens = 1
+  run limited(b"a", &limits, CssErrorKind.TokenLimit)
+  limits = Limits.make()
+  limits.maxDepth = 1
+  run limited(b"([", &limits, CssErrorKind.NestingLimit)
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-an-escaped-code-point
+// https://www.w3.org/TR/css-syntax-3/#consume-a-string-token
+// https://www.w3.org/TR/css-syntax-3/#consume-a-url-token
+test effect fn eofEscapesHexBoundariesAndUnclosedTokens() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let names = run lexer.tokenize(b"\\000061b \\\n \\", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ts = names.tokens.asSlice()
+  run Testing.expect(
+    match &ts[0].kind {
+      Kind.Ident { text } => equal(names.text(text), b"ab")
+      _ => false
+    },
+    "hex escape consumes at most six digits",
+  )
+  run Testing.expect(
+    match &ts[2].kind {
+      Kind.Delim { scalar } => scalar == 92
+      _ => false
+    },
+    "backslash newline is not a valid identifier escape",
+  )
+  run Testing.expect(
+    match &ts[4].kind {
+      Kind.Ident { text } => equal(names.text(text), &[239, 191, 189])
+      _ => false
+    },
+    "backslash EOF is a replacement escape",
+  )
+  let string = run lexer.tokenize(b"'tail\\", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &string.tokens.asSlice()[0].kind {
+      Kind.String { text } => equal(string.text(text), b"tail")
+      _ => false
+    },
+    "string EOF returns string; terminal reverse solidus contributes nothing",
+  )
+  let url = run lexer.tokenize(b"url( tail", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &url.tokens.asSlice()[0].kind {
+      Kind.Url { text } => equal(url.text(text), b"tail")
+      _ => false
+    },
+    "URL EOF returns URL",
+  )
+  let comment = run lexer.tokenize(b"a/* unclosed", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    comment.tokens.length() == 2
+      && comment.tokens.asSlice()[1].source.start == comment.sourceLength,
+    "unclosed comment consumes through EOF without an extra token",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#tokenization
+test effect fn exactLimitAndDecodedStorageAccounting() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut limits = Limits.make()
+  limits.maxInputBytes = 0
+  limits.maxStorageBytes = 0
+  limits.maxTokens = 1
+  limits.maxDepth = 0
+  let empty = run lexer.tokenize(b"", &limits) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    empty.tokens.length() == 1 && empty.all().end == 0,
+    "EOF counts toward token bound and empty storage needs no bytes",
+  )
+  limits = Limits.make()
+  limits.maxStorageBytes = 3
+  run limited(b"\\61", &limits, CssErrorKind.StorageLimit)
+}
+
+// https://www.w3.org/TR/css-syntax-3/#non-ascii-ident-code-point
+test effect fn unicodeIdentifierClassesAndScalarDelimiters() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+
+  // a, NBSP, b, multiplication sign, middle dot, CJK ideograph, bidi override, z.
+  let data: [u8; 15] = [97, 194, 160, 98, 195, 151, 194, 183, 228, 184, 173, 226, 128, 174, 122]
+  let buffer = run lexer.tokenize(&data, &limits) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ts = buffer.tokens.asSlice()
+  run Testing.expect(ts.length == 8, "excluded non-ASCII scalars split identifiers")
+  run Testing.expect(
+    match &ts[1].kind {
+      Kind.Delim { scalar } => scalar == 160
+      _ => false
+    },
+    "NBSP is a scalar delimiter, not whitespace or identifier",
+  )
+  run Testing.expect(
+    match &ts[3].kind {
+      Kind.Delim { scalar } => scalar == 215
+      _ => false
+    },
+    "multiplication sign is excluded",
+  )
+  run Testing.expect(
+    match &ts[4].kind {
+      Kind.Ident { text } => equal(buffer.text(text), &[194, 183, 228, 184, 173])
+      _ => false
+    },
+    "middle dot and CJK belong to identifier class",
+  )
+  run Testing.expect(
+    match &ts[5].kind {
+      Kind.Delim { scalar } => scalar == 8238
+      _ => false
+    },
+    "bidi override is excluded as one scalar",
+  )
+  let escaped = run lexer.tokenize(b"\\a0 \\d7 \\202e ", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &escaped.tokens.asSlice()[0].kind {
+      Kind.Ident { text } => equal(escaped.text(text), &[194, 160, 195, 151, 226, 128, 174])
+      _ => false
+    },
+    "escapes may include scalars excluded from unescaped identifiers",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-number
+// https://www.w3.org/TR/css-values-4/#numeric-types
+// https://www.w3.org/TR/css-values-4/#css-signed-zero
+test effect fn extremeDecimalsAndLongMantissas() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(
+    b"1e999999999999999999999999 -1e999999999999999999999999 -1e-999999999999999999999999 -0 0e999999999999999999999999",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ts = buffer.tokens.asSlice()
+  run Testing.expect(
+    match &ts[0].kind {
+      Kind.Number { value, integer } => value == f64.MAX && !integer
+      _ => false
+    },
+    "positive overflow clamps to supported finite endpoint",
+  )
+  run Testing.expect(
+    match &ts[2].kind {
+      Kind.Number { value, integer } => value == -f64.MAX && !integer
+      _ => false
+    },
+    "negative overflow clamps to supported finite endpoint",
+  )
+  let mut i: usize = 4
+  while i <= 8 {
+    run Testing.expect(
+      match &ts[i].kind {
+        Kind.Number { value, integer } => f64.toBits(value) == 0
+        _ => false
+      },
+      "underflow and signed zero literals yield unsigned zero; zero times enormous exponent is zero",
+    )
+    i = i + 2
+  }
+  let mut long = Bytes.make()
+  run long.append(b"1") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut n: usize = 0
+  while n < 4096 {
+    run long.append(b"0") |> Effect.provideMut<Allocator>(&mut allocator)
+    n = n + 1
+  }
+  run long.append(b"e-4096") |> Effect.provideMut<Allocator>(&mut allocator)
+  let exact = run lexer.tokenize(long.asSlice(), &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &exact.tokens.asSlice()[0].kind {
+      Kind.Number { value, integer } => value == 1.0 && !integer
+      _ => false
+    },
+    "long mantissa and cancelling exponent are not truncated or rejected",
+  )
+}

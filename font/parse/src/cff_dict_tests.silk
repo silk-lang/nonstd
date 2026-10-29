@@ -1,0 +1,451 @@
+// Ports of all ps/cff/dict.rs, v1.rs and v2.rs tests.
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import ps.cff.dict {
+  Operator,
+  Token,
+  Tokens,
+  tokens,
+  Entry,
+  Entries,
+  entries,
+  unhintedPrivateEntries
+}
+import ps.cff.stack { Number }
+import ps.cff.blend { BlendState }
+import ps.cff.v1 { Cff, CffHeader, Index }
+import ps.cff.v2 { Cff2, Cff2Header, Index as Index2 }
+import ps.cff.charset { Charset, Iter }
+import ps.hinting { Blues, StemSnaps }
+import ps.string { Sid }
+import tables.variations { ItemVariationStore }
+import font_types.lib { Fixed, F2Dot14, GlyphId, Matrix }
+import font_data { FontData }
+import font { FontRef }
+import table_ref { ByteRange }
+import model.error { Error }
+import generated_cff_fixtures {
+  exampleCff2,
+  notoSerifFont,
+  notoSerifTable,
+  iconsFont,
+  cantarellFont
+}
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
+
+effect fn must<T, E>(result: Result<T, E>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, E>.Success { value } => move value
+    _ => {
+      run Testing.expect(false, "dictionary fixture succeeds")
+      return Intrinsic.trap("test assertion")
+    }
+  }
+}
+
+effect fn some<T>(option: Option<T>) -> T
+  ! AssertionError<'static> {
+  return match move option {
+    Option<T>.Some { value } => move value
+    _ => {
+      run Testing.expect(false, "dictionary value exists")
+      return Intrinsic.trap("test assertion")
+    }
+  }
+}
+
+fn absent<T>(option: Option<T>) -> bool {
+  return match move option {
+    Option<T>.None => true
+    _ => false
+  }
+}
+
+union TokenSpec {
+  Int { value: i32 },
+  Op { value: Operator },
+  Invalid { value: u8 },
+  InvalidTwo { value: u8 },
+}
+
+effect fn checkTokens(data: &'static [u8], expected: &[TokenSpec]) -> ()
+  ! AssertionError<'static> {
+  let mut iter = tokens(data)
+  let mut i: usize = 0
+  while i < expected.length {
+    let token = run must(run some(Tokens.next(&mut iter)))
+    let valid = match &expected[i] {
+      TokenSpec.Int { value: number } => match move token {
+        Token.Operand { number: Number.I32 { value }, bcd } => value == number && absent(move bcd)
+        _ => false
+      }
+      TokenSpec.Op { value: op } => match move token {
+        Token.Operator { value } => value == op
+        _ => false
+      }
+      TokenSpec.Invalid { value: byte } => match move token {
+        Token.InvalidOperator { value } => value == byte
+        _ => false
+      }
+      TokenSpec.InvalidTwo { value: byte } => match move token {
+        Token.InvalidTwoByteOperator { value } => value == byte
+        _ => false
+      }
+    }
+    run Testing.expect(valid, "decoded raw token")
+    i = i + 1
+  }
+  run Testing.expect(absent(Tokens.next(&mut iter)), "token iterator length")
+}
+
+effect fn checkEntries<'a, 'c>(input: Entries<'a, 'c>, expected: &[Entry]) -> ()
+  ! AssertionError<'static> {
+  let mut iter = move input
+  let mut i: usize = 0
+  while i < expected.length {
+    let entry = run must(run some(Entries.next(&mut iter)))
+    run Testing.expect(&entry == &expected[i], "decoded DICT entry")
+    i = i + 1
+  }
+  run Testing.expect(absent(Entries.next(&mut iter)), "entry iterator length")
+}
+
+fn noBlend() -> Option<BlendState<'static, 'static>> {
+  return Option<BlendState<'static, 'static>>.None
+}
+
+fn exampleRange(start: usize, end: usize) -> &'static [u8] {
+  return Slice.view<u8>(exampleCff2(), start, end - start)
+}
+
+effect fn store() -> ItemVariationStore<'static>
+  ! AssertionError<'static> {
+  return run must(ItemVariationStore.read(FontData.new(exampleRange(18, exampleCff2().length))))
+}
+
+test effect fn unknownOperatorsAreTokens() -> ()
+  ! AssertionError<'static> {
+  run checkTokens(
+    b"\x8b\x19\x8b\x0c\x4d\x8b\x11",
+    &[
+      TokenSpec.Int { value: 0 },
+      TokenSpec.Invalid { value: 25 },
+      TokenSpec.Int { value: 0 },
+      TokenSpec.InvalidTwo { value: 77 },
+      TokenSpec.Int { value: 0 },
+      TokenSpec.Op { value: Operator.CharstringsOffset },
+    ],
+  )
+}
+
+test effect fn exampleTopDictTokens() -> ()
+  ! AssertionError<'static> {
+  run checkTokens(
+    exampleRange(5, 12),
+    &[
+      TokenSpec.Int { value: 68 },
+      TokenSpec.Op { value: Operator.FdArrayOffset },
+      TokenSpec.Int { value: 56 },
+      TokenSpec.Op { value: Operator.CharstringsOffset },
+      TokenSpec.Int { value: 16 },
+      TokenSpec.Op { value: Operator.VariationStoreOffset },
+    ],
+  )
+}
+
+test effect fn exampleTopDictEntries() -> ()
+  ! AssertionError<'static> {
+  run checkEntries(
+    entries(exampleRange(5, 12), noBlend()),
+    &[
+      Entry.FdArrayOffset { value: 68 },
+      Entry.CharstringsOffset { value: 56 },
+      Entry.VariationStoreOffset { value: 16 },
+    ],
+  )
+}
+
+fn keepUnhinted(entry: &Entry) -> bool {
+  return match entry.* {
+    Entry.SubrsOffset { value } => true
+    Entry.VariationStoreIndex { value } => true
+    Entry.DefaultWidthX { value } => true
+    Entry.NominalWidthX { value } => true
+    _ => false
+  }
+}
+
+test effect fn unhintedPrivateEntriesPreserveBlends() -> ()
+  ! AssertionError<'static> {
+  let positions: [f64; 4] = [-0.75, 0.0, 0.25, 0.75]
+  let mut i: usize = 0
+  while i < 4 {
+    let coords = [F2Dot14.fromF64(positions[i])]
+    let state = run must(BlendState.new(run store(), &coords, 0))
+    let mut all = entries(exampleRange(79, 193), Option<BlendState>.some(state))
+    let mut filtered = unhintedPrivateEntries(exampleRange(79, 193), Option<BlendState>.some(state))
+    while true {
+      let entry = match move Entries.next(&mut all) {
+        Option<Result<Entry, Error>>.Some { value } => run must(move value)
+        _ => {
+          break
+        }
+      }
+      if keepUnhinted(&entry) {
+        let actual = run must(run some(Entries.next(&mut filtered)))
+        run Testing.expect(&actual == &entry, "unhinted preserves blend and relevant operands")
+      }
+    }
+    run Testing.expect(absent(Entries.next(&mut filtered)), "unhinted iterator ends")
+    i = i + 1
+  }
+}
+
+test effect fn unhintedPrivateEntriesPreserveStackAndSpecialOperators() -> ()
+  ! AssertionError<'static> {
+  let data = b"\x8e\x8f\x06\x0a\x1e\x0a\x00\x1f\x0c\x09\x1c\x02\x58\x14\x1e\x0a\x00\x1f\x8b\x8b\x1e\x0a\x00\x1f\x8b\x8b\x0c\x07\x8c\xff\x9f\x15\x95\x13"
+  run checkEntries(
+    unhintedPrivateEntries(data, noBlend()),
+    &[
+      Entry.DefaultWidthX { value: Fixed.fromI32(600) },
+      Entry.NominalWidthX { value: Fixed.fromI32(20) },
+      Entry.SubrsOffset { value: 10 },
+    ],
+  )
+}
+
+fn blues(values: &[f64]) -> Blues {
+  let mut output = [Fixed.zero(); 14]
+  let mut i: usize = 0
+  while i < values.length && i < 14 {
+    output[i] = Fixed.fromF64(values[i])
+    i = i + 1
+  }
+  return Blues.new(Slice.view<Fixed>(&output, 0, i))
+}
+
+fn snaps(values: &[f64]) -> StemSnaps {
+  let mut output = [Fixed.zero(); 12]
+  let mut i: usize = 0
+  while i < values.length && i < 12 {
+    output[i] = Fixed.fromF64(values[i])
+    i = i + 1
+  }
+  return StemSnaps.new(Slice.view<Fixed>(&output, 0, i))
+}
+
+test effect fn examplePrivateDictEntries() -> ()
+  ! AssertionError<'static> {
+  let coords = [F2Dot14.zero()]
+  let state = run must(BlendState.new(run store(), &coords, 0))
+  run checkEntries(
+    entries(exampleRange(79, 193), Option<BlendState>.some(state)),
+    &[
+      Entry.BlueValues {
+        value: blues(
+          &[-20.0, 0.0, 472.0, 490.0, 525.0, 540.0, 645.0, 660.0, 670.0, 690.0, 730.0, 750.0],
+        ),
+      },
+      Entry.OtherBlues { value: blues(&[-250.0, -240.0]) },
+      Entry.FamilyBlues {
+        value: blues(
+          &[-20.0, 0.0, 473.0, 491.0, 525.0, 540.0, 644.0, 659.0, 669.0, 689.0, 729.0, 749.0],
+        ),
+      },
+      Entry.FamilyOtherBlues { value: blues(&[-249.0, -239.0]) },
+      Entry.BlueScale { value: Fixed.fromF64(0.037506103515625) },
+      Entry.BlueFuzz { value: Fixed.zero() },
+      Entry.StdHw { value: Fixed.fromF64(55.0) },
+      Entry.StdVw { value: Fixed.fromF64(80.0) },
+      Entry.StemSnapH { value: snaps(&[40.0, 55.0]) },
+      Entry.StemSnapV { value: snaps(&[80.0, 90.0]) },
+      Entry.SubrsOffset { value: 114 },
+    ],
+  )
+}
+
+test effect fn notoSerifDisplayTopDictEntries() -> ()
+  ! AssertionError<'static> {
+  let cff = run must(Cff.read(FontData.new(notoSerifTable())))
+  let dict = run some(Index.get(&Cff.topDicts(&cff), 0))
+  run checkEntries(
+    entries(dict, noBlend()),
+    &[
+      Entry.Version { value: Sid.new(391) },
+      Entry.Notice { value: Sid.new(392) },
+      Entry.Copyright { value: Sid.new(393) },
+      Entry.FullName { value: Sid.new(394) },
+      Entry.FamilyName { value: Sid.new(395) },
+      Entry.FontBbox {
+        value: [
+          Fixed.fromF64(-693.0),
+          Fixed.fromF64(-470.0),
+          Fixed.fromF64(2797.0),
+          Fixed.fromF64(1048.0),
+        ],
+      },
+      Entry.Charset { value: 517 },
+      Entry.PrivateDictRange { value: ByteRange { start: 549, end: 587 } },
+      Entry.CharstringsOffset { value: 521 },
+    ],
+  )
+}
+
+test effect fn privateDictRangeAvoidOverflow() -> ()
+  ! AssertionError<'static> {
+  let mut iter = entries(b"\x1d\xff\xff\xff\xff\x1d\xff\xff\xff\xff\x12", noBlend())
+  let result = run some(Entries.next(&mut iter))
+  match move result {
+    Result<Entry, Error>.Failure { error } => {
+      run Testing.expect(error == Error.Malformed, "overflow rejects malformed range")
+    }
+    _ => {
+      run Testing.expect(false, "overflow rejected")
+    }
+  }
+  run Testing.expect(absent(Entries.next(&mut iter)), "overflow cursor terminates")
+}
+
+test effect fn readFontMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut iter = entries(
+    b"\x1e\x0a\x00\x1f\x8b\x1e\x0a\x00\x01\x67\xff\x1e\x0a\x00\x1f\x8b\x8b\x0c\x07",
+    noBlend(),
+  )
+  let entry = run must(run some(Entries.next(&mut iter)))
+  match entry {
+    Entry.FontMatrix { value } => {
+      let values = Matrix.elements<Fixed>(&value.matrix)
+      let expected = [
+        Fixed.one(),
+        Fixed.zero(),
+        Fixed.fromF64(0.167007446289062),
+        Fixed.one(),
+        Fixed.zero(),
+        Fixed.zero(),
+      ]
+      let mut i: usize = 0
+      while i < 6 {
+        run Testing.expect(
+          Fixed.toBits(values[i]) == Fixed.toBits(expected[i]),
+          "font matrix dynamic precision",
+        )
+        i = i + 1
+      }
+    }
+    _ => {
+      run Testing.expect(false, "font matrix operator")
+    }
+  }
+}
+
+test effect fn parseDegenerateFontMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut iter = entries(b"\x1e\x0f\x1e\x0f\x1e\x0f\x1e\x0f\x1e\x0f\x1e\x0f\x0c\x07", noBlend())
+  run Testing.expect(absent(Entries.next(&mut iter)), "degenerate matrix skipped")
+}
+
+effect fn string(bytes: Option<&'static [u8]>) -> string<'static>
+  ! AssertionError<'static> {
+  return run must(String.fromUtf8(run some(move bytes)))
+}
+
+test effect fn readNotoSerifDisplayCff() -> ()
+  ! AssertionError<'static> {
+  let font = run must(FontRef.new(notoSerifFont()))
+  let cff = run must(FontRef.cff(&font))
+  let header = Cff.header(&cff)
+  run Testing.expect(CffHeader.major(&header) == 1 && CffHeader.minor(&header) == 0, "CFF version")
+  run Testing.expect(
+    Index.count(&Cff.topDicts(&cff)) == 1 && Index.count(&Cff.names(&cff)) == 1
+      && Index.count(&Cff.globalSubrs(&cff)) == 17
+      && Index.count(&Cff.strings(&cff)) == 5,
+    "CFF indexes",
+  )
+  run Testing.expect(
+    (run string(Index.get(&Cff.names(&cff), 0))) == "NotoSerifDisplay-Regular",
+    "PostScript font name",
+  )
+  run Testing.expect((run string(Cff.string(&cff, Sid.new(391)))) == "2.9", "version string")
+  run Testing.expect(
+    (run string(Cff.string(&cff, Sid.new(392)))) == "Noto is a trademark of Google LLC.",
+    "notice string",
+  )
+  run Testing.expect(
+    (run string(Cff.string(&cff, Sid.new(393))))
+      == "Copyright 2022 The Noto Project Authors https:github.comnotofontslatin-greek-cyrillic",
+    "copyright string",
+  )
+  run Testing.expect(
+    (run string(Cff.string(&cff, Sid.new(394)))) == "Noto Serif Display Regular",
+    "full name string",
+  )
+  run Testing.expect(
+    (run string(Cff.string(&cff, Sid.new(395)))) == "Noto Serif Display",
+    "family name string",
+  )
+}
+
+effect fn checkNames(data: &'static [u8], expected: &[string<'static>]) -> ()
+  ! AssertionError<'static> {
+  let font = run must(FontRef.new(data))
+  let cff = run must(FontRef.cff(&font))
+  let charset = run some(Cff.charset(&cff, 0))
+  let mut iter = Charset.iter(&charset)
+  run Testing.expect(
+    Charset.numGlyphs(&charset) == usize.toU32(expected.length),
+    "glyph-name count",
+  )
+  let mut i: usize = 0
+  while i < expected.length {
+    let sid = run some(Charset.stringId(&charset, GlyphId.new(usize.toU32(i))))
+    run Testing.expect((run string(Cff.string(&cff, sid))) == expected[i], "glyph name by lookup")
+    let entry = run some(Iter.next(&mut iter))
+    run Testing.expect(
+      (run string(Cff.string(&cff, entry.sid))) == expected[i],
+      "glyph name by iterator",
+    )
+    i = i + 1
+  }
+  run Testing.expect(absent(Iter.next(&mut iter)), "name iterator ends")
+}
+
+test effect fn glyphNames() -> ()
+  ! AssertionError<'static> {
+  run checkNames(notoSerifFont(), &[".notdef", "i", "j", "k", "l"])
+}
+
+test effect fn iconsGlyphNames() -> ()
+  ! AssertionError<'static> {
+  run checkNames(iconsFont(), &[".notdef", "_10k"])
+}
+
+effect fn checkCff2(table: Cff2<'static>) -> ()
+  ! AssertionError<'static> {
+  let header = Cff2.header(&table)
+  run Testing.expect(
+    Cff2Header.majorVersion(&header) == 2 && Cff2Header.minorVersion(&header) == 0
+      && Cff2Header.headerSize(&header) == 5,
+    "CFF2 header",
+  )
+  run Testing.expect(
+    Cff2.topDictData(&table).length == 7 && Index2.count(&Cff2.globalSubrs(&table)) == 0,
+    "CFF2 dictionary and subrs",
+  )
+}
+
+test effect fn readExampleCff2Table() -> ()
+  ! AssertionError<'static> {
+  run checkCff2(run must(Cff2.read(FontData.new(exampleCff2()))))
+}
+
+test effect fn readCantarell() -> ()
+  ! AssertionError<'static> {
+  let font = run must(FontRef.new(cantarellFont()))
+  run checkCff2(run must(FontRef.cff2(&font)))
+}

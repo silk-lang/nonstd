@@ -1,0 +1,405 @@
+//! SVG grammar and equivalent-path contracts; links refer to specs.lock.json pins.
+import svg
+import svg { Alignment, AspectRatio }
+import geometry { Path, Segment, Point, Rect, Transform }
+import silk.core.option { Option }
+import silk.num.f64
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+fn equalsNumber(data: &[u8], expected: f64) -> bool {
+  let parsed = svg.number(data)
+  return match &parsed {
+    Option<f64>.Some { value } => value == expected
+    _ => false
+  }
+}
+
+fn invalidNumber(data: &[u8]) -> bool {
+  let parsed = svg.number(data)
+  return match &parsed {
+    Option<f64>.None => true
+    _ => false
+  }
+}
+
+fn endpoint(path: &Path, x: f64, y: f64) -> bool {
+  let point = Path.currentPoint(path)
+  return match &point {
+    Option<Point>.Some { value } => value.x == x && value.y == y
+    _ => false
+  }
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataBNF
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/types.html#Precision
+test effect fn numericGrammarAndFiniteBoundaries() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(equalsNumber(b"-.5e+2", -50.0), "sign fraction exponent")
+  run Testing.expect(equalsNumber(b"1.", 1.0), "trailing decimal point")
+  run Testing.expect(equalsNumber(b"-0e99999", -0.0), "zero with huge exponent")
+  run Testing.expect(equalsNumber(b"1e-99999", 0.0), "underflow is finite zero")
+  run Testing.expect(
+    equalsNumber(b"1.7976931348623157e308", f64.MAX),
+    "largest finite binary64 rounds correctly",
+  )
+  run Testing.expect(
+    equalsNumber(b"4.9406564584124654e-324", f64.fromBits(1)),
+    "smallest subnormal survives conversion",
+  )
+  run Testing.expect(
+    invalidNumber(b"1e309") && invalidNumber(b"1e+"),
+    "overflow and incomplete exponent",
+  )
+  run Testing.expect(
+    invalidNumber(b"nan") && invalidNumber(b"Infinity") && invalidNumber(b"0x10"),
+    "decimal only",
+  )
+  run Testing.expect(
+    invalidNumber(b"1 2") && invalidNumber(b".") && invalidNumber(b"+"),
+    "one complete token",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataMovetoCommands
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataClosePathCommand
+test effect fn relativeImplicitMoveAndClose() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let path = run svg.parsePath(b"m1 2 3 4 h5 v6 z l7 8 m1 1 2 2")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Path.length(&path.path) == 9 && endpoint(&path.path, 11.0, 13.0),
+    "implicit relative moves become lines; close restores start",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataCubicBezierCommands
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataQuadraticBezierCommands
+test effect fn smoothControlsResetByCommandKind() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let path = run svg.parsePath(b"M0 0 C1 2 3 4 5 6 S7 8 9 10 Q11 12 13 14 T15 16 S17 18 19 20")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let segments = Path.segments(&path.path)
+  let cubic = match &segments[2] {
+    Segment.CubicTo { control1, control2, to } => control1.x == 7.0 && control1.y == 8.0
+    _ => false
+  }
+  let quad = match &segments[4] {
+    Segment.QuadraticTo { control, to } => control.x == 15.0 && control.y == 16.0
+    _ => false
+  }
+  let reset = match &segments[5] {
+    Segment.CubicTo { control1, control2, to } => control1.x == 15.0 && control1.y == 16.0
+    _ => false
+  }
+  run Testing.expect(cubic && quad && reset, "reflection only after same curve family")
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataBNF
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataErrorHandling
+test effect fn compactArcsAndAtomicErrorPrefix() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let compact = run svg.parsePath(b"M0 0a1 1 0 00.5.5 2 3 0 11-2-3")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    compact.complete && Path.length(&compact.path) == 3 && endpoint(&compact.path, -1.5, -2.5),
+    "flags consume exactly one byte",
+  )
+  let prefix = run svg.parsePath(b"M0 0 L1 2 3 4 5x M9 9")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !prefix.complete && Path.length(&prefix.path) == 3 && endpoint(&prefix.path, 3.0, 4.0),
+    "complete tuples before malformed tuple survive",
+  )
+  let comma = run svg.parsePath(b"M0 0 L1 2,,3 4") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Path.length(&comma.path) == 2, "double comma stops parsing")
+  let invalidFlag = run svg.parsePath(b"M0 0 A1 1 0 2 0 4 5")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Path.length(&invalidFlag.path) == 1, "arc flags only zero or one")
+  let overflow = run svg.parsePath(b"M1e308 0 l1e308 0")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Path.length(&overflow.path) == 1,
+    "relative arithmetic overflow keeps finite prefix",
+  )
+  let noMove = run svg.parsePath(b"L1 2") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Path.isEmpty(&noMove.path), "initial moveto required")
+  let truncatedData = b"M0 0 L2"
+  let truncated = run svg.parsePath(truncatedData) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !truncated.complete && truncated.offset == truncatedData.length
+      && Path.length(&truncated.path) == 1,
+    "reaching EOF inside a tuple is incomplete, while preserving preceding segments",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/shapes.html#PolylineElement
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/shapes.html#PolygonElement
+test effect fn pointListOddCoordinatePrefix() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let line = run svg.points(b"0,0 10,20 30", false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let polygon = run svg.points(b"0,0 10,20 30", true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Path.length(&line) == 2 && endpoint(&line, 10.0, 20.0),
+    "odd coordinate ignored",
+  )
+  run Testing.expect(
+    Path.length(&polygon) == 3 && endpoint(&polygon, 0.0, 0.0),
+    "polygon closes complete pairs",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#ViewBoxAttribute
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#PreserveAspectRatioAttribute
+test effect fn viewportAlignmentAndInvalidDefaults() -> ()
+  ! AssertionError<'static> {
+  let parsed = svg.viewBox(b"10 20 100 50")
+  let box = match &parsed {
+    Option<Rect>.Some { value } => value
+    _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+  }
+  let meet = svg.viewport(box, 200.0, 200.0, b"xMaxYMax meet")
+  let valid = match &meet {
+    Option<Transform>.Some { value } => value.a == 2.0 && value.d == 2.0 && value.e == -20.0
+      && value.f == 60.0
+    _ => false
+  }
+  run Testing.expect(valid, "meet alignment includes viewBox origin")
+  let invalid = svg.viewport(box, 200.0, 200.0, b"xMaxYMax garbage")
+  let defaults = match &invalid {
+    Option<Transform>.Some { value } => value.f == 10.0
+    _ => false
+  }
+  run Testing.expect(defaults, "invalid entire preserveAspectRatio defaults to xMidYMid meet")
+  let none = svg.viewport(box, 200.0, 200.0, b"none slice")
+  let stretched = match &none {
+    Option<Transform>.Some { value } => value.a == 2.0 && value.d == 4.0
+    _ => false
+  }
+  run Testing.expect(stretched, "none ignores meetOrSlice")
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#PreserveAspectRatioAttribute
+// https://www.w3.org/TR/2011/REC-SVG11-20110816/coords.html#PreserveAspectRatioAttribute
+test effect fn typedAspectRatioParsingAndMapping() -> ()
+  ! AssertionError<'static> {
+  let initial = AspectRatio.make()
+  run Testing.expect(
+    initial.alignment == Alignment.XMidYMid && !initial.slice && !initial.defer,
+    "named default is xMidYMid meet",
+  )
+  let legacy = svg.aspectRatio(b" \tdefer none slice\r\n")
+  match &legacy {
+    Option<AspectRatio>.Some { value } => {
+      run Testing.expect(
+        value.alignment == Alignment.None && value.slice && value.defer,
+        "legacy defer and ignored none mode remain represented",
+      )
+      let mapped = svg.viewportWithAspectRatio(
+        Rect { xMin: 10.0, yMin: 20.0, xMax: 110.0, yMax: 70.0 },
+        200.0,
+        200.0,
+        value,
+      )
+      run Testing.expect(
+        match &mapped {
+          Option<Transform>.Some { value: matrix } => matrix.a == 2.0 && matrix.d == 4.0
+            && matrix.e == -20.0
+            && matrix.f == -80.0
+          _ => false
+        },
+        "typed none mapping does not serialize or parse",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "legacy grammar accepted")
+    }
+  }
+  let meet = svg.aspectRatio(b"none meet")
+  run Testing.expect(
+    match &meet {
+      Option<AspectRatio>.Some { value } => value.alignment == Alignment.None && !value.slice
+        && !value.defer
+      _ => false
+    },
+    "none also accepts meet",
+  )
+  let invalid: [&[u8]; 9] = [
+    b"",
+    b"defer",
+    b"defer defer none",
+    b"xmidYMid",
+    b"none bogus",
+    b"none meet slice",
+    b"xMinYMin,slice",
+    b"xMaxYMax slice extra",
+    b"none\x0Cmeet",
+  ]
+  let box = Rect { xMin: 10.0, yMin: 20.0, xMax: 110.0, yMax: 70.0 }
+  let mut i: usize = 0
+  while i < invalid.length {
+    let parsed = svg.aspectRatio(invalid[i])
+    run Testing.expect(
+      match &parsed {
+        Option<AspectRatio>.None => true
+        _ => false
+      },
+      "strict grammar rejects malformed values",
+    )
+    let mapped = svg.viewport(box, 200.0, 200.0, invalid[i])
+    run Testing.expect(
+      match &mapped {
+        Option<Transform>.Some { value } => value.a == 2.0 && value.d == 2.0 && value.e == -20.0
+          && value.f == 10.0
+        _ => false
+      },
+      "raw mapping defaults invalid entire attributes",
+    )
+    i = i + 1
+  }
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#ComputingAViewportsTransform
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#PreserveAspectRatioAttribute
+test effect fn typedViewportAllAlignmentsWithoutParsing() -> ()
+  ! AssertionError<'static> {
+  let alignments: [Alignment; 9] = [
+    Alignment.XMinYMin,
+    Alignment.XMidYMin,
+    Alignment.XMaxYMin,
+    Alignment.XMinYMid,
+    Alignment.XMidYMid,
+    Alignment.XMaxYMid,
+    Alignment.XMinYMax,
+    Alignment.XMidYMax,
+    Alignment.XMaxYMax,
+  ]
+  let xs: [f64; 9] = [-20.0, 80.0, 180.0, -20.0, 80.0, 180.0, -20.0, 80.0, 180.0]
+  let ys: [f64; 9] = [-40.0, -40.0, -40.0, 10.0, 10.0, 10.0, 60.0, 60.0, 60.0]
+  let box = Rect { xMin: 10.0, yMin: 20.0, xMax: 110.0, yMax: 70.0 }
+  let mut i: usize = 0
+  while i < alignments.length {
+    let ratio = AspectRatio { alignment: alignments[i], slice: false, defer: false }
+    let wide = svg.viewportWithAspectRatio(box, 400.0, 100.0, ratio)
+    let tall = svg.viewportWithAspectRatio(box, 200.0, 200.0, ratio)
+    run Testing.expect(
+      match &wide {
+        Option<Transform>.Some { value } => value.a == 2.0 && value.d == 2.0 && value.e == xs[i]
+          && value.f == -40.0
+        _ => false
+      },
+      "typed mapping aligns horizontal free space",
+    )
+    run Testing.expect(
+      match &tall {
+        Option<Transform>.Some { value } => value.a == 2.0 && value.d == 2.0 && value.e == -20.0
+          && value.f == ys[i]
+        _ => false
+      },
+      "typed mapping aligns vertical free space",
+    )
+    i = i + 1
+  }
+  let slice = svg.viewportWithAspectRatio(
+    box,
+    200.0,
+    200.0,
+    AspectRatio { alignment: Alignment.XMaxYMin, slice: true, defer: true },
+  )
+  run Testing.expect(
+    match &slice {
+      Option<Transform>.Some { value } => value.a == 4.0 && value.d == 4.0 && value.e == -240.0
+        && value.f == -80.0
+      _ => false
+    },
+    "typed slice crops and defer does not change the mapping",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/shapes.html#RectElement
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/shapes.html#EllipseElement
+test effect fn shapeEquivalentPathsAndDegeneracy() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let rect = run svg.rectangle(0.0, 0.0, 10.0, 20.0, 50.0, 50.0)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let segments = Path.segments(&rect)
+  let radii = match &segments[2] {
+    Segment.ArcTo { arc } => arc.radii.width == 5.0 && arc.radii.height == 10.0
+    _ => false
+  }
+  run Testing.expect(radii && Path.length(&rect) == 10, "corner radii clamped to half extents")
+  let empty = run svg.ellipse(0.0, 0.0, 0.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Path.isEmpty(&empty), "zero radius disables shape")
+  let ellipse = run svg.ellipse(3.0, 4.0, 2.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Path.length(&ellipse) == 6 && endpoint(&ellipse, 5.0, 4.0),
+    "ellipse equivalent four arcs closes at positive x",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#PreserveAspectRatioAttribute
+test effect fn allViewportAlignmentsAndSlice() -> ()
+  ! AssertionError<'static> {
+  let box = Rect { xMin: 10.0, yMin: 20.0, xMax: 110.0, yMax: 70.0 }
+  let aligns: [&[u8]; 9] = [
+    b"xMinYMin",
+    b"xMidYMin",
+    b"xMaxYMin",
+    b"xMinYMid",
+    b"xMidYMid",
+    b"xMaxYMid",
+    b"xMinYMax",
+    b"xMidYMax",
+    b"xMaxYMax",
+  ]
+  let expected: [f64; 9] = [-40.0, -40.0, -40.0, 10.0, 10.0, 10.0, 60.0, 60.0, 60.0]
+  let mut i: usize = 0
+  while i < aligns.length {
+    let result = svg.viewport(box, 200.0, 200.0, aligns[i])
+    let valid = match &result {
+      Option<Transform>.Some { value } => value.a == 2.0 && value.e == -20.0
+        && value.f == expected[i]
+      _ => false
+    }
+    run Testing.expect(valid, "all nine meet alignments")
+    i = i + 1
+  }
+  let slice = svg.viewport(box, 200.0, 200.0, b"xMaxYMin slice")
+  let sliced = match &slice {
+    Option<Transform>.Some { value } => value.a == 4.0 && value.e == -240.0 && value.f == -80.0
+    _ => false
+  }
+  run Testing.expect(sliced, "slice alignment crops larger dimension")
+  let zero = svg.viewport(Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 1.0 }, 10.0, 10.0, b"")
+  let disabled = match &zero {
+    Option<Transform>.None => true
+    _ => false
+  }
+  run Testing.expect(disabled, "zero viewBox extent disables rendering")
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataBNF
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/shapes.html#PolylineElement
+test effect fn pathSeparatorsDifferFromPointListSeparators() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let compact = run svg.parsePath(b"M.5-.5L1e1-2e1H30V40zZ")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Path.length(&compact.path) == 6 && endpoint(&compact.path, 0.5, -0.5),
+    "signs delimit path numbers, repeated close is valid",
+  )
+  let noSeparator = run svg.points(b"0-1 2 3", false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Path.isEmpty(&noSeparator),
+    "point list requires comma-wsp between coordinates",
+  )
+}

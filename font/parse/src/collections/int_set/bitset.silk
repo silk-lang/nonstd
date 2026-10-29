@@ -1,0 +1,722 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// Sparse ordered u32 membership, with stable page storage and a sorted page map.
+import collections.int_set.bitpage { BitPage, U32Range }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.equal { Equal }
+import silk.core.order { Order, Ordering }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+struct PageInfo {
+  major: u32,
+  index: usize,
+}
+
+impl Copy for PageInfo {}
+
+pub struct U32Set {
+  pages: List<BitPage>,
+  pageMap: List<PageInfo>,
+  length: u64,
+}
+
+fn major(value: u32) -> u32 {
+  return u32.shiftRight(value, 9)
+}
+
+fn base(value: u32) -> u32 {
+  return u32.shiftLeft(value, 9)
+}
+
+impl U32Set {
+  pub fn empty() -> Self {
+    return Self { pages: List<BitPage>.make(), pageMap: List<PageInfo>.make(), length: 0 }
+  }
+
+  pub fn default() -> Self {
+    return U32Set.empty()
+  }
+
+  pub fn len(self: &Self) -> u64 {
+    return self.length
+  }
+
+  pub fn isEmpty(self: &Self) -> bool {
+    return self.length == 0
+  }
+
+  pub fn numPages(self: &Self) -> usize {
+    return List<BitPage>.length(&self.pages)
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    List<BitPage>.clear(&mut self.pages)
+    List<PageInfo>.clear(&mut self.pageMap)
+    self.length = 0
+  }
+
+  fn lowerBound(self: &Self, target: u32) -> usize {
+    let mut lo: usize = 0
+    let mut hi = List<PageInfo>.length(&self.pageMap)
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2
+      let info = List<PageInfo>.get(&self.pageMap, mid)
+      if info.major < target {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    return lo
+  }
+
+  fn pageIndex(self: &Self, target: u32) -> Option<usize> {
+    let at = U32Set.lowerBound(self, target)
+    if at >= List<PageInfo>.length(&self.pageMap) {
+      return Option<usize>.None
+    }
+    let info = List<PageInfo>.get(&self.pageMap, at)
+    if info.major != target {
+      return Option<usize>.None
+    }
+    return Option<usize>.some(info.index)
+  }
+
+  effect fn ensurePage(self: &mut Self, target: u32) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = U32Set.lowerBound(&self, target)
+    if at < List<PageInfo>.length(&self.pageMap) {
+      let info = List<PageInfo>.get(&self.pageMap, at)
+      if info.major == target {
+        return info.index
+      }
+    }
+
+    // Reserve both before linking the new page, preserving invariants on allocation failure.
+    run List<BitPage>.reserve(&mut self.pages, 1)
+    run List<PageInfo>.reserve(&mut self.pageMap, 1)
+    let index = List<BitPage>.length(&self.pages)
+    run List<BitPage>.append(&mut self.pages, BitPage.newZeroes())
+    run List<PageInfo>.insert(&mut self.pageMap, at, PageInfo { major: target, index: index })
+    return index
+  }
+
+  fn insertInPage(self: &mut Self, index: usize, value: u32) -> bool {
+    let mut page = List<BitPage>.get(&self.pages, index)
+    let added = BitPage.insert(&mut page, value)
+    List<BitPage>.set(&mut self.pages, index, page)
+    if added {
+      self.length = self.length + 1
+    }
+    return added
+  }
+
+  pub effect fn insert(self: &mut Self, value: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let index = run U32Set.ensurePage(&mut self, major(value))
+    return U32Set.insertInPage(&mut self, index, value)
+  }
+
+  pub fn remove(self: &mut Self, value: u32) -> bool {
+    let index = match move U32Set.pageIndex(&self, major(value)) {
+      Option<usize>.Some { value: index } => index
+      _ => {
+        return false
+      }
+    }
+    let mut page = List<BitPage>.get(&self.pages, index)
+    let removed = BitPage.remove(&mut page, value)
+    List<BitPage>.set(&mut self.pages, index, page)
+    if removed {
+      self.length = self.length - 1
+    }
+    return removed
+  }
+
+  pub fn contains(self: &Self, value: u32) -> bool {
+    let index = match move U32Set.pageIndex(self, major(value)) {
+      Option<usize>.Some { value: index } => index
+      _ => {
+        return false
+      }
+    }
+    let page = List<BitPage>.get(&self.pages, index)
+    return BitPage.contains(&page, value)
+  }
+
+  pub effect fn insertRange(self: &mut Self, first: u32, last: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if first > last {
+      return
+    }
+    let mut pageMajor = major(first)
+    let end = major(last)
+    while pageMajor <= end {
+      let index = run U32Set.ensurePage(&mut self, pageMajor)
+      let mut page = List<BitPage>.get(&self.pages, index)
+      let before = BitPage.len(&page)
+      let mut low = base(pageMajor)
+      if first > low {
+        low = first
+      }
+      let mut high = base(pageMajor) + 511
+      if last < high {
+        high = last
+      }
+      BitPage.insertRange(&mut page, low, high)
+      self.length = self.length + u32.toU64(BitPage.len(&page) - before)
+      List<BitPage>.set(&mut self.pages, index, page)
+      pageMajor = pageMajor + 1
+    }
+  }
+
+  pub fn removeRange(self: &mut Self, first: u32, last: u32) -> () {
+    if first > last {
+      return
+    }
+    let mut at = U32Set.lowerBound(&self, major(first))
+    let end = major(last)
+    while at < List<PageInfo>.length(&self.pageMap) {
+      let info = List<PageInfo>.get(&self.pageMap, at)
+      if info.major > end {
+        break
+      }
+      let mut page = List<BitPage>.get(&self.pages, info.index)
+      let before = BitPage.len(&page)
+      let mut low = base(info.major)
+      if first > low {
+        low = first
+      }
+      let mut high = base(info.major) + 511
+      if last < high {
+        high = last
+      }
+      BitPage.removeRange(&mut page, low, high)
+      self.length = self.length - u32.toU64(before - BitPage.len(&page))
+      List<BitPage>.set(&mut self.pages, info.index, page)
+      at = at + 1
+    }
+  }
+
+  pub effect fn extend(self: &mut Self, values: &[u32]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut lastMajor: u32 = u32.MAX
+    let mut pageIndex: usize = 0
+    let mut i: usize = 0
+    while i < values.length {
+      let current = major(values[i])
+      if current != lastMajor {
+        pageIndex = run U32Set.ensurePage(&mut self, current)
+        lastMajor = current
+      }
+      drop U32Set.insertInPage(&mut self, pageIndex, values[i])
+      i = i + 1
+    }
+  }
+
+  pub effect fn extendUnsorted(self: &mut Self, values: &[u32]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run U32Set.extend(&mut self, values)
+  }
+
+  pub fn removeAll(self: &mut Self, values: &[u32]) -> () {
+    let mut i: usize = 0
+    while i < values.length {
+      drop U32Set.remove(&mut self, values[i])
+      i = i + 1
+    }
+  }
+
+  pub effect fn fromValues(values: &[u32]) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = U32Set.empty()
+    run U32Set.extend(&mut result, values)
+    return move result
+  }
+
+  pub effect fn clone(self: &Self) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = U32Set.empty()
+    let count = List<PageInfo>.length(&self.pageMap)
+    run List<BitPage>.reserveExact(&mut result.pages, count)
+    run List<PageInfo>.reserveExact(&mut result.pageMap, count)
+    let mut i: usize = 0
+    while i < count {
+      let info = List<PageInfo>.get(&self.pageMap, i)
+      run U32Set.appendPage(&mut result, info.major, List<BitPage>.get(&self.pages, info.index))
+      i = i + 1
+    }
+    return move result
+  }
+
+  effect fn appendPage(self: &mut Self, pageMajor: u32, page: BitPage) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run List<BitPage>.reserve(&mut self.pages, 1)
+    run List<PageInfo>.reserve(&mut self.pageMap, 1)
+    let index = List<BitPage>.length(&self.pages)
+    run List<BitPage>.append(&mut self.pages, page)
+    run List<PageInfo>.append(&mut self.pageMap, PageInfo { major: pageMajor, index: index })
+    self.length = self.length + u32.toU64(BitPage.len(&page))
+  }
+
+  pub fn firstFrom(self: &Self, value: u32) -> Option<u32> {
+    let mut at = U32Set.lowerBound(self, major(value))
+    while at < List<PageInfo>.length(&self.pageMap) {
+      let info = List<PageInfo>.get(&self.pageMap, at)
+      let page = List<BitPage>.get(&self.pages, info.index)
+      let mut from: u32 = 0
+      if info.major == major(value) {
+        from = value
+      }
+      match move BitPage.firstFrom(&page, from) {
+        Option<u32>.Some { value: found } => {
+          return Option<u32>.some(base(info.major) + found)
+        }
+        _ => {}
+      }
+      at = at + 1
+    }
+    return Option<u32>.None
+  }
+
+  pub fn lastFrom(self: &Self, value: u32) -> Option<u32> {
+    let target = major(value)
+    let mut at = U32Set.lowerBound(self, target)
+    if at < List<PageInfo>.length(&self.pageMap)
+      && List<PageInfo>.get(&self.pageMap, at).major == target {
+      at = at + 1
+    }
+    while at > 0 {
+      at = at - 1
+      let info = List<PageInfo>.get(&self.pageMap, at)
+      let page = List<BitPage>.get(&self.pages, info.index)
+      let mut from: u32 = 511
+      if info.major == target {
+        from = value
+      }
+      match move BitPage.lastFrom(&page, from) {
+        Option<u32>.Some { value: found } => {
+          return Option<u32>.some(base(info.major) + found)
+        }
+        _ => {}
+      }
+    }
+    return Option<u32>.None
+  }
+
+  pub fn lastAbsentFrom(self: &Self, value: u32) -> Option<u32> {
+    let mut candidate = value
+    let mut pageMajor = major(value)
+    let mut at = U32Set.lowerBound(self, pageMajor)
+    if at < List<PageInfo>.length(&self.pageMap)
+      && List<PageInfo>.get(&self.pageMap, at).major == pageMajor {
+      at = at + 1
+    }
+    while true {
+      if at == 0 {
+        return Option<u32>.some(candidate)
+      }
+      at = at - 1
+      let info = List<PageInfo>.get(&self.pageMap, at)
+      if info.major != pageMajor {
+        return Option<u32>.some(candidate)
+      }
+      let page = List<BitPage>.get(&self.pages, info.index)
+      match move BitPage.lastAbsentFrom(&page, candidate) {
+        Option<u32>.Some { value: found } => {
+          return Option<u32>.some(base(pageMajor) + found)
+        }
+        _ => {}
+      }
+      if pageMajor == 0 {
+        return Option<u32>.None
+      }
+      pageMajor = pageMajor - 1
+      candidate = base(pageMajor) + 511
+    }
+    return Option<u32>.None
+  }
+
+  pub fn nextAfter(self: &Self, value: u32) -> Option<u32> {
+    if value == u32.MAX {
+      return Option<u32>.None
+    }
+    return U32Set.firstFrom(self, value + 1)
+  }
+
+  pub fn firstAbsentFrom(self: &Self, value: u32) -> Option<u32> {
+    let mut candidate = value
+    let mut pageMajor = major(value)
+    let mut at = U32Set.lowerBound(self, pageMajor)
+    while true {
+      if at >= List<PageInfo>.length(&self.pageMap) {
+        return Option<u32>.some(candidate)
+      }
+      let info = List<PageInfo>.get(&self.pageMap, at)
+      if info.major != pageMajor {
+        return Option<u32>.some(candidate)
+      }
+      let page = List<BitPage>.get(&self.pages, info.index)
+      match move BitPage.firstAbsentFrom(&page, candidate) {
+        Option<u32>.Some { value: found } => {
+          return Option<u32>.some(base(pageMajor) + found)
+        }
+        _ => {}
+      }
+      if pageMajor == 8388607 {
+        return Option<u32>.None
+      }
+      pageMajor = pageMajor + 1
+      candidate = base(pageMajor)
+      at = at + 1
+    }
+    return Option<u32>.None
+  }
+
+  pub fn nextAbsentAfter(self: &Self, value: u32) -> Option<u32> {
+    if value == u32.MAX {
+      return Option<u32>.None
+    }
+    return U32Set.firstAbsentFrom(self, value + 1)
+  }
+
+  pub fn intersectsSet(self: &Self, other: &Self) -> bool {
+    return U32Set.commonCount(self, other, true) != 0
+  }
+
+  pub fn intersectionLen(self: &Self, other: &Self) -> u64 {
+    return U32Set.commonCount(self, other, false)
+  }
+
+  fn commonCount(self: &Self, other: &Self, stopAtFirst: bool) -> u64 {
+    let mut a: usize = 0
+    let mut b: usize = 0
+    let mut count: u64 = 0
+    while a < List<PageInfo>.length(&self.pageMap) && b < List<PageInfo>.length(&other.pageMap) {
+      let ai = List<PageInfo>.get(&self.pageMap, a)
+      let bi = List<PageInfo>.get(&other.pageMap, b)
+      if ai.major < bi.major {
+        a = a + 1
+      } else if bi.major < ai.major {
+        b = b + 1
+      } else {
+        let ap = List<BitPage>.get(&self.pages, ai.index)
+        let bp = List<BitPage>.get(&other.pages, bi.index)
+        if stopAtFirst && BitPage.intersectsSet(&ap, &bp) {
+          return 1
+        }
+        if !stopAtFirst {
+          count = count + u32.toU64(BitPage.intersectionLen(&ap, &bp))
+        }
+        a = a + 1
+        b = b + 1
+      }
+    }
+    return count
+  }
+
+  pub fn isSubset(self: &Self, other: &Self) -> bool {
+    if self.length > other.length {
+      return false
+    }
+    return U32Set.intersectionLen(self, other) == self.length
+  }
+
+  pub fn equals(self: &Self, other: &Self) -> bool {
+    return self.length == other.length && U32Set.isSubset(self, other)
+  }
+
+  pub effect fn unionValue(self: &mut Self, other: &Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run U32Set.process(&mut self, other, 0)
+  }
+
+  pub effect fn intersect(self: &mut Self, other: &Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run U32Set.process(&mut self, other, 1)
+  }
+
+  pub effect fn subtract(self: &mut Self, other: &Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run U32Set.process(&mut self, other, 2)
+  }
+
+  pub effect fn reversedSubtract(self: &mut Self, other: &Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run U32Set.process(&mut self, other, 3)
+  }
+
+  effect fn process(self: &mut Self, other: &Self, operation: u8) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Merge into fresh storage so allocation failure leaves self unchanged.
+    let mut result = U32Set.empty()
+    let mut a: usize = 0
+    let mut b: usize = 0
+    let ac = List<PageInfo>.length(&self.pageMap)
+    let bc = List<PageInfo>.length(&other.pageMap)
+    while a < ac || b < bc {
+      let mut ai = PageInfo { major: u32.MAX, index: 0 }
+      let mut bi = PageInfo { major: u32.MAX, index: 0 }
+      if a < ac {
+        ai = List<PageInfo>.get(&self.pageMap, a)
+      }
+      if b < bc {
+        bi = List<PageInfo>.get(&other.pageMap, b)
+      }
+      if ai.major < bi.major {
+        if operation == 0 || operation == 2 {
+          run U32Set.appendPage(&mut result, ai.major, List<BitPage>.get(&self.pages, ai.index))
+        }
+        a = a + 1
+      } else if bi.major < ai.major {
+        if operation == 0 || operation == 3 {
+          run U32Set.appendPage(&mut result, bi.major, List<BitPage>.get(&other.pages, bi.index))
+        }
+        b = b + 1
+      } else {
+        let ap = List<BitPage>.get(&self.pages, ai.index)
+        let bp = List<BitPage>.get(&other.pages, bi.index)
+        let mut page = BitPage.newZeroes()
+        if operation == 0 {
+          page = BitPage.unionValue(&ap, &bp)
+        } else if operation == 1 {
+          page = BitPage.intersect(&ap, &bp)
+        } else if operation == 2 {
+          page = BitPage.subtract(&ap, &bp)
+        } else {
+          page = BitPage.subtract(&bp, &ap)
+        }
+        run U32Set.appendPage(&mut result, ai.major, page)
+        a = a + 1
+        b = b + 1
+      }
+    }
+    self.* = move result
+  }
+
+  pub fn iter<'a>(self: &'a Self) -> U32SetIter<'a> {
+    return U32Set.iterFrom(self, 0)
+  }
+
+  pub fn iterFrom<'a>(self: &'a Self, value: u32) -> U32SetIter<'a> {
+    return U32SetIter<'a> {
+      set: self,
+      frontMap: U32Set.lowerBound(self, major(value)),
+      backMap: List<PageInfo>.length(&self.pageMap),
+      front: u32.toU64(value),
+      end: 4294967296,
+    }
+  }
+
+  pub fn iterRanges<'a>(self: &'a Self) -> U32SetRangeIter<'a> {
+    return U32SetRangeIter<'a> { set: self, nextValue: 0 }
+  }
+
+  pub fn compare(self: &Self, other: &Self) -> Ordering {
+    let mut a = U32Set.iter(self)
+    let mut b = U32Set.iter(other)
+    while true {
+      let av = match move U32SetIter.next(&mut a) {
+        Option<u32>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      let bv = match move U32SetIter.next(&mut b) {
+        Option<u32>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      if av < bv {
+        return Ordering.Less
+      }
+      if av > bv {
+        return Ordering.Greater
+      }
+    }
+    if self.length < other.length {
+      return Ordering.Less
+    }
+    if self.length > other.length {
+      return Ordering.Greater
+    }
+    return Ordering.Equal
+  }
+
+  pub fn hash(self: &Self, seed: &HashSeed) -> u64 {
+    let mut result = Hash.mix(seed, 0)
+    let mut i: usize = 0
+    while i < List<PageInfo>.length(&self.pageMap) {
+      let info = List<PageInfo>.get(&self.pageMap, i)
+      let page = List<BitPage>.get(&self.pages, info.index)
+      if !BitPage.isEmpty(&page) {
+        result = Hash.combine(result, u32.toU64(info.major))
+        result = Hash.combine(result, BitPage.hash(&page, seed))
+      }
+      i = i + 1
+    }
+    return result
+  }
+}
+
+impl Equal for U32Set {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return U32Set.equals(a, b)
+  }
+}
+
+impl Order for U32Set {
+  fn compare(a: &Self, b: &Self) -> Ordering {
+    return U32Set.compare(a, b)
+  }
+}
+
+impl HashKey for U32Set {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return U32Set.equals(a, b)
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    return U32Set.hash(value, seed)
+  }
+}
+
+pub struct U32SetIter<'a> {
+  set: &'a U32Set,
+  frontMap: usize,
+  backMap: usize,
+  front: u64,
+  end: u64,
+}
+
+impl<'a> U32SetIter<'a> {
+  pub fn next(self: &mut Self) -> Option<u32> {
+    while self.front < self.end && self.frontMap < self.backMap {
+      let info = List<PageInfo>.get(&self.set.pageMap, self.frontMap)
+      let page = List<BitPage>.get(&self.set.pages, info.index)
+      let start = base(info.major)
+      let mut from: u32 = 0
+      if self.front > u32.toU64(start) {
+        from = u64.toU32(self.front) - start
+      }
+      if from < 512 {
+        match move BitPage.firstFrom(&page, from) {
+          Option<u32>.Some { value } => {
+            let result = start + value
+            if u32.toU64(result) >= self.end {
+              self.front = self.end
+              return Option<u32>.None
+            }
+            self.front = u32.toU64(result) + 1
+            return Option<u32>.some(result)
+          }
+          _ => {}
+        }
+      }
+      self.frontMap = self.frontMap + 1
+    }
+    self.front = self.end
+    return Option<u32>.None
+  }
+
+  pub fn nextBack(self: &mut Self) -> Option<u32> {
+    while self.front < self.end && self.frontMap < self.backMap {
+      let info = List<PageInfo>.get(&self.set.pageMap, self.backMap - 1)
+      let page = List<BitPage>.get(&self.set.pages, info.index)
+      let start = base(info.major)
+      let mut from: u32 = 511
+      if self.end <= u32.toU64(start) + 512 {
+        if self.end <= u32.toU64(start) {
+          self.backMap = self.backMap - 1
+          continue
+        }
+        from = u64.toU32(self.end - 1) - start
+      }
+      match move BitPage.lastFrom(&page, from) {
+        Option<u32>.Some { value } => {
+          let result = start + value
+          if u32.toU64(result) < self.front {
+            self.end = self.front
+            return Option<u32>.None
+          }
+          self.end = u32.toU64(result)
+          return Option<u32>.some(result)
+        }
+        _ => {}
+      }
+      self.backMap = self.backMap - 1
+    }
+    self.end = self.front
+    return Option<u32>.None
+  }
+}
+
+pub struct U32SetRangeIter<'a> {
+  set: &'a U32Set,
+  nextValue: u64,
+}
+
+impl<'a> U32SetRangeIter<'a> {
+  pub fn next(self: &mut Self) -> Option<U32Range> {
+    if self.nextValue > 4294967295 {
+      return Option<U32Range>.None
+    }
+    let first = match move U32Set.firstFrom(self.set, u64.toU32(self.nextValue)) {
+      Option<u32>.Some { value } => value
+      _ => {
+        self.nextValue = 4294967296
+        return Option<U32Range>.None
+      }
+    }
+    let end: u64 = match move U32Set.firstAbsentFrom(self.set, first) {
+      Option<u32>.Some { value } => u32.toU64(value)
+      _ => 4294967296
+    }
+    self.nextValue = end
+    return Option<U32Range>.some(U32Range { first: first, last: u64.toU32(end - 1) })
+  }
+}
+
+pub struct U32SetBuilder<'a> {
+  set: &'a mut U32Set,
+  lastMajor: u32,
+  lastPage: usize,
+}
+
+impl<'a> U32SetBuilder<'a> {
+  pub fn start(set: &'a mut U32Set) -> Self {
+    return Self { set: move set, lastMajor: u32.MAX, lastPage: 0 }
+  }
+
+  pub effect fn insert(self: &mut Self, value: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let current = major(value)
+    if current != self.lastMajor {
+      self.lastPage = run U32Set.ensurePage(&mut self.set.*, current)
+      self.lastMajor = current
+    }
+    drop U32Set.insertInPage(&mut self.set.*, self.lastPage, value)
+  }
+
+  pub fn finish(self: Self) -> () {}
+}

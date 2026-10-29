@@ -1,0 +1,235 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Control-point bounds shared by VARC components and COLR outline clips.
+import model.metrics.glyf_outline { GlyfContext, load }
+import model.metrics.glyf_path { outlineToPath, PathContourStart }
+import tables.glyf { PointFlags }
+import model.glyph { GlyphSource, GlyphSourceOrder, GlyphSources }
+import model.glyph.outline { PathSink }
+import model.optional { Maybe }
+import model.error { Error }
+import table_provider { GlyfLoca }
+import tables.gvar { SelectedGvar }
+import tables.hmtx { GlyphMetricRecords }
+import ps.cff.font { CffFontRef, Subfont }
+import font_data { FontData }
+import font_types.lib { F2Dot14, GlyphId, Point, Matrix, BoundingBox }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.num.f32
+
+pub struct BaseOutlines<'a> {
+  pub glyf: Maybe<GlyfLoca<'a>>,
+  pub gvar: Maybe<SelectedGvar<'a>>,
+  pub hMetrics: GlyphMetricRecords<'a>,
+  pub vMetrics: GlyphMetricRecords<'a>,
+  pub glyphCount: u32,
+  pub ascender: i32,
+  pub descender: i32,
+  pub cff: Maybe<CffFontRef<'a>>,
+  pub cff2: Maybe<CffFontRef<'a>>,
+  pub standalone: Maybe<&'a CffFontRef<'a>>,
+  pub upem: u16,
+  pub order: GlyphSourceOrder,
+}
+
+impl<'a> Copy for BaseOutlines<'a> {}
+
+pub struct ControlBounds {
+  pub matrix: Matrix<f32>,
+  pub bounds: Maybe<BoundingBox<f32>>,
+}
+
+impl Copy for ControlBounds {}
+
+impl ControlBounds {
+  pub fn new(matrix: Matrix<f32>) -> Self {
+    return Self { matrix: matrix, bounds: Maybe<BoundingBox<f32>>.None }
+  }
+
+  pub fn point(self: &mut Self, x: f32, y: f32) -> () {
+    let p = self.matrix * Point<f32> { x: x, y: y }
+    match self.bounds {
+      Maybe<BoundingBox<f32>>.None => {
+        self.bounds = Maybe<BoundingBox<f32>>.Some {
+          value: BoundingBox<f32> { xMin: p.x, yMin: p.y, xMax: p.x, yMax: p.y }
+        }
+      }
+      Maybe<BoundingBox<f32>>.Some { value } => {
+        let mut box = value
+        box.xMin = minNumber(box.xMin, p.x)
+        box.xMax = maxNumber(box.xMax, p.x)
+        box.yMin = minNumber(box.yMin, p.y)
+        box.yMax = maxNumber(box.yMax, p.y)
+        self.bounds = Maybe<BoundingBox<f32>>.Some { value: box }
+      }
+    }
+  }
+
+  pub fn finish(self: &Self) -> BoundingBox<f32> {
+    return match self.bounds {
+      Maybe<BoundingBox<f32>>.Some { value } => value
+      _ => BoundingBox<f32> { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+    }
+  }
+}
+
+impl PathSink for ControlBounds {
+  fn moveTo(self: &mut Self, x: f32, y: f32) {
+    ControlBounds.point(&mut self, x, y)
+  }
+
+  fn lineTo(self: &mut Self, x: f32, y: f32) {
+    ControlBounds.point(&mut self, x, y)
+  }
+
+  fn quadTo(self: &mut Self, cx: f32, cy: f32, x: f32, y: f32) {
+    ControlBounds.point(&mut self, cx, cy)
+    ControlBounds.point(&mut self, x, y)
+  }
+
+  fn curveTo(self: &mut Self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+    ControlBounds.point(&mut self, cx0, cy0)
+    ControlBounds.point(&mut self, cx1, cy1)
+    ControlBounds.point(&mut self, x, y)
+  }
+
+  fn close(self: &mut Self) {}
+}
+
+impl<'a> BaseOutlines<'a> {
+  pub fn available(self: &Self) -> bool {
+    let mut sources = GlyphSourceOrder.iter(self.order)
+    while let Option<GlyphSource>.Some { value: source } = GlyphSources.next(&mut sources) {
+      if source == GlyphSource.Glyf {
+        if let Maybe<GlyfLoca<'a>>.Some { value } = self.glyf {
+          return true
+        }
+      }
+      if source == GlyphSource.Cff || source == GlyphSource.Cff2 {
+        if source == GlyphSource.Cff {
+          if let Maybe<&'a CffFontRef<'a>>.Some { value } = self.standalone {
+            return true
+          }
+        }
+        let mut data = self.cff
+        if source == GlyphSource.Cff2 {
+          data = self.cff2
+        }
+        if let Maybe<CffFontRef<'a>>.Some { value } = data {
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  pub effect fn draw(
+    self: &Self,
+    glyph: GlyphId,
+    coords: &[F2Dot14],
+    sink: &mut ControlBounds,
+  ) -> ()
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    let mut sources = GlyphSourceOrder.iter(self.order)
+    while let Option<GlyphSource>.Some { value: source } = GlyphSources.next(&mut sources) {
+      if source == GlyphSource.Glyf {
+        if let Maybe<GlyfLoca<'a>>.Some { value: tables } = self.glyf {
+          if GlyphId.toU32(glyph) >= self.glyphCount {
+            fail Error.MissingResource
+          }
+          let context = GlyfContext {
+            outlines: tables,
+            gvar: self.gvar,
+            hMetrics: self.hMetrics,
+            vMetrics: self.vMetrics,
+            glyphCount: self.glyphCount,
+            coords: coords,
+            ascender: self.ascender,
+            descender: self.descender,
+          }
+          let outline = run load(&context, glyph)
+          if !outlineToPath(
+            List<Point<f32>>.asSlice(&outline.points),
+            List<PointFlags>.asSlice(&outline.flags),
+            List<u16>.asSlice(&outline.contours),
+            PathContourStart.ScanBackward,
+            &mut sink,
+          ) {
+            fail Error.Malformed
+          }
+          return
+        }
+      }
+      if source == GlyphSource.Cff || source == GlyphSource.Cff2 {
+        if source == GlyphSource.Cff {
+          if let Maybe<&'a CffFontRef<'a>>.Some { value } = self.standalone {
+            run drawCff(value, glyph, coords, &mut sink)
+            return
+          }
+        }
+        let mut data = self.cff
+        if source == GlyphSource.Cff2 {
+          data = self.cff2
+        }
+        if let Maybe<CffFontRef<'a>>.Some { value: font } = data {
+          run drawCff(&font, glyph, coords, &mut sink)
+          return
+        }
+      }
+    }
+    fail Error.MissingResource
+  }
+}
+
+effect fn drawCff(
+  font: &CffFontRef,
+  glyph: GlyphId,
+  coords: &[F2Dot14],
+  sink: &mut ControlBounds,
+) -> ()
+  ! Error {
+  let index = match move CffFontRef.subfontIndex(font, glyph) {
+    Option<u16>.Some { value } => value
+    _ => {
+      fail Error.MissingResource
+    }
+  }
+  let subfont = match move CffFontRef.subfont(font, index, coords) {
+    Result<Subfont, Error>.Success { value } => move value
+    Result<Subfont, Error>.Failure { error } => {
+      fail error
+    }
+  }
+  match move CffFontRef.draw(font, &subfont, glyph, coords, Option<f32>.None, &mut sink) {
+    Result<Option<f32>, Error>.Failure { error } => {
+      fail error
+    }
+    _ => {}
+  }
+}
+
+// Rust min/max ignore a single NaN; Silk min/max propagate it.
+pub fn minNumber(a: f32, b: f32) -> f32 {
+  if f32.isNaN(a) {
+    return b
+  }
+  if f32.isNaN(b) {
+    return a
+  }
+  return f32.min(a, b)
+}
+
+pub fn maxNumber(a: f32, b: f32) -> f32 {
+  if f32.isNaN(a) {
+    return b
+  }
+  if f32.isNaN(b) {
+    return a
+  }
+  return f32.max(a, b)
+}

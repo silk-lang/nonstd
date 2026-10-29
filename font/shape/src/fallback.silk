@@ -1,0 +1,258 @@
+//! Geometric mark placement for fonts without usable mark positioning.
+import trace
+import buffer { Buffer, Glyph, GlyphPosition }
+import font { ConfiguredShaper, FontFuncs, Shaper, Metrics, metrics }
+import direction { Direction }
+import scale { Scale, add, sub, clamp }
+import unicode
+import read_fonts.model.metrics.extents { GlyphExtents }
+import font_types.lib { GlyphId }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.u8
+
+fn category(cp: u32, input: u8) -> u8 {
+  let mut c = input
+  if c >= 200 {
+    return c
+  }
+  if (cp & 4294967040) == 0x0e00 {
+    if c == 0 {
+      if cp == 0x0e31 || (cp >= 0x0e34 && cp <= 0x0e37) || cp == 0x0e47
+        || (cp >= 0x0e4c && cp <= 0x0e4e) {
+        c = 232
+      }
+      if cp == 0x0eb1 || (cp >= 0x0eb4 && cp <= 0x0eb7) || cp == 0x0ebb || cp == 0x0ecc
+        || cp == 0x0ecd {
+        c = 230
+      }
+      if cp == 0x0ebc {
+        c = 220
+      }
+    } else if cp == 0x0e3a {
+      c = 222
+    }
+  }
+  if c >= 15 && c <= 25 {
+    return 220
+  }
+  if c == 13 {
+    return 214
+  }
+  if c == 10 {
+    return 232
+  }
+  if c == 11 || c == 14 {
+    return 228
+  }
+  if c == 26 || (c >= 27 && c <= 36 && c != 30 && c != 33) {
+    return 230
+  }
+  if c == 30 || c == 33 || c == 118 || c == 129 || c == 131 {
+    return 220
+  }
+  if c == 3 {
+    return 222
+  }
+  if c == 107 {
+    return 232
+  }
+  if c == 122 || c == 132 {
+    return 230
+  }
+  return c
+}
+
+pub effect fn position<F: FontFuncs>(font: &ConfiguredShaper<F>, buffer: &mut Buffer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !run trace.message(font, &buffer.*, "start fallback mark") {
+    return
+  }
+  let m = run metrics(font)
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) {
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    if !unicode.isMark(item.codepoint) {
+      let mut end = i + 1
+      while end < Buffer.len(&buffer.*) {
+        let other = List<Glyph>.get(&buffer.glyphs, end)
+        if !unicode.isMark(other.codepoint) && !other.ignorable {
+          break
+        }
+        end = end + 1
+      }
+      if end > i + 1 {
+        run aroundBase(font, &m, &mut buffer, i, end)
+      }
+      i = end
+    } else {
+      i = i + 1
+    }
+  }
+  drop run trace.message(font, &buffer.*, "end fallback mark")
+}
+
+effect fn aroundBase<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  metrics: &Metrics<F>,
+  buffer: &mut Buffer,
+  base: usize,
+  end: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  Buffer.unsafeToBreak(&mut buffer, base, end)
+  let original = List<Glyph>.get(&buffer.glyphs, base)
+  let mut bounds = match move run Metrics.extents(metrics, GlyphId.new(original.info.glyphId)) {
+    Option<GlyphExtents<i32>>.Some { value } => value
+    _ => {
+      return
+    }
+  }
+  bounds.height = sub(0, bounds.height)
+  bounds.yBearing = add(bounds.yBearing, original.position.yOffset)
+  bounds.xBearing = 0
+  bounds.width = Metrics.hAdvance(metrics, GlyphId.new(original.info.glyphId))
+  let mut x: i32 = 0
+  let mut y: i32 = 0
+  if Direction.isForward(buffer.direction) {
+    x = sub(0, original.position.xAdvance)
+    y = sub(0, original.position.yAdvance)
+  }
+  let mut lastComponent: i32 = -1
+  let mut lastClass: u8 = 255
+  let mut component = bounds
+  let mut cluster = bounds
+  let mut i = base + 1
+  while i < end {
+    let mut item = List<Glyph>.get(&buffer.glyphs, i)
+    let mut c = item.combiningClass
+    if unicode.generalCategory(item.codepoint) == 12 {
+      c = category(item.codepoint, c)
+    }
+    if c != 0 {
+      let count = Glyph.ligNumComps(&original)
+      if count > 1 && original.ligated {
+        let mut part: i32 = -1
+        if item.component != 0 {
+          part = u8.toI32(item.component) - 1
+        }
+        if original.ligatureId == 0 || original.ligatureId != item.ligatureId
+          || part >= u32.toI32(count) {
+          part = u32.toI32(count - 1)
+        }
+        if lastComponent != part {
+          lastComponent = part
+          lastClass = 255
+          component = bounds
+          let mut rtl = buffer.direction == Direction.RightToLeft
+          if !Direction.isHorizontal(buffer.direction) {
+            rtl = unicode.isRtl(buffer.script)
+          }
+          if rtl {
+            part = u32.toI32(count) - 1 - part
+          }
+          component.xBearing = clamp(
+            i32.toI64(component.xBearing)
+              + i32.toI64(part) * i32.toI64(component.width) / u32.toI64(count),
+          )
+          component.width = component.width / u32.toI32(count)
+        }
+      }
+      if lastClass != c {
+        lastClass = c
+        cluster = component
+      }
+      run mark(
+        font,
+        metrics,
+        item.info.glyphId,
+        &mut item.position,
+        &mut cluster,
+        c,
+        buffer.direction,
+      )
+      item.position.xAdvance = 0
+      item.position.yAdvance = 0
+      item.position.xOffset = add(item.position.xOffset, x)
+      item.position.yOffset = add(item.position.yOffset, y)
+      List<Glyph>.set(&mut buffer.glyphs, i, item)
+    } else {
+      if Direction.isForward(buffer.direction) {
+        x = sub(x, item.position.xAdvance)
+        y = sub(y, item.position.yAdvance)
+      } else {
+        x = add(x, item.position.xAdvance)
+        y = add(y, item.position.yAdvance)
+      }
+    }
+    i = i + 1
+  }
+}
+
+effect fn mark<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  metrics: &Metrics<F>,
+  glyph: u32,
+  pos: &mut GlyphPosition,
+  base: &mut GlyphExtents<i32>,
+  c: u8,
+  direction: Direction,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut extents = match move run Metrics.extents(metrics, GlyphId.new(glyph)) {
+    Option<GlyphExtents<i32>>.Some { value } => value
+    _ => {
+      return
+    }
+  }
+  extents.height = sub(0, extents.height)
+  let gap = Scale.y(&font.scale, u16.toI32(font.data.upem) / 16)
+  pos.xOffset = 0
+  pos.yOffset = 0
+  if (c == 233 || c == 234) && Direction.isHorizontal(direction) {
+    let mut edge: i32 = 0
+    if Direction.isForward(direction) {
+      edge = base.width
+    }
+    pos.xOffset = sub(sub(add(base.xBearing, edge), extents.width / 2), extents.xBearing)
+  } else if c == 200 || c == 218 || c == 228 {
+    pos.xOffset = sub(base.xBearing, extents.xBearing)
+  } else if c == 216 || c == 222 || c == 232 {
+    pos.xOffset = sub(sub(add(base.xBearing, base.width), extents.width), extents.xBearing)
+  } else {
+    pos.xOffset = sub(add(base.xBearing, sub(base.width, extents.width) / 2), extents.xBearing)
+  }
+  let attached = c == 200 || c == 202 || c == 214 || c == 216
+  if c == 233 || c == 218 || c == 220 || c == 222 || c == 200 || c == 202 {
+    if !attached {
+      base.height = sub(base.height, gap)
+    }
+    pos.yOffset = sub(add(base.yBearing, base.height), extents.yBearing)
+    if (gap > 0) == (pos.yOffset > 0) {
+      base.height = sub(base.height, pos.yOffset)
+      pos.yOffset = 0
+    }
+    base.height = add(base.height, extents.height)
+  } else if c == 234 || c == 228 || c == 230 || c == 232 || c == 214 || c == 216 {
+    if !attached {
+      base.yBearing = add(base.yBearing, gap)
+      base.height = sub(base.height, gap)
+    }
+    pos.yOffset = sub(base.yBearing, add(extents.yBearing, extents.height))
+    if (gap > 0) != (pos.yOffset > 0) {
+      let correction = sub(0, pos.yOffset / 2)
+      base.yBearing = add(base.yBearing, correction)
+      base.height = sub(base.height, correction)
+      pos.yOffset = add(pos.yOffset, correction)
+    }
+    base.yBearing = sub(base.yBearing, extents.height)
+    base.height = add(base.height, extents.height)
+  }
+}

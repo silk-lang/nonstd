@@ -1,0 +1,357 @@
+//! Executor safety contracts; rasterization/presentation integration is tested by svg_render.
+import cpu
+import patterns
+import svg_core.scene {
+  DisplayList,
+  Command,
+  Color,
+  Brush,
+  FillRule,
+  RenderError,
+  GradientStop,
+  Gradient,
+  PaintInstance,
+  StrokeSpace,
+  Pattern,
+}
+import svg_geometry.geometry { Path, Segment, Point, Rect }
+import svg_core.mapping { Mapping, ProjectionClip }
+import vector.projective { HalfPlane, Homography }
+import vector.pixmap { Pixmap }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.testing.testing { Testing, AssertionError }
+
+fn empty(width: u32, height: u32) -> DisplayList {
+  return DisplayList {
+    width: width,
+    height: height,
+    maxPatternPixels: 1048576,
+    maxPatternWork: 1000000,
+    patterns: List<Pattern>.make(),
+    paths: List<Path>.make(),
+    dashes: List<List<f64>>.make(),
+    commands: List<Command>.make(),
+    projectionClips: List<ProjectionClip>.make(),
+    gradientStops: List<List<GradientStop>>.make(),
+    gradients: List<Gradient>.make(),
+    paints: List<PaintInstance>.make(),
+    strokeSpaces: List<StrokeSpace>.make(),
+  }
+}
+
+fn bounds() -> Rect {
+  return Rect { xMin: 0.0, yMin: 0.0, xMax: 2.0, yMax: 2.0 }
+}
+
+effect fn rejected(list: &DisplayList, expected: RenderError) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let result = run Effect.result(cpu.execute(list))
+  return match &result {
+    Result<Pixmap, RenderError | OutOfMemoryError>.Success { value: _ } => false
+    Result<Pixmap, RenderError | OutOfMemoryError>.Failure { error } => match &error {
+      RenderError problem => problem == expected
+      OutOfMemoryError problem => {
+        fail OutOfMemoryError {}
+      }
+    }
+  }
+}
+
+effect fn invalidLists() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let zero = empty(0, 2)
+  run Testing.expect(run rejected(&zero, RenderError.InvalidSize), "zero viewport rejected")
+  let huge = empty(4294967295, 4294967295)
+  run Testing.expect(
+    run rejected(&huge, RenderError.TooLarge),
+    "size arithmetic checked before allocation",
+  )
+  let mut badPath = empty(2, 2)
+  run badPath.commands.append(
+    Command.FillPath {
+      path: 0,
+      transform: Mapping.identity(),
+      clip: Option<usize>.None,
+      bounds: bounds(),
+      brush: Brush.Solid { color: Color.black() },
+      opacity: 1.0,
+      linearRgb: false,
+      rule: FillRule.Nonzero,
+      crispEdges: false,
+    },
+  )
+  run Testing.expect(
+    run rejected(&badPath, RenderError.InvalidGeometry),
+    "missing path rejected before indexing",
+  )
+  let missingClip = run geometryList(Option<usize>.some(0))
+  run Testing.expect(
+    run rejected(&missingClip, RenderError.InvalidGeometry),
+    "missing projection clip rejected before indexing",
+  )
+  let mut cyclicClip = run geometryList(Option<usize>.some(0))
+  run cyclicClip.projectionClips.append(
+    ProjectionClip { parent: Option<usize>.some(0), plane: HalfPlane { x: 1.0, y: 0.0, w: 0.0 } },
+  )
+  run Testing.expect(
+    run rejected(&cyclicClip, RenderError.InvalidGeometry),
+    "projection clip cycle rejected before traversal",
+  )
+  let mut underflow = empty(2, 2)
+  run underflow.commands.append(Command.PopLayer)
+  run Testing.expect(
+    run rejected(&underflow, RenderError.InvalidGeometry),
+    "layer stack underflow rejected",
+  )
+  let mut unclosed = empty(2, 2)
+  run unclosed.commands.append(
+    Command.PushLayer { opacity: 0.5, bounds: bounds(), linearRgb: false },
+  )
+  run Testing.expect(
+    run rejected(&unclosed, RenderError.InvalidGeometry),
+    "unclosed isolated layer rejected",
+  )
+  let mut layered = empty(4096, 4096)
+  let mut i: usize = 0
+  while i < 4 {
+    run layered.commands.append(
+      Command.PushLayer { opacity: 0.5, bounds: bounds(), linearRgb: false },
+    )
+    i = i + 1
+  }
+  i = 0
+  while i < 4 {
+    run layered.commands.append(Command.PopLayer)
+    i = i + 1
+  }
+  run Testing.expect(
+    run rejected(&layered, RenderError.TooLarge),
+    "nested isolated surfaces obey the aggregate 64M-pixel allocation ceiling",
+  )
+}
+
+test effect fn validatesExportedExecutorInputs() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run invalidLists() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn geometryList(clip: Option<usize>) -> DisplayList
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = empty(2, 2)
+  let mut path = Path.make()
+  drop run path.append(Segment.MoveTo { to: Point.new(-1.0e20, -1.0e20) })
+  drop run path.append(Segment.LineTo { to: Point.new(1.0e20, -1.0e20) })
+  drop run path.append(Segment.LineTo { to: Point.new(1.0e20, 1.0e20) })
+  drop run path.append(Segment.LineTo { to: Point.new(-1.0e20, 1.0e20) })
+  drop run path.append(Segment.Close)
+  run list.paths.append(move path)
+  run list.commands.append(
+    Command.FillPath {
+      path: 0,
+      transform: Mapping.identity(),
+      clip: clip,
+      bounds: bounds(),
+      brush: Brush.Solid { color: Color.black() },
+      opacity: 1.0,
+      linearRgb: false,
+      rule: FillRule.Nonzero,
+      crispEdges: false,
+    },
+  )
+  return move list
+}
+
+test effect fn preservesRepresentableLargeFiniteCoordinates() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let list = run geometryList(Option<usize>.None) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pixels = run cpu.execute(&list) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    pixels.pixel(0, 0).a == 255 && pixels.pixel(1, 1).a == 255,
+    "large representable rectangle covers the viewport without coordinate saturation",
+  )
+}
+
+fn patternFill(brush: Brush) -> Command {
+  return patternFillBounds(brush, bounds())
+}
+
+fn patternFillBounds(brush: Brush, rectangle: Rect) -> Command {
+  return Command.FillPath {
+    path: 0,
+    transform: Mapping.identity(),
+    clip: Option<usize>.None,
+    bounds: rectangle,
+    brush: brush,
+    opacity: 1.0,
+    linearRgb: false,
+    rule: FillRule.Nonzero,
+    crispEdges: false,
+  }
+}
+
+effect fn rectanglePath(rectangle: Rect) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut path = Path.make()
+  drop run path.append(Segment.MoveTo { to: Point.new(rectangle.xMin, rectangle.yMin) })
+  drop run path.append(Segment.LineTo { to: Point.new(rectangle.xMax, rectangle.yMin) })
+  drop run path.append(Segment.LineTo { to: Point.new(rectangle.xMax, rectangle.yMax) })
+  drop run path.append(Segment.LineTo { to: Point.new(rectangle.xMin, rectangle.yMax) })
+  drop run path.append(Segment.Close)
+  return move path
+}
+
+// SVG2 CR2018 pservers §14.4: a pattern is a repeated retained picture, not a
+// paint fallback. SVGWG issue 129: overflow copies are painted row-major.
+effect fn patternList() -> DisplayList
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = run geometryList(Option<usize>.None)
+  let mut paths = list.paths.asMutSlice()
+  paths[0] = run rectanglePath(bounds())
+  let mut commands = List<Command>.make()
+  run commands.append(patternFill(Brush.Solid { color: Color.black() }))
+  run list.patterns.append(
+    Pattern { tile: bounds(), contentBounds: bounds(), commands: move commands },
+  )
+  run list.paints.append(PaintInstance.Pattern { pattern: 0, transform: Mapping.identity() })
+  let mut drawing = list.commands.asMutSlice()
+  drawing[0] = patternFill(Brush.Server { index: 0 })
+  return move list
+}
+
+effect fn patternContracts() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = run patternList()
+  let pixels = run cpu.execute(&list)
+  run Testing.expect(
+    pixels.pixel(0, 0).a == 255 && pixels.pixel(1, 1).a == 255,
+    "native repeated image shader consumes the retained tile",
+  )
+  list.maxPatternPixels = 3
+  run Testing.expect(
+    run rejected(&list, RenderError.TooLarge),
+    "texture pixel limit is checked before allocation",
+  )
+  list.maxPatternPixels = 1048576
+  list.maxPatternWork = 0
+  run Testing.expect(
+    run rejected(&list, RenderError.TooLarge),
+    "picture repetition is charged against the work limit",
+  )
+  list.maxPatternWork = 1000000
+  let mut resources = list.patterns.asMutSlice()
+  let mut drawing = resources[0].commands.asMutSlice()
+  drawing[0] = patternFill(Brush.Server { index: 0 })
+  run Testing.expect(
+    run rejected(&list, RenderError.InvalidGeometry),
+    "recursive retained patterns fail before executor recursion",
+  )
+  list.patterns.asMutSlice()[0].commands.clear()
+  run list.patterns.asMutSlice()[0].commands.append(Command.PopLayer)
+  run Testing.expect(
+    run rejected(&list, RenderError.InvalidGeometry),
+    "resource picture stacks are validated, not only root commands",
+  )
+  list.patterns.asMutSlice()[0].commands.clear()
+  let mut paints = list.paints.asMutSlice()
+  paints[0] = PaintInstance.Pattern { pattern: 1, transform: Mapping.identity() }
+  run Testing.expect(
+    run rejected(&list, RenderError.InvalidGeometry),
+    "missing pattern handles fail before indexing",
+  )
+}
+
+test effect fn validatesAndExecutesRetainedPatterns() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run patternContracts() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn overflowAndNestedPatterns() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = run patternList()
+  let overflowBounds = Rect { xMin: -6.0, yMin: 0.0, xMax: 2.0, yMax: 2.0 }
+  let mut overflowPaths = list.paths.asMutSlice()
+  overflowPaths[0] = run rectanglePath(overflowBounds)
+  let mut overflowResources = list.patterns.asMutSlice()
+  overflowResources[0].contentBounds = overflowBounds
+  let mut overflowDrawing = overflowResources[0].commands.asMutSlice()
+  overflowDrawing[0] = patternFillBounds(
+    Brush.Solid { color: Color { r: 1.0, g: 0.0, b: 0.0, a: 0.5 } },
+    overflowBounds,
+  )
+  let overflow = run cpu.execute(&list)
+  run Testing.expect(
+    overflow.pixel(0, 0).a == 240 && overflow.pixel(1, 1).r == 240,
+    "four intersecting overflow copies composite, not a fixed neighbor ring",
+  )
+  list.maxPatternWork = 3
+  run Testing.expect(
+    run rejected(&list, RenderError.TooLarge),
+    "overflow copy work is checked before repetition",
+  )
+  list.maxPatternWork = 1000000
+  let mut paths = list.paths.asMutSlice()
+  paths[0] = run rectanglePath(bounds())
+  let mut resources = list.patterns.asMutSlice()
+  resources[0].contentBounds = bounds()
+  let mut drawing = resources[0].commands.asMutSlice()
+  drawing[0] = patternFill(Brush.Server { index: 1 })
+  let mut nested = List<Command>.make()
+  run nested.append(patternFill(Brush.Solid { color: Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 } }))
+  run list.patterns.append(
+    Pattern { tile: bounds(), contentBounds: bounds(), commands: move nested },
+  )
+  run list.paints.append(PaintInstance.Pattern { pattern: 1, transform: Mapping.identity() })
+  let pixels = run cpu.execute(&list)
+  run Testing.expect(
+    pixels.pixel(0, 0).b == 255 && pixels.pixel(1, 1).a == 255,
+    "nested texture ownership survives recursive cache growth",
+  )
+  list.maxPatternPixels = 7
+  run Testing.expect(
+    run rejected(&list, RenderError.TooLarge),
+    "the pixel ceiling is cumulative across nested cached tiles",
+  )
+}
+
+test effect fn repeatsAllOverflowAndCachesNestedPictures() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run overflowAndNestedPatterns() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn projectivePatternResolutionUsesFiniteDestinationMagnification() -> ()
+  ! AssertionError<'static> | RenderError {
+  let picture = Pattern { tile: bounds(), contentBounds: bounds(), commands: List<Command>.make() }
+  let map = Mapping.Projective {
+    value: Homography {
+      xx: 1.0,
+      xy: 0.0,
+      xw: 0.0,
+      yx: 0.0,
+      yy: 1.0,
+      yw: 0.0,
+      wx: -0.1,
+      wy: 0.0,
+      ww: 1.0,
+    },
+  }
+  let result = run patterns.size(&map, &picture, 10, 10)
+  run Testing.expect(
+    result.width >= 8 && result.height >= 4,
+    "resolution bounds the forward Jacobian on the destination, not just one source tile",
+  )
+}

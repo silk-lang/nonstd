@@ -1,0 +1,915 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// Included beside the implementation so upstream private-parser tests stay private.
+import font { FontRef, TableDirectory, TableRecords, TableRecord }
+import tables.cmap { Cmap }
+import generated_layout {
+  ConditionFormat1,
+  ConditionFormat2,
+  ConditionFormat3,
+  ConditionFormat4,
+  ConditionFormat5
+}
+import generated_variations { PackedDeltaFetcher }
+import generated_misc_table_fixtures as VarcFixtures
+import test_font_builder as VarcBuilder
+import font_types.cast as VarcCast
+import silk.collections.slice { Slice }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.f32
+import silk.num.i8
+
+effect fn vmust<T>(result: Result<T, ReadError>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    _ => {
+      run Testing.expect(false, "VARC read succeeds")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+effect fn vsome<T>(option: Option<T>) -> T
+  ! AssertionError<'static> {
+  return match move option {
+    Option<T>.Some { value } => move value
+    _ => {
+      run Testing.expect(false, "VARC value present")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+fn vnone<T>(option: Option<T>) -> bool {
+  return match move option {
+    Option<T>.None => true
+    _ => false
+  }
+}
+
+fn voob<T>(result: Result<T, ReadError>) -> bool {
+  return match move result {
+    Result<T, ReadError>.Failure { error: ReadError.OutOfBounds } => true
+    _ => false
+  }
+}
+
+effect fn vtable<'a>(bytes: &'a [u8]) -> Varc<'a>
+  ! AssertionError<'static> {
+  return run vmust(FontRef.varc(&run vmust(FontRef.new(bytes))))
+}
+
+effect fn vcjk() -> Varc<'static>
+  ! AssertionError<'static> {
+  return run vtable(VarcFixtures.varcCjkFont())
+}
+
+effect fn vcond() -> Varc<'static>
+  ! AssertionError<'static> {
+  return run vtable(VarcFixtures.varcConditionalsFont())
+}
+
+effect fn vparse<'t, 'a>(table: &Varc<'t>, cursor: &mut Cursor<'a>) -> VarcComponent<'a>
+  ! AssertionError<'static> {
+  return run vmust(run Effect.result(VarcComponent.parse(table, &mut cursor)))
+}
+
+effect fn vsentinel<'a>(cursor: &mut Cursor<'a>) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect((run vmust(Cursor<'a>.read<u8>(&mut cursor))) == 170, "sentinel not consumed")
+}
+
+effect fn vdeltas<'a>(deltas: PackedDeltas<'a>, expected: &[i32]) -> ()
+  ! AssertionError<'static> {
+  let mut iter = PackedDeltas.iter(&deltas)
+  let mut i: usize = 0
+  while i < expected.length {
+    run Testing.expect((run vsome(DeltaRunIter.next(&mut iter))) == expected[i], "packed delta")
+    i = i + 1
+  }
+  run Testing.expect(vnone(DeltaRunIter.next(&mut iter)), "delta sequence exhausted")
+}
+
+fn vcopy(out: &mut [u8], bytes: &[u8]) -> () {
+  let mut i: usize = 0
+  while i < bytes.length {
+    out[i] = bytes[i]
+    i = i + 1
+  }
+}
+
+effect fn vzeroAxes(bytes: &mut [u8]) -> ()
+  ! AssertionError<'static> {
+  vcopy(&mut bytes, VarcFixtures.varcCjkFont())
+  let table = run vtable(&bytes)
+  let data = Varc.offsetData(&table)
+  let base = run vtableOffset(&bytes)
+  let relative = u32.toUsize(
+    Offset32.toU32(Nullable<Offset32>.offset(&Varc.axisIndicesListOffset(&table)).*),
+  )
+  let replacement = b"\x00\x00\x00\x01\x01\x01\x01"
+  let mut i: usize = 0
+  while i < 7 {
+    bytes[base + relative + i] = replacement[i]
+    i = i + 1
+  }
+}
+
+fn vvar(out: &mut [u8], at: usize, value: u32) -> usize {
+  let mut count: usize = 1
+  let mut lead: u32 = value
+  if value >= 268435456 {
+    count = 5
+    lead = 240
+  } else if value >= 2097152 {
+    count = 4
+    lead = 224 | u32.shiftRight(value, 24)
+  } else if value >= 16384 {
+    count = 3
+    lead = 192 | u32.shiftRight(value, 16)
+  } else if value >= 128 {
+    count = 2
+    lead = 128 | u32.shiftRight(value, 8)
+  }
+  out[at] = u32.toU8(lead)
+  let mut i: usize = 1
+  while i < count {
+    out[at + i] = u32.toU8(u32.shiftRight(value, usize.toU32((count - i - 1) * 8)) & 255)
+    i = i + 1
+  }
+  return at + count
+}
+
+fn vstate(value: u32) -> u32 {
+  let a = value ^ u32.shiftLeft(value, 13)
+  let b = a ^ u32.shiftRight(a, 17)
+  return b ^ u32.shiftLeft(b, 5)
+}
+
+test effect fn sparseRegionAxisOffsets() -> ()
+  ! AssertionError<'static> {
+  let data = b"\x00\x00\x00\x02\x00\x00\x00\x0c\x00\x00\x00\x12\x00\x01\x00\x00\x00\x10\x00\x02\x00\x00\x00\x0a\x00\x00\x00\x12\x00\x00\x00\x00\x40\x00\x40\x00\x00\x01\xc0\x00\xc0\x00\x00\x00"
+  let list = run vmust(SparseVariationRegionList.read(FontData.new(data)))
+  let regions = SparseVariationRegionList.regions(&list)
+  let first = run vmust(
+    ArrayOfOffsets<'static, (), SparseVariationRegion<'static>, Offset32>.get(&regions, 0),
+  )
+  let second = run vmust(
+    ArrayOfOffsets<'static, (), SparseVariationRegion<'static>, Offset32>.get(&regions, 1),
+  )
+  run Testing.expect(
+    SparseVariationRegion.computeScalarF32(&first, &[F2Dot14.fromF32(0.5)]) == 0.5,
+    "first sparse scalar",
+  )
+  run Testing.expect(
+    SparseVariationRegion.computeScalarF32(&second, &[F2Dot14.fromF32(0.5), F2Dot14.fromF32(-1.0)])
+      == 0.5,
+    "second sparse scalar",
+  )
+  let axis = run vmust(
+    ArrayOfOffsets<'static, (), SparseRegionAxisCoordinates<'static>, Offset32>.get(
+      &SparseVariationRegion.axisCoordinates(&second),
+      1,
+    ),
+  )
+  run Testing.expect(SparseRegionAxisCoordinates.axisIndex(&axis) == 1, "axis index")
+}
+
+test effect fn sparseRegionCountUint32() -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 262150] = [0; 262150]
+  VarcBuilder.put32(&mut bytes, 0, 65536)
+  let mut i: usize = 0
+  while i < 65536 {
+    VarcBuilder.put32(&mut bytes, 4 + i * 4, 262148)
+    i = i + 1
+  }
+  let list = run vmust(SparseVariationRegionList.read(FontData.new(&bytes)))
+  run Testing.expect(SparseVariationRegionList.regionCount(&list) == 65536, "32 bit count")
+  let last = run vregion(&list, 65535)
+  run Testing.expect(SparseVariationRegion.regionAxisCount(&last) == 0, "last region resolves")
+}
+
+test effect fn invalidSparseAxisOffset() -> ()
+  ! AssertionError<'static> {
+  let region = run vmust(SparseVariationRegion.read(FontData.new(b"\x00\x01\xff\xff\xff\xff")))
+  run Testing.expect(
+    SparseVariationRegion.computeScalarF32(&region, &[F2Dot14.one()]) == 0.0,
+    "invalid axis zeros scalar",
+  )
+}
+
+test effect fn deltaSetIndexOffset() -> ()
+  ! AssertionError<'static> {
+  let table = run vmust(
+    MultiItemVariationData.read(
+      FontData.new(
+        b"\x01\x00\x02\x00\x00\x00\x01\x00\x00\x00\x13\xde\xad\xbe\xef\xde\xad\xbe\xef\x00\x00\x00\x02\x01\x01\x05\x05\x01\x01\xfe\x80",
+      ),
+    ),
+  )
+  run Testing.expect(
+    Offset32.toU32(MultiItemVariationData.deltaSetsOffset(&table)) == 19,
+    "index offset",
+  )
+  run vdeltas(run vmust(MultiItemVariationData.deltaSet(&table, 0)), &[1, -2, 0])
+  run vdeltas(run vmust(MultiItemVariationData.deltaSet(&table, 1)), &[])
+}
+
+test effect fn truncatedDeltaSetIndexOffset() -> ()
+  ! AssertionError<'static> {
+  let table = run vmust(MultiItemVariationData.read(FontData.new(b"\x01\x00\x01\x00\x00\x00\x00")))
+  run Testing.expect(
+    Offset32.isNull(MultiItemVariationData.deltaSetsOffset(&table)),
+    "truncated scalar defaults null",
+  )
+  run Testing.expect(
+    match move MultiItemVariationData.deltaSets(&table) {
+      Result<Index2<'static>, ReadError>.Failure { error: ReadError.NullOffset } => true
+      _ => false
+    },
+    "null index error",
+  )
+}
+
+test effect fn readCjk0x6868() -> ()
+  ! AssertionError<'static> {
+  let table = run vcjk()
+  drop run vmust(Varc.coverage(&table))
+}
+
+effect fn vcondition(index: usize) -> Condition<'static>
+  ! AssertionError<'static> {
+  let table = run vcond()
+  let list = run vmust(run vsome(Varc.conditionList(&table)))
+  return run vmust(
+    ArrayOfOffsets<'static, (), Condition<'static>, Offset32>.get(
+      &ConditionList.conditions(&list),
+      index,
+    ),
+  )
+}
+
+test effect fn identifyAllConditionalTypes() -> ()
+  ! AssertionError<'static> {
+  let mut i: usize = 0
+  while i < 5 {
+    run Testing.expect(
+      Condition.format(&run vcondition(i)) == usize.toU16(i + 1),
+      "condition format",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn readConditionFormat1AxisRange() -> ()
+  ! AssertionError<'static> {
+  let cond = run vcondition(0)
+  match cond {
+    Condition<'static>.Format1AxisRange { value } => run Testing.expect(
+      ConditionFormat1.axisIndex(&value) == 0
+        && F2Dot14.toF32(ConditionFormat1.filterRangeMinValue(&value)) == 0.5
+        && F2Dot14.toF32(ConditionFormat1.filterRangeMaxValue(&value)) == 1.0,
+      "condition axis/range",
+    )
+    _ => run Testing.expect(false, "format1")
+  }
+}
+
+test effect fn readConditionFormat2VariableValue() -> ()
+  ! AssertionError<'static> {
+  let cond = run vcondition(1)
+  match cond {
+    Condition<'static>.Format2VariableValue { value } => run Testing.expect(
+      ConditionFormat2.defaultValue(&value) == 1 && ConditionFormat2.varIndex(&value) == 2,
+      "condition default/index",
+    )
+    _ => run Testing.expect(false, "format2")
+  }
+}
+
+effect fn vconditionChildren(list: ArrayOfOffsets<'static, (), Condition<'static>, Offset24>) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    ArrayOfOffsets<'static, (), Condition<'static>, Offset24>.len(&list) == 2,
+    "two child conditions",
+  )
+  let mut i: usize = 0
+  while i < 2 {
+    let item = run vmust(ArrayOfOffsets<'static, (), Condition<'static>, Offset24>.get(&list, i))
+    run Testing.expect(Condition.format(&item) == usize.toU16(i + 1), "child condition format")
+    i = i + 1
+  }
+}
+
+test effect fn readConditionFormat3And() -> ()
+  ! AssertionError<'static> {
+  match run vcondition(2) {
+    Condition<'static>.Format3And { value } => run vconditionChildren(
+      ConditionFormat3.conditions(&value),
+    )
+    _ => run Testing.expect(false, "format3")
+  }
+}
+
+test effect fn readConditionFormat4Or() -> ()
+  ! AssertionError<'static> {
+  match run vcondition(3) {
+    Condition<'static>.Format4Or { value } => run vconditionChildren(
+      ConditionFormat4.conditions(&value),
+    )
+    _ => run Testing.expect(false, "format4")
+  }
+}
+
+test effect fn readConditionFormat5Negate() -> ()
+  ! AssertionError<'static> {
+  match run vcondition(4) {
+    Condition<'static>.Format5Negate { value } => run Testing.expect(
+      Condition.format(&run vmust(ConditionFormat5.condition(&value))) == 1,
+      "negated condition",
+    )
+    _ => run Testing.expect(false, "format5")
+  }
+}
+
+test effect fn readAxisIndicesList() -> ()
+  ! AssertionError<'static> {
+  let table = run vcond()
+  let list = run vmust(run vsome(Varc.axisIndicesList(&table)))
+  run Testing.expect(Index2.count(&list) == 2, "two axis lists")
+  run vdeltas(run vmust(Varc.axisIndices(&table, 1)), &[2, 3, 4, 5, 6])
+}
+
+test effect fn computeSparseRegionScalarHandlesBoundariesAndProducts() -> ()
+  ! AssertionError<'static> {
+  let table = run vcjk()
+  let store = run vmust(run vsome(Varc.multiVarStore(&table)))
+  let regions = SparseVariationRegionList.regions(
+    &run vmust(MultiItemVariationStore.regionList(&store)),
+  )
+  let region = run vmust(
+    ArrayOfOffsets<'static, (), SparseVariationRegion<'static>, Offset32>.get(&regions, 0),
+  )
+  let coords: [f32; 4] = [1.0, 0.5, 0.0, -0.25]
+  let expected: [f32; 4] = [1.0, 0.5, 0.0, 0.0]
+  let mut i: usize = 0
+  while i < 4 {
+    run Testing.expect(
+      SparseVariationRegion.computeScalarF32(&region, &[F2Dot14.fromF32(coords[i])]) == expected[i],
+      "scalar boundaries",
+    )
+    i = i + 1
+  }
+  run Testing.expect(SparseVariationRegion.computeScalarF32(&region, &[]) == 0.0, "missing coord")
+  let region2 = run vmust(
+    ArrayOfOffsets<'static, (), SparseVariationRegion<'static>, Offset32>.get(&regions, 2),
+  )
+  run Testing.expect(
+    SparseVariationRegion.computeScalarF32(&region2, &[F2Dot14.fromF32(0.5), F2Dot14.fromF32(0.25)])
+      == 0.125,
+    "product",
+  )
+}
+
+effect fn vbadOffset(axis: bool) -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 8948] = [0; 8948]
+  vcopy(&mut bytes, VarcFixtures.varcCjkFont())
+  let data = Varc.offsetData(&run vtable(&bytes))
+  let length = FontData.len(&data)
+  let base = run vtableOffset(&bytes)
+  let mut at: usize = 20
+  if axis {
+    at = 16
+  }
+  VarcBuilder.put32(&mut bytes, base + at, usize.toU32(length + 8))
+  let table = run vtable(&bytes)
+  if axis {
+    run Testing.expect(voob(Varc.axisIndices(&table, 0)), "axis offset bounds")
+  } else {
+    run Testing.expect(voob(Varc.glyph(&table, 0)), "glyph offset bounds")
+  }
+}
+
+test effect fn axisIndicesOffsetOutOfBoundsErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadOffset(true)
+}
+
+test effect fn varCompositeGlyphsOffsetOutOfBoundsErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadOffset(false)
+}
+
+effect fn vbadComponent<'t, 'a>(table: &Varc<'t>, data: &'a [u8]) -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.new(data))
+  run Testing.expect(
+    voob(run Effect.result(VarcComponent.parse(table, &mut cursor))),
+    "component bounds error",
+  )
+}
+
+test effect fn parseComponentWithMissingTranslateDataErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadComponent(&run vcjk(), b"\x10\x00\x01")
+}
+
+test effect fn parseComponentWithInvalidAxisIndicesIndexErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadComponent(&run vcond(), b"\x02\x00\x01\x7f")
+}
+
+test effect fn parseComponentReservedFieldsAreConsumed() -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.new(b"\xc1\x80\x10\x00\x01\x00\x07\x01\x02\xaa"))
+  let item = run vparse(&run vcjk(), &mut cursor)
+  run Testing.expect(
+    DecomposedTransform.translateX(&VarcComponent.transform(&item)) == 7.0,
+    "translate",
+  )
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentReservedFieldsTruncationErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadComponent(&run vcjk(), b"\xc1\x80\x10\x00\x01\x00\x07\x01")
+}
+
+test effect fn parseComponentGidIs24bitPath() -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.new(b"\x90\x00\x12\x34\x56\xaa"))
+  let item = run vparse(&run vcjk(), &mut cursor)
+  run Testing.expect(GlyphId.toU32(VarcComponent.gid(&item)) == 1193046, "24 bit gid")
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentGidIs24bitTruncationErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadComponent(&run vcjk(), b"\x90\x00\x12\x34")
+}
+
+test effect fn parseComponentWithAxesZeroCountDoesNotConsumeAxisValues() -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 8948] = [0; 8948]
+  run vzeroAxes(&mut bytes)
+  let table = run vtable(&bytes)
+  run Testing.expect(
+    PackedDeltas.countOrCompute(&run vmust(Varc.axisIndices(&table, 0))) == 0,
+    "empty axes",
+  )
+  let mut cursor = FontData.cursor(&FontData.new(b"\x12\x00\x01\x00\x00\x05\xaa"))
+  let item = run vparse(&table, &mut cursor)
+  run Testing.expect(
+    DecomposedTransform.translateX(&VarcComponent.transform(&item)) == 5.0,
+    "translate after empty axes",
+  )
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentWithAxesNonzeroCountConsumesAxisValues() -> ()
+  ! AssertionError<'static> {
+  let table = run vcond()
+  run Testing.expect(
+    PackedDeltas.countOrCompute(&run vmust(Varc.axisIndices(&table, 1))) == 5,
+    "five axes",
+  )
+  let mut cursor = FontData.cursor(
+    &FontData.new(b"\x12\x00\x01\x01\x04\x01\x02\x03\x04\x05\x00\x09\xaa"),
+  )
+  let item = run vparse(&table, &mut cursor)
+  run Testing.expect(
+    DecomposedTransform.translateX(&VarcComponent.transform(&item)) == 9.0,
+    "translate after axes",
+  )
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentScaleXOnlyAppliesToScaleY() -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.new(b"\x81\x00\x00\x01\x08\x00\xaa"))
+  let item = run vparse(&run vcjk(), &mut cursor)
+  let t = VarcComponent.transform(&item)
+  run Testing.expect(
+    DecomposedTransform.scaleX(&t) == 2.0 && DecomposedTransform.scaleY(&t) == 2.0,
+    "uniform scale",
+  )
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentScaleXAndScaleYAreIndependent() -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.new(b"\x83\x00\x00\x01\x08\x00\x0c\x00\xaa"))
+  let item = run vparse(&run vcjk(), &mut cursor)
+  let t = VarcComponent.transform(&item)
+  run Testing.expect(
+    DecomposedTransform.scaleX(&t) == 2.0 && DecomposedTransform.scaleY(&t) == 3.0,
+    "independent scales",
+  )
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentMultibyteConditionAndVarIndices() -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(
+    &FontData.new(b"\x80\x9c\x00\x01\xa3\x45\x81\x23\x82\x22\x00\x07\xaa"),
+  )
+  let item = run vparse(&run vcjk(), &mut cursor)
+  run Testing.expect(
+    (run vsome(VarcComponent.conditionIndex(&item))) == 9029
+      && (run vsome(VarcComponent.axisValuesVarIndex(&item))) == 291
+      && (run vsome(VarcComponent.transformVarIndex(&item))) == 546,
+    "multibyte indices",
+  )
+  run Testing.expect(
+    DecomposedTransform.translateX(&VarcComponent.transform(&item)) == 7.0,
+    "translate",
+  )
+  run vsentinel(&mut cursor)
+}
+
+test effect fn parseComponentTruncatedMultibyteConditionIndexErrors() -> ()
+  ! AssertionError<'static> {
+  run vbadComponent(&run vcjk(), b"\x80\x80\x00\x01\x81")
+}
+
+test effect fn parseComponentAxesWithVarIndexAndZeroAxisCount() -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 8948] = [0; 8948]
+  run vzeroAxes(&mut bytes)
+  let table = run vtable(&bytes)
+  let mut cursor = FontData.cursor(&FontData.new(b"\x16\x00\x01\x00\x81\x23\x00\x06\xaa"))
+  let item = run vparse(&table, &mut cursor)
+  run Testing.expect(
+    (run vsome(VarcComponent.axisIndicesIndex(&item))) == 0
+      && vnone(VarcComponent.axisValues(&item))
+      && (run vsome(VarcComponent.axisValuesVarIndex(&item))) == 291,
+    "empty axes with variation",
+  )
+  run Testing.expect(
+    DecomposedTransform.translateX(&VarcComponent.transform(&item)) == 6.0,
+    "translate",
+  )
+  run vsentinel(&mut cursor)
+}
+
+effect fn vbadFetch(data: &'static [u8]) -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.new(data))
+  let item = run vparse(&run vcond(), &mut cursor)
+  let deltas = run vsome(VarcComponent.axisValues(&item))
+  let mut fetcher = PackedDeltas.fetcher(&deltas)
+  let mut out: [f32; 5] = [0.0; 5]
+  run Testing.expect(
+    voob(PackedDeltaFetcher.addToF32Scaled(&mut fetcher, &mut out, 1.0)),
+    "truncated payload fails on fetch",
+  )
+}
+
+test effect fn parseComponentAxesTruncatedI16PayloadDetectedOnFetch() -> ()
+  ! AssertionError<'static> {
+  run vbadFetch(b"\x02\x00\x01\x01\x44\x00\x01\x00\x02\x00\x03")
+}
+
+test effect fn parseComponentAxesTruncatedI32PayloadDetectedOnFetch() -> ()
+  ! AssertionError<'static> {
+  run vbadFetch(b"\x02\x00\x01\x01\xc4\x00\x00\x00\x01\x00\x00\x00\x02")
+}
+
+test effect fn parseComponentAxesPayloadOvershootCausesFollowingFieldError() -> ()
+  ! AssertionError<'static> {
+  run vbadComponent(&run vcond(), b"\x12\x00\x01\x01\x44\x00\x01\x00\x02\x00\x09")
+}
+
+test effect fn generatedConditionVarintsRoundtrip() -> ()
+  ! AssertionError<'static> {
+  let table = run vcjk()
+  let mut state: u32 = 305419896
+  let mut n: usize = 0
+  while n < 256 {
+    state = vstate(state)
+    let mut bytes: [u8; 10] = [0; 10]
+    bytes[0] = 128
+    bytes[1] = 128
+    bytes[3] = 1
+    let end = vvar(&mut bytes, 4, state)
+    bytes[end] = 170
+    let mut cursor = FontData.cursor(&FontData.new(Slice.view(&bytes, 0, end + 1)))
+    let item = run vparse(&table, &mut cursor)
+    run Testing.expect(
+      (run vsome(VarcComponent.conditionIndex(&item))) == state,
+      "generated varint",
+    )
+    run vsentinel(&mut cursor)
+    n = n + 1
+  }
+}
+
+test effect fn generatedAxisValuesSingleRunRoundtrip() -> ()
+  ! AssertionError<'static> {
+  let table = run vcond()
+  let mut state: u32 = 2779077210
+  let mut n: usize = 0
+  while n < 128 {
+    state = vstate(state)
+    let kind = state & 3
+    let mut bytes: [u8; 28] = [0; 28]
+    bytes[0] = 18
+    bytes[2] = 1
+    bytes[3] = 1
+    bytes[4] = match kind {
+      0 => 4
+      1 => 68
+      2 => 196
+      _ => 132
+    }
+    let mut end: usize = 5
+    let mut expected: [f32; 5] = [0.0; 5]
+    let mut i: usize = 0
+    while i < 5 {
+      if kind != 3 {
+        state = u32.wrappingAdd(u32.wrappingMultiply(state, 1664525), 1013904223)
+      }
+      match kind {
+        0 => {
+          let v = VarcCast.u8ToI8(u32.toU8(u32.shiftRight(state, 24))) % 64
+          bytes[end] = VarcCast.i8ToU8(v)
+          end = end + 1
+          expected[i] = i8.toF32(v)
+        }
+        1 => {
+          let v = VarcCast.u16ToI16(u32.toU16(u32.shiftRight(state, 16))) % 2048
+          VarcBuilder.put16(&mut bytes, end, VarcCast.i16ToU16(v))
+          end = end + 2
+          expected[i] = i16.toF32(v)
+        }
+        2 => {
+          let v = VarcCast.u32ToI32(state) % 1000000
+          VarcBuilder.put32(&mut bytes, end, VarcCast.i32ToU32(v))
+          end = end + 4
+          expected[i] = i32.toF32(v)
+        }
+        _ => {}
+      }
+      i = i + 1
+    }
+    bytes[end] = 0
+    bytes[end + 1] = 7
+    bytes[end + 2] = 170
+    end = end + 3
+    let mut cursor = FontData.cursor(&FontData.new(Slice.view(&bytes, 0, end)))
+    let item = run vparse(&table, &mut cursor)
+    let deltas = run vsome(VarcComponent.axisValues(&item))
+    let mut fetcher = PackedDeltas.fetcher(&deltas)
+    let mut out: [f32; 5] = [0.0; 5]
+    drop run vmust(PackedDeltaFetcher.addToF32Scaled(&mut fetcher, &mut out, 1.0))
+    i = 0
+    while i < 5 {
+      run Testing.expect(out[i] == expected[i], "generated packed values")
+      i = i + 1
+    }
+    run Testing.expect(
+      DecomposedTransform.translateX(&VarcComponent.transform(&item)) == 7.0,
+      "translate after generated run",
+    )
+    run vsentinel(&mut cursor)
+    n = n + 1
+  }
+}
+
+test effect fn parseComponentTruncatedConditionVarintBoundariesError() -> ()
+  ! AssertionError<'static> {
+  let values: [u32; 4] = [128, 16384, 2097152, 268435456]
+  let table = run vcjk()
+  let mut i: usize = 0
+  while i < 4 {
+    let mut bytes: [u8; 9] = [0; 9]
+    bytes[0] = 128
+    bytes[1] = 128
+    bytes[3] = 1
+    let end = vvar(&mut bytes, 4, values[i])
+    run vbadComponent(&table, Slice.view(&bytes, 0, end - 1))
+    i = i + 1
+  }
+}
+
+test effect fn readGlyph6868() -> ()
+  ! AssertionError<'static> {
+  let font = run vmust(FontRef.new(VarcFixtures.varcCjkFont()))
+  let cmap = run vmust(FontRef.cmap(&font))
+  let gid = run vsome(Cmap.mapCodepoint(&cmap, 26728))
+  let table = run vmust(FontRef.varc(&font))
+  let index = run vsome(CoverageTable.get(&run vmust(Varc.coverage(&table)), gid))
+  let glyph = run vmust(Varc.glyph(&table, u32.toUsize(index)))
+  let mut components = VarcGlyph.components(&glyph)
+  let expected: [u32; 3] = [2, 5, 7]
+  let mut i: usize = 0
+  while i < 3 {
+    let item = run vmust(run vsome(VarcComponentIter.next(&mut components)))
+    run Testing.expect(GlyphId.toU32(VarcComponent.gid(&item)) == expected[i], "component glyph")
+    i = i + 1
+  }
+  run Testing.expect(vnone(VarcComponentIter.next(&mut components)), "all components")
+}
+
+effect fn vmatrix(transform: DecomposedTransform, expected: [f32; 6]) -> ()
+  ! AssertionError<'static> {
+  let actual = Matrix.elements<f32>(&DecomposedTransform.matrix(&transform))
+  let mut i: usize = 0
+  while i < 6 {
+    run Testing.expect(
+      f32.round(actual[i] * 1000000.0) / 1000000.0 == expected[i],
+      "matrix rounded to six digits",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn decomposedScaleToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._scaleX = 2.0
+  t._scaleY = 3.0
+  run vmatrix(t, [2.0, 0.0, 0.0, 3.0, 0.0, 0.0])
+}
+
+test effect fn decomposedRotateToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._rotation = 0.5
+  run vmatrix(t, [0.0, 1.0, -1.0, 0.0, 0.0, 0.0])
+}
+
+test effect fn decomposedSkewToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._skewX = 1.0 / 6.0
+  t._skewY = -1.0 / 3.0
+  let pi: f32 = 3.14159265358979323846
+  run vmatrix(
+    t,
+    [
+      1.0,
+      f32.round((unsafe tanf(t._skewY * pi)) * 1000000.0) / 1000000.0,
+      f32.round((unsafe tanf(-t._skewX * pi)) * 1000000.0) / 1000000.0,
+      1.0,
+      0.0,
+      0.0,
+    ],
+  )
+}
+
+test effect fn decomposedScaleRotateToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._scaleX = 2.0
+  t._scaleY = 3.0
+  t._rotation = 0.5
+  run vmatrix(t, [0.0, 2.0, -3.0, 0.0, 0.0, 0.0])
+}
+
+test effect fn decomposedScaleRotateTranslateToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._scaleX = 2.0
+  t._rotation = 0.5
+  t._translateX = 10.0
+  t._translateY = 20.0
+  run vmatrix(t, [0.0, 2.0, -1.0, 0.0, 10.0, 20.0])
+}
+
+test effect fn decomposedScaleSkewTranslateToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._scaleX = 2.0
+  t._scaleY = 3.0
+  t._rotation = 1.0 / 6.0
+  t._skewX = 1.0 / 6.0
+  t._skewY = 1.0 / 3.0
+  t._translateX = 10.0
+  t._translateY = 20.0
+  run vmatrix(t, [-0.866026, 5.5, -2.5, 2.020726, 10.0, 20.0])
+}
+
+test effect fn decomposedRotateAroundToMatrix() -> ()
+  ! AssertionError<'static> {
+  let mut t = DecomposedTransform.default()
+  t._scaleX = 2.0
+  t._rotation = 1.0 / 6.0
+  t._translateX = 10.0
+  t._translateY = 20.0
+  t._centerX = 1.0
+  t._centerY = 2.0
+  run vmatrix(t, [1.732051, 1.0, -0.5, 0.866025, 10.267949, 19.267949])
+}
+
+test effect fn readMultivarStoreRegionList() -> ()
+  ! AssertionError<'static> {
+  let table = run vcjk()
+  let store = run vmust(run vsome(Varc.multiVarStore(&table)))
+  let regions = SparseVariationRegionList.regions(
+    &run vmust(MultiItemVariationStore.regionList(&store)),
+  )
+  let indices: [usize; 3] = [0, 2, 38]
+  let counts: [usize; 3] = [1, 2, 1]
+  let mut i: usize = 0
+  while i < 3 {
+    let region = run vmust(
+      ArrayOfOffsets<'static, (), SparseVariationRegion<'static>, Offset32>.get(
+        &regions,
+        indices[i],
+      ),
+    )
+    let axes = SparseVariationRegion.axisCoordinates(&region)
+    run Testing.expect(
+      ArrayOfOffsets<'static, (), SparseRegionAxisCoordinates<'static>, Offset32>.len(&axes)
+        == counts[i],
+      "region axes count",
+    )
+    let mut j: usize = 0
+    while j < counts[i] {
+      let axis = run vmust(
+        ArrayOfOffsets<'static, (), SparseRegionAxisCoordinates<'static>, Offset32>.get(&axes, j),
+      )
+      let mut id = usize.toU16(j)
+      if i == 2 {
+        id = 6
+      }
+      let mut start: f32 = 0.0
+      let mut peak: f32 = 1.0
+      let mut end: f32 = 1.0
+      if i == 2 {
+        start = -1.0
+        peak = -1.0
+        end = 0.0
+      }
+      run Testing.expect(
+        SparseRegionAxisCoordinates.axisIndex(&axis) == id
+          && F2Dot14.toF32(SparseRegionAxisCoordinates.start(&axis)) == start
+          && F2Dot14.toF32(SparseRegionAxisCoordinates.peak(&axis)) == peak
+          && F2Dot14.toF32(SparseRegionAxisCoordinates.end(&axis)) == end,
+        "sparse region coordinates",
+      )
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+test effect fn readMultivarStoreDeltaSets() -> ()
+  ! AssertionError<'static> {
+  let table = run vcjk()
+  let store = run vmust(run vsome(Varc.multiVarStore(&table)))
+  let data = MultiItemVariationStore.variationData(&store)
+  let regions: [u16; 4] = [3, 33, 10, 25]
+  let counts: [u32; 4] = [6, 6, 5, 8]
+  run Testing.expect(
+    ArrayOfOffsets<'static, (), MultiItemVariationData<'static>, Offset32>.len(&data) == 4,
+    "four variation data",
+  )
+  let mut i: usize = 0
+  while i < 4 {
+    let item = run vmust(
+      ArrayOfOffsets<'static, (), MultiItemVariationData<'static>, Offset32>.get(&data, i),
+    )
+    run Testing.expect(
+      MultiItemVariationData.regionIndexCount(&item) == regions[i]
+        && Index2.count(&run vmust(MultiItemVariationData.deltaSets(&item))) == counts[i],
+      "variation counts",
+    )
+    i = i + 1
+  }
+  let first = run vmust(
+    ArrayOfOffsets<'static, (), MultiItemVariationData<'static>, Offset32>.get(&data, 0),
+  )
+  run vdeltas(run vmust(MultiItemVariationData.deltaSet(&first, 5)), &[-1, 33, 0, 0, 0, 0])
+}
+
+effect fn vtableOffset(data: &[u8]) -> usize
+  ! AssertionError<'static> {
+  let font = run vmust(FontRef.new(data))
+  let records = TableDirectory.tableRecords(FontRef.tableDirectory(&font))
+  let mut i: usize = 0
+  while i < TableRecords.len(&records) {
+    let record = run vsome(TableRecords.get(&records, i))
+    if Tag.toU32(TableRecord.tag(&record)) == 1447121475 {
+      return u32.toUsize(TableRecord.offset(&record))
+    }
+    i = i + 1
+  }
+  run Testing.expect(false, "VARC directory record")
+  return 0
+}
+
+effect fn vregion<'a>(list: &SparseVariationRegionList<'a>, index: usize) -> SparseVariationRegion<
+  'a
+>
+  ! AssertionError<'static> {
+  return run vmust(
+    ArrayOfOffsets<'a, (), SparseVariationRegion<'a>, Offset32>.get(
+      &SparseVariationRegionList.regions(list),
+      index,
+    ),
+  )
+}

@@ -1,0 +1,295 @@
+//! Shared interpreter for the pinned Ragel syllable machines.
+import generated_machines as data
+import buffer { Buffer, Glyph }
+import view { View }
+import unicode
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+
+pub fn indicCategory(cp: u32) -> u16 {
+  let d = View.bytes(data.indicData())
+  let mut index: usize = 37
+  if cp < 71396 {
+    let u = u32.toUsize(cp)
+    let nibble = u / 512
+    let mut a = u8.toUsize(View.u8(&d, nibble / 2))
+    if (nibble & 1) != 0 {
+      a = a / 16
+    }
+    a = (a & 15) * 8 + ((u / 64) & 7)
+    a = u8.toUsize(View.u8(&d, 70 + a)) * 8 + ((u / 8) & 7)
+    a = u8.toUsize(View.u8(&d, 186 + a)) * 4 + ((u / 2) & 3)
+    a = u8.toUsize(View.u8(&d, 488 + a)) + (u & 1)
+    index = u8.toUsize(View.u8(&d, 996 + a))
+  }
+  return View.u16(&View.bytes(data.indicValues()), index * 2)
+}
+
+pub fn useCategory(cp: u32) -> u8 {
+  if cp >= 921600 {
+    return 0
+  }
+  let d = View.bytes(data.use_u8())
+  let wide = View.bytes(data.use_u16())
+  let u = u32.toUsize(cp)
+  let nibble = u / 4096
+  let mut a = u8.toUsize(View.u8(&d, nibble / 2))
+  if (nibble & 1) != 0 {
+    a = a / 16
+  }
+  a = (a & 15) * 32 + ((u / 128) & 31)
+  a = u8.toUsize(View.u8(&d, 113 + a)) * 8 + ((u / 16) & 7)
+  a = u16.toUsize(View.u16(&wide, a * 2)) + ((u / 2) & 7)
+  a = u8.toUsize(View.u8(&d, 625 + a)) * 2 + (u & 1)
+  return View.u8(&d, 2969 + a)
+}
+
+pub fn universal(script: u32) -> bool {
+  let data = View.bytes(data.universalScripts())
+  let mut i: usize = 0
+  while i < View.len(&data) {
+    if View.u32(&data, i) == script {
+      return true
+    }
+    i = i + 4
+  }
+  return false
+}
+
+pub fn next(buffer: &Buffer, start: usize) -> usize {
+  if start >= Buffer.len(buffer) {
+    return Buffer.len(buffer)
+  }
+  let syllable = List<Glyph>.asSlice(&buffer.glyphs)[start].syllable
+  let mut end = start + 1
+  while end < Buffer.len(buffer) && List<Glyph>.asSlice(&buffer.glyphs)[end].syllable == syllable {
+    end = end + 1
+  }
+  return end
+}
+
+// A big-endian u16 from the machine tables, which are generated with in-range offsets.
+fn be16(bytes: &[u8], at: usize) -> usize with Intrinsic.inlineAlways() {
+  return u8.toUsize(bytes[at]) * 256 + u8.toUsize(bytes[at + 1])
+}
+
+pub effect fn find(buffer: &mut Buffer, machine: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut states = data.useStates()
+  let mut transitions = data.useTransitions()
+  let mut actions = data.useActions()
+  if machine == 2 {
+    states = data.khmerStates()
+    transitions = data.khmerTransitions()
+    actions = data.khmerActions()
+  } else if machine == 3 {
+    states = data.myanmarStates()
+    transitions = data.myanmarTransitions()
+    actions = data.myanmarActions()
+  } else if machine != 4 {
+    states = data.indicStates()
+    transitions = data.indicTransitions()
+    actions = data.indicActions()
+  }
+  let stateCount = (states.length - 4) / 2
+  let length = Buffer.len(&buffer.*)
+  if length > 1048576 {
+    return
+  }
+
+  // Only the universal machine skips glyphs, so it alone keeps the included glyphs'
+  // indices; for the others position p is glyph p.
+  let mut indices = List<usize>.make()
+  let mut len = length
+  if machine == 4 {
+    run List<usize>.reserve(&mut indices, length + 1)
+    let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+    let mut i: usize = 0
+    while i < length {
+      let mut include = glyphs[i].category != 6
+      if glyphs[i].category == 14 {
+        let mut j = i + 1
+        while j < length {
+          if glyphs[j].category != 6 {
+            include = !unicode.isMark(glyphs[j].codepoint)
+            break
+          }
+          j = j + 1
+        }
+      }
+      if include {
+        run List<usize>.append(&mut indices, i)
+      }
+      i = i + 1
+    }
+    len = List<usize>.length(&indices)
+    run List<usize>.append(&mut indices, length)
+  }
+  let mut breakFlags: u32 = 1
+  if (buffer.flags & 64) != 0 {
+    breakFlags = 3
+  }
+  let positions = List<usize>.asSlice(&indices)
+  let skips = machine == 4
+  let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+
+  // Whether a step from the state starts a token (Ragel's from-state action). Transitions
+  // carry their target's flags: bit 14 for this one, and bit 15 for whether a step into the
+  // target resets the token start (its to-state action).
+  let fromState = Slice.view(states, 4, stateCount)
+
+  // Positions are unsigned; stepping back from 0 wraps past `len` and ends the scan, as a
+  // negative position would.
+  let mut p: usize = 0
+  let mut ts: usize = 0
+  let mut te: usize = 0
+  let mut act: u8 = 0
+  let mut state = be16(states, 0)
+  let mut starts = state < stateCount && fromState[state] != 0
+  let mut resets = false
+  let mut serial: u32 = 1
+  let mut budget = length * 8 + 16
+  while p <= len && budget != 0 {
+    budget = budget - 1
+    if state >= stateCount {
+      break
+    }
+    if starts {
+      ts = p
+    }
+    let mut category: usize = 59
+    if p < len {
+      let mut at = p
+      if skips {
+        at = positions[at]
+      }
+      category = u8.toUsize(glyphs[at].category)
+      if category >= 59 {
+        category = 0
+      }
+    }
+    let entry = Slice.view(transitions, (state * 60 + category) * 4, 4)
+    let target = u8.toUsize(entry[0]) * 256 + u8.toUsize(entry[1])
+    state = target & 0x3fff
+    starts = (target & 0x4000) != 0
+    resets = (target & 0x8000) != 0
+    let mut pc = u8.toUsize(entry[2]) * 256 + u8.toUsize(entry[3])
+    while pc + 1 < actions.length {
+      let op = actions[pc]
+      if op == 0 {
+        break
+      }
+      let arg = actions[pc + 1]
+      pc = pc + 2
+
+      // Ops 8 and 9 are the generator's fused syllable endings: `te = p; p -= 1; found` and
+      // `p = te - 1; found`.
+      let mut kind = op
+      if op == 8 {
+        te = p
+        p = usize.wrappingSubtract(p, 1)
+        kind = 6
+      } else if op == 9 {
+        p = usize.wrappingSubtract(te, 1)
+        kind = 6
+      }
+      match kind {
+        1 => {
+          te = p + 1
+        }
+        2 => {
+          te = p
+        }
+        3 => {
+          p = usize.wrappingSubtract(p, 1)
+        }
+        4 => {
+          p = usize.wrappingSubtract(te, 1)
+        }
+        5 => {
+          act = arg
+        }
+        6 => {
+          if ts < te && te <= len {
+            let mut start = ts
+            let mut end = te
+            if skips {
+              start = positions[start]
+              end = positions[end]
+            }
+            markSyllable(&mut glyphs, start, end, serial * 16 + u8.toU32(arg), breakFlags)
+            serial = serial + 1
+            if serial == 16 {
+              serial = 1
+            }
+          }
+        }
+        7 => {
+          let skip = u8.toUsize(actions[pc])
+          pc = pc + 1
+          if act != arg {
+            pc = pc + skip
+          }
+        }
+        _ => {}
+      }
+    }
+    if p == len {
+      break
+    }
+    if resets {
+      ts = 0
+    }
+    p = usize.wrappingAdd(p, 1)
+  }
+}
+
+/// Gives glyphs `start..end` the syllable `value` and marks them unsafe to break, as
+/// `Buffer.unsafeToBreak` does, skipping the glyphs in the lowest cluster.
+fn markSyllable(
+  glyphs: &mut [Glyph],
+  start: usize,
+  end: usize,
+  value: u32,
+  flags: u32,
+) -> () with Intrinsic.inlineAlways() {
+  if start >= end || end > glyphs.length {
+    return
+  }
+  let span = Slice.viewMut(&mut glyphs, start, end - start)
+  let first = span[0].info.cluster
+  let mut cluster = first
+  let mut mixed = false
+  span[0].syllable = u32.wrappingToU8(value)
+  let mut i: usize = 1
+  while i < span.length {
+    span[i].syllable = u32.wrappingToU8(value)
+    let other = span[i].info.cluster
+    if other != first {
+      mixed = true
+      if other < cluster {
+        cluster = other
+      }
+    }
+    i = i + 1
+  }
+
+  // Glyphs that all share one cluster are all in the lowest one.
+  if !mixed {
+    return
+  }
+  i = 0
+  while i < span.length {
+    if span[i].info.cluster != cluster {
+      span[i].info.flags = span[i].info.flags | flags
+    }
+    i = i + 1
+  }
+}

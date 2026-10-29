@@ -1,0 +1,126 @@
+//! External stylesheet byte decoding, before CSS input preprocessing.
+//! Syntax3 fallback precedence and Encoding Standard replacement decoding are
+//! independent of lexer CR/FF/NUL normalization. Preserve `encoding` for imports.
+//! LIMITATION-8: local web text codecs; silk-lang/silk#2579 tracks the stdlib gap.
+pub import encoding_types { Encoding }
+import encoding_data
+import encoding_multibyte
+import encoding_unicode
+import encoding_output { Output, scalar }
+import tokens { CssError, equal }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.u8
+
+pub struct DecodedStylesheet {
+  pub bytes: Bytes,
+  pub encoding: Encoding,
+}
+
+// https://encoding.spec.whatwg.org/#concept-encoding-get
+pub fn label(input: &[u8]) -> Option<Encoding> {
+  return encoding_data.label(input)
+}
+
+// https://www.w3.org/TR/css-syntax-3/#determine-the-fallback-encoding
+fn fallback(data: &[u8], protocol: Option<Encoding>, environment: Option<Encoding>) -> Encoding {
+  match &protocol {
+    Option<Encoding>.Some { value } => {
+      return value
+    }
+    _ => {}
+  }
+  let probe = if data.length < 1024 {
+    data.length
+  } else {
+    1024
+  }
+  if probe >= 12 && equal(Slice.view<u8>(data, 0, 10), b"@charset \"") {
+    let mut end: usize = 10
+    while end < probe && data[end] != 34 && data[end] <= 127 {
+      end = end + 1
+    }
+    if end < probe && probe - end >= 2 && data[end] == 34 && data[end + 1] == 59 {
+      let declared = label(Slice.view<u8>(data, 10, end - 10))
+      match &declared {
+        Option<Encoding>.Some { value } => {
+          if value == Encoding.Utf16Be || value == Encoding.Utf16Le {
+            return Encoding.Utf8
+          }
+          return value
+        }
+        _ => {}
+      }
+    }
+  }
+  return match &environment {
+    Option<Encoding>.Some { value } => value
+    _ => Encoding.Utf8
+  }
+}
+
+// https://www.w3.org/TR/css-syntax-3/#css-decode-bytes
+// https://encoding.spec.whatwg.org/#decode
+// https://encoding.spec.whatwg.org/#bom-sniff
+pub effect fn decodeStylesheet(
+  data: &[u8],
+  protocolEncoding: Option<Encoding>,
+  environmentEncoding: Option<Encoding>,
+  maxOutput: usize,
+) -> DecodedStylesheet
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut selected = fallback(data, protocolEncoding, environmentEncoding)
+  let mut skip: usize = 0
+  if data.length >= 3 && data[0] == 239 && data[1] == 187 && data[2] == 191 {
+    selected = Encoding.Utf8
+    skip = 3
+  } else if data.length >= 2 && data[0] == 254 && data[1] == 255 {
+    selected = Encoding.Utf16Be
+    skip = 2
+  } else if data.length >= 2 && data[0] == 255 && data[1] == 254 {
+    selected = Encoding.Utf16Le
+    skip = 2
+  }
+  let payload = Slice.view<u8>(data, skip, data.length - skip)
+  let mut output = Output { bytes: Bytes.make(), maxOutput: maxOutput }
+  if selected == Encoding.Utf8 {
+    run encoding_unicode.utf8(payload, &mut output)
+  } else if selected == Encoding.Utf16Be || selected == Encoding.Utf16Le {
+    run encoding_unicode.utf16(payload, selected == Encoding.Utf16Be, &mut output)
+  } else if selected == Encoding.Gbk || selected == Encoding.Gb18030 || selected == Encoding.Big5
+    || selected == Encoding.EucJp
+    || selected == Encoding.Iso2022Jp
+    || selected == Encoding.ShiftJis
+    || selected == Encoding.EucKr {
+    run encoding_multibyte.decode(payload, selected, &mut output)
+  } else if selected == Encoding.Replacement {
+    // https://encoding.spec.whatwg.org/#replacement-decoder
+    if payload.length != 0 {
+      run scalar(&mut output, 65533, 0)
+    }
+  } else {
+    // https://encoding.spec.whatwg.org/#single-byte-decoder
+    // https://encoding.spec.whatwg.org/#x-user-defined-decoder
+    let mut at: usize = 0
+    while at < payload.length {
+      let byte = payload[at]
+      let mut cp = u8.toU32(byte)
+      if byte >= 128 {
+        if selected == Encoding.XUserDefined {
+          cp = 0xf780 + cp - 128
+        } else {
+          cp = encoding_data.single(selected, u8.toUsize(byte - 128))
+          if cp == 0xffffffff {
+            cp = 65533
+          }
+        }
+      }
+      run scalar(&mut output, cp, at)
+      at = at + 1
+    }
+  }
+  return DecodedStylesheet { bytes: move output.bytes, encoding: selected }
+}

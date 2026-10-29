@@ -1,0 +1,246 @@
+//! Allocation-free, analytic object/fill bounds in user or affine target coordinates.
+//! https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#BoundingBoxes
+//! Controls are not geometry; fill paint, fill-rule, clipping, stroke and markers
+//! do not participate. Every moveto contributes its positioned zero-area subpath.
+//! Empty storage remains distinct from a point; the SVG element layer maps an
+//! absent equivalent path to the specification's (0,0,0,0) element bounding box.
+//! "Exact" means extrema of the curves, evaluated in binary64, not flattening.
+import geometry { Path, Segment, Point, Rect, Transform }
+import arcs
+import silk.core.option { Option }
+import silk.num.f64
+
+pub union Result {
+  Empty,
+  Finite { pub rect: Rect, },
+  // A transform, arc normalization, or extremum exceeds binary64 representation.
+  // Never return a partial box or substitute a control hull in this case.
+  Limited,
+}
+
+/// The returned rectangle may have zero width/height at a nonzero location.
+/// No allocation, subdivision tolerance, or approximation limit is involved.
+pub fn path(value: &Path) -> Result {
+  return pathTransformed(value, Transform.identity())
+}
+
+/// Bounds the transformed curves themselves, not the transformed source box.
+/// Singular matrices retain positioned line/point bounds. Nonfinite matrices or
+/// unrepresentable transformed controls/extrema return Limited, never a hull.
+pub fn pathTransformed(value: &Path, transform: Transform) -> Result {
+  if !Transform.isFinite(transform) {
+    return Result.Limited
+  }
+  let segments = Path.segments(value)
+  if segments.length == 0 {
+    return Result.Empty
+  }
+
+  // Path validates that its first segment is a finite MoveTo.
+  let mut current = match &segments[0] {
+    Segment.MoveTo { to } => to
+    _ => {
+      return Result.Limited
+    }
+  }
+  let mut start = current
+  let mut mappedCurrent = Transform.mapPoint(transform, current)
+  if !Point.isFinite(mappedCurrent) {
+    return Result.Limited
+  }
+  let mut mappedStart = mappedCurrent
+  let mut result = Rect {
+    xMin: mappedCurrent.x,
+    yMin: mappedCurrent.y,
+    xMax: mappedCurrent.x,
+    yMax: mappedCurrent.y,
+  }
+  let mut index: usize = 1
+  while index < segments.length {
+    match &segments[index] {
+      Segment.MoveTo { to } => {
+        mappedCurrent = Transform.mapPoint(transform, to)
+        if !Point.isFinite(mappedCurrent) {
+          return Result.Limited
+        }
+        mappedStart = mappedCurrent
+        include(&mut result, mappedCurrent)
+        current = to
+        start = to
+      }
+      Segment.LineTo { to } => {
+        mappedCurrent = Transform.mapPoint(transform, to)
+        if !Point.isFinite(mappedCurrent) {
+          return Result.Limited
+        }
+        include(&mut result, mappedCurrent)
+        current = to
+      }
+      Segment.QuadraticTo { control, to } => {
+        let mappedControl = Transform.mapPoint(transform, control)
+        let mappedTo = Transform.mapPoint(transform, to)
+        if !Point.isFinite(mappedControl) || !Point.isFinite(mappedTo) {
+          return Result.Limited
+        }
+        let x = quadratic(mappedCurrent.x, mappedControl.x, mappedTo.x)
+        let y = quadratic(mappedCurrent.y, mappedControl.y, mappedTo.y)
+        mappedCurrent = mappedTo
+        include(&mut result, Point.new(x[0], y[0]))
+        include(&mut result, Point.new(x[1], y[1]))
+        current = to
+      }
+      Segment.CubicTo { control1, control2, to } => {
+        let mappedControl1 = Transform.mapPoint(transform, control1)
+        let mappedControl2 = Transform.mapPoint(transform, control2)
+        let mappedTo = Transform.mapPoint(transform, to)
+        if !Point.isFinite(mappedControl1) || !Point.isFinite(mappedControl2)
+          || !Point.isFinite(mappedTo) {
+          return Result.Limited
+        }
+        let x = cubic(mappedCurrent.x, mappedControl1.x, mappedControl2.x, mappedTo.x)
+        let y = cubic(mappedCurrent.y, mappedControl1.y, mappedControl2.y, mappedTo.y)
+        mappedCurrent = mappedTo
+        include(&mut result, Point.new(x[0], y[0]))
+        include(&mut result, Point.new(x[1], y[1]))
+        current = to
+      }
+      Segment.ArcTo { arc } => {
+        let resolved = arcs.boundsTransformed(current, arc, transform)
+        match &resolved {
+          Option<Rect>.Some { value: arcBounds } => {
+            include(&mut result, Point.new(arcBounds.xMin, arcBounds.yMin))
+            include(&mut result, Point.new(arcBounds.xMax, arcBounds.yMax))
+          }
+          _ => {
+            return Result.Limited
+          }
+        }
+        current = arc.to
+        mappedCurrent = Transform.mapPoint(transform, current)
+      }
+      Segment.Close => {
+        // Closing adds only a line between already included endpoints. The
+        // implicit fill-closing line of an open subpath cannot enlarge it either.
+        current = start
+        mappedCurrent = mappedStart
+      }
+    }
+    index = index + 1
+  }
+  return Result.Finite { rect: result }
+}
+
+fn include(rect: &mut Rect, point: Point) -> () {
+  rect.xMin = f64.min(rect.xMin, point.x)
+  rect.yMin = f64.min(rect.yMin, point.y)
+  rect.xMax = f64.max(rect.xMax, point.x)
+  rect.yMax = f64.max(rect.yMax, point.y)
+}
+
+fn extend(interval: &mut [f64; 2], value: f64) -> () {
+  interval[0] = f64.min(interval[0], value)
+  interval[1] = f64.max(interval[1], value)
+}
+
+// Convex interpolation avoids overflowing b-a for opposite-sign endpoints,
+// and avoids rounded weights summing above one for very large equal endpoints.
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+  if (a >= 0.0 && b >= 0.0) || (a <= 0.0 && b <= 0.0) {
+    return a + (b - a) * t
+  }
+  return a * (1.0 - t) + b * t
+}
+
+fn quadraticValue(a: f64, b: f64, c: f64, t: f64) -> f64 {
+  return lerp(lerp(a, b, t), lerp(b, c, t), t)
+}
+
+fn cubicValue(a: f64, b: f64, c: f64, d: f64, t: f64) -> f64 {
+  let ab = lerp(a, b, t)
+  let bc = lerp(b, c, t)
+  let cd = lerp(c, d, t)
+  return lerp(lerp(ab, bc, t), lerp(bc, cd, t), t)
+}
+
+// Adjacent differences preserve small variations about large coordinates.
+// Only if a difference overflows do we halve *all* operands before subtraction;
+// the derivative roots are invariant under that common scale. Normalizing the
+// differences next avoids both overflow and underflow in polynomial products.
+fn differences(a: f64, b: f64, c: f64, d: f64) -> [f64; 3] {
+  let mut first = b - a
+  let mut second = c - b
+  let mut third = d - c
+  if !f64.isFinite(first) || !f64.isFinite(second) || !f64.isFinite(third) {
+    first = b * 0.5 - a * 0.5
+    second = c * 0.5 - b * 0.5
+    third = d * 0.5 - c * 0.5
+  }
+  let scale = f64.max(f64.abs(first), f64.max(f64.abs(second), f64.abs(third)))
+  if scale == 0.0 {
+    return [0.0, 0.0, 0.0]
+  }
+  return [first / scale, second / scale, third / scale]
+}
+
+fn quadratic(a: f64, b: f64, c: f64) -> [f64; 2] {
+  let mut result = [f64.min(a, c), f64.max(a, c)]
+  let delta = differences(a, b, c, c)
+  let denominator = delta[0] - delta[1]
+  if denominator != 0.0 {
+    let t = delta[0] / denominator
+    if t > 0.0 && t < 1.0 {
+      extend(&mut result, quadraticValue(a, b, c, t))
+    }
+  }
+  return result
+}
+
+fn cubic(a: f64, b: f64, c: f64, d: f64) -> [f64; 2] {
+  let mut result = [f64.min(a, d), f64.max(a, d)]
+  let delta = differences(a, b, c, d)
+
+  // B'(t)/3 = qa*t*t + qb*t + qc. No epsilon discards small
+  // but real coefficients; the linear and constant cases are handled exactly.
+  let qa = delta[0] - 2.0 * delta[1] + delta[2]
+  let qb = 2.0 * (delta[1] - delta[0])
+  let qc = delta[0]
+  if qa == 0.0 {
+    if qb != 0.0 {
+      let t = -qc / qb
+      if t > 0.0 && t < 1.0 {
+        extend(&mut result, cubicValue(a, b, c, d, t))
+      }
+    }
+    return result
+  }
+  let discriminant = qb * qb - 4.0 * qa * qc
+  if discriminant < 0.0 {
+    return result
+  }
+  let root = f64.sqrt(discriminant)
+
+  // The q form avoids cancellation in one root; Vieta gives the other.
+  let q = -0.5
+    * (qb
+      + if qb < 0.0 {
+        -root
+      } else {
+        root
+      })
+  if q == 0.0 {
+    let t = -qb / (2.0 * qa)
+    if t > 0.0 && t < 1.0 {
+      extend(&mut result, cubicValue(a, b, c, d, t))
+    }
+    return result
+  }
+  let first = q / qa
+  if first > 0.0 && first < 1.0 {
+    extend(&mut result, cubicValue(a, b, c, d, first))
+  }
+  let second = qc / q
+  if second > 0.0 && second < 1.0 && second != first {
+    extend(&mut result, cubicValue(a, b, c, d, second))
+  }
+  return result
+}

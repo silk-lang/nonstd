@@ -1,0 +1,393 @@
+//! Conditional Rules 3 queries and Cascade 4 import conditions over shared token Input.
+import input { Input, TokenView, TokenRef }
+import tokens { Kind, TokenRange, Limits, CssError, CssErrorKind }
+import condition_cursor { Structure }
+import condition_cursor
+import declaration_values
+import properties { Property }
+import properties
+import values { Store, ValueId, Mode }
+import values
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+// Grammar validity is independent of support: unknown properties and unsupported
+// values are valid false conditions. Invalid grammar always has value false.
+pub struct Evaluation {
+  pub valid: bool,
+  pub value: bool,
+}
+
+fn invalid() -> Evaluation {
+  return Evaluation { valid: false, value: false }
+}
+
+fn truth(value: bool) -> Evaluation {
+  return Evaluation { valid: true, value: value }
+}
+
+fn trimEnd(input: &Input, start: usize, end: usize) -> usize {
+  let mut result = end
+  while result > start {
+    let view = input.at(result - 1)
+    let whitespace = match &view {
+      Option<TokenView>.Some { value } => match &value.token.kind {
+        Kind.Whitespace => true
+        _ => false
+      }
+      _ => false
+    }
+    if !whitespace {
+      break
+    }
+    result = result - 1
+  }
+  return result
+}
+
+fn delim(input: &Input, position: usize, scalar: u32) -> bool {
+  let view = input.at(position)
+  return match &view {
+    Option<TokenView>.Some { value } => match &value.token.kind {
+      Kind.Delim { scalar: actual } => actual == scalar
+      _ => false
+    }
+    _ => false
+  }
+}
+
+// Preserve tokens, including adjacency, when taking a declaration value slice.
+effect fn typed(
+  input: &Input,
+  store: &mut Store,
+  property: Property,
+  start: usize,
+  end: usize,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if start > end || end > input.length() {
+    return false
+  }
+  match &input.* {
+    Input.Contiguous { buffer, range } => {
+      let source = Input.Contiguous {
+        buffer: buffer,
+        range: TokenRange { start: range.start + start, end: range.start + end },
+      }
+      let parsed = run values.parse(&mut store.*, property, &source, Mode.Css)
+      return match &parsed {
+        Option<ValueId>.Some { value } => true
+        _ => false
+      }
+    }
+    Input.Expanded { buffers, references } => {
+      let source = Input.Expanded {
+        buffers: buffers,
+        references: Slice.view<TokenRef>(references, start, end - start),
+      }
+      let parsed = run values.parse(&mut store.*, property, &source, Mode.Css)
+      return match &parsed {
+        Option<ValueId>.Some { value } => true
+        _ => false
+      }
+    }
+  }
+}
+
+// The name and colon have already been recognized. !important is syntax, not
+// part of a property's value grammar; only a final top-level annotation is removed.
+effect fn declaration(
+  input: &Input,
+  structure: &Structure,
+  store: &mut Store,
+  name: &[u8],
+  start: usize,
+  end: usize,
+) -> Evaluation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = condition_cursor.skip(input, start, end)
+  let mut last = first
+  let mut previous = end
+  let mut finalStart = end
+  let mut top = first
+  let mut bang = end
+  while top < end {
+    top = condition_cursor.skip(input, top, end)
+    if top == end {
+      break
+    }
+    previous = finalStart
+    finalStart = top
+    let view = input.at(top)
+    let opening = match &view {
+      Option<TokenView>.Some { value } => match &value.token.kind {
+        Kind.Function { name: functionName } => true
+        Kind.OpenParen => true
+        Kind.OpenSquare => true
+        Kind.OpenBrace => true
+        Kind.Semicolon => {
+          return invalid()
+        }
+        _ => false
+      }
+      _ => false
+    }
+    if opening {
+      let close = structure.end(top)
+      top = if close < end {
+        close + 1
+      } else {
+        end
+      }
+    } else {
+      if delim(input, top, 33) {
+        if bang != end {
+          return invalid()
+        }
+        bang = top
+      }
+      top = top + 1
+    }
+    last = top
+  }
+  if finalStart < end && previous < end && condition_cursor.ident(input, finalStart, b"important")
+    && delim(input, previous, 33) {
+    last = trimEnd(input, first, previous)
+    bang = end
+  }
+
+  // Bare @import declarations have no general-enclosed fallback. Keep generic
+  // declaration grammar failures separate from unsupported property values.
+  if bang != end {
+    return invalid()
+  }
+  let custom = declaration_values.customName(name)
+  if !custom && declaration_values.mixedTopLevelBlock(input, structure, first, last) {
+    return invalid()
+  }
+  let validation = declaration_values.validateRange(input, structure, first, last)
+  if !validation.valid {
+    return truth(false)
+  }
+  if custom {
+    return truth(true)
+  }
+  let found = properties.lookup(name)
+  let property = match &found {
+    Option<Property>.Some { value } => value
+    _ => {
+      return truth(false)
+    }
+  }
+  if validation.hasVariables {
+    return truth(true)
+  }
+  return truth(run typed(input, &mut store.*, property, first, last))
+}
+
+// Recognize the declaration alternative without copying or retokenizing Input.
+effect fn declarationQuery(
+  input: &Input,
+  structure: &Structure,
+  store: &mut Store,
+  start: usize,
+  end: usize,
+) -> Evaluation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = condition_cursor.skip(input, start, end)
+  if first >= end {
+    return invalid()
+  }
+  let initial = input.at(first)
+  match &initial {
+    Option<TokenView>.Some { value } => match &value.token.kind {
+      Kind.Ident { text } => {
+        let colon = condition_cursor.skip(input, first + 1, end)
+        if colon >= end {
+          return invalid()
+        }
+        let separator = input.at(colon)
+        let declarationStart = match &separator {
+          Option<TokenView>.Some { value: colonView } => match &colonView.token.kind {
+            Kind.Colon => true
+            _ => false
+          }
+          _ => false
+        }
+        if declarationStart {
+          return run declaration(input, structure, &mut store.*, value.text(text), colon + 1, end)
+        }
+      }
+      _ => {}
+    }
+    _ => {}
+  }
+  return invalid()
+}
+
+// Each operand spends one unit. All token scans skip whole indexed components;
+// declaration parsing visits disjoint spans, so work is linear in input length.
+effect fn operand(
+  input: &Input,
+  structure: &Structure,
+  store: &mut Store,
+  position: &mut usize,
+  end: usize,
+  remaining: &mut usize,
+) -> Evaluation
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  position.* = condition_cursor.skip(input, position.*, end)
+  if position.* >= end {
+    return invalid()
+  }
+  if remaining.* == 0 {
+    fail CssError { kind: CssErrorKind.MatchLimit, offset: position.* }
+  }
+  remaining.* = remaining.* - 1
+  let opening = position.*
+  let view = input.at(opening)
+  let parentheses = match &view {
+    Option<TokenView>.Some { value } => match &value.token.kind {
+      Kind.OpenParen => true
+      Kind.Function { name } => false
+      _ => {
+        return invalid()
+      }
+    }
+    _ => {
+      return invalid()
+    }
+  }
+  let close = structure.end(opening)
+  if close > end || !structure.any(opening + 1, close) {
+    return invalid()
+  }
+  position.* = if close < end {
+    close + 1
+  } else {
+    end
+  }
+  if !parentheses {
+    return truth(false)
+  }
+  let inner = condition_cursor.skip(input, opening + 1, close)
+  let declared = run declarationQuery(input, structure, &mut store.*, inner, close)
+  if declared.valid {
+    return move declared
+  }
+  let nested = run condition(input, structure, &mut store.*, inner, close, &mut remaining.*)
+  if nested.valid {
+    return move nested
+  }
+
+  // The general-enclosed alternative is false, never selector() evaluation.
+  // https://www.w3.org/TR/mediaqueries-5/#typedef-general-enclosed
+  // The 2024 Conditional3 link to Values4 is broken; its preceding CR links MQ5:
+  // https://www.w3.org/TR/2022/CR-css-conditional-3-20220113/#typedef-supports-in-parens
+  return truth(false)
+}
+
+// https://www.w3.org/TR/css-conditional-3/#typedef-supports-condition
+// Boolean operators have no implicit precedence; mixed chains require grouping.
+effect fn condition(
+  input: &Input,
+  structure: &Structure,
+  store: &mut Store,
+  start: usize,
+  end: usize,
+  remaining: &mut usize,
+) -> Evaluation
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut position = condition_cursor.skip(input, start, end)
+  if position >= end {
+    return invalid()
+  }
+  if condition_cursor.ident(input, position, b"not") {
+    position = position + 1
+    let negated = run operand(input, structure, &mut store.*, &mut position, end, &mut remaining.*)
+    if !negated.valid || condition_cursor.skip(input, position, end) != end {
+      return invalid()
+    }
+    return truth(!negated.value)
+  }
+  let initial = run operand(input, structure, &mut store.*, &mut position, end, &mut remaining.*)
+  if !initial.valid {
+    return invalid()
+  }
+  let mut result = initial.value
+  let mut operator: u8 = 0
+  while true {
+    position = condition_cursor.skip(input, position, end)
+    if position == end {
+      return truth(result)
+    }
+    let nextOperator: u8 = if condition_cursor.ident(input, position, b"and") {
+      1
+    } else if condition_cursor.ident(input, position, b"or") {
+      2
+    } else {
+      0
+    }
+    if nextOperator == 0 || (operator != 0 && operator != nextOperator) {
+      return invalid()
+    }
+    operator = nextOperator
+    position = position + 1
+    let next = run operand(input, structure, &mut store.*, &mut position, end, &mut remaining.*)
+    if !next.valid {
+      return invalid()
+    }
+    result = if operator == 1 {
+      result && next.value
+    } else {
+      result || next.value
+    }
+  }
+}
+
+// https://www.w3.org/TR/css-conditional-3/#at-supports
+// https://www.w3.org/TR/css-conditional-3/#support-definition
+pub effect fn evaluate(input: &Input, store: &mut Store, limits: &Limits) -> Evaluation
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let structure = run condition_cursor.inspect(input, limits)
+  if !structure.any(0, input.length()) {
+    return invalid()
+  }
+  let mut remaining = limits.maxTokens
+  return run condition(input, &structure, &mut store.*, 0, input.length(), &mut remaining)
+}
+
+// Takes only the contents of @import supports(...), not the wrapping function.
+// A bare declaration is equivalent to a parenthesized supports declaration;
+// otherwise the entire contents must be a supports-condition.
+// https://www.w3.org/TR/css-cascade-4/#at-import
+// https://www.w3.org/TR/css-cascade-4/#conditional-import
+pub effect fn evaluateImport(input: &Input, store: &mut Store, limits: &Limits) -> Evaluation
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let structure = run condition_cursor.inspect(input, limits)
+  if !structure.any(0, input.length()) {
+    return invalid()
+  }
+  let declared = run declarationQuery(input, &structure, &mut store.*, 0, input.length())
+  if declared.valid {
+    return move declared
+  }
+  let mut remaining = limits.maxTokens
+  return run condition(input, &structure, &mut store.*, 0, input.length(), &mut remaining)
+}
+
+// Boolean convenience wrapper; rule-placement callers must use evaluate.
+pub effect fn matches(input: &Input, store: &mut Store, limits: &Limits) -> bool
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let result = run evaluate(input, &mut store.*, limits)
+  return result.valid && result.value
+}

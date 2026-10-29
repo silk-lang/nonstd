@@ -1,0 +1,618 @@
+//! Apple morphology and legacy pair kerning, using read_fonts lookup readers.
+import view { View, offset }
+import aat_map { Range }
+import aat_map
+import aat_insert
+import trace
+import buffer { Buffer, Glyph, reverseRange }
+import font { ConfiguredShaper, FontFuncs, Shaper, table }
+import feature { Feature }
+import plan { featureValue }
+import direction { Direction }
+import scale { Scale, add }
+import font_types.lib { Tag, GlyphId }
+import read_fonts.lib { ReadError, TableProvider }
+import read_fonts.tables.aat { TypedLookup }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import unicode
+
+pub fn lookup<'a>(data: View<'a>, glyph: u32) -> u32 {
+  if glyph > 65535 {
+    return 65536
+  }
+  if let Result<TypedLookup<'a, u16>, ReadError>.Success { value } = TypedLookup<'a, u16>.read(
+    data.data,
+  ) {
+    if let Result<u16, ReadError>.Success { value: found } = TypedLookup<'a, u16>.value(
+      &value,
+      u32.toU16(glyph),
+    ) {
+      return u16.toU32(found)
+    }
+  }
+  return 65536
+}
+
+fn set(buffer: &mut Buffer, index: usize, glyph: u32) -> () {
+  if index >= Buffer.len(&buffer.*) {
+    return
+  }
+  let mut item = List<Glyph>.get(&buffer.glyphs, index)
+  item.info.glyphId = glyph
+  item.substituted = true
+  List<Glyph>.set(&mut buffer.glyphs, index, item)
+}
+
+pub effect fn substitute<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &mut Buffer,
+  features: &[Feature],
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut data = font.data.morx
+  let mut legacy = false
+  if View.len(&data) == 0 {
+    data = font.data.mort
+    legacy = true
+  }
+  if View.len(&data) < 8 {
+    return false
+  }
+  let mut startMessage = "start table morx"
+  let mut endMessage = "end table morx"
+  if legacy {
+    startMessage = "start table mort"
+    endMessage = "end table mort"
+  }
+  if !run trace.message(font, &buffer.*, startMessage) {
+    return true
+  }
+  let chains = u32.toUsize(View.u32(&data, 4))
+  let mut chainOffset: usize = 8
+  let mut chainIndex: usize = 0
+  let mut budget = buffer.maxOperations
+  while chainIndex < chains && chainOffset < View.len(&data) && budget != 0 {
+    let mut chain = View.tail(&data, chainOffset)
+    let length = u32.toUsize(View.u32(&chain, 4))
+    let mut header: usize = 16
+    let mut featureCount = u32.toUsize(View.u32(&chain, 8))
+    let mut subCount = u32.toUsize(View.u32(&chain, 12))
+    if legacy {
+      header = 12
+      featureCount = u16.toUsize(View.u16(&chain, 8))
+      subCount = u16.toUsize(View.u16(&chain, 10))
+    }
+    if length < header || length > View.len(&chain) {
+      break
+    }
+    chain = View.range(&chain, 0, length)
+    let ranges = run aat_map.compile(
+      font,
+      chain,
+      header,
+      featureCount,
+      features,
+      &buffer.languageValue,
+    )
+    let mut subOffset = offset(header, featureCount, 12)
+    let mut n: usize = 0
+    while n < subCount && subOffset < length && budget != 0 {
+      let subtable = View.tail(&chain, subOffset)
+      let mut subLength = u32.toUsize(View.u32(&subtable, 0))
+      let mut coverage = View.u32(&subtable, 4)
+      let mut subFlags = View.u32(&subtable, 8)
+      let mut subHeader: usize = 12
+      if legacy {
+        subLength = u16.toUsize(View.u16(&subtable, 0))
+        let c = u16.toU32(View.u16(&subtable, 2))
+        coverage = u32.shiftLeft(c & 0xff00, 16) | (c & 255)
+        subFlags = View.u32(&subtable, 4)
+        subHeader = 8
+      }
+      if subLength < subHeader || subLength > length - subOffset {
+        break
+      }
+      if aat_map.any(List<Range>.asSlice(&ranges), subFlags)
+        && ((coverage & 0x20000000) != 0
+          || ((coverage & 0x80000000) != 0) == !Direction.isHorizontal(buffer.direction)) {
+        if !run trace.indexed(font, &buffer.*, "start chainsubtable ", n, "") {
+          subOffset = subOffset + subLength
+          n = n + 1
+          continue
+        }
+        let mut reverse = (coverage & 0x40000000) != 0
+        if (coverage & 0x10000000) == 0 {
+          reverse = reverse != !Direction.isForward(buffer.direction)
+        }
+        if reverse {
+          Buffer.reverse(&mut buffer)
+        }
+        let body = View.range(&subtable, subHeader, subLength)
+        let kind = coverage & 7
+        if kind == 4 {
+          let mut i: usize = 0
+          while i < Buffer.len(&buffer.*) && budget != 0 {
+            budget = budget - 1
+            let item = List<Glyph>.get(&buffer.glyphs, i)
+            if (aat_map.flags(List<Range>.asSlice(&ranges), item.info.cluster) & subFlags) != 0 {
+              let mapped = lookup(body, item.info.glyphId)
+              if mapped != 65536 {
+                set(&mut buffer, i, mapped)
+              }
+            }
+            i = i + 1
+          }
+        } else if kind == 0 || kind == 1 || kind == 2 || kind == 5 {
+          run machine(
+            &mut buffer,
+            body,
+            kind,
+            legacy,
+            &mut budget,
+            List<Range>.asSlice(&ranges),
+            subFlags,
+          )
+        }
+        drop run trace.indexed(font, &buffer.*, "end chainsubtable ", n, "")
+        if reverse {
+          Buffer.reverse(&mut buffer)
+        }
+      }
+      subOffset = subOffset + subLength
+      n = n + 1
+    }
+    chainOffset = chainOffset + length
+    chainIndex = chainIndex + 1
+  }
+  buffer.maxOperations = budget
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) {
+    if List<Glyph>.get(&buffer.glyphs, i).info.glyphId == 65535 {
+      Buffer.deleteGlyph(&mut buffer, i)
+    } else {
+      i = i + 1
+    }
+  }
+  drop run trace.message(font, &buffer.*, endMessage)
+  return true
+}
+
+effect fn machine(
+  buffer: &mut Buffer,
+  data: View,
+  kind: u32,
+  legacy: bool,
+  budget: &mut usize,
+  ranges: &[Range],
+  mask: u32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if kind == 5 {
+    run aat_insert.apply(&mut buffer, data, legacy, &mut budget, ranges, mask)
+    return
+  }
+  let mut classes = View.offset32(&data, 4)
+  let mut states = View.offset32(&data, 8)
+  let mut entries = View.offset32(&data, 12)
+  let mut extra: usize = 16
+  let mut classCount = u32.toUsize(View.u32(&data, 0))
+  if legacy {
+    classes = View.offset16(&data, 2)
+    states = View.offset16(&data, 4)
+    entries = View.offset16(&data, 6)
+    extra = 8
+    classCount = u16.toUsize(View.u16(&data, 0))
+  }
+  if classCount == 0 {
+    return
+  }
+  let mut entrySize: usize = 4
+  if kind == 1 {
+    entrySize = 8
+  }
+  if kind == 2 && !legacy {
+    entrySize = 6
+  }
+  let substitutions = View.offset32(&data, extra)
+  let mut state: usize = 0
+  let mut index: usize = 0
+  let mut mark: usize = 0
+  let mut markSet = false
+  let mut start: usize = 0
+  let mut end: usize = 0
+  let mut stack: [usize; 64] = [0; 64]
+  let mut stackLen: usize = 0
+  let mut rangeFlags: u32 = 0
+  while index <= Buffer.len(&buffer.*) && (budget.* != 0 || kind == 1) {
+    if kind != 1 {
+      budget.* = budget.* - 1
+    }
+    let atEnd = index == Buffer.len(&buffer.*)
+    if !atEnd {
+      rangeFlags = aat_map.flags(ranges, List<Glyph>.get(&buffer.glyphs, index).info.cluster)
+    }
+    if (rangeFlags & mask) == 0 {
+      if atEnd {
+        break
+      }
+      state = 0
+      index = index + 1
+      continue
+    }
+    let mut class: usize = 0
+    if !atEnd {
+      let glyph = List<Glyph>.get(&buffer.glyphs, index).info.glyphId
+      class = u32.toUsize(lookup(classes, glyph))
+      if legacy {
+        let first = u16.toU32(View.u16(&classes, 0))
+        class = 1
+        if glyph >= first && glyph - first < u16.toU32(View.u16(&classes, 2)) {
+          class = u8.toUsize(View.u8(&classes, 4 + u32.toUsize(glyph - first)))
+        }
+      }
+      if glyph == 65535 {
+        class = 2
+      }
+      if class >= classCount {
+        class = 1
+      }
+    }
+    let stateIndex = offset(class, state, classCount)
+    let mut entryIndex = u16.toUsize(View.u16(&states, offset(0, stateIndex, 2)))
+    if legacy {
+      entryIndex = u8.toUsize(View.u8(&states, stateIndex))
+    }
+    if (!legacy && offset(0, stateIndex, 2) >= View.len(&states))
+      || (legacy && stateIndex >= View.len(&states)) {
+      break
+    }
+    let entry = View.tail(&entries, offset(0, entryIndex, entrySize))
+    if View.len(&entry) < entrySize {
+      break
+    }
+    let flags = View.u16(&entry, 2)
+    let nextState = u16.toUsize(View.u16(&entry, 0))
+    if index > 0 && !atEnd {
+      let mut startEntry = u16.toUsize(View.u16(&states, class * 2))
+      let mut endEntry = u16.toUsize(View.u16(&states, state * classCount * 2))
+      if legacy {
+        startEntry = u8.toUsize(View.u8(&states, class))
+        endEntry = u8.toUsize(View.u8(&states, state * classCount))
+      }
+      let startTransition = View.tail(&entries, offset(0, startEntry, entrySize))
+      let endTransition = View.tail(&entries, offset(0, endEntry, entrySize))
+      let mut starts = nextState == 0
+      if legacy {
+        starts = nextState == u16.toUsize(View.u16(&data, 4))
+      }
+      let same = View.u16(&startTransition, 0) == View.u16(&entry, 0)
+        && ((View.u16(&startTransition, 2) & 0x4000) == (flags & 0x4000))
+      let safe = !actionable(kind, legacy, entry)
+        && (state == 0 || ((flags & 0x4000) != 0 && starts)
+          || (!actionable(kind, legacy, startTransition) && same))
+        && (!actionable(kind, legacy, endTransition) || (kind == 1 && !markSet))
+      if !safe {
+        Buffer.unsafeToBreak(&mut buffer, index - 1, index + 1)
+      }
+    }
+
+    if kind == 0 {
+      if (flags & 0x8000) != 0 {
+        start = index
+      }
+      if (flags & 0x2000) != 0 {
+        end = index + 1
+        if end > Buffer.len(&buffer.*) {
+          end = Buffer.len(&buffer.*)
+        }
+      }
+      if (flags & 15) != 0 && start < end {
+        rearrange(&mut buffer, start, end, u16.toUsize(flags & 15))
+      }
+    }
+    if kind == 1 && (!atEnd || markSet) {
+      let mut n: usize = 0
+      while n < 2 {
+        let action = View.u16(&entry, 4 + n * 2)
+        let mut target = index
+        if n == 0 {
+          target = mark
+        }
+        if target == Buffer.len(&buffer.*) && target > 0 {
+          target = target - 1
+        }
+        if target < Buffer.len(&buffer.*)
+          && ((!legacy && action != 65535) || (legacy && action != 0)) {
+          let glyph = List<Glyph>.get(&buffer.glyphs, target).info.glyphId
+          let mut mapped = lookup(View.offset32(&substitutions, u16.toUsize(action) * 4), glyph)
+          if legacy {
+            mapped = u16.toU32(
+              View.u16(&data, offset(u16.toUsize(action) * 2, u32.toUsize(glyph), 2)),
+            )
+            if mapped == 0 {
+              mapped = 65536
+            }
+          }
+          if mapped != 65536 {
+            set(&mut buffer, target, mapped)
+            if n == 0 {
+              let mut limit = index + 1
+              if limit > Buffer.len(&buffer.*) {
+                limit = Buffer.len(&buffer.*)
+              }
+              Buffer.unsafeToBreak(&mut buffer, target, limit)
+            }
+          }
+        }
+        n = n + 1
+      }
+      if (flags & 0x8000) != 0 {
+        mark = index
+        markSet = true
+      }
+    }
+    if kind == 2 && !atEnd {
+      if (flags & 0x8000) != 0 {
+        if stackLen > 0 && stack[(stackLen - 1) % 64] == index {
+          stackLen = stackLen - 1
+        }
+        stack[stackLen % 64] = index
+        stackLen = stackLen + 1
+      }
+      if ((!legacy && (flags & 0x2000) != 0) || (legacy && (flags & 0x3fff) != 0)) && stackLen > 0 {
+        let actions = View.offset32(&data, extra)
+        let components = View.offset32(&data, extra + 4)
+        let ligatures = View.offset32(&data, extra + 8)
+        let mut actionIndex = u16.toUsize(View.u16(&entry, 4))
+        if legacy {
+          actionIndex = u16.toUsize(flags & 0x3fff)
+        }
+        let mut cursor = stackLen
+        let mut ligature: usize = 0
+        while cursor > 0 && budget.* != 0 {
+          budget.* = budget.* - 1
+          cursor = cursor - 1
+          let at = stack[cursor % 64]
+          if at >= Buffer.len(&buffer.*) {
+            break
+          }
+          if (!legacy && offset(4, actionIndex, 4) > View.len(&actions))
+            || (legacy && actionIndex + 4 > View.len(&data)) {
+            break
+          }
+          let mut action = View.u32(&actions, offset(0, actionIndex, 4))
+          if legacy {
+            action = View.u32(&data, actionIndex)
+          }
+          let mut delta = u32.toI64(action & 0x3fffffff)
+          if (action & 0x20000000) != 0 {
+            delta = delta - 1073741824
+          }
+          let componentIndex = u32.toI64(List<Glyph>.get(&buffer.glyphs, at).info.glyphId) + delta
+          if componentIndex < 0 {
+            break
+          }
+          let componentEnd = offset(2, i64.toUsize(componentIndex), 2)
+          if (!legacy && componentEnd > View.len(&components))
+            || (legacy && componentEnd > View.len(&data)) {
+            break
+          }
+          let mut component = View.u16(&components, offset(0, i64.toUsize(componentIndex), 2))
+          if legacy {
+            component = View.u16(&data, offset(0, i64.toUsize(componentIndex), 2))
+          }
+          ligature = usize.saturatingAdd(ligature, u16.toUsize(component))
+          if (action & 0xc0000000) != 0 {
+            if (!legacy && offset(2, ligature, 2) > View.len(&ligatures))
+              || (legacy && usize.saturatingAdd(ligature, 2) > View.len(&data)) {
+              break
+            }
+            let mut glyph = View.u16(&ligatures, offset(0, ligature, 2))
+            if legacy {
+              glyph = View.u16(&data, ligature)
+            }
+            set(&mut buffer, at, u16.toU32(glyph))
+            let last = stack[(stackLen - 1) % 64] + 1
+            Buffer.mergeClusters(&mut buffer, at, last)
+            while stackLen - 1 > cursor {
+              stackLen = stackLen - 1
+              set(&mut buffer, stack[stackLen % 64], 65535)
+            }
+          }
+          if (action & 0x80000000) != 0 {
+            break
+          }
+          if cursor == 0 {
+            stackLen = 0
+          }
+          actionIndex = actionIndex + 1
+          if legacy {
+            actionIndex = actionIndex + 3
+          }
+        }
+      }
+    }
+    state = nextState
+    if legacy {
+      let stateOffset = u16.toUsize(View.u16(&data, 4))
+      if nextState < stateOffset {
+        break
+      }
+      state = (nextState - stateOffset) / classCount
+    }
+    if atEnd {
+      break
+    }
+    if (flags & 0x4000) == 0 {
+      index = index + 1
+    } else if kind == 1 {
+      if budget.* == 0 {
+        index = index + 1
+      } else {
+        budget.* = budget.* - 1
+      }
+    }
+  }
+}
+
+fn rearrange(buffer: &mut Buffer, start: usize, end: usize, verb: usize) -> () {
+  let map: [u8; 16] = [0, 16, 1, 17, 32, 48, 2, 3, 18, 19, 33, 49, 34, 50, 35, 51]
+  let left = u8.toUsize(map[verb] / 16)
+  let right = u8.toUsize(map[verb] & 15)
+  let mut l = left
+  let mut r = right
+  if l > 2 {
+    l = 2
+  }
+  if r > 2 {
+    r = 2
+  }
+  if end - start < l + r || end - start > 64 {
+    return
+  }
+  Buffer.mergeClusters(&mut buffer, start, end)
+  reverseRange(&mut buffer.glyphs, start, start + l)
+  reverseRange(&mut buffer.glyphs, start + l, end)
+  reverseRange(&mut buffer.glyphs, start, end)
+  reverseRange(&mut buffer.glyphs, start, end - l - r)
+  reverseRange(&mut buffer.glyphs, end - l - r, end - l)
+  reverseRange(&mut buffer.glyphs, start, end - l)
+  if left == 3 {
+    reverseRange(&mut buffer.glyphs, end - 2, end)
+  }
+  if right == 3 {
+    reverseRange(&mut buffer.glyphs, start, start + 2)
+  }
+}
+
+pub fn tracking<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &mut Buffer,
+  features: &[Feature],
+  pointSize: f32,
+) -> () {
+  let trak = font.data.trak
+  let horizontal = Direction.isHorizontal(buffer.direction)
+  let mut at: usize = 8
+  if horizontal {
+    at = 6
+  }
+  let data = View.offset16(&trak, at)
+  let tracks = u16.toUsize(View.u16(&data, 0))
+  let sizes = u16.toUsize(View.u16(&data, 2))
+  let sizesOffset = u32.toUsize(View.u32(&data, 4))
+  let actualSizes = View.tail(&trak, sizesOffset)
+  if tracks == 0 || sizes == 0 || 8 + tracks * 8 > View.len(&data)
+    || sizes * 4 > View.len(&actualSizes) {
+    return
+  }
+  let mut ptem = pointSize
+  if ptem <= 0.0 {
+    ptem = 12.0
+  }
+  let mut a: usize = 0
+  let mut b = tracks - 1
+  while a + 1 < tracks && View.i32(&data, 8 + (a + 1) * 8) <= 0 {
+    a = a + 1
+  }
+  while b > 0 && View.i32(&data, 8 + (b - 1) * 8) >= 0 {
+    b = b - 1
+  }
+  let x = trackValue(trak, data, actualSizes, sizes, a, ptem)
+  let mut value = x
+  if a != b {
+    let t0 = i32.toF32(View.i32(&data, 8 + a * 8)) / 65536.0
+    let t1 = i32.toF32(View.i32(&data, 8 + b * 8)) / 65536.0
+    let y = trackValue(trak, data, actualSizes, sizes, b, ptem)
+    if t0 != t1 {
+      value = x + (0.0 - t0) / (t1 - t0) * (y - x)
+    }
+  }
+  let mut amount = Scale.xf(&font.scale, value)
+  if !horizontal {
+    amount = Scale.yf(&font.scale, value)
+  }
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) {
+    let mut item = List<Glyph>.get(&buffer.glyphs, i)
+    if (i == 0 || !unicode.isMark(item.codepoint))
+      && featureValue(0x7472616b, 1, item.info.cluster, features) != 0 {
+      if horizontal {
+        item.position.xAdvance = add(item.position.xAdvance, amount)
+      } else {
+        item.position.yAdvance = add(item.position.yAdvance, amount)
+      }
+      List<Glyph>.set(&mut buffer.glyphs, i, item)
+    }
+    i = i + 1
+  }
+}
+
+fn trackValue(
+  trak: View,
+  data: View,
+  sizeTable: View,
+  count: usize,
+  track: usize,
+  ptem: f32,
+) -> f32 {
+  let offset = u16.toUsize(View.u16(&data, 14 + track * 8))
+  let actualValues = View.tail(&trak, offset)
+  if count * 2 > View.len(&actualValues) {
+    return 0.0
+  }
+  let mut i: usize = 0
+  while i < count {
+    let point = i32.toF32(View.i32(&sizeTable, i * 4)) / 65536.0
+    if point >= ptem {
+      let value = i16.toF32(View.i16(&actualValues, i * 2))
+      if i == 0 {
+        return value
+      }
+      let prev = i32.toF32(View.i32(&sizeTable, (i - 1) * 4)) / 65536.0
+      let before = i16.toF32(View.i16(&actualValues, (i - 1) * 2))
+      if point == prev {
+        return (before + value) / 2.0
+      }
+      return before + (ptem - prev) / (point - prev) * (value - before)
+    }
+    i = i + 1
+  }
+  return i16.toF32(View.i16(&actualValues, (count - 1) * 2))
+}
+
+fn actionable(kind: u32, legacy: bool, entry: View) -> bool {
+  let flags = View.u16(&entry, 2)
+  if kind == 0 {
+    return (flags & 15) != 0
+  }
+  if kind == 1 {
+    let mut none: u16 = 65535
+    if legacy {
+      none = 0
+    }
+    return View.u16(&entry, 4) != none || View.u16(&entry, 6) != none
+  }
+  if kind == 2 {
+    if legacy {
+      return (flags & 0x3fff) != 0
+    }
+    return (flags & 0x2000) != 0
+  }
+  if kind == 5 {
+    return (flags & 0x3ff) != 0 && (View.u16(&entry, 4) != 65535 || View.u16(&entry, 6) != 65535)
+  }
+  return false
+}

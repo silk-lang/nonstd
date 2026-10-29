@@ -1,0 +1,535 @@
+//! Normative XML and namespace cases; URLs are pinned by images/svg/specs.lock.json.
+import xml {
+  Document,
+  NodeId,
+  XmlError,
+  XmlErrorKind,
+  Limits,
+  Encoding,
+  PseudoAttributes,
+  parse,
+  parseWithLimits,
+  parsePseudoAttributes
+}
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.testing.testing { Testing, AssertionError }
+
+fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn attribute(doc: &Document, node: NodeId, uri: &[u8], name: &[u8], expected: &[u8]) -> bool {
+  return match &Document.attribute(doc, node, uri, name) {
+    Option<&[u8]>.Some { value } => equal(value, expected)
+    _ => false
+  }
+}
+
+effect fn rejected(data: &[u8]) -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(parse(data) |> Effect.provideMut<Allocator>(&mut allocator))
+  run Testing.expect(
+    match &result {
+      Result<Document, XmlError | OutOfMemoryError>.Failure { error } => match &error {
+        XmlError problem => true
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "malformed XML is rejected",
+  )
+}
+
+// https://www.w3.org/TR/xml-names/#defaulting
+// https://www.w3.org/TR/xml/#sec-starttags
+test effect fn expandedNamesAndForeignMetadata() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<svg xmlns='urn:svg' xmlns:p='urn:private' id='x' p:id='y'><p:meta>value</p:meta><g xmlns=''/></svg>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = Document.root(&doc)
+  run Testing.expect(
+    equal(Document.namespaceUri(&doc, root), b"urn:svg"),
+    "default element namespace",
+  )
+  run Testing.expect(
+    attribute(&doc, root, b"", b"id", b"x"),
+    "unprefixed attribute has no namespace",
+  )
+  run Testing.expect(
+    attribute(&doc, root, b"urn:private", b"id", b"y"),
+    "foreign attribute retained",
+  )
+  run Testing.expect(
+    equal(Document.localName(&doc, NodeId { index: 1 }), b"meta"),
+    "foreign element retained",
+  )
+  run Testing.expect(
+    equal(Document.text(&doc, NodeId { index: 2 }), b"value"),
+    "foreign content retained",
+  )
+  run Testing.expect(
+    equal(Document.namespaceUri(&doc, NodeId { index: 3 }), b""),
+    "default namespace undeclaration",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-line-ends
+// https://www.w3.org/TR/xml/#AVNormalize
+// https://www.w3.org/TR/xml/#sec-cdata-sect
+// https://www.w3.org/TR/xml/#sec-pi
+test effect fn textNormalizationAndRetainedMisc() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<?xml version='1.0'?><?style yes?><r a='a\r\nb\tc&#xA;d'><!--keep--><![CDATA[<x>\r\ny]]>&lt;&amp;&#x1F600;</r>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    attribute(&doc, Document.root(&doc), b"", b"a", b"a b c\nd"),
+    "literal whitespace normalized, reference preserved",
+  )
+  run Testing.expect(equal(Document.text(&doc, NodeId { index: 0 }), b"yes"), "PI data retained")
+  run Testing.expect(equal(Document.text(&doc, NodeId { index: 2 }), b"keep"), "comment retained")
+  run Testing.expect(
+    equal(Document.text(&doc, NodeId { index: 3 }), b"<x>\ny"),
+    "CDATA and newlines",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-internal-ent
+// https://www.w3.org/TR/xml/#sec-entexpand
+// https://www.w3.org/TR/xml/#sec-attr-defaults
+test effect fn internalEntitiesAndAttributeDefaults() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<!DOCTYPE r [<!ENTITY word 'hello'><!ENTITY markup '<child a=\"&word;\"/>'><!ATTLIST r tokens NMTOKENS '  a   b  '>]><r>&markup;</r>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    attribute(&doc, Document.root(&doc), b"", b"tokens", b"a b"),
+    "tokenized DTD default normalization",
+  )
+  run Testing.expect(
+    equal(Document.localName(&doc, NodeId { index: 1 }), b"child"),
+    "entity markup parsed",
+  )
+  run Testing.expect(
+    attribute(&doc, NodeId { index: 1 }, b"", b"a", b"hello"),
+    "entity references in replacement attributes",
+  )
+}
+
+// https://www.w3.org/TR/xml/#as-PE
+// https://www.w3.org/TR/xml/#proc-types
+test effect fn parameterEntitiesAndUnfetchedExternalSubset() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<!DOCTYPE r SYSTEM 'https://invalid.example/never-fetch' [<!ENTITY % defs \"<!ENTITY x 'ok'>\">%defs;]><r>&x;</r>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(Document.text(&doc, NodeId { index: 1 }), b"ok"),
+    "internal parameter entity declaration",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-guessing
+// https://www.w3.org/TR/xml/#charencoding
+test effect fn utf16DetectionAndSupplementaryCharacters() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let le: [u8; 18] = [255, 254, 60, 0, 114, 0, 62, 0, 61, 216, 0, 222, 60, 0, 47, 0, 114, 0]
+  let mut data = run Bytes.copy(&le) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Bytes.append(&mut data, &[62, 0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let doc = run parse(Bytes.asSlice(&data)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Document.text(&doc, NodeId { index: 1 }).length == 4,
+    "surrogate pair becomes UTF8",
+  )
+  let be: [u8; 8] = [0, 60, 0, 114, 0, 47, 0, 62]
+  let other = run parse(&be) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(Document.localName(&other, Document.root(&other)), b"r"),
+    "UTF16 byte pattern",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-well-formed
+// https://www.w3.org/TR/xml/#NT-Name
+// https://www.w3.org/TR/xml/#NT-Comment
+test effect fn malformedStructureAndCharacters() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  run rejected(b"")
+  run rejected(b"<a/><b/>")
+  run rejected(b"<a><b></a></b>")
+  run rejected(b"<a>")
+  run rejected(b"<1a/>")
+  run rejected(b"<a x='1'x='2'/>")
+  run rejected(b"<a x='1' x='2'/>")
+  run rejected(b"<a><!--a--b--></a>")
+  run rejected(b"<a>]]></a>")
+  run rejected(b"<a>&#0;</a>")
+  run rejected(b"<a>&unknown;</a>")
+  run rejected(b"<?XML data?><a/>")
+  run rejected(b" <?xml version='1.0'?><a/>")
+  run rejected(b"<?xml version='2.0'?><a/>")
+  run rejected(b"<?xml version='1.'?><a/>")
+  run rejected(b"<a x='<bad'/>")
+  run rejected(&[60, 97, 62, 192, 128, 60, 47, 97, 62])
+}
+
+// https://www.w3.org/TR/xml/#sec-versioning (any 1.x document is processed as 1.0)
+// https://www.w3.org/TR/xml/#wf-entdeclared (a parameter entity reference in the
+// internal subset makes an undeclared entity a validity error, not a fatal one)
+test effect fn laterVersionsAndUndeclaredAfterParameterEntities() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let later = run parse(b"<?xml version='1.7'?><a/>")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(equal(Document.localName(&later, Document.root(&later)), b"a"), "1.x accepted")
+  let referenced = run parse(
+    b"<!DOCTYPE a [<!ENTITY % pe \"<!ENTITY one 'text'>\">%pe;]><a>&two;</a>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(Document.localName(&referenced, Document.root(&referenced)), b"a"),
+    "undeclared entity after a parameter entity reference",
+  )
+  run rejected(
+    b"<?xml version='1.0' standalone='yes'?><!DOCTYPE a [<!ENTITY % pe ''>%pe;]><a>&two;</a>",
+  )
+  run rejected(b"<!DOCTYPE a [<!ENTITY one 'text'>]><a>&two;</a>")
+}
+
+// https://www.w3.org/TR/xml-names/#nsc-NSDeclared
+// https://www.w3.org/TR/xml-names/#nsc-AttrsUnique
+// https://www.w3.org/TR/xml-names/#xmlReserved
+test effect fn namespaceConstraints() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  run rejected(b"<p:r/>")
+  run rejected(b"<a p:x='1'/>")
+  run rejected(b"<a xmlns:p=''/>")
+  run rejected(b"<a xmlns:xml='wrong'/>")
+  run rejected(b"<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>")
+  run rejected(b"<a xmlns='http://www.w3.org/2000/xmlns/'/>")
+  run rejected(b"<a xmlns:xmlns='urn:x'/>")
+  run rejected(b"<xmlns:r/>")
+  run rejected(b"<a:b:c/>")
+  run rejected(b"<a xmlns:p='u' xmlns:q='u' p:x='1' q:x='2'/>")
+}
+
+// https://www.w3.org/TR/xml/#norecursion
+// https://www.w3.org/TR/xml/#wf-entdeclared
+// https://www.w3.org/TR/xml/#CleanAttrVals
+test effect fn malformedEntityReplacement() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  run rejected(b"<!DOCTYPE r [<!ENTITY x '&x;'>]><r>&x;</r>")
+  run rejected(b"<!DOCTYPE r [<!ENTITY x '<a>'>]><r>&x;</a></r>")
+  run rejected(b"<!DOCTYPE r [<!ENTITY x '<'>]><r a='&x;'/>")
+  run rejected(b"<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///private'>]><r a='&x;'/>")
+  run rejected(b"<!DOCTYPE r [<!ENTITY x SYSTEM 'x' NDATA n>]><r>&x;</r>")
+  run rejected(b"<!DOCTYPE r [<!ENTITY % x 'a'><!ENTITY y '%x;'>]><r/>")
+}
+
+// https://www.w3.org/TR/xml/#sec-entexpand (host resource bounds are parser policy).
+test effect fn hostLimitsAreEnforced() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut limits = Limits.make()
+  limits.maxDepth = 2
+  let result = run Effect.result(
+    parseWithLimits(b"<r><a><b/></a></r>", &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &result {
+      Result<Document, XmlError | OutOfMemoryError>.Failure { error } => match &error {
+        XmlError problem => match &problem.kind {
+          XmlErrorKind.Limit => true
+          _ => false
+        }
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "nesting bound is checked before recursion",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-prolog-dtd
+// https://www.w3.org/TR/xml/#wf-entdeclared
+// https://www.w3.org/TR/xml-names/#Conformance
+test effect fn declarationsAreCheckedEvenWhenUnused() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  run rejected(b"<!DOCTYPE r [<!ATTLIST unused x CDATA '&;'>]><r/>")
+  run rejected(b"<!DOCTYPE r [<!ATTLIST unused x CDATA '&later;'><!ENTITY later 'x'>]><r/>")
+  run rejected(b"<!DOCTYPE r [<!ELEMENT unused (a|b,c)>]><r/>")
+  run rejected(b"<!DOCTYPE r [<!ENTITY a:b 'x'>]><r/>")
+  run rejected(b"<?a:b x?><r/>")
+  run rejected(b"<!DOCTYPE r [<!ATTLIST a:b:c x CDATA #IMPLIED>]><r/>")
+}
+
+// https://www.w3.org/TR/xml/#sec-predefined-ent
+// https://www.w3.org/TR/xml/#sec-attr-defaults
+test effect fn predefinedDeclarationsAndDefaultFirstBinding() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<!DOCTYPE r [<!ENTITY lt '&#38;#60;'><!ENTITY amp '&#38;#38;'><!ATTLIST r a CDATA '&amp;'><!ATTLIST r a CDATA 'second'>]><r/>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    attribute(&doc, Document.root(&doc), b"", b"a", b"&"),
+    "default values are expanded once and first declaration wins",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-entexpand
+test effect fn entityBudgetCountsRepeatedReferences() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut limits = Limits.make()
+  limits.maxExpandedBytes = 3
+  let result = run Effect.result(
+    parseWithLimits(b"<!DOCTYPE r [<!ENTITY x 'ab'>]><r>&x;&x;</r>", &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &result {
+      Result<Document, XmlError | OutOfMemoryError>.Failure { error } => match &error {
+        XmlError problem => match &problem.kind {
+          XmlErrorKind.Limit => true
+          _ => false
+        }
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "cumulative expansion budget",
+  )
+}
+
+// https://www.w3.org/TR/xml/#include-if-valid
+// https://www.w3.org/TR/xml/#proc-types
+test effect fn skippedExternalContentIsReported() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<!DOCTYPE r [<!ENTITY external SYSTEM 'file:///not-opened'>]><r>&external;</r>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Document.skippedExternalContent(&doc),
+    "nonvalidating application notification",
+  )
+}
+
+// https://www.w3.org/TR/xml/#proc-types
+test effect fn standaloneProcessesDeclarationsAfterSkippedParameterEntity() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<?xml version='1.0' standalone='yes'?><!DOCTYPE r [<!ENTITY % external SYSTEM 'not-opened'>%external;<!ATTLIST r a CDATA 'kept'>]><r/>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    attribute(&doc, Document.root(&doc), b"", b"a", b"kept"),
+    "standalone exception to skipped declaration rule",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-attribute-types
+// https://www.w3.org/TR/xml/#AVNormalize
+test effect fn declaredIdTypeSurvivesNormalization() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let doc = run parse(
+    b"<!DOCTYPE r [<!ATTLIST r key ID #IMPLIED ref IDREF #IMPLIED id CDATA #IMPLIED>]><r key='  chosen  ' ref='chosen' id='other'/>",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let attrs = Document.attributes(&doc, Document.root(&doc))
+  run Testing.expect(
+    Document.attributeIsId(&doc, attrs[0])
+      && equal(Document.attributeValue(&doc, attrs[0]), b"chosen")
+      && !Document.attributeIsId(&doc, attrs[1])
+      && !Document.attributeIsId(&doc, attrs[2]),
+    "ID typing follows the declaration, not the attribute name or an IDREF value",
+  )
+}
+
+fn pseudoValue(attrs: &PseudoAttributes, name: &[u8], expected: &[u8]) -> bool {
+  return match &PseudoAttributes.get(attrs, name) {
+    Option<&[u8]>.Some { value } => equal(value, expected)
+    _ => false
+  }
+}
+
+effect fn pseudoRejected(data: &[u8], limits: &Limits, expected: XmlErrorKind) -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(
+    parsePseudoAttributes(data, limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &result {
+      Result<PseudoAttributes, XmlError | OutOfMemoryError>.Failure { error } => match &error {
+        XmlError problem => problem.kind == expected
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "pseudo-attribute failure retains its typed error kind",
+  )
+}
+
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#NT-PseudoAtts
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#NT-PseudoAtt
+test effect fn pseudoAttributeSeparatorsAndXmlNames() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let attrs = run parsePseudoAttributes(
+    b" \t\r\nhref \t= \n'a.css'\r\n::a:b='colon' \xc3\xa9='unicode' A='' a='lower' ",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    pseudoValue(&attrs, b"href", b"a.css") && pseudoValue(&attrs, b"::a:b", b"colon")
+      && pseudoValue(&attrs, b"\xc3\xa9", b"unicode")
+      && pseudoValue(&attrs, b"A", b"")
+      && pseudoValue(&attrs, b"a", b"lower"),
+    "XML Name is Unicode and is not namespace-restricted",
+  )
+  let emptyAttrs = run parsePseudoAttributes(b"", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let spaceAttrs = run parsePseudoAttributes(b" \t\r\n", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &PseudoAttributes.get(&emptyAttrs, b"missing") {
+      Option<&[u8]>.None => true
+      _ => false
+    },
+    "empty input has no attributes",
+  )
+  run Testing.expect(!pseudoValue(&spaceAttrs, b"missing", b""), "whitespace input is empty")
+  run pseudoRejected(b"a='x'b='y'", &limits, XmlErrorKind.Syntax)
+  run pseudoRejected(b"a='x'\x0bb='y'", &limits, XmlErrorKind.Syntax)
+  run pseudoRejected(b"a x='y'", &limits, XmlErrorKind.Syntax)
+  run pseudoRejected(b"1a='x'", &limits, XmlErrorKind.InvalidName)
+  run pseudoRejected(b"a=x", &limits, XmlErrorKind.Syntax)
+  run pseudoRejected(b"a='x", &limits, XmlErrorKind.UnexpectedEnd)
+}
+
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#dt-value
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#NT-PredefEntityRef
+test effect fn pseudoAttributeReferencesAndLiteralWhitespace() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let attrs = run parsePseudoAttributes(
+    b"a=\"&lt;&gt;&amp;&quot;&apos;&#65;&#x1F600;\" b='\"\t\r\n &#9;&#13;&#10;&amp;lt;'",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    pseudoValue(&attrs, b"a", b"<>&\"'A\xf0\x9f\x98\x80")
+      && pseudoValue(&attrs, b"b", b"\"\t\r\n \t\r\n&lt;"),
+    "only references and enclosing quotes change; literal whitespace is not normalized",
+  )
+}
+
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#pseudo-attributes
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#NT-PseudoAttValue
+// https://www.w3.org/TR/xml/#wf-Legalchar
+test effect fn pseudoAttributeMalformedValuesAndDuplicates() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let limits = Limits.make()
+  run pseudoRejected(b"a='1' a='2'", &limits, XmlErrorKind.DuplicateAttribute)
+  run pseudoRejected(b"a='&custom;'", &limits, XmlErrorKind.UndeclaredEntity)
+  run pseudoRejected(b"a='&AMP;'", &limits, XmlErrorKind.UndeclaredEntity)
+  run pseudoRejected(b"a='&amp'", &limits, XmlErrorKind.Syntax)
+  run pseudoRejected(b"a='<'", &limits, XmlErrorKind.Syntax)
+  run pseudoRejected(b"a='&#0;'", &limits, XmlErrorKind.InvalidCharacter)
+  run pseudoRejected(b"a='&#xD800;'", &limits, XmlErrorKind.InvalidCharacter)
+  run pseudoRejected(b"a='&#x110000;'", &limits, XmlErrorKind.InvalidCharacter)
+  run pseudoRejected(b"a='&#;'", &limits, XmlErrorKind.InvalidCharacter)
+  run pseudoRejected(b"a='\xff'", &limits, XmlErrorKind.Encoding)
+}
+
+// https://www.w3.org/TR/2010/REC-xml-stylesheet-20101028/#pseudo-attributes
+// Host resource limits bound the retained set independently of grammar errors.
+test effect fn pseudoAttributeLimitsRemainDistinguishable() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut limits = Limits.make()
+  limits.maxInputBytes = 4
+  run pseudoRejected(b"a='x'", &limits, XmlErrorKind.Limit)
+  limits = Limits.make()
+  limits.maxAttributes = 1
+  run pseudoRejected(b"a='' b=''", &limits, XmlErrorKind.Limit)
+  limits = Limits.make()
+  limits.maxStorageBytes = 1
+  run pseudoRejected(b"a='x'", &limits, XmlErrorKind.Limit)
+  limits = Limits.make()
+  limits.maxExpandedBytes = 3
+  run pseudoRejected(b"a='&#x1F600;'", &limits, XmlErrorKind.Limit)
+  run pseudoRejected(b"a='&amp;&amp;' b='&amp;&amp;'", &limits, XmlErrorKind.Limit)
+  limits.maxExpandedBytes = 4
+  limits.maxStorageBytes = 5
+  let attrs = run parsePseudoAttributes(b"a='&#x1F600;'", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    pseudoValue(&attrs, b"a", b"\xf0\x9f\x98\x80"),
+    "exact storage and expanded-byte limits are accepted",
+  )
+}
+
+// https://www.w3.org/TR/xml/#sec-guessing
+// https://www.w3.org/TR/xml/#charencoding
+test effect fn documentRetainsDetectedEncoding() -> ()
+  ! AssertionError<'static> | XmlError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let utf8 = run parse(b"<r/>") |> Effect.provideMut<Allocator>(&mut allocator)
+  let utf8Bom = run parse(b"\xef\xbb\xbf<r/>") |> Effect.provideMut<Allocator>(&mut allocator)
+  let le = run parse(&[60, 0, 114, 0, 47, 0, 62, 0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let leBom = run parse(&[255, 254, 60, 0, 114, 0, 47, 0, 62, 0])
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let be = run parse(&[0, 60, 0, 114, 0, 47, 0, 62]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let beBom = run parse(&[254, 255, 0, 60, 0, 114, 0, 47, 0, 62])
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    Document.encoding(&utf8) == Encoding.Utf8 && Document.encoding(&utf8Bom) == Encoding.Utf8
+      && Document.encoding(&le) == Encoding.Utf16Le
+      && Document.encoding(&leBom) == Encoding.Utf16Le
+      && Document.encoding(&be) == Encoding.Utf16Be
+      && Document.encoding(&beBom) == Encoding.Utf16Be,
+    "detected byte encoding survives normalized UTF8 document storage",
+  )
+}

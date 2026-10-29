@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Compare model selection, fallback and ownership edge cases against upstream."""
+import argparse
+import ast
+from pathlib import Path
+import re
+import struct
+import tempfile
+import harness
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def tables(data):
+    count = int.from_bytes(data[4:6], 'big')
+    result = {}
+    for i in range(count):
+        tag, _, offset, length = struct.unpack_from('>4sIII', data, 12 + i * 16)
+        result[tag] = data[offset:offset + length]
+    return result
+
+
+def sfnt(records):
+    out = bytearray(struct.pack('>IHHHH', 0x10000, len(records), 0, 0, 0)
+                    + bytes(16 * len(records)))
+    for i, (tag, value) in enumerate(sorted(records.items())):
+        struct.pack_into('>4sIII', out, 12 + i * 16, tag, 0, len(out), len(value))
+        out.extend(value)
+        out.extend(bytes(-len(out) % 4))
+    return bytes(out)
+
+
+def fixtures():
+    source = (ROOT / 'font/parse/src/generated_model_fixtures.silk').read_text()
+    seeds = {}
+    for name, literal in re.findall(r"pub fn (\w+)\(\) -> &'static \[u8\] \{\s*return (b\"[^\"]*\")\s*\}", source):
+        data = ast.literal_eval(literal)
+        if name.endswith('DrawnBounds'):
+            continue
+        if name == 'postSimple':
+            data = sfnt({b'post': data, b'maxp': struct.pack('>IH', 0x5000, 7)})
+        seeds[name] = data
+        yield name, data
+    # Withholding a whole table forces the next real model source to answer.
+    for name in ('tinos', 'vazirmatn', 'mplusVertical', 'negativeVarAdvances', 'verticalCff2'):
+        records = tables(seeds[name])
+        for hidden in [(b'HVAR',), (b'VVAR',), (b'HVAR', b'VVAR'),
+                       (b'hmtx',), (b'vmtx',), (b'hhea', b'OS/2'),
+                       (b'glyf', b'loca'), (b'post',)]:
+            if not any(tag in records for tag in hidden):
+                continue
+            yield name + '-without-' + '-'.join(t.decode().replace('/', '_') for t in hidden), sfnt(
+                {tag: value for tag, value in records.items() if tag not in hidden})
+        for tag in (b'hmtx', b'vmtx', b'HVAR', b'VVAR', b'MVAR', b'gvar', b'VORG'):
+            if tag not in records:
+                continue
+            value = records[tag]
+            for cut in sorted({0, min(2, len(value)), min(4, len(value)), len(value) - 1}):
+                yield f'{name}-{tag.decode()}-prefix-{cut}', sfnt({**records, tag: value[:cut]})
+    # The stored em and line signs are normalized by the global model.
+    records = tables(seeds['tinos'])
+    for em in (0, 15, 16, 1000, 16384, 16385, 65535):
+        head = bytearray(records[b'head'])
+        struct.pack_into('>H', head, 18, em)
+        yield f'tinos-em-{em}', sfnt({**records, b'head': head})
+    for ascender, descender in ((1600, -400), (1600, 400), (-1600, 400), (-1600, -400)):
+        hhea = bytearray(records[b'hhea'])
+        struct.pack_into('>hh', hhea, 4, ascender, descender)
+        yield f'tinos-line-{ascender}-{descender}', sfnt(
+            {tag: hhea if tag == b'hhea' else value for tag, value in records.items() if tag != b'OS/2'})
+    variable = tables(seeds['verticalCff2'])
+    variable[b'VORG'] = tables(seeds['vorgFont'])[b'VORG']
+    yield 'combined-VORG-VVAR', sfnt(variable)
+    # Empty, invalid UTF-8 and overlong post names exercise both inline names and
+    # exact full-name reverse lookup, including duplicate first-glyph selection.
+    for label, names in [('duplicate', [b'alpha', b'alpha']),
+                         ('long', [b'x' * 80, b'x' * 63]),
+                         ('utf8', [b'\xc3\xa9' * 40, b'\xff']),
+                         ('empty', [b'', b'valid'])]:
+        post = struct.pack('>I', 0x20000) + bytes(28) + struct.pack('>HHH', 2, 258, 259)
+        post += b''.join(bytes([len(name)]) + name for name in names)
+        yield 'post-' + label, sfnt({b'post': post, b'maxp': struct.pack('>IH', 0x5000, 2)})
+
+    # Full source selection needs real outlines underneath color, bitmap and
+    # variable-composite tables, including missing-table fallbacks.
+    misc_source = (ROOT / 'font/parse/src/generated_misc_table_fixtures.silk').read_text()
+    misc = {name: ast.literal_eval(literal) for name, literal in re.findall(
+        r"pub fn (\w+)\(\) -> &'static \[u8\] \{\s*return (b\"[^\"]*\")\s*\}", misc_source)}
+    for name in ('colrInvalidCubicFont', 'colrValidCubicFont'):
+        yield name, misc[name]
+    names = ('cbdtFont', 'cbdtMissingGlyph2At16', 'colrFont', 'colrV0Font',
+             'variableColrFont', 'unclippedColrFont', 'gradientFont',
+             'varcCjkFont', 'varcConditionalsFont', 'varcStaticFont',
+             'varcDeltaPrecisionFont', 'colrEmptyColorLineFont')
+    for name in names:
+        yield 'misc-' + name, misc[name]
+        records = tables(misc[name])
+        for hidden in ((b'COLR',), (b'VARC',), (b'CBDT',), (b'CBLC',),
+                       (b'glyf', b'loca'), (b'gvar',), (b'fvar',)):
+            if any(tag in records for tag in hidden):
+                yield 'misc-' + name + '-without-' + '-'.join(tag.decode() for tag in hidden), sfnt(
+                    {tag: value for tag, value in records.items() if tag not in hidden})
+    base = tables(seeds['materialSymbols'])
+    for name, data in misc.items():
+        # The 4,096-deep condition is an implementation-level rejection test,
+        # exercised directly by model_extent_source_tests, beyond the field dumper's
+        # explicit graph-depth limit. Never count an incomplete dump as parity.
+        if name.startswith('varc') and name not in names and name != 'varcDeepCondition':
+            yield 'model-' + name, sfnt({**base, b'VARC': data})
+            for cut in sorted({0, 4, 24, len(data)//2, len(data)-1}):
+                yield f'model-{name}-prefix-{cut}', sfnt({**base, b'VARC': data[:cut]})
+    # A mixed bitmap/outline font must fall through when its selected strike
+    # lacks the glyph, while a larger strike still answers.
+    for name in ('cbdtFont', 'cbdtMissingGlyph2At16'):
+        bitmap = {tag: value for tag, value in tables(misc[name]).items()
+                  if tag in (b'CBDT', b'CBLC')}
+        combined = {**base, **bitmap}
+        yield 'mixed-' + name, sfnt(combined)
+        for count in (0, 2):
+            maxp = bytearray(combined[b'maxp'])
+            struct.pack_into('>H', maxp, 4, count)
+            yield f'mixed-{name}-count-{count}', sfnt({**combined, b'maxp': maxp})
+            yield f'only-{name}-count-{count}', sfnt({**bitmap, b'maxp': maxp})
+    # A failed selected base can fall through to color/bitmap sources, but never
+    # chooses a second base outline or activates VARC after its chosen base.
+    for name in ('variableColrFont', 'colrFont'):
+        records = tables(misc[name])
+        if b'loca' in records:
+            yield name + '-short-loca', sfnt({**records, b'loca': b'\x00\x00'})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference', type=Path, default=harness.REFERENCE)
+    parser.add_argument('--silk-dumper', type=Path)
+    parser.add_argument('--report', type=Path)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='font-model-fixtures-') as temporary:
+        paths = []
+        for name, data in fixtures():
+            path = Path(temporary) / f'{name}.ttf'
+            path.write_bytes(data)
+            paths.append(path)
+        assert len(paths) == len(set(paths)), 'fixture names must be unique'
+        return harness.compare(paths, args.reference, args.silk_dumper or harness.silk_binary(), 120, args.report)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

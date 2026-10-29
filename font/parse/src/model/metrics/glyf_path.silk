@@ -1,0 +1,576 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Float outline-to-path conversion used by drawn COLR/VARC control bounds.
+//! Port of tables/glyf/outline/path.rs; raw varied metrics remain point bounds.
+import model.glyph.outline { PathSink }
+import tables.glyf { PointFlags }
+import font_types.lib { Point }
+import silk.core.ownership { Copy }
+import silk.num.u16
+
+pub enum(u8) PathContourStart {
+  ScanBackward = 0,
+  ScanForward = 1,
+}
+
+struct ContourPoint {
+  point: Point<f32>,
+  flags: PointFlags,
+}
+
+impl Copy for ContourPoint {}
+
+fn midpoint(a: ContourPoint, b: ContourPoint) -> ContourPoint {
+  return ContourPoint {
+    point: Point<f32> {
+      x: a.point.x + 0.5 * (b.point.x - a.point.x),
+      y: a.point.y + 0.5 * (b.point.y - a.point.y),
+    },
+    flags: b.flags,
+  }
+}
+
+fn at(points: &[Point<f32>], flags: &[PointFlags], index: usize) -> ContourPoint {
+  return ContourPoint { point: points[index], flags: flags[index] }
+}
+
+pub fn outlineToPath<S: PathSink>(
+  points: &[Point<f32>],
+  flags: &[PointFlags],
+  contours: &[u16],
+  start: PathContourStart,
+  sink: &mut S,
+) -> bool {
+  if points.length != flags.length {
+    return false
+  }
+  let mut base: usize = 0
+  let mut i: usize = 0
+  while i < contours.length {
+    let end = u16.toUsize(contours[i])
+    if end < base || end >= points.length {
+      return false
+    }
+    if !walkContour(points, flags, base, end - base + 1, start, &mut sink) {
+      return false
+    }
+    base = end + 1
+    i = i + 1
+  }
+  return true
+}
+
+fn walkContour<S: PathSink>(
+  points: &[Point<f32>],
+  flags: &[PointFlags],
+  offset: usize,
+  length: usize,
+  start: PathContourStart,
+  sink: &mut S,
+) -> bool {
+  if length == 0 {
+    return true
+  }
+  let first = at(points, flags, offset)
+  let mut startPoint = first
+  let mut base: usize = 1
+  let mut count = length - 1
+  if !PointFlags.isOnCurve(first.flags) {
+    if PointFlags.isOffCurveCubic(first.flags) {
+      let last = at(points, flags, offset + length - 1)
+      base = 0
+      if PointFlags.isOnCurve(last.flags) {
+        startPoint = last
+      } else if PointFlags.isOffCurveCubic(last.flags) {
+        startPoint = midpoint(last, first)
+        count = length
+      } else {
+        return false
+      }
+    } else if start == PathContourStart.ScanBackward {
+      let last = at(points, flags, offset + length - 1)
+      base = 0
+      if PointFlags.isOnCurve(last.flags) {
+        startPoint = last
+      } else if PointFlags.isOffCurveQuad(last.flags) {
+        startPoint = midpoint(last, first)
+        count = length
+      } else {
+        return false
+      }
+    } else {
+      if length < 2 {
+        return true
+      }
+      let second = at(points, flags, offset + 1)
+      count = length
+      if PointFlags.isOnCurve(second.flags) {
+        startPoint = second
+        base = 2
+      } else if PointFlags.isOffCurveQuad(second.flags) {
+        startPoint = midpoint(first, second)
+        base = 1
+      } else {
+        return false
+      }
+    }
+  }
+  PathSink.moveTo(&mut sink, startPoint.point.x, startPoint.point.y)
+  let mut state = PendingState.Empty
+  let mut index = base
+  let mut i: usize = 0
+  while i < count {
+    if index >= length {
+      index = index - length
+    }
+    if !PendingState.emit(&mut state, at(points, flags, offset + index), &mut sink) {
+      return false
+    }
+    index = index + 1
+    i = i + 1
+  }
+  if !PendingState.isEmpty(state) {
+    startPoint.flags = PointFlags.onCurve()
+    if !PendingState.emit(&mut state, startPoint, &mut sink) {
+      return false
+    }
+  }
+  PathSink.close(&mut sink)
+  return true
+}
+
+union PendingState {
+  Empty,
+  Quad { value: ContourPoint },
+  Cubic { value: ContourPoint },
+  TwoCubics { first: ContourPoint, second: ContourPoint },
+}
+
+impl Copy for PendingState {}
+
+impl PendingState {
+  fn isEmpty(self: Self) -> bool {
+    return match self {
+      PendingState.Empty => true
+      _ => false
+    }
+  }
+
+  fn emit<S: PathSink>(self: &mut Self, point: ContourPoint, sink: &mut S) -> bool {
+    let p = point.point
+    match &self.* {
+      PendingState.Empty => {
+        if PointFlags.isOffCurveQuad(point.flags) {
+          self.* = PendingState.Quad { value: point }
+        } else if PointFlags.isOffCurveCubic(point.flags) {
+          self.* = PendingState.Cubic { value: point }
+        } else {
+          PathSink.lineTo(&mut sink, p.x, p.y)
+        }
+      }
+      PendingState.Quad { value } => {
+        if PointFlags.isOffCurveCubic(point.flags) {
+          return false
+        }
+        let c = value.point
+        if PointFlags.isOffCurveQuad(point.flags) {
+          let end = midpoint(value, point).point
+          PathSink.quadTo(&mut sink, c.x, c.y, end.x, end.y)
+          self.* = PendingState.Quad { value: point }
+        } else {
+          PathSink.quadTo(&mut sink, c.x, c.y, p.x, p.y)
+          self.* = PendingState.Empty
+        }
+      }
+      PendingState.Cubic { value } => {
+        if !PointFlags.isOffCurveCubic(point.flags) {
+          return false
+        }
+        self.* = PendingState.TwoCubics { first: value, second: point }
+      }
+      PendingState.TwoCubics { first, second } => {
+        if PointFlags.isOffCurveQuad(point.flags) {
+          return false
+        }
+        let c0 = first.point
+        let c1 = second.point
+        if PointFlags.isOffCurveCubic(point.flags) {
+          let end = midpoint(second, point).point
+          PathSink.curveTo(&mut sink, c0.x, c0.y, c1.x, c1.y, end.x, end.y)
+          self.* = PendingState.Cubic { value: point }
+        } else {
+          PathSink.curveTo(&mut sink, c0.x, c0.y, c1.x, c1.y, p.x, p.y)
+          self.* = PendingState.Empty
+        }
+      }
+    }
+    return true
+  }
+}
+
+// Upstream tables/glyf/outline/path.rs tests, recording the same commands in
+// fixed buffers. The metric path uses f32; the 26.6 examples convert exactly.
+import silk.testing.testing { Testing, AssertionError }
+import silk.collections.slice { Slice }
+import model.glyph.outline { NullSink }
+
+struct Spec {
+  point: Point<f32>,
+  kind: u8,
+}
+
+impl Copy for Spec {}
+
+fn p(x: f32, y: f32, kind: u8) -> Spec {
+  return Spec { point: Point<f32> { x: x, y: y }, kind: kind }
+}
+
+struct Command {
+  kind: u8,
+  values: [f32; 6],
+}
+
+impl Copy for Command {}
+
+fn m(x: f32, y: f32) -> Command {
+  return Command { kind: 0, values: [x, y, 0.0, 0.0, 0.0, 0.0] }
+}
+
+fn l(x: f32, y: f32) -> Command {
+  return Command { kind: 1, values: [x, y, 0.0, 0.0, 0.0, 0.0] }
+}
+
+fn q(cx: f32, cy: f32, x: f32, y: f32) -> Command {
+  return Command { kind: 2, values: [cx, cy, x, y, 0.0, 0.0] }
+}
+
+fn c(x0: f32, y0: f32, x1: f32, y1: f32, x: f32, y: f32) -> Command {
+  return Command { kind: 3, values: [x0, y0, x1, y1, x, y] }
+}
+
+fn z() -> Command {
+  return Command { kind: 4, values: [0.0; 6] }
+}
+
+struct Trace<'a> {
+  expected: &'a [Command],
+  count: usize,
+  valid: bool,
+}
+
+impl<'a> Trace<'a> {
+  fn accept(self: &mut Self, command: Command) {
+    if self.count >= self.expected.length {
+      self.valid = false
+      return
+    }
+    let wanted = self.expected[self.count]
+    if command.kind != wanted.kind {
+      self.valid = false
+    }
+    let mut i: usize = 0
+    while i < 6 {
+      if command.values[i] != wanted.values[i] {
+        self.valid = false
+      }
+      i = i + 1
+    }
+    self.count = self.count + 1
+  }
+}
+
+impl<'a> PathSink for Trace<'a> {
+  fn moveTo(self: &mut Self, x: f32, y: f32) {
+    Trace.accept(&mut self, m(x, y))
+  }
+
+  fn lineTo(self: &mut Self, x: f32, y: f32) {
+    Trace.accept(&mut self, l(x, y))
+  }
+
+  fn quadTo(self: &mut Self, cx: f32, cy: f32, x: f32, y: f32) {
+    Trace.accept(&mut self, q(cx, cy, x, y))
+  }
+
+  fn curveTo(self: &mut Self, x0: f32, y0: f32, x1: f32, y1: f32, x: f32, y: f32) {
+    Trace.accept(&mut self, c(x0, y0, x1, y1, x, y))
+  }
+
+  fn close(self: &mut Self) {
+    Trace.accept(&mut self, z())
+  }
+}
+
+fn draw<S: PathSink>(spec: &[Spec], ends: &[u16], start: PathContourStart, sink: &mut S) -> bool {
+  if spec.length > 16 {
+    return false
+  }
+  let mut points = [Point<f32> { x: 0.0, y: 0.0 }; 16]
+  let mut flags = [PointFlags.onCurve(); 16]
+  let mut i: usize = 0
+  while i < spec.length {
+    points[i] = spec[i].point
+    if spec[i].kind == 1 {
+      flags[i] = PointFlags.offCurveQuad()
+    } else if spec[i].kind == 2 {
+      flags[i] = PointFlags.offCurveCubic()
+    }
+    i = i + 1
+  }
+  return outlineToPath(
+    Slice.view<Point<f32>>(&points, 0, spec.length),
+    Slice.view<PointFlags>(&flags, 0, spec.length),
+    ends,
+    start,
+    &mut sink,
+  )
+}
+
+fn same(spec: &[Spec], ends: &[u16], start: PathContourStart, expected: &[Command]) -> bool {
+  let mut sink = Trace { expected: expected, count: 0, valid: true }
+  let valid = draw(spec, ends, start, &mut sink)
+  return valid && sink.valid && sink.count == expected.length
+}
+
+fn offCurve(start: PathContourStart, allOff: bool, expected: &[Command]) -> bool {
+  let mut kind: u8 = 1
+  if !allOff {
+    kind = 0
+  }
+  return same(
+    &[p(10.0, 2.0, 1), p(4.0, 1.0, kind), p(10.0, 1.0, 1), p(2.0, 2.0, 1)],
+    &[3],
+    start,
+    expected,
+  )
+}
+
+test effect fn aContourOfOffCurvePointsStartsBetweenItsEndsScanningBackward() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    offCurve(
+      PathContourStart.ScanBackward,
+      true,
+      &[
+        m(6.0, 2.0),
+        q(10.0, 2.0, 7.0, 1.5),
+        q(4.0, 1.0, 7.0, 1.0),
+        q(10.0, 1.0, 6.0, 1.5),
+        q(2.0, 2.0, 6.0, 2.0),
+        z(),
+      ],
+    ),
+    "backward off-curve path",
+  )
+}
+
+test effect fn aContourOfOffCurvePointsStartsBetweenItsEndsScanningForward() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    offCurve(
+      PathContourStart.ScanForward,
+      true,
+      &[
+        m(7.0, 1.5),
+        q(4.0, 1.0, 7.0, 1.0),
+        q(10.0, 1.0, 6.0, 1.5),
+        q(2.0, 2.0, 6.0, 2.0),
+        q(10.0, 2.0, 7.0, 1.5),
+        z(),
+      ],
+    ),
+    "forward off-curve path",
+  )
+}
+
+test effect fn aContourBeginningOffCurveScansBackwardToAnOnCurvePoint() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    offCurve(
+      PathContourStart.ScanBackward,
+      false,
+      &[m(6.0, 2.0), q(10.0, 2.0, 4.0, 1.0), q(10.0, 1.0, 6.0, 1.5), q(2.0, 2.0, 6.0, 2.0), z()],
+    ),
+    "backward mixed path",
+  )
+}
+
+test effect fn aContourBeginningOffCurveScansForwardToAnOnCurvePoint() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    offCurve(
+      PathContourStart.ScanForward,
+      false,
+      &[m(4.0, 1.0), q(10.0, 1.0, 6.0, 1.5), q(2.0, 2.0, 6.0, 2.0), q(10.0, 2.0, 4.0, 1.0), z()],
+    ),
+    "forward mixed path",
+  )
+}
+
+test effect fn aContourOfOnCurvePointsIsARunOfLines() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    same(
+      &[p(0.0, 0.0, 0), p(8.0, 0.0, 0), p(8.0, 8.0, 0)],
+      &[2],
+      PathContourStart.ScanBackward,
+      &[m(0.0, 0.0), l(8.0, 0.0), l(8.0, 8.0), z()],
+    ),
+    "on-curve lines",
+  )
+}
+
+test effect fn aContourBeginningOffCurveStartsWhereTheCallerAsks() -> ()
+  ! AssertionError<'static> {
+  let points = [p(0.0, 0.0, 1), p(8.0, 0.0, 0), p(8.0, 8.0, 0)]
+  run Testing.expect(
+    same(&points, &[2], PathContourStart.ScanBackward, &[m(8.0, 8.0), q(0.0, 0.0, 8.0, 0.0), z()]),
+    "backward begins at last point",
+  )
+  run Testing.expect(
+    same(
+      &points,
+      &[2],
+      PathContourStart.ScanForward,
+      &[m(8.0, 0.0), l(8.0, 8.0), q(0.0, 0.0, 8.0, 0.0), z()],
+    ),
+    "forward begins at second point",
+  )
+}
+
+test effect fn twoContoursAreDrawnInTurn() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    same(
+      &[p(0.0, 0.0, 0), p(4.0, 0.0, 0), p(8.0, 8.0, 0), p(9.0, 9.0, 0)],
+      &[1, 3],
+      PathContourStart.ScanBackward,
+      &[m(0.0, 0.0), l(4.0, 0.0), z(), m(8.0, 8.0), l(9.0, 9.0), z()],
+    ),
+    "two independent contours",
+  )
+}
+
+test effect fn pointsThatDoNotDescribeAPathAreRefused() -> ()
+  ! AssertionError<'static> {
+  let mut sink = NullSink {}
+  run Testing.expect(
+    !draw(
+      &[p(0.0, 0.0, 0), p(4.0, 4.0, 2), p(8.0, 0.0, 0)],
+      &[2],
+      PathContourStart.ScanBackward,
+      &mut sink,
+    ),
+    "cubic needs two controls",
+  )
+  run Testing.expect(
+    !draw(&[p(0.0, 0.0, 0), p(8.0, 0.0, 0)], &[7], PathContourStart.ScanBackward, &mut sink),
+    "contour end stays within points",
+  )
+}
+
+test effect fn aFlagPerPointIsRequired() -> ()
+  ! AssertionError<'static> {
+  let mut sink = NullSink {}
+  let points = [Point<f32> { x: 0.0, y: 0.0 }, Point<f32> { x: 8.0, y: 0.0 }]
+  run Testing.expect(
+    !outlineToPath(
+      &points,
+      &[PointFlags.onCurve()],
+      &[1],
+      PathContourStart.ScanBackward,
+      &mut sink,
+    ),
+    "flags and points have equal lengths",
+  )
+}
+
+test effect fn cubicContoursCanStartWithControls() -> ()
+  ! AssertionError<'static> {
+  let starts = [PathContourStart.ScanBackward, PathContourStart.ScanForward]
+  let mut i: usize = 0
+  while i < 2 {
+    run Testing.expect(
+      same(
+        &[p(0.0, 0.0, 2), p(80.0, 0.0, 2), p(80.0, 80.0, 0)],
+        &[2],
+        starts[i],
+        &[m(80.0, 80.0), c(0.0, 0.0, 80.0, 0.0, 80.0, 80.0), z()],
+      ),
+      "cubic control start",
+    )
+    run Testing.expect(
+      same(
+        &[p(0.0, 0.0, 2), p(80.0, 0.0, 2), p(80.0, 80.0, 2), p(0.0, 80.0, 2)],
+        &[3],
+        starts[i],
+        &[
+          m(0.0, 40.0),
+          c(0.0, 0.0, 80.0, 0.0, 80.0, 40.0),
+          c(80.0, 80.0, 0.0, 80.0, 0.0, 40.0),
+          z(),
+        ],
+      ),
+      "all cubic controls",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn cubicFlagOnOnCurvePointsIsAllowed() -> ()
+  ! AssertionError<'static> {
+  let points = [
+    Point<f32> { x: 0.0, y: 0.0 },
+    Point<f32> { x: 10.0, y: 0.0 },
+    Point<f32> { x: 10.0, y: 10.0 },
+  ]
+  let mut flags = [PointFlags.fromBits(129), PointFlags.fromBits(129), PointFlags.onCurve()]
+  let expected = [m(0.0, 0.0), l(10.0, 0.0), l(10.0, 10.0), z()]
+  let mut sink = Trace { expected: &expected, count: 0, valid: true }
+  run Testing.expect(!PointFlags.isOffCurve(flags[0]), "on-curve flag takes precedence")
+  run Testing.expect(
+    outlineToPath(&points, &flags, &[2], PathContourStart.ScanBackward, &mut sink) && sink.valid
+      && sink.count == 4,
+    "cubic flag does not change on-curve path",
+  )
+  PointFlags.flipOnCurve(&mut flags[0])
+  run Testing.expect(PointFlags.isOffCurveCubic(flags[0]), "flipping on-curve exposes cubic flag")
+}
+
+test effect fn invalidCubicRunsAreRefused() -> ()
+  ! AssertionError<'static> {
+  let cases: [&[u8]; 5] = [b"ccc", b"cnc", b"ccqn", b"qccn", b"ccnc"]
+  let starts = [PathContourStart.ScanBackward, PathContourStart.ScanForward]
+  let mut i: usize = 0
+  while i < 5 {
+    let kinds = cases[i]
+    let mut points = [p(0.0, 0.0, 0); 8]
+    let mut j: usize = 0
+    while j < kinds.length {
+      let mut kind: u8 = 0
+      if kinds[j] == 99 {
+        kind = 2
+      } else if kinds[j] == 113 {
+        kind = 1
+      }
+      points[j] = p(0.0, 0.0, kind)
+      j = j + 1
+    }
+    j = 0
+    while j < 2 {
+      let mut sink = NullSink {}
+      run Testing.expect(
+        !draw(
+          Slice.view<Spec>(&points, 0, kinds.length),
+          &[usize.toU16(kinds.length - 1)],
+          starts[j],
+          &mut sink,
+        ),
+        "invalid cubic sequence",
+      )
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+import silk.num.usize

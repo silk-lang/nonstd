@@ -1,0 +1,372 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! The bitmap source subset used by glyph metrics: select one strike, then measure.
+import model.optional { Maybe }
+import model.glyph { GlyphSource }
+import model.metrics.extents { GlyphExtents }
+import table_provider { TableProvider }
+import font_data { FontData }
+import read { ReadError }
+import array { ComputedArray, ScalarArray }
+import offset_array { ArrayOfOffsets }
+import tables.sbix { Sbix, Strike, GlyphData }
+import tables.cblc { Cblc }
+import tables.cbdt { Cbdt }
+import tables.eblc { Eblc }
+import tables.ebdt { Ebdt }
+import tables.bitmap {
+  BitmapSize,
+  BitmapLocation,
+  BitmapData,
+  BitmapMetrics,
+  BitmapContent,
+  BitmapDataFormat,
+  SmallGlyphMetrics,
+  BigGlyphMetrics
+}
+import font_types.lib { GlyphId, Offset32, Tag, F48Dot16 }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i8
+import silk.num.i16
+import silk.num.i32
+import silk.num.f32
+
+pub struct BitmapSources<'a> {
+  sbix: Maybe<Sbix<'a>>,
+  cblc: Maybe<Cblc<'a>>,
+  cbdt: Maybe<Cbdt<'a>>,
+  eblc: Maybe<Eblc<'a>>,
+  ebdt: Maybe<Ebdt<'a>>,
+}
+
+impl<'a> Copy for BitmapSources<'a> {}
+
+impl<'a> BitmapSources<'a> {
+  pub fn empty() -> Self {
+    return Self {
+      sbix: Maybe<Sbix<'a>>.None,
+      cblc: Maybe<Cblc<'a>>.None,
+      cbdt: Maybe<Cbdt<'a>>.None,
+      eblc: Maybe<Eblc<'a>>.None,
+      ebdt: Maybe<Ebdt<'a>>.None,
+    }
+  }
+
+  pub fn new<P: TableProvider<'a>>(provider: &P) -> Self {
+    return Self {
+      sbix: Maybe<Sbix<'a>>.fromResult(TableProvider.sbix(provider)),
+      cblc: Maybe<Cblc<'a>>.fromResult(TableProvider.cblc(provider)),
+      cbdt: Maybe<Cbdt<'a>>.fromResult(TableProvider.cbdt(provider)),
+      eblc: Maybe<Eblc<'a>>.fromResult(TableProvider.eblc(provider)),
+      ebdt: Maybe<Ebdt<'a>>.fromResult(TableProvider.ebdt(provider)),
+    }
+  }
+
+  pub fn available(self: &Self, source: GlyphSource) -> bool {
+    if source == GlyphSource.Sbix {
+      if let Maybe<Sbix<'a>>.Some { value } = self.sbix {
+        return ArrayOfOffsets<'a, u32, Strike<'a>, Offset32>.len(&Sbix.strikes(&value)) != 0
+      }
+    }
+    if source == GlyphSource.Cbdt && Maybe<Cbdt<'a>>.present(&self.cbdt) {
+      if let Maybe<Cblc<'a>>.Some { value } = self.cblc {
+        return ComputedArray<'a, (), BitmapSize<'a>>.len(&Cblc.bitmapSizes(&value)) != 0
+      }
+    }
+    if source == GlyphSource.Ebdt && Maybe<Ebdt<'a>>.present(&self.ebdt) {
+      if let Maybe<Eblc<'a>>.Some { value } = self.eblc {
+        return ComputedArray<'a, (), BitmapSize<'a>>.len(&Eblc.bitmapSizes(&value)) != 0
+      }
+    }
+    return false
+  }
+
+  pub fn extents(
+    self: &Self,
+    source: GlyphSource,
+    ppem: Maybe<f32>,
+    glyph: GlyphId,
+    upem: u16,
+  ) -> Option<GlyphExtents<F48Dot16>> {
+    if source == GlyphSource.Sbix {
+      if let Maybe<Sbix<'a>>.Some { value: table } = self.sbix {
+        let strikes = Sbix.strikes(&table)
+        let mut best = Maybe<Strike<'a>>.None
+        let mut i: usize = 0
+        while i < ArrayOfOffsets<'a, u32, Strike<'a>, Offset32>.len(&strikes) {
+          if let Result<Strike<'a>, ReadError>.Success { value: strike } = move ArrayOfOffsets<
+            'a,
+            u32,
+            Strike<'a>,
+            Offset32
+          >.get(&strikes, i) {
+            let mut replace = true
+            if let Maybe<Strike<'a>>.Some { value } = best {
+              replace = closer(ppem, Strike.ppem(&strike), Strike.ppem(&value))
+            }
+            if replace {
+              best = Maybe<Strike<'a>>.Some { value: strike }
+            }
+          }
+          i = i + 1
+        }
+        if let Maybe<Strike<'a>>.Some { value } = best {
+          return sbixExtents(&value, glyph, upem)
+        }
+      }
+    }
+    if source == GlyphSource.Cbdt {
+      if let Maybe<Cblc<'a>>.Some { value: locations } = self.cblc {
+        if let Maybe<Cbdt<'a>>.Some { value: images } = self.cbdt {
+          if let Maybe<BitmapSize<'a>>.Some { value: size } = selectSize(
+            Cblc.bitmapSizes(&locations),
+            ppem,
+          ) {
+            if BitmapSize.ppemX(&size) == 0 || BitmapSize.ppemY(&size) == 0 {
+              return Option<GlyphExtents<F48Dot16>>.None
+            }
+            if let Result<BitmapLocation<'a>, ReadError>.Success {
+              value: location
+            } = move BitmapSize.location(&size, Cblc.offsetData(&locations), glyph) {
+              if let Result<BitmapData<'a>, ReadError>.Success { value: data } = move Cbdt.data(
+                &images,
+                &location,
+              ) {
+                return bdtExtents(&size, data, upem)
+              }
+            }
+          }
+        }
+      }
+    }
+    if source == GlyphSource.Ebdt {
+      if let Maybe<Eblc<'a>>.Some { value: locations } = self.eblc {
+        if let Maybe<Ebdt<'a>>.Some { value: images } = self.ebdt {
+          if let Maybe<BitmapSize<'a>>.Some { value: size } = selectSize(
+            Eblc.bitmapSizes(&locations),
+            ppem,
+          ) {
+            if BitmapSize.ppemX(&size) == 0 || BitmapSize.ppemY(&size) == 0 {
+              return Option<GlyphExtents<F48Dot16>>.None
+            }
+            if let Result<BitmapLocation<'a>, ReadError>.Success {
+              value: location
+            } = move BitmapSize.location(&size, Eblc.offsetData(&locations), glyph) {
+              if let Result<BitmapData<'a>, ReadError>.Success { value: data } = move Ebdt.data(
+                &images,
+                &location,
+              ) {
+                return bdtExtents(&size, data, upem)
+              }
+            }
+          }
+        }
+      }
+    }
+    return Option<GlyphExtents<F48Dot16>>.None
+  }
+}
+
+fn closer(ppem: Maybe<f32>, candidate: u16, best: u16) -> bool {
+  let mut requested = f32.INFINITY
+  if let Maybe<f32>.Some { value } = ppem {
+    if value > 0.0 {
+      requested = value
+    }
+  }
+  let c = u16.toF32(candidate)
+  let b = u16.toF32(best)
+  return (requested <= c && c < b) || (requested > b && c > b)
+}
+
+fn sizePpem(size: &BitmapSize) -> u16 {
+  let x = BitmapSize.ppemX(size)
+  let y = BitmapSize.ppemY(size)
+  if x > y {
+    return u8.toU16(x)
+  }
+  return u8.toU16(y)
+}
+
+fn selectSize<'a>(sizes: ComputedArray<'a, (), BitmapSize<'a>>, ppem: Maybe<f32>) -> Maybe<
+  BitmapSize<'a>
+> {
+  let mut best = Maybe<BitmapSize<'a>>.None
+  let mut i: usize = 0
+  while i < ComputedArray<'a, (), BitmapSize<'a>>.len(&sizes) {
+    if let Result<BitmapSize<'a>, ReadError>.Success { value: size } = move ComputedArray<
+      'a,
+      (),
+      BitmapSize<'a>
+    >.get(&sizes, i) {
+      let mut replace = true
+      if let Maybe<BitmapSize<'a>>.Some { value } = best {
+        replace = closer(ppem, sizePpem(&size), sizePpem(&value))
+      }
+      if replace {
+        best = Maybe<BitmapSize<'a>>.Some { value: size }
+      }
+    }
+    i = i + 1
+  }
+  return best
+}
+
+fn scalePixel(value: i32, upem: u16, ppem: u16) -> F48Dot16 {
+  return F48Dot16.fromF64(
+    f32.toF64(f32.round(i32.toF32(value) * u16.toF32(upem) / u16.toF32(ppem))),
+  )
+}
+
+fn extents(
+  x: i32,
+  y: i32,
+  width: i32,
+  height: i32,
+  upem: u16,
+  ppemX: u16,
+  ppemY: u16,
+) -> GlyphExtents<F48Dot16> {
+  return GlyphExtents<F48Dot16> {
+    xBearing: scalePixel(x, upem, ppemX),
+    yBearing: scalePixel(y, upem, ppemY),
+    width: scalePixel(width, upem, ppemX),
+    height: scalePixel(height, upem, ppemY),
+  }
+}
+
+fn sbixExtents<'a>(strike: &Strike<'a>, glyph: GlyphId, upem: u16) -> Option<
+  GlyphExtents<F48Dot16>
+> {
+  let ppem = Strike.ppem(strike)
+  if ppem == 0 {
+    return Option<GlyphExtents<F48Dot16>>.None
+  }
+  let mut gid = glyph
+  let mut depth: usize = 0
+  while depth <= 8 {
+    let entry = match move Strike.glyphData(strike, gid) {
+      Result<Option<GlyphData<'a>>, ReadError>.Success { value: option } => match move option {
+        Option<GlyphData<'a>>.Some { value } => value
+        _ => {
+          return Option<GlyphExtents<F48Dot16>>.None
+        }
+      }
+      _ => {
+        return Option<GlyphExtents<F48Dot16>>.None
+      }
+    }
+    let tag = Tag.toU32(GlyphData.graphicType(&entry))
+    let bytes = ScalarArray<'a, u8>.offsetData(&GlyphData.data(&entry))
+    if tag == 1685418085 {
+      let next = match move FontData<'a>.readAt<u16>(&bytes, 0) {
+        Result<u16, ReadError>.Success { value } => value
+        _ => {
+          return Option<GlyphExtents<F48Dot16>>.None
+        }
+      }
+      gid = GlyphId.new(u16.toU32(next))
+    } else if tag == 1886283552 {
+      let signature = b"\x89PNG\x0d\x0a\x1a\x0a"
+      let raw = FontData.asBytes(&bytes)
+      if raw.length < 24 {
+        return Option<GlyphExtents<F48Dot16>>.None
+      }
+      let mut i: usize = 0
+      while i < 8 {
+        if raw[i] != signature[i] {
+          return Option<GlyphExtents<F48Dot16>>.None
+        }
+        i = i + 1
+      }
+      let width = FontData<'a>.readAt<u32>(&bytes, 16) |> Result<u32, ReadError>.unwrapOr(65536)
+      let height = FontData<'a>.readAt<u32>(&bytes, 20) |> Result<u32, ReadError>.unwrapOr(65536)
+      if width >= 65536 || height >= 65536 {
+        return Option<GlyphExtents<F48Dot16>>.None
+      }
+      return Option<GlyphExtents<F48Dot16>>.some(
+        extents(
+          i16.toI32(GlyphData.originOffsetX(&entry)),
+          i16.toI32(GlyphData.originOffsetY(&entry)) + u32.toI32(height),
+          u32.toI32(width),
+          u32.toI32(height),
+          upem,
+          ppem,
+          ppem,
+        ),
+      )
+    } else {
+      return Option<GlyphExtents<F48Dot16>>.None
+    }
+    depth = depth + 1
+  }
+  return Option<GlyphExtents<F48Dot16>>.None
+}
+
+fn bdtExtents<'a>(size: &BitmapSize<'a>, data: BitmapData<'a>, upem: u16) -> Option<
+  GlyphExtents<F48Dot16>
+> {
+  let mut x: i32 = 0
+  let mut y: i32 = 0
+  let mut width: u8 = 0
+  let mut height: u8 = 0
+  match data.metrics {
+    BitmapMetrics<'a>.Small { value } => {
+      x = i8.toI32(SmallGlyphMetrics.bearingX(&value))
+      y = i8.toI32(SmallGlyphMetrics.bearingY(&value))
+      width = SmallGlyphMetrics.width(&value)
+      height = SmallGlyphMetrics.height(&value)
+    }
+    BitmapMetrics<'a>.Big { value } => {
+      x = i8.toI32(BigGlyphMetrics.horiBearingX(&value))
+      y = i8.toI32(BigGlyphMetrics.horiBearingY(&value))
+      width = BigGlyphMetrics.width(&value)
+      height = BigGlyphMetrics.height(&value)
+    }
+  }
+  let depth = BitmapSize.bitDepth(size)
+  match data.content {
+    BitmapContent<'a>.Composite { value } => {
+      return Option<GlyphExtents<F48Dot16>>.None
+    }
+    BitmapContent<'a>.Data { format, bytes } => {
+      if format == BitmapDataFormat.Png {
+        if depth != 32 {
+          return Option<GlyphExtents<F48Dot16>>.None
+        }
+      } else {
+        let mut length: usize = 0
+        if depth == 32 && format == BitmapDataFormat.ByteAligned {
+          length = u8.toUsize(width) * u8.toUsize(height) * 4
+        } else if depth == 1 || depth == 2 || depth == 4 || depth == 8 {
+          let rowBits = u8.toUsize(width) * u8.toUsize(depth)
+          if format == BitmapDataFormat.BitAligned {
+            length = (rowBits * u8.toUsize(height) + 7) / 8
+          } else {
+            length = ((rowBits + 7) / 8) * u8.toUsize(height)
+          }
+        } else {
+          return Option<GlyphExtents<F48Dot16>>.None
+        }
+        if bytes.length < length {
+          return Option<GlyphExtents<F48Dot16>>.None
+        }
+      }
+    }
+  }
+  return Option<GlyphExtents<F48Dot16>>.some(
+    extents(
+      x,
+      y,
+      u8.toI32(width),
+      u8.toI32(height),
+      upem,
+      u8.toU16(BitmapSize.ppemX(size)),
+      u8.toU16(BitmapSize.ppemY(size)),
+    ),
+  )
+}

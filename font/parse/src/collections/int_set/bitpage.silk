@@ -1,0 +1,487 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// Fixed 512-bit pages backing the ordered sparse integer set.
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.equal { Equal }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+pub const PAGE_BITS: u32 = 512
+
+pub struct U32Range {
+  pub first: u32,
+  pub last: u32,
+}
+
+impl Copy for U32Range {}
+
+// font/docs/stdlib-gaps.md 004: this release has no population/leading/trailing bit counts.
+pub fn countOnes(value: u64) -> u32 {
+  let a = value - ((u64.shiftRight(value, 1)) & 0x5555555555555555)
+  let b = (a & 0x3333333333333333) + ((u64.shiftRight(a, 2)) & 0x3333333333333333)
+  let c = (b + u64.shiftRight(b, 4)) & 0x0f0f0f0f0f0f0f0f
+  return u64.toU32(u64.shiftRight(u64.wrappingMultiply(c, 0x0101010101010101), 56))
+}
+
+pub fn trailingZeros(value: u64) -> u32 {
+  if value == 0 {
+    return 64
+  }
+  let mut bits = value
+  let mut n: u32 = 0
+  if bits & 0xffffffff == 0 {
+    n = n + 32
+    bits = u64.shiftRight(bits, 32)
+  }
+  if bits & 0xffff == 0 {
+    n = n + 16
+    bits = u64.shiftRight(bits, 16)
+  }
+  if bits & 0xff == 0 {
+    n = n + 8
+    bits = u64.shiftRight(bits, 8)
+  }
+  if bits & 0xf == 0 {
+    n = n + 4
+    bits = u64.shiftRight(bits, 4)
+  }
+  if bits & 3 == 0 {
+    n = n + 2
+    bits = u64.shiftRight(bits, 2)
+  }
+  if bits & 1 == 0 {
+    n = n + 1
+  }
+  return n
+}
+
+pub fn leadingZeros(value: u64) -> u32 {
+  if value == 0 {
+    return 64
+  }
+  let mut bits = value
+  let mut n: u32 = 0
+  if u64.shiftRight(bits, 32) == 0 {
+    n = n + 32
+    bits = u64.shiftLeft(bits, 32)
+  }
+  if u64.shiftRight(bits, 48) == 0 {
+    n = n + 16
+    bits = u64.shiftLeft(bits, 16)
+  }
+  if u64.shiftRight(bits, 56) == 0 {
+    n = n + 8
+    bits = u64.shiftLeft(bits, 8)
+  }
+  if u64.shiftRight(bits, 60) == 0 {
+    n = n + 4
+    bits = u64.shiftLeft(bits, 4)
+  }
+  if u64.shiftRight(bits, 62) == 0 {
+    n = n + 2
+    bits = u64.shiftLeft(bits, 2)
+  }
+  if u64.shiftRight(bits, 63) == 0 {
+    n = n + 1
+  }
+  return n
+}
+
+fn mask(value: u32) -> u64 {
+  return u64.shiftLeft(1, u32.toU64(value & 63))
+}
+
+fn elementIndex(value: u32) -> usize {
+  return u32.toUsize((value & 511) / 64)
+}
+
+pub struct BitPage {
+  storage: [u64; 8],
+  length: u32,
+}
+
+impl Copy for BitPage {}
+
+impl BitPage {
+  pub fn newZeroes() -> Self {
+    return Self { storage: [0; 8], length: 0 }
+  }
+
+  pub fn default() -> Self {
+    return BitPage.newZeroes()
+  }
+
+  pub fn newOnes() -> Self {
+    return Self { storage: [u64.MAX; 8], length: 512 }
+  }
+
+  pub fn len(self: &Self) -> u32 {
+    return self.length
+  }
+
+  pub fn isEmpty(self: &Self) -> bool {
+    return self.length == 0
+  }
+
+  pub fn recomputeLength(self: &mut Self) -> () {
+    let mut length: u32 = 0
+    let mut i: usize = 0
+    while i < 8 {
+      length = length + countOnes(self.storage[i])
+      i = i + 1
+    }
+    self.length = length
+  }
+
+  pub fn contains(self: &Self, value: u32) -> bool {
+    return self.storage[elementIndex(value)] & mask(value) != 0
+  }
+
+  pub fn insert(self: &mut Self, value: u32) -> bool {
+    let i = elementIndex(value)
+    let bit = mask(value)
+    let added = self.storage[i] & bit == 0
+    self.storage[i] = self.storage[i] | bit
+    if added {
+      self.length = self.length + 1
+    }
+    return added
+  }
+
+  pub fn remove(self: &mut Self, value: u32) -> bool {
+    let present = BitPage.contains(&self, value)
+    let i = elementIndex(value)
+    self.storage[i] = self.storage[i] & u64.bitNot(mask(value))
+    if present {
+      self.length = self.length - 1
+    }
+    return present
+  }
+
+  pub fn insertRange(self: &mut Self, first: u32, last: u32) -> () {
+    BitPage.changeRange(&mut self, first, last, true)
+  }
+
+  pub fn removeRange(self: &mut Self, first: u32, last: u32) -> () {
+    BitPage.changeRange(&mut self, first, last, false)
+  }
+
+  fn changeRange(self: &mut Self, first: u32, last: u32, include: bool) -> () {
+    let begin = first & 511
+    let end = last & 511
+    let mut i = begin / 64
+    let finalIndex = end / 64
+    while i <= finalIndex {
+      let mut low: u32 = 0
+      if begin > i * 64 {
+        low = begin - i * 64
+      }
+      let mut high: u32 = 63
+      if end < (i + 1) * 64 - 1 {
+        high = end - i * 64
+      }
+
+      // Reversed ranges in one word have an empty mask, as in the original.
+      let mut bits: u64 = 0
+      if low <= high {
+        bits = u64.shiftRight(
+          u64.shiftLeft(u64.MAX, u32.toU64(low + 63 - high)),
+          u32.toU64(63 - high),
+        )
+      }
+      let at = u32.toUsize(i)
+      if include {
+        self.storage[at] = self.storage[at] | bits
+      } else {
+        self.storage[at] = self.storage[at] & u64.bitNot(bits)
+      }
+      i = i + 1
+    }
+    BitPage.recomputeLength(&mut self)
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.storage = [0; 8]
+    self.length = 0
+  }
+
+  pub fn firstFrom(self: &Self, value: u32) -> Option<u32> {
+    return BitPage.firstBitFrom(self, value, false)
+  }
+
+  pub fn firstAbsentFrom(self: &Self, value: u32) -> Option<u32> {
+    return BitPage.firstBitFrom(self, value, true)
+  }
+
+  fn firstBitFrom(self: &Self, value: u32, invert: bool) -> Option<u32> {
+    let mut i = elementIndex(value)
+    let mut keep = u64.shiftLeft(u64.MAX, u32.toU64(value & 63))
+    while i < 8 {
+      let mut bits = self.storage[i]
+      if invert {
+        bits = u64.bitNot(bits)
+      }
+      bits = bits & keep
+      if bits != 0 {
+        return Option<u32>.some(usize.toU32(i) * 64 + trailingZeros(bits))
+      }
+      keep = u64.MAX
+      i = i + 1
+    }
+    return Option<u32>.None
+  }
+
+  pub fn lastFrom(self: &Self, value: u32) -> Option<u32> {
+    return BitPage.lastBitFrom(self, value, false)
+  }
+
+  pub fn lastAbsentFrom(self: &Self, value: u32) -> Option<u32> {
+    return BitPage.lastBitFrom(self, value, true)
+  }
+
+  fn lastBitFrom(self: &Self, value: u32, invert: bool) -> Option<u32> {
+    let mut i = elementIndex(value) + 1
+    let mut keep = u64.shiftRight(u64.MAX, u32.toU64(63 - (value & 63)))
+    while i > 0 {
+      i = i - 1
+      let mut bits = self.storage[i]
+      if invert {
+        bits = u64.bitNot(bits)
+      }
+      bits = bits & keep
+      if bits != 0 {
+        return Option<u32>.some(usize.toU32(i) * 64 + 63 - leadingZeros(bits))
+      }
+      keep = u64.MAX
+    }
+    return Option<u32>.None
+  }
+
+  pub fn intersectsSet(self: &Self, other: &Self) -> bool {
+    let mut i: usize = 0
+    while i < 8 {
+      if self.storage[i] & other.storage[i] != 0 {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn isSubset(self: &Self, other: &Self) -> bool {
+    if self.length > other.length {
+      return false
+    }
+    let mut i: usize = 0
+    while i < 8 {
+      if self.storage[i] & other.storage[i] != self.storage[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  pub fn intersectionLen(self: &Self, other: &Self) -> u32 {
+    let mut n: u32 = 0
+    let mut i: usize = 0
+    while i < 8 {
+      n = n + countOnes(self.storage[i] & other.storage[i])
+      i = i + 1
+    }
+    return n
+  }
+
+  pub fn unionValue(a: &Self, b: &Self) -> Self {
+    return BitPage.combine(a, b, 0)
+  }
+
+  pub fn intersect(a: &Self, b: &Self) -> Self {
+    return BitPage.combine(a, b, 1)
+  }
+
+  pub fn subtract(a: &Self, b: &Self) -> Self {
+    return BitPage.combine(a, b, 2)
+  }
+
+  fn combine(a: &Self, b: &Self, operation: u8) -> Self {
+    let mut result = BitPage.newZeroes()
+    let mut i: usize = 0
+    while i < 8 {
+      if operation == 0 {
+        result.storage[i] = a.storage[i] | b.storage[i]
+      } else if operation == 1 {
+        result.storage[i] = a.storage[i] & b.storage[i]
+      } else {
+        result.storage[i] = a.storage[i] & u64.bitNot(b.storage[i])
+      }
+      i = i + 1
+    }
+    BitPage.recomputeLength(&mut result)
+    return result
+  }
+
+  pub fn equals(a: &Self, b: &Self) -> bool {
+    let mut i: usize = 0
+    while i < 8 {
+      if a.storage[i] != b.storage[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  pub fn hash(self: &Self, seed: &HashSeed) -> u64 {
+    let mut result = Hash.mix(seed, self.storage[0])
+    let mut i: usize = 1
+    while i < 8 {
+      result = Hash.combine(result, self.storage[i])
+      i = i + 1
+    }
+    return result
+  }
+
+  pub fn iter<'a>(self: &'a Self) -> PageIter<'a> {
+    return BitPage.iterFrom(self, 0)
+  }
+
+  pub fn iterFrom<'a>(self: &'a Self, value: u32) -> PageIter<'a> {
+    return PageIter<'a> { page: self, front: value & 511, end: 512 }
+  }
+
+  pub fn iterRanges<'a>(self: &'a Self) -> RangeIter<'a> {
+    return RangeIter<'a> { page: self, nextValue: 0 }
+  }
+}
+
+impl Equal for BitPage {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return BitPage.equals(a, b)
+  }
+}
+
+impl HashKey for BitPage {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return BitPage.equals(a, b)
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    return BitPage.hash(value, seed)
+  }
+}
+
+pub struct PageIter<'a> {
+  page: &'a BitPage,
+  front: u32,
+  end: u32,
+}
+
+impl<'a> PageIter<'a> {
+  pub fn next(self: &mut Self) -> Option<u32> {
+    if self.front >= self.end {
+      return Option<u32>.None
+    }
+    let value = match move BitPage.firstFrom(self.page, self.front) {
+      Option<u32>.Some { value } => value
+      _ => {
+        self.front = self.end
+        return Option<u32>.None
+      }
+    }
+    if value >= self.end {
+      self.front = self.end
+      return Option<u32>.None
+    }
+    self.front = value + 1
+    return Option<u32>.some(value)
+  }
+
+  pub fn nextBack(self: &mut Self) -> Option<u32> {
+    if self.front >= self.end {
+      return Option<u32>.None
+    }
+    let value = match move BitPage.lastFrom(self.page, self.end - 1) {
+      Option<u32>.Some { value } => value
+      _ => {
+        self.end = self.front
+        return Option<u32>.None
+      }
+    }
+    if value < self.front {
+      self.end = self.front
+      return Option<u32>.None
+    }
+    self.end = value
+    return Option<u32>.some(value)
+  }
+}
+
+pub struct RangeIter<'a> {
+  page: &'a BitPage,
+  nextValue: u32,
+}
+
+impl<'a> RangeIter<'a> {
+  pub fn next(self: &mut Self) -> Option<U32Range> {
+    if self.nextValue >= 512 {
+      return Option<U32Range>.None
+    }
+    let first = match move BitPage.firstFrom(self.page, self.nextValue) {
+      Option<u32>.Some { value } => value
+      _ => {
+        self.nextValue = 512
+        return Option<U32Range>.None
+      }
+    }
+    let end = BitPage.firstAbsentFrom(self.page, first) |> Option<u32>.unwrapOr(512)
+    self.nextValue = end
+    return Option<U32Range>.some(U32Range { first: first, last: end - 1 })
+  }
+}
+
+pub struct BitIter {
+  bits: u64,
+  front: u32,
+  end: u32,
+}
+
+impl BitIter {
+  pub fn new(bits: u64) -> Self {
+    return Self { bits: bits, front: 0, end: 64 }
+  }
+
+  pub fn from(bits: u64, index: u32) -> Self {
+    return Self { bits: bits, front: index, end: 64 }
+  }
+
+  pub fn next(self: &mut Self) -> Option<u32> {
+    if self.front >= self.end {
+      return Option<u32>.None
+    }
+    let n = trailingZeros(self.bits & u64.shiftLeft(u64.MAX, u32.toU64(self.front)))
+    if n >= self.end {
+      return Option<u32>.None
+    }
+    self.front = n + 1
+    return Option<u32>.some(n)
+  }
+
+  pub fn nextBack(self: &mut Self) -> Option<u32> {
+    if self.front >= self.end {
+      return Option<u32>.None
+    }
+    let bits = self.bits & u64.shiftRight(u64.MAX, u32.toU64(64 - self.end))
+    if bits == 0 {
+      return Option<u32>.None
+    }
+    let n = 63 - leadingZeros(bits)
+    if n < self.front {
+      return Option<u32>.None
+    }
+    self.end = n
+    return Option<u32>.some(n)
+  }
+}

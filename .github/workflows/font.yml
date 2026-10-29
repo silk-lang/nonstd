@@ -1,0 +1,250 @@
+# Budget: 15 minutes wall clock per job, worst case, cold caches.
+# Slow differential checks against Rust read-fonts and harfrust run weekly (baseline jobs).
+name: font
+on:
+  pull_request:
+    paths:
+      - font/**
+      - text/ucd/**
+      - toolchains.lock.json
+      - scripts/install-*
+      - scripts/_install.py
+      - .github/actions/setup-silk/**
+      - .github/workflows/font.yml
+  push:
+    branches: [main]
+    paths:
+      - font/**
+      - text/ucd/**
+      - toolchains.lock.json
+      - .github/workflows/font.yml
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: font-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+env:
+  READ_FONTS_PROFILE: release
+jobs:
+  tests:
+    name: font-types and font-parse tests
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-silk
+      - run: silk test --manifest-path font/types/silk.toml --root src/tests.silk
+      - run: silk test --manifest-path font/parse/silk.toml --root src/tests.silk
+
+  codegen:
+    name: Generated code, formatting and tools
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-silk
+      - uses: actions/cache@v4
+        with:
+          path: |
+            css/style/.cache/encodings
+            images/svg/.cache/idna
+          key: svg-generated-inputs-${{ hashFiles('css/style/encodings.lock.json', 'images/svg/idna.lock.json') }}
+      - name: Hydrate pinned SVG generation inputs
+        run: |
+          images/svg/scripts/generate-encodings --fetch
+          images/svg/scripts/generate-idna --fetch
+      - name: Generated and formatted files are committed
+        run: font/scripts/generate --check
+      - name: Codegen tool
+        run: |
+          cargo fmt --manifest-path font/parse/tools/font-codegen-silk/Cargo.toml --check
+          cargo clippy --locked --manifest-path font/parse/tools/font-codegen-silk/Cargo.toml --target-dir build/codegen --all-targets -- -D warnings
+          cargo test --locked --manifest-path font/parse/tools/font-codegen-silk/Cargo.toml --target-dir build/codegen
+      - name: Script tests
+        run: python3 -m unittest discover -s font/scripts/tests
+
+  robustness:
+    name: Corpus and corrupted fonts
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-silk
+      - name: Build release font_dump
+        run: silk build --release --manifest-path font/parse/dump/silk.toml
+      - name: CLI
+        run: |
+          build/llvm/x86_64-unknown-linux-gnu/release/font_dump --help
+          build/llvm/x86_64-unknown-linux-gnu/release/font_dump --version
+      - name: Every corpus font and 4 corrupted variants of each dump cleanly
+        run: font/scripts/check-robustness --mutations-per-font 4
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robustness-failures
+          path: build/robustness-failures/
+          if-no-files-found: ignore
+
+  shaping:
+    name: Native Silk shaping
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-silk
+      - name: Library unit tests
+        run: rm -rf build/llvm build/cache && silk test --release --manifest-path font/shape/silk.toml --root src/tests.silk
+      - name: Build the shaping runner once
+        run: rm -rf build/llvm build/cache && silk build --release --manifest-path font/shape/cli/silk.toml
+      - name: Pinned shaping cases
+        run: build/llvm/x86_64-unknown-linux-gnu/release/hr_shape --suite font/shape/tests/shaping.bin
+      - name: Long-input regressions
+        run: build/llvm/x86_64-unknown-linux-gnu/release/hr_shape --regressions
+      - name: Tracing integration
+        run: font/scripts/check-shaping-trace
+      - name: Malformed input smoke checks
+        run: font/scripts/check-shaping-malformed
+      - name: Upload failing shaping inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaping-failures
+          path: build/shaping-malformed-failures/
+          if-no-files-found: ignore
+
+  wasm:
+    name: WebAssembly shaping
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-silk
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: font/shape/wasm/js/package-lock.json
+      - name: Build hr_wasm for wasm32
+        run: |
+          PATH="$(dirname "$SILK_CLANG"):$PATH"
+          command -v wasm-ld || { sudo apt-get update && sudo apt-get install -y lld; }
+          font/scripts/build-wasm
+      - name: JS wrapper matches native shaping
+        working-directory: font/shape/wasm/js
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+
+  baseline-parse:
+    name: Rust read-fonts differential baseline
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-silk
+      - name: Build release dumpers
+        run: font/scripts/build --release
+      - name: Rust reference dumper
+        run: |
+          cargo fmt --manifest-path font/scripts/rust-font-dump/Cargo.toml --check
+          cargo clippy --locked --manifest-path font/scripts/rust-font-dump/Cargo.toml --target-dir build/rust --all-targets -- -D warnings
+          cargo test --locked --manifest-path font/scripts/rust-font-dump/Cargo.toml --target-dir build/rust
+      - name: Reference corpus
+        run: |
+          font/scripts/font-list --output build/fonts.txt --report build/corpus-inventory.json
+          font/scripts/verify-reference --timeout 600 --report build/reference-report.json
+      - name: Corpus dumps
+        if: ${{ !cancelled() }}
+        run: font/scripts/compare --timeout 600 --report build/parity-report.json
+      - name: Fixtures
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          font/scripts/check-core-fixtures || status=1
+          for kind in table layout variation aat cff model misc-table; do
+            font/scripts/check-$kind-fixtures --report build/$kind-fixtures-report.json || status=1
+          done
+          exit $status
+      - name: Malformed corpus
+        if: ${{ !cancelled() }}
+        run: font/scripts/check-malformed --report build/malformed-report.json.gz
+      - name: Speed
+        if: ${{ !cancelled() }}
+        run: font/scripts/benchmark --report build/benchmark-report.json
+      - name: Library speed
+        if: ${{ !cancelled() }}
+        run: font/scripts/bench-library
+      - name: Upload reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-reports
+          path: |
+            build/*.json
+            build/*.json.gz
+            build/malformed-failures/
+          if-no-files-found: ignore
+
+  baseline-shape:
+    name: Rust harfrust differential and performance baseline
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-silk
+      - run: silk build --release --manifest-path font/shape/cli/silk.toml
+      - run: cargo build --locked --release --manifest-path font/scripts/rust-hr-shape/Cargo.toml --target-dir build/harfrust-rust
+      - name: Rust shaping harness
+        run: |
+          cargo fmt --manifest-path font/scripts/rust-hr-shape/Cargo.toml --check
+          cargo clippy --locked --manifest-path font/scripts/rust-hr-shape/Cargo.toml --target-dir build/harfrust-rust --all-targets -- -D warnings
+      - name: Shaping comparisons
+        run: font/scripts/compare-shaping | tee build/shaping-comparison.txt
+      - name: Corrupted shaping corpus
+        if: ${{ !cancelled() }}
+        run: font/scripts/check-shaping-malformed --all-fonts --mutations-per-font 16 | tee build/shaping-malformed.txt
+      - name: Pinned workloads and checksums
+        if: ${{ !cancelled() }}
+        run: font/scripts/bench-shaping | tee build/shaping-benchmark.txt
+      - name: Upload shaping results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaping-baseline
+          path: |
+            build/shaping-*.txt
+            build/shaping-malformed-failures/
+          if-no-files-found: ignore

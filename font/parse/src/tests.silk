@@ -1,0 +1,588 @@
+// Core regression tests, including ports from read-fonts src/{lib,array,read,font_data}.rs.
+import lib {
+  FontData,
+  Cursor,
+  FontRef,
+  FileRef,
+  CollectionRef,
+  TableDirectory,
+  TableRecords,
+  ReadError,
+  ScalarArray,
+  FontRead,
+  FontReadAt,
+  ComputeSize,
+  VarSize,
+  VarLenArray,
+  VarLenIter,
+  ComputedArray,
+  totalLenForCount,
+  resolve,
+  resolveNullableWithArgs,
+  CheckedOffset
+}
+import array { representableLen }
+import font_types.lib { Tag, Offset16, Nullable, writeScalar }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.testing.testing { Testing, AssertionError }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+effect fn must<T>(result: Result<T, ReadError>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    Result<T, ReadError>.Failure { error } => {
+      run Testing.expect(false, "read succeeds")
+      return Intrinsic.trap("unreachable after test failure")
+    }
+  }
+}
+
+fn isOob<T>(result: Result<T, ReadError>) -> bool {
+  return match move result {
+    Result<T, ReadError>.Success { value } => false
+    Result<T, ReadError>.Failure { error } => match error {
+      ReadError.OutOfBounds => true
+      _ => false
+    }
+  }
+}
+
+fn put32(bytes: &mut [u8], index: usize, value: u32) -> () {
+  bytes[index] = u32.toU8(u32.shiftRight(value, 24))
+  bytes[index + 1] = u32.toU8(u32.shiftRight(value, 16) & 255)
+  bytes[index + 2] = u32.toU8(u32.shiftRight(value, 8) & 255)
+  bytes[index + 3] = u32.toU8(value & 255)
+}
+
+fn sfnt() -> [u8; 12] {
+  return [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn ttc() -> [u8; 44] {
+  let mut bytes: [u8; 44] = [0; 44]
+  put32(&mut bytes, 0, 1953784678)
+  put32(&mut bytes, 4, 65536)
+  put32(&mut bytes, 8, 2)
+  put32(&mut bytes, 12, 20)
+  put32(&mut bytes, 16, 32)
+  put32(&mut bytes, 20, 65536)
+  put32(&mut bytes, 32, 65536)
+  return bytes
+}
+
+test effect fn fileRefNonCollection() -> ()
+  ! AssertionError<'static> {
+  let data = sfnt()
+  let file = run must(FileRef.new(&data))
+  let isFont = match file {
+    FileRef.Font { font } => true
+    _ => false
+  }
+  run Testing.expect(isFont, "single sfnt file")
+}
+
+test effect fn fileRefCollection() -> ()
+  ! AssertionError<'static> {
+  let data = ttc()
+  let file = run must(FileRef.new(&data))
+  let count = match file {
+    FileRef.Collection { collection } => CollectionRef.len(&collection)
+    _ => 0
+  }
+  run Testing.expect(count == 2, "two-face collection")
+}
+
+test effect fn extendedTtcDirectoryListTakesPrecedence() -> ()
+  ! AssertionError<'static> {
+  let mut major: u32 = 1
+  while major <= 2 {
+    let mut legacy: u32 = 0
+    while legacy <= 1 {
+      let mut bytes: [u8; 72] = [0; 72]
+      let mut extended: usize = 12 + u32.toUsize(legacy) * 4
+      if major == 2 {
+        extended = extended + 12
+      }
+      let first = extended + 12
+      let second = first + 12
+      put32(&mut bytes, 0, 1953784678)
+      put32(&mut bytes, 4, u32.shiftLeft(major, 16) | 1)
+      put32(&mut bytes, 8, legacy)
+      if legacy != 0 {
+        put32(&mut bytes, 12, usize.toU32(first))
+      }
+      if major == 2 {
+        put32(&mut bytes, extended - 12, 1146308935)
+        put32(&mut bytes, extended - 8, 8)
+        put32(&mut bytes, extended - 4, usize.toU32(second + 12))
+      }
+      put32(&mut bytes, extended, 2)
+      put32(&mut bytes, extended + 4, usize.toU32(second))
+      put32(&mut bytes, extended + 8, usize.toU32(first))
+      put32(&mut bytes, first, 65536)
+      put32(&mut bytes, second, 1330926671)
+      let collection = run must(CollectionRef.new(&bytes))
+      run Testing.expect(CollectionRef.len(&collection) == 2, "extended count takes precedence")
+      let a = run must(CollectionRef.get(&collection, 0))
+      let b = run must(CollectionRef.get(&collection, 1))
+      run Testing.expect(
+        TableDirectory.sfntVersion(FontRef.tableDirectory(&a)) == 1330926671,
+        "extended order first",
+      )
+      run Testing.expect(
+        TableDirectory.sfntVersion(FontRef.tableDirectory(&b)) == 65536,
+        "extended order second",
+      )
+      legacy = legacy + 1
+    }
+    major = major + 1
+  }
+}
+
+test effect fn ttcIndex() -> ()
+  ! AssertionError<'static> {
+  let data = ttc()
+  let a = run must(FontRef.fromIndex(&data, 0))
+  let b = run must(FontRef.fromIndex(&data, 1))
+  run Testing.expect((FontRef.ttcIndex(&a) |> Option<u32>.unwrapOr(99)) == 0, "first ttc index")
+  run Testing.expect((FontRef.ttcIndex(&b) |> Option<u32>.unwrapOr(99)) == 1, "second ttc index")
+  let single = sfnt()
+  let font = run must(FontRef.new(&single))
+  run Testing.expect(
+    (FontRef.ttcIndex(&font) |> Option<u32>.unwrapOr(99)) == 99,
+    "single has no ttc index",
+  )
+}
+
+test effect fn unsortedTableDirectory() -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 80] = [0; 80]
+  put32(&mut bytes, 0, 65536)
+  bytes[5] = 4
+  let tags: [u32; 4] = [1886352244, 1196445523, 1195656518, 1128678962]
+  let mut i: usize = 0
+  while i < 4 {
+    put32(&mut bytes, 12 + 16 * i, tags[i])
+    put32(&mut bytes, 20 + 16 * i, usize.toU32(76 + i))
+    put32(&mut bytes, 24 + 16 * i, 1)
+    i = i + 1
+  }
+  let font = run must(FontRef.new(&bytes))
+  i = 0
+  while i < 4 {
+    let found = FontRef.tableData(&font, Tag.fromU32(tags[i]))
+    let size = match move found {
+      Option<FontData>.Some { value } => FontData.len(&value)
+      Option<FontData>.None => 0
+    }
+    run Testing.expect(size == 1, "unsorted table is found")
+    i = i + 1
+  }
+}
+
+test effect fn directoryTruncationAndNullOffsets() -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 28] = [0; 28]
+  put32(&mut bytes, 0, 65536)
+  bytes[5] = 1
+  put32(&mut bytes, 12, 1751474532)
+  let font = run must(FontRef.new(&bytes))
+  let missing = match move FontRef.tableData(&font, Tag.fromU32(1751474532)) {
+    Option<FontData>.None => true
+    _ => false
+  }
+  run Testing.expect(missing, "zero table offset is null")
+  let data = FontData.new(&bytes)
+  let short = FontData.slice(&data, 0, 20) |> Option<FontData>.unwrapOr(FontData.new(b""))
+  let truncated = run must(FontRef.new(FontData.asBytes(&short)))
+  let records = TableDirectory.tableRecords(FontRef.tableDirectory(&truncated))
+  run Testing.expect(TableRecords.len(&records) == 0, "truncated records lazily default empty")
+}
+
+test effect fn fontDataBoundsAndArrayErrors() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x00\x01\x00\x02")
+  run Testing.expect(
+    isOob(FontData<'static>.readAt<u32>(&data, usize.MAX)),
+    "overflowing scalar offset",
+  )
+  run Testing.expect(isOob(FontData<'static>.readAt<u32>(&data, 1)), "truncated scalar")
+  let array = run must(FontData<'static>.readArray<u16>(&data, 0, 4))
+  run Testing.expect(ScalarArray<u16>.len(&array) == 2, "two borrowed scalars")
+  run Testing.expect(
+    (ScalarArray<u16>.get(&array, 1) |> Option<u16>.unwrapOr(0)) == 2,
+    "array lazy decode",
+  )
+  let invalid = FontData<'static>.readArray<u16>(&data, 0, 3)
+  let isInvalid = match move invalid {
+    Result<ScalarArray<u16>, ReadError>.Failure { error } => match error {
+      ReadError.InvalidArrayLen => true
+      _ => false
+    }
+    _ => false
+  }
+  run Testing.expect(isInvalid, "in-bounds invalid array length")
+  run Testing.expect(
+    isOob(FontData<'static>.readArray<u16>(&data, 0, 5)),
+    "bounds checked before array length",
+  )
+}
+
+test effect fn cursorAdvancesOnFailureAndVarints() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x7f\x80\x01\xc0\x01\x02\xe0\x01\x02\x03\xf0\xff\xff\xff\xff")
+  let mut cursor = FontData.cursor(&data)
+  let expected: [u32; 5] = [127, 1, 258, 66051, 4294967295]
+  let mut i: usize = 0
+  while i < expected.length {
+    let value = run must(Cursor.readU32Var(&mut cursor))
+    run Testing.expect(value == expected[i], "u32 variable-length encoding")
+    i = i + 1
+  }
+  run Testing.expect(isOob(Cursor<'static>.read<u16>(&mut cursor)), "cursor past end fails")
+  run Testing.expect(cursor.pos == 17, "failed read still advances")
+  Cursor.advanceBy(&mut cursor, usize.MAX)
+  run Testing.expect(cursor.pos == usize.MAX, "cursor advance saturates")
+}
+
+test effect fn representableLenBound() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(representableLen(0, 4, 10) == 10, "ordinary bound")
+  run Testing.expect(representableLen(100, 4, 10) == 10, "nonzero start")
+  run Testing.expect(representableLen(usize.MAX, 0, 10) == 10, "zero stride")
+  run Testing.expect(representableLen(0, 1, usize.MAX) == usize.MAX, "exact maximum")
+  run Testing.expect(representableLen(2, 1, usize.MAX) == usize.MAX - 2, "offset limits count")
+  run Testing.expect(representableLen(usize.MAX, 1, 5) == 0, "no representable next offset")
+  let starts: [usize; 5] = [0, 100, usize.MAX, usize.MAX - 8, usize.MAX / 2]
+  let widths: [usize; 5] = [4, 4, 1, 4, 3]
+  let counts: [usize; 5] = [10, 10, 5, 100, usize.MAX]
+  let mut i: usize = 0
+  while i < 5 {
+    let bounded = representableLen(starts[i], widths[i], counts[i])
+    run Testing.expect(bounded <= counts[i], "bound never grows")
+    let valid = usize.checkedAdd(starts[i], bounded * widths[i])
+    let fits = match move valid {
+      Option<usize>.Some { value } => true
+      _ => false
+    }
+    run Testing.expect(fits, "one-past offset fits")
+    i = i + 1
+  }
+}
+
+struct DummyVarSize {}
+
+impl VarSize for DummyVarSize {
+  fn readLenAt<'a>(data: FontData<'a>, position: usize) -> Option<usize> {
+    return match move FontData<'a>.readAt<u16>(&data, position) {
+      Result<u16, ReadError>.Success { value } => Option<usize>.some(u16.toUsize(value))
+      _ => Option<usize>.None
+    }
+  }
+}
+
+test effect fn totalVarSizeWithZeroLengthElement() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x00\x02\x00\x04\x00\x01\x00\x00\x00\x14")
+  let length = run must(totalLenForCount<DummyVarSize>(data, usize.MAX))
+  run Testing.expect(length == 6, "zero item terminates huge count")
+}
+
+struct VarLenItem<'a> {
+  bytes: FontData<'a>,
+}
+
+impl<'a> FontRead<'a, ()> for VarLenItem<'a> {
+  fn readWithArgs(data: FontData<'a>, args: ()) -> Result<Self, ReadError> {
+    if FontData.len(&data) < 4 {
+      return Result<Self, ReadError>.failResult(ReadError.OutOfBounds)
+    }
+    return Result<Self, ReadError>.succeed(Self { bytes: data })
+  }
+}
+
+impl<'a> VarSize for VarLenItem<'a> {
+  fn readLenAt<'b>(data: FontData<'b>, position: usize) -> Option<usize> {
+    return match move FontData<'b>.readAt<u32>(&data, position) {
+      Result<u32, ReadError>.Success { value } => Option<usize>.some(u32.toUsize(value))
+      _ => Option<usize>.None
+    }
+  }
+}
+
+test effect fn varLenIterWithZeroLengthItem() -> ()
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 30] = [0; 30]
+  put32(&mut bytes, 0, 8)
+  put32(&mut bytes, 8, 18)
+  run checkVarLenZero(&bytes)
+}
+
+effect fn checkVarLenZero<'a>(bytes: &'a [u8]) -> ()
+  ! AssertionError<'static> {
+  let array = run must(VarLenArray<'a, VarLenItem<'a>>.read(FontData.new(bytes)))
+  let mut iter = VarLenArray<'a, VarLenItem<'a>>.iter(&array)
+  let mut count: usize = 0
+  while count < 10 {
+    let next = VarLenIter<'a, VarLenItem<'a>>.next(&mut iter)
+    if let Option<Result<VarLenItem<'a>, ReadError>>.None = move next {
+      break
+    }
+    count = count + 1
+  }
+  run Testing.expect(count == 2, "zero item does not loop")
+}
+
+test effect fn varLenIterSameAsGet() -> ()
+  ! AssertionError<'static> {
+  // Preserve upstream's original fixture, whose second length exceeds the data.
+  let original = b"\x00\x00\x00\x04\x01\x02\x03\x04\x00\x00\x00\x02\x05\x06\x00\x00\x00\x03\x07\x08\x09"
+  run checkVarLenGet(original, 1)
+  let bytes = b"\x00\x00\x00\x08\x01\x02\x03\x04\x00\x00\x00\x06\x05\x06\x00\x00\x00\x07\x07\x08\x09"
+  run checkVarLenGet(bytes, 3)
+}
+
+effect fn checkVarLenGet<'a>(bytes: &'a [u8], expected: usize) -> ()
+  ! AssertionError<'static> {
+  let array = run must(VarLenArray<'a, VarLenItem<'a>>.read(FontData.new(bytes)))
+  let mut iter = VarLenArray<'a, VarLenItem<'a>>.iter(&array)
+  let mut i: usize = 0
+  while i < expected {
+    let next = VarLenIter<'a, VarLenItem<'a>>.next(&mut iter)
+    let indexed = VarLenArray<'a, VarLenItem<'a>>.get(&array, i)
+    if let Option<Result<VarLenItem<'a>, ReadError>>.Some { value: nextResult } = move next {
+      if let Option<Result<VarLenItem<'a>, ReadError>>.Some { value: indexResult } = move indexed {
+        let a = run must(move nextResult)
+        let b = run must(move indexResult)
+        let left = FontData.asBytes(&a.bytes)
+        let right = FontData.asBytes(&b.bytes)
+        run Testing.expect(left.length == right.length, "same item size")
+        let mut j: usize = 0
+        while j < left.length {
+          run Testing.expect(left[j] == right[j], "same item bytes")
+          j = j + 1
+        }
+      } else {
+        run Testing.expect(false, "indexed item exists")
+      }
+    } else {
+      run Testing.expect(false, "iterated item exists")
+    }
+    i = i + 1
+  }
+  let ended = match move VarLenIter<'a, VarLenItem<'a>>.next(&mut iter) {
+    Option<Result<VarLenItem<'a>, ReadError>>.None => true
+    _ => false
+  }
+  run Testing.expect(ended, "iterator stops after expected items")
+}
+
+test effect fn resolveOffsets() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x00\x01\x02")
+  let resolved = run must(resolve<FontData<'static>, Offset16>(Offset16.new(1), data))
+  run Testing.expect(
+    FontData.len(&resolved) == 2 && FontData.asBytes(&resolved)[0] == 1,
+    "offset resolves suffix",
+  )
+  let null = resolve<FontData<'static>, Offset16>(Offset16.new(0), data)
+  let isNull = match move null {
+    Result<FontData, ReadError>.Failure { error } => match error {
+      ReadError.NullOffset => true
+      _ => false
+    }
+    _ => false
+  }
+  run Testing.expect(isNull, "required null offset errors")
+  let offset = Nullable<Offset16>.new(Offset16.new(0))
+  let optional = resolveNullableWithArgs<(), FontData<'static>, Offset16>(&offset, data, ())
+  let absent = match move optional {
+    Option<Result<FontData, ReadError>>.None => true
+    _ => false
+  }
+  run Testing.expect(absent, "nullable offset absent")
+  run Testing.expect(
+    isOob(resolve<FontData<'static>, Offset16>(Offset16.new(4), data)),
+    "nonzero invalid offset errors",
+  )
+}
+
+import lib { FontIter }
+
+test effect fn fontRefFontsIter() -> ()
+  ! AssertionError<'static> {
+  let data = ttc()
+  let mut iter = FontRef.fonts(&data)
+  let mut count: usize = 0
+  while count < 3 {
+    if let Option<Result<FontRef, ReadError>>.Some { value } = move FontIter.next(&mut iter) {
+      drop run must(move value)
+      count = count + 1
+    } else {
+      break
+    }
+  }
+  run Testing.expect(count == 2, "iterates two collection faces")
+  let mut bad = FontRef.fonts(b"invalid")
+  let empty = match move FontIter.next(&mut bad) {
+    Option<Result<FontRef, ReadError>>.None => true
+    _ => false
+  }
+  run Testing.expect(empty, "invalid data has no font iterator items")
+}
+
+test effect fn howDoesBigEndianWorkAgain() -> ()
+  ! AssertionError<'static> {
+  let u16Data = FontData.defaultFormat1U16TableData()
+  let u8Data = FontData.defaultFormat1U8TableData()
+  run Testing.expect(
+    (run must(FontData<'static>.readAt<u16>(&u16Data, 0))) == 1,
+    "u16 format one default",
+  )
+  run Testing.expect(
+    (run must(FontData<'static>.readAt<u8>(&u8Data, 0))) == 1,
+    "u8 format one default",
+  )
+}
+
+import lib { ComputedIter }
+
+struct Positioned<'a> {
+  enclosing: FontData<'a>,
+  position: usize,
+}
+
+impl<'a> ComputeSize<usize> for Positioned<'a> {
+  fn computeSize(args: usize) -> Result<usize, ReadError> {
+    return Result<usize, ReadError>.succeed(args)
+  }
+}
+
+impl<'a> FontReadAt<'a, usize> for Positioned<'a> {
+  fn readAt(data: FontData<'a>, offset: usize, args: usize) -> Result<Self, ReadError> {
+    return Result<Self, ReadError>.succeed(Self { enclosing: data, position: offset })
+  }
+}
+
+test effect fn computedArrayPreservesEnclosingData() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x12\x34\x00\x00\x00\x00\x00")
+  let array = run must(ComputedArray<'static, usize, Positioned<'static>>.new(data, 2, 7, 2))
+  run Testing.expect(
+    ComputedArray<'static, usize, Positioned<'static>>.len(&array) == 2,
+    "partial trailing item excluded",
+  )
+  let second = run must(ComputedArray<'static, usize, Positioned<'static>>.get(&array, 1))
+  run Testing.expect(second.position == 4, "item position in enclosing data")
+  run Testing.expect(
+    (run must(FontData<'static>.readAt<u16>(&second.enclosing, 0))) == 4660,
+    "item retains enclosing offset base",
+  )
+  let mut iter = ComputedArray<'static, usize, Positioned<'static>>.iter(&array)
+  let mut count: usize = 0
+  while count < 3 {
+    if let Option<Result<Positioned<'static>, ReadError>>.Some { value } = move ComputedIter<
+      'static,
+      usize,
+      Positioned<'static>
+    >.next(&mut iter) {
+      drop run must(move value)
+      count = count + 1
+    } else {
+      break
+    }
+  }
+  run Testing.expect(count == 2, "computed iterator length")
+  run Testing.expect(
+    isOob(ComputedArray<'static, usize, Positioned<'static>>.get(&array, usize.MAX)),
+    "huge computed index fails",
+  )
+  let zero = run must(ComputedArray<'static, usize, Positioned<'static>>.new(data, 0, 7, 0))
+  run Testing.expect(
+    ComputedArray<'static, usize, Positioned<'static>>.isEmpty(&zero),
+    "zero stride creates empty array",
+  )
+}
+
+test effect fn cursorComputedReadsAndCheckedOffsets() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x00\x01\x00\x02")
+  let mut cursor = FontData.cursor(&data)
+  let positioned = run must(
+    Cursor<'static>.readAtWithArgs<usize, Positioned<'static>>(&mut cursor, 2),
+  )
+  run Testing.expect(positioned.position == 0 && cursor.pos == 2, "positioned cursor read advances")
+  let array = run must(
+    Cursor<'static>.readComputedArray<usize, Positioned<'static>>(&mut cursor, 1, 2),
+  )
+  run Testing.expect(
+    ComputedArray<'static, usize, Positioned<'static>>.len(&array) == 1 && cursor.pos == 4,
+    "computed cursor read advances",
+  )
+  run Testing.expect(
+    isOob(Cursor<'static>.readArray<u16>(&mut cursor, usize.MAX)),
+    "cursor product overflow",
+  )
+  let offset = CheckedOffset.mul(CheckedOffset.add(CheckedOffset.new(4), 6), 3)
+  run Testing.expect(
+    (CheckedOffset.get(&offset) |> Option<usize>.unwrapOr(0)) == 30,
+    "checked arithmetic chain",
+  )
+  run Testing.expect(
+    isOob(CheckedOffset.okOrOob(CheckedOffset.add(CheckedOffset.new(usize.MAX), 1))),
+    "checked arithmetic overflow",
+  )
+}
+
+import table_tests
+import name_tests
+import metric_tests
+import post_tests
+import cmap_tests
+import provider_tests
+import layout_spec_tests
+import condition_tests
+import lookup_variation_tests
+import variation_tests
+import axis_tests
+import selected_variation_tests
+import metric_variation_tests
+import packed_variation_tests
+import gvar_tests
+import glyf_tests
+import glyph_delta_tests
+import extended_provider_tests
+import aat_tests
+import aat_misc_tests
+import morx_tests
+import kerning_tests
+import cff_basic_tests
+import ps_numeric_tests
+import cff_stack_tests
+import cff_dict_tests
+import cff_font_tests
+import ps.charstring
+import collections.int_set.bitpage_tests
+import collections.int_set.bitset_tests
+import collections.int_set.intset_tests
+import collections.int_set.stream_tests
+import collections.int_set.sparse_tests
+import layout_set_tests
+import model_tables_tests
+import model_glyph_name_tests
+import model_charmap_tests
+import model_global_metrics_tests
+import model_metrics_tests
+import model_scaled_metrics_tests
+import model_glyph_source_tests
+import misc_table_tests
+import bitmap_tests
+import colr_tests
+import math_tests
+import model_extent_source_tests

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Outside-PR-CI full-domain UCD truth and preserved Harfrust-view comparison.
+
+Reads emitted packed byte tables, independently parses pinned UCD sources, then
+compares every code point with the pre-cutover Harfrust 1503ff0 source tables.
+No discrepancy is accepted except the exact documented shaping-policy sets.
+"""
+from array import array as integers
+from pathlib import Path
+import re
+import runpy
+import struct
+from shaping_unicode_helpers import SOURCE, array, numbers, script_tags
+
+ROOT = Path(__file__).resolve().parents[2]
+LIMIT = 0x110000
+CACHE = ROOT / "build/ucd/18.0.0"
+IGNORABLE_POLICY = {0x115f, 0x1160, 0x3164, 0xffa0, *range(0x1bca0, 0x1bca4)}
+SELECTOR_POLICY = {0x180b, 0x180c, 0x180d, 0x180f}
+
+
+def source_rows(name, missing=False):
+    for line in (CACHE / name).read_text().splitlines():
+        if missing:
+            if "@missing:" not in line:
+                continue
+            line = line.split("@missing:", 1)[1]
+        else:
+            line = line.split("#", 1)[0]
+        if line.strip():
+            yield [field.strip() for field in line.split(";")]
+
+
+def assign(target, span, value):
+    ends = span.split("..")
+    first, last = int(ends[0], 16), int(ends[-1], 16)
+    target[first:last + 1] = integers("I", [value]) * (last + 1 - first)
+
+
+def blob_tables():
+    source = (ROOT / "text/ucd/src/generated_unicode.silk").read_text()
+    blobs = {name: bytes.fromhex(literal.replace("\\x", "")) for name, literal in re.findall(r'pub fn (\w+)\(\) -> &\'static \[u8\] \{\s*return b"([^"]*)"', source)}
+    tables = {}
+    for name, end, default, shift, middle, widths in re.findall(r"// lookup (\w+) (\d+) (\d+) (\d+) (\d+) ([124,]+)", source):
+        widths = list(map(int, widths.split(",")))
+        stages = [list(struct.unpack(">" + {1: "B", 2: "H", 4: "I"}[width] * (len(blobs[name + str(i)]) // width), blobs[name + str(i)])) for i, width in enumerate(widths)]
+        end, default, shift, middle = map(int, (end, default, shift, middle))
+        result = integers("I", [default]) * LIMIT
+        for cp in range(end):
+            if middle:
+                block = stages[1][(stages[0][cp >> (shift + middle)] << middle) + ((cp >> shift) & ((1 << middle) - 1))]
+            else:
+                block = stages[0][cp >> shift]
+            result[cp] = stages[-1][(block << shift) + (cp & ((1 << shift) - 1))]
+        tables[name] = result
+    if len(tables) != 29:
+        raise SystemExit(f"expected all 29 property tables, found {len(tables)}")
+    return tables, blobs
+
+
+def normative_reference(blobs):
+    """Independent parser: never imports or calls the property generator."""
+    aliases = {}
+    for fields in source_rows("PropertyValueAliases.txt"):
+        aliases.setdefault(fields[0], []).append(fields[1:])
+    expected = {}
+    def prop(name, file, default, convert, selector=None):
+        values = integers("I", [convert(default)]) * LIMIT
+        if selector is None:
+            for fields in source_rows(file, True):
+                assign(values, fields[0], convert(fields[-1]))
+        for fields in source_rows(file):
+            if selector is None:
+                assign(values, fields[0], convert(fields[1]))
+            elif fields[1] == selector:
+                assign(values, fields[0], convert(fields[2] if len(fields) > 2 else "Y"))
+        expected[name] = values
+    categories = "Cc Cf Cn Co Cs Ll Lm Lo Lt Lu Mc Me Mn Nd Nl No Pc Pd Pe Pf Pi Po Ps Sc Sk Sm So Zl Zp Zs".split()
+    expected["generalCategory"] = integers("I", [2]) * LIMIT
+    expected["combiningClass"] = integers("I", [0]) * LIMIT
+    decomp, wide, vertical = {}, {}, {}
+    pending = None
+    for fields in source_rows("UnicodeData.txt"):
+        cp = int(fields[0], 16)
+        if fields[1].endswith(", First>"):
+            pending = fields[0]
+        else:
+            span = pending + ".." + fields[0] if fields[1].endswith(", Last>") else fields[0]
+            pending = None
+            assign(expected["generalCategory"], span, categories.index(fields[2]))
+            assign(expected["combiningClass"], span, int(fields[3]))
+        parts = fields[5].split()
+        if parts and not parts[0].startswith("<"):
+            decomp[cp] = tuple(int(v, 16) for v in parts) + (0,) * (2 - len(parts))
+        if len(parts) == 2 and parts[0] == "<vertical>":
+            vertical.setdefault(int(parts[1], 16), cp)
+        if len(parts) == 2 and parts[0] == "<wide>":
+            wide[int(parts[1], 16)] = cp
+    tags = {alias: int.from_bytes(fields[0].encode(), "big") for fields in aliases["sc"] for alias in fields}
+    prop("script", "Scripts.txt", "Zzzz", tags.__getitem__)
+    for name, alias, file, default in [
+        ("bidiClass", "bc", "extracted/DerivedBidiClass.txt", "L"),
+        ("joiningType", "jt", "extracted/DerivedJoiningType.txt", "U"),
+        ("joiningGroup", "jg", "extracted/DerivedJoiningGroup.txt", "No_Joining_Group"),
+        ("lineBreak", "lb", "LineBreak.txt", "XX"),
+        ("eastAsianWidth", "ea", "EastAsianWidth.txt", "N"),
+        ("graphemeBreak", "GCB", "auxiliary/GraphemeBreakProperty.txt", "Other"),
+        ("wordBreak", "WB", "auxiliary/WordBreakProperty.txt", "Other"),
+        ("sentenceBreak", "SB", "auxiliary/SentenceBreakProperty.txt", "Other"),
+        ("verticalOrientation", "vo", "VerticalOrientation.txt", "R"),
+    ]:
+        codes = {alias: i for i, fields in enumerate(aliases[alias]) for alias in fields}
+        prop(name, file, default, codes.__getitem__)
+    prop("indicConjunctBreak", "DerivedCoreProperties.txt", "None", ["None", "Consonant", "Extend", "Linker"].index, "InCB")
+    for name, file, property_name in [
+        ("isEmoji", "emoji/emoji-data.txt", "Emoji"),
+        ("isEmojiPresentation", "emoji/emoji-data.txt", "Emoji_Presentation"),
+        ("isEmojiModifier", "emoji/emoji-data.txt", "Emoji_Modifier"),
+        ("isEmojiModifierBase", "emoji/emoji-data.txt", "Emoji_Modifier_Base"),
+        ("isEmojiComponent", "emoji/emoji-data.txt", "Emoji_Component"),
+        ("isExtendedPictographic", "emoji/emoji-data.txt", "Extended_Pictographic"),
+        ("isRegionalIndicator", "PropList.txt", "Regional_Indicator"),
+        ("isVariationSelector", "PropList.txt", "Variation_Selector"),
+        ("isDefaultIgnorable", "DerivedCoreProperties.txt", "Default_Ignorable_Code_Point"),
+    ]:
+        prop(name, file, "N", lambda value: int(value == "Y"), property_name)
+    for name in ("mirrorDelta", "bracketDelta", "bidiPairedBracketType", "verticalDelta"):
+        expected[name] = integers("I", [0]) * LIMIT
+    for cp, other in source_rows("BidiMirroring.txt"):
+        expected["mirrorDelta"][int(cp, 16)] = (int(other, 16) - int(cp, 16)) & 0xffffffff
+    for cp, other, kind in source_rows("BidiBrackets.txt"):
+        expected["bracketDelta"][int(cp, 16)] = (int(other, 16) - int(cp, 16)) & 0xffffffff
+        expected["bidiPairedBracketType"][int(cp, 16)] = {"o": 1, "c": 2}[kind]
+    vertical = {wide.get(cp, cp): target for cp, target in vertical.items()}
+    vertical[0xfe4f] = 0xfe34
+    for cp, target in vertical.items():
+        expected["verticalDelta"][cp] = (target - cp) & 0xffffffff
+    excluded = set()
+    for span, *fields in source_rows("DerivedNormalizationProps.txt"):
+        if fields[0] == "Full_Composition_Exclusion":
+            ends = span.split("..")
+            excluded.update(range(int(ends[0], 16), int(ends[-1], 16) + 1))
+    compositions = {(a, b): cp for cp, (a, b) in decomp.items() if b and cp not in excluded}
+    expected["composesAsSecond"] = integers("I", [0]) * LIMIT
+    for a, b in compositions:
+        expected["composesAsSecond"][b] = 1
+    offsets = list(struct.unpack(">" + "I" * (len(blobs["scriptSetOffsets"]) // 4), blobs["scriptSetOffsets"]))
+    members = list(struct.unpack(">" + "I" * (len(blobs["scriptSetMembers"]) // 4), blobs["scriptSetMembers"]))
+    sets = [tuple(members[start:end]) for start, end in zip(offsets, offsets[1:])]
+    set_ids = {value: i for i, value in enumerate(sets)}
+    expected["scriptExtensions"] = integers("I", (set_ids[(script,)] for script in expected["script"]))
+    for span, scripts in source_rows("ScriptExtensions.txt"):
+        assign(expected["scriptExtensions"], span, set_ids[tuple(sorted(tags[name] for name in scripts.split()))])
+    pairs = list(struct.iter_unpack(">II", blobs["decompositions"]))
+    pair_ids = {pair: i for i, pair in enumerate(pairs)}
+    expected["decomposition"] = integers("I", [pair_ids[(0, 0)]]) * LIMIT
+    for cp, pair in decomp.items():
+        expected["decomposition"][cp] = pair_ids[pair]
+    return expected, aliases, pairs, compositions
+
+
+def old_reference():
+    source = (SOURCE / "unicode/ucd_table.rs").read_text()
+    if "description: Unicode 18.0.0" not in source:
+        raise SystemExit("unexpected Harfrust source Unicode version")
+    small, wide, palette = (numbers(array(source, name)) for name in ("ucd_u8", "ucd_u16", "ucd_palette"))
+    tags = script_tags()
+    scripts = [int.from_bytes(tags[name].encode(), "big") for name in re.findall(r"Script::(\w+)", array(source, "ucd_sc_map"))]
+    singles0, singles2 = (numbers(array(source, name)) for name in ("ucd_dm1_p0_map", "ucd_dm1_p2_map"))
+    triples = [tuple(int(v, 16) for v in row) for name in ("ucd_dm2_u32_map", "ucd_dm2_u64_map") for row in re.findall(r"\((0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+)\)", array(source, name))]
+    emoji = numbers(array((SOURCE / "unicode/emoji_table.rs").read_text(), "emoji_u8"))
+    joining = numbers(array((SOURCE / "ot/shaper/arabic_table.rs").read_text(), "arabic_joining_u8"))
+    vertical_source = (SOURCE / "unicode/mod.rs").read_text().split("fn vertical(self) -> Option<Codepoint> {", 1)[1].split("#[cfg", 1)[0]
+    vertical = {int(a, 16): int(b, 16) for a, b in re.findall(r"(0x[0-9a-f]+) => (0x[0-9a-f]+)", vertical_source)}
+    result = {name: integers("I", [0]) * LIMIT for name in ("generalCategory", "combiningClass", "script", "mirrorDelta", "isExtendedPictographic", "verticalDelta", "joining", "isDefaultIgnorable", "isVariationSelector")}
+    decompositions = {}
+    for cp in range(LIMIT):
+        gc = small[7944 + small[2176 + wide[small[cp // 512] * 32 + ((cp // 16) & 31)] + ((cp // 2) & 7)] * 2 + (cp & 1)] if cp < 1114110 else 2
+        result["generalCategory"][cp] = gc
+        result["combiningClass"][cp] = small[10432 + small[9308 + small[8577 + small[8332 + cp // 512] * 16 + ((cp // 32) & 15)] * 8 + ((cp // 4) & 7)] * 4 + (cp & 3)] if cp < 125259 else 0
+        result["script"][cp] = scripts[small[12721 + wide[4520 + wide[3392 + small[11824 + cp // 1024] * 16 + ((cp // 64) & 15)] + ((cp // 8) & 7)] + (cp & 7)]] if cp < 918000 else 0x5a7a7a7a
+        if cp < 121617:
+            nibble = (small[10952 + (cp // 512) // 2] >> (((cp // 512) & 1) * 4)) & 15
+            delta = palette[small[11624 + small[11272 + small[11071 + nibble * 16 + ((cp // 32) & 15)] * 8 + ((cp // 4) & 7)] + (cp & 3)]]
+            result["mirrorDelta"][cp] = delta & 0xffffffff
+        if cp < 131070:
+            nibble = (emoji[(cp // 1024) // 2] >> (((cp // 1024) & 1) * 4)) & 15
+            bit = emoji[64 + nibble * 16 + ((cp // 64) & 15)] * 64 + (cp & 63)
+            result["isExtendedPictographic"][cp] = (emoji[224 + bit // 8] >> (bit & 7)) & 1
+        state = 7
+        if cp < 125260:
+            nibble = (joining[(cp // 512) // 2] >> (((cp // 512) & 1) * 4)) & 15
+            index = joining[209 + joining[123 + nibble * 8 + ((cp // 64) & 7)] + ((cp // 8) & 7)] * 8 + (cp & 7)
+            state = (joining[441 + index // 2] >> ((index & 1) * 4)) & 15
+        result["joining"][cp] = (6 if gc in (1, 11, 12) else 0) if state == 7 else state
+        result["verticalDelta"][cp] = (vertical.get(cp, cp) - cp) & 0xffffffff
+        result["isVariationSelector"][cp] = 0xfe00 <= cp <= 0xfe0f or 0xe0100 <= cp <= 0xe01ef
+        result["isDefaultIgnorable"][cp] = cp in (0xad, 0x34f, 0x61c, 0xfeff) or 0x17b4 <= cp <= 0x17b5 or 0x180b <= cp <= 0x180f or 0x200b <= cp <= 0x200f or 0x202a <= cp <= 0x202e or 0x2060 <= cp <= 0x206f or 0xfe00 <= cp <= 0xfe0f or 0xfff0 <= cp <= 0xfff8 or 0x1d173 <= cp <= 0x1d17a or 0xe0000 <= cp <= 0xe0fff
+        if cp < 195102:
+            code = wide[7816 + small[19095 + small[18713 + cp // 512] * 32 + ((cp // 16) & 31)] * 16 + (cp & 15)]
+            if code:
+                index = code - 1
+                decompositions[cp] = (singles0[index], 0) if index < 825 else (0x20000 | singles2[index - 825], 0) if index < 935 else triples[index - 935][:2]
+    return result, decompositions, {(a, b): cp for a, b, cp in triples if cp}
+
+
+def compare(name, actual, expected):
+    differences = [(cp, a, b) for cp, (a, b) in enumerate(zip(actual, expected)) if a != b]
+    if differences:
+        sample = ", ".join(f"U+{cp:04X}: {a!r} != {b!r}" for cp, a, b in differences[:20])
+        raise SystemExit(f"{name}: {len(differences)} unexplained differences: {sample}")
+    print(f"{name}: all {LIMIT:,} code points agree")
+
+
+def main():
+    runpy.run_path(str(ROOT / "text/ucd/scripts/fetch-unicode"))["fetch"]()
+    actual, blobs = blob_tables()
+    expected, aliases, pairs, compositions = normative_reference(blobs)
+    if set(actual) != set(expected):
+        raise SystemExit(f"uncovered tables: {set(actual) ^ set(expected)}")
+    for name in actual:
+        compare("UCD " + name, actual[name], expected[name])
+    emitted_compositions = {(a, b): cp for a, b, cp in struct.iter_unpack(">III", blobs["compositions"])}
+    if emitted_compositions != compositions:
+        raise SystemExit("UCD composition pair map differs")
+    old, old_decompositions, old_compositions = old_reference()
+    for name, values in old.items():
+        if name == "joining":
+            jt = [fields[0] for fields in aliases["jt"]]
+            jg = [fields[1] for fields in aliases["jg"]]
+            view = integers("I", (4 if jg[group] == "Alaph" else 5 if jg[group] == "Dalath_Rish" else {"U": 0, "L": 1, "R": 2, "D": 3, "C": 3, "T": 6}[jt[kind]] for kind, group in zip(actual["joiningType"], actual["joiningGroup"])))
+        else:
+            view = integers("I", actual[name])
+        policy = IGNORABLE_POLICY if name == "isDefaultIgnorable" else SELECTOR_POLICY if name == "isVariationSelector" else set()
+        observed = {cp for cp, (a, b) in enumerate(zip(view, values)) if a != b} if policy else set()
+        if policy and observed != policy:
+            raise SystemExit(f"{name}: policy difference set changed: {sorted(observed)}")
+        for cp in policy:
+            if view[cp] != 1 or values[cp] != 0:
+                raise SystemExit(f"{name}: unexpected policy direction at U+{cp:04X}")
+            view[cp] = 0
+        compare("Harfrust view " + name, view, values)
+        if policy:
+            print("  documented shaping policy: " + ", ".join(f"U+{cp:04X}" for cp in sorted(policy)))
+    for cp in range(LIMIT):
+        new_pair = pairs[actual["decomposition"][cp]]
+        old_pair = old_decompositions.get(cp, (0, 0))
+        if new_pair != old_pair:
+            raise SystemExit(f"raw decomposition U+{cp:04X}: {new_pair} != {old_pair}")
+    if compositions != old_compositions:
+        changed = set(compositions.items()) ^ set(old_compositions.items())
+        raise SystemExit(f"raw compositions differ: {sorted(changed)[:20]}")
+    old_seconds = {second for _, second in old_compositions}
+    compare("Harfrust view composesAsSecond", actual["composesAsSecond"], [int(cp in old_seconds) for cp in range(LIMIT)])
+    compare("Harfrust view isMark", [int(gc in (10, 11, 12)) for gc in actual["generalCategory"]], [int(gc in (10, 11, 12)) for gc in old["generalCategory"]])
+    print("Raw decomposition domain and entire canonical composition pair map agree; Hangul uses unchanged algorithmic mappings.")
+    print("Unicode 18 Harfrust header confirmed; no Unicode-version difference has been waived.")
+
+
+if __name__ == "__main__":
+    main()

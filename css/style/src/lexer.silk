@@ -1,0 +1,634 @@
+//! CSS Syntax 3 tokenizer. Source is normalized UTF-8; only escaped text extends the arena.
+import tokens { TokenBuffer, Token, Kind, Span, Limits, CssError, CssErrorKind, insensitive }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.result { Result }
+import silk.text.string { String, InvalidUtf8 }
+import silk.text.format { Format, ParseError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.f64
+
+struct Scalar {
+  value: u32,
+  length: usize
+}
+
+// UTF-8 replacement decoding consumes each maximal valid prefix of an ill-formed sequence.
+fn decode(data: &[u8], at: usize) -> Scalar {
+  let first = data[at]
+  if first < 128 {
+    return Scalar { value: u8.toU32(first), length: 1 }
+  }
+  let mut count: usize = 0
+  let mut value: u32 = 0
+  let mut low: u8 = 128
+  let mut high: u8 = 191
+  if first >= 194 && first <= 223 {
+    count = 2
+    value = u8.toU32(first - 192)
+  } else if first >= 224 && first <= 239 {
+    count = 3
+    value = u8.toU32(first - 224)
+    if first == 224 {
+      low = 160
+    }
+    if first == 237 {
+      high = 159
+    }
+  } else if first >= 240 && first <= 244 {
+    count = 4
+    value = u8.toU32(first - 240)
+    if first == 240 {
+      low = 144
+    }
+    if first == 244 {
+      high = 143
+    }
+  } else {
+    return Scalar { value: 65533, length: 1 }
+  }
+  let mut n: usize = 1
+  while n < count {
+    if n >= data.length - at {
+      return Scalar { value: 65533, length: n }
+    }
+    let byte = data[at + n]
+    if byte < low || byte > high {
+      return Scalar { value: 65533, length: n }
+    }
+    value = value * 64 + u8.toU32(byte - 128)
+    low = 128
+    high = 191
+    n = n + 1
+  }
+  return Scalar { value: value, length: count }
+}
+
+effect fn append(data: &mut Bytes, bytes: &[u8], limits: &Limits, offset: usize) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let length = data.length()
+  if length > limits.maxStorageBytes || bytes.length > limits.maxStorageBytes - length {
+    fail CssError { kind: CssErrorKind.StorageLimit, offset: offset }
+  }
+  run data.append(bytes)
+}
+
+effect fn appendScalar(data: &mut Bytes, value: u32, limits: &Limits, offset: usize) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if value < 128 {
+    run append(&mut data.*, &[u32.toU8(value)], limits, offset)
+  } else if value < 2048 {
+    run append(
+      &mut data.*,
+      &[u32.toU8(192 + value / 64), u32.toU8(128 + value % 64)],
+      limits,
+      offset,
+    )
+  } else if value < 65536 {
+    run append(
+      &mut data.*,
+      &[u32.toU8(224 + value / 4096), u32.toU8(128 + value / 64 % 64), u32.toU8(128 + value % 64)],
+      limits,
+      offset,
+    )
+  } else {
+    run append(
+      &mut data.*,
+      &[
+        u32.toU8(240 + value / 262144),
+        u32.toU8(128 + value / 4096 % 64),
+        u32.toU8(128 + value / 64 % 64),
+        u32.toU8(128 + value % 64),
+      ],
+      limits,
+      offset,
+    )
+  }
+}
+
+struct Lexer {
+  buffer: TokenBuffer,
+  limits: Limits,
+  at: usize
+}
+
+fn peek(l: &Lexer, distance: usize) -> u8 {
+  if distance >= l.buffer.sourceLength - l.at {
+    return 0
+  }
+  return l.buffer.data.asSlice()[l.at + distance]
+}
+
+fn space(c: u8) -> bool {
+  return c == 32 || c == 9 || c == 10
+}
+
+fn digit(c: u8) -> bool {
+  return c >= 48 && c <= 57
+}
+
+fn hex(c: u8) -> bool {
+  return digit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+}
+
+fn nameStart(l: &Lexer, distance: usize) -> bool {
+  let byte = peek(l, distance)
+  if byte < 128 {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+  }
+  let c = decode(l.buffer.source(), l.at + distance).value
+  return c == 183 || (c >= 192 && c <= 214) || (c >= 216 && c <= 246) || (c >= 248 && c <= 893)
+    || (c >= 895 && c <= 8191)
+    || c == 8204
+    || c == 8205
+    || c == 8255
+    || c == 8256
+    || (c >= 8304 && c <= 8591)
+    || (c >= 11264 && c <= 12271)
+    || (c >= 12289 && c <= 55295)
+    || (c >= 63744 && c <= 64975)
+    || (c >= 65008 && c <= 65533)
+    || c >= 65536
+}
+
+fn nameByte(l: &Lexer, distance: usize) -> bool {
+  let c = peek(l, distance)
+  return nameStart(l, distance) || digit(c) || c == 45
+}
+
+fn escape(l: &Lexer, distance: usize) -> bool {
+  return peek(l, distance) == 92 && peek(l, distance + 1) != 10
+}
+
+fn identStart(l: &Lexer, distance: usize) -> bool {
+  let a = peek(l, distance)
+  let b = peek(l, distance + 1)
+  if a == 45 {
+    return nameStart(l, distance + 1) || b == 45 || escape(l, distance + 1)
+  }
+  return nameStart(l, distance) || escape(l, distance)
+}
+
+fn numberStart(l: &Lexer) -> bool {
+  let a = peek(l, 0)
+  let b = peek(l, 1)
+  if a == 43 || a == 45 {
+    return digit(b) || (b == 46 && digit(peek(l, 2)))
+  }
+  return digit(a) || (a == 46 && digit(b))
+}
+
+// Copy by source index: no borrow into Bytes is held across its growth.
+effect fn copySource(l: &mut Lexer, start: usize, end: usize) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let length = l.buffer.data.length()
+  if length > l.limits.maxStorageBytes || end - start > l.limits.maxStorageBytes - length {
+    fail CssError { kind: CssErrorKind.StorageLimit, offset: start }
+  }
+  let mut i = start
+  while i < end {
+    let byte = l.buffer.data.asSlice()[i]
+    run l.buffer.data.append(&[byte])
+    i = i + 1
+  }
+}
+
+// Called with the reverse solidus still in the input.
+fn escaped(l: &mut Lexer) -> u32 {
+  l.at = l.at + 1
+  if l.at == l.buffer.sourceLength {
+    return 65533
+  }
+  if hex(peek(&l.*, 0)) {
+    let mut value: u32 = 0
+    let mut n: usize = 0
+    while n < 6 && hex(peek(&l.*, 0)) {
+      let byte = peek(&l.*, 0)
+      let part = if digit(byte) {
+        u8.toU32(byte - 48)
+      } else if byte <= 70 {
+        u8.toU32(byte - 65) + 10
+      } else {
+        u8.toU32(byte - 97) + 10
+      }
+      value = value * 16 + part
+      l.at = l.at + 1
+      n = n + 1
+    }
+    if space(peek(&l.*, 0)) {
+      l.at = l.at + 1
+    }
+    if value == 0 || value > 1114111 || (value >= 55296 && value <= 57343) {
+      return 65533
+    }
+    return value
+  }
+  let scalar = decode(l.buffer.source(), l.at)
+  l.at = l.at + scalar.length
+  return scalar.value
+}
+
+effect fn name(l: &mut Lexer) -> Span
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let start = l.at
+  let mut segment = start
+  let mut decoded = false
+  let arena = l.buffer.data.length()
+  while l.at < l.buffer.sourceLength {
+    if nameByte(&l.*, 0) {
+      let length = if peek(&l.*, 0) < 128 {
+        1
+      } else {
+        decode(l.buffer.source(), l.at).length
+      }
+      l.at = l.at + length
+    } else if escape(&l.*, 0) {
+      decoded = true
+      let end = l.at
+      run copySource(&mut l.*, segment, end)
+      let value = escaped(&mut l.*)
+      run appendScalar(&mut l.buffer.data, value, &l.limits, l.at)
+      segment = l.at
+    } else {
+      break
+    }
+  }
+  if !decoded {
+    return Span { start: start, end: l.at }
+  }
+  let end = l.at
+  run copySource(&mut l.*, segment, end)
+  return Span { start: arena, end: l.buffer.data.length() }
+}
+
+effect fn stringToken(l: &mut Lexer, quote: u8) -> Kind
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  l.at = l.at + 1
+  let start = l.at
+  let arena = l.buffer.data.length()
+  let mut segment = start
+  let mut decoded = false
+  while l.at < l.buffer.sourceLength {
+    let c = peek(&l.*, 0)
+    if c == quote {
+      break
+    }
+    if c == 10 {
+      return Kind.BadString
+    }
+    if c == 92 {
+      decoded = true
+      let end = l.at
+      run copySource(&mut l.*, segment, end)
+      if peek(&l.*, 1) == 0 {
+        l.at = l.at + 1
+      } else if peek(&l.*, 1) == 10 {
+        l.at = l.at + 2
+      } else {
+        let value = escaped(&mut l.*)
+        run appendScalar(&mut l.buffer.data, value, &l.limits, l.at)
+      }
+      segment = l.at
+    } else {
+      l.at = l.at + 1
+    }
+  }
+  let end = l.at
+  if decoded {
+    run copySource(&mut l.*, segment, end)
+  }
+  if l.at < l.buffer.sourceLength {
+    l.at = l.at + 1
+  }
+  return Kind.String {
+    text: if decoded {
+      Span { start: arena, end: l.buffer.data.length() }
+    } else {
+      Span { start: start, end: end }
+    },
+  }
+}
+
+fn badUrl(l: &mut Lexer) -> () {
+  while l.at < l.buffer.sourceLength {
+    if peek(&l.*, 0) == 41 {
+      l.at = l.at + 1
+      return
+    }
+    if escape(&l.*, 0) {
+      let ignored = escaped(&mut l.*)
+    } else {
+      l.at = l.at + 1
+    }
+  }
+}
+
+effect fn urlToken(l: &mut Lexer) -> Kind
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  while space(peek(&l.*, 0)) {
+    l.at = l.at + 1
+  }
+  let start = l.at
+  let arena = l.buffer.data.length()
+  let mut segment = start
+  let mut decoded = false
+  while l.at < l.buffer.sourceLength {
+    let c = peek(&l.*, 0)
+    if c == 41 || space(c) {
+      break
+    }
+    if c == 34 || c == 39 || c == 40 || c <= 8 || c == 11 || (c >= 14 && c <= 31) || c == 127
+      || (c == 92 && !escape(&l.*, 0)) {
+      badUrl(&mut l.*)
+      return Kind.BadUrl
+    }
+    if c == 92 {
+      decoded = true
+      let end = l.at
+      run copySource(&mut l.*, segment, end)
+      let value = escaped(&mut l.*)
+      run appendScalar(&mut l.buffer.data, value, &l.limits, l.at)
+      segment = l.at
+    } else {
+      l.at = l.at + 1
+    }
+  }
+  let end = l.at
+  if decoded {
+    run copySource(&mut l.*, segment, end)
+  }
+  while space(peek(&l.*, 0)) {
+    l.at = l.at + 1
+  }
+  if l.at < l.buffer.sourceLength && peek(&l.*, 0) != 41 {
+    badUrl(&mut l.*)
+    return Kind.BadUrl
+  }
+  if l.at < l.buffer.sourceLength {
+    l.at = l.at + 1
+  }
+  return Kind.Url {
+    text: if decoded {
+      Span { start: arena, end: l.buffer.data.length() }
+    } else {
+      Span { start: start, end: end }
+    },
+  }
+}
+
+// This lexer only passes a nonempty ASCII decimal accepted by Format.f64Value.
+// dev.27 parseDecimal only rejects malformed grammar; long exponents saturate while scanning,
+// and mantissas remain indexed source spans. Overflow/underflow are successful IEEE results.
+// CSS literals use finite binary64 endpoints and unsigned zero (Values 4 numeric-types).
+fn decimal(l: &Lexer, start: usize) -> f64 {
+  let text = String.fromUtf8(Slice.view<u8>(l.buffer.source(), start, l.at - start))
+  let parsed = match &text {
+    Result<string, InvalidUtf8>.Success { value } => Format.f64Value(value)
+    _ => {
+      return Intrinsic.trap("CSS numeric token must be ASCII")
+    }
+  }
+  return match &parsed {
+    Result<f64, ParseError>.Success { value } => {
+      if value > f64.MAX {
+        return f64.MAX
+      }
+      if value < -f64.MAX {
+        return -f64.MAX
+      }
+      if value == 0.0 {
+        return 0.0
+      }
+      return value
+    }
+    _ => {
+      return Intrinsic.trap("CSS number grammar must be accepted by the decimal parser")
+    }
+  }
+}
+
+effect fn numeric(l: &mut Lexer) -> Kind
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let start = l.at
+  let mut integer = true
+  if peek(&l.*, 0) == 43 || peek(&l.*, 0) == 45 {
+    l.at = l.at + 1
+  }
+  while digit(peek(&l.*, 0)) {
+    l.at = l.at + 1
+  }
+  if peek(&l.*, 0) == 46 && digit(peek(&l.*, 1)) {
+    integer = false
+    l.at = l.at + 2
+    while digit(peek(&l.*, 0)) {
+      l.at = l.at + 1
+    }
+  }
+  if peek(&l.*, 0) == 101 || peek(&l.*, 0) == 69 {
+    let sign = peek(&l.*, 1) == 43 || peek(&l.*, 1) == 45
+    if digit(peek(&l.*, 1)) || (sign && digit(peek(&l.*, 2))) {
+      integer = false
+      l.at = l.at + 1
+      if sign {
+        l.at = l.at + 1
+      }
+      while digit(peek(&l.*, 0)) {
+        l.at = l.at + 1
+      }
+    }
+  }
+  let value = decimal(&l.*, start)
+  if identStart(&l.*, 0) {
+    let unit = run name(&mut l.*)
+    return Kind.Dimension { value: value, integer: integer, unit: unit }
+  }
+  if peek(&l.*, 0) == 37 {
+    l.at = l.at + 1
+    return Kind.Percentage { value: value, integer: integer }
+  }
+  return Kind.Number { value: value, integer: integer }
+}
+
+effect fn next(l: &mut Lexer) -> Kind
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let c = peek(&l.*, 0)
+  if space(c) {
+    while space(peek(&l.*, 0)) {
+      l.at = l.at + 1
+    }
+    return Kind.Whitespace
+  }
+  if c == 34 || c == 39 {
+    return run stringToken(&mut l.*, c)
+  }
+  if c == 35 && (nameByte(&l.*, 1) || escape(&l.*, 1)) {
+    l.at = l.at + 1
+    let identifier = identStart(&l.*, 0)
+    let text = run name(&mut l.*)
+    return Kind.Hash { text: text, identifier: identifier }
+  }
+  if c == 64 && identStart(&l.*, 1) {
+    l.at = l.at + 1
+    let text = run name(&mut l.*)
+    return Kind.AtKeyword { name: text }
+  }
+  if c == 60 && peek(&l.*, 1) == 33 && peek(&l.*, 2) == 45 && peek(&l.*, 3) == 45 {
+    l.at = l.at + 4
+    return Kind.Cdo
+  }
+  if c == 45 && peek(&l.*, 1) == 45 && peek(&l.*, 2) == 62 {
+    l.at = l.at + 3
+    return Kind.Cdc
+  }
+  if numberStart(&l.*) {
+    return run numeric(&mut l.*)
+  }
+  if identStart(&l.*, 0) {
+    let text = run name(&mut l.*)
+    if peek(&l.*, 0) != 40 {
+      return Kind.Ident { text: text }
+    }
+    l.at = l.at + 1
+    if insensitive(l.buffer.text(text), b"url") {
+      while space(peek(&l.*, 0)) && space(peek(&l.*, 1)) {
+        l.at = l.at + 1
+      }
+      let quoted = peek(&l.*, 0) == 34 || peek(&l.*, 0) == 39
+        || (space(peek(&l.*, 0)) && (peek(&l.*, 1) == 34 || peek(&l.*, 1) == 39))
+      if !quoted {
+        return run urlToken(&mut l.*)
+      }
+    }
+    return Kind.Function { name: text }
+  }
+  if c >= 128 {
+    let scalar = decode(l.buffer.source(), l.at)
+    l.at = l.at + scalar.length
+    return Kind.Delim { scalar: scalar.value }
+  }
+  l.at = l.at + 1
+  return match c {
+    58 => Kind.Colon
+    59 => Kind.Semicolon
+    44 => Kind.Comma
+    40 => Kind.OpenParen
+    41 => Kind.CloseParen
+    91 => Kind.OpenSquare
+    93 => Kind.CloseSquare
+    123 => Kind.OpenBrace
+    125 => Kind.CloseBrace
+    _ => Kind.Delim { scalar: u8.toU32(c) }
+  }
+}
+
+fn opening(kind: &Kind) -> u8 {
+  return match &kind.* {
+    Kind.Function { name } => 41
+    Kind.OpenParen => 41
+    Kind.OpenSquare => 93
+    Kind.OpenBrace => 125
+    _ => 0
+  }
+}
+
+fn closing(kind: &Kind) -> u8 {
+  return match &kind.* {
+    Kind.CloseParen => 41
+    Kind.CloseSquare => 93
+    Kind.CloseBrace => 125
+    _ => 0
+  }
+}
+
+pub effect fn tokenize(data: &[u8], limits: &Limits) -> TokenBuffer
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if data.length > limits.maxInputBytes {
+    fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+  }
+  let mut l = Lexer { buffer: TokenBuffer.make(), limits: limits.*, at: 0 }
+  let mut p: usize = 0
+  if data.length >= 3 && data[0] == 239 && data[1] == 187 && data[2] == 191 {
+    p = 3
+  }
+  while p < data.length {
+    let scalar = decode(data, p)
+    p = p + scalar.length
+    let mut value = scalar.value
+    if value == 13 {
+      if p < data.length && data[p] == 10 {
+        p = p + 1
+      }
+      value = 10
+    } else if value == 12 {
+      value = 10
+    } else if value == 0 {
+      value = 65533
+    }
+    run appendScalar(&mut l.buffer.data, value, limits, p - scalar.length)
+  }
+  l.buffer.sourceLength = l.buffer.data.length()
+  let mut stack = List<usize>.make()
+  while l.at < l.buffer.sourceLength {
+    if peek(&l, 0) == 47 && peek(&l, 1) == 42 {
+      l.at = l.at + 2
+      while l.at < l.buffer.sourceLength && !(peek(&l, 0) == 42 && peek(&l, 1) == 47) {
+        l.at = l.at + 1
+      }
+      if l.at < l.buffer.sourceLength {
+        l.at = l.at + 2
+      }
+      continue
+    }
+    let start = l.at
+    let kind = run next(&mut l)
+    let index = l.buffer.tokens.length()
+    if index >= limits.maxTokens {
+      fail CssError { kind: CssErrorKind.TokenLimit, offset: start }
+    }
+    let open = opening(&kind)
+    let close = closing(&kind)
+    if open != 0 {
+      if stack.length() >= limits.maxDepth {
+        fail CssError { kind: CssErrorKind.NestingLimit, offset: start }
+      }
+      run stack.append(index)
+    } else if close != 0 && stack.length() != 0 {
+      let previous = stack.asSlice()[stack.length() - 1]
+      if opening(&l.buffer.tokens.asSlice()[previous].kind) == close {
+        let mut tokens = l.buffer.tokens.asMutSlice()
+        tokens[previous].matching = index
+        let remaining = stack.length() - 1
+        stack.truncate(remaining)
+      }
+    }
+    run l.buffer.tokens.append(
+      Token { kind: move kind, source: Span { start: start, end: l.at }, matching: index },
+    )
+  }
+  let eof = l.buffer.tokens.length()
+  if eof >= limits.maxTokens {
+    fail CssError { kind: CssErrorKind.TokenLimit, offset: l.at }
+  }
+  let mut i: usize = 0
+  while i < stack.length() {
+    let mut tokens = l.buffer.tokens.asMutSlice()
+    tokens[stack.asSlice()[i]].matching = eof
+    i = i + 1
+  }
+  run l.buffer.tokens.append(
+    Token { kind: Kind.Eof, source: Span { start: l.at, end: l.at }, matching: eof },
+  )
+  return move l.buffer
+}

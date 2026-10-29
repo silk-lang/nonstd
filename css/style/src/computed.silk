@@ -1,0 +1,900 @@
+//! Immutable computed styles. Source buffers and declarations remain caller-owned.
+import cascade { Declaration, Candidate, Target, Specified }
+import cascade
+import variables { VariableStore, ScopeId }
+import variables
+import properties { Property, InitialKind }
+import properties
+import values { Store, Value, ValueId, Wide, Mode, ComputeContext, Range, Basis, Paint, Fallback }
+import values
+import computed_projection
+import computed_queries
+import dimensions { Context, Unit }
+import dimensions
+import colors { Color, Identity, SystemColor }
+import colors
+import text_values { TextValue, Atom }
+import value_keywords { Keyword }
+import tokens { TokenBuffer, Limits, CssError }
+import input { Input, TokenRef }
+import lexer
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub struct StyleId {
+  pub index: usize
+}
+
+impl Copy for StyleId {}
+
+/// The value handle is immutable. Text values contain only the requested longhand.
+/// Mask values share immutable compound storage; use maskItem/borderItem to project.
+pub struct ComputedValue {
+  pub value: ValueId,
+  pub property: Property,
+  pub sourceProperty: Property,
+  pub sourceBuffer: Option<usize>,
+}
+
+impl Copy for ComputedValue {}
+
+/// Font metrics in dimensions describe the selected face at dimensions.fontSize.
+/// They are scaled to the cascaded size, never replaced by invented OS metrics.
+/// For rem/rex/etc, the engine supplies the actual computed root metrics.
+/// Rebuild with a new host snapshot after font matching; old StyleIds remain valid.
+/// Change revision when host palette, initial font configuration, or system fonts change.
+pub struct HostContext<'a> {
+  pub dimensions: Context,
+  pub colors: colors.Context,
+  pub systemFonts: &'a [TextValue; 6],
+  pub fontFamily: ValueId,
+  pub revision: usize,
+}
+
+struct Style {
+  entries: [Option<ComputedValue>; 162],
+  scope: ScopeId,
+  dimensions: Context,
+  root: StyleId,
+}
+
+struct Resolved {
+  declaration: usize,
+  value: Option<ValueId>,
+  wide: Wide,
+  compound: Option<ValueId>,
+}
+
+impl Copy for Resolved {}
+
+pub struct Engine {
+  pub values: Store,
+  pub variables: VariableStore,
+  styles: List<Style>,
+  initialSpecified: [Option<ValueId>; 162],
+  initialComputed: [Option<ValueId>; 162],
+  revision: Option<usize>,
+}
+
+impl Engine {
+  pub fn make(closingBuffer: usize) -> Engine {
+    return Engine {
+      values: Store.make(),
+      variables: VariableStore.make(closingBuffer),
+      styles: List<Style>.make(),
+      initialSpecified: [Option<ValueId>.None; 162],
+      initialComputed: [Option<ValueId>.None; 162],
+      revision: Option<usize>.None,
+    }
+  }
+
+  // Whitespace layout queries use the three Text4 longhands, never WhiteSpace.
+  // Resolve the returned ValueId through values.get: Value.Text contains only
+  // Atom.Keyword entries tagged with that longhand. Collapse and wrap have one
+  // keyword; trim has None or DiscardBefore/DiscardAfter/DiscardInner in that order.
+  // These immutable computed values share handles with their specified/inherited values.
+  pub fn get(self: &Engine, style: StyleId, property: Property) -> Option<ComputedValue> {
+    if style.index >= self.styles.length() {
+      return Option<ComputedValue>.None
+    }
+    return self.styles.asSlice()[style.index].entries[properties.index(
+      properties.canonical(property),
+    )]
+  }
+
+  pub fn scope(self: &Engine, style: StyleId) -> Option<ScopeId> {
+    if style.index >= self.styles.length() {
+      return Option<ScopeId>.None
+    }
+    return Option<ScopeId>.some(self.styles.asSlice()[style.index].scope)
+  }
+
+  pub fn metrics(self: &Engine, style: StyleId) -> Option<Context> {
+    if style.index >= self.styles.length() {
+      return Option<Context>.None
+    }
+    return Option<Context>.some(self.styles.asSlice()[style.index].dimensions)
+  }
+
+  pub fn number(self: &Engine, style: StyleId, property: Property, basis: f64) -> Option<f64> {
+    return match &self.get(style, property) {
+      Option<ComputedValue>.Some { value } => values.usedNumber(&self.values, value.value, basis)
+      _ => Option<f64>.None
+    }
+  }
+
+  pub fn textNumber(self: &Engine, style: StyleId, property: Property, basis: f64) -> Option<f64> {
+    return match &self.get(style, property) {
+      Option<ComputedValue>.Some { value } => textNumber(&self.values, value.value, basis)
+      _ => Option<f64>.None
+    }
+  }
+
+  pub fn maskCount(self: &Engine, style: StyleId, property: Property) -> usize {
+    return match &self.get(style, property) {
+      Option<ComputedValue>.Some { value } => computed_queries.maskCount(&self.values, value.value)
+      _ => 0
+    }
+  }
+
+  pub fn maskItem<'a>(self: &'a Engine, style: StyleId, property: Property, index: usize) -> Option<
+    computed_queries.MaskItem<'a>
+  > {
+    return match &self.get(style, property) {
+      Option<ComputedValue>.Some { value } => computed_queries.maskItem(
+        &self.values,
+        value.value,
+        property,
+        index,
+      )
+      _ => Option<computed_queries.MaskItem<'a>>.None
+    }
+  }
+
+  pub fn borderItem<'a>(self: &'a Engine, style: StyleId, property: Property) -> Option<
+    computed_queries.BorderItem<'a>
+  > {
+    return match &self.get(style, property) {
+      Option<ComputedValue>.Some { value } => computed_queries.borderItem(
+        &self.values,
+        value.value,
+        property,
+      )
+      _ => Option<computed_queries.BorderItem<'a>>.None
+    }
+  }
+
+  pub effect fn build(
+    self: &mut Engine,
+    buffers: &[TokenBuffer],
+    declarations: &[Declaration],
+    candidates: &[Candidate],
+    parent: Option<StyleId>,
+    host: &HostContext,
+    limits: &Limits,
+  ) -> StyleId
+    ! CssError | ComputedError | OutOfMemoryError
+    ? &mut Allocator {
+    let sameRevision = match &self.revision {
+      Option<usize>.Some { value } => value == host.revision
+      _ => false
+    }
+    if !sameRevision {
+      self.initialComputed = [Option<ValueId>.None; 162]
+      self.revision = Option<usize>.some(host.revision)
+    }
+    let parentScope = match &parent {
+      Option<StyleId>.Some { value } => self.scope(value)
+      _ => Option<ScopeId>.None
+    }
+    let scope = run self.variables.build(buffers, declarations, candidates, parentScope, limits)
+    let id = StyleId { index: self.styles.length() }
+    let mut metrics = host.dimensions
+    let mut root = id
+    match &parent {
+      Option<StyleId>.Some { value } => {
+        if value.index < self.styles.length() {
+          let ancestor = &self.styles.asSlice()[value.index]
+          root = ancestor.root
+          let p = ancestor.dimensions
+          metrics.parentFontSize = p.fontSize
+          metrics.parentXHeight = p.xHeight
+          metrics.parentCapHeight = p.capHeight
+          metrics.parentZeroAdvance = p.zeroAdvance
+          metrics.parentIdeographAdvance = p.ideographAdvance
+          metrics.parentLineHeight = p.lineHeight
+          metrics.parentFontWeight = numberOr(
+            self.textNumber(value, Property.FontWeight, 0.0),
+            400.0,
+          )
+          metrics.parentFontStretch = numberOr(
+            self.textNumber(value, Property.FontWidth, 100.0),
+            100.0,
+          )
+          let r = self.styles.asSlice()[root.index].dimensions
+          metrics.rootFontSize = r.fontSize
+          metrics.rootXHeight = r.xHeight
+          metrics.rootCapHeight = r.capHeight
+          metrics.rootZeroAdvance = r.zeroAdvance
+          metrics.rootIdeographAdvance = r.ideographAdvance
+          metrics.rootLineHeight = r.lineHeight
+          metrics.vertical = r.vertical
+        }
+      }
+      _ => {
+        // Root font-relative units use initial font metrics while computing font-size.
+        let scale = if host.dimensions.fontSize > 0.0 {
+          metrics.initialFontSize / host.dimensions.fontSize
+        } else {
+          0.0
+        }
+        metrics.parentFontSize = metrics.initialFontSize
+        metrics.parentXHeight = host.dimensions.xHeight * scale
+        metrics.parentCapHeight = host.dimensions.capHeight * scale
+        metrics.parentZeroAdvance = host.dimensions.zeroAdvance * scale
+        metrics.parentIdeographAdvance = host.dimensions.ideographAdvance * scale
+        metrics.parentLineHeight = host.dimensions.lineHeight * scale
+        metrics.parentFontWeight = 400.0
+        metrics.parentFontStretch = 100.0
+        metrics.rootFontSize = metrics.parentFontSize
+        metrics.rootXHeight = metrics.parentXHeight
+        metrics.rootCapHeight = metrics.parentCapHeight
+        metrics.rootZeroAdvance = metrics.parentZeroAdvance
+        metrics.rootIdeographAdvance = metrics.parentIdeographAdvance
+        metrics.rootLineHeight = metrics.parentLineHeight
+      }
+    }
+    let mut style = Style {
+      entries: [Option<ComputedValue>.None; 162],
+      scope: scope,
+      dimensions: metrics,
+      root: root,
+    }
+    let mut resolved = List<Resolved>.make()
+
+    // Dependency boundaries: font-size uses parent metrics; other lengths use the
+    // winning current font-size, even when it overrides a font shorthand's size.
+    let early = [
+      Property.Color,
+      Property.WritingMode,
+      Property.FontSize,
+      Property.FontWeight,
+      Property.FontWidth,
+    ]
+    let mut i: usize = 0
+    while i < early.length {
+      run resolve(
+        &mut self.*,
+        &mut style,
+        early[i],
+        buffers,
+        declarations,
+        candidates,
+        &mut resolved,
+        parent,
+        host,
+        limits,
+      )
+      if early[i] == Property.WritingMode && root.index == id.index {
+        let writing = entryKeyword(&self.values, &style, Property.WritingMode)
+        style.dimensions.vertical = match &writing {
+          Option<Keyword>.Some { value } => value == Keyword.VerticalRl
+            || value == Keyword.VerticalLr
+          _ => false
+        }
+      }
+      i = i + 1
+    }
+    let size = entryNumber(&self.values, &style, Property.FontSize, metrics.initialFontSize)
+    let ratio = if host.dimensions.fontSize > 0.0 {
+      size / host.dimensions.fontSize
+    } else {
+      0.0
+    }
+    style.dimensions.fontSize = size
+    style.dimensions.xHeight = host.dimensions.xHeight * ratio
+    style.dimensions.capHeight = host.dimensions.capHeight * ratio
+    style.dimensions.zeroAdvance = host.dimensions.zeroAdvance * ratio
+    style.dimensions.ideographAdvance = host.dimensions.ideographAdvance * ratio
+    style.dimensions.lineHeight = host.dimensions.lineHeight * ratio
+    if root.index == id.index {
+      style.dimensions.rootFontSize = size
+      style.dimensions.rootXHeight = style.dimensions.xHeight
+      style.dimensions.rootCapHeight = style.dimensions.capHeight
+      style.dimensions.rootZeroAdvance = style.dimensions.zeroAdvance
+      style.dimensions.rootIdeographAdvance = style.dimensions.ideographAdvance
+    }
+    run resolve(
+      &mut self.*,
+      &mut style,
+      Property.LineHeight,
+      buffers,
+      declarations,
+      candidates,
+      &mut resolved,
+      parent,
+      host,
+      limits,
+    )
+    match &style.entries[properties.index(Property.LineHeight)] {
+      Option<ComputedValue>.Some { value } => match &self.values.get(value.value).* {
+        Value.Text { value: text } => {
+          if text.items.length() > 0 {
+            match &text.items.asSlice()[0].atom {
+              Atom.Numeric { value: expression } => {
+                let number = dimensions.evaluate(&self.values.numerics, expression, size)
+                style.dimensions.lineHeight = if dimensions.numberResult(
+                  &self.values.numerics,
+                  expression,
+                ) {
+                  number * size
+                } else {
+                  number
+                }
+              }
+              _ => {}
+            }
+          }
+        }
+        _ => {}
+      }
+      _ => {}
+    }
+    if root.index == id.index {
+      style.dimensions.rootLineHeight = style.dimensions.lineHeight
+    }
+    let all = properties.all()
+    i = 0
+    while i < all.length {
+      let property = all[i]
+      if properties.canonical(property) == property && properties.longhandCount(property) == 1 {
+        run resolve(
+          &mut self.*,
+          &mut style,
+          property,
+          buffers,
+          declarations,
+          candidates,
+          &mut resolved,
+          parent,
+          host,
+          limits,
+        )
+      }
+      i = i + 1
+    }
+    run computeOverflow(&mut self.*, &mut style)
+    run self.styles.append(move style)
+    return id
+  }
+}
+
+fn numberOr(value: Option<f64>, fallback: f64) -> f64 {
+  return match &value {
+    Option<f64>.Some { value: number } => number
+    _ => fallback
+  }
+}
+
+fn textNumber(store: &Store, id: ValueId, basis: f64) -> Option<f64> {
+  return match &store.get(id).* {
+    Value.Text { value } => {
+      let mut i: usize = 0
+      while i < value.items.length() {
+        match &value.items.asSlice()[i].atom {
+          Atom.Numeric { value: expression } => {
+            return Option<f64>.some(dimensions.evaluate(&store.numerics, expression, basis))
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+      Option<f64>.None
+    }
+    _ => Option<f64>.None
+  }
+}
+
+fn entryNumber(store: &Store, style: &Style, property: Property, fallback: f64) -> f64 {
+  return match &style.entries[properties.index(property)] {
+    Option<ComputedValue>.Some { value } => numberOr(textNumber(store, value.value, 0.0), fallback)
+    _ => fallback
+  }
+}
+
+fn entryKeyword(store: &Store, style: &Style, property: Property) -> Option<Keyword> {
+  return match &style.entries[properties.index(property)] {
+    Option<ComputedValue>.Some { value } => match &store.get(value.value).* {
+      Value.Keyword { keyword } => Option<Keyword>.some(keyword)
+      _ => Option<Keyword>.None
+    }
+    _ => Option<Keyword>.None
+  }
+}
+
+fn context<'a>(
+  style: &Style,
+  property: Property,
+  host: &HostContext<'a>,
+  inheritedColor: Color,
+) -> ComputeContext<'a> {
+  let mut palette = host.colors
+
+  // Preserve currentColor in all properties other than color itself.
+  palette.currentColor = if property == Property.Color {
+    inheritedColor
+  } else {
+    Color.current()
+  }
+  return ComputeContext {
+    dimensions: style.dimensions,
+    colors: palette,
+    systemFonts: host.systemFonts,
+  }
+}
+
+fn parentColor(engine: &Engine, parent: Option<StyleId>, host: &HostContext) -> Color {
+  match &parent {
+    Option<StyleId>.Some { value: style } => match &engine.get(style, Property.Color) {
+      Option<ComputedValue>.Some { value } => match &engine.values.get(value.value).* {
+        Value.Color { color } => {
+          return color
+        }
+        _ => {}
+      }
+      _ => {}
+    }
+    _ => {}
+  }
+  return host.colors.system[colors.systemIndex(SystemColor.CanvasText)]
+}
+
+effect fn resolve(
+  engine: &mut Engine,
+  style: &mut Style,
+  property: Property,
+  buffers: &[TokenBuffer],
+  declarations: &[Declaration],
+  candidates: &[Candidate],
+  resolved: &mut List<Resolved>,
+  parent: Option<StyleId>,
+  host: &HostContext,
+  limits: &Limits,
+) -> ()
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let index = properties.index(property)
+  match &style.entries[index] {
+    Option<ComputedValue>.Some { value } => {
+      return
+    }
+    _ => {}
+  }
+  let mut excluded: u8 = 0
+  while true {
+    let winner = cascade.select(declarations, candidates, property, excluded)
+    let candidate = match &winner {
+      Option<Candidate>.Some { value } => value
+      _ => {
+        let value = run defaultValue(
+          &mut engine.*,
+          &mut style.*,
+          property,
+          Wide.Unset,
+          buffers,
+          declarations,
+          candidates,
+          &mut resolved.*,
+          parent,
+          host,
+          limits,
+        )
+        style.entries[index] = Option<ComputedValue>.some(value)
+        return
+      }
+    }
+    let declaration = &declarations[candidate.declaration]
+    let sourceProperty = match &declaration.target {
+      Target.Property { property: source } => source
+      _ => property
+    }
+    let selected = run resolveDeclaration(
+      &mut engine.*,
+      buffers,
+      declaration,
+      candidate.declaration,
+      style.scope,
+      &mut resolved.*,
+      limits,
+    )
+    let specified = match &selected.value {
+      Option<ValueId>.Some { value } => value
+      _ => {
+        if selected.wide == Wide.Revert {
+          excluded = excluded | cascade.revertMask(candidate.priority.origin)
+          continue
+        }
+        let value = run defaultValue(
+          &mut engine.*,
+          &mut style.*,
+          property,
+          selected.wide,
+          buffers,
+          declarations,
+          candidates,
+          &mut resolved.*,
+          parent,
+          host,
+          limits,
+        )
+        style.entries[index] = Option<ComputedValue>.some(value)
+        return
+      }
+    }
+    let projected = run computed_projection.project(
+      &mut engine.values,
+      specified,
+      sourceProperty,
+      property,
+      host.systemFonts,
+    )
+    let inheritedColor = parentColor(&engine.*, parent, host)
+    let computeContext = context(&style.*, property, host, inheritedColor)
+    let computed = match &selected.compound {
+      Option<ValueId>.Some { value } => value
+      _ => run computeValue(&mut engine.values, projected, property, &computeContext)
+    }
+    let compound = match &engine.values.get(specified).* {
+      Value.Effect { value } => true
+      _ => false
+    }
+    if compound {
+      let mut cached: usize = 0
+      while cached < resolved.length() {
+        if resolved.asSlice()[cached].declaration == candidate.declaration {
+          let mut entries = resolved.asMutSlice()
+          entries[cached].compound = Option<ValueId>.some(computed)
+          break
+        }
+        cached = cached + 1
+      }
+    }
+    if !values.validComputed(&engine.values, computed) {
+      let value = run defaultValue(
+        &mut engine.*,
+        &mut style.*,
+        property,
+        Wide.Unset,
+        buffers,
+        declarations,
+        candidates,
+        &mut resolved.*,
+        parent,
+        host,
+        limits,
+      )
+      style.entries[index] = Option<ComputedValue>.some(value)
+      return
+    }
+    style.entries[index] = Option<ComputedValue>.some(
+      ComputedValue {
+        value: computed,
+        property: property,
+        sourceProperty: sourceProperty,
+        sourceBuffer: Option<usize>.some(declaration.buffer),
+      },
+    )
+    return
+  }
+}
+
+effect fn resolveDeclaration(
+  engine: &mut Engine,
+  buffers: &[TokenBuffer],
+  declaration: &Declaration,
+  index: usize,
+  scope: ScopeId,
+  cache: &mut List<Resolved>,
+  limits: &Limits,
+) -> Resolved
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < cache.length() {
+    if cache.asSlice()[i].declaration == index {
+      return cache.asSlice()[i]
+    }
+    i = i + 1
+  }
+  let mut out = Resolved {
+    declaration: index,
+    value: Option<ValueId>.None,
+    wide: Wide.Unset,
+    compound: Option<ValueId>.None,
+  }
+  match &declaration.specified {
+    Specified.Wide { keyword } => {
+      out.wide = keyword
+    }
+    Specified.Parsed { value } => {
+      out.value = Option<ValueId>.some(value)
+    }
+    Specified.Pending { range, mode } => {
+      let substituted = run engine.variables.substitute(
+        buffers,
+        scope,
+        declaration.buffer,
+        range,
+        limits,
+      )
+      match &substituted {
+        Option<List<TokenRef>>.Some { value: references } => {
+          let source = Input.Expanded { buffers: buffers, references: references.asSlice() }
+          let property = match &declaration.target {
+            Target.Property { property } => property
+            _ => Property.All
+          }
+          out.value = run values.parse(&mut engine.values, property, &source, mode)
+        }
+        _ => {}
+      }
+    }
+  }
+  match &out.value {
+    Option<ValueId>.Some { value } => match &engine.values.get(value).* {
+      Value.Wide { keyword } => {
+        out.wide = keyword
+        out.value = Option<ValueId>.None
+      }
+      _ => {}
+    }
+    _ => {}
+  }
+  run cache.append(out)
+  return out
+}
+
+effect fn defaultValue(
+  engine: &mut Engine,
+  style: &mut Style,
+  property: Property,
+  wide: Wide,
+  buffers: &[TokenBuffer],
+  declarations: &[Declaration],
+  candidates: &[Candidate],
+  resolved: &mut List<Resolved>,
+  parent: Option<StyleId>,
+  host: &HostContext,
+  limits: &Limits,
+) -> ComputedValue
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  if wide == Wide.Inherit || (wide == Wide.Unset && properties.inherited(property)) {
+    match &parent {
+      Option<StyleId>.Some { value } => match &engine.get(value, property) {
+        Option<ComputedValue>.Some { value: inherited } => {
+          return inherited
+        }
+        _ => {}
+      }
+      _ => {}
+    }
+  }
+  let kind = properties.initialKind(property)
+  if kind == InitialKind.DecorationFill || kind == InitialKind.DecorationStroke {
+    let dependency = if kind == InitialKind.DecorationFill {
+      Property.Fill
+    } else {
+      Property.Stroke
+    }
+    run resolve(
+      &mut engine.*,
+      &mut style.*,
+      dependency,
+      buffers,
+      declarations,
+      candidates,
+      &mut resolved.*,
+      parent,
+      host,
+      limits,
+    )
+    match &style.entries[properties.index(dependency)] {
+      Option<ComputedValue>.Some { value } => {
+        let mut out = value
+        out.property = property
+        return out
+      }
+      _ => {}
+    }
+  }
+  let index = properties.index(property)
+  if kind == InitialKind.HostFontFamily {
+    return ComputedValue {
+      value: host.fontFamily,
+      property: property,
+      sourceProperty: property,
+      sourceBuffer: Option<usize>.None,
+    }
+  }
+  match &engine.initialComputed[index] {
+    Option<ValueId>.Some { value } => {
+      return ComputedValue {
+        value: value,
+        property: property,
+        sourceProperty: property,
+        sourceBuffer: Option<usize>.None,
+      }
+    }
+    _ => {}
+  }
+  let specified = match &engine.initialSpecified[index] {
+    Option<ValueId>.Some { value } => value
+    _ => {
+      let buffer = run lexer.tokenize(properties.initial(property), limits)
+      let source = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+      let parsed = run values.parse(&mut engine.values, property, &source, Mode.Css)
+      let value = match &parsed {
+        Option<ValueId>.Some { value } => value
+        _ => {
+          // A catalog/grammar disagreement is an integration error, not a default keyword.
+          fail ComputedError { property: property }
+        }
+      }
+      engine.initialSpecified[index] = Option<ValueId>.some(value)
+      value
+    }
+  }
+  let inheritedColor = parentColor(&engine.*, parent, host)
+  let computeContext = context(&style.*, property, host, inheritedColor)
+  let value = run computeValue(&mut engine.values, specified, property, &computeContext)
+  engine.initialComputed[index] = Option<ValueId>.some(value)
+  return ComputedValue {
+    value: value,
+    property: property,
+    sourceProperty: property,
+    sourceBuffer: Option<usize>.None,
+  }
+}
+
+/// Signals a property-catalog initial that the shared value grammar cannot parse.
+pub struct ComputedError {
+  pub property: Property
+}
+
+effect fn computeValue(
+  store: &mut Store,
+  id: ValueId,
+  property: Property,
+  computeContext: &ComputeContext,
+) -> ValueId
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &store.get(id).* {
+    Value.Color { color } => {
+      if stableColor(color, property) {
+        return id
+      }
+    }
+    Value.IccColor { color, icc } => {
+      if stableColor(color, property) {
+        return id
+      }
+    }
+    Value.Paint { paint } => {
+      let stable = match &paint {
+        Paint.Color { color } => stableColor(color, property)
+        Paint.IccColor { color, icc } => stableColor(color, property)
+        Paint.Server { url, fallback } => match &fallback {
+          Fallback.Color { color } => stableColor(color, property)
+          Fallback.IccColor { color, icc } => stableColor(color, property)
+          _ => true
+        }
+        _ => true
+      }
+      if stable {
+        return id
+      }
+    }
+    Value.Numeric { expression, range, basis } => {
+      if range != Range.UnitInterval {
+        let original = expression
+        let computedRange = range
+        let percentageBasis = basis
+        let result = run dimensions.compute(
+          &mut store.numerics,
+          original,
+          &computeContext.dimensions,
+        )
+        if result.index == original.index {
+          return id
+        }
+        return run store.add(
+          Value.Numeric { expression: result, range: computedRange, basis: percentageBasis },
+        )
+      }
+    }
+    _ => {}
+  }
+  if property == Property.WritingMode {
+    match &store.get(id).* {
+      Value.Keyword { keyword } => {
+        let normalized = match keyword {
+          Keyword.Lr => Keyword.HorizontalTb
+          Keyword.LrTb => Keyword.HorizontalTb
+          Keyword.Rl => Keyword.HorizontalTb
+          Keyword.RlTb => Keyword.HorizontalTb
+          Keyword.Tb => Keyword.VerticalRl
+          Keyword.TbRl => Keyword.VerticalRl
+          _ => keyword
+        }
+        if normalized != keyword {
+          return run store.add(Value.Keyword { keyword: normalized })
+        }
+      }
+      _ => {}
+    }
+  }
+  let computed = run values.compute(&mut store.*, id, computeContext)
+
+  // Opacity percentages are numbers, not reference-box-dependent percentages.
+  match &store.get(computed).* {
+    Value.Numeric { expression, range, basis } => {
+      if range == Range.UnitInterval {
+        let number = numberOr(values.usedNumber(&store.*, computed, 1.0), 1.0)
+        let scalar = run dimensions.literal(&mut store.numerics, number, Unit.Number)
+        return run store.add(
+          Value.Numeric { expression: scalar, range: Range.UnitInterval, basis: Basis.None },
+        )
+      }
+    }
+    _ => {}
+  }
+  return computed
+}
+
+fn stableColor(color: Color, property: Property) -> bool {
+  return match &color.identity {
+    Identity.Absolute => true
+    Identity.CurrentColor => property != Property.Color
+    Identity.System { color: systemRole } => false
+  }
+}
+
+effect fn computeOverflow(engine: &mut Engine, style: &mut Style) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let x = entryKeyword(&engine.values, &style.*, Property.OverflowX)
+  let y = entryKeyword(&engine.values, &style.*, Property.OverflowY)
+  let horizontal = match &x {
+    Option<Keyword>.Some { value } => value
+    _ => Keyword.Visible
+  }
+  let vertical = match &y {
+    Option<Keyword>.Some { value } => value
+    _ => Keyword.Visible
+  }
+  let target = if horizontal == Keyword.Visible && vertical != Keyword.Visible {
+    Option<Property>.some(Property.OverflowX)
+  } else if vertical == Keyword.Visible && horizontal != Keyword.Visible {
+    Option<Property>.some(Property.OverflowY)
+  } else {
+    Option<Property>.None
+  }
+  match &target {
+    Option<Property>.Some { value: property } => {
+      let index = properties.index(property)
+      match &style.entries[index] {
+        Option<ComputedValue>.Some { value } => {
+          let mut changed = value
+          changed.value = run engine.values.add(Value.Keyword { keyword: Keyword.Auto })
+          style.entries[index] = Option<ComputedValue>.some(changed)
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+}

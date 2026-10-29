@@ -1,0 +1,264 @@
+//! Test-only canonical normalizer exercising raw UCD APIs against every column
+//! of the pinned Unicode 18 NormalizationTest. This is not a public NFC/NFD API.
+import lib as Ucd
+import utf8 as Utf8
+import test_support as Scan
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.text.format { Format }
+import silk.system.host_input { HostInputError }
+import silk.collections.list { List }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.core.option { Option }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.io.writer_native { StderrWriter }
+import silk.testing.testing { Testing, AssertionError }
+import silk.io.writer { Writer, WriterError }
+
+// Recursively expand canonical mappings, including algorithmic Hangul, then
+// insert each leaf stably within its combining sequence. Equal CCCs never swap.
+effect fn appendDecomposed(cp: u32, output: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pair = Ucd.decomposeRaw(cp)
+  if pair.first != 0 {
+    run appendDecomposed(pair.first, &mut output)
+    if pair.second != 0 {
+      run appendDecomposed(pair.second, &mut output)
+    }
+    return
+  }
+  let mut index = List<u32>.length(&output)
+  run List<u32>.append(&mut output, cp)
+  let currentClass = Ucd.combiningClass(cp).number()
+  if currentClass == 0 {
+    return
+  }
+  while index > 0 {
+    let previous = List<u32>.get(&output, index - 1)
+    if Ucd.combiningClass(previous).number() <= currentClass {
+      break
+    }
+    List<u32>.set(&mut output, index, previous)
+    index = index - 1
+  }
+  List<u32>.set(&mut output, index, cp)
+}
+
+// Input is canonically ordered. Only an intervening, unconsumed character can
+// block composition; a successful composition does not change lastClass.
+effect fn compose(ordered: &[u32], output: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  List<u32>.clear(&mut output)
+  let mut starter: usize = 0
+  let mut hasStarter = false
+  let mut lastClass: u8 = 0
+  let mut index: usize = 0
+  while index < ordered.length {
+    let cp = ordered[index]
+    let currentClass = Ucd.combiningClass(cp).number()
+    let mut combined: u32 = 0
+    if hasStarter && (lastClass == 0 || lastClass < currentClass) {
+      combined = Ucd.composeRaw(List<u32>.get(&output, starter), cp)
+    }
+    if combined != 0 {
+      List<u32>.set(&mut output, starter, combined)
+    } else {
+      if currentClass == 0 {
+        starter = List<u32>.length(&output)
+        hasStarter = true
+      }
+      run List<u32>.append(&mut output, cp)
+      lastClass = currentClass
+    }
+    index = index + 1
+  }
+}
+
+effect fn encode(scalars: &[u32], output: &mut List<u8>) -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  List<u8>.clear(&mut output)
+  let mut index: usize = 0
+  while index < scalars.length {
+    run Scan.appendScalar(scalars[index], &mut output)
+    index = index + 1
+  }
+}
+
+effect fn column(body: &[u8], position: &mut usize, output: &mut List<u8>) -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  List<u8>.clear(&mut output)
+  let text = Scan.trim(Scan.view(body, Scan.field(body, &mut position, 59)))
+  run Testing.expect(text.length != 0, "empty normalization column")
+  run Testing.expect(
+    position.* > 0 && body[position.* - 1] == 59,
+    "missing normalization column delimiter",
+  )
+  let mut at: usize = 0
+  while at < text.length {
+    let token = Scan.view(text, Scan.word(text, &mut at))
+    let number = Scan.number(token, 16)
+    run Testing.expect(number.isSome(), "invalid normalization scalar")
+    run Scan.appendScalar(move number |> Option<u32>.unwrapOr(0), &mut output)
+  }
+}
+
+effect fn mismatch(line: usize, column: usize, form: string) -> ()
+  ! OutOfMemoryError | WriterError
+  ? &mut Allocator {
+  let mut writer = StderrWriter.make()
+  run Format.format(
+    "NormalizationTest.txt:{line}: {form}(c{column}) mismatch\n",
+    &.{ line: line, form: form, column: column },
+  )
+    |> Effect.provideMut<Writer>(&mut writer)
+}
+
+// The expected bytes come only from the fixture's columns, never from another
+// normalizer or generated property data. Both relations run even after failure.
+effect fn relationships(
+  input: &[u8],
+  expectedNfc: &[u8],
+  expectedNfd: &[u8],
+  line: usize,
+  column: usize,
+  ordered: &mut List<u32>,
+  composed: &mut List<u32>,
+  actual: &mut List<u8>,
+) -> usize
+  ! OutOfMemoryError | AssertionError<'static> | WriterError
+  ? &mut Allocator {
+  List<u32>.clear(&mut ordered)
+  let mut at: usize = 0
+  while at < input.length {
+    let decoded = Utf8.decode(input, at)
+    run appendDecomposed(decoded.cp, &mut ordered)
+    at = decoded.next
+  }
+  let mut failures: usize = 0
+  run encode(List<u32>.asSlice(&ordered), &mut actual)
+  if !Scan.equal(List<u8>.asSlice(&actual), expectedNfd) {
+    failures = failures + 1
+    run mismatch(line, column, "NFD")
+  }
+  run compose(List<u32>.asSlice(&ordered), &mut composed)
+  run encode(List<u32>.asSlice(&composed), &mut actual)
+  if !Scan.equal(List<u8>.asSlice(&actual), expectedNfc) {
+    failures = failures + 1
+    run mismatch(line, column, "NFC")
+  }
+  return failures
+}
+
+effect fn conformance() -> ()
+  ! FileError | HostInputError | OutOfMemoryError | AssertionError<'static> | WriterError
+  ? &mut Allocator {
+  let cwd = run NativeHostInput.workingDirectory()
+  let root = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let path = run Path.resolve(&root, "build/ucd/18.0.0/NormalizationTest.txt")
+  let mut files = run OsFileSystem.make("/")
+  let contents = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  let data = Bytes.asSlice(&contents)
+  let mut c1 = List<u8>.make()
+  let mut c2 = List<u8>.make()
+  let mut c3 = List<u8>.make()
+  let mut c4 = List<u8>.make()
+  let mut c5 = List<u8>.make()
+  let mut ordered = List<u32>.make()
+  let mut composed = List<u32>.make()
+  let mut actual = List<u8>.make()
+  let mut at: usize = 0
+  let mut line: usize = 0
+  let mut cases: usize = 0
+  let mut failures: usize = 0
+  while at < data.length {
+    let row = Scan.view(data, Scan.line(data, &mut at))
+    line = line + 1
+    let mut comment: usize = 0
+    let body = Scan.trim(Scan.view(row, Scan.field(row, &mut comment, 35)))
+    if body.length == 0 {
+      continue
+    }
+
+    // @Part directives divide the file into sections; they are not test rows.
+    if body[0] == 64 {
+      continue
+    }
+    let mut position: usize = 0
+    run column(body, &mut position, &mut c1)
+    run column(body, &mut position, &mut c2)
+    run column(body, &mut position, &mut c3)
+    run column(body, &mut position, &mut c4)
+    run column(body, &mut position, &mut c5)
+    run Testing.expect(position == body.length, "unexpected normalization columns")
+    failures = failures
+      + run relationships(
+        List<u8>.asSlice(&c1),
+        List<u8>.asSlice(&c2),
+        List<u8>.asSlice(&c3),
+        line,
+        1,
+        &mut ordered,
+        &mut composed,
+        &mut actual,
+      )
+    failures = failures
+      + run relationships(
+        List<u8>.asSlice(&c2),
+        List<u8>.asSlice(&c2),
+        List<u8>.asSlice(&c3),
+        line,
+        2,
+        &mut ordered,
+        &mut composed,
+        &mut actual,
+      )
+    failures = failures
+      + run relationships(
+        List<u8>.asSlice(&c3),
+        List<u8>.asSlice(&c2),
+        List<u8>.asSlice(&c3),
+        line,
+        3,
+        &mut ordered,
+        &mut composed,
+        &mut actual,
+      )
+    failures = failures
+      + run relationships(
+        List<u8>.asSlice(&c4),
+        List<u8>.asSlice(&c4),
+        List<u8>.asSlice(&c5),
+        line,
+        4,
+        &mut ordered,
+        &mut composed,
+        &mut actual,
+      )
+    failures = failures
+      + run relationships(
+        List<u8>.asSlice(&c5),
+        List<u8>.asSlice(&c4),
+        List<u8>.asSlice(&c5),
+        line,
+        5,
+        &mut ordered,
+        &mut composed,
+        &mut actual,
+      )
+    cases = cases + 1
+  }
+  run Testing.expect(cases == 20171, "complete pinned Unicode 18 normalization row count")
+  run Testing.expect(failures == 0, "Unicode raw normalization conformance failures (see stderr)")
+}
+
+test effect fn fullNormalizationTest() -> ()
+  ! FileError | HostInputError | OutOfMemoryError | AssertionError<'static> | WriterError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run conformance() |> Effect.provideMut<Allocator>(&mut allocator)
+}

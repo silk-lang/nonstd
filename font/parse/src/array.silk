@@ -1,0 +1,340 @@
+//! Lazy borrowed array views; values are decoded only when accessed.
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import font_data { FontData }
+import read { ReadError }
+import font_types.lib { Scalar, rawByteLen }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.collections.slice { Slice }
+
+pub struct ScalarArray<'a, T: Scalar> {
+  data: FontData<'a>,
+}
+
+impl<'a, T: Scalar> Copy for ScalarArray<'a, T> {}
+
+impl<'a, T> ScalarArray<'a, T> {
+  pub fn new(data: FontData<'a>) -> Result<ScalarArray<'a, T>, ReadError> {
+    let size = rawByteLen<T>()
+    if size == 0 || FontData.len(&data) % size != 0 {
+      return Result<Self, ReadError>.failResult(ReadError.InvalidArrayLen)
+    }
+    return Result<Self, ReadError>.succeed(Self { data: data })
+  }
+
+  pub fn empty() -> ScalarArray<'static, T> {
+    return ScalarArray<'static, T> { data: FontData.new(b"") }
+  }
+
+  pub fn len(self: &Self) -> usize {
+    return FontData.len(&self.data) / rawByteLen<T>()
+  }
+
+  pub fn isEmpty(self: &Self) -> bool {
+    return FontData.isEmpty(&self.data)
+  }
+
+  /// Returns the raw big-endian bytes of all elements. For hot loops that decode in place.
+  pub fn bytes(self: &Self) -> &'a [u8] {
+    return FontData.asBytes(&self.data)
+  }
+
+  pub fn get(self: &Self, index: usize) -> Option<T> {
+    if index >= ScalarArray<T>.len(self) {
+      return Option<T>.None
+    }
+    return match move FontData<'a>.readAt<T>(&self.data, index * rawByteLen<T>()) {
+      Result<T, ReadError>.Success { value } => Option<T>.some(move value)
+      Result<T, ReadError>.Failure { error } => Option<T>.None
+    }
+  }
+
+  pub fn iter(self: &Self) -> ScalarIter<'a, T> {
+    return ScalarIter<'a, T> { array: self.*, index: 0 }
+  }
+
+  pub fn offsetData(self: &Self) -> FontData<'a> {
+    return self.data
+  }
+}
+
+pub struct ScalarIter<'a, T: Scalar> {
+  array: ScalarArray<'a, T>,
+  index: usize,
+}
+
+impl<'a, T> ScalarIter<'a, T> {
+  pub fn next(self: &mut Self) -> Option<T> {
+    if self.index >= ScalarArray<T>.len(&self.array) {
+      return Option<T>.None
+    }
+    let item = ScalarArray<T>.get(&self.array, self.index)
+    self.index = self.index + 1
+    return move item
+  }
+}
+
+import read {
+  FontRead,
+  FontReadAt,
+  ComputeSize,
+  readWithArgs,
+  readAtWithArgs,
+  computeSize,
+  VarSize,
+  readLenAt
+}
+import silk.num.usize
+
+pub fn representableLen(start: usize, itemLen: usize, count: usize) -> usize {
+  if itemLen == 0 {
+    return count
+  }
+  let maximum = (usize.MAX - start) / itemLen
+  if count < maximum {
+    return count
+  }
+  return maximum
+}
+
+pub struct ComputedArray<'a, Args: Copy, T: FontReadAt<'a, Args> + ComputeSize<Args>> {
+  itemLen: usize,
+  count: usize,
+  start: usize,
+  data: FontData<'a>,
+  args: Args,
+}
+
+impl<'a, Args: Copy, T: FontReadAt<'a, Args> + ComputeSize<Args>> Copy for ComputedArray<
+  'a,
+  Args,
+  T
+> {}
+
+impl<'a, Args, T> ComputedArray<'a, Args, T> {
+  pub fn empty(args: Args) -> Self {
+    return Self { itemLen: 0, count: 0, start: 0, data: FontData.new(b""), args: args }
+  }
+
+  pub fn new(data: FontData<'a>, start: usize, end: usize, args: Args) -> Result<Self, ReadError> {
+    let itemLen = match move computeSize<Args, T>(args) {
+      Result<usize, ReadError>.Success { value } => value
+      Result<usize, ReadError>.Failure { error } => {
+        return Result<Self, ReadError>.failResult(error)
+      }
+    }
+    if start > end || end > FontData.len(&data) {
+      return Result<Self, ReadError>.failResult(ReadError.OutOfBounds)
+    }
+    let mut count: usize = 0
+    if itemLen != 0 {
+      count = (end - start) / itemLen
+    }
+    return Result<Self, ReadError>.succeed(
+      Self {
+        itemLen: itemLen,
+        count: representableLen(start, itemLen, count),
+        start: start,
+        data: data,
+        args: args,
+      },
+    )
+  }
+
+  pub fn len(self: &Self) -> usize {
+    return self.count
+  }
+
+  pub fn isEmpty(self: &Self) -> bool {
+    return self.count == 0
+  }
+
+  /// Returns the raw bytes of item `index`, `itemLength()` bytes, or an empty slice when it is
+  /// out of range. For hot loops that decode fixed fields in place.
+  pub fn itemBytes(self: &Self, index: usize) -> &'a [u8] {
+    if index >= self.count {
+      return Slice.view<u8>(FontData.asBytes(&self.data), 0, 0)
+    }
+
+    // new/representableLen keep start + count * itemLen within the data.
+    return Slice.view<u8>(
+      FontData.asBytes(&self.data),
+      self.start + index * self.itemLen,
+      self.itemLen,
+    )
+  }
+
+  /// Returns the raw bytes of all items, `len() * itemLength()` bytes.
+  pub fn itemsBytes(self: &Self) -> &'a [u8] {
+    // new/representableLen keep start + count * itemLen within the data.
+    return Slice.view<u8>(FontData.asBytes(&self.data), self.start, self.count * self.itemLen)
+  }
+
+  pub fn get(self: &Self, index: usize) -> Result<T, ReadError> {
+    if index >= self.count {
+      return Result<T, ReadError>.failResult(ReadError.OutOfBounds)
+    }
+
+    // new/representableLen establish the arithmetic bound for every item.
+    return readAtWithArgs<Args, T>(self.data, self.start + index * self.itemLen, self.args)
+  }
+
+  pub fn iter(self: &Self) -> ComputedIter<'a, Args, T> {
+    return ComputedIter<'a, Args, T> { array: self.*, index: 0 }
+  }
+}
+
+pub struct ComputedIter<'a, Args: Copy, T: FontReadAt<'a, Args> + ComputeSize<Args>> {
+  array: ComputedArray<'a, Args, T>,
+  index: usize,
+}
+
+impl<'a, Args, T> ComputedIter<'a, Args, T> {
+  pub fn next(self: &mut Self) -> Option<Result<T, ReadError>> {
+    // Keep the owner lifetime explicit when its interface bounds depend on it.
+    if self.index >= ComputedArray<'a, Args, T>.len(&self.array) {
+      return Option<Result<T, ReadError>>.None
+    }
+    let item = ComputedArray<'a, Args, T>.get(&self.array, self.index)
+    self.index = self.index + 1
+    return Option<Result<T, ReadError>>.some(move item)
+  }
+}
+
+pub struct VarLenArray<'a, T> {
+  data: FontData<'a>,
+}
+
+impl<'a, T> Copy for VarLenArray<'a, T> {}
+
+impl<'a, T> VarLenArray<'a, T> {
+  pub fn empty() -> Self {
+    return Self { data: FontData.new(b"") }
+  }
+
+  pub fn read(data: FontData<'a>) -> Result<Self, ReadError> {
+    return Result<Self, ReadError>.succeed(Self { data: data })
+  }
+
+  pub fn get<T: FontRead<'a, ()> + VarSize>(self: &Self, index: usize) -> Option<
+    Result<T, ReadError>
+  > {
+    if FontData.isEmpty(&self.data) {
+      return Option<Result<T, ReadError>>.None
+    }
+    let mut position: usize = 0
+    let mut i: usize = 0
+    while i < index {
+      let size = match move readLenAt<T>(self.data, position) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          return Option<Result<T, ReadError>>.None
+        }
+      }
+
+      // A zero-size item leaves every subsequent index at the same position.
+      // Upstream returns the read of that empty extent; skip the repeated loop.
+      if size == 0 {
+        break
+      }
+      position = match move usize.checkedAdd(position, size) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          return Option<Result<T, ReadError>>.None
+        }
+      }
+      i = i + 1
+    }
+    let size = match move readLenAt<T>(self.data, position) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Option<Result<T, ReadError>>.None
+      }
+    }
+    let end = match move usize.checkedAdd(position, size) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Option<Result<T, ReadError>>.None
+      }
+    }
+    return match move FontData.slice(&self.data, position, end) {
+      Option<FontData<'a>>.Some { value } => Option<Result<T, ReadError>>.some(
+        readWithArgs<(), T>(value, ()),
+      )
+      Option<FontData<'a>>.None => Option<Result<T, ReadError>>.None
+    }
+  }
+
+  pub fn iter<T: FontRead<'a, ()> + VarSize>(self: &Self) -> VarLenIter<'a, T> {
+    return VarLenIter<'a, T> { data: self.data, done: false }
+  }
+}
+
+pub struct VarLenIter<'a, T: FontRead<'a, ()> + VarSize> {
+  data: FontData<'a>,
+  done: bool,
+}
+
+impl<'a, T> VarLenIter<'a, T> {
+  pub fn next(self: &mut Self) -> Option<Result<T, ReadError>> {
+    if self.done || FontData.isEmpty(&self.data) {
+      return Option<Result<T, ReadError>>.None
+    }
+    let size = match move readLenAt<T>(self.data, 0) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        self.done = true
+        return Option<Result<T, ReadError>>.None
+      }
+    }
+    if size == 0 {
+      self.done = true
+      return Option<Result<T, ReadError>>.None
+    }
+    let item = match move FontData.takeUpTo(&mut self.data, size) {
+      Option<FontData<'a>>.Some { value } => value
+      Option<FontData<'a>>.None => {
+        self.done = true
+        return Option<Result<T, ReadError>>.None
+      }
+    }
+    return Option<Result<T, ReadError>>.some(readWithArgs<(), T>(item, ()))
+  }
+}
+
+import silk.num.u16
+
+impl<'a, T: Scalar> FontRead<'a, u16> for ScalarArray<'a, T> {
+  fn readWithArgs(data: FontData<'a>, args: u16) -> Result<Self, ReadError> {
+    let end = match move usize.checkedMultiply(u16.toUsize(args), rawByteLen<T>()) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Result<Self, ReadError>.failResult(ReadError.OutOfBounds)
+      }
+    }
+    return FontData<'a>.readArray<T>(&data, 0, end)
+  }
+}
+
+impl<'a, T: Scalar> FontRead<'a, usize> for ScalarArray<'a, T> {
+  fn readWithArgs(data: FontData<'a>, count: usize) -> Result<Self, ReadError> {
+    let mut cursor = FontData.cursor(&data)
+    return Cursor<'a>.readArray<T>(&mut cursor, count)
+  }
+}
+
+impl<'a, T: FontReadAt<'a, ()> + ComputeSize<()>> FontRead<'a, usize> for ComputedArray<'a, (), T> {
+  fn readWithArgs(data: FontData<'a>, count: usize) -> Result<Self, ReadError> {
+    let mut cursor = FontData.cursor(&data)
+    return Cursor<'a>.readComputedArray<(), T>(&mut cursor, count, ())
+  }
+}
+
+import font_data { Cursor }
+
+impl<'a, T> FontRead<'a, ()> for VarLenArray<'a, T> {
+  fn readWithArgs(data: FontData<'a>, args: ()) -> Result<Self, ReadError> {
+    return VarLenArray<'a, T>.read(data)
+  }
+}

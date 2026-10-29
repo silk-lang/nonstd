@@ -1,0 +1,417 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+fn deltaSetIndexData(format: EntryFormat, count: usize) -> usize {
+  return usize.saturatingMultiply(
+    count,
+    u8.toUsize(u8.shiftRight(EntryFormat.bits(&format) & 48, 4)) + 1,
+  )
+}
+
+fn itemVariationDataLen(count: u16, words: u16, regions: u16) -> usize {
+  let longs = u16.toUsize(words & 32767)
+  let shorts = usize.saturatingSubtract(u16.toUsize(regions), longs)
+  let mut wordSize: usize = 2
+  let mut smallSize: usize = 1
+  if (words & 32768) != 0 {
+    wordSize = 4
+    smallSize = 2
+  }
+  return (longs * wordSize + shorts * smallSize) * u16.toUsize(count)
+}
+
+import font_types.lib { F48Dot16 }
+import font_data { Cursor }
+import silk.num.i8
+
+pub const NO_VARIATION_INDEX: u32 = 4294967295
+
+pub struct DeltaSetIndex {
+  pub outer: u16,
+  pub inner: u16,
+}
+
+impl Copy for DeltaSetIndex {}
+
+impl DeltaSetIndex {
+  pub fn default() -> Self {
+    return Self { outer: 0, inner: 0 }
+  }
+
+  pub fn noVariationIndex() -> Self {
+    return Self { outer: 65535, inner: 65535 }
+  }
+
+  pub fn fromU32(value: u32) -> Self {
+    return Self { outer: u32.toU16(u32.shiftRight(value, 16)), inner: u32.toU16(value & 65535) }
+  }
+}
+
+impl Equal for DeltaSetIndex {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return left.outer == right.outer && left.inner == right.inner
+  }
+}
+
+impl Order for DeltaSetIndex {
+  fn compare(left: &Self, right: &Self) -> Ordering {
+    if left.outer < right.outer || (left.outer == right.outer && left.inner < right.inner) {
+      return Ordering.Less
+    }
+    if left.outer > right.outer || left.inner > right.inner {
+      return Ordering.Greater
+    }
+    return Ordering.Equal
+  }
+}
+
+impl EntryFormat {
+  pub fn entrySize(self: Self) -> u8 {
+    return u8.shiftRight(self.raw & 48, 4) + 1
+  }
+
+  pub fn bitCount(self: Self) -> u8 {
+    return (self.raw & 15) + 1
+  }
+}
+
+impl<'a> DeltaSetIndexMap<'a> {
+  pub fn get(self: &Self, index: u32) -> Result<DeltaSetIndex, ReadError> {
+    let mut format = EntryFormat.empty()
+    let mut count: u32 = 0
+    let mut data = FontData.new(b"")
+    match &self.* {
+      DeltaSetIndexMap<'a>.Format0 { value } => {
+        format = DeltaSetIndexMapFormat0.entryFormat(&value)
+        count = u16.toU32(DeltaSetIndexMapFormat0.mapCount(&value))
+        data = ScalarArray<u8>.offsetData(&DeltaSetIndexMapFormat0.mapData(&value))
+      }
+      DeltaSetIndexMap<'a>.Format1 { value } => {
+        format = DeltaSetIndexMapFormat1.entryFormat(&value)
+        count = DeltaSetIndexMapFormat1.mapCount(&value)
+        data = ScalarArray<u8>.offsetData(&DeltaSetIndexMapFormat1.mapData(&value))
+      }
+    }
+    if count == 0 {
+      return Result<DeltaSetIndex, ReadError>.succeed(DeltaSetIndex.fromU32(index))
+    }
+    let mut selected = index
+    if selected >= count {
+      selected = count - 1
+    }
+    let size = EntryFormat.entrySize(format)
+    let offset = usize.saturatingMultiply(u32.toUsize(selected), u8.toUsize(size))
+    let mut entry: u32 = 0
+    let mut i: usize = 0
+    while i < u8.toUsize(size) {
+      let byte = match move FontData<'a>.readAt<u8>(&data, usize.saturatingAdd(offset, i)) {
+        Result<u8, ReadError>.Success { value } => value
+        Result<u8, ReadError>.Failure { error } => {
+          return Result<DeltaSetIndex, ReadError>.failResult(error)
+        }
+      }
+      entry = u32.shiftLeft(entry, 8) | u8.toU32(byte)
+      i = i + 1
+    }
+    let bits = u8.toU32(EntryFormat.bitCount(format))
+    return Result<DeltaSetIndex, ReadError>.succeed(
+      DeltaSetIndex {
+        outer: u32.toU16(u32.shiftRight(entry, bits) & 65535),
+        inner: u32.toU16(entry & (u32.shiftLeft(1, bits) - 1)),
+      },
+    )
+  }
+}
+
+impl<'a> ItemVariationData<'a> {
+  pub fn deltaRowLen(words: u16, regions: u16) -> usize {
+    return itemVariationDataLen(1, words, regions)
+  }
+
+  pub fn deltaSetsLen(count: u16, words: u16, regions: u16) -> usize {
+    return itemVariationDataLen(count, words, regions)
+  }
+
+  pub fn getDeltaRowLen(self: &Self) -> usize {
+    return ItemVariationData.deltaRowLen(
+      ItemVariationData.wordDeltaCount(self),
+      ItemVariationData.regionIndexCount(self),
+    )
+  }
+
+  pub fn deltaSet(self: &Self, innerIndex: u16) -> ItemDeltas<'a> {
+    let words = ItemVariationData.wordDeltaCount(self)
+    let bytes = ScalarArray<u8>.offsetData(&ItemVariationData.deltaSets(self))
+    let offset = ItemVariationData.getDeltaRowLen(self) * u16.toUsize(innerIndex)
+    let data = FontData.splitOff(&bytes, offset) |> Option<FontData<'a>>.unwrapOr(FontData.new(b""))
+    return ItemDeltas<'a> {
+      cursor: FontData.cursor(&data),
+      wordCount: words & 32767,
+      longWords: (words & 32768) != 0,
+      len: ItemVariationData.regionIndexCount(self),
+      pos: 0,
+    }
+  }
+}
+
+pub struct ItemDeltas<'a> {
+  cursor: Cursor<'a>,
+  wordCount: u16,
+  longWords: bool,
+  len: u16,
+  pos: u16,
+}
+
+impl<'a> Copy for ItemDeltas<'a> {}
+
+impl<'a> ItemDeltas<'a> {
+  pub fn next(self: &mut Self) -> Option<i32> {
+    if self.pos >= self.len {
+      return Option<i32>.None
+    }
+    let large = self.pos < self.wordCount
+    self.pos = self.pos + 1
+    if large && self.longWords {
+      return match move Cursor<'a>.read<i32>(&mut self.cursor) {
+        Result<i32, ReadError>.Success { value } => Option<i32>.some(value)
+        _ => Option<i32>.None
+      }
+    }
+    if large || self.longWords {
+      return match move Cursor<'a>.read<i16>(&mut self.cursor) {
+        Result<i16, ReadError>.Success { value } => Option<i32>.some(i16.toI32(value))
+        _ => Option<i32>.None
+      }
+    }
+    return match move Cursor<'a>.read<i8>(&mut self.cursor) {
+      Result<i8, ReadError>.Success { value } => Option<i32>.some(i8.toI32(value))
+      _ => Option<i32>.None
+    }
+  }
+}
+
+impl<'a> VariationRegion<'a> {
+  pub fn computeScalar(self: &Self, coords: &[F2Dot14]) -> Fixed {
+    let axes = VariationRegion.regionAxes(self)
+    let mut scalar = Fixed.one()
+    let mut i: usize = 0
+    while i < ComputedArray<'a, (), RegionAxisCoordinates<'a>>.len(&axes) {
+      let axis = match move ComputedArray<'a, (), RegionAxisCoordinates<'a>>.get(&axes, i) {
+        Result<RegionAxisCoordinates<'a>, ReadError>.Success { value } => value
+        _ => {
+          return Fixed.zero()
+        }
+      }
+      let peak = RegionAxisCoordinates.peakCoord(&axis)
+      let mut coord = F2Dot14.zero()
+      if i < coords.length {
+        coord = coords[i]
+      }
+      i = i + 1
+      if F2Dot14.toBits(peak) == 0 || F2Dot14.toBits(peak) == F2Dot14.toBits(coord) {
+        continue
+      }
+      let start = F2Dot14.toFixed(RegionAxisCoordinates.startCoord(&axis))
+      let end = F2Dot14.toFixed(RegionAxisCoordinates.endCoord(&axis))
+      let peakFixed = F2Dot14.toFixed(peak)
+      if Fixed.toBits(start) > Fixed.toBits(peakFixed)
+        || Fixed.toBits(peakFixed) > Fixed.toBits(end)
+        || (Fixed.toBits(start) < 0 && Fixed.toBits(end) > 0) {
+        continue
+      }
+      let point = F2Dot14.toFixed(coord)
+      if Fixed.toBits(point) < Fixed.toBits(start) || Fixed.toBits(point) > Fixed.toBits(end) {
+        return Fixed.zero()
+      }
+      if Fixed.toBits(point) < Fixed.toBits(peakFixed) {
+        scalar = Fixed.mulDiv(&scalar, point - start, peakFixed - start)
+      } else {
+        scalar = Fixed.mulDiv(&scalar, end - point, end - peakFixed)
+      }
+    }
+    return scalar
+  }
+}
+
+impl<'a> ItemVariationStore<'a> {
+  pub fn computeDelta(self: &Self, index: DeltaSetIndex, coords: &[F2Dot14]) -> Option<F48Dot16> {
+    return ItemVariationStore.computeDeltaWithScalars(self, index, coords, &[])
+  }
+
+  pub fn computeDeltaWithScalars(
+    self: &Self,
+    index: DeltaSetIndex,
+    coords: &[F2Dot14],
+    scalars: &[Fixed],
+  ) -> Option<F48Dot16> {
+    if coords.length == 0 || (index.outer == 65535 && index.inner == 65535) {
+      return Option<F48Dot16>.some(F48Dot16.zero())
+    }
+    let offsets = ItemVariationStore.itemVariationData(self)
+    let data = match move ArrayOfNullableOffsets<'a, (), ItemVariationData<'a>, Offset32>.get(
+      &offsets,
+      u16.toUsize(index.outer),
+    ) {
+      Option<Result<ItemVariationData<'a>, ReadError>>.None => {
+        return Option<F48Dot16>.some(F48Dot16.zero())
+      }
+      Option<Result<ItemVariationData<'a>, ReadError>>.Some { value } => match move value {
+        Result<ItemVariationData<'a>, ReadError>.Success { value: item } => item
+        _ => {
+          return Option<F48Dot16>.None
+        }
+      }
+    }
+    let indices = ItemVariationData.regionIndexes(&data)
+    let mut deltas = ItemVariationData.deltaSet(&data, index.inner)
+    let mut regions = Option<ComputedArray<'a, u16, VariationRegion<'a>>>.None
+    let mut accum = F48Dot16.zero()
+    let mut i: usize = 0
+    while i < ScalarArray<u16>.len(&indices) {
+      let delta = match move ItemDeltas.next(&mut deltas) {
+        Option<i32>.Some { value } => value
+        Option<i32>.None => {
+          break
+        }
+      }
+      let regionIndex = u16.toUsize(ScalarArray<u16>.get(&indices, i) |> Option<u16>.unwrapOr(0))
+      i = i + 1
+      let mut scalar = Fixed.zero()
+      if regionIndex < scalars.length {
+        scalar = scalars[regionIndex]
+      } else {
+        if match &regions {
+          Option<ComputedArray<'a, u16, VariationRegion<'a>>>.None => true
+          _ => false
+        } {
+          let list = match move ItemVariationStore.variationRegionList(self) {
+            Result<VariationRegionList<'a>, ReadError>.Success { value } => value
+            _ => {
+              return Option<F48Dot16>.None
+            }
+          }
+          regions = Option<ComputedArray<'a, u16, VariationRegion<'a>>>.some(
+            VariationRegionList.variationRegions(&list),
+          )
+        }
+        let regionResult = match &regions {
+          Option<ComputedArray<'a, u16, VariationRegion<'a>>>.Some { value } => ComputedArray<
+            'a,
+            u16,
+            VariationRegion<'a>
+          >.get(&value, regionIndex)
+          _ => {
+            return Option<F48Dot16>.None
+          }
+        }
+        let region = match move regionResult {
+          Result<VariationRegion<'a>, ReadError>.Success { value } => value
+          _ => {
+            return Option<F48Dot16>.None
+          }
+        }
+
+        // Resolve even zero deltas: malformed region indices must still fail.
+        if delta == 0 {
+          continue
+        }
+        scalar = VariationRegion.computeScalar(&region, coords)
+      }
+      accum = accum + Fixed.mulI32(scalar, delta)
+    }
+    return Option<F48Dot16>.some(accum)
+  }
+
+  pub fn computeScalars(self: &Self, coords: &[F2Dot14], out: &mut [Fixed]) -> usize {
+    let list = match move ItemVariationStore.variationRegionList(self) {
+      Result<VariationRegionList<'a>, ReadError>.Success { value } => value
+      _ => {
+        return 0
+      }
+    }
+    let regions = VariationRegionList.variationRegions(&list)
+    let mut count = ComputedArray<'a, u16, VariationRegion<'a>>.len(&regions)
+    if count > out.length {
+      count = out.length
+    }
+    let mut i: usize = 0
+    while i < count {
+      let region = match move ComputedArray<'a, u16, VariationRegion<'a>>.get(&regions, i) {
+        Result<VariationRegion<'a>, ReadError>.Success { value } => value
+        _ => {
+          return i
+        }
+      }
+      out[i] = VariationRegion.computeScalar(&region, coords)
+      i = i + 1
+    }
+    return count
+  }
+}
+
+pub fn advanceDeltaWithScalars<'a>(
+  mapping: Option<Result<DeltaSetIndexMap<'a>, ReadError>>,
+  store: Result<ItemVariationStore<'a>, ReadError>,
+  glyphId: GlyphId,
+  coords: &[F2Dot14],
+  scalars: &[Fixed],
+) -> Option<F48Dot16> {
+  if coords.length == 0 {
+    return Option<F48Dot16>.some(F48Dot16.zero())
+  }
+  let gid = GlyphId.toU32(glyphId)
+  let mut index = DeltaSetIndex.default()
+  match move mapping {
+    Option<Result<DeltaSetIndexMap<'a>, ReadError>>.Some {
+      value: Result<DeltaSetIndexMap<'a>, ReadError>.Success { value }
+    } => {
+      index = match move DeltaSetIndexMap.get(&value, gid) {
+        Result<DeltaSetIndex, ReadError>.Success { value: found } => found
+        _ => {
+          return Option<F48Dot16>.None
+        }
+      }
+    }
+    _ => {
+      if gid > 65535 {
+        return Option<F48Dot16>.some(F48Dot16.zero())
+      }
+      index = DeltaSetIndex { outer: 0, inner: u32.toU16(gid) }
+    }
+  }
+  return match move store {
+    Result<ItemVariationStore<'a>, ReadError>.Success {
+      value
+    } => ItemVariationStore.computeDeltaWithScalars(&value, index, coords, scalars)
+    _ => Option<F48Dot16>.None
+  }
+}
+
+pub fn itemDeltaWithScalars<'a>(
+  mapping: Option<Result<DeltaSetIndexMap<'a>, ReadError>>,
+  store: Result<ItemVariationStore<'a>, ReadError>,
+  glyphId: GlyphId,
+  coords: &[F2Dot14],
+  scalars: &[Fixed],
+) -> Option<F48Dot16> {
+  if coords.length == 0 {
+    return Option<F48Dot16>.some(F48Dot16.zero())
+  }
+  let index = match move mapping {
+    Option<Result<DeltaSetIndexMap<'a>, ReadError>>.Some {
+      value: Result<DeltaSetIndexMap<'a>, ReadError>.Success { value }
+    } => match move DeltaSetIndexMap.get(&value, GlyphId.toU32(glyphId)) {
+      Result<DeltaSetIndex, ReadError>.Success { value: index } => index
+      _ => {
+        return Option<F48Dot16>.None
+      }
+    }
+    _ => {
+      return Option<F48Dot16>.None
+    }
+  }
+  return match move store {
+    Result<ItemVariationStore<'a>, ReadError>.Success {
+      value
+    } => ItemVariationStore.computeDeltaWithScalars(&value, index, coords, scalars)
+    _ => Option<F48Dot16>.None
+  }
+}

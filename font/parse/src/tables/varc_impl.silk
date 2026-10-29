@@ -1,0 +1,444 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import silk.core.effect { Effect }
+
+// Snapshot views retain font bytes without borrowing a temporary table facade.
+effect fn varcTake<T>(result: Result<T, ReadError>) -> T
+  ! ReadError {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    Result<T, ReadError>.Failure { error } => {
+      fail error
+    }
+  }
+}
+
+fn varcCopy<T: Copy>(option: &Option<T>) -> Option<T> {
+  return match &option.* {
+    Option<T>.Some { value } => Option<T>.some(value)
+    _ => Option<T>.None
+  }
+}
+
+effect fn varcIndex<'a>(result: Option<Result<Index2<'a>, ReadError>>, nth: usize) -> &'a [u8]
+  ! ReadError {
+  let index = match move result {
+    Option<Result<Index2<'a>, ReadError>>.Some { value } => run varcTake(move value)
+    _ => {
+      fail ReadError.NullOffset
+    }
+  }
+  return match move Index2.get(&index, nth) {
+    Option<&'a [u8]>.Some { value } => value
+    _ => {
+      fail ReadError.OutOfBounds
+    }
+  }
+}
+
+impl<'a> Varc<'a> {
+  pub fn axisIndices(self: &Self, nth: usize) -> Result<PackedDeltas<'a>, ReadError> {
+    return run Effect.result(Varc.readAxes(self, nth))
+  }
+
+  effect fn readAxes(self: &Self, nth: usize) -> PackedDeltas<'a>
+    ! ReadError {
+    return PackedDeltas.consumeAll(FontData.new(run varcIndex(Varc.axisIndicesList(self), nth)))
+  }
+
+  pub fn glyph(self: &Self, nth: usize) -> Result<VarcGlyph<'a>, ReadError> {
+    return run Effect.result(Varc.readGlyph(self, nth))
+  }
+
+  effect fn readGlyph(self: &Self, nth: usize) -> VarcGlyph<'a>
+    ! ReadError {
+    return VarcGlyph<'a> {
+      table: self.*,
+      data: FontData.new(
+        run varcIndex(
+          Option<Result<Index2<'a>, ReadError>>.some(Varc.varCompositeGlyphs(self)),
+          nth,
+        ),
+      ),
+    }
+  }
+}
+
+impl<'a> SparseVariationRegion<'a> {
+  pub fn computeScalarF32(self: &Self, coords: &[F2Dot14]) -> f32 {
+    let axes = SparseVariationRegion.axisCoordinates(self)
+    let mut scalar: f32 = 1.0
+    let mut i: usize = 0
+    while i < ArrayOfOffsets<'a, (), SparseRegionAxisCoordinates<'a>, Offset32>.len(&axes) {
+      let axis = match move ArrayOfOffsets<'a, (), SparseRegionAxisCoordinates<'a>, Offset32>.get(
+        &axes,
+        i,
+      ) {
+        Result<SparseRegionAxisCoordinates<'a>, ReadError>.Success { value } => value
+        _ => {
+          return 0.0
+        }
+      }
+      i = i + 1
+      let peak = i16.toI32(F2Dot14.toBits(SparseRegionAxisCoordinates.peak(&axis)))
+      if peak == 0 {
+        continue
+      }
+      let index = u16.toUsize(SparseRegionAxisCoordinates.axisIndex(&axis))
+      let mut coord: i32 = 0
+      if index < coords.length {
+        coord = i16.toI32(F2Dot14.toBits(coords[index]))
+      }
+      if coord == peak {
+        continue
+      }
+      if coord == 0 {
+        return 0.0
+      }
+      let start = i16.toI32(F2Dot14.toBits(SparseRegionAxisCoordinates.start(&axis)))
+      let end = i16.toI32(F2Dot14.toBits(SparseRegionAxisCoordinates.end(&axis)))
+      if start > peak || peak > end || (start < 0 && end > 0) {
+        continue
+      }
+      if coord < start || coord > end {
+        return 0.0
+      }
+      if coord < peak {
+        let num = coord - start
+        if num == 0 {
+          return 0.0
+        }
+        scalar = scalar * (i32.toF32(num) / i32.toF32(peak - start))
+      } else {
+        let num = end - coord
+        if num == 0 {
+          return 0.0
+        }
+        scalar = scalar * (i32.toF32(num) / i32.toF32(end - peak))
+      }
+    }
+    return scalar
+  }
+}
+
+pub struct VarcGlyph<'a> {
+  table: Varc<'a>,
+  data: FontData<'a>,
+}
+
+impl<'a> Copy for VarcGlyph<'a> {}
+
+impl<'a> VarcGlyph<'a> {
+  pub fn components(self: &Self) -> VarcComponentIter<'a> {
+    return VarcComponentIter<'a> { table: self.table, cursor: FontData.cursor(&self.data) }
+  }
+}
+
+pub struct VarcComponentIter<'a> {
+  table: Varc<'a>,
+  cursor: Cursor<'a>,
+}
+
+impl<'a> Copy for VarcComponentIter<'a> {}
+
+impl<'a> VarcComponentIter<'a> {
+  pub fn next(self: &mut Self) -> Option<Result<VarcComponent<'a>, ReadError>> {
+    if Cursor.isEmpty(&self.cursor) {
+      return Option<Result<VarcComponent<'a>, ReadError>>.None
+    }
+    return Option<Result<VarcComponent<'a>, ReadError>>.some(
+      run Effect.result(VarcComponent.parse(&self.table, &mut self.cursor)),
+    )
+  }
+}
+
+pub struct VarcComponent<'a> {
+  _flags: VarcFlags,
+  _gid: GlyphId,
+  _conditionIndex: Option<u32>,
+  _axisIndicesIndex: Option<u32>,
+  _axisValues: Option<PackedDeltas<'a>>,
+  _axisValuesVarIndex: Option<u32>,
+  _transformVarIndex: Option<u32>,
+  _transform: DecomposedTransform,
+}
+
+impl<'a> VarcComponent<'a> {
+  effect fn parse<'t>(table: &Varc<'t>, cursor: &mut Cursor<'a>) -> Self
+    ! ReadError {
+    let raw = run varcTake(Cursor.readU32Var(&mut cursor))
+    let flags = VarcFlags.fromBitsTruncate(raw)
+    let mut gid = GlyphId.new(0)
+    if (raw & 4096) != 0 {
+      gid = GlyphId.new(Uint24.toU32(run varcTake(Cursor<'a>.read<Uint24>(&mut cursor))))
+    } else {
+      gid = GlyphId.new(u16.toU32(run varcTake(Cursor<'a>.read<u16>(&mut cursor))))
+    }
+    let mut conditionIndex = Option<u32>.None
+    if (raw & 128) != 0 {
+      conditionIndex = Option<u32>.some(run varcTake(Cursor.readU32Var(&mut cursor)))
+    }
+    let mut axisIndex = Option<u32>.None
+    let mut axisValues = Option<PackedDeltas<'a>>.None
+    if (raw & 2) != 0 {
+      let index = run varcTake(Cursor.readU32Var(&mut cursor))
+      axisIndex = Option<u32>.some(index)
+      let count = PackedDeltas.countOrCompute(
+        &run varcTake(Varc.axisIndices(table, u32.toUsize(index))),
+      )
+      if count > 0 {
+        let data = match move Cursor.remaining(&cursor) {
+          Option<FontData<'a>>.Some { value } => value
+          _ => {
+            fail ReadError.OutOfBounds
+          }
+        }
+        let deltas = PackedDeltas.new(data, count)
+        cursor.* = DeltaRunIter.end(PackedDeltas.iter(&deltas))
+        axisValues = Option<PackedDeltas<'a>>.some(deltas)
+      }
+    }
+    let mut axisVarIndex = Option<u32>.None
+    if (raw & 4) != 0 {
+      axisVarIndex = Option<u32>.some(run varcTake(Cursor.readU32Var(&mut cursor)))
+    }
+    let mut transformVarIndex = Option<u32>.None
+    if (raw & 8) != 0 {
+      transformVarIndex = Option<u32>.some(run varcTake(Cursor.readU32Var(&mut cursor)))
+    }
+    let mut transform = DecomposedTransform.default()
+    if (raw & 16) != 0 {
+      transform._translateX = i16.toF32(run varcTake(Cursor<'a>.read<i16>(&mut cursor)))
+    }
+    if (raw & 32) != 0 {
+      transform._translateY = i16.toF32(run varcTake(Cursor<'a>.read<i16>(&mut cursor)))
+    }
+    if (raw & 64) != 0 {
+      transform._rotation = F4Dot12.toF32(run varcTake(Cursor<'a>.read<F4Dot12>(&mut cursor)))
+    }
+    if (raw & 768) != 0 {
+      if (raw & 256) != 0 {
+        transform._scaleX = F6Dot10.toF32(run varcTake(Cursor<'a>.read<F6Dot10>(&mut cursor)))
+      }
+      transform._scaleY = transform._scaleX
+      if (raw & 512) != 0 {
+        transform._scaleY = F6Dot10.toF32(run varcTake(Cursor<'a>.read<F6Dot10>(&mut cursor)))
+      }
+    }
+    if (raw & 8192) != 0 {
+      transform._skewX = F4Dot12.toF32(run varcTake(Cursor<'a>.read<F4Dot12>(&mut cursor)))
+    }
+    if (raw & 16384) != 0 {
+      transform._skewY = F4Dot12.toF32(run varcTake(Cursor<'a>.read<F4Dot12>(&mut cursor)))
+    }
+    if (raw & 1024) != 0 {
+      transform._centerX = i16.toF32(run varcTake(Cursor<'a>.read<i16>(&mut cursor)))
+    }
+    if (raw & 2048) != 0 {
+      transform._centerY = i16.toF32(run varcTake(Cursor<'a>.read<i16>(&mut cursor)))
+    }
+    let mut reserved = u32.shiftRight(raw & 4294934528, 15)
+    while reserved != 0 {
+      if (reserved & 1) != 0 {
+        let ignored = run varcTake(Cursor.readU32Var(&mut cursor))
+      }
+      reserved = u32.shiftRight(reserved, 1)
+    }
+    return Self {
+      _flags: flags,
+      _gid: gid,
+      _conditionIndex: move conditionIndex,
+      _axisIndicesIndex: move axisIndex,
+      _axisValues: move axisValues,
+      _axisValuesVarIndex: move axisVarIndex,
+      _transformVarIndex: move transformVarIndex,
+      _transform: transform,
+    }
+  }
+
+  pub fn flags(self: &Self) -> VarcFlags {
+    return self._flags
+  }
+
+  pub fn gid(self: &Self) -> GlyphId {
+    return self._gid
+  }
+
+  pub fn conditionIndex(self: &Self) -> Option<u32> {
+    return varcCopy(&self._conditionIndex)
+  }
+
+  pub fn axisIndicesIndex(self: &Self) -> Option<u32> {
+    return varcCopy(&self._axisIndicesIndex)
+  }
+
+  pub fn axisValues(self: &Self) -> Option<PackedDeltas<'a>> {
+    return varcCopy(&self._axisValues)
+  }
+
+  pub fn axisValuesVarIndex(self: &Self) -> Option<u32> {
+    return varcCopy(&self._axisValuesVarIndex)
+  }
+
+  pub fn transformVarIndex(self: &Self) -> Option<u32> {
+    return varcCopy(&self._transformVarIndex)
+  }
+
+  pub fn transform(self: &Self) -> DecomposedTransform {
+    return self._transform
+  }
+}
+
+pub struct DecomposedTransform {
+  _translateX: f32,
+  _translateY: f32,
+  _rotation: f32,
+  _scaleX: f32,
+  _scaleY: f32,
+  _skewX: f32,
+  _skewY: f32,
+  _centerX: f32,
+  _centerY: f32,
+}
+
+impl Copy for DecomposedTransform {}
+
+// Match upstream's platform f32 trigonometry, including rounding of matrix entries.
+unsafe extern "C" fn sinf(value: f32) -> f32
+
+unsafe extern "C" fn cosf(value: f32) -> f32
+
+unsafe extern "C" fn tanf(value: f32) -> f32
+
+impl DecomposedTransform {
+  pub fn default() -> Self {
+    return Self {
+      _translateX: 0.0,
+      _translateY: 0.0,
+      _rotation: 0.0,
+      _scaleX: 1.0,
+      _scaleY: 1.0,
+      _skewX: 0.0,
+      _skewY: 0.0,
+      _centerX: 0.0,
+      _centerY: 0.0,
+    }
+  }
+
+  pub fn translateX(self: &Self) -> f32 {
+    return self._translateX
+  }
+
+  pub fn setTranslateX(self: &mut Self, value: f32) -> () {
+    self._translateX = value
+  }
+
+  pub fn translateY(self: &Self) -> f32 {
+    return self._translateY
+  }
+
+  pub fn setTranslateY(self: &mut Self, value: f32) -> () {
+    self._translateY = value
+  }
+
+  pub fn rotation(self: &Self) -> f32 {
+    return self._rotation
+  }
+
+  pub fn setRotation(self: &mut Self, value: f32) -> () {
+    self._rotation = value
+  }
+
+  pub fn scaleX(self: &Self) -> f32 {
+    return self._scaleX
+  }
+
+  pub fn setScaleX(self: &mut Self, value: f32) -> () {
+    self._scaleX = value
+  }
+
+  pub fn scaleY(self: &Self) -> f32 {
+    return self._scaleY
+  }
+
+  pub fn setScaleY(self: &mut Self, value: f32) -> () {
+    self._scaleY = value
+  }
+
+  pub fn skewX(self: &Self) -> f32 {
+    return self._skewX
+  }
+
+  pub fn setSkewX(self: &mut Self, value: f32) -> () {
+    self._skewX = value
+  }
+
+  pub fn skewY(self: &Self) -> f32 {
+    return self._skewY
+  }
+
+  pub fn setSkewY(self: &mut Self, value: f32) -> () {
+    self._skewY = value
+  }
+
+  pub fn centerX(self: &Self) -> f32 {
+    return self._centerX
+  }
+
+  pub fn setCenterX(self: &mut Self, value: f32) -> () {
+    self._centerX = value
+  }
+
+  pub fn centerY(self: &Self) -> f32 {
+    return self._centerY
+  }
+
+  pub fn setCenterY(self: &mut Self, value: f32) -> () {
+    self._centerY = value
+  }
+
+  pub fn matrix(self: &Self) -> Matrix<f32> {
+    let mut transform = Matrix.identity<f32>()
+    transform.dx = self._translateX + self._centerX
+    transform.dy = self._translateY + self._centerY
+    let pi: f32 = 3.14159265358979323846
+    if self._rotation != 0.0 {
+      let angle = self._rotation * pi
+      let s = unsafe sinf(angle)
+      let c = unsafe cosf(angle)
+      transform = transform * Matrix.fromElements<f32>([c, s, -s, c, 0.0, 0.0])
+    }
+    if self._scaleX != 1.0 || self._scaleY != 1.0 {
+      transform = transform
+        * Matrix.fromElements<f32>([self._scaleX, 0.0, 0.0, self._scaleY, 0.0, 0.0])
+    }
+    if self._skewX != 0.0 || self._skewY != 0.0 {
+      transform = transform
+        * Matrix.fromElements<f32>(
+          [1.0, unsafe tanf(self._skewY * pi), unsafe tanf(-self._skewX * pi), 1.0, 0.0, 0.0],
+        )
+    }
+    if self._centerX != 0.0 || self._centerY != 0.0 {
+      transform = transform
+        * Matrix.fromElements<f32>([1.0, 0.0, 0.0, 1.0, -self._centerX, -self._centerY])
+    }
+    return transform
+  }
+}
+
+impl<'a> MultiItemVariationData<'a> {
+  pub fn deltaSet(self: &Self, index: usize) -> Result<PackedDeltas<'a>, ReadError> {
+    return run Effect.result(MultiItemVariationData.readDeltaSet(self, index))
+  }
+
+  effect fn readDeltaSet(self: &Self, index: usize) -> PackedDeltas<'a>
+    ! ReadError {
+    return PackedDeltas.consumeAll(
+      FontData.new(
+        run varcIndex(
+          Option<Result<Index2<'a>, ReadError>>.some(MultiItemVariationData.deltaSets(self)),
+          index,
+        ),
+      ),
+    )
+  }
+}

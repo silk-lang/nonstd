@@ -1,0 +1,299 @@
+//! Media Queries 4 grammar, per-arm recovery, and Kleene three-valued evaluation.
+import input { Input, TokenView }
+import tokens { Kind, Limits, CssError }
+import condition_cursor { Structure }
+import condition_cursor
+import media_features { Environment, MediaType, Truth }
+import media_features
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+struct Parsed {
+  valid: bool,
+  value: Truth,
+  next: usize,
+}
+
+fn invalid(position: usize) -> Parsed {
+  return Parsed { valid: false, value: Truth.Unknown, next: position }
+}
+
+fn negate(value: Truth) -> Truth {
+  return match value {
+    Truth.True => Truth.False
+    Truth.False => Truth.True
+    Truth.Unknown => Truth.Unknown
+  }
+}
+
+fn conjunction(left: Truth, right: Truth) -> Truth {
+  if left == Truth.False || right == Truth.False {
+    return Truth.False
+  }
+  if left == Truth.Unknown || right == Truth.Unknown {
+    return Truth.Unknown
+  }
+  return Truth.True
+}
+
+fn disjunction(left: Truth, right: Truth) -> Truth {
+  if left == Truth.True || right == Truth.True {
+    return Truth.True
+  }
+  if left == Truth.Unknown || right == Truth.Unknown {
+    return Truth.Unknown
+  }
+  return Truth.False
+}
+
+effect fn inParens(
+  input: &Input,
+  start: usize,
+  end: usize,
+  structure: &Structure,
+  environment: &Environment,
+) -> Parsed
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let position = condition_cursor.skip(input, start, end)
+  if position >= end {
+    return invalid(position)
+  }
+  let view = input.at(position)
+  let mut function = false
+  match &view {
+    Option<TokenView>.Some { value } => {
+      match &value.token.kind {
+        Kind.OpenParen => {}
+        Kind.Function { name } => {
+          function = true
+        }
+        _ => {
+          return invalid(position)
+        }
+      }
+    }
+    _ => {
+      return invalid(position)
+    }
+  }
+  let close = structure.end(position)
+  if close > end || !structure.any(position + 1, close) {
+    return invalid(position)
+  }
+  let next = if close < end {
+    close + 1
+  } else {
+    close
+  }
+  if function {
+    return Parsed { valid: true, value: Truth.Unknown, next: next }
+  }
+  let nested = run condition(input, position + 1, close, false, structure, environment)
+  if nested.valid && condition_cursor.skip(input, nested.next, close) == close {
+    return Parsed { valid: true, value: nested.value, next: next }
+  }
+
+  // The feature branch precedes general-enclosed. Both unknown feature syntax and
+  // general-enclosed have the same Unknown result; invalid any-value was rejected above.
+  let feature = run media_features.evaluate(input, position + 1, close, environment)
+  return Parsed { valid: true, value: feature, next: next }
+}
+
+effect fn condition(
+  input: &Input,
+  start: usize,
+  end: usize,
+  withoutOr: bool,
+  structure: &Structure,
+  environment: &Environment,
+) -> Parsed
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut position = condition_cursor.skip(input, start, end)
+  if position >= end {
+    return invalid(position)
+  }
+  if condition_cursor.ident(input, position, b"not") {
+    let term = run inParens(input, position + 1, end, structure, environment)
+    if !term.valid {
+      return invalid(position)
+    }
+    return Parsed { valid: true, value: negate(term.value), next: term.next }
+  }
+  let first = run inParens(input, position, end, structure, environment)
+  if !first.valid {
+    return invalid(position)
+  }
+  let mut result = first.value
+  position = condition_cursor.skip(input, first.next, end)
+  let mut operator: u8 = 0
+  while position < end {
+    let mut current: u8 = 0
+    if condition_cursor.ident(input, position, b"and") {
+      current = 1
+    } else if !withoutOr && condition_cursor.ident(input, position, b"or") {
+      current = 2
+    } else {
+      return invalid(position)
+    }
+    if operator != 0 && operator != current {
+      return invalid(position)
+    }
+    operator = current
+    let term = run inParens(input, position + 1, end, structure, environment)
+    if !term.valid {
+      return invalid(position)
+    }
+    result = if operator == 1 {
+      conjunction(result, term.value)
+    } else {
+      disjunction(result, term.value)
+    }
+    position = condition_cursor.skip(input, term.next, end)
+  }
+  return Parsed { valid: true, value: result, next: position }
+}
+
+effect fn query(
+  input: &Input,
+  start: usize,
+  end: usize,
+  structure: &Structure,
+  environment: &Environment,
+) -> Truth
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut position = condition_cursor.skip(input, start, end)
+  if position >= end {
+    return Truth.False
+  }
+  let expression = run condition(input, position, end, false, structure, environment)
+  if expression.valid && condition_cursor.skip(input, expression.next, end) == end {
+    return expression.value
+  }
+  let mut negative = false
+  if condition_cursor.ident(input, position, b"not") {
+    negative = true
+    position = condition_cursor.skip(input, position + 1, end)
+  } else if condition_cursor.ident(input, position, b"only") {
+    position = condition_cursor.skip(input, position + 1, end)
+  }
+  if position >= end {
+    return Truth.False
+  }
+  if condition_cursor.ident(input, position, b"not")
+    || condition_cursor.ident(input, position, b"only")
+    || condition_cursor.ident(input, position, b"and")
+    || condition_cursor.ident(input, position, b"or")
+    || condition_cursor.ident(input, position, b"layer") {
+    return Truth.False
+  }
+  let typeView = input.at(position)
+  match &typeView {
+    Option<TokenView>.Some { value } => {
+      match &value.token.kind {
+        Kind.Ident { text } => {}
+        _ => {
+          return Truth.False
+        }
+      }
+    }
+    _ => {
+      return Truth.False
+    }
+  }
+  let isPrint = environment.mediaType == MediaType.Print
+
+  // MQ4 explicitly deprecates speech and the legacy types: they match nothing.
+  let matched = condition_cursor.ident(input, position, b"all")
+    || (condition_cursor.ident(input, position, b"print") && isPrint)
+    || (condition_cursor.ident(input, position, b"screen") && !isPrint)
+  let mut result = if matched {
+    Truth.True
+  } else {
+    Truth.False
+  }
+  position = condition_cursor.skip(input, position + 1, end)
+  if position < end {
+    if !condition_cursor.ident(input, position, b"and") {
+      return Truth.False
+    }
+    let suffix = run condition(input, position + 1, end, true, structure, environment)
+    if !suffix.valid || condition_cursor.skip(input, suffix.next, end) != end {
+      return Truth.False
+    }
+    result = conjunction(result, suffix.value)
+  }
+  return if negative {
+    negate(result)
+  } else {
+    result
+  }
+}
+
+// https://www.w3.org/TR/mediaqueries-4/#mq-syntax
+// https://www.w3.org/TR/mediaqueries-4/#evaluating
+// https://www.w3.org/TR/mediaqueries-4/#error-handling
+pub effect fn matches(input: &Input, environment: &Environment, limits: &Limits) -> bool
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let structure = run condition_cursor.inspect(input, limits)
+  if !structure.valid {
+    return false
+  }
+  let end = input.length()
+  if condition_cursor.skip(input, 0, end) == end {
+    return true
+  }
+  let mut start: usize = 0
+  let mut position: usize = 0
+  let mut matched = false
+  while position < end {
+    let view = input.at(position)
+    let mut comma = false
+    let mut block = false
+    match &view {
+      Option<TokenView>.Some { value } => {
+        match &value.token.kind {
+          Kind.Comma => {
+            comma = true
+          }
+          Kind.Function { name } => {
+            block = true
+          }
+          Kind.OpenParen => {
+            block = true
+          }
+          Kind.OpenSquare => {
+            block = true
+          }
+          Kind.OpenBrace => {
+            block = true
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    if comma {
+      let result = run query(input, start, position, &structure, environment)
+      if result == Truth.True {
+        matched = true
+      }
+      start = position + 1
+    }
+    if block {
+      let close = structure.end(position)
+      position = if close < end {
+        close + 1
+      } else {
+        end
+      }
+    } else {
+      position = position + 1
+    }
+  }
+  let result = run query(input, start, end, &structure, environment)
+  return matched || result == Truth.True
+}

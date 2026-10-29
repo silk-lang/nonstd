@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Compare AAT prefixes, format dispatch, offsets, and equal-sized table scopes."""
+import argparse
+import ast
+from pathlib import Path
+import re
+import struct
+import tempfile
+import harness
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def sfnt(tables):
+    tables = {b'maxp': struct.pack('>IH', 0x5000, 32)} | tables
+    out = bytearray(struct.pack('>IHHHH', 0x10000, len(tables), 0, 0, 0) + bytes(16 * len(tables)))
+    for i, (tag, payload) in enumerate(sorted(tables.items())):
+        struct.pack_into('>4sIII', out, 12 + i * 16, tag, 0, len(out), len(payload))
+        out.extend(payload)
+        out.extend(bytes(-len(out) % 4))
+    return bytes(out)
+
+
+def literals(text):
+    return [ast.literal_eval(value) for value in re.findall(r'b"(?:\\.|[^"\\])*"', text)]
+
+
+def morph(body, format, extended=True):
+    header = struct.pack('>III', len(body) + 12, 0x20000000 | format, 1) if extended else struct.pack('>HHI', len(body) + 8, 0x2000 | format, 1)
+    subtable = header + body
+    chain = (struct.pack('>IIII', 1, 16 + len(subtable), 0, 1) if extended else struct.pack('>IIHH', 1, 12 + len(subtable), 0, 1)) + subtable
+    return struct.pack('>HHI', 2 if extended else 1, 0, 1) + chain
+
+
+def kerx(body, format, tuples=0):
+    return struct.pack('>HHI', 2, 0, 1) + struct.pack('>III', len(body) + 12, format, tuples) + body
+
+
+def seeds():
+    for file in sorted((ROOT / 'font/parse/upstream/font-test-data/test_data/ttf').glob('TestMORX*.ttf')):
+        data = file.read_bytes()
+        for i in range(struct.unpack_from('>H', data, 4)[0]):
+            tag, _, off, size = struct.unpack_from('>4sIII', data, 12 + i * 16)
+            if tag in {b'morx', b'mort', b'kerx', b'kern', b'trak', b'ankr', b'feat', b'ltag'}:
+                yield file.stem + '-' + tag.decode(), tag, data[off:off + size]
+    source = (ROOT / 'font/parse/src/generated_aat_fixtures.silk').read_text()
+    for name in ('otKern0', 'aatKern0', 'kern2'):
+        yield name, b'kern', literals(source.split(f'fn {name}()', 1)[1])[0]
+    source = (ROOT / 'font/parse/src/kerning_tests.silk').read_text()
+    chunks = re.split(r'test effect fn (\w+)\(\)', source)
+    for name, body in zip(chunks[1::2], chunks[2::2]):
+        values = literals(body)
+        if not values:
+            continue
+        if name.startswith('parseSubtable'):
+            fmt = int(name[13])
+            yield name, b'kerx', kerx(values[0], fmt, int(name.endswith('Vector')))
+        elif name == 'format3':
+            yield name, b'kern', struct.pack('>HHHHH', 0, 1, 0, len(values[0]) + 6, 0x301) + values[0]
+    source = (ROOT / 'font/parse/src/aat_misc_tests.silk').read_text()
+    for function, tag in [('trakBytes', b'trak'), ('featBytes', b'feat'), ('anchorPoints', b'ankr'), ('languageTags', b'ltag')]:
+        yield function, tag, literals(source.split(f'fn {function}()', 1)[1])[0]
+    source = (ROOT / 'font/parse/src/aat_tests.silk').read_text()
+    values = literals(source)
+    for i, lookup in enumerate(values[:6]):
+        yield f'lookup-{i}', b'morx', morph(lookup, 4)
+        yield f'legacy-lookup-{i}', b'mort', morph(lookup, 4, False)
+    yield 'extended-state', b'morx', morph(values[6], 0)
+    yield 'legacy-state', b'mort', morph(values[7], 0, False)
+    for fmt in (0, 1, 2, 5):
+        extra = {0: 0, 1: 2, 2: 6, 5: 2}[fmt]
+        payload = 4 if fmt in (1, 5) else 0
+        classes = 8 + extra
+        states = classes + 8
+        entries = states + 8
+        glyphs = entries + (4 + payload) * 2
+        body = struct.pack('>4H', 4, classes, states, entries)
+        body += (struct.pack('>H', glyphs) if extra == 2 else bytes(extra))
+        body += struct.pack('>HH4B', 0, 4, 0, 1, 2, 3)
+        body += bytes([0, 1, 0, 1, 1, 0, 1, 0])
+        body += (struct.pack('>HH', states, 0) + bytes(payload)) * 2 + struct.pack('>3H', 3, 4, 5)
+        yield f'legacy-format-{fmt}', b'mort', morph(body, fmt, False)
+    # Rust's fixed-size binary search has a different candidate sequence from
+    # an upper-bound search on malformed unsorted keys.
+    keys = [0, 0, 0, 1, 0]
+    for fmt in (2, 4, 6):
+        width = 4 if fmt == 6 else 6
+        body = struct.pack('>6H', fmt, width, 5, 0, 0, 0)
+        for i, key in enumerate(keys):
+            body += struct.pack('>HH', key, i) if fmt == 6 else struct.pack('>HHH', key, key, 42 + i * 2 if fmt == 4 else i)
+        if fmt == 4:
+            body += struct.pack('>5H', *range(5))
+        yield f'unsorted-lookup-{fmt}', b'morx', morph(body, 4)
+    pairs = struct.pack('>4I', 5, 0, 0, 0) + b''.join(struct.pack('>HHh', 0, key, i) for i, key in enumerate(keys))
+    yield 'unsorted-kerning-pairs', b'kerx', kerx(pairs, 0)
+    feat = struct.pack('>IHHI', 0x10000, 5, 0, 0) + b''.join(struct.pack('>HHIHH', key, 0, 0, 0, 100 + i) for i, key in enumerate(keys))
+    yield 'unsorted-features', b'feat', feat
+    lookup = struct.pack('>4H', 0, 1, 2, 3)
+    single = morph(lookup, 4)
+    chain = bytearray(single[8:])
+    struct.pack_into('>I', chain, 0, 42)
+    yield 'equal-sized-chains', b'morx', single[:4] + struct.pack('>I', 2) + single[8:] + chain
+    chain = single[8:]
+    subtable = bytearray(chain[16:])
+    struct.pack_into('>I', subtable, 8, 42)
+    yield 'equal-sized-subtables', b'morx', single[:8] + struct.pack('>IIII', 1, 16 + len(subtable) * 2, 0, 2) + chain[16:] + subtable
+
+
+def fixtures():
+    for name, tag, payload in seeds():
+        lengths = set(range(min(len(payload), 160) + 1))
+        if len(payload) <= 512:
+            lengths.update(range(len(payload) + 1))
+        else:
+            lengths.update(range(0, len(payload), max(1, len(payload) // 32)))
+            lengths.update((len(payload) - 1, len(payload)))
+        for length in sorted(lengths):
+            yield f'{name}-prefix-{length}', sfnt({tag: payload[:length]})
+        # All aligned header words: counts, format/coverage bits, lengths, offsets.
+        for width in (2, 4):
+            for offset in range(0, min(len(payload) - width + 1, 40), width):
+                for value in (0, 1, (1 << (width * 8)) - 1):
+                    broken = bytearray(payload)
+                    broken[offset:offset + width] = value.to_bytes(width, 'big')
+                    yield f'{name}-word-{offset}-{width}-{value}', sfnt({tag: broken})
+    for tag in (b'morx', b'mort'):
+        for fmt in (3, 6, 255):
+            yield f'bad-{tag.decode()}-format-{fmt}', sfnt({tag: morph(b'', fmt, tag == b'morx')})
+    for fmt in (3, 5, 255):
+        yield f'bad-kerx-format-{fmt}', sfnt({b'kerx': kerx(b'', fmt)})
+    for unit in (0, 1, 2, 3, 4, 8, 65535):
+        payload = struct.pack('>4H', 10, unit, 0, 1) + bytes(8)
+        yield f'lookup10-unit-{unit}', sfnt({b'morx': morph(payload, 4)})
+    for payload in (b'\xff', b'\xc0\xaf', b'\xed\xa0\x80', b'\xf0\x9f\x92\xa9', b'\x00\n'):
+        table = struct.pack('>IIIHH', 1, 0, 1, 16, len(payload)) + payload
+        yield 'ltag-utf8-' + payload.hex(), sfnt({b'ltag': table})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference', type=Path, default=harness.REFERENCE)
+    parser.add_argument('--silk-dumper', type=Path)
+    parser.add_argument('--report', type=Path)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='font-aat-fixtures-') as temporary:
+        paths = []
+        for name, data in fixtures():
+            path = Path(temporary) / f'{name}.ttf'
+            path.write_bytes(data)
+            paths.append(path)
+        assert len(paths) == len(set(paths)), 'fixture names must be unique'
+        return harness.compare(paths, args.reference, args.silk_dumper or harness.silk_binary(), 30, args.report)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

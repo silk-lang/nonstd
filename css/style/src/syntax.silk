@@ -1,0 +1,344 @@
+//! Generic CSS Syntax rules and declarations; no resource loading or property interpretation.
+import tokens { TokenBuffer, TokenRange, Span, Kind, Limits, CssError, CssErrorKind, insensitive }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub enum RuleKind {
+  Qualified,
+  AtStatement,
+  AtBlock
+}
+
+pub struct Rule {
+  pub kind: RuleKind,
+  pub name: Span,
+  pub prelude: TokenRange,
+  pub body: TokenRange,
+}
+
+impl Copy for Rule {}
+
+pub struct Declaration {
+  pub name: Span,
+  pub value: TokenRange,
+  pub important: bool,
+}
+
+impl Copy for Declaration {}
+
+fn whitespace(buffer: &TokenBuffer, index: usize) -> bool {
+  return match &buffer.tokens.asSlice()[index].kind {
+    Kind.Whitespace => true
+    _ => false
+  }
+}
+
+fn opener(kind: &Kind) -> bool {
+  return match &kind.* {
+    Kind.Function { name } => true
+    Kind.OpenParen => true
+    Kind.OpenSquare => true
+    Kind.OpenBrace => true
+    _ => false
+  }
+}
+
+fn rangeEnd(buffer: &TokenBuffer, range: TokenRange) -> usize {
+  let count = buffer.all().end
+  return if range.end < count {
+    range.end
+  } else {
+    count
+  }
+}
+
+fn componentEnd(buffer: &TokenBuffer, index: usize, end: usize) -> usize {
+  let token = &buffer.tokens.asSlice()[index]
+  if opener(&token.kind) {
+    if token.matching >= end {
+      return end
+    }
+    if token.matching > index {
+      return token.matching + 1
+    }
+  }
+  return index + 1
+}
+
+fn custom(buffer: &TokenBuffer, name: Span) -> bool {
+  let text = buffer.text(name)
+  return text.length >= 2 && text[0] == 45 && text[1] == 45
+}
+
+// A custom-property-shaped qualified prelude is excluded by Syntax's nesting-safe grammar.
+fn customPrelude(buffer: &TokenBuffer, start: usize, end: usize) -> bool {
+  let mut at = start
+  while at < end && whitespace(buffer, at) {
+    at = at + 1
+  }
+  if at == end {
+    return false
+  }
+  let isCustom = match &buffer.tokens.asSlice()[at].kind {
+    Kind.Ident { text } => custom(buffer, text)
+    _ => false
+  }
+  if !isCustom {
+    return false
+  }
+  at = at + 1
+  while at < end && whitespace(buffer, at) {
+    at = at + 1
+  }
+  if at == end {
+    return false
+  }
+  return match &buffer.tokens.asSlice()[at].kind {
+    Kind.Colon => true
+    _ => false
+  }
+}
+
+pub effect fn parseRules(
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  topLevel: bool,
+  limits: &Limits,
+) -> List<Rule>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut rules = List<Rule>.make()
+  let end = rangeEnd(buffer, range)
+  let mut at = range.start
+  while at < end {
+    let skip = match &buffer.tokens.asSlice()[at].kind {
+      Kind.Whitespace => true
+      Kind.Cdo => topLevel
+      Kind.Cdc => topLevel
+      _ => false
+    }
+    if skip {
+      at = at + 1
+      continue
+    }
+    let start = at
+    let mut isAt = false
+    let mut name = Span { start: 0, end: 0 }
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.AtKeyword { name: text } => {
+        isAt = true
+        name = text
+      }
+      _ => {}
+    }
+    if isAt {
+      at = at + 1
+    }
+    let preludeStart = at
+    let mut preludeEnd = end
+    let mut body = TokenRange { start: end, end: end }
+    let mut kind = if isAt {
+      RuleKind.AtStatement
+    } else {
+      RuleKind.Qualified
+    }
+    let mut valid = isAt
+    while at < end {
+      let block = match &buffer.tokens.asSlice()[at].kind {
+        Kind.OpenBrace => true
+        _ => false
+      }
+      let semicolon = match &buffer.tokens.asSlice()[at].kind {
+        Kind.Semicolon => true
+        _ => false
+      }
+      if block {
+        preludeEnd = at
+        let close = buffer.tokens.asSlice()[at].matching
+        body = TokenRange {
+          start: at + 1,
+          end: if close < end {
+            close
+          } else {
+            end
+          },
+        }
+        kind = if isAt {
+          RuleKind.AtBlock
+        } else {
+          RuleKind.Qualified
+        }
+        valid = isAt || !customPrelude(buffer, preludeStart, preludeEnd)
+        at = componentEnd(buffer, at, end)
+        break
+      }
+      if isAt && semicolon {
+        preludeEnd = at
+        body = TokenRange { start: at, end: at }
+        at = at + 1
+        break
+      }
+      at = componentEnd(buffer, at, end)
+    }
+    if valid {
+      if rules.length() >= limits.maxRules {
+        fail CssError {
+          kind: CssErrorKind.RuleLimit,
+          offset: buffer.tokens.asSlice()[start].source.start,
+        }
+      }
+      run rules.append(
+        Rule {
+          kind: kind,
+          name: name,
+          prelude: TokenRange { start: preludeStart, end: preludeEnd },
+          body: body,
+        },
+      )
+    }
+  }
+  return move rules
+}
+
+// Declaration-list at-rules are consumed whole, then discarded by this declarations-only API.
+fn skipAtRule(buffer: &TokenBuffer, start: usize, end: usize) -> usize {
+  let mut at = start + 1
+  while at < end {
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Semicolon => {
+        return at + 1
+      }
+      Kind.OpenBrace => {
+        return componentEnd(buffer, at, end)
+      }
+      _ => {
+        at = componentEnd(buffer, at, end)
+      }
+    }
+  }
+  return end
+}
+
+pub effect fn parseDeclarations(buffer: &TokenBuffer, range: TokenRange, limits: &Limits) -> List<
+  Declaration
+>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut declarations = List<Declaration>.make()
+  let end = rangeEnd(buffer, range)
+  let mut at = range.start
+  while at < end {
+    let skip = match &buffer.tokens.asSlice()[at].kind {
+      Kind.Whitespace => true
+      Kind.Semicolon => true
+      _ => false
+    }
+    if skip {
+      at = at + 1
+      continue
+    }
+    if match &buffer.tokens.asSlice()[at].kind {
+      Kind.AtKeyword { name } => true
+      _ => false
+    } {
+      at = skipAtRule(buffer, at, end)
+      continue
+    }
+    let start = at
+    let mut name = Span { start: 0, end: 0 }
+    let mut valid = false
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Ident { text } => {
+        name = text
+        valid = true
+      }
+      _ => {}
+    }
+    at = componentEnd(buffer, at, end)
+    while at < end && whitespace(buffer, at) {
+      at = at + 1
+    }
+    if at < end
+      && match &buffer.tokens.asSlice()[at].kind {
+        Kind.Colon => true
+        _ => false
+      } {
+      at = at + 1
+    } else {
+      valid = false
+    }
+    while at < end && whitespace(buffer, at) {
+      at = at + 1
+    }
+    let valueStart = at
+    let mut last = end
+    let mut previous = end
+    let mut valueEnd = at
+    let mut curly = false
+    let mut nonWhitespace: usize = 0
+    while at < end {
+      if match &buffer.tokens.asSlice()[at].kind {
+        Kind.Semicolon => true
+        _ => false
+      } {
+        break
+      }
+      let next = componentEnd(buffer, at, end)
+      if !whitespace(buffer, at) {
+        previous = last
+        last = at
+        valueEnd = next
+        nonWhitespace = nonWhitespace + 1
+        if match &buffer.tokens.asSlice()[at].kind {
+          Kind.OpenBrace => true
+          _ => false
+        } {
+          curly = true
+        }
+      }
+      at = next
+    }
+    let mut important = false
+    if last != end && previous != end {
+      let keyword = match &buffer.tokens.asSlice()[last].kind {
+        Kind.Ident { text } => insensitive(buffer.text(text), b"important")
+        _ => false
+      }
+      let bang = match &buffer.tokens.asSlice()[previous].kind {
+        Kind.Delim { scalar } => scalar == 33
+        _ => false
+      }
+      if keyword && bang {
+        important = true
+        valueEnd = previous
+        while valueEnd > valueStart && whitespace(buffer, valueEnd - 1) {
+          valueEnd = valueEnd - 1
+        }
+        nonWhitespace = nonWhitespace - 2
+      }
+    }
+    if curly && nonWhitespace != 1 && !custom(buffer, name) {
+      valid = false
+    }
+    if valid {
+      if declarations.length() >= limits.maxDeclarations {
+        fail CssError {
+          kind: CssErrorKind.DeclarationLimit,
+          offset: buffer.tokens.asSlice()[start].source.start,
+        }
+      }
+      run declarations.append(
+        Declaration {
+          name: name,
+          value: TokenRange { start: valueStart, end: valueEnd },
+          important: important,
+        },
+      )
+    }
+    if at < end {
+      at = at + 1
+    }
+  }
+  return move declarations
+}

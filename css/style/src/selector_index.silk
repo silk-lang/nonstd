@@ -1,0 +1,245 @@
+//! Conservative subject indexing; complete selectors still determine matches and specificity.
+//! Sorted fingerprints keep lookup logarithmic even for adversarial collisions. Every collision
+//! remains a candidate, and discovery shares the exact matcher's document-wide work budget.
+import selectors { SelectorList, SubjectKind, SubjectKey }
+import element { ElementTree, MatchContext }
+import tokens { TokenBuffer, CssError }
+import silk.collections.hash { Hash }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.core.order { Order, Ordering }
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+
+struct Entry {
+  key: u64,
+  rule: usize,
+}
+
+impl Copy for Entry {}
+
+impl Order for Entry {
+  fn compare(a: &Self, b: &Self) -> Ordering {
+    if a.key < b.key {
+      return Ordering.Less
+    }
+    if a.key > b.key {
+      return Ordering.Greater
+    }
+    if a.rule < b.rule {
+      return Ordering.Less
+    }
+    if a.rule > b.rule {
+      return Ordering.Greater
+    }
+    return Ordering.Equal
+  }
+}
+
+fn kindBit(kind: SubjectKind) -> u8 {
+  return match kind {
+    SubjectKind.Id => 1
+    SubjectKind.Class => 2
+    SubjectKind.LocalName => 4
+    SubjectKind.Any => 0
+  }
+}
+
+fn fingerprint(kind: SubjectKind, text: &[u8]) -> u64 {
+  let seed = Hash.seed(u8.toU64(kindBit(kind)))
+  let mut result = Hash.mix(&seed, usize.toU64(text.length))
+  let mut i: usize = 0
+  while i < text.length {
+    result = Hash.combine(result, u8.toU64(text[i]))
+    i = i + 1
+  }
+  return result
+}
+
+fn className(name: &[u8]) -> bool {
+  return name.length == 5 && name[0] == 99 && name[1] == 108 && name[2] == 97 && name[3] == 115
+    && name[4] == 115
+}
+
+fn space(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 12
+}
+
+/// Build by adding rules in source order, then finish before collecting candidates.
+/// Storage is reused across elements. A failed collection is safe to retry with a new budget.
+pub struct CandidateIndex {
+  entries: List<Entry>,
+  fallback: List<usize>,
+  seen: List<bool>,
+  selected: List<usize>,
+  indexedRules: usize,
+  kinds: u8,
+}
+
+impl CandidateIndex {
+  pub fn make() -> CandidateIndex {
+    return CandidateIndex {
+      entries: List<Entry>.make(),
+      fallback: List<usize>.make(),
+      seen: List<bool>.make(),
+      selected: List<usize>.make(),
+      indexedRules: 0,
+      kinds: 0,
+    }
+  }
+
+  pub fn ready(self: &Self, rules: usize) -> bool {
+    return self.indexedRules == rules
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.indexedRules = usize.MAX
+    self.entries.truncate(0)
+    self.fallback.truncate(0)
+    self.seen.truncate(0)
+    self.selected.truncate(0)
+    self.kinds = 0
+  }
+
+  pub effect fn add(self: &mut Self, selectors: &SelectorList, buffer: &TokenBuffer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.indexedRules = usize.MAX
+    let rule = self.seen.length()
+    run self.seen.append(false)
+    let start = self.entries.length()
+    let previousKinds = self.kinds
+    let mut keys = selectors.subjectKeys()
+    while let Option<SubjectKey>.Some { value } = keys.next() {
+      if value.kind == SubjectKind.Any {
+        // One unkeyed arm makes the entire rule a candidate for every element.
+        self.entries.truncate(start)
+        self.kinds = previousKinds
+        run self.fallback.append(rule)
+        return
+      }
+      run self.entries.append(
+        Entry { key: fingerprint(value.kind, buffer.text(value.text)), rule: rule },
+      )
+      self.kinds = u8.bitOr(self.kinds, kindBit(value.kind))
+    }
+  }
+
+  pub effect fn finish(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.entries.sort()
+    self.indexedRules = self.seen.length()
+  }
+
+  effect fn select(self: &mut Self, rule: usize, context: &mut MatchContext) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    run context.spend(1)
+    if !self.seen.asSlice()[rule] {
+      // Append before marking: allocation failure must not hide a rule on retry.
+      run self.selected.append(rule)
+      let mut seen = self.seen.asMutSlice()
+      seen[rule] = true
+    }
+  }
+
+  effect fn lookup(
+    self: &mut Self,
+    kind: SubjectKind,
+    text: &[u8],
+    context: &mut MatchContext,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    run context.spend(text.length)
+    let key = fingerprint(kind, text)
+    let mut low: usize = 0
+    let mut high = self.entries.length()
+    while low < high {
+      run context.spend(1)
+      let mid = low + (high - low) / 2
+      if self.entries.asSlice()[mid].key < key {
+        low = mid + 1
+      } else {
+        high = mid
+      }
+    }
+    while low < self.entries.length() && self.entries.asSlice()[low].key == key {
+      let rule = self.entries.asSlice()[low].rule
+      run self.select(rule, &mut context.*)
+      low = low + 1
+    }
+  }
+
+  pub effect fn collect<T: ElementTree>(
+    self: &mut Self,
+    tree: &T,
+    node: usize,
+    context: &mut MatchContext,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    // Previous selections were already charged. Clearing just these marks is linear
+    // in previously charged work, including when the previous collection failed.
+    let mut i: usize = 0
+    while i < self.selected.length() {
+      let rule = self.selected.asSlice()[i]
+      let mut seen = self.seen.asMutSlice()
+      seen[rule] = false
+      i = i + 1
+    }
+    self.selected.truncate(0)
+    i = 0
+    while i < self.fallback.length() {
+      let rule = self.fallback.asSlice()[i]
+      run self.select(rule, &mut context.*)
+      i = i + 1
+    }
+    if self.entries.length() == 0 {
+      return
+    }
+    if u8.bitAnd(self.kinds, 4) != 0 {
+      run self.lookup(SubjectKind.LocalName, ElementTree.localName(tree, node), &mut context.*)
+    }
+    let ids = u8.bitAnd(self.kinds, 1) != 0
+    let classes = u8.bitAnd(self.kinds, 2) != 0
+    if !ids && !classes {
+      return
+    }
+    let attributes = ElementTree.attributeCount(tree, node)
+    i = 0
+    while i < attributes {
+      run context.spend(1)
+      if ids && ElementTree.attributeIsId(tree, node, i) {
+        run self.lookup(SubjectKind.Id, ElementTree.attributeValue(tree, node, i), &mut context.*)
+      }
+      if classes && ElementTree.attributeNamespace(tree, node, i).length == 0
+        && className(ElementTree.attributeName(tree, node, i)) {
+        let value = ElementTree.attributeValue(tree, node, i)
+        run context.spend(value.length)
+        let mut at: usize = 0
+        while at < value.length {
+          if space(value[at]) {
+            at = at + 1
+          } else {
+            let start = at
+            while at < value.length && !space(value[at]) {
+              at = at + 1
+            }
+            run self.lookup(SubjectKind.Class, Slice.view(value, start, at - start), &mut context.*)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  pub fn candidates(self: &Self) -> &[usize] {
+    return self.selected.asSlice()
+  }
+}

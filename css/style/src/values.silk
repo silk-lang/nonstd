@@ -1,0 +1,1419 @@
+//! Validated specified values, typed arenas, and context-dependent computation.
+import properties { Property }
+import value_keywords { Keyword }
+import value_keywords
+import value_cursor { Cursor }
+import input { Input, TokenView }
+import tokens { Kind, Span }
+import dimensions { ExprId, Dimension, Expr, Store as NumericStore }
+import dimensions
+import colors { Color, Identity }
+import colors
+import text_values { TextValue }
+import text_values
+import effect_values { EffectValue }
+import effect_values
+import transform_values { TransformValue }
+import transform_values
+import svg_geometry.geometry { Path }
+import svg_geometry.svg
+import svg_geometry.math
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.f64
+
+pub enum Mode {
+  Css,
+  Presentation
+}
+
+pub enum Wide {
+  Initial,
+  Inherit,
+  Unset,
+  Revert
+}
+
+pub enum Range {
+  Unrestricted,
+  Nonnegative,
+  AtLeastOne,
+  UnitInterval
+}
+
+pub enum Basis {
+  None,
+  Horizontal,
+  Vertical,
+  Diagonal,
+  Font
+}
+
+pub enum PaintLayer {
+  Fill,
+  Stroke,
+  Markers
+}
+
+pub enum VectorReference {
+  Viewport,
+  Screen
+}
+
+pub struct ValueId {
+  pub index: usize
+}
+
+impl Copy for ValueId {}
+
+// SVG11 types.html#DataTypeICCColor. Profiles/channels live once in the value store;
+// ordinary CSS Color4 values remain fixed-size and allocation-free.
+pub struct IccId {
+  pub index: usize
+}
+
+impl Copy for IccId {}
+
+pub struct IccColor {
+  pub profile: Span,
+  pub channels: List<f64>
+}
+
+pub union Fallback {
+  Missing,
+  None,
+  Color { pub color: Color },
+  IccColor { pub color: Color, pub icc: IccId }
+}
+
+impl Copy for Fallback {}
+
+pub union Paint {
+  None,
+  Color { pub color: Color },
+  IccColor { pub color: Color, pub icc: IccId },
+  ContextFill,
+  ContextStroke,
+  Server { pub url: Span, pub fallback: Fallback },
+}
+
+impl Copy for Paint {}
+
+pub struct CursorImage {
+  pub url: Span,
+  pub hotspot: bool,
+  pub x: f64,
+  pub y: f64
+}
+
+impl Copy for CursorImage {}
+
+pub union Value {
+  Wide { pub keyword: Wide },
+  Keyword { pub keyword: Keyword },
+  Numeric { pub expression: ExprId, pub range: Range, pub basis: Basis },
+  Color { pub color: Color },
+  IccColor { pub color: Color, pub icc: IccId },
+  Paint { pub paint: Paint },
+  Resource { pub url: Span },
+  Profile { pub name: Span },
+  Dashes { pub expressions: List<ExprId> },
+  PaintOrder { pub order: [PaintLayer; 3] },
+  VectorEffect { pub flags: u8, pub reference: VectorReference },
+  Cursor { pub images: List<CursorImage>, pub fallback: Keyword },
+  BlendModes { pub modes: List<Keyword> },
+  Path { pub index: usize },
+  Text { pub value: TextValue },
+  Effect { pub value: EffectValue },
+  Transform { pub value: TransformValue },
+}
+
+pub struct Store {
+  pub numerics: dimensions.Store,
+  pub values: List<Value>,
+  pub strings: Bytes,
+  pub paths: List<Path>,
+  pub iccColors: List<IccColor>,
+}
+
+impl Store {
+  pub fn make() -> Store {
+    return Store {
+      numerics: NumericStore.make(),
+      values: List<Value>.make(),
+      strings: Bytes.make(),
+      paths: List<Path>.make(),
+      iccColors: List<IccColor>.make(),
+    }
+  }
+
+  pub fn get(self: &Store, id: ValueId) -> &Value {
+    return &self.values.asSlice()[id.index]
+  }
+
+  pub fn icc(self: &Store, id: IccId) -> &IccColor {
+    return &self.iccColors.asSlice()[id.index]
+  }
+
+  pub fn text(self: &Store, span: Span) -> &[u8] {
+    return Slice.view<u8>(Bytes.asSlice(&self.strings), span.start, span.end - span.start)
+  }
+
+  pub effect fn add(self: &mut Store, value: Value) -> ValueId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = ValueId { index: self.values.length() }
+    run self.values.append(move value)
+    return id
+  }
+
+  pub effect fn storeText(self: &mut Store, text: &[u8]) -> Span
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let start = Bytes.asSlice(&self.strings).length
+    run Bytes.append(&mut self.strings, text)
+    return Span { start: start, end: Bytes.asSlice(&self.strings).length }
+  }
+}
+
+pub struct ComputeContext<'a> {
+  pub dimensions: dimensions.Context,
+  pub colors: colors.Context,
+  pub systemFonts: &'a [TextValue; 6],
+}
+
+fn wide(source: &Input, cursor: &mut Cursor) -> Option<Wide> {
+  if cursor.ident(source, b"initial") {
+    return Option<Wide>.some(Wide.Initial)
+  }
+  if cursor.ident(source, b"inherit") {
+    return Option<Wide>.some(Wide.Inherit)
+  }
+  if cursor.ident(source, b"unset") {
+    return Option<Wide>.some(Wide.Unset)
+  }
+  if cursor.ident(source, b"revert") {
+    return Option<Wide>.some(Wide.Revert)
+  }
+  return Option<Wide>.None
+}
+
+// URL tokens and quoted url() both own decoded semantic URL bytes, never source strings.
+effect fn url(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<Span>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let saved = cursor.position
+  cursor.skip(source)
+  if cursor.position < cursor.end {
+    let next = source.at(cursor.position)
+    match &next {
+      Option<TokenView>.Some { value } => {
+        match &value.token.kind {
+          Kind.Url { text } => {
+            cursor.position = cursor.position + 1
+            return Option<Span>.some(run store.storeText(value.text(text)))
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+  }
+  if cursor.function(source, b"url") || cursor.function(source, b"src") {
+    cursor.skip(source)
+    let next = source.at(cursor.position)
+    match &next {
+      Option<TokenView>.Some { value } => {
+        match &value.token.kind {
+          Kind.String { text } => {
+            cursor.position = cursor.position + 1
+            if cursor.close(source) {
+              return Option<Span>.some(run store.storeText(value.text(text)))
+            }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+  }
+  cursor.position = saved
+  return Option<Span>.None
+}
+
+// The SVG name grammar is not restricted to CSS identifiers. Assemble semantic
+// token text up to comma-wsp, preserving case and CSS identifier escapes.
+effect fn iccProfile(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<Span>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let start = Bytes.asSlice(&store.strings).length
+  while cursor.position < cursor.end {
+    let next = source.at(cursor.position)
+    match &next {
+      Option<TokenView>.Some { value } => {
+        match &value.token.kind {
+          Kind.Whitespace => {
+            break
+          }
+          Kind.Comma => {
+            break
+          }
+          _ => {}
+        }
+        let text = match &value.token.kind {
+          Kind.Ident { text } => value.text(text)
+          _ => value.text(value.token.source)
+        }
+        let mut i: usize = 0
+        while i < text.length {
+          let byte = text[i]
+          if byte == 44 || byte == 40 || byte == 41 || byte == 32 || byte == 9 || byte == 13
+            || byte == 10
+            || byte == 12 {
+            return Option<Span>.None
+          }
+          i = i + 1
+        }
+        run Bytes.append(&mut store.strings, text)
+        cursor.position = cursor.position + 1
+      }
+      _ => {
+        return Option<Span>.None
+      }
+    }
+  }
+  let end = Bytes.asSlice(&store.strings).length
+  return if end > start {
+    Option<Span>.some(Span { start: start, end: end })
+  } else {
+    Option<Span>.None
+  }
+}
+
+// Called only after the ICC function opener; one or more comma-wsp-separated
+// numbers are required. No percentages, calc(), channel clamping, or transforms.
+effect fn iccColor(store: &mut Store, source: &Input, cursor: &mut Cursor, mode: Mode) -> Option<
+  IccId
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  cursor.skip(source)
+  let parsed = run iccProfile(&mut store.*, source, &mut cursor.*)
+  let profile = match &parsed {
+    Option<Span>.Some { value } => value
+    _ => {
+      return Option<IccId>.None
+    }
+  }
+  let mut channels = List<f64>.make()
+  while true {
+    let before = cursor.position
+    cursor.skip(source)
+    let whitespace = cursor.position > before
+    let comma = cursor.comma(source)
+    if !comma && !whitespace {
+      return Option<IccId>.None
+    }
+    cursor.skip(source)
+    if mode == Mode.Css {
+      // SVG11 types.html#DataTypeNumber gives ICC's stylesheet grammar no
+      // exponent production; the presentation-attribute grammar includes it.
+      let token = source.at(cursor.position)
+      match &token {
+        Option<TokenView>.Some { value } => {
+          let text = value.text(value.token.source)
+          let mut i: usize = 0
+          while i < text.length {
+            if text[i] == 69 || text[i] == 101 {
+              return Option<IccId>.None
+            }
+            i = i + 1
+          }
+        }
+        _ => {
+          return Option<IccId>.None
+        }
+      }
+    }
+    let parsed = number(source, &mut cursor.*)
+    match &parsed {
+      Option<f64>.Some { value } => {
+        run channels.append(value)
+      }
+      _ => {
+        return Option<IccId>.None
+      }
+    }
+    let mut closing = cursor.*
+    closing.skip(source)
+    if mode == Mode.Presentation && closing.position >= closing.end {
+      return Option<IccId>.None
+    }
+    if closing.close(source) {
+      cursor.position = closing.position
+      let id = IccId { index: store.iccColors.length() }
+      run store.iccColors.append(IccColor { profile: profile, channels: move channels })
+      return Option<IccId>.some(id)
+    }
+  }
+}
+
+effect fn svgColor(
+  store: &mut Store,
+  source: &Input,
+  cursor: &mut Cursor,
+  allowIcc: bool,
+  mode: Mode,
+) -> Option<Fallback>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = run colors.parse(source, &mut cursor.*)
+  let color = match &parsed {
+    Option<Color>.Some { value } => value
+    _ => {
+      return Option<Fallback>.None
+    }
+  }
+  if allowIcc && cursor.function(source, b"icc-color") {
+    // SVG11's currentColor alternative never carries an ICC suffix.
+    match &color.identity {
+      Identity.CurrentColor => {
+        return Option<Fallback>.None
+      }
+      _ => {}
+    }
+    let parsed = run iccColor(&mut store.*, source, &mut cursor.*, mode)
+    return match &parsed {
+      Option<IccId>.Some { value } => Option<Fallback>.some(
+        Fallback.IccColor { color: color, icc: value },
+      )
+      _ => Option<Fallback>.None
+    }
+  }
+  return Option<Fallback>.some(Fallback.Color { color: color })
+}
+
+effect fn paint(
+  store: &mut Store,
+  source: &Input,
+  cursor: &mut Cursor,
+  allowIcc: bool,
+  mode: Mode,
+) -> Option<Paint>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if cursor.ident(source, b"none") {
+    return Option<Paint>.some(Paint.None)
+  }
+  if cursor.ident(source, b"context-fill") {
+    return Option<Paint>.some(Paint.ContextFill)
+  }
+  if cursor.ident(source, b"context-stroke") {
+    return Option<Paint>.some(Paint.ContextStroke)
+  }
+  let resource = run url(&mut store.*, source, &mut cursor.*)
+  match &resource {
+    Option<Span>.Some { value } => {
+      let mut fallback = Fallback.Missing
+      if cursor.ident(source, b"none") {
+        fallback = Fallback.None
+      } else if !cursor.done(source) {
+        let color = run svgColor(&mut store.*, source, &mut cursor.*, allowIcc, mode)
+        match &color {
+          Option<Fallback>.Some { value: parsedFallback } => {
+            fallback = parsedFallback
+          }
+          _ => {
+            return Option<Paint>.None
+          }
+        }
+      }
+      return Option<Paint>.some(Paint.Server { url: value, fallback: fallback })
+    }
+    _ => {}
+  }
+  let color = run svgColor(&mut store.*, source, &mut cursor.*, allowIcc, mode)
+  return match &color {
+    Option<Fallback>.Some { value } => match &value {
+      Fallback.Color { color: absolute } => Option<Paint>.some(Paint.Color { color: absolute })
+      Fallback.IccColor { color: absolute, icc } => Option<Paint>.some(
+        Paint.IccColor { color: absolute, icc: icc },
+      )
+      _ => Option<Paint>.None
+    }
+    _ => Option<Paint>.None
+  }
+}
+
+fn numericBasis(property: Property) -> Basis {
+  return match property {
+    Property.X => Basis.Horizontal
+    Property.Cx => Basis.Horizontal
+    Property.Rx => Basis.Horizontal
+    Property.Width => Basis.Horizontal
+    Property.InlineSize => Basis.Horizontal
+    Property.Y => Basis.Vertical
+    Property.Cy => Basis.Vertical
+    Property.Ry => Basis.Vertical
+    Property.Height => Basis.Vertical
+    Property.R => Basis.Diagonal
+    Property.StrokeWidth => Basis.Diagonal
+    Property.StrokeDashoffset => Basis.Diagonal
+    Property.ShapeMargin => Basis.Horizontal
+    Property.Kerning => Basis.Font
+    _ => Basis.None
+  }
+}
+
+fn numericRange(property: Property) -> Range {
+  return match property {
+    Property.R => Range.Nonnegative
+    Property.Rx => Range.Nonnegative
+    Property.Ry => Range.Nonnegative
+    Property.Width => Range.Nonnegative
+    Property.Height => Range.Nonnegative
+    Property.StrokeWidth => Range.Nonnegative
+    Property.ShapeMargin => Range.Nonnegative
+    Property.InlineSize => Range.Nonnegative
+    Property.StrokeMiterlimit => Range.AtLeastOne
+    Property.Opacity => Range.UnitInterval
+    Property.FillOpacity => Range.UnitInterval
+    Property.StrokeOpacity => Range.UnitInterval
+    Property.StopOpacity => Range.UnitInterval
+    Property.FloodOpacity => Range.UnitInterval
+    _ => Range.Unrestricted
+  }
+}
+
+fn numericDimension(property: Property) -> Option<Dimension> {
+  return match property {
+    Property.X => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Y => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Cx => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Cy => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.R => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Rx => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Ry => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Width => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Height => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.InlineSize => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.ShapeMargin => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.Kerning => Option<Dimension>.some(Dimension.Length)
+    Property.StrokeWidth => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.StrokeDashoffset => Option<Dimension>.some(Dimension.LengthPercentage)
+    Property.StrokeMiterlimit => Option<Dimension>.some(Dimension.Number)
+    Property.Opacity => Option<Dimension>.some(Dimension.NumberPercentage)
+    Property.FillOpacity => Option<Dimension>.some(Dimension.NumberPercentage)
+    Property.StrokeOpacity => Option<Dimension>.some(Dimension.NumberPercentage)
+    Property.StopOpacity => Option<Dimension>.some(Dimension.NumberPercentage)
+    Property.FloodOpacity => Option<Dimension>.some(Dimension.NumberPercentage)
+    _ => Option<Dimension>.None
+  }
+}
+
+fn paintOrder(source: &Input, cursor: &mut Cursor) -> Option<Value> {
+  let mut result = [PaintLayer.Fill, PaintLayer.Stroke, PaintLayer.Markers]
+  if cursor.ident(source, b"normal") {
+    return Option<Value>.some(Value.PaintOrder { order: result })
+  }
+  let mut count: usize = 0
+  let mut used: u8 = 0
+  while count < 3 {
+    let mut flag: u8 = 0
+    let mut layer = PaintLayer.Fill
+    if cursor.ident(source, b"fill") {
+      flag = 1
+    } else if cursor.ident(source, b"stroke") {
+      flag = 2
+      layer = PaintLayer.Stroke
+    } else if cursor.ident(source, b"markers") {
+      flag = 4
+      layer = PaintLayer.Markers
+    } else {
+      break
+    }
+    if (used & flag) != 0 {
+      return Option<Value>.None
+    }
+    used = used | flag
+    result[count] = layer
+    count = count + 1
+  }
+  if count == 0 {
+    return Option<Value>.None
+  }
+  if (used & 1) == 0 {
+    result[count] = PaintLayer.Fill
+    count = count + 1
+  }
+  if (used & 2) == 0 {
+    result[count] = PaintLayer.Stroke
+    count = count + 1
+  }
+  if (used & 4) == 0 {
+    result[count] = PaintLayer.Markers
+  }
+  return Option<Value>.some(Value.PaintOrder { order: result })
+}
+
+fn vectorEffect(source: &Input, cursor: &mut Cursor) -> Option<Value> {
+  if cursor.ident(source, b"none") {
+    return Option<Value>.some(Value.VectorEffect { flags: 0, reference: VectorReference.Viewport })
+  }
+  let mut flags: u8 = 0
+  while true {
+    let bit: u8 = if cursor.ident(source, b"non-scaling-stroke") {
+      1
+    } else if cursor.ident(source, b"non-scaling-size") {
+      2
+    } else if cursor.ident(source, b"non-rotation") {
+      4
+    } else if cursor.ident(source, b"fixed-position") {
+      8
+    } else {
+      0
+    }
+    if bit == 0 {
+      break
+    }
+    flags = flags | bit
+  }
+  if flags == 0 {
+    return Option<Value>.None
+  }
+  let reference = if cursor.ident(source, b"screen") {
+    VectorReference.Screen
+  } else {
+    drop cursor.ident(source, b"viewport")
+    VectorReference.Viewport
+  }
+  return Option<Value>.some(Value.VectorEffect { flags: flags, reference: reference })
+}
+
+effect fn dashes(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<Value>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if cursor.ident(source, b"none") {
+    return Option<Value>.some(Value.Keyword { keyword: Keyword.None })
+  }
+  let mut expressions = List<ExprId>.make()
+  while true {
+    // SVG's dasharray production explicitly includes numbers, even in CSS declarations.
+    let mut parsed = run dimensions.parse(
+      &mut store.numerics,
+      source,
+      &mut cursor.*,
+      Dimension.LengthPercentage,
+      true,
+    )
+    if match &parsed {
+      Option<ExprId>.None => true
+      _ => false
+    } {
+      parsed = run dimensions.parse(
+        &mut store.numerics,
+        source,
+        &mut cursor.*,
+        Dimension.Number,
+        false,
+      )
+    }
+    match &parsed {
+      Option<ExprId>.Some { value } => {
+        if dimensions.negativeLiteral(&store.numerics, value) {
+          return Option<Value>.None
+        }
+        run expressions.append(value)
+      }
+      _ => {
+        return Option<Value>.None
+      }
+    }
+    let beforeWhitespace = cursor.position
+    cursor.skip(source)
+    let separated = cursor.position > beforeWhitespace
+    if cursor.done(source) {
+      break
+    }
+    if !cursor.comma(source) && !separated {
+      return Option<Value>.None
+    }
+    if cursor.done(source) {
+      return Option<Value>.None
+    }
+  }
+  return Option<Value>.some(Value.Dashes { expressions: move expressions })
+}
+
+fn number(source: &Input, cursor: &mut Cursor) -> Option<f64> {
+  let saved = cursor.position
+  cursor.skip(source)
+  if cursor.position < cursor.end {
+    let token = source.at(cursor.position)
+    match &token {
+      Option<TokenView>.Some { value } => {
+        match &value.token.kind {
+          Kind.Number { value: n, integer } => {
+            if f64.isFinite(n) {
+              cursor.position = cursor.position + 1
+              return Option<f64>.some(n)
+            }
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+  }
+  cursor.position = saved
+  return Option<f64>.None
+}
+
+effect fn cursorValue(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<Value>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut images = List<CursorImage>.make()
+  while true {
+    let resource = run url(&mut store.*, source, &mut cursor.*)
+    match &resource {
+      Option<Span>.Some { value } => {
+        let mut image = CursorImage { url: value, hotspot: false, x: 0.0, y: 0.0 }
+        let x = number(source, &mut cursor.*)
+        match &x {
+          Option<f64>.Some { value: xValue } => {
+            let y = number(source, &mut cursor.*)
+            match &y {
+              Option<f64>.Some { value: yValue } => {
+                image.hotspot = true
+                image.x = xValue
+                image.y = yValue
+              }
+              _ => {
+                return Option<Value>.None
+              }
+            }
+          }
+          _ => {}
+        }
+        run images.append(image)
+        if !cursor.comma(source) {
+          return Option<Value>.None
+        }
+      }
+      _ => {
+        break
+      }
+    }
+  }
+  let fallback = cursorKeyword(source, &mut cursor.*)
+  return match &fallback {
+    Option<Keyword>.Some { value } => Option<Value>.some(
+      Value.Cursor { images: move images, fallback: value },
+    )
+    _ => Option<Value>.None
+  }
+}
+
+effect fn pathValue(store: &mut Store, source: &Input, cursor: &mut Cursor, mode: Mode) -> Option<
+  Value
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if cursor.ident(source, b"none") {
+    return Option<Value>.some(Value.Keyword { keyword: Keyword.None })
+  }
+  if mode == Mode.Presentation {
+    match &source.* {
+      Input.Contiguous { buffer, range } => {
+        let bytes = buffer.source()
+        let start = if range.start < range.end {
+          buffer.tokens.asSlice()[range.start].source.start
+        } else {
+          0
+        }
+        let end = if range.start < range.end {
+          buffer.tokens.asSlice()[range.end - 1].source.end
+        } else {
+          0
+        }
+        let parsed = run svg.parsePath(Slice.view<u8>(bytes, start, end - start))
+        let index = store.paths.length()
+        run store.paths.append(move parsed.path)
+        cursor.position = cursor.end
+        return Option<Value>.some(Value.Path { index: index })
+      }
+      _ => {
+        return Option<Value>.None
+      }
+    }
+  }
+  if !cursor.function(source, b"path") {
+    return Option<Value>.None
+  }
+  cursor.skip(source)
+  let next = source.at(cursor.position)
+  match &next {
+    Option<TokenView>.Some { value } => {
+      match &value.token.kind {
+        Kind.String { text } => {
+          cursor.position = cursor.position + 1
+          if !cursor.close(source) {
+            return Option<Value>.None
+          }
+          let parsed = run svg.parsePath(value.text(text))
+          if !parsed.complete {
+            return Option<Value>.None
+          }
+          let index = store.paths.length()
+          run store.paths.append(move parsed.path)
+          return Option<Value>.some(Value.Path { index: index })
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  return Option<Value>.None
+}
+
+effect fn profile(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<Value>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if cursor.ident(source, b"auto") {
+    return Option<Value>.some(Value.Keyword { keyword: Keyword.Auto })
+  }
+  if cursor.ident(source, b"sRGB") {
+    return Option<Value>.some(Value.Keyword { keyword: Keyword.SRGB })
+  }
+  let resource = run url(&mut store.*, source, &mut cursor.*)
+  match &resource {
+    Option<Span>.Some { value } => {
+      return Option<Value>.some(Value.Resource { url: value })
+    }
+    _ => {}
+  }
+  cursor.skip(source)
+  let next = source.at(cursor.position)
+  match &next {
+    Option<TokenView>.Some { value } => {
+      match &value.token.kind {
+        Kind.Ident { text } => {
+          cursor.position = cursor.position + 1
+          let name = run store.storeText(value.text(text))
+          return Option<Value>.some(Value.Profile { name: name })
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  return Option<Value>.None
+}
+
+fn cursorKeyword(source: &Input, cursor: &mut Cursor) -> Option<Keyword> {
+  if cursor.ident(source, b"auto") {
+    return Option<Keyword>.some(Keyword.Auto)
+  }
+  if cursor.ident(source, b"default") {
+    return Option<Keyword>.some(Keyword.Default)
+  }
+  if cursor.ident(source, b"none") {
+    return Option<Keyword>.some(Keyword.None)
+  }
+  if cursor.ident(source, b"context-menu") {
+    return Option<Keyword>.some(Keyword.ContextMenu)
+  }
+  if cursor.ident(source, b"help") {
+    return Option<Keyword>.some(Keyword.Help)
+  }
+  if cursor.ident(source, b"pointer") {
+    return Option<Keyword>.some(Keyword.Pointer)
+  }
+  if cursor.ident(source, b"progress") {
+    return Option<Keyword>.some(Keyword.Progress)
+  }
+  if cursor.ident(source, b"wait") {
+    return Option<Keyword>.some(Keyword.Wait)
+  }
+  if cursor.ident(source, b"cell") {
+    return Option<Keyword>.some(Keyword.Cell)
+  }
+  if cursor.ident(source, b"crosshair") {
+    return Option<Keyword>.some(Keyword.Crosshair)
+  }
+  if cursor.ident(source, b"text") {
+    return Option<Keyword>.some(Keyword.Text)
+  }
+  if cursor.ident(source, b"vertical-text") {
+    return Option<Keyword>.some(Keyword.VerticalText)
+  }
+  if cursor.ident(source, b"alias") {
+    return Option<Keyword>.some(Keyword.Alias)
+  }
+  if cursor.ident(source, b"copy") {
+    return Option<Keyword>.some(Keyword.Copy)
+  }
+  if cursor.ident(source, b"move") {
+    return Option<Keyword>.some(Keyword.Move)
+  }
+  if cursor.ident(source, b"no-drop") {
+    return Option<Keyword>.some(Keyword.NoDrop)
+  }
+  if cursor.ident(source, b"not-allowed") {
+    return Option<Keyword>.some(Keyword.NotAllowed)
+  }
+  if cursor.ident(source, b"grab") {
+    return Option<Keyword>.some(Keyword.Grab)
+  }
+  if cursor.ident(source, b"grabbing") {
+    return Option<Keyword>.some(Keyword.Grabbing)
+  }
+  if cursor.ident(source, b"e-resize") {
+    return Option<Keyword>.some(Keyword.EResize)
+  }
+  if cursor.ident(source, b"n-resize") {
+    return Option<Keyword>.some(Keyword.NResize)
+  }
+  if cursor.ident(source, b"ne-resize") {
+    return Option<Keyword>.some(Keyword.NeResize)
+  }
+  if cursor.ident(source, b"nw-resize") {
+    return Option<Keyword>.some(Keyword.NwResize)
+  }
+  if cursor.ident(source, b"s-resize") {
+    return Option<Keyword>.some(Keyword.SResize)
+  }
+  if cursor.ident(source, b"se-resize") {
+    return Option<Keyword>.some(Keyword.SeResize)
+  }
+  if cursor.ident(source, b"sw-resize") {
+    return Option<Keyword>.some(Keyword.SwResize)
+  }
+  if cursor.ident(source, b"w-resize") {
+    return Option<Keyword>.some(Keyword.WResize)
+  }
+  if cursor.ident(source, b"ew-resize") {
+    return Option<Keyword>.some(Keyword.EwResize)
+  }
+  if cursor.ident(source, b"ns-resize") {
+    return Option<Keyword>.some(Keyword.NsResize)
+  }
+  if cursor.ident(source, b"nesw-resize") {
+    return Option<Keyword>.some(Keyword.NeswResize)
+  }
+  if cursor.ident(source, b"nwse-resize") {
+    return Option<Keyword>.some(Keyword.NwseResize)
+  }
+  if cursor.ident(source, b"col-resize") {
+    return Option<Keyword>.some(Keyword.ColResize)
+  }
+  if cursor.ident(source, b"row-resize") {
+    return Option<Keyword>.some(Keyword.RowResize)
+  }
+  if cursor.ident(source, b"all-scroll") {
+    return Option<Keyword>.some(Keyword.AllScroll)
+  }
+  if cursor.ident(source, b"zoom-in") {
+    return Option<Keyword>.some(Keyword.ZoomIn)
+  }
+  if cursor.ident(source, b"zoom-out") {
+    return Option<Keyword>.some(Keyword.ZoomOut)
+  }
+  return Option<Keyword>.None
+}
+
+fn textProperty(property: Property) -> bool {
+  return match property {
+    Property.WhiteSpace => true
+    Property.WhiteSpaceCollapse => true
+    Property.TextWrapMode => true
+    Property.WhiteSpaceTrim => true
+    Property.Font => true
+    Property.FontFamily => true
+    Property.FontSize => true
+    Property.FontSizeAdjust => true
+    Property.FontStretch => true
+    Property.FontWidth => true
+    Property.FontStyle => true
+    Property.FontVariant => true
+    Property.FontVariantLigatures => true
+    Property.FontVariantCaps => true
+    Property.FontVariantNumeric => true
+    Property.FontVariantEastAsian => true
+    Property.FontVariantPosition => true
+    Property.FontVariantAlternates => true
+    Property.FontWeight => true
+    Property.FontFeatureSettings => true
+    Property.FontVariationSettings => true
+    Property.FontKerning => true
+    Property.FontOpticalSizing => true
+    Property.FontLanguageOverride => true
+    Property.FontSynthesis => true
+    Property.FontSynthesisWeight => true
+    Property.FontSynthesisStyle => true
+    Property.FontSynthesisSmallCaps => true
+    Property.FontSynthesisPosition => true
+    Property.FontPalette => true
+    Property.LineHeight => true
+    Property.LetterSpacing => true
+    Property.WordSpacing => true
+    Property.BaselineShift => true
+    Property.AlignmentBaseline => true
+    Property.DominantBaseline => true
+    Property.TextIndent => true
+    Property.TextDecoration => true
+    Property.TextDecorationLine => true
+    Property.TextDecorationStyle => true
+    Property.TextDecorationColor => true
+    Property.TextDecorationThickness => true
+    Property.TextUnderlinePosition => true
+    Property.TextOverflow => true
+    Property.GlyphOrientationHorizontal => true
+    Property.GlyphOrientationVertical => true
+    Property.TextTransform => true
+    Property.TabSize => true
+    Property.HangingPunctuation => true
+    Property.TextEmphasis => true
+    Property.TextEmphasisStyle => true
+    Property.TextEmphasisColor => true
+    Property.TextEmphasisPosition => true
+    Property.VerticalAlign => true
+    Property.TextShadow => true
+    _ => false
+  }
+}
+
+fn effectProperty(property: Property) -> bool {
+  return match property {
+    Property.Filter => true
+    Property.Mask => true
+    Property.MaskImage => true
+    Property.MaskMode => true
+    Property.MaskRepeat => true
+    Property.MaskPosition => true
+    Property.MaskClip => true
+    Property.MaskOrigin => true
+    Property.MaskSize => true
+    Property.MaskComposite => true
+    Property.MaskBorder => true
+    Property.MaskBorderSource => true
+    Property.MaskBorderSlice => true
+    Property.MaskBorderWidth => true
+    Property.MaskBorderOutset => true
+    Property.MaskBorderRepeat => true
+    Property.ClipPath => true
+    Property.ShapeInside => true
+    Property.ShapeSubtract => true
+    Property.Clip => true
+    Property.EnableBackground => true
+    _ => false
+  }
+}
+
+fn transformProperty(property: Property) -> bool {
+  return match property {
+    Property.Transform => true
+    Property.TransformOrigin => true
+    Property.Perspective => true
+    Property.PerspectiveOrigin => true
+    Property.TransformBox => true
+    Property.TransformStyle => true
+    Property.BackfaceVisibility => true
+    Property.Translate => true
+    Property.Rotate => true
+    Property.Scale => true
+    _ => false
+  }
+}
+
+effect fn parseValue(
+  store: &mut Store,
+  property: Property,
+  source: &Input,
+  cursor: &mut Cursor,
+  mode: Mode,
+) -> Option<Value>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let global = wide(source, &mut cursor.*)
+  match &global {
+    Option<Wide>.Some { value } => {
+      return Option<Value>.some(Value.Wide { keyword: value })
+    }
+    _ => {}
+  }
+  let keyword = value_keywords.parse(property, source, &mut cursor.*)
+  match &keyword {
+    Option<Keyword>.Some { value } => {
+      return Option<Value>.some(Value.Keyword { keyword: value })
+    }
+    _ => {}
+  }
+  let presentation = mode == Mode.Presentation
+  if textProperty(property) {
+    let parsed = run text_values.parse(
+      &mut store.numerics,
+      property,
+      source,
+      &mut cursor.*,
+      presentation,
+    )
+    return match move parsed {
+      Option<TextValue>.Some { value } => Option<Value>.some(Value.Text { value: move value })
+      _ => Option<Value>.None
+    }
+  }
+  if effectProperty(property) {
+    let parsed = run effect_values.parse(
+      &mut store.numerics,
+      property,
+      source,
+      &mut cursor.*,
+      presentation,
+    )
+    return match move parsed {
+      Option<EffectValue>.Some { value } => Option<Value>.some(Value.Effect { value: move value })
+      _ => Option<Value>.None
+    }
+  }
+  if transformProperty(property) {
+    let parsed = run transform_values.parse(
+      &mut store.numerics,
+      property,
+      source,
+      &mut cursor.*,
+      presentation,
+    )
+    return match move parsed {
+      Option<TransformValue>.Some { value } => Option<Value>.some(
+        Value.Transform { value: move value },
+      )
+      _ => Option<Value>.None
+    }
+  }
+  if property == Property.Fill || property == Property.Stroke
+    || property == Property.TextDecorationFill
+    || property == Property.TextDecorationStroke {
+    let parsed = run paint(
+      &mut store.*,
+      source,
+      &mut cursor.*,
+      property == Property.Fill || property == Property.Stroke,
+      mode,
+    )
+    return match &parsed {
+      Option<Paint>.Some { value } => Option<Value>.some(Value.Paint { paint: value })
+      _ => Option<Value>.None
+    }
+  }
+  if property == Property.Color || property == Property.StopColor || property == Property.FloodColor
+    || property == Property.LightingColor {
+    let parsed = run svgColor(&mut store.*, source, &mut cursor.*, property != Property.Color, mode)
+    return match &parsed {
+      Option<Fallback>.Some { value } => match &value {
+        Fallback.Color { color } => Option<Value>.some(Value.Color { color: color })
+        Fallback.IccColor { color, icc } => Option<Value>.some(
+          Value.IccColor { color: color, icc: icc },
+        )
+        _ => Option<Value>.None
+      }
+      _ => Option<Value>.None
+    }
+  }
+  if property == Property.Marker || property == Property.MarkerStart
+    || property == Property.MarkerMid
+    || property == Property.MarkerEnd {
+    if cursor.ident(source, b"none") {
+      return Option<Value>.some(Value.Keyword { keyword: Keyword.None })
+    }
+    let parsed = run url(&mut store.*, source, &mut cursor.*)
+    return match &parsed {
+      Option<Span>.Some { value } => Option<Value>.some(Value.Resource { url: value })
+      _ => Option<Value>.None
+    }
+  }
+  if property == Property.StrokeDasharray {
+    return run dashes(&mut store.*, source, &mut cursor.*)
+  }
+  if property == Property.PaintOrder {
+    return paintOrder(source, &mut cursor.*)
+  }
+  if property == Property.VectorEffect {
+    return vectorEffect(source, &mut cursor.*)
+  }
+  if property == Property.Cursor {
+    return run cursorValue(&mut store.*, source, &mut cursor.*)
+  }
+  if property == Property.D {
+    return run pathValue(&mut store.*, source, &mut cursor.*, mode)
+  }
+  if property == Property.ColorProfile {
+    return run profile(&mut store.*, source, &mut cursor.*)
+  }
+  if property == Property.BackgroundBlendMode {
+    let mut modes = List<Keyword>.make()
+    while true {
+      let parsed = value_keywords.parse(Property.MixBlendMode, source, &mut cursor.*)
+      match &parsed {
+        Option<Keyword>.Some { value } => {
+          run modes.append(value)
+        }
+        _ => {
+          return Option<Value>.None
+        }
+      }
+      if !cursor.comma(source) {
+        break
+      }
+    }
+    return Option<Value>.some(Value.BlendModes { modes: move modes })
+  }
+  if property == Property.Rx || property == Property.Ry || property == Property.Width
+    || property == Property.Height
+    || property == Property.Kerning {
+    if cursor.ident(source, b"auto") {
+      return Option<Value>.some(Value.Keyword { keyword: Keyword.Auto })
+    }
+  }
+  let expected = numericDimension(property)
+  match &expected {
+    Option<Dimension>.Some { value } => {
+      let parsed = run dimensions.parse(
+        &mut store.numerics,
+        source,
+        &mut cursor.*,
+        value,
+        presentation,
+      )
+      match &parsed {
+        Option<ExprId>.Some { value: expression } => {
+          let range = numericRange(property)
+          if (range == Range.Nonnegative || range == Range.AtLeastOne)
+            && dimensions.negativeLiteral(&store.numerics, expression) {
+            return Option<Value>.None
+          }
+          if range == Range.AtLeastOne {
+            match &store.numerics.get(expression).* {
+              Expr.Literal { value: n, unit } => {
+                if n < 1.0 {
+                  return Option<Value>.None
+                }
+              }
+              _ => {}
+            }
+          }
+          return Option<Value>.some(
+            Value.Numeric { expression: expression, range: range, basis: numericBasis(property) },
+          )
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  return Option<Value>.None
+}
+
+pub effect fn parse(store: &mut Store, property: Property, source: &Input, mode: Mode) -> Option<
+  ValueId
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut cursor = Cursor.make(source)
+  let parsed = run parseValue(&mut store.*, property, source, &mut cursor, mode)
+  if !cursor.done(source) {
+    return Option<ValueId>.None
+  }
+  return match move parsed {
+    Option<Value>.Some { value } => Option<ValueId>.some(run store.add(move value))
+    _ => Option<ValueId>.None
+  }
+}
+
+fn computePaint(value: Paint, context: &colors.Context) -> Paint {
+  return match &value {
+    Paint.Color { color } => Paint.Color { color: colors.compute(color, context) }
+    Paint.IccColor { color, icc } => Paint.IccColor {
+      color: colors.compute(color, context),
+      icc: icc,
+    }
+    Paint.Server { url, fallback } => {
+      let resolved = match &fallback {
+        Fallback.Color { color } => Fallback.Color { color: colors.compute(color, context) }
+        Fallback.IccColor { color, icc } => Fallback.IccColor {
+          color: colors.compute(color, context),
+          icc: icc,
+        }
+        _ => fallback
+      }
+      return Paint.Server { url: url, fallback: resolved }
+    }
+    _ => value
+  }
+}
+
+pub effect fn compute(store: &mut Store, id: ValueId, context: &ComputeContext) -> ValueId
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // Immutable nodes can share the specified-value handle. Only context-dependent nodes allocate.
+  let value = &store.values.asSlice()[id.index]
+  let computed = match &value.* {
+    Value.Numeric { expression, range, basis } => {
+      let resolved = run dimensions.compute(&mut store.numerics, expression, &context.dimensions)
+      Value.Numeric { expression: resolved, range: range, basis: basis }
+    }
+    Value.Color { color } => Value.Color { color: colors.compute(color, &context.colors) }
+    Value.IccColor { color, icc } => Value.IccColor {
+      color: colors.compute(color, &context.colors),
+      icc: icc,
+    }
+    Value.Paint { paint } => Value.Paint { paint: computePaint(paint, &context.colors) }
+    Value.Dashes { expressions } => {
+      let mut resolved = List<ExprId>.make()
+      let mut i: usize = 0
+      while i < expressions.length() {
+        run resolved.append(
+          run dimensions.compute(
+            &mut store.numerics,
+            expressions.asSlice()[i],
+            &context.dimensions,
+          ),
+        )
+        i = i + 1
+      }
+      Value.Dashes { expressions: move resolved }
+    }
+    Value.Text { value: text } => {
+      // Text4 whitespace keywords are immutable computed values, including trim sets.
+      if text.property == Property.WhiteSpace || text.property == Property.WhiteSpaceCollapse
+        || text.property == Property.TextWrapMode
+        || text.property == Property.WhiteSpaceTrim {
+        return id
+      }
+      Value.Text {
+        value: run text_values.compute(
+          &text,
+          &mut store.numerics,
+          &context.dimensions,
+          &context.colors,
+          context.systemFonts,
+        ),
+      }
+    }
+    Value.Effect { value: effects } => Value.Effect {
+      value: run effect_values.compute(
+        &effects,
+        &mut store.numerics,
+        &context.dimensions,
+        &context.colors,
+      ),
+    }
+    Value.Transform { value: transform } => Value.Transform {
+      value: run transform_values.compute(&transform, &mut store.numerics, &context.dimensions),
+    }
+    _ => {
+      return id
+    }
+  }
+  return run store.add(move computed)
+}
+
+// Used-value range restrictions apply after math and percentage resolution, not while parsing calc().
+pub fn usedNumber(store: &Store, id: ValueId, percentageBasis: f64) -> Option<f64> {
+  return match &store.get(id).* {
+    Value.Numeric { expression, range, basis } => {
+      let limit = f64.fromBits(9218868437227405311)
+      let number = f64.max(
+        -limit,
+        f64.min(limit, dimensions.evaluate(&store.numerics, expression, percentageBasis)),
+      )
+      let bounded = match range {
+        Range.Unrestricted => number
+        Range.Nonnegative => f64.max(0.0, number)
+        Range.AtLeastOne => f64.max(1.0, number)
+        Range.UnitInterval => f64.max(0.0, f64.min(1.0, number))
+      }
+      return Option<f64>.some(bounded)
+    }
+    _ => Option<f64>.None
+  }
+}
+
+pub fn percentageBasis(basis: Basis, width: f64, height: f64, font: f64) -> f64 {
+  return match basis {
+    Basis.None => 1.0
+    Basis.Horizontal => width
+    Basis.Vertical => height
+    Basis.Font => font
+    Basis.Diagonal => math.hypot(width, height) / 1.4142135623730951
+  }
+}
+
+pub fn validComputed(store: &Store, id: ValueId) -> bool {
+  return match &store.get(id).* {
+    Value.Text { value } => text_values.validComputed(&value)
+    _ => true
+  }
+}
+
+// Keyword shorthands are projected at cascade expansion, before their source property is discarded.
+pub fn projectKeyword(store: &Store, id: ValueId, source: Property, target: Property) -> Option<
+  Keyword
+> {
+  return match &store.get(id).* {
+    Value.Keyword { keyword } => {
+      if source == Property.TextAlign {
+        if target == Property.TextAlignLast {
+          return Option<Keyword>.some(
+            if keyword == Keyword.JustifyAll {
+              Keyword.Justify
+            } else {
+              Keyword.Auto
+            },
+          )
+        }
+        if keyword == Keyword.JustifyAll {
+          return Option<Keyword>.some(Keyword.Justify)
+        }
+      }
+      return Option<Keyword>.some(keyword)
+    }
+    _ => Option<Keyword>.None
+  }
+}
+
+pub fn dashCount(store: &Store, id: ValueId) -> usize {
+  return match &store.get(id).* {
+    Value.Dashes { expressions } => {
+      let count = expressions.length()
+      return if count % 2 == 0 {
+        count
+      } else {
+        count * 2
+      }
+    }
+    _ => 0
+  }
+}
+
+pub fn usedDash(store: &Store, id: ValueId, index: usize, percentageBasis: f64) -> Option<f64> {
+  return match &store.get(id).* {
+    Value.Dashes { expressions } => {
+      let count = expressions.length()
+      if count == 0 || index >= dashCount(store, id) {
+        return Option<f64>.None
+      }
+      let number = dimensions.evaluate(
+        &store.numerics,
+        expressions.asSlice()[index % count],
+        percentageBasis,
+      )
+      return Option<f64>.some(f64.max(0.0, f64.min(f64.fromBits(9218868437227405311), number)))
+    }
+    _ => Option<f64>.None
+  }
+}

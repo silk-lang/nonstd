@@ -1,0 +1,471 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Unhinted floating-point outline loading used by glyph metrics.
+//! Based on tables/glyf/outline/{plan,load,scale}.rs; font units, no hinter.
+import model.optional { Maybe }
+import model.error { Error }
+import table_provider { GlyfLoca }
+import tables.glyf {
+  Glyph,
+  SimpleGlyph,
+  CompositeGlyph,
+  Component,
+  ComponentIter,
+  ComponentGlyphIdFlagsIter,
+  ComponentGlyphFlags,
+  CompositeGlyphFlags,
+  PointFlags,
+  Anchor
+}
+import tables.loca { Loca, LocaGlyph }
+import tables.gvar { SelectedGvar, DeltaBuffers }
+import tables.hmtx { GlyphMetricRecords, LongMetric }
+import array { ScalarArray, ComputedArray }
+import font_types.lib { GlyphId, Point, Fixed, F2Dot14 }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i16
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+// Rust f32::hypot uses the platform math implementation as well.
+unsafe extern "C" fn hypotf(x: f32, y: f32) -> f32
+
+pub struct GlyfContext<'a, 'c> {
+  pub outlines: GlyfLoca<'a>,
+  pub gvar: Maybe<SelectedGvar<'a>>,
+  pub hMetrics: GlyphMetricRecords<'a>,
+  pub vMetrics: GlyphMetricRecords<'a>,
+  pub glyphCount: u32,
+  pub coords: &'c [F2Dot14],
+  pub ascender: i32,
+  pub descender: i32,
+}
+
+impl<'a, 'c> Copy for GlyfContext<'a, 'c> {}
+
+pub struct LoadedOutline {
+  pub points: List<Point<f32>>,
+  pub flags: List<PointFlags>,
+  pub contours: List<u16>,
+  pub phantom: [Point<f32>; 4],
+}
+
+struct Plan {
+  points: usize,
+  contours: usize,
+  edges: usize,
+}
+
+struct Loader {
+  points: List<Point<f32>>,
+  flags: List<PointFlags>,
+  contours: List<u16>,
+  pointCount: usize,
+  contourCount: usize,
+  phantom: [Point<f32>; 4],
+}
+
+fn zero() -> Point<f32> {
+  return Point<f32> { x: 0.0, y: 0.0 }
+}
+
+pub fn metricsEmpty<'a>(records: &GlyphMetricRecords<'a>) -> bool {
+  return ComputedArray<'a, (), LongMetric<'a>>.len(&GlyphMetricRecords.longMetrics(records)) == 0
+}
+
+pub fn statedAdvance(records: &GlyphMetricRecords, glyph: GlyphId, count: u32) -> i32 {
+  if GlyphId.toU32(glyph) >= count {
+    return 0
+  }
+  return u16.toI32(GlyphMetricRecords.advance(records, glyph) |> Option<u16>.unwrapOr(0))
+}
+
+pub fn statedBearing(records: &GlyphMetricRecords, glyph: GlyphId) -> i32 {
+  return i16.toI32(GlyphMetricRecords.sideBearing(records, glyph) |> Option<i16>.unwrapOr(0))
+}
+
+effect fn require<T>(value: Option<T>) -> T
+  ! Error {
+  return match move value {
+    Option<T>.Some { value: found } => move found
+    _ => {
+      fail Error.MissingResource
+    }
+  }
+}
+
+effect fn read<T>(value: Result<T, ReadError>) -> T
+  ! Error {
+  return match move value {
+    Result<T, ReadError>.Success { value: found } => move found
+    _ => {
+      fail Error.Malformed
+    }
+  }
+}
+
+effect fn repeated<T: Copy>(value: T, count: usize) -> List<T>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<T>.make()
+  let mut i: usize = 0
+  while i < count {
+    run List<T>.append(&mut result, value)
+    i = i + 1
+  }
+  return move result
+}
+
+effect fn glyph<'a, 'c>(context: &GlyfContext<'a, 'c>, gid: GlyphId) -> LocaGlyph<'a>
+  ! Error {
+  return run require(Loca.get(&context.outlines.loca, gid, &context.outlines.glyf))
+}
+
+effect fn survey<'a, 'c>(
+  context: &GlyfContext<'a, 'c>,
+  data: Glyph<'a>,
+  depth: usize,
+  plan: &mut Plan,
+) -> ()
+  ! Error {
+  if depth > 64 {
+    fail Error.LimitExceeded
+  }
+  match data {
+    Glyph<'a>.Simple { value } => {
+      plan.points = plan.points + SimpleGlyph.numPoints(&value)
+      if plan.points > 65536 {
+        fail Error.LimitExceeded
+      }
+      plan.contours = plan.contours + ScalarArray<u16>.len(&SimpleGlyph.endPtsOfContours(&value))
+    }
+    Glyph<'a>.Composite { value } => {
+      let mut components = CompositeGlyph.componentGlyphsAndFlags(&value)
+      while let Option<ComponentGlyphFlags>.Some {
+        value: component
+      } = ComponentGlyphIdFlagsIter.next(&mut components) {
+        let child = run glyph(context, component.glyph)
+        if let LocaGlyph<'a>.Glyph { value: childData } = child {
+          plan.edges = plan.edges + 1
+          if plan.edges > 2048 {
+            fail Error.LimitExceeded
+          }
+          run survey(context, childData, depth + 1, &mut plan)
+        }
+      }
+    }
+  }
+}
+
+pub effect fn load<'a, 'c>(context: &GlyfContext<'a, 'c>, gid: GlyphId) -> LoadedOutline
+  ! Error | OutOfMemoryError
+  ? &mut Allocator {
+  let root = run glyph(context, gid)
+  let mut plan = Plan { points: 0, contours: 0, edges: 0 }
+  if let LocaGlyph<'a>.Glyph { value } = root {
+    run survey(context, value, 0, &mut plan)
+  }
+  let mut loader = Loader {
+    points: run repeated(zero(), plan.points + 4),
+    flags: run repeated(PointFlags.default(), plan.points + 4),
+    contours: run repeated<u16>(0, plan.contours),
+    pointCount: 0,
+    contourCount: 0,
+    phantom: [zero(); 4],
+  }
+  run Loader.load(&mut loader, context, root, gid, 0)
+  let shift = loader.phantom[0].x
+  let mut i: usize = 0
+  if shift != 0.0 {
+    while i < loader.pointCount {
+      let mut point = List<Point<f32>>.get(&loader.points, i)
+      point.x = point.x - shift
+      List<Point<f32>>.set(&mut loader.points, i, point)
+      i = i + 1
+    }
+  }
+  List<Point<f32>>.truncate(&mut loader.points, loader.pointCount)
+  List<PointFlags>.truncate(&mut loader.flags, loader.pointCount)
+  List<u16>.truncate(&mut loader.contours, loader.contourCount)
+  return LoadedOutline {
+    points: move loader.points,
+    flags: move loader.flags,
+    contours: move loader.contours,
+    phantom: loader.phantom,
+  }
+}
+
+impl Loader {
+  effect fn load<'a, 'c>(
+    self: &mut Self,
+    context: &GlyfContext<'a, 'c>,
+    data: LocaGlyph<'a>,
+    gid: GlyphId,
+    depth: usize,
+  ) -> ()
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    if depth > 64 {
+      fail Error.LimitExceeded
+    }
+    let mut xMin: i32 = 0
+    let mut yMax: i32 = 0
+    if let LocaGlyph<'a>.Glyph { value } = data {
+      xMin = i16.toI32(Glyph.xMin(&value))
+      yMax = i16.toI32(Glyph.yMax(&value))
+    }
+    let lsb = statedBearing(&context.hMetrics, gid)
+    let advance = statedAdvance(&context.hMetrics, gid, context.glyphCount)
+    let mut tsb = context.ascender - yMax
+    let mut vAdvance = context.ascender - context.descender
+    if !metricsEmpty(&context.vMetrics) {
+      tsb = statedBearing(&context.vMetrics, gid)
+      vAdvance = statedAdvance(&context.vMetrics, gid, context.glyphCount)
+    }
+    self.phantom = [
+      Point<f32> { x: i32.toF32(xMin - lsb), y: 0.0 },
+      Point<f32> { x: i32.toF32(xMin - lsb + advance), y: 0.0 },
+      Point<f32> { x: 0.0, y: i32.toF32(yMax + tsb) },
+      Point<f32> { x: 0.0, y: i32.toF32(yMax + tsb - vAdvance) },
+    ]
+    match data {
+      LocaGlyph<'a>.Empty => {
+        if context.coords.length != 0 {
+          if let Maybe<SelectedGvar<'a>>.Some { value } = context.gvar {
+            if let Option<[Point<Fixed>; 4]>.Some {
+              value: deltas
+            } = SelectedGvar.phantomPointDeltas(
+              &value,
+              &context.outlines.glyf,
+              &context.outlines.loca,
+              context.coords,
+              gid,
+            ) {
+              let mut i: usize = 0
+              while i < 2 {
+                self.phantom[i].x = self.phantom[i].x + Fixed.toF32(deltas[i].x)
+                self.phantom[i].y = self.phantom[i].y + Fixed.toF32(deltas[i].y)
+                i = i + 1
+              }
+            }
+          }
+        }
+      }
+      LocaGlyph<'a>.Glyph { value: Glyph<'a>.Simple { value } } => {
+        run Loader.simple(&mut self, context, value, gid)
+      }
+      LocaGlyph<'a>.Glyph { value: Glyph<'a>.Composite { value } } => {
+        run Loader.composite(&mut self, context, value, gid, depth)
+      }
+    }
+  }
+
+  effect fn simple<'a, 'c>(
+    self: &mut Self,
+    context: &GlyfContext<'a, 'c>,
+    data: SimpleGlyph<'a>,
+    gid: GlyphId,
+  ) -> ()
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    let count = SimpleGlyph.numPoints(&data)
+    let ends = SimpleGlyph.endPtsOfContours(&data)
+    let contourCount = ScalarArray<u16>.len(&ends)
+    let mut contours = List<u16>.make()
+    let mut i: usize = 0
+    let mut previous: u16 = 0
+    while i < contourCount {
+      let end = run require(ScalarArray<u16>.get(&ends, i))
+      if end < previous {
+        fail Error.Malformed
+      }
+      previous = end
+      run List<u16>.append(&mut contours, end)
+      i = i + 1
+    }
+    let mut points = run repeated(zero(), count)
+    let mut flags = run repeated(PointFlags.default(), count)
+    drop run read(
+      SimpleGlyph<'a>.readPointsFast<f32>(
+        &data,
+        List<Point<f32>>.asMutSlice(&mut points),
+        List<PointFlags>.asMutSlice(&mut flags),
+      ),
+    )
+    i = 0
+    while i < 4 {
+      run List<Point<f32>>.append(&mut points, self.phantom[i])
+      run List<PointFlags>.append(&mut flags, PointFlags.default())
+      i = i + 1
+    }
+    if context.coords.length != 0 {
+      if let Maybe<SelectedGvar<'a>>.Some { value: gvar } = context.gvar {
+        let mut deltas = run repeated(zero(), count + 4)
+        let mut iup = run repeated(zero(), count + 4)
+        let mut buffers = DeltaBuffers<f32> {
+          deltas: List<Point<f32>>.asMutSlice(&mut deltas),
+          iup: List<Point<f32>>.asMutSlice(&mut iup),
+        }
+        let valid = SelectedGvar<'a>.simpleDeltas<f32, f32>(
+          &gvar,
+          gid,
+          context.coords,
+          List<Point<f32>>.asSlice(&points),
+          List<PointFlags>.asMutSlice(&mut flags),
+          List<u16>.asSlice(&contours),
+          &mut buffers,
+        )
+        drop buffers
+        if let Option<bool>.Some { value } = move valid {
+          i = 0
+          while i < count + 4 {
+            let point = List<Point<f32>>.get(&points, i)
+            let delta = List<Point<f32>>.get(&deltas, i)
+            List<Point<f32>>.set(
+              &mut points,
+              i,
+              Point<f32> { x: point.x + delta.x, y: point.y + delta.y },
+            )
+            i = i + 1
+          }
+        }
+      }
+    }
+    i = 0
+    while i < count + 4 {
+      let at = self.pointCount + i
+      if at >= List<Point<f32>>.length(&self.points) {
+        fail Error.InsufficientMemory
+      }
+      List<Point<f32>>.set(&mut self.points, at, List<Point<f32>>.get(&points, i))
+      List<PointFlags>.set(&mut self.flags, at, List<PointFlags>.get(&flags, i))
+      i = i + 1
+    }
+    i = 0
+    while i < 4 {
+      self.phantom[i] = List<Point<f32>>.get(&points, count + i)
+      i = i + 1
+    }
+    i = 0
+    while i < contourCount {
+      let end = u16.toUsize(List<u16>.get(&contours, i)) + self.pointCount
+      if end > 65535 || self.contourCount + i >= List<u16>.length(&self.contours) {
+        fail Error.Malformed
+      }
+      List<u16>.set(&mut self.contours, self.contourCount + i, usize.toU16(end))
+      i = i + 1
+    }
+    self.pointCount = self.pointCount + count
+    self.contourCount = self.contourCount + contourCount
+  }
+
+  effect fn composite<'a, 'c>(
+    self: &mut Self,
+    context: &GlyfContext<'a, 'c>,
+    data: CompositeGlyph<'a>,
+    gid: GlyphId,
+    depth: usize,
+  ) -> ()
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    let pointBase = self.pointCount
+    let counted = CompositeGlyph.countAndInstructions(&data)
+    let count = counted.count
+    let mut deltas = List<Point<f32>>.make()
+    let mut haveDeltas = false
+    if context.coords.length != 0 {
+      if let Maybe<SelectedGvar<'a>>.Some { value: gvar } = context.gvar {
+        deltas = run repeated(zero(), count + 4)
+        if let Option<bool>.Some { value } = SelectedGvar<'a>.compositeDeltas<f32>(
+          &gvar,
+          gid,
+          context.coords,
+          List<Point<f32>>.asMutSlice(&mut deltas),
+        ) {
+          haveDeltas = true
+          let mut i: usize = 0
+          while i < 4 {
+            let delta = List<Point<f32>>.get(&deltas, count + i)
+            self.phantom[i].x = self.phantom[i].x + delta.x
+            self.phantom[i].y = self.phantom[i].y + delta.y
+            i = i + 1
+          }
+        }
+      }
+    }
+    let mut iter = CompositeGlyph.components(&data)
+    let mut index: usize = 0
+    while let Option<Component>.Some { value: component } = ComponentIter.next(&mut iter) {
+      let saved = self.phantom
+      let start = self.pointCount
+      let child = run glyph(context, component.glyph)
+      run Loader.load(&mut self, context, child, component.glyph, depth + 1)
+      if !CompositeGlyphFlags.contains(&component.flags, CompositeGlyphFlags.useMyMetrics()) {
+        self.phantom = saved
+      }
+      let bits = CompositeGlyphFlags.bits(&component.flags)
+      let transformed = (bits & (8 | 64 | 128)) != 0
+      let xx = F2Dot14.toF32(component.transform.xx)
+      let xy = F2Dot14.toF32(component.transform.xy)
+      let yx = F2Dot14.toF32(component.transform.yx)
+      let yy = F2Dot14.toF32(component.transform.yy)
+      if transformed {
+        let mut i = start
+        while i < self.pointCount {
+          let point = List<Point<f32>>.get(&self.points, i)
+          List<Point<f32>>.set(
+            &mut self.points,
+            i,
+            Point<f32> { x: point.x * xx + point.y * xy, y: point.x * yx + point.y * yy },
+          )
+          i = i + 1
+        }
+      }
+      let mut offset = zero()
+      match component.anchor {
+        Anchor.Offset { x, y } => {
+          offset = Point<f32> { x: i16.toF32(x), y: i16.toF32(y) }
+          if transformed && (bits & (2048 | 4096)) == 2048 {
+            offset.x = offset.x * (unsafe hypotf(xx, xy))
+            offset.y = offset.y * (unsafe hypotf(yx, yy))
+          }
+          if haveDeltas && index < List<Point<f32>>.length(&deltas) {
+            let delta = List<Point<f32>>.get(&deltas, index)
+            offset.x = offset.x + delta.x
+            offset.y = offset.y + delta.y
+          }
+        }
+        Anchor.Point { base, component: childPoint } => {
+          let baseIndex = pointBase + u16.toUsize(base)
+          let childIndex = start + u16.toUsize(childPoint)
+          if baseIndex >= List<Point<f32>>.length(&self.points)
+            || childIndex >= List<Point<f32>>.length(&self.points) {
+            fail Error.Malformed
+          }
+          let basePoint = List<Point<f32>>.get(&self.points, baseIndex)
+          let childValue = List<Point<f32>>.get(&self.points, childIndex)
+          offset = Point<f32> { x: basePoint.x - childValue.x, y: basePoint.y - childValue.y }
+        }
+      }
+      if offset.x != 0.0 || offset.y != 0.0 {
+        let mut i = start
+        while i < self.pointCount {
+          let point = List<Point<f32>>.get(&self.points, i)
+          List<Point<f32>>.set(
+            &mut self.points,
+            i,
+            Point<f32> { x: point.x + offset.x, y: point.y + offset.y },
+          )
+          i = i + 1
+        }
+      }
+      index = index + 1
+    }
+  }
+}

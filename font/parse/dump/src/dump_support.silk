@@ -1,0 +1,454 @@
+//! Allocation-free paths for the bounded table graph traversal.
+import silk.core.ownership { Copy }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Format }
+import silk.text.string { String }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import font_types.lib { Version16Dot16, readScalar }
+import read_fonts.lib { ReadError }
+import dump
+
+// Where a segment's text starts in `DumpPath.prefix`, and where its name ends (its index
+// follows).
+struct Segment {
+  start: usize,
+  nameEnd: usize,
+}
+
+impl Copy for Segment {}
+
+struct NodeKey {
+  typ: u32,
+  remaining: usize,
+  args: [u64; 3],
+}
+
+impl Copy for NodeKey {}
+
+struct Node {
+  key: NodeKey,
+  id: usize,
+}
+
+impl Copy for Node {}
+
+fn nodeHash(key: NodeKey) -> usize {
+  let mut hash = u64.wrappingMultiply(u32.toU64(key.typ), 1099511628211)
+    ^ usize.toU64(key.remaining)
+  let mut i: usize = 0
+  while i < 3 {
+    hash = u64.wrappingMultiply(hash, 1099511628211) ^ key.args[i]
+    i = i + 1
+  }
+  return u64.toUsize(hash & 16383)
+}
+
+fn nodeEqual(a: NodeKey, b: NodeKey) -> bool {
+  return a.typ == b.typ && a.remaining == b.remaining && a.args[0] == b.args[0]
+    && a.args[1] == b.args[1]
+    && a.args[2] == b.args[2]
+}
+
+// Paths are rendered as they are built, so each dumped line writes its path with one call.
+// Names are at most 40 bytes and indexes at most 22, so 128 segments fit in 8192 bytes.
+pub struct DumpPath {
+  prefix: [u8; 8192],
+  length: usize,
+  segments: [Segment; 128],
+  depth: usize,
+  visits: usize,
+  args: [u64; 3],
+  nodes: [Node; 16384],
+  nextNode: usize,
+  scopeStart: usize,
+}
+
+impl DumpPath {
+  pub fn new(index: usize) -> Self {
+    let mut value = Self {
+      prefix: [0; 8192],
+      length: 0,
+      segments: [Segment { start: 0, nameEnd: 0 }; 128],
+      depth: 1,
+      visits: 0,
+      args: [0; 3],
+      nodes: [Node { key: NodeKey { typ: 0, remaining: 0, args: [0; 3] }, id: 0 }; 16384],
+      nextNode: 1,
+      scopeStart: 1,
+    }
+    DumpPath.append(&mut value, "font")
+    value.segments[0] = Segment { start: 0, nameEnd: value.length }
+    DumpPath.setIndex(&mut value, index)
+    return move value
+  }
+
+  pub fn arguments(self: &Self) -> [u64; 3] {
+    return self.args
+  }
+
+  pub fn setArguments(self: &mut Self, args: [u64; 3]) -> () {
+    self.args = args
+  }
+
+  pub fn beginTable(self: &mut Self) -> () {
+    self.scopeStart = self.nextNode
+    self.args = [0; 3]
+  }
+
+  pub effect fn visit(self: &mut Self, typ: u32, remaining: usize, args: [u64; 3]) -> bool
+    ! WriterError
+    ? &mut Writer {
+    if !DumpPath.enter(&mut self) {
+      run scalar(&self, "traversal-limit")
+      return false
+    }
+    let key = NodeKey { typ: typ, remaining: remaining, args: args }
+    let first = nodeHash(key)
+    let mut slot = first
+    let mut probes: usize = 0
+    while probes < 16384 && self.nodes[slot].id >= self.scopeStart {
+      if nodeEqual(self.nodes[slot].key, key) {
+        let id = self.nodes[slot].id
+        DumpPath.push(&mut self, "ref")
+        run scalar(&self, id)
+        DumpPath.pop(&mut self)
+        return false
+      }
+      slot = (slot + 1) & 16383
+      probes = probes + 1
+    }
+
+    // Eviction only causes a later view to be printed again; no fields are omitted.
+    if probes == 16384 {
+      slot = first
+    }
+    let id = self.nextNode
+    self.nextNode = self.nextNode + 1
+    self.nodes[slot] = Node { key: key, id: id }
+    DumpPath.push(&mut self, "node")
+    run scalar(&self, id)
+    DumpPath.pop(&mut self)
+    return true
+  }
+
+  pub fn enter(self: &mut Self) -> bool {
+    if self.depth >= 64 || self.visits >= 10000000 {
+      return false
+    }
+    self.visits = self.visits + 1
+    return true
+  }
+
+  pub fn push(self: &mut Self, name: string<'static>) -> () {
+    // Each generated node stops before depth 64, leaving room for field paths.
+    if self.depth >= 128 {
+      return Intrinsic.trap("generated dump path exceeds its static bound")
+    }
+    let start = self.length
+    DumpPath.append(&mut self, ".")
+    DumpPath.append(&mut self, name)
+    self.segments[self.depth] = Segment { start: start, nameEnd: self.length }
+    self.depth = self.depth + 1
+  }
+
+  pub fn pop(self: &mut Self) -> () {
+    if self.depth > 1 {
+      self.depth = self.depth - 1
+      self.length = self.segments[self.depth].start
+    }
+  }
+
+  pub fn setIndex(self: &mut Self, index: usize) -> () {
+    self.length = self.segments[self.depth - 1].nameEnd
+    DumpPath.append(&mut self, "[")
+    self.length = appendDecimal(&mut self.prefix, self.length, usize.toU64(index))
+    DumpPath.append(&mut self, "]")
+  }
+
+  pub fn clearIndex(self: &mut Self) -> () {
+    self.length = self.segments[self.depth - 1].nameEnd
+  }
+
+  fn append(self: &mut Self, text: string<'static>) -> () {
+    let bytes = String.utf8Bytes(text)
+    if bytes.length > self.prefix.length - self.length {
+      return Intrinsic.trap("generated dump path exceeds its static bound")
+    }
+    let mut i: usize = 0
+    while i < bytes.length {
+      self.prefix[self.length + i] = bytes[i]
+      i = i + 1
+    }
+    self.length = self.length + bytes.length
+  }
+
+  pub effect fn write(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Writer.writeAll(Slice.view<u8>(&self.prefix, 0, self.length))
+  }
+}
+
+// Writes `value` in decimal at `at` and returns the end. The caller leaves 20 bytes of room.
+fn appendDecimal(output: &mut [u8], at: usize, value: u64) -> usize {
+  let mut count: usize = 1
+  let mut bound: u64 = 10
+  while count < 20 && value >= bound {
+    count = count + 1
+
+    // Stops at 20 digits, before 10^20 would overflow.
+    if count < 20 {
+      bound = bound * 10
+    }
+  }
+  let digitPairs = String.utf8Bytes(
+    "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899",
+  )
+  let mut rest = value
+  let mut position = at + count
+  while rest >= 100 {
+    let pair = u64.toUsize(rest % 100) * 2
+    rest = rest / 100
+    position = position - 2
+    output[position] = digitPairs[pair]
+    output[position + 1] = digitPairs[pair + 1]
+  }
+  if rest >= 10 {
+    let pair = u64.toUsize(rest) * 2
+    output[position - 2] = digitPairs[pair]
+    output[position - 1] = digitPairs[pair + 1]
+  } else {
+    output[position - 1] = 48 + u64.toU8(rest)
+  }
+  return at + count
+}
+
+/// A value that a dump line can hold. Integers bypass `silk.text.format`, which costs about a
+/// thousand instructions a call.
+pub interface DumpValue {
+  /// Writes `=value` and the line's newline.
+  effect fn dumpValue(self: &Self) -> () ! WriterError ? &mut Writer
+}
+
+effect fn dumpUnsigned(value: u64) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut line: [u8; 24] = [0; 24]
+  line[0] = 61
+  let end = appendDecimal(&mut line, 1, value)
+  line[end] = 10
+  run Writer.writeAll(Slice.view<u8>(&line, 0, end + 1))
+}
+
+// Writes `value` in decimal at `at` and returns the end. The caller leaves 21 bytes of room.
+fn appendSigned(output: &mut [u8], at: usize, value: i64) -> usize {
+  if value >= 0 {
+    return appendDecimal(&mut output, at, i64.toU64(value))
+  }
+  output[at] = 45
+
+  // -(value + 1) cannot overflow, even for the minimum.
+  return appendDecimal(&mut output, at + 1, i64.toU64(-(value + 1)) + 1)
+}
+
+effect fn dumpSigned(value: i64) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut line: [u8; 24] = [0; 24]
+  line[0] = 61
+  let end = appendSigned(&mut line, 1, value)
+  line[end] = 10
+  run Writer.writeAll(Slice.view<u8>(&line, 0, end + 1))
+}
+
+/// Writes the path and up to four comma-separated integers, as `path=1,2,3`.
+pub effect fn integers(path: &DumpPath, values: &[i64]) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run DumpPath.write(path)
+  let mut line: [u8; 96] = [0; 96]
+  line[0] = 61
+  let mut end: usize = 1
+  let mut i: usize = 0
+  while i < values.length {
+    if i != 0 {
+      line[end] = 44
+      end = end + 1
+    }
+    end = appendSigned(&mut line, end, values[i])
+    i = i + 1
+  }
+  line[end] = 10
+  run Writer.writeAll(Slice.view<u8>(&line, 0, end + 1))
+}
+
+impl DumpValue for u8 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpUnsigned(u8.toU64(self.*))
+  }
+}
+
+impl DumpValue for u16 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpUnsigned(u16.toU64(self.*))
+  }
+}
+
+impl DumpValue for u32 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpUnsigned(u32.toU64(self.*))
+  }
+}
+
+impl DumpValue for u64 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpUnsigned(self.*)
+  }
+}
+
+impl DumpValue for usize {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpUnsigned(usize.toU64(self.*))
+  }
+}
+
+impl DumpValue for i8 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpSigned(i8.toI64(self.*))
+  }
+}
+
+impl DumpValue for i16 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpSigned(i16.toI64(self.*))
+  }
+}
+
+impl DumpValue for i32 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpSigned(i32.toI64(self.*))
+  }
+}
+
+impl DumpValue for i64 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run dumpSigned(self.*)
+  }
+}
+
+impl DumpValue for bool {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    if self.* {
+      return run Writer.writeString("=true\n")
+    }
+    run Writer.writeString("=false\n")
+  }
+}
+
+impl<'text> DumpValue for string<'text> {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Writer.writeString("=")
+    run Writer.writeString(self.*)
+    run Writer.writeString("\n")
+  }
+}
+
+impl DumpValue for f32 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Format.format("={value}\n", &.{ value: self.* })
+  }
+}
+
+impl DumpValue for f64 {
+  effect fn dumpValue(self: &Self) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Format.format("={value}\n", &.{ value: self.* })
+  }
+}
+
+pub effect fn scalar<T: DumpValue>(path: &DumpPath, value: T) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run DumpPath.write(path)
+  run value.dumpValue()
+}
+
+pub effect fn absent(path: &DumpPath) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run scalar(path, "none")
+}
+
+pub effect fn bytes(path: &DumpPath, data: &[u8]) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run DumpPath.write(path)
+  run Writer.writeString("=")
+  let digits = String.utf8Bytes("0123456789abcdef")
+  let mut chunk: [u8; 256] = [0; 256]
+  let mut used: usize = 0
+  let mut i: usize = 0
+  while i < data.length {
+    if used == 256 {
+      run Writer.writeAll(Slice.view<u8>(&chunk, 0, used))
+      used = 0
+    }
+    chunk[used] = digits[u8.toUsize(data[i] / 16)]
+    chunk[used + 1] = digits[u8.toUsize(data[i] % 16)]
+    used = used + 2
+    i = i + 1
+  }
+  run Writer.writeAll(Slice.view<u8>(&chunk, 0, used))
+  run Writer.writeString("\n")
+}
+
+pub effect fn readError(path: &DumpPath, value: ReadError) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run DumpPath.write(path)
+  run Writer.writeString(".error=")
+  run dump.error(value)
+  run Writer.writeString("\n")
+}
+
+pub fn versionBits(value: Version16Dot16) -> u32 {
+  let bytes = Version16Dot16.toBeBytes(&value)
+  return readScalar<u32>(&bytes) |> Option<u32>.unwrapOr(0)
+}
+
+pub import generated_dump_traits { DumpTable }
+import silk.num.usize
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.u16
+import silk.num.i8
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64

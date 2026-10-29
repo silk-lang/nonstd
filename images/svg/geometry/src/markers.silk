@@ -1,0 +1,535 @@
+//! SVG 2 source vertices and analytic automatic marker orientation.
+//! https://www.w3.org/TR/2018/CR-SVG2-20181004/painting.html#RenderingMarkers
+//! https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDirectionality
+import geometry { Path, Segment, Point }
+import arcs { NormalizedArc }
+import arcs
+import transforms { Matrix }
+import transforms
+import math
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+
+pub enum MarkerKind {
+  Start,
+  Mid,
+  End
+}
+
+pub struct MarkerPosition {
+  pub position: Point,
+  pub angle: f64,
+  pub kind: MarkerKind,
+}
+
+impl Copy for MarkerPosition {}
+
+/// Source geometry, a projected position or tangent, or a required arithmetic
+/// intermediate cannot be represented in binary64 (including underflow).
+/// A nonfinite matrix or a collapsed mapped direction also fails explicitly.
+/// This never authorizes callers to replace an arc with a line.
+pub enum MarkerError {
+  NumericLimit
+}
+
+struct Tangents {
+  start: Point,
+  end: Point,
+  defined: bool,
+}
+
+impl Copy for Tangents {}
+
+fn same(a: Point, b: Point) -> bool {
+  return a.x == b.x && a.y == b.y
+}
+
+fn overflowsDifference(a: f64, b: f64) -> bool {
+  return ((a < 0.0 && b > 0.0) || (a > 0.0 && b < 0.0))
+    && f64.abs(a) > 1.7976931348623157e308 - f64.abs(b)
+}
+
+effect fn direction(from: Point, to: Point, mapped: bool) -> Point
+  ! MarkerError {
+  // Halve both components only when subtraction really would overflow. Scaling
+  // every point by its magnitude would erase small deltas on translated paths.
+  if overflowsDifference(to.x, from.x) || overflowsDifference(to.y, from.y) {
+    let value = Point.new(to.x * 0.5 - from.x * 0.5, to.y * 0.5 - from.y * 0.5)
+    if mapped && ((to.x != from.x && value.x == 0.0) || (to.y != from.y && value.y == 0.0)) {
+      fail MarkerError.NumericLimit
+    }
+    return value
+  }
+  return Point.new(to.x - from.x, to.y - from.y)
+}
+
+effect fn straight(from: Point, to: Point, mapped: bool) -> Tangents
+  ! MarkerError {
+  let angle = run direction(from, to, mapped)
+  return Tangents { start: angle, end: angle, defined: !same(from, to) }
+}
+
+fn canonical(angle: f64) -> f64 {
+  if angle > math.PI {
+    return angle - math.TAU
+  }
+  if angle <= -math.PI {
+    return angle + math.TAU
+  }
+  return angle
+}
+
+fn bisect(incoming: f64, outgoing: f64) -> f64 {
+  // SVG 2 says "half way" but does not settle the antiparallel tie:
+  // https://github.com/w3c/svgwg/issues/333. Choose incoming + pi/2 at
+  // exactly pi, consistently for either ordering and without an epsilon.
+  let turn = canonical(outgoing - incoming)
+  return canonical(incoming + turn * 0.5)
+}
+
+effect fn tangents(segment: &Segment, from: Point, initial: Point, mapped: bool) -> Tangents
+  ! MarkerError {
+  return match &segment.* {
+    Segment.MoveTo { to } => Tangents {
+      start: Point.new(1.0, 0.0),
+      end: Point.new(1.0, 0.0),
+      defined: false,
+    }
+    Segment.LineTo { to } => run straight(from, to, mapped)
+    Segment.Close => run straight(from, initial, mapped)
+    Segment.QuadraticTo { control, to } => {
+      let first = if same(from, control) {
+        to
+      } else {
+        control
+      }
+      let last = if same(to, control) {
+        from
+      } else {
+        control
+      }
+      Tangents {
+        start: run direction(from, first, mapped),
+        end: run direction(last, to, mapped),
+        defined: !same(from, first),
+      }
+    }
+    Segment.CubicTo { control1, control2, to } => {
+      let first = if !same(from, control1) {
+        control1
+      } else if !same(from, control2) {
+        control2
+      } else {
+        to
+      }
+      let last = if !same(to, control2) {
+        control2
+      } else if !same(to, control1) {
+        control1
+      } else {
+        from
+      }
+      Tangents {
+        start: run direction(from, first, mapped),
+        end: run direction(last, to, mapped),
+        defined: !same(from, first),
+      }
+    }
+    Segment.ArcTo { arc } => {
+      let normalized = arcs.normalize(from, arc)
+      match &normalized {
+        NormalizedArc.Empty => Tangents {
+          start: Point.new(1.0, 0.0),
+          end: Point.new(1.0, 0.0),
+          defined: false,
+        }
+        NormalizedArc.Line { end } => run straight(from, end, mapped)
+        NormalizedArc.Limited => {
+          fail MarkerError.NumericLimit
+        }
+        NormalizedArc.Ellipse { center, axisX, axisY, sweep, end } => {
+          // d/dt (center + axisX*cos(t) + axisY*sin(t)), with t=0 at
+          // the source start. Positive rescaling avoids overflowing the sum.
+          let scale = f64.max(
+            f64.max(f64.abs(axisX.x), f64.abs(axisX.y)),
+            f64.max(f64.abs(axisY.x), f64.abs(axisY.y)),
+          )
+          let sine = f64.sin(sweep)
+          let cosine = f64.cos(sweep)
+          let x = if mapped {
+            run sum(
+              -(run product(run quotient(axisX.x, scale), sine)),
+              run product(run quotient(axisY.x, scale), cosine),
+            )
+          } else {
+            -(axisX.x / scale) * sine + (axisY.x / scale) * cosine
+          }
+          let y = if mapped {
+            run sum(
+              -(run product(run quotient(axisX.y, scale), sine)),
+              run product(run quotient(axisY.y, scale), cosine),
+            )
+          } else {
+            -(axisX.y / scale) * sine + (axisY.y / scale) * cosine
+          }
+          if scale == 0.0 || (axisY.x == 0.0 && axisY.y == 0.0) || (x == 0.0 && y == 0.0)
+            || !f64.isFinite(x)
+            || !f64.isFinite(y) {
+            fail MarkerError.NumericLimit
+          }
+          let sign = if sweep < 0.0 {
+            -1.0
+          } else {
+            1.0
+          }
+          Tangents {
+            start: Point.new(axisY.x * sign, axisY.y * sign),
+            end: Point.new(x * sign, y * sign),
+            defined: true,
+          }
+        }
+      }
+    }
+  }
+}
+
+fn endpoint(segment: &Segment, initial: Point) -> Point {
+  return match &segment.* {
+    Segment.MoveTo { to } => to
+    Segment.LineTo { to } => to
+    Segment.QuadraticTo { control, to } => to
+    Segment.CubicTo { control1, control2, to } => to
+    Segment.ArcTo { arc } => arc.to
+    Segment.Close => initial
+  }
+}
+
+// A monotonic lookahead finds the next nonzero source segment. Each segment's
+// geometry (including arc normalization) is evaluated once, not once per vertex
+// of a zero-length run. No auxiliary allocation and no flattening are needed.
+struct Lookahead {
+  scan: usize,
+  point: Point,
+  initial: Point,
+  index: usize,
+  next: Tangents,
+}
+
+impl Lookahead {
+  effect fn advance(self: &mut Lookahead, segments: &[Segment], mapped: bool) -> ()
+    ! MarkerError {
+    self.index = segments.length
+    self.next.defined = false
+    while self.scan < segments.length {
+      let index = self.scan
+      let segment = &segments[index]
+      let value = run tangents(segment, self.point, self.initial, mapped)
+      self.point = endpoint(segment, self.initial)
+      match &segment.* {
+        Segment.MoveTo { to } => {
+          self.initial = to
+        }
+        _ => {}
+      }
+
+      // scan < length proves this increment cannot overflow.
+      self.scan = self.scan + 1
+      if value.defined {
+        self.index = index
+        self.next = value
+        return
+      }
+    }
+  }
+}
+
+effect fn append(out: &mut List<MarkerPosition>, position: Point, angle: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(MarkerPosition { position: position, angle: angle, kind: MarkerKind.Mid })
+}
+
+effect fn product(a: f64, b: f64) -> f64
+  ! MarkerError {
+  let value = a * b
+  if !f64.isFinite(value) || (a != 0.0 && b != 0.0 && value == 0.0) {
+    fail MarkerError.NumericLimit
+  }
+  return value
+}
+
+effect fn sum(a: f64, b: f64) -> f64
+  ! MarkerError {
+  let value = a + b
+  if !f64.isFinite(value) {
+    fail MarkerError.NumericLimit
+  }
+  return value
+}
+
+effect fn quotient(a: f64, b: f64) -> f64
+  ! MarkerError {
+  let value = a / b
+  if !f64.isFinite(value) || (a != 0.0 && value == 0.0) {
+    fail MarkerError.NumericLimit
+  }
+  return value
+}
+
+effect fn linear(a: f64, x: f64, b: f64, y: f64) -> f64
+  ! MarkerError {
+  return run sum(run product(a, x), run product(b, y))
+}
+
+struct Projected {
+  point: Point,
+  w: f64,
+}
+
+effect fn project(point: Point, matrix: &Matrix) -> Projected
+  ! MarkerError {
+  let m = transforms.coefficients(matrix)
+  let w = run sum(run linear(m[12], point.x, m[13], point.y), m[15])
+  if w <= 0.0 {
+    return Projected { point: Point.new(0.0, 0.0), w: w }
+  }
+  let x = run sum(run linear(m[0], point.x, m[1], point.y), m[3])
+  let y = run sum(run linear(m[4], point.x, m[5], point.y), m[7])
+  return Projected { point: Point.new(run quotient(x, w), run quotient(y, w)), w: w }
+}
+
+effect fn mappedDirection(value: Point, at: &Projected, matrix: &Matrix) -> f64
+  ! MarkerError {
+  // Direction magnitude is arbitrary. Normalize before applying the analytic
+  // quotient-rule Jacobian, retaining exact axis-aligned directions (no trig
+  // round trip and no endpoint chord, even for curves and projective arcs).
+  let scale = f64.max(f64.abs(value.x), f64.abs(value.y))
+  let dx = run quotient(value.x, scale)
+  let dy = run quotient(value.y, scale)
+  let m = transforms.coefficients(matrix)
+  let dw = run linear(m[12], dx, m[13], dy)
+  let x = run quotient(
+    run sum(run linear(m[0], dx, m[1], dy), -(run product(at.point.x, dw))),
+    at.w,
+  )
+  let y = run quotient(
+    run sum(run linear(m[4], dx, m[5], dy), -(run product(at.point.y, dw))),
+    at.w,
+  )
+  if x == 0.0 && y == 0.0 {
+    fail MarkerError.NumericLimit
+  }
+  return math.atan2(y, x)
+}
+
+effect fn orientation(
+  point: Point,
+  incoming: Point,
+  outgoing: Point,
+  middle: bool,
+  matrix: &Matrix,
+  mapped: bool,
+) -> f64
+  ! MarkerError {
+  if !mapped {
+    let angle = math.atan2(incoming.y, incoming.x)
+    return if middle {
+      bisect(angle, math.atan2(outgoing.y, outgoing.x))
+    } else {
+      angle
+    }
+  }
+  let at = run project(point, matrix)
+  if at.w <= 0.0 {
+    return 0.0
+  }
+  let angle = run mappedDirection(incoming, &at, matrix)
+  return if middle {
+    bisect(angle, run mappedDirection(outgoing, &at, matrix))
+  } else {
+    angle
+  }
+}
+
+/// Appends source marker placements to reusable caller scratch, in path order.
+/// Angles are radians; Start/End designate only the whole-path endpoints. A
+/// closed subpath has two coincident endpoint placements with the same bisector.
+/// Empty paths append nothing; a single moveto appends both Start and End, and
+/// wholly zero-length paths point along +x. Equal-endpoint arcs are omitted per
+/// paths.html#ArcOutOfRangeParameters. Close followed by a drawing command starts
+/// another subpath, with an implicit initial vertex at the closed point.
+///
+/// Only the output list allocates. Runtime is linear, including zero-length runs.
+/// On failure an appended prefix may remain; callers must discard that suffix.
+pub effect fn positions(path: &Path, out: &mut List<MarkerPosition>) -> ()
+  ! OutOfMemoryError | MarkerError
+  ? &mut Allocator {
+  let identity = transforms.identity()
+  run placements(path, &mut out.*, &identity, false)
+}
+
+/// Maps the z=0 plane through an already composed, finite 4x4 matrix. Angles are
+/// radians. Each analytic incoming/outgoing direction is mapped at its source
+/// vertex before bisecting; zero-length fallback uses the same source traversal
+/// as positions(). Nonpositive-w vertices are omitted without reassigning their
+/// whole-path Start/End roles. There is no near-plane epsilon.
+///
+/// NumericLimit includes unrepresentable arithmetic intermediates, nonzero
+/// underflow and collapsed Jacobian directions; no chord or sample substitute is
+/// used. Only the returned list allocates. Runtime and compaction are linear.
+pub effect fn positionsMapped(path: &Path, matrix: &Matrix) -> List<MarkerPosition>
+  ! MarkerError | OutOfMemoryError
+  ? &mut Allocator {
+  if !transforms.finite(matrix) {
+    fail MarkerError.NumericLimit
+  }
+  let mut out = List<MarkerPosition>.make()
+  run placements(path, &mut out, matrix, true)
+  let mut retained: usize = 0
+  let mut i: usize = 0
+  let mut entries = out.asMutSlice()
+  while i < entries.length {
+    let at = run project(entries[i].position, matrix)
+    if at.w > 0.0 {
+      let mut entry = entries[i]
+      entry.position = at.point
+      entries[retained] = entry
+      retained = retained + 1
+    }
+    i = i + 1
+  }
+  drop entries
+  out.truncate(retained)
+  return move out
+}
+
+effect fn placements(
+  path: &Path,
+  out: &mut List<MarkerPosition>,
+  matrix: &Matrix,
+  mapped: bool,
+) -> ()
+  ! MarkerError | OutOfMemoryError
+  ? &mut Allocator {
+  let segments = path.segments()
+  if segments.length == 0 {
+    return
+  }
+  let base = out.length()
+  let zero = Point.new(0.0, 0.0)
+  let forward = Point.new(1.0, 0.0)
+  let mut look = Lookahead {
+    scan: 0,
+    point: zero,
+    initial: zero,
+    index: segments.length,
+    next: Tangents { start: forward, end: forward, defined: false },
+  }
+  run look.advance(segments, mapped)
+  let mut previous = forward
+  let mut havePrevious = false
+  let mut point = zero
+  let mut initial = zero
+  let mut active = false
+  let mut first = base
+  let mut haveSegment = false
+  let mut firstDirection = forward
+  let mut incoming = forward
+  let mut i: usize = 0
+  while i < segments.length {
+    let segment = &segments[i]
+    match &segment.* {
+      Segment.MoveTo { to } => {
+        point = to
+        initial = to
+        first = out.length()
+        let angle = if look.next.defined {
+          look.next.start
+        } else {
+          previous
+        }
+        run append(&mut out.*, point, run orientation(point, angle, angle, false, matrix, mapped))
+        active = true
+        haveSegment = false
+      }
+      _ => {
+        // Coincident-endpoint arcs are omitted entirely, not converted to
+        // zero-length lines (whose extra vertex would receive a marker).
+        let omitted = match &segment.* {
+          Segment.ArcTo { arc } => same(point, arc.to)
+          _ => false
+        }
+        if !omitted {
+          if !active {
+            first = out.length()
+            run append(&mut out.*, point, 0.0)
+            active = true
+            haveSegment = false
+          }
+          let nonzero = look.index == i
+          let start = if nonzero {
+            look.next.start
+          } else if havePrevious {
+            previous
+          } else if look.next.defined {
+            look.next.start
+          } else {
+            forward
+          }
+          let end = if look.next.defined {
+            if nonzero {
+              look.next.end
+            } else {
+              look.next.start
+            }
+          } else {
+            previous
+          }
+          if haveSegment {
+            let last = out.length() - 1
+            let mut entries = out.asMutSlice()
+            entries[last].angle = run orientation(point, incoming, start, true, matrix, mapped)
+          } else {
+            firstDirection = start
+            let mut entries = out.asMutSlice()
+            entries[first].angle = run orientation(point, start, start, false, matrix, mapped)
+          }
+          point = endpoint(segment, initial)
+          run append(&mut out.*, point, run orientation(point, end, end, false, matrix, mapped))
+          haveSegment = true
+          incoming = end
+          match &segment.* {
+            Segment.Close => {
+              let angle = run orientation(point, end, firstDirection, true, matrix, mapped)
+              let last = out.length() - 1
+              let mut entries = out.asMutSlice()
+              entries[first].angle = angle
+              entries[last].angle = angle
+              active = false
+            }
+            _ => {}
+          }
+          if nonzero {
+            previous = end
+            havePrevious = true
+            run look.advance(segments, mapped)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  let mut entries = out.asMutSlice()
+  entries[base].kind = MarkerKind.Start
+  drop entries
+  if out.length() - base == 1 {
+    let position = out.asSlice()[base].position
+    let angle = out.asSlice()[base].angle
+    run append(&mut out.*, position, angle)
+  }
+  let last = out.length() - 1
+  let mut finalEntries = out.asMutSlice()
+  finalEntries[last].kind = MarkerKind.End
+}

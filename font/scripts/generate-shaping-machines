@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Compile pinned Ragel transition tables and script properties to Silk data.
+
+Only table representation changes: DFA states and action programs retain the
+upstream transitions. No font, input, or expected test output is embedded.
+"""
+from pathlib import Path
+import re
+import struct
+import runpy
+
+ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / 'font/shape/test-data/harfrust/harfrust/src'
+helpers = runpy.run_path(str(ROOT / 'font/scripts/generate-shaping-unicode'))
+array, numbers, byte_function = (helpers[n] for n in ('array', 'numbers', 'byte_function'))
+
+
+def body(text, start):
+    start = text.index('{', start)
+    depth = 1
+    end = start + 1
+    while depth:
+        depth += (text[end] == '{') - (text[end] == '}')
+        end += 1
+    return text[start + 1:end - 1], end
+
+
+def arms(text):
+    pos = 0
+    result = []
+    while (m := re.search(r'([\w\s|]+)\s*=>\s*(match\s*\(act\)\s*)?\{', text[pos:])):
+        content, end = body(text, pos + m.end() - 1)
+        result.append((m[1].strip(), content, bool(m[2])))
+        pos = end
+    return result
+
+
+def constants(text):
+    result = {}
+    for key, val in re.findall(r'pub const (\w+): u8 = (\w+);', text):
+        result[key] = int(val) if val.isdigit() else result[val]
+    return result
+
+
+def action_code(text, kinds):
+    instructions = []
+    tokens = r'te\s*=\s*p\s*\+\s*1;|te\s*=\s*p;|p\s*=\s*p\s*-\s*1;|p\s*=\s*\(te\)\s*-\s*1;|act\s*=\s*(\d+);|found_syllable!\(SyllableType::(\w+)\)'
+    for m in re.finditer(tokens, text):
+        v = re.sub(r'\s+', '', m[0])
+        if v == 'te=p+1;': instructions += [1, 0]
+        elif v == 'te=p;': instructions += [2, 0]
+        elif v == 'p=p-1;': instructions += [3, 0]
+        elif v == 'p=(te)-1;': instructions += [4, 0]
+        elif m[1]: instructions += [5, int(m[1])]
+        elif m[2]: instructions += [6, kinds[m[2]]]
+    # Fuse the two common ways a syllable ends: `te = p; p -= 1; found(k)` becomes [8, k] and
+    # `p = te - 1; found(k)` becomes [9, k].
+    fused = []
+    i = 0
+    while i < len(instructions):
+        if instructions[i:i + 5] == [2, 0, 3, 0, 6] and i + 5 < len(instructions):
+            fused += [8, instructions[i + 5]]
+            i += 6
+        elif instructions[i:i + 3] == [4, 0, 6] and i + 3 < len(instructions):
+            fused += [9, instructions[i + 3]]
+            i += 4
+        else:
+            fused += instructions[i:i + 2]
+            i += 2
+    return fused
+
+
+def machine(name):
+    src = (SRC / f'ot/shaper/{name}_machine.rs').read_text()
+    prefix = f'_{name}_syllable_machine_'
+    tables = {key: numbers(array(src, prefix + key)) for key in re.findall(rf'static {prefix}(\w+):\s*\[', src)}
+    start = int(re.search(rf'static {name}_syllable_machine_start: i32 = (\d+)', src)[1])
+    kinds = {v.strip().split('=')[0].strip(): i for i, v in enumerate(body(src, src.index('pub enum SyllableType'))[0].split(',')) if v.strip()}
+    key = f'match ({prefix}cond_actions' if name != 'khmer' else f'match ({prefix}actions[(_acts)'
+    # Khmer's first actions match is from_state; find transition actions explicitly.
+    where = src.index(key, src.index(f'cs = ({prefix}cond_targs'))
+    action_bodies = arms(body(src, where)[0])
+    codes = {0: []}
+    for key, content, conditional in action_bodies:
+        if key == '_': continue
+        if conditional:
+            code = []
+            for condition, branch, _ in arms(content):
+                if condition == '_': continue
+                insns = action_code(branch, kinds)
+                code.extend([7, int(condition), len(insns), *insns])
+        else:
+            code = action_code(content, kinds)
+        codes[int(key)] = code
+    programs = bytearray([0])
+    offsets = {}
+    for ident in set(tables['cond_actions']):
+        sequence = [ident]
+        if name == 'khmer': sequence = tables['actions'][ident + 1:ident + 1 + tables['actions'][ident]]
+        program = [v for i in sequence for v in codes.get(i, [])] + [0]
+        offsets[ident] = len(programs)
+        programs.extend(program)
+    states = len(tables['eof_trans'])
+    froms = tables['from_state_actions']
+    tos = tables['to_state_actions']
+    if name == 'khmer':
+        froms = [bool(tables['actions'][n]) for n in froms]
+        tos = [bool(tables['actions'][n]) for n in tos]
+    assert states < 0x4000
+
+    # Each transition's target carries the target's to-state flag in bit 15 and its
+    # from-state flag in bit 14, so a step reads no per-state table.
+    def target(state):
+        return state | (0x8000 if tos[state] else 0) | (0x4000 if froms[state] else 0)
+
+    matrix = bytearray()
+    for state in range(states):
+        for category in range(60):
+            if category == 59:
+                trans = tables['eof_trans'][state] - 1
+            elif name == 'khmer':
+                keys = tables['key_offsets'][state]
+                singles = tables['single_lengths'][state]
+                ranges = tables['range_lengths'][state]
+                trans = tables['index_offsets'][state]
+                found = False
+                for k in range(singles):
+                    if tables['trans_keys'][keys + k] == category:
+                        trans += k
+                        found = True
+                        break
+                if not found:
+                    trans += singles
+                    keys += singles
+                    for k in range(ranges):
+                        if tables['trans_keys'][keys + k * 2] <= category <= tables['trans_keys'][keys + k * 2 + 1]:
+                            trans += k
+                            found = True
+                            break
+                    if not found: trans += ranges
+            else:
+                bias = 1 if name in ('indic', 'myanmar') else 0
+                maximum = 57 if name == 'indic' else (57 if name == 'myanmar' else 56)
+                ic = tables['char_class'][category - bias] if bias <= category <= maximum else -1
+                keys = tables['trans_keys'][state * 2:state * 2 + 2]
+                lo, hi = keys if len(keys) == 2 else (1, 0)
+                trans = tables['index_defaults'][state]
+                if lo <= ic <= hi: trans = tables['indices'][tables['index_offsets'][state] + ic - lo]
+            if trans < 0:
+                matrix.extend(struct.pack('>HH', target(state), 0))
+            else:
+                matrix.extend(struct.pack('>HH', target(tables['cond_targs'][trans]), offsets[tables['cond_actions'][trans]]))
+    header = struct.pack('>HH', start, kinds.get('BrokenCluster', 255))
+    header += bytes(bool(x) for x in froms) + bytes(bool(x) for x in tos)
+    return byte_function(name + 'States', header), byte_function(name + 'Transitions', matrix), byte_function(name + 'Actions', programs)
+
+
+def generate():
+    out = ['// THIS FILE IS AUTOGENERATED by font/scripts/generate-shaping-machines. DO NOT EDIT.\n',
+           '// From pinned Harfrust/HarfBuzz shaping data, MIT licensed.\n']
+    indic = (SRC / 'ot/shaper/indic_table.rs').read_text()
+    consts = constants((SRC / 'ot/shaper/indic.rs').read_text())
+    aliases = dict(re.findall(r'use (\w+)\s+as (\w+);', indic))
+    values = []
+    for a,b in re.findall(r'indic_combine_categories\((\w+),\s*(\w+)\)', array(indic, 'indic_values')):
+        reverse = {v:k for k,v in aliases.items()}
+        values.append(consts[reverse[a]] + 256 * consts[reverse[b]])
+    out.append(byte_function('indicValues', b''.join(struct.pack('>H',v) for v in values)))
+    out.append(byte_function('indicData', bytes(numbers(array(indic, 'indic_u8')))))
+    use = (SRC / 'ot/shaper/use_table.rs').read_text()
+    use_consts = constants((SRC / 'ot/shaper/use_.rs').read_text())
+    for name, fmt in [('use_u8', 'B'), ('use_u16', 'H')]:
+        data = re.sub(r'\b[A-Za-z]\w*\b', lambda m:str(use_consts[m[0]]), array(use, name))
+        out.append(byte_function(name, b''.join(struct.pack('>' + fmt,n) for n in numbers(data))))
+    for name in ('indic', 'khmer', 'myanmar', 'use'): out.extend(machine(name))
+    scripts = dict(re.findall(r'pub const (\w+): Self = Self::from_bytes\(b"(....)"\);', (SRC / 'script.rs').read_text()))
+    mod = (SRC / 'ot/shaper/mod.rs').read_text()
+    universal = mod.split('// Unicode-2.0 additions', 1)[1].split('=> &use_::UNIVERSAL_SHAPER', 1)[0]
+    out.append(byte_function('universalScripts', b''.join(scripts[n].encode() for n in re.findall(r'Script::(\w+)', universal))))
+    constraints = (SRC / 'ot/shaper/vowel_constraints.rs').read_text()
+    pairs = []
+    for m in re.finditer(r'Some\(Script::(\w+)\) =>', constraints):
+        content, _ = body(constraints, m.end())
+        match = re.search(r'match cur_glyph\(buffer, 0\)', content)
+        if not match: continue
+        # Outer alternatives may themselves be a nested match on the second codepoint.
+        cursor = body(content, match.end())[0]
+        pos = 0
+        while (a := re.search(r'((?:0x[0-9A-Fa-f]+\s*\|?\s*)+) =>\s*(match cur_glyph\(buffer, 1\))?', cursor[pos:])):
+            branch, end = body(cursor, pos + a.end())
+            firsts = [int(n,16) for n in re.findall(r'0x[0-9a-fA-F]+', a[1])]
+            seconds = []
+            if a[2]:
+                for b in re.finditer(r'((?:0x[0-9A-Fa-f]+\s*\|?\s*)+) =>\s*\{\s*matched = true;', branch):
+                    seconds += [int(n,16) for n in re.findall(r'0x[0-9a-fA-F]+', b[1])]
+            else:
+                seconds += [int(n,16) for n in re.findall(r'matched = (0x\w+) == cur_glyph\(buffer, 1\)', branch)]
+            pairs += [(scripts[m[1]], a,b) for a in firsts for b in seconds]
+            pos = end
+    pairs.append(('Taml',0xb85,0xbc2))
+    pairs = sorted(pairs)
+    out.append(byte_function('vowelConstraints', b''.join(s.encode()+struct.pack('>II',a,b) for s,a,b in pairs)))
+    # Each script's rows in vowelConstraints, as the script tag and its first and end row.
+    index = bytearray()
+    for script in sorted({s for s, _, _ in pairs}):
+        rows = [i for i, p in enumerate(pairs) if p[0] == script]
+        index += script.encode() + struct.pack('>HH', rows[0], rows[-1] + 1)
+    out.append(byte_function('vowelScripts', bytes(index)))
+    (ROOT / 'font/shape/src/generated_machines.silk').write_text(''.join(out))
+
+if __name__ == '__main__': generate()

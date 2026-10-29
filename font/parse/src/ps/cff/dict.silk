@@ -1,0 +1,875 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// PostScript DICT tokenization and operator/operand decoding.
+import ps.cff.stack { Number, Stack, FixedValues }
+import ps.cff.blend { BlendState }
+import ps.num { readInt, BcdComponents }
+import ps.string { Sid }
+import ps.hinting { Blues, StemSnaps }
+import ps.transform { ScaledFontMatrix }
+import ps.read { take, takeRead, require, Failed, catchError }
+import font_types.lib { Fixed, Matrix }
+import font_data { FontData, Cursor }
+import table_ref { ByteRange }
+import generated_support { signedCount }
+import model.error { Error }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.core.equal { Equal }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.usize
+
+pub enum Operator {
+  Version,
+  Notice,
+  FullName,
+  FamilyName,
+  Weight,
+  FontBbox,
+  CharstringsOffset,
+  PrivateDictRange,
+  VariationStoreOffset,
+  Copyright,
+  IsFixedPitch,
+  ItalicAngle,
+  UnderlinePosition,
+  UnderlineThickness,
+  PaintType,
+  CharstringType,
+  FontMatrix,
+  StrokeWidth,
+  FdArrayOffset,
+  FdSelectOffset,
+  BlueValues,
+  OtherBlues,
+  FamilyBlues,
+  FamilyOtherBlues,
+  SubrsOffset,
+  VariationStoreIndex,
+  BlueScale,
+  BlueShift,
+  BlueFuzz,
+  LanguageGroup,
+  ExpansionFactor,
+  Encoding,
+  Charset,
+  UniqueId,
+  Xuid,
+  SyntheticBase,
+  PostScript,
+  BaseFontName,
+  BaseFontBlend,
+  Ros,
+  CidFontVersion,
+  CidFontRevision,
+  CidFontType,
+  CidCount,
+  UidBase,
+  FontName,
+  StdHw,
+  StdVw,
+  DefaultWidthX,
+  NominalWidthX,
+  Blend,
+  StemSnapH,
+  StemSnapV,
+  ForceBold,
+  InitialRandomSeed,
+}
+
+impl Operator {
+  pub fn fromOpcode(opcode: u8) -> Option<Self> {
+    return match opcode {
+      0 => Option<Self>.some(Operator.Version)
+      1 => Option<Self>.some(Operator.Notice)
+      2 => Option<Self>.some(Operator.FullName)
+      3 => Option<Self>.some(Operator.FamilyName)
+      4 => Option<Self>.some(Operator.Weight)
+      5 => Option<Self>.some(Operator.FontBbox)
+      13 => Option<Self>.some(Operator.UniqueId)
+      14 => Option<Self>.some(Operator.Xuid)
+      15 => Option<Self>.some(Operator.Charset)
+      16 => Option<Self>.some(Operator.Encoding)
+      17 => Option<Self>.some(Operator.CharstringsOffset)
+      18 => Option<Self>.some(Operator.PrivateDictRange)
+      24 => Option<Self>.some(Operator.VariationStoreOffset)
+      6 => Option<Self>.some(Operator.BlueValues)
+      7 => Option<Self>.some(Operator.OtherBlues)
+      8 => Option<Self>.some(Operator.FamilyBlues)
+      9 => Option<Self>.some(Operator.FamilyOtherBlues)
+      10 => Option<Self>.some(Operator.StdHw)
+      11 => Option<Self>.some(Operator.StdVw)
+      19 => Option<Self>.some(Operator.SubrsOffset)
+      20 => Option<Self>.some(Operator.DefaultWidthX)
+      21 => Option<Self>.some(Operator.NominalWidthX)
+      22 => Option<Self>.some(Operator.VariationStoreIndex)
+      23 => Option<Self>.some(Operator.Blend)
+      _ => Option<Self>.None
+    }
+  }
+
+  pub fn fromExtendedOpcode(opcode: u8) -> Option<Self> {
+    return match opcode {
+      0 => Option<Self>.some(Operator.Copyright)
+      1 => Option<Self>.some(Operator.IsFixedPitch)
+      2 => Option<Self>.some(Operator.ItalicAngle)
+      3 => Option<Self>.some(Operator.UnderlinePosition)
+      4 => Option<Self>.some(Operator.UnderlineThickness)
+      5 => Option<Self>.some(Operator.PaintType)
+      6 => Option<Self>.some(Operator.CharstringType)
+      7 => Option<Self>.some(Operator.FontMatrix)
+      8 => Option<Self>.some(Operator.StrokeWidth)
+      20 => Option<Self>.some(Operator.SyntheticBase)
+      21 => Option<Self>.some(Operator.PostScript)
+      22 => Option<Self>.some(Operator.BaseFontName)
+      23 => Option<Self>.some(Operator.BaseFontBlend)
+      30 => Option<Self>.some(Operator.Ros)
+      31 => Option<Self>.some(Operator.CidFontVersion)
+      32 => Option<Self>.some(Operator.CidFontRevision)
+      33 => Option<Self>.some(Operator.CidFontType)
+      34 => Option<Self>.some(Operator.CidCount)
+      35 => Option<Self>.some(Operator.UidBase)
+      36 => Option<Self>.some(Operator.FdArrayOffset)
+      37 => Option<Self>.some(Operator.FdSelectOffset)
+      38 => Option<Self>.some(Operator.FontName)
+      9 => Option<Self>.some(Operator.BlueScale)
+      10 => Option<Self>.some(Operator.BlueShift)
+      11 => Option<Self>.some(Operator.BlueFuzz)
+      12 => Option<Self>.some(Operator.StemSnapH)
+      13 => Option<Self>.some(Operator.StemSnapV)
+      14 => Option<Self>.some(Operator.ForceBold)
+      17 => Option<Self>.some(Operator.LanguageGroup)
+      18 => Option<Self>.some(Operator.ExpansionFactor)
+      19 => Option<Self>.some(Operator.InitialRandomSeed)
+      _ => Option<Self>.None
+    }
+  }
+}
+
+pub union Token {
+  Operator { pub value: Operator },
+  InvalidOperator { pub value: u8 },
+  InvalidTwoByteOperator { pub value: u8 },
+  Operand { pub number: Number, pub bcd: Option<BcdComponents> },
+}
+
+pub struct Tokens<'a> {
+  cursor: Cursor<'a>,
+}
+
+impl<'a> Copy for Tokens<'a> {}
+
+pub fn tokens<'a>(dictData: &'a [u8]) -> Tokens<'a> {
+  return Tokens<'a> { cursor: FontData.cursor(&FontData.new(dictData)) }
+}
+
+impl<'a> Tokens<'a> {
+  pub fn next(self: &mut Self) -> Option<Result<Token, Error>> {
+    if Cursor.remainingBytes(&self.cursor) == 0 {
+      return Option<Result<Token, Error>>.None
+    }
+    return Option<Result<Token, Error>>.some(run Effect.result(parseToken(&mut self.cursor)))
+  }
+}
+
+effect fn parseToken<'a>(cursor: &mut Cursor<'a>) -> Token
+  ! Error {
+  let b0 = run takeRead(Cursor<'a>.read<u8>(&mut cursor))
+  if b0 == 12 {
+    let b1 = run takeRead(Cursor<'a>.read<u8>(&mut cursor))
+    return match move Operator.fromExtendedOpcode(b1) {
+      Option<Operator>.Some { value } => Token.Operator { value: value }
+      _ => Token.InvalidTwoByteOperator { value: b1 }
+    }
+  }
+  if b0 == 28 || b0 == 29 || (b0 >= 32 && b0 <= 254) {
+    return Token.Operand {
+      number: Number.I32 { value: run readInt(&mut cursor, b0) },
+      bcd: Option<BcdComponents>.None,
+    }
+  }
+  if b0 == 30 {
+    let components = run take(BcdComponents.parse(&mut cursor))
+    return Token.Operand {
+      number: Number.Fixed { value: BcdComponents.value(&components, false) },
+      bcd: Option<BcdComponents>.some(components),
+    }
+  }
+  return match move Operator.fromOpcode(b0) {
+    Option<Operator>.Some { value } => Token.Operator { value: value }
+    _ => Token.InvalidOperator { value: b0 }
+  }
+}
+
+pub union Entry {
+  Version { pub value: Sid },
+  Notice { pub value: Sid },
+  FullName { pub value: Sid },
+  FamilyName { pub value: Sid },
+  Weight { pub value: Sid },
+  FontBbox { pub value: [Fixed; 4] },
+  CharstringsOffset { pub value: usize },
+  PrivateDictRange { pub value: ByteRange },
+  VariationStoreOffset { pub value: usize },
+  Copyright { pub value: Sid },
+  IsFixedPitch { pub value: bool },
+  ItalicAngle { pub value: Fixed },
+  UnderlinePosition { pub value: Fixed },
+  UnderlineThickness { pub value: Fixed },
+  PaintType { pub value: i32 },
+  CharstringType { pub value: i32 },
+  FontMatrix { pub value: ScaledFontMatrix },
+  StrokeWidth { pub value: Fixed },
+  FdArrayOffset { pub value: usize },
+  FdSelectOffset { pub value: usize },
+  BlueValues { pub value: Blues },
+  OtherBlues { pub value: Blues },
+  FamilyBlues { pub value: Blues },
+  FamilyOtherBlues { pub value: Blues },
+  SubrsOffset { pub value: usize },
+  VariationStoreIndex { pub value: u16 },
+  BlueScale { pub value: Fixed },
+  BlueShift { pub value: Fixed },
+  BlueFuzz { pub value: Fixed },
+  LanguageGroup { pub value: i32 },
+  ExpansionFactor { pub value: Fixed },
+  Encoding { pub value: usize },
+  Charset { pub value: usize },
+  UniqueId { pub value: i32 },
+  Xuid,
+  SyntheticBase { pub value: i32 },
+  PostScript { pub value: Sid },
+  BaseFontName { pub value: Sid },
+  BaseFontBlend,
+  Ros { pub registry: Sid, pub ordering: Sid, pub supplement: Fixed },
+  CidFontVersion { pub value: Fixed },
+  CidFontRevision { pub value: Fixed },
+  CidFontType { pub value: i32 },
+  CidCount { pub value: u32 },
+  UidBase { pub value: i32 },
+  FontName { pub value: Sid },
+  StdHw { pub value: Fixed },
+  StdVw { pub value: Fixed },
+  DefaultWidthX { pub value: Fixed },
+  NominalWidthX { pub value: Fixed },
+  StemSnapH { pub value: StemSnaps },
+  StemSnapV { pub value: StemSnaps },
+  ForceBold { pub value: bool },
+  InitialRandomSeed { pub value: i32 },
+}
+
+impl Copy for Entry {}
+
+pub struct Entries<'a, 'c> {
+  data: &'a [u8],
+  cursor: Cursor<'a>,
+  cursorPos: usize,
+  stack: Stack,
+  blend: Option<BlendState<'a, 'c>>,
+  hasBcd: bool,
+  lastBcd: BcdComponents,
+  unhinted: bool,
+}
+
+pub fn entries<'a, 'c>(dictData: &'a [u8], blendState: Option<BlendState<'a, 'c>>) -> Entries<
+  'a,
+  'c
+> {
+  return Entries<'a, 'c> {
+    data: dictData,
+    cursor: FontData.cursor(&FontData.new(dictData)),
+    cursorPos: 0,
+    stack: Stack.new(),
+    blend: move blendState,
+    hasBcd: false,
+    lastBcd: BcdComponents.default(),
+    unhinted: false,
+  }
+}
+
+pub fn unhintedPrivateEntries<'a, 'c>(
+  dictData: &'a [u8],
+  blendState: Option<BlendState<'a, 'c>>,
+) -> Entries<'a, 'c> {
+  let mut result = entries(dictData, move blendState)
+  result.unhinted = true
+  return move result
+}
+
+impl<'a, 'c> Entries<'a, 'c> {
+  pub fn next(self: &mut Self) -> Option<Result<Entry, Error>> {
+    let parsed = run Effect.result(Entries.nextImpl(&mut self))
+    return match move parsed {
+      Result<Option<Entry>, Error>.Failure { error } => Option<Result<Entry, Error>>.some(
+        Result<Entry, Error>.failResult(error),
+      )
+      Result<Option<Entry>, Error>.Success { value } => match move value {
+        Option<Entry>.Some { value: entry } => Option<Result<Entry, Error>>.some(
+          Result<Entry, Error>.succeed(entry),
+        )
+        _ => Option<Result<Entry, Error>>.None
+      }
+    }
+  }
+
+  pub effect fn nextImpl(self: &mut Self) -> Option<Entry>
+    ! Error with Intrinsic.inlineAlways() {
+    while Cursor.remainingBytes(&self.cursor) != 0 {
+      let b0 = run takeRead(Cursor<'a>.read<u8>(&mut self.cursor))
+      if b0 == 28 || b0 == 29 || (b0 >= 32 && b0 <= 254) {
+        self.hasBcd = false
+        let value = run readInt(&mut self.cursor, b0)
+        run take(Stack.push(&mut self.stack, value))
+        continue
+      }
+      if b0 == 30 {
+        let components = run take(BcdComponents.parse(&mut self.cursor))
+        let result = Stack.push(&mut self.stack, BcdComponents.value(&components, false))
+        self.hasBcd = true
+        self.lastBcd = components
+        run take(move result)
+        continue
+      }
+      let mut operation = Operator.fromOpcode(b0)
+      if b0 == 12 {
+        let b1 = run takeRead(Cursor<'a>.read<u8>(&mut self.cursor))
+        operation = Operator.fromExtendedOpcode(b1)
+      }
+      let op = match move operation {
+        Option<Operator>.Some { value } => value
+        _ => {
+          Stack.clear(&mut self.stack)
+          continue
+        }
+      }
+      if op == Operator.Blend || op == Operator.VariationStoreIndex {
+        // Borrowed Option payloads are Copy snapshots; write the updated state
+        // back before propagating errors so failed vsindex updates persist.
+        let mut state = match &self.blend {
+          Option<BlendState<'a, 'c>>.Some { value } => value
+          _ => {
+            fail Error.MissingResource
+          }
+        }
+        if op == Operator.VariationStoreIndex {
+          let index = run take(Stack.getI32(&self.stack, 0))
+          let result = BlendState.setStoreIndex(&mut state, i32.toU16(index & 65535))
+          self.blend = Option<BlendState<'a, 'c>>.some(state)
+          run take(move result)
+        } else {
+          run take(Stack.applyBlend(&mut self.stack, &state))
+          continue
+        }
+      }
+      let keep = !self.unhinted || op == Operator.SubrsOffset || op == Operator.VariationStoreIndex
+        || op == Operator.DefaultWidthX
+        || op == Operator.NominalWidthX
+      if op == Operator.BlueScale && self.hasBcd {
+        self.hasBcd = false
+        if failed(Stack.popFixed(&mut self.stack)) {
+          return Option<Entry>.None
+        }
+        if failed(Stack.push(&mut self.stack, BcdComponents.value(&self.lastBcd, true))) {
+          return Option<Entry>.None
+        }
+      }
+      if op == Operator.FontMatrix {
+        Stack.clear(&mut self.stack)
+        self.hasBcd = false
+        let mut cursor = FontData.cursor(&FontData.new(self.data))
+        Cursor.advanceBy(&mut cursor, self.cursorPos)
+        match move ScaledFontMatrix.parse(&mut cursor) {
+          Option<ScaledFontMatrix>.Some { value } => {
+            if keep {
+              return Option<Entry>.some(Entry.FontMatrix { value: value })
+            }
+          }
+          _ => {}
+        }
+        continue
+      }
+      self.hasBcd = false
+      if keep {
+        let parsed = run Intrinsic.catchFailure<Error>(parseEntry(op, &mut self.stack), catchError)
+        Stack.clear(&mut self.stack)
+        self.cursorPos = Cursor.position(&self.cursor) |> Result<usize, ReadError>.unwrapOr(0)
+        return match move parsed {
+          Entry entry => Option<Entry>.some(entry)
+          Failed { error } => {
+            fail error
+          }
+        }
+      }
+      Stack.clear(&mut self.stack)
+      self.cursorPos = Cursor.position(&self.cursor) |> Result<usize, ReadError>.unwrapOr(0)
+    }
+    return Option<Entry>.None
+  }
+}
+
+fn failed<T>(result: Result<T, Error>) -> bool {
+  return match move result {
+    Result<T, Error>.Failure { error } => true
+    _ => false
+  }
+}
+
+effect fn parseEntry(op: Operator, stack: &mut Stack) -> Entry
+  ! Error {
+  return match op {
+    Operator.Version => Entry.Version { value: Sid.fromI32(run take(Stack.popI32(&mut stack))) }
+    Operator.Notice => Entry.Notice { value: Sid.fromI32(run take(Stack.popI32(&mut stack))) }
+    Operator.FullName => Entry.FullName { value: Sid.fromI32(run take(Stack.popI32(&mut stack))) }
+    Operator.FamilyName => Entry.FamilyName {
+      value: Sid.fromI32(run take(Stack.popI32(&mut stack))),
+    }
+    Operator.Weight => Entry.Weight { value: Sid.fromI32(run take(Stack.popI32(&mut stack))) }
+    Operator.FontBbox => Entry.FontBbox {
+      value: [
+        run take(Stack.getFixed(&stack, 0)),
+        run take(Stack.getFixed(&stack, 1)),
+        run take(Stack.getFixed(&stack, 2)),
+        run take(Stack.getFixed(&stack, 3)),
+      ],
+    }
+    Operator.CharstringsOffset => Entry.CharstringsOffset {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.PrivateDictRange => {
+      let length = signedCount(i32.toI64(run take(Stack.getI32(&stack, 0))))
+      let start = signedCount(i32.toI64(run take(Stack.getI32(&stack, 1))))
+      let end = run require(usize.checkedAdd(start, length), Error.Malformed)
+      return Entry.PrivateDictRange { value: ByteRange { start: start, end: end } }
+    }
+    Operator.VariationStoreOffset => Entry.VariationStoreOffset {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.Copyright => Entry.Copyright { value: Sid.fromI32(run take(Stack.popI32(&mut stack))) }
+    Operator.IsFixedPitch => Entry.IsFixedPitch { value: (run take(Stack.popI32(&mut stack))) != 0 }
+    Operator.ItalicAngle => Entry.ItalicAngle { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.UnderlinePosition => Entry.UnderlinePosition {
+      value: run take(Stack.popFixed(&mut stack)),
+    }
+    Operator.UnderlineThickness => Entry.UnderlineThickness {
+      value: run take(Stack.popFixed(&mut stack)),
+    }
+    Operator.PaintType => Entry.PaintType { value: run take(Stack.popI32(&mut stack)) }
+    Operator.CharstringType => Entry.CharstringType { value: run take(Stack.popI32(&mut stack)) }
+    Operator.FontMatrix => {
+      fail Error.InvalidOperation
+    }
+    Operator.StrokeWidth => Entry.StrokeWidth { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.FdArrayOffset => Entry.FdArrayOffset {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.FdSelectOffset => Entry.FdSelectOffset {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.BlueValues => {
+      Stack.applyDeltaPrefixSum(&mut stack)
+      let mut values = [Fixed.zero(); 14]
+      let mut iter = Stack.fixedValues(&stack)
+      let mut length: usize = 0
+      while length < 14 {
+        match move FixedValues.next(&mut iter) {
+          Option<Fixed>.Some { value } => {
+            values[length] = value
+            length = length + 1
+          }
+          _ => {
+            break
+          }
+        }
+      }
+      return Entry.BlueValues { value: Blues.new(Slice.view<Fixed>(&values, 0, length)) }
+    }
+    Operator.OtherBlues => {
+      Stack.applyDeltaPrefixSum(&mut stack)
+      let mut values = [Fixed.zero(); 14]
+      let mut iter = Stack.fixedValues(&stack)
+      let mut length: usize = 0
+      while length < 14 {
+        match move FixedValues.next(&mut iter) {
+          Option<Fixed>.Some { value } => {
+            values[length] = value
+            length = length + 1
+          }
+          _ => {
+            break
+          }
+        }
+      }
+      return Entry.OtherBlues { value: Blues.new(Slice.view<Fixed>(&values, 0, length)) }
+    }
+    Operator.FamilyBlues => {
+      Stack.applyDeltaPrefixSum(&mut stack)
+      let mut values = [Fixed.zero(); 14]
+      let mut iter = Stack.fixedValues(&stack)
+      let mut length: usize = 0
+      while length < 14 {
+        match move FixedValues.next(&mut iter) {
+          Option<Fixed>.Some { value } => {
+            values[length] = value
+            length = length + 1
+          }
+          _ => {
+            break
+          }
+        }
+      }
+      return Entry.FamilyBlues { value: Blues.new(Slice.view<Fixed>(&values, 0, length)) }
+    }
+    Operator.FamilyOtherBlues => {
+      Stack.applyDeltaPrefixSum(&mut stack)
+      let mut values = [Fixed.zero(); 14]
+      let mut iter = Stack.fixedValues(&stack)
+      let mut length: usize = 0
+      while length < 14 {
+        match move FixedValues.next(&mut iter) {
+          Option<Fixed>.Some { value } => {
+            values[length] = value
+            length = length + 1
+          }
+          _ => {
+            break
+          }
+        }
+      }
+      return Entry.FamilyOtherBlues { value: Blues.new(Slice.view<Fixed>(&values, 0, length)) }
+    }
+    Operator.SubrsOffset => Entry.SubrsOffset {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.VariationStoreIndex => Entry.VariationStoreIndex {
+      value: i32.toU16((run take(Stack.popI32(&mut stack))) & 65535),
+    }
+    Operator.BlueScale => Entry.BlueScale { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.BlueShift => Entry.BlueShift { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.BlueFuzz => Entry.BlueFuzz { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.LanguageGroup => Entry.LanguageGroup { value: run take(Stack.popI32(&mut stack)) }
+    Operator.ExpansionFactor => Entry.ExpansionFactor {
+      value: run take(Stack.popFixed(&mut stack)),
+    }
+    Operator.Encoding => Entry.Encoding {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.Charset => Entry.Charset {
+      value: signedCount(i32.toI64(run take(Stack.popI32(&mut stack)))),
+    }
+    Operator.UniqueId => Entry.UniqueId { value: run take(Stack.popI32(&mut stack)) }
+    Operator.Xuid => Entry.Xuid
+    Operator.SyntheticBase => Entry.SyntheticBase { value: run take(Stack.popI32(&mut stack)) }
+    Operator.PostScript => Entry.PostScript {
+      value: Sid.fromI32(run take(Stack.popI32(&mut stack))),
+    }
+    Operator.BaseFontName => Entry.BaseFontName {
+      value: Sid.fromI32(run take(Stack.popI32(&mut stack))),
+    }
+    Operator.BaseFontBlend => Entry.BaseFontBlend
+    Operator.Ros => Entry.Ros {
+      registry: Sid.fromI32(run take(Stack.getI32(&stack, 0))),
+      ordering: Sid.fromI32(run take(Stack.getI32(&stack, 1))),
+      supplement: run take(Stack.getFixed(&stack, 2)),
+    }
+    Operator.CidFontVersion => Entry.CidFontVersion { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.CidFontRevision => Entry.CidFontRevision {
+      value: run take(Stack.popFixed(&mut stack)),
+    }
+    Operator.CidFontType => Entry.CidFontType { value: run take(Stack.popI32(&mut stack)) }
+    Operator.CidCount => Entry.CidCount { value: i32Bits(run take(Stack.popI32(&mut stack))) }
+    Operator.UidBase => Entry.UidBase { value: run take(Stack.popI32(&mut stack)) }
+    Operator.FontName => Entry.FontName { value: Sid.fromI32(run take(Stack.popI32(&mut stack))) }
+    Operator.StdHw => Entry.StdHw { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.StdVw => Entry.StdVw { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.DefaultWidthX => Entry.DefaultWidthX { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.NominalWidthX => Entry.NominalWidthX { value: run take(Stack.popFixed(&mut stack)) }
+    Operator.Blend => {
+      fail Error.InvalidOperation
+    }
+    Operator.StemSnapH => {
+      Stack.applyDeltaPrefixSum(&mut stack)
+      let mut values = [Fixed.zero(); 12]
+      let mut iter = Stack.fixedValues(&stack)
+      let mut length: usize = 0
+      while length < 12 {
+        match move FixedValues.next(&mut iter) {
+          Option<Fixed>.Some { value } => {
+            values[length] = value
+            length = length + 1
+          }
+          _ => {
+            break
+          }
+        }
+      }
+      return Entry.StemSnapH { value: StemSnaps.new(Slice.view<Fixed>(&values, 0, length)) }
+    }
+    Operator.StemSnapV => {
+      Stack.applyDeltaPrefixSum(&mut stack)
+      let mut values = [Fixed.zero(); 12]
+      let mut iter = Stack.fixedValues(&stack)
+      let mut length: usize = 0
+      while length < 12 {
+        match move FixedValues.next(&mut iter) {
+          Option<Fixed>.Some { value } => {
+            values[length] = value
+            length = length + 1
+          }
+          _ => {
+            break
+          }
+        }
+      }
+      return Entry.StemSnapV { value: StemSnaps.new(Slice.view<Fixed>(&values, 0, length)) }
+    }
+    Operator.ForceBold => Entry.ForceBold { value: (run take(Stack.popI32(&mut stack))) != 0 }
+    Operator.InitialRandomSeed => Entry.InitialRandomSeed {
+      value: run take(Stack.popI32(&mut stack)),
+    }
+  }
+}
+
+fn i32Bits(value: i32) -> u32 {
+  if value >= 0 {
+    return i32.toU32(value)
+  }
+  return 4294967295 - i32.toU32(-(value + 1))
+}
+
+impl Equal for Entry {
+  fn equals(a: &Entry, b: &Entry) -> bool {
+    return match a.* {
+      Entry.Version { value } => match b.* {
+        Entry.Version { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.Notice { value } => match b.* {
+        Entry.Notice { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.FullName { value } => match b.* {
+        Entry.FullName { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.FamilyName { value } => match b.* {
+        Entry.FamilyName { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.Weight { value } => match b.* {
+        Entry.Weight { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.FontBbox { value } => match b.* {
+        Entry.FontBbox { value: other } => {
+          let mut i: usize = 0
+          while i < 4 {
+            if Fixed.toBits(value[i]) != Fixed.toBits(other[i]) {
+              return false
+            }
+            i = i + 1
+          }
+          return true
+        }
+        _ => false
+      }
+      Entry.CharstringsOffset { value } => match b.* {
+        Entry.CharstringsOffset { value: other } => value == other
+        _ => false
+      }
+      Entry.PrivateDictRange { value } => match b.* {
+        Entry.PrivateDictRange { value: other } => value.start == other.start
+          && value.end == other.end
+        _ => false
+      }
+      Entry.VariationStoreOffset { value } => match b.* {
+        Entry.VariationStoreOffset { value: other } => value == other
+        _ => false
+      }
+      Entry.Copyright { value } => match b.* {
+        Entry.Copyright { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.IsFixedPitch { value } => match b.* {
+        Entry.IsFixedPitch { value: other } => value == other
+        _ => false
+      }
+      Entry.ItalicAngle { value } => match b.* {
+        Entry.ItalicAngle { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.UnderlinePosition { value } => match b.* {
+        Entry.UnderlinePosition { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.UnderlineThickness { value } => match b.* {
+        Entry.UnderlineThickness { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.PaintType { value } => match b.* {
+        Entry.PaintType { value: other } => value == other
+        _ => false
+      }
+      Entry.CharstringType { value } => match b.* {
+        Entry.CharstringType { value: other } => value == other
+        _ => false
+      }
+      Entry.FontMatrix { value } => match b.* {
+        Entry.FontMatrix { value: other } => &value == &other
+        _ => false
+      }
+      Entry.StrokeWidth { value } => match b.* {
+        Entry.StrokeWidth { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.FdArrayOffset { value } => match b.* {
+        Entry.FdArrayOffset { value: other } => value == other
+        _ => false
+      }
+      Entry.FdSelectOffset { value } => match b.* {
+        Entry.FdSelectOffset { value: other } => value == other
+        _ => false
+      }
+      Entry.BlueValues { value } => match b.* {
+        Entry.BlueValues { value: other } => &value == &other
+        _ => false
+      }
+      Entry.OtherBlues { value } => match b.* {
+        Entry.OtherBlues { value: other } => &value == &other
+        _ => false
+      }
+      Entry.FamilyBlues { value } => match b.* {
+        Entry.FamilyBlues { value: other } => &value == &other
+        _ => false
+      }
+      Entry.FamilyOtherBlues { value } => match b.* {
+        Entry.FamilyOtherBlues { value: other } => &value == &other
+        _ => false
+      }
+      Entry.SubrsOffset { value } => match b.* {
+        Entry.SubrsOffset { value: other } => value == other
+        _ => false
+      }
+      Entry.VariationStoreIndex { value } => match b.* {
+        Entry.VariationStoreIndex { value: other } => value == other
+        _ => false
+      }
+      Entry.BlueScale { value } => match b.* {
+        Entry.BlueScale { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.BlueShift { value } => match b.* {
+        Entry.BlueShift { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.BlueFuzz { value } => match b.* {
+        Entry.BlueFuzz { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.LanguageGroup { value } => match b.* {
+        Entry.LanguageGroup { value: other } => value == other
+        _ => false
+      }
+      Entry.ExpansionFactor { value } => match b.* {
+        Entry.ExpansionFactor { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.Encoding { value } => match b.* {
+        Entry.Encoding { value: other } => value == other
+        _ => false
+      }
+      Entry.Charset { value } => match b.* {
+        Entry.Charset { value: other } => value == other
+        _ => false
+      }
+      Entry.UniqueId { value } => match b.* {
+        Entry.UniqueId { value: other } => value == other
+        _ => false
+      }
+      Entry.SyntheticBase { value } => match b.* {
+        Entry.SyntheticBase { value: other } => value == other
+        _ => false
+      }
+      Entry.PostScript { value } => match b.* {
+        Entry.PostScript { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.BaseFontName { value } => match b.* {
+        Entry.BaseFontName { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.CidFontVersion { value } => match b.* {
+        Entry.CidFontVersion { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.CidFontRevision { value } => match b.* {
+        Entry.CidFontRevision { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.CidFontType { value } => match b.* {
+        Entry.CidFontType { value: other } => value == other
+        _ => false
+      }
+      Entry.CidCount { value } => match b.* {
+        Entry.CidCount { value: other } => value == other
+        _ => false
+      }
+      Entry.UidBase { value } => match b.* {
+        Entry.UidBase { value: other } => value == other
+        _ => false
+      }
+      Entry.FontName { value } => match b.* {
+        Entry.FontName { value: other } => Sid.toU16(value) == Sid.toU16(other)
+        _ => false
+      }
+      Entry.StdHw { value } => match b.* {
+        Entry.StdHw { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.StdVw { value } => match b.* {
+        Entry.StdVw { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.DefaultWidthX { value } => match b.* {
+        Entry.DefaultWidthX { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.NominalWidthX { value } => match b.* {
+        Entry.NominalWidthX { value: other } => Fixed.toBits(value) == Fixed.toBits(other)
+        _ => false
+      }
+      Entry.StemSnapH { value } => match b.* {
+        Entry.StemSnapH { value: other } => &value == &other
+        _ => false
+      }
+      Entry.StemSnapV { value } => match b.* {
+        Entry.StemSnapV { value: other } => &value == &other
+        _ => false
+      }
+      Entry.ForceBold { value } => match b.* {
+        Entry.ForceBold { value: other } => value == other
+        _ => false
+      }
+      Entry.InitialRandomSeed { value } => match b.* {
+        Entry.InitialRandomSeed { value: other } => value == other
+        _ => false
+      }
+      Entry.Xuid => match b.* {
+        Entry.Xuid => true
+        _ => false
+      }
+      Entry.BaseFontBlend => match b.* {
+        Entry.BaseFontBlend => true
+        _ => false
+      }
+      Entry.Ros { registry, ordering, supplement } => match b.* {
+        Entry.Ros { registry: r, ordering: o, supplement: v } => Sid.toU16(registry) == Sid.toU16(r)
+          && Sid.toU16(ordering) == Sid.toU16(o)
+          && Fixed.toBits(supplement) == Fixed.toBits(v)
+        _ => false
+      }
+    }
+  }
+}

@@ -1,0 +1,167 @@
+//! Turn resolved SVG painting order into retained backend-neutral commands.
+import svg_core.scene {
+  RenderTree,
+  ResolvedNode,
+  ResolvedShape,
+  DisplayList,
+  Pattern,
+  Command,
+  Color,
+  Paint,
+  Brush,
+  Stroke,
+  RenderError,
+}
+import svg_css.values { PaintLayer }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+
+struct Painting {
+  brush: Brush,
+  opacity: f64,
+}
+
+effect fn painting(paint: &Paint, currentColor: Color, opacity: f64) -> Option<Painting>
+  ! RenderError {
+  if opacity == 0.0 {
+    return Option<Painting>.None
+  }
+  let mut color = match &paint.* {
+    Paint.None => {
+      return Option<Painting>.None
+    }
+    Paint.CurrentColor => currentColor
+    Paint.Solid { color } => color
+    Paint.Server { index } => {
+      return Option<Painting>.some(
+        Painting { brush: Brush.Server { index: index }, opacity: opacity },
+      )
+    }
+    Paint.ContextFill => {
+      fail RenderError.InvalidGeometry
+    }
+    Paint.ContextStroke => {
+      fail RenderError.InvalidGeometry
+    }
+  }
+
+  // Keep the solid-color path's single alpha quantization.
+  color.a = color.a * opacity
+  return if color.a == 0.0 {
+    Option<Painting>.None
+  } else {
+    Option<Painting>.some(Painting { brush: Brush.Solid { color: color }, opacity: 1.0 })
+  }
+}
+
+effect fn recordCommands(nodes: &[ResolvedNode], shapes: &[ResolvedShape]) -> List<Command>
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut commands = List<Command>.make()
+  let mut i: usize = 0
+  while i < nodes.length {
+    match &nodes[i] {
+      ResolvedNode.BeginGroup { opacity, bounds, linearRgb } => {
+        run commands.append(
+          Command.PushLayer { opacity: opacity, bounds: bounds, linearRgb: linearRgb },
+        )
+      }
+      ResolvedNode.EndGroup => {
+        run commands.append(Command.PopLayer)
+      }
+      ResolvedNode.Paint { shape, layer } => {
+        if shape >= shapes.length || layer == PaintLayer.Markers {
+          fail RenderError.InvalidGeometry
+        }
+        let resolved = &shapes[shape]
+        let style = &resolved.style
+        let selected = if layer == PaintLayer.Fill {
+          run painting(&style.fill, style.color, style.fillOpacity)
+        } else if style.strokeWidth > 0.0 {
+          run painting(&style.stroke, style.color, style.strokeOpacity)
+        } else {
+          Option<Painting>.None
+        }
+        match &selected {
+          Option<Painting>.Some { value } => {
+            if layer == PaintLayer.Fill {
+              run commands.append(
+                Command.FillPath {
+                  path: resolved.path,
+                  transform: resolved.transform,
+                  clip: resolved.clip,
+                  bounds: resolved.bounds,
+                  brush: value.brush,
+                  opacity: value.opacity,
+                  linearRgb: style.linearRgb,
+                  rule: style.fillRule,
+                  crispEdges: style.crispEdges,
+                },
+              )
+            } else {
+              run commands.append(
+                Command.StrokePath {
+                  path: resolved.path,
+                  transform: resolved.transform,
+                  strokeSpace: resolved.strokeSpace,
+                  clip: resolved.clip,
+                  bounds: resolved.bounds,
+                  brush: value.brush,
+                  opacity: value.opacity,
+                  linearRgb: style.linearRgb,
+                  crispEdges: style.crispEdges,
+                  stroke: Stroke {
+                    width: style.strokeWidth,
+                    cap: style.lineCap,
+                    join: style.lineJoin,
+                    miterLimit: style.miterLimit,
+                    dashIndex: style.dashIndex,
+                    dashOffset: style.dashOffset,
+                  },
+                },
+              )
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    i = i + 1
+  }
+  return move commands
+}
+
+pub effect fn record(tree: RenderTree) -> DisplayList
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let commands = run recordCommands(tree.nodes.asSlice(), tree.shapes.asSlice())
+  let mut patterns = run List<Pattern>.makeWithCapacity(tree.patterns.length())
+  let mut i: usize = 0
+  while i < tree.patterns.length() {
+    let picture = &tree.patterns.asSlice()[i]
+    run patterns.append(
+      Pattern {
+        tile: picture.tile,
+        contentBounds: picture.contentBounds,
+        commands: run recordCommands(picture.nodes.asSlice(), picture.shapes.asSlice()),
+      },
+    )
+    i = i + 1
+  }
+  return DisplayList {
+    width: tree.width,
+    height: tree.height,
+    maxPatternPixels: tree.maxPixels,
+    maxPatternWork: tree.graph.limits.maxOccurrences,
+    patterns: move patterns,
+    paths: move tree.paths,
+    dashes: move tree.dashes,
+    commands: move commands,
+    projectionClips: move tree.projectionClips,
+    gradientStops: move tree.gradientStops,
+    gradients: move tree.gradients,
+    paints: move tree.paints,
+    strokeSpaces: move tree.strokeSpaces,
+  }
+}

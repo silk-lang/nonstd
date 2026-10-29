@@ -1,0 +1,424 @@
+//! Variables1 token identity, dependency cycles, and inherited computed values.
+import cascade { Declaration, Candidate, Priority, Origin }
+import cascade
+import variables { VariableStore, ScopeId }
+import variables
+import input { Input, TokenRef }
+import tokens { TokenBuffer, TokenRange, Limits, CssError, CssErrorKind, Kind }
+import tokens
+import values { Store }
+import lexer
+import syntax
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+struct Fixture {
+  buffers: List<TokenBuffer>,
+  catalog: List<Declaration>,
+  candidates: List<Candidate>,
+  store: Store,
+  variables: VariableStore,
+}
+
+effect fn fixture(css: &[u8]) -> Fixture
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let mut buffers = List<TokenBuffer>.make()
+  let buffer = run lexer.tokenize(css, &limits)
+  let parsed = run syntax.parseDeclarations(&buffer, buffer.all(), &limits)
+  run buffers.append(move buffer)
+  let close = run variables.appendClosingBuffer(&mut buffers)
+  let mut result = Fixture {
+    buffers: move buffers,
+    catalog: List<Declaration>.make(),
+    candidates: List<Candidate>.make(),
+    store: Store.make(),
+    variables: VariableStore.make(close),
+  }
+  let mut i: usize = 0
+  while i < parsed.length() {
+    let compiled = run cascade.compile(
+      &mut result.store,
+      result.buffers.asSlice(),
+      0,
+      &parsed.asSlice()[i],
+      &limits,
+    )
+    match &compiled {
+      Option<Declaration>.Some { value } => {
+        let index = result.catalog.length()
+        run result.catalog.append(value)
+        run result.candidates.append(
+          Candidate { declaration: index, priority: Priority.make(Origin.Author, i) },
+        )
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return move result
+}
+
+effect fn substitution(f: &mut Fixture, scope: ScopeId, css: &[u8]) -> Option<List<TokenRef>>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(css, &limits)
+  let range = buffer.all()
+  let index = f.buffers.length()
+  run f.buffers.append(move buffer)
+  return run f.variables.substitute(f.buffers.asSlice(), scope, index, range, &limits)
+}
+
+// https://www.w3.org/TR/css-variables-1/#cycles
+// https://www.w3.org/TR/css-variables-1/#using-variables
+test effect fn fallbackEdgesAreCyclesButDependentFallbackRecovers() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut f = run fixture(
+    b"--ok: red; --a:var(--ok,var(--b)); --b:var(--a); --safe:var(--a,blue); --empty:;",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let scope = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.None,
+    &Limits.make(),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let invalid = run substitution(&mut f, scope, b"var(--a)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &invalid {
+      Option<List<TokenRef>>.None => true
+      _ => false
+    },
+    "unused fallback edge invalidates the entire cycle",
+  )
+  let safe = run substitution(&mut f, scope, b"var(--safe)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &safe {
+      Option<List<TokenRef>>.Some { value } => value.length() > 0
+      _ => false
+    },
+    "acyclic dependent may recover using fallback",
+  )
+  let empty = run substitution(&mut f, scope, b"var(--empty,red)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &empty {
+      Option<List<TokenRef>>.Some { value } => value.length() == 0
+      _ => false
+    },
+    "valid empty does not use fallback",
+  )
+}
+
+// https://www.w3.org/TR/css-variables-1/#using-variables
+// https://www.w3.org/TR/css-syntax-3/#consume-simple-block
+test effect fn substitutionNeverRetokenizesAndClosesImplicitBlocks() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut f = run fixture(b"--n:12; --block: foo(") |> Effect.provideMut<Allocator>(&mut allocator)
+  let scope = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.None,
+    &Limits.make(),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let joined = run substitution(&mut f, scope, b"var(--n)px")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let separate = match &joined {
+    Option<List<TokenRef>>.Some { value } => {
+      if value.length() != 2 {
+        false
+      } else {
+        let first = value.asSlice()[0]
+        let second = value.asSlice()[1]
+        let number = match &f.buffers.asSlice()[first.buffer].tokens.asSlice()[first.token].kind {
+          Kind.Number { value: amount, integer } => true
+          _ => false
+        }
+        let ident = match &f.buffers.asSlice()[second.buffer].tokens.asSlice()[second.token].kind {
+          Kind.Ident { text } => true
+          _ => false
+        }
+        number && ident
+      }
+    }
+    _ => false
+  }
+  run Testing.expect(separate, "number plus ident remains two tokens, never dimension")
+  let closed = run substitution(&mut f, scope, b"var(--block) red")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let hasClose = match &closed {
+    Option<List<TokenRef>>.Some { value } => {
+      let mut found = false
+      let mut i: usize = 0
+      while i < value.length() {
+        let reference = value.asSlice()[i]
+        match &f.buffers.asSlice()[reference.buffer].tokens.asSlice()[reference.token].kind {
+          Kind.CloseParen => {
+            found = true
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+      found
+    }
+    _ => false
+  }
+  run Testing.expect(hasClose, "implicit closure is explicit before following property tokens")
+}
+
+effect fn addDeclarations(f: &mut Fixture, css: &[u8], origin: Origin) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(css, &limits)
+  let parsed = run syntax.parseDeclarations(&buffer, buffer.all(), &limits)
+  let source = f.buffers.length()
+  run f.buffers.append(move buffer)
+  let mut i: usize = 0
+  while i < parsed.length() {
+    let compiled = run cascade.compile(
+      &mut f.store,
+      f.buffers.asSlice(),
+      source,
+      &parsed.asSlice()[i],
+      &limits,
+    )
+    match &compiled {
+      Option<Declaration>.Some { value } => {
+        let index = f.catalog.length()
+        run f.catalog.append(value)
+        run f.candidates.append(
+          Candidate { declaration: index, priority: Priority.make(origin, index) },
+        )
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+}
+
+fn isIdent(f: &Fixture, result: &Option<List<TokenRef>>, expected: &[u8]) -> bool {
+  match &result.* {
+    Option<List<TokenRef>>.Some { value } => {
+      let mut found = false
+      let mut i: usize = 0
+      while i < value.length() {
+        let reference = value.asSlice()[i]
+        let buffer = &f.buffers.asSlice()[reference.buffer]
+        match &buffer.tokens.asSlice()[reference.token].kind {
+          Kind.Whitespace => {}
+          Kind.Ident { text } => {
+            if found || !tokens.equal(buffer.text(text), expected) {
+              return false
+            }
+            found = true
+          }
+          _ => {
+            return false
+          }
+        }
+        i = i + 1
+      }
+      return found
+    }
+    _ => {
+      return false
+    }
+  }
+}
+
+// https://www.w3.org/TR/css-variables-1/#cycles
+// https://www.w3.org/TR/css-variables-1/#defining-variables
+test effect fn inheritedVariablesAreAlreadyComputedAndNamesAreCaseSensitive() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut f = run fixture(b"--a:red;--b:var(--a);--A:green;--reset:blue")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let parent = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.None,
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  f.candidates.truncate(0)
+  let shared = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.some(parent),
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(shared.index == parent.index, "no custom declarations share the parent scope")
+  run addDeclarations(
+    &mut f,
+    b"--a:blue;--reset:initial;--inherited:var(--missing,inherit)",
+    Origin.Author,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let child = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.some(parent),
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let inherited = run substitution(&mut f, child, b"var(--b)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    isIdent(&f, &inherited, b"red"),
+    "parent computed references are not re-substituted with child's blue",
+  )
+  let capital = run substitution(&mut f, child, b"var(--A)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(isIdent(&f, &capital, b"green"), "custom names remain case sensitive")
+  let reset = run substitution(&mut f, child, b"var(--reset,orange)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    isIdent(&f, &reset, b"orange"),
+    "initial masks inherited value with guaranteed-invalid",
+  )
+}
+
+// https://www.w3.org/TR/css-cascade-4/#default
+// https://www.w3.org/TR/css-variables-1/#using-variables
+test effect fn customRollbackAndSubstitutedWideKeywords() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut f = run fixture(
+    b"--x:var(--missing,revert);--y:var(--x,revert);--z:var(--missing,initial)",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run addDeclarations(&mut f, b"--x:green;--y:blue", Origin.User)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let scope = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.None,
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let x = run substitution(&mut f, scope, b"var(--x)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    isIdent(&f, &x, b"green"),
+    "substituted revert recascades custom property to user origin",
+  )
+  let y = run substitution(&mut f, scope, b"var(--y)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    isIdent(&f, &y, b"green"),
+    "dependent waits for rollback, never prematurely applies its own revert fallback",
+  )
+  let z = run substitution(&mut f, scope, b"var(--z,orange)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(isIdent(&f, &z, b"orange"), "substituted initial is guaranteed-invalid")
+}
+
+// https://www.w3.org/TR/css-variables-1/#cycles
+test effect fn overlappingCyclesInvalidateEntireStrongComponent() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut f = run fixture(b"--a:var(--b)var(--c);--b:var(--a);--c:var(--b);--safe:var(--c,green)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let scope = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.None,
+    &Limits.make(),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let result = run substitution(&mut f, scope, b"var(--safe)")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    isIdent(&f, &result, b"green"),
+    "cross-edge SCC member is invalid even after its DFS sibling returned",
+  )
+}
+
+// https://www.w3.org/TR/css-variables-1/#long-variables
+test effect fn variableResourceExhaustionIsTypedNotInvalidValue() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut f = run fixture(b"--a:var(--b);--b:var(--c);--c:green")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut limits = Limits.make()
+  limits.maxDepth = 1
+  let depth = run Effect.result(
+    f.variables.build(
+      f.buffers.asSlice(),
+      f.catalog.asSlice(),
+      f.candidates.asSlice(),
+      Option<ScopeId>.None,
+      &limits,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &depth {
+      Result<ScopeId, CssError | OutOfMemoryError>.Failure { error } => match &error {
+        CssError problem => problem.kind == CssErrorKind.NestingLimit
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "dependency recursion limit is reported as typed error",
+  )
+  limits = Limits.make()
+  let scope = run f.variables.build(
+    f.buffers.asSlice(),
+    f.catalog.asSlice(),
+    f.candidates.asSlice(),
+    Option<ScopeId>.None,
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let buffer = run lexer.tokenize(b"var(--a)", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let range = buffer.all()
+  let source = f.buffers.length()
+  run f.buffers.append(move buffer) |> Effect.provideMut<Allocator>(&mut allocator)
+  limits.maxTokens = 3
+  let bounded = run Effect.result(
+    f.variables.substitute(f.buffers.asSlice(), scope, source, range, &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &bounded {
+      Result<Option<List<TokenRef>>, CssError | OutOfMemoryError>.Failure {
+        error
+      } => match &error {
+        CssError problem => problem.kind == CssErrorKind.MatchLimit
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "reference work exhaustion does not silently become guaranteed-invalid",
+  )
+}

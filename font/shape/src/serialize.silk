@@ -1,0 +1,224 @@
+//! HarfBuzz glyph strings without a general-purpose formatter in the glyph loop.
+import buffer { Buffer, Glyph, ContentType }
+import font { ConfiguredShaper, FontFuncs, DefaultFontFuncs, Shaper, Metrics, metrics }
+import scale { Scale, add, sub }
+import read_fonts.model.name.glyph { GlyphNameMap, GlyphName }
+import read_fonts.model.metrics.glyph { GlyphMetrics }
+import read_fonts.model.metrics.extents { GlyphExtents }
+import font_types.lib { GlyphId, F2Dot14 }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.i32
+import silk.num.u32
+
+interface SerializationFont {
+  fn glyphName(self: &Self, glyph: GlyphId) -> GlyphName
+
+  effect fn extents(self: &Self, glyph: GlyphId) -> Option<GlyphExtents<i32>>
+    ! OutOfMemoryError
+    ? &mut Allocator
+}
+
+struct FontSerialization<'a, 's, 'f, F: FontFuncs> {
+  font: &'f ConfiguredShaper<'a, 's, F>,
+}
+
+impl<'a, 's, 'f, F: FontFuncs> SerializationFont for FontSerialization<'a, 's, 'f, F> {
+  fn glyphName(self: &Self, glyph: GlyphId) -> GlyphName {
+    return GlyphNameMap.glyphName(&self.font.data.names, glyph)
+      |> Option<GlyphName>.unwrapOr(GlyphName.synthesized(glyph))
+  }
+
+  effect fn extents(self: &Self, glyph: GlyphId) -> Option<GlyphExtents<i32>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run ConfiguredShaper.glyphExtents(self.font, glyph)
+  }
+}
+
+struct NoFontSerialization {}
+
+impl SerializationFont for NoFontSerialization {
+  fn glyphName(self: &Self, glyph: GlyphId) -> GlyphName {
+    return GlyphName.synthesized(glyph)
+  }
+
+  effect fn extents(self: &Self, glyph: GlyphId) -> Option<GlyphExtents<i32>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Option<GlyphExtents<i32>>.None
+  }
+}
+
+pub effect fn serialize<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &Buffer,
+  flags: u32,
+) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run serializeImpl(&FontSerialization { font: font }, buffer, flags)
+}
+
+pub effect fn serializeWithoutFont(buffer: &Buffer, flags: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run serializeImpl(&NoFontSerialization {}, buffer, flags)
+}
+
+pub effect fn serializeOptional<F: FontFuncs>(
+  font: Option<&ConfiguredShaper<F>>,
+  buffer: &Buffer,
+  flags: u32,
+) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move font {
+    Option.Some { value } => run serialize(value, buffer, flags)
+    Option.None => run serializeWithoutFont(buffer, flags)
+  }
+}
+
+effect fn serializeImpl<F: SerializationFont>(font: &F, buffer: &Buffer, flags: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if buffer.contentType == ContentType.Unicode {
+    return run serializeUnicode(buffer, flags)
+  }
+  if Buffer.isEmpty(buffer) {
+    return String.make()
+  }
+  let mut out = String.make()
+  run String.append(&mut out, "[")
+  let mut x: i32 = 0
+  let mut y: i32 = 0
+  let mut i: usize = 0
+  while i < Buffer.len(buffer) {
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    if i != 0 {
+      run String.append(&mut out, "|")
+    }
+    if (flags & 4) == 0 {
+      let name = SerializationFont.glyphName(font, GlyphId.new(item.info.glyphId))
+      run String.append(&mut out, GlyphName.asStr(&name))
+    } else {
+      run decimal(&mut out, u32.toI64(item.info.glyphId))
+    }
+    if (flags & 1) == 0 {
+      run String.append(&mut out, "=")
+      run decimal(&mut out, u32.toI64(item.info.cluster))
+    }
+    if buffer.havePositions && (flags & 2) == 0 {
+      let dx = add(x, item.position.xOffset)
+      let dy = add(y, item.position.yOffset)
+      if dx != 0 || dy != 0 {
+        run String.append(&mut out, "@")
+        run decimal(&mut out, i32.toI64(dx))
+        run String.append(&mut out, ",")
+        run decimal(&mut out, i32.toI64(dy))
+      }
+      if (flags & 32) == 0 {
+        run String.append(&mut out, "+")
+        run decimal(&mut out, i32.toI64(item.position.xAdvance))
+        if item.position.yAdvance != 0 {
+          run String.append(&mut out, ",")
+          run decimal(&mut out, i32.toI64(item.position.yAdvance))
+        }
+      }
+    }
+    if (flags & 16) != 0 && (item.info.flags & 7) != 0 {
+      run String.append(&mut out, "#")
+      run decimal(&mut out, u32.toI64(item.info.flags & 7))
+    }
+    if (flags & 8) != 0 {
+      if let Option<GlyphExtents<i32>>.Some { value: extents } = run SerializationFont.extents(
+        font,
+        GlyphId.new(item.info.glyphId),
+      ) {
+        run String.append(&mut out, "<")
+        run decimal(&mut out, i32.toI64(extents.xBearing))
+        run String.append(&mut out, ",")
+        run decimal(&mut out, i32.toI64(extents.yBearing))
+        run String.append(&mut out, ",")
+        run decimal(&mut out, i32.toI64(extents.width))
+        run String.append(&mut out, ",")
+        run decimal(&mut out, i32.toI64(extents.height))
+        run String.append(&mut out, ">")
+      }
+    }
+    if (flags & 32) != 0 {
+      x = add(x, item.position.xAdvance)
+      y = add(y, item.position.yAdvance)
+    }
+    i = i + 1
+  }
+  run String.append(&mut out, "]")
+  return move out
+}
+
+effect fn decimal(out: &mut String, number: i64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bytes: [u8; 24] = [0; 24]
+  let mut index: usize = 24
+  let mut value = number
+  if value < 0 {
+    value = -value
+  }
+  while true {
+    index = index - 1
+    bytes[index] = i64.toU8(value % 10) + 48
+    value = value / 10
+    if value == 0 {
+      break
+    }
+  }
+  if number < 0 {
+    index = index - 1
+    bytes[index] = 45
+  }
+  let text = String.fromUtf8(Slice.view(&bytes, index, 24 - index))
+    |> Result<string, InvalidUtf8>.unwrapOr("")
+  run String.append(&mut out, text)
+}
+
+pub effect fn serializeUnicode(buffer: &Buffer, flags: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < Buffer.len(buffer) {
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    if i == 0 {
+      run String.append(&mut out, "<U+")
+    } else {
+      run String.append(&mut out, "|U+")
+    }
+    let mut hex: [u8; 8] = [48; 8]
+    let mut n: usize = 8
+    let mut value = item.codepoint
+    while n > 0 && (value != 0 || n > 4) {
+      n = n - 1
+      hex[n] = b"0123456789ABCDEF"[u32.toUsize(value & 15)]
+      value = u32.shiftRight(value, 4)
+    }
+    run String.append(
+      &mut out,
+      String.fromUtf8(Slice.view(&hex, n, 8 - n)) |> Result<string, InvalidUtf8>.unwrapOr(""),
+    )
+    if (flags & 1) == 0 {
+      run String.append(&mut out, "=")
+      run decimal(&mut out, u32.toI64(item.info.cluster))
+    }
+    i = i + 1
+  }
+  if i != 0 {
+    run String.append(&mut out, ">")
+  }
+  return move out
+}

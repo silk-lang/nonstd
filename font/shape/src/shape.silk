@@ -1,0 +1,504 @@
+import buffer { Buffer, Glyph, GlyphPosition, ContentType }
+import font { ConfiguredShaper, FontFuncs, Shaper, ShaperData, Metrics, Advances, metrics, table }
+import direction { Direction }
+import feature { Feature }
+import plan { OtPlan, LookupStep }
+import shape_plan { ShapePlan }
+import options { ShapeOptions }
+import silk.core.option { Option }
+import scale { Scale, sub }
+import normalize
+import preprocess
+import unicode
+import ot
+import arabic
+import fallback
+import aat
+import aat_kern
+import complex
+import view { View }
+import read_fonts.model.metrics.glyph { GlyphMetrics }
+import font_types.lib { GlyphId, F2Dot14 }
+import silk.num.u8
+import silk.num.u16
+import silk.collections.list { List }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub union ShapeError {
+  AlreadyShaped,
+  DirectionUnset,
+  DirectionMismatch { pub plan: Direction, pub buffer: Direction },
+  ScriptMismatch { pub plan: u32, pub buffer: u32 },
+}
+
+pub effect fn shapeWithFeatures<'a, 's, F: FontFuncs>(
+  font: &ConfiguredShaper<'a, 's, F>,
+  buffer: &mut Buffer,
+  features: &[Feature],
+) -> Result<(), ShapeError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if buffer.contentType == ContentType.Glyphs {
+    return Result<(), ShapeError>.failResult(ShapeError.AlreadyShaped)
+  }
+  if buffer.direction == Direction.Invalid {
+    return Result<(), ShapeError>.failResult(ShapeError.DirectionUnset)
+  }
+  let plan = run ShapePlan.new(font, &buffer.*, features)
+  return run execute(font, &mut buffer, &plan, features, font.pointSize)
+}
+
+pub effect fn shape<'a: 'p, 's, 'p, F: FontFuncs>(
+  font: &ConfiguredShaper<'a, 's, F>,
+  buffer: &mut Buffer,
+  options: ShapeOptions<'a, 'p>,
+) -> Result<(), ShapeError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if buffer.contentType == ContentType.Glyphs {
+    return Result<(), ShapeError>.failResult(ShapeError.AlreadyShaped)
+  }
+  let emptyFeatures: [Feature; 0] = []
+  let features = match move options.features {
+    Option<&[Feature]>.Some { value } => value
+    _ => &emptyFeatures
+  }
+  let pointSize = move options.pointSize |> Option<f32>.unwrapOr(font.pointSize)
+  if let Option<&ShapePlan<'a>>.Some { value: plan } = move options.plan {
+    return run execute(font, &mut buffer, plan, features, pointSize)
+  }
+  if buffer.direction == Direction.Invalid {
+    return Result<(), ShapeError>.failResult(ShapeError.DirectionUnset)
+  }
+  let plan = run ShapePlan.new(font, &buffer.*, features)
+  return run execute(font, &mut buffer, &plan, features, pointSize)
+}
+
+effect fn execute<'a, 's, F: FontFuncs>(
+  font: &ConfiguredShaper<'a, 's, F>,
+  buffer: &mut Buffer,
+  plan: &ShapePlan<'a>,
+  features: &[Feature],
+  pointSize: f32,
+) -> Result<(), ShapeError>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if buffer.direction != plan.direction {
+    return Result<(), ShapeError>.failResult(
+      ShapeError.DirectionMismatch { plan: plan.direction, buffer: buffer.direction },
+    )
+  }
+  let mut requestedScript = buffer.script
+  let mut plannedScript = plan.script
+  if requestedScript == 0 {
+    requestedScript = 0x5a7a7a7a
+  }
+  if plannedScript == 0 {
+    plannedScript = 0x5a7a7a7a
+  }
+  if requestedScript != plannedScript {
+    return Result<(), ShapeError>.failResult(
+      ShapeError.ScriptMismatch { plan: plan.script, buffer: buffer.script },
+    )
+  }
+  let positions = &plan.positions
+  let substitutions = &plan.substitutions
+  Buffer.enter(&mut buffer)
+  if Buffer.isEmpty(&buffer.*) {
+    Buffer.leave(&mut buffer)
+    buffer.contentType = ContentType.Glyphs
+    return Result<(), ShapeError>.succeed(())
+  }
+  let direction = buffer.direction
+  buffer.targetDirection = direction
+  buffer.shaper = plan.shaper
+  buffer.dumber = plan.dumber
+  if (buffer.flags & 1) != 0 && (buffer.flags & 16) == 0
+    && List<u32>.length(&buffer.preContext) == 0
+    && Buffer.len(&buffer.*) != 0 {
+    let first = List<Glyph>.get(&buffer.glyphs, 0)
+    if unicode.isMark(first.codepoint) && ConfiguredShaper.hasGlyph(font, 0x25cc) {
+      run List<Glyph>.insert(&mut buffer.glyphs, 0, Glyph.new(0x25cc, first.info.cluster))
+    }
+  }
+  normalize.formClusters(&mut buffer)
+  normalize.nativeDirection(&mut buffer)
+  let mut i: usize = 0
+  if !Direction.isForward(direction) {
+    mirror(font, List<Glyph>.asMutSlice(&mut buffer.glyphs))
+  }
+  if !Direction.isHorizontal(direction) {
+    if !hasFeature(substitutions, 0x76657274) {
+      i = 0
+      let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+      while i < glyphs.length {
+        let cp = unicode.vertical(glyphs[i].codepoint)
+        if ConfiguredShaper.hasGlyph(font, cp) {
+          glyphs[i].codepoint = cp
+        }
+        i = i + 1
+      }
+    }
+  }
+  fractions(&mut buffer)
+  if !buffer.dumber {
+    run preprocess.apply(font, &mut buffer)
+    run complex.preprocess(&mut buffer)
+  }
+  run normalize.normalize(font, &mut buffer, hasFeature(positions, 0x6d61726b))
+  if !buffer.dumber && arabic.usesScript(buffer.script) {
+    arabic.setup(&mut buffer)
+  }
+  i = 0
+  if View.len(&substitutions.glyphClassDef) > 0 {
+    ot.setGdefGlyphClasses(substitutions, List<Glyph>.asMutSlice(&mut buffer.glyphs))
+  } else {
+    let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+    while i < glyphs.length {
+      let item = &mut glyphs[i]
+      item.glyphClass = 1
+      if unicode.generalCategory(item.codepoint) == 12 && !item.ignorable {
+        item.glyphClass = 3
+      }
+      i = i + 1
+    }
+  }
+  buffer.contentType = ContentType.Glyphs
+  if !buffer.dumber {
+    run complex.setup(&mut buffer)
+  }
+  let mut morx = false
+  if (View.len(&font.data.morx) >= 8 || View.len(&font.data.mort) >= 8)
+    && (Direction.isHorizontal(buffer.direction) || View.len(&font.data.gsub) == 0) {
+    morx = run aat.substitute(font, &mut buffer, features)
+  }
+  if !morx {
+    run ot.apply(font, &mut buffer, substitutions, features)
+  }
+  let hasKerx = View.len(&font.data.kerx) != 0
+  let hasGsub = !morx && View.len(&font.data.gsub) != 0
+  let hasGpos = View.len(&font.data.gpos) != 0
+    && (buffer.script != 0x48656272 || positions.chosenScript == 0x68656272)
+  let mut kernTag: u32 = 0x6b65726e
+  if !Direction.isHorizontal(direction) {
+    kernTag = 0x766b726e
+  }
+  let applyGpos = hasGpos && (!hasKerx || hasGsub)
+  let applyKerx = hasKerx && (!applyGpos || !hasFeature(positions, kernTag))
+  let applyKern = !applyKerx && (!applyGpos || !hasFeature(positions, kernTag))
+    && plan.fallbackPosition
+    && View.len(&font.data.kern) != 0
+  let zeroMarks = !buffer.dumber && !applyKerx && (!applyKern || !aat_kern.hasMachine(font))
+  let fallbackMarks = !applyGpos && !applyKerx && (!applyKern || !aat_kern.hasCross(font))
+  buffer.havePositions = true
+  let metrics = run metrics(font)
+  if Direction.isHorizontal(buffer.direction) {
+    let mut advances = Advances { glyphs: List<Glyph>.asMutSlice(&mut buffer.glyphs) }
+    Metrics.hAdvances(&metrics, &mut advances)
+  }
+
+  // Horizontal runs leave most glyphs as they are, so only the rest are copied out and back.
+  let vertical = !Direction.isHorizontal(buffer.direction)
+  let zeroShaperMarks = zeroMarks && (buffer.shaper == 3 || buffer.shaper == 4)
+  i = 0
+  if !vertical {
+    let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+    while i < glyphs.length && (glyphs[i].spaceFallback == 0 || glyphs[i].substituted)
+      && (!zeroShaperMarks || glyphs[i].glyphClass != 3) {
+      i = i + 1
+    }
+  }
+  while i < Buffer.len(&buffer.*) {
+    let current = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+    if !vertical && (current.spaceFallback == 0 || current.substituted)
+      && (!zeroShaperMarks || current.glyphClass != 3) {
+      i = i + 1
+      continue
+    }
+    let mut item = List<Glyph>.get(&buffer.glyphs, i)
+    let glyph = GlyphId.new(item.info.glyphId)
+    if !Direction.isHorizontal(buffer.direction) {
+      item.position.yAdvance = sub(0, Metrics.vAdvance(&metrics, glyph))
+      let origin = run Metrics.vOrigin(&metrics, glyph)
+      item.position.xOffset = sub(0, origin[0])
+      item.position.yOffset = sub(0, origin[1])
+    }
+    if item.spaceFallback != 0 && !item.substituted {
+      let kind = item.spaceFallback
+      let upem = u16.toI32(font.data.upem)
+      let mut advance = item.position.xAdvance
+      if !Direction.isHorizontal(buffer.direction) {
+        advance = item.position.yAdvance
+      }
+      if kind <= 16 || kind == 36 {
+        let mut units = upem * 4 / 18
+        if kind <= 16 {
+          units = (upem + u8.toI32(kind) / 2) / u8.toI32(kind)
+        }
+        advance = Scale.x(&font.scale, units)
+        if !Direction.isHorizontal(buffer.direction) {
+          advance = sub(0, Scale.y(&font.scale, units))
+        }
+      } else if kind == 35 {
+        advance = advance / 2
+      } else if kind == 33 || kind == 34 {
+        let mut cp: u32 = 48
+        let mut last: u32 = 57
+        if kind == 34 {
+          cp = 44
+          last = 46
+        }
+        let mut replacement = ConfiguredShaper.nominalGlyph(font, 46)
+        if kind != 34 {
+          replacement = Option<GlyphId>.None
+        }
+        while cp <= last {
+          if let Option<GlyphId>.Some { value } = &replacement {
+            break
+          }
+          replacement = ConfiguredShaper.nominalGlyph(font, cp)
+          cp = cp + 1
+        }
+        if let Option<GlyphId>.Some { value: replacementGlyph } = move replacement {
+          if Direction.isHorizontal(buffer.direction) {
+            advance = Metrics.hAdvance(&metrics, replacementGlyph)
+          } else {
+            advance = sub(0, Metrics.vAdvance(&metrics, replacementGlyph))
+          }
+        }
+      }
+      if Direction.isHorizontal(buffer.direction) {
+        item.position.xAdvance = advance
+      } else {
+        item.position.yAdvance = advance
+      }
+    }
+    if zeroMarks && item.glyphClass == 3 && (buffer.shaper == 3 || buffer.shaper == 4) {
+      if fallbackMarks && !morx {
+        item.position.xOffset = sub(item.position.xOffset, item.position.xAdvance)
+        item.position.yOffset = sub(item.position.yOffset, item.position.yAdvance)
+      }
+      item.position.xAdvance = 0
+      item.position.yAdvance = 0
+    }
+    List<Glyph>.set(&mut buffer.glyphs, i, item)
+    i = i + 1
+  }
+  if applyGpos {
+    run ot.apply(font, &mut buffer, positions, features)
+  } else if applyKerx {
+    run aat_kern.kerx(font, &mut buffer, features)
+  }
+  if applyKern {
+    run aat_kern.kern(font, &mut buffer, features)
+  }
+  let zeroBaseMarks = zeroMarks && buffer.shaper == 0 && buffer.script != 0x48616e67
+    && buffer.script != 0x51616167
+  let zeroIgnorables = (buffer.flags & 4) == 0
+  let horizontalRun = Direction.isHorizontal(buffer.direction)
+  i = 0
+  let positioned = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  while i < positioned.length {
+    let item = &mut positioned[i]
+    if zeroBaseMarks && item.glyphClass == 3 {
+      item.position.xAdvance = 0
+      item.position.yAdvance = 0
+    }
+    if zeroIgnorables && item.ignorable && !item.substituted {
+      item.position.xAdvance = 0
+      item.position.yAdvance = 0
+      if horizontalRun {
+        item.position.xOffset = 0
+      } else {
+        item.position.yOffset = 0
+      }
+    }
+    i = i + 1
+  }
+  if View.len(&font.data.trak) != 0 {
+    aat.tracking(font, &mut buffer, features, pointSize)
+  }
+  run ot.finishOffsets(&mut buffer)
+  if fallbackMarks && plan.fallbackPosition {
+    run fallback.position(font, &mut buffer)
+  }
+  if !Direction.isForward(buffer.direction) {
+    Buffer.reverse(&mut buffer)
+  }
+  i = 0
+
+  // Most runs have no selector fallbacks or ignorables, so the first one is found without
+  // copying glyphs out, and the invisible glyph is only looked up when there is one.
+  if true {
+    let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+    while i < glyphs.length && !glyphs[i].selectorFallback
+      && (!glyphs[i].ignorable || glyphs[i].substituted) {
+      i = i + 1
+    }
+  }
+  let mut invisible: u32 = 0
+  let mut haveInvisible = false
+  if i < Buffer.len(&buffer.*) {
+    let invisibleOption = match &buffer.invisibleGlyph {
+      Option<GlyphId>.Some { value } => Option<GlyphId>.some(value)
+      _ => ConfiguredShaper.nominalGlyph(font, 32)
+    }
+    if let Option<GlyphId>.Some { value } = move invisibleOption {
+      invisible = GlyphId.toU32(value)
+      haveInvisible = true
+    }
+  }
+  let mut notFoundSelector: u32 = 0
+  let mut haveNotFoundSelector = false
+  if let Option<u32>.Some { value } = &buffer.notFoundVariationSelectorGlyph {
+    notFoundSelector = value
+    haveNotFoundSelector = true
+  }
+  let hideIgnorables = (buffer.flags & 4) == 0
+  let removeIgnorables = (buffer.flags & 8) != 0 || !haveInvisible
+  while i < Buffer.len(&buffer.*) {
+    let mut remove = false
+    if true {
+      let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+      while i < glyphs.length && !glyphs[i].selectorFallback
+        && (!glyphs[i].ignorable || glyphs[i].substituted) {
+        i = i + 1
+      }
+      if i == glyphs.length {
+        break
+      }
+      let item = &mut glyphs[i]
+      if item.selectorFallback && haveNotFoundSelector {
+        item.info.glyphId = notFoundSelector
+        item.position = GlyphPosition.zero()
+      }
+      if item.ignorable && !item.substituted && hideIgnorables {
+        if removeIgnorables {
+          remove = true
+        } else {
+          item.info.glyphId = invisible
+        }
+      }
+    }
+    if remove {
+      Buffer.deleteGlyph(&mut buffer, i)
+      continue
+    }
+    i = i + 1
+  }
+
+  // Only the Arabic shaper's scripts record stretches.
+  if arabic.usesScript(buffer.script) {
+    run arabic.stretch(font, &mut buffer)
+  }
+  Buffer.propagateFlags(&mut buffer)
+  buffer.contentType = ContentType.Glyphs
+  buffer.direction = direction
+  Buffer.leave(&mut buffer)
+  return Result<(), ShapeError>.succeed(())
+}
+
+/// Replaces code points with their mirrored forms where the font has one, and marks the rest
+/// as mirrored.
+fn mirror<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  glyphs: &mut [Glyph],
+) -> () with Intrinsic.inlineNever() {
+  let mut i: usize = 0
+  while i < glyphs.length {
+    let original = glyphs[i].codepoint
+
+    // No code point below U+0028 or in U+00BC..U+0F39, which holds the Arabic and Hebrew
+    // blocks, has a mirror.
+    let mut cp = original
+    if original >= 0x28 && (original < 0xbc || original >= 0xf3a) {
+      cp = unicode.mirror(original)
+    }
+    if cp != original && ConfiguredShaper.hasGlyph(font, cp) {
+      glyphs[i].codepoint = cp
+    } else {
+      glyphs[i].mirrored = true
+    }
+    i = i + 1
+  }
+}
+
+fn hasFeature(plan: &OtPlan, tag: u32) -> bool {
+  let mut i: usize = 0
+  while i < List<LookupStep>.length(&plan.steps) {
+    if List<LookupStep>.get(&plan.steps, i).tag == tag {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn fractions(buffer: &mut Buffer) -> () with Intrinsic.inlineAlways() {
+  // Most runs have no fraction slash, so they are scanned here and only the rest are marked.
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let mut i: usize = 0
+  while i < glyphs.length && glyphs[i].codepoint != 0x2044 {
+    i = i + 1
+  }
+  if i < glyphs.length {
+    markFractions(&mut buffer, i)
+  }
+}
+
+fn markFractions(buffer: &mut Buffer, from: usize) -> () {
+  let mut i = from
+  while i < Buffer.len(&buffer.*) {
+    if List<Glyph>.asSlice(&buffer.glyphs)[i].codepoint == 0x2044 {
+      let mut first = i
+      let mut end = i + 1
+      while first > 0
+        && unicode.generalCategory(List<Glyph>.asSlice(&buffer.glyphs)[first - 1].codepoint) == 13 {
+        first = first - 1
+      }
+      while end < Buffer.len(&buffer.*)
+        && unicode.generalCategory(List<Glyph>.asSlice(&buffer.glyphs)[end].codepoint) == 13 {
+        end = end + 1
+      }
+      if first != i && end != i + 1 {
+        Buffer.unsafeToBreak(&mut buffer, first, end)
+        let mut j = first
+        while j < end {
+          let mut item = List<Glyph>.get(&buffer.glyphs, j)
+          item.fraction = 3
+          if j < i {
+            item.fraction = 1
+            if !Direction.isForward(buffer.direction) {
+              item.fraction = 2
+            }
+          } else if j > i {
+            item.fraction = 2
+            if !Direction.isForward(buffer.direction) {
+              item.fraction = 1
+            }
+          }
+          List<Glyph>.set(&mut buffer.glyphs, j, item)
+          j = j + 1
+        }
+        i = end
+        continue
+      }
+    }
+    i = i + 1
+  }
+}
+
+impl ShapeError {
+  pub fn description(self: &Self) -> string {
+    return match &self.* {
+      ShapeError.AlreadyShaped => "buffer already contains glyphs"
+      ShapeError.DirectionUnset => "buffer direction is unset"
+      ShapeError.DirectionMismatch {
+        plan,
+        buffer
+      } => "buffer direction does not match the shape plan"
+      ShapeError.ScriptMismatch { plan, buffer } => "buffer script does not match the shape plan"
+    }
+  }
+}

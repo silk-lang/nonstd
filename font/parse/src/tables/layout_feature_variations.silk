@@ -1,0 +1,393 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import silk.collections.list { List }
+import silk.collections.hash_set { HashSet }
+import silk.collections.hash { Hash, Word }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import table_provider { TableProvider }
+import generated_gsub { Gsub }
+import generated_gpos { Gpos }
+import generated_gdef { Gdef }
+
+pub struct SelectedFeatureVariations {
+  pub gsub: Option<u32>,
+  pub gpos: Option<u32>,
+  pub hasLookupVariations: bool,
+}
+
+impl SelectedFeatureVariations {
+  pub fn default() -> Self {
+    return Self { gsub: Option<u32>.None, gpos: Option<u32>.None, hasLookupVariations: false }
+  }
+
+  pub fn new<'a, P: TableProvider<'a>>(tables: &P, coords: &[F2Dot14]) -> Self {
+    let sub = match move TableProvider.gsub(tables) {
+      Result<Gsub<'a>, ReadError>.Success { value } => featureVars(Gsub.featureVariations(&value))
+      _ => Option<FeatureVariations<'a>>.None
+    }
+    let pos = match move TableProvider.gpos(tables) {
+      Result<Gpos<'a>, ReadError>.Success { value } => featureVars(Gpos.featureVariations(&value))
+      _ => Option<FeatureVariations<'a>>.None
+    }
+    let mut store = Option<ItemVariationStore<'a>>.None
+    let hasSub = match &sub {
+      Option<FeatureVariations<'a>>.Some { value } => true
+      _ => false
+    }
+    let hasPos = match &pos {
+      Option<FeatureVariations<'a>>.Some { value } => true
+      _ => false
+    }
+    if hasSub || hasPos {
+      match move TableProvider.gdef(tables) {
+        Result<Gdef<'a>, ReadError>.Success { value } => {
+          match move Gdef.itemVarStore(&value) {
+            Option<Result<ItemVariationStore<'a>, ReadError>>.Some {
+              value: Result<ItemVariationStore<'a>, ReadError>.Success { value: found }
+            } => {
+              store = Option<ItemVariationStore<'a>>.some(found)
+            }
+            _ => {}
+          }
+        }
+        _ => {}
+      }
+    }
+    let hasLookups = containsLookupVariations(&sub) || containsLookupVariations(&pos)
+    let gsub = selectFeatureIndex(move sub, &store, coords)
+    let gpos = selectFeatureIndex(move pos, &store, coords)
+    return Self { gsub: move gsub, gpos: move gpos, hasLookupVariations: hasLookups }
+  }
+}
+
+fn featureVars<'a>(value: Option<Result<FeatureVariations<'a>, ReadError>>) -> Option<
+  FeatureVariations<'a>
+> {
+  return match move value {
+    Option<Result<FeatureVariations<'a>, ReadError>>.Some {
+      value: Result<FeatureVariations<'a>, ReadError>.Success { value: table }
+    } => Option<FeatureVariations<'a>>.some(table)
+    _ => Option<FeatureVariations<'a>>.None
+  }
+}
+
+fn containsLookupVariations<'a>(value: &Option<FeatureVariations<'a>>) -> bool {
+  return match &value.* {
+    Option<FeatureVariations<'a>>.Some {
+      value: table
+    } => match move FeatureVariations.lookupVariations(&table) {
+      Option<LookupVariations<'a>>.Some { value: found } => true
+      _ => false
+    }
+    _ => false
+  }
+}
+
+fn selectFeatureIndex<'a>(
+  value: Option<FeatureVariations<'a>>,
+  store: &Option<ItemVariationStore<'a>>,
+  coords: &[F2Dot14],
+) -> Option<u32> {
+  let table = match move value {
+    Option<FeatureVariations<'a>>.Some { value: table } => table
+    _ => {
+      return Option<u32>.None
+    }
+  }
+  let copy = match &store.* {
+    Option<ItemVariationStore<'a>>.Some { value: foundStore } => Option<
+      ItemVariationStore<'a>
+    >.some(foundStore)
+    _ => Option<ItemVariationStore<'a>>.None
+  }
+  return FeatureVariations<'a>.indexForCoordsWithDelta<Error>(
+    &table,
+    coords,
+    storeDeltas(move copy, coords),
+  )
+}
+
+impl Equal for SelectedFeatureVariations {
+  fn equals(left: &Self, right: &Self) -> bool {
+    let leftSub = match &left.gsub {
+      Option<u32>.Some { value } => u64.toI64(u32.toU64(value))
+      _ => -1
+    }
+    let rightSub = match &right.gsub {
+      Option<u32>.Some { value } => u64.toI64(u32.toU64(value))
+      _ => -1
+    }
+    let leftPos = match &left.gpos {
+      Option<u32>.Some { value } => u64.toI64(u32.toU64(value))
+      _ => -1
+    }
+    let rightPos = match &right.gpos {
+      Option<u32>.Some { value } => u64.toI64(u32.toU64(value))
+      _ => -1
+    }
+    return leftSub == rightSub && leftPos == rightPos
+      && left.hasLookupVariations == right.hasLookupVariations
+  }
+}
+
+impl<'a> FeatureVariations<'a> {
+  pub fn lookupVariationRecords(self: &Self) -> Option<
+    ComputedArray<'a, (), LookupVariationRecord<'a>>
+  > {
+    if !MajorMinor.compatible(&FeatureVariations<'a>.version(self), MajorMinor.new(1, 1)) {
+      return Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None
+    }
+    if u32.toU64(FeatureVariations<'a>.featureVariationRecordCount(self)) * 8
+      > usize.toU64(usize.saturatingSubtract(FontData.len(&self._fontData), 8)) {
+      return Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None
+    }
+    let count = match move FeatureVariations<'a>.lookupVariationRecordCount(self) {
+      Option<u32>.Some { value } => u32.toUsize(value)
+      Option<u32>.None => {
+        return Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None
+      }
+    }
+    let length = match move usize.checkedMultiply(count, 6) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None
+      }
+    }
+    let start = FeatureVariations<'a>.lookupVariationRecordCountByteRange(self).end
+    let end = match move usize.checkedAdd(start, length) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None
+      }
+    }
+    return match move ComputedArray<'a, (), LookupVariationRecord<'a>>.new(
+      self._fontData,
+      start,
+      end,
+      (),
+    ) {
+      Result<ComputedArray<'a, (), LookupVariationRecord<'a>>, ReadError>.Success {
+        value
+      } => Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.some(value)
+      Result<ComputedArray<'a, (), LookupVariationRecord<'a>>, ReadError>.Failure {
+        error
+      } => Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None
+    }
+  }
+
+  pub fn lookupVariations(self: &Self) -> Option<LookupVariations<'a>> {
+    let records = match move FeatureVariations<'a>.lookupVariationRecords(self) {
+      Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.Some { value } => value
+      Option<ComputedArray<'a, (), LookupVariationRecord<'a>>>.None => {
+        return Option<LookupVariations<'a>>.None
+      }
+    }
+    if ComputedArray<'a, (), LookupVariationRecord<'a>>.isEmpty(&records) {
+      return Option<LookupVariations<'a>>.None
+    }
+    let mut previous: u16 = 0
+    let mut i: usize = 0
+    while i < ComputedArray<'a, (), LookupVariationRecord<'a>>.len(&records) {
+      let record = match move ComputedArray<'a, (), LookupVariationRecord<'a>>.get(&records, i) {
+        Result<LookupVariationRecord<'a>, ReadError>.Success { value } => value
+        Result<LookupVariationRecord<'a>, ReadError>.Failure { error } => {
+          return Option<LookupVariations<'a>>.None
+        }
+      }
+      let index = LookupVariationRecord<'a>.featureIndex(&record)
+      if i != 0 && index <= previous {
+        return Option<LookupVariations<'a>>.None
+      }
+      previous = index
+      i = i + 1
+    }
+    return Option<LookupVariations<'a>>.some(
+      LookupVariations<'a> { data: self._fontData, records: records },
+    )
+  }
+}
+
+pub struct LookupVariations<'a> {
+  data: FontData<'a>,
+  records: ComputedArray<'a, (), LookupVariationRecord<'a>>,
+}
+
+impl<'a> Copy for LookupVariations<'a> {}
+
+impl<'a> LookupVariations<'a> {
+  fn featureLookups(self: &Self, featureIndex: u16) -> Option<FeatureLookups<'a>> {
+    let mut lo: usize = 0
+    let mut hi = ComputedArray<'a, (), LookupVariationRecord<'a>>.len(&self.records)
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2
+      let record = match move ComputedArray<'a, (), LookupVariationRecord<'a>>.get(
+        &self.records,
+        mid,
+      ) {
+        Result<LookupVariationRecord<'a>, ReadError>.Success { value } => value
+        Result<LookupVariationRecord<'a>, ReadError>.Failure { error } => {
+          return Option<FeatureLookups<'a>>.None
+        }
+      }
+      let index = LookupVariationRecord<'a>.featureIndex(&record)
+      if index < featureIndex {
+        lo = mid + 1
+        continue
+      }
+      if index > featureIndex {
+        hi = mid
+        continue
+      }
+      if Offset32.toU32(LookupVariationRecord<'a>.featureLookupsOffset(&record)) == 0 {
+        return Option<FeatureLookups<'a>>.None
+      }
+      let table = match move LookupVariationRecord<'a>.featureLookups(&record, self.data) {
+        Result<FeatureLookups<'a>, ReadError>.Success { value } => value
+        Result<FeatureLookups<'a>, ReadError>.Failure { error } => {
+          return Option<FeatureLookups<'a>>.None
+        }
+      }
+      let length = match move usize.checkedMultiply(
+        u32.toUsize(FeatureLookups<'a>.lookupConditionCount(&table)),
+        8,
+      ) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          return Option<FeatureLookups<'a>>.None
+        }
+      }
+      let end = match move usize.checkedAdd(
+        FeatureLookups<'a>.lookupConditionCountByteRange(&table).end,
+        length,
+      ) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          return Option<FeatureLookups<'a>>.None
+        }
+      }
+      if FeatureLookups<'a>.version(&table).major != 1 || end > FontData.len(&table._fontData) {
+        return Option<FeatureLookups<'a>>.None
+      }
+      return Option<FeatureLookups<'a>>.some(table)
+    }
+    return Option<FeatureLookups<'a>>.None
+  }
+
+  pub effect fn apply<E>(
+    self: &Self,
+    featureIndex: u16,
+    coords: &[F2Dot14],
+    mut delta: mut fn(u32) -> Result<f64, E>,
+    lookups: &mut List<u16>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let table = match move LookupVariations<'a>.featureLookups(self, featureIndex) {
+      Option<FeatureLookups<'a>>.Some { value } => value
+      Option<FeatureLookups<'a>>.None => {
+        return false
+      }
+    }
+    if !FeatureLookupsFlags.contains(
+      &FeatureLookups<'a>.flags(&table),
+      FeatureLookupsFlags.addDefaultLookups(),
+    ) {
+      List<u16>.clear(&mut lookups)
+    }
+    let mut budget: usize = 65536
+    let mut added = HashSet<Word>.make(Hash.seed(0))
+    let mut mappedDelta = fn(index: u32) -> Result<f64, Error> {
+      return match move delta(index) {
+        Result<f64, E>.Success { value } => Result<f64, Error>.succeed(value)
+        Result<f64, E>.Failure { error } => Result<f64, Error>.failResult(Error.Malformed)
+      }
+    }
+    let records = FeatureLookups<'a>.lookupConditionRecords(&table)
+    let mut i: usize = 0
+    while i < ComputedArray<'a, (), LookupConditionRecord<'a>>.len(&records) {
+      let index = i
+      i = i + 1
+      let record = match move ComputedArray<'a, (), LookupConditionRecord<'a>>.get(
+        &records,
+        index,
+      ) {
+        Result<LookupConditionRecord<'a>, ReadError>.Success { value } => value
+        Result<LookupConditionRecord<'a>, ReadError>.Failure { error } => {
+          continue
+        }
+      }
+      let offset = Offset32.toU32(
+        Nullable<Offset32>.offset(&LookupConditionRecord<'a>.conditionOffset(&record)).*,
+      )
+      let matches = evaluateConditionOffset(
+        table._fontData,
+        offset,
+        coords,
+        &mut mappedDelta,
+        64,
+        &mut budget,
+      )
+        |> Result<bool, Error>.unwrapOr(false)
+      if matches {
+        run extendLookupList(&record, table._fontData, &mut added, &mut lookups)
+      }
+    }
+    return true
+  }
+
+  pub effect fn addAll(self: &Self, featureIndex: u16, lookups: &mut List<u16>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let table = match move LookupVariations<'a>.featureLookups(self, featureIndex) {
+      Option<FeatureLookups<'a>>.Some { value } => value
+      Option<FeatureLookups<'a>>.None => {
+        return false
+      }
+    }
+    let mut added = HashSet<Word>.make(Hash.seed(0))
+    let records = FeatureLookups<'a>.lookupConditionRecords(&table)
+    let mut i: usize = 0
+    while i < ComputedArray<'a, (), LookupConditionRecord<'a>>.len(&records) {
+      if let Result<LookupConditionRecord<'a>, ReadError>.Success { value } = ComputedArray<
+        'a,
+        (),
+        LookupConditionRecord<'a>
+      >.get(&records, i) {
+        run extendLookupList(&value, table._fontData, &mut added, &mut lookups)
+      }
+      i = i + 1
+    }
+    return true
+  }
+}
+
+effect fn extendLookupList<'a>(
+  record: &LookupConditionRecord<'a>,
+  data: FontData<'a>,
+  added: &mut HashSet<Word>,
+  lookups: &mut List<u16>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let offset = Offset32.toU32(LookupConditionRecord<'a>.lookupIndexListOffset(record))
+  if offset == 0 {
+    return
+  }
+  if run HashSet<Word>.insert(&mut added, Hash.word(u32.toU64(offset))) {
+    return
+  }
+  if let Result<LookupIndexList<'a>, ReadError>.Success { value } = LookupConditionRecord<
+    'a
+  >.lookupIndexList(record, data) {
+    let indices = LookupIndexList<'a>.lookupIndices(&value)
+    if ScalarArray<u16>.len(&indices) == u16.toUsize(LookupIndexList<'a>.lookupIndexCount(&value)) {
+      let mut i: usize = 0
+      while i < ScalarArray<u16>.len(&indices) {
+        run List<u16>.append(
+          &mut lookups,
+          ScalarArray<u16>.get(&indices, i) |> Option<u16>.unwrapOr(0),
+        )
+        i = i + 1
+      }
+    }
+  }
+}

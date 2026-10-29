@@ -1,0 +1,261 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Stable byte ownership and table access without self-referential views.
+import model.font.blob { Blob }
+import font { FontRef, TableDirectory, TableRecords, TableRecord }
+import font_data { FontData }
+import read { ReadError }
+import table_provider { TableProvider, GlyfLoca }
+import font_types.lib { Tag }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+pub interface TableCallback {
+  effect fn table(self: &Self, tag: Tag) -> Option<Blob> ! OutOfMemoryError ? &mut Allocator
+}
+
+struct NamedBlob {
+  tag: Tag,
+  blob: Blob,
+}
+
+pub struct TableFunction {
+  entries: List<NamedBlob>,
+}
+
+impl TableFunction {
+  // Resolve the static callback once per known tag; the snapshot owns every blob.
+  pub effect fn new<F: TableCallback>(callback: &F) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut entries = List<NamedBlob>.make()
+    let mut i: usize = 0
+    while i < MODEL_TABLE_TAGS.length {
+      let tag = Tag.fromU32(MODEL_TABLE_TAGS[i])
+      if let Option<Blob>.Some { value } = run TableCallback.table(callback, tag) {
+        run List<NamedBlob>.append(&mut entries, NamedBlob { tag: tag, blob: move value })
+      }
+      i = i + 1
+    }
+    return TableFunction { entries: move entries }
+  }
+
+  pub effect fn clone(self: &Self) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut entries = List<NamedBlob>.make()
+    let values = List<NamedBlob>.asSlice(&self.entries)
+    let mut i: usize = 0
+    while i < values.length {
+      run List<NamedBlob>.append(
+        &mut entries,
+        NamedBlob { tag: values[i].tag, blob: run Blob.clone(&values[i].blob) },
+      )
+      i = i + 1
+    }
+    return TableFunction { entries: move entries }
+  }
+}
+
+struct BlobTableRange {
+  tag: Tag,
+  start: usize,
+  end: usize,
+}
+
+impl Copy for BlobTableRange {}
+
+union TableSource {
+  Empty,
+  Blob { blob: Blob, ranges: List<BlobTableRange> },
+  Function { function: TableFunction },
+}
+
+pub struct Tables {
+  source: TableSource,
+}
+
+pub struct TablesView<'a> {
+  tables: &'a Tables,
+}
+
+impl<'a> Copy for TablesView<'a> {}
+
+struct RawTables<'a> {
+  tables: &'a Tables,
+}
+
+impl Tables {
+  pub fn empty() -> Self {
+    return Tables { source: TableSource.Empty }
+  }
+
+  pub effect fn new(blob: Blob, index: u32) -> Option<Self>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut ranges = List<BlobTableRange>.make()
+
+    // All views end before the blob is moved into its owning source.
+    let valid = run collectBlobRanges(Blob.asBytes(&blob), index, &mut ranges)
+    if !valid {
+      return Option<Self>.None
+    }
+    return Option<Self>.some(
+      Tables { source: TableSource.Blob { blob: move blob, ranges: move ranges } },
+    )
+  }
+
+  pub fn fromTableFunction(function: TableFunction) -> Self {
+    return Tables { source: TableSource.Function { function: move function } }
+  }
+
+  pub fn view<'a>(self: &'a Self) -> TablesView<'a> {
+    return TablesView<'a> { tables: self }
+  }
+
+  pub fn rawData<'a>(self: &'a Self, tag: Tag) -> Option<FontData<'a>> {
+    match &self.source {
+      TableSource.Empty => {
+        return Option<FontData<'a>>.None
+      }
+      TableSource.Blob { blob, ranges } => {
+        let values = List<BlobTableRange>.asSlice(&ranges)
+        let mut i: usize = 0
+        while i < values.length {
+          if &values[i].tag == &tag {
+            return FontData.slice(
+              &FontData.new(Blob.asBytes(&blob)),
+              values[i].start,
+              values[i].end,
+            )
+          }
+          i = i + 1
+        }
+      }
+      TableSource.Function { function } => {
+        let values = List<NamedBlob>.asSlice(&function.entries)
+        let mut i: usize = 0
+        while i < values.length {
+          if &values[i].tag == &tag {
+            return Option<FontData<'a>>.some(FontData.new(Blob.asBytes(&values[i].blob)))
+          }
+          i = i + 1
+        }
+      }
+    }
+    return Option<FontData<'a>>.None
+  }
+
+  pub fn expectRawData<'a>(self: &'a Self, tag: Tag) -> Result<FontData<'a>, ReadError> {
+    return match move Tables.rawData(self, tag) {
+      Option<FontData<'a>>.Some { value } => Result<FontData<'a>, ReadError>.succeed(value)
+      _ => Result<FontData<'a>, ReadError>.failResult(ReadError.TableIsMissing { tag: tag })
+    }
+  }
+}
+
+impl<'a> TableProvider<'a> for RawTables<'a> {
+  fn dataForTag(self: &Self, tag: Tag) -> Option<FontData<'a>> {
+    return Tables.rawData(self.tables, tag)
+  }
+}
+
+fn validated<T>(result: Result<T, ReadError>) -> Result<T, ReadError> {
+  match move result {
+    Result<T, ReadError>.Success { value } => {
+      return Result<T, ReadError>.succeed(move value)
+    }
+    Result<T, ReadError>.Failure { error } => {
+      match error {
+        ReadError.TableIsMissing { tag } => {
+          return Result<T, ReadError>.failResult(ReadError.TableIsMissing { tag: tag })
+        }
+        _ => {
+          return Result<T, ReadError>.failResult(ReadError.ValidationError)
+        }
+      }
+    }
+  }
+}
+
+effect fn collectBlobRanges<'a>(
+  bytes: &'a [u8],
+  index: u32,
+  ranges: &mut List<BlobTableRange>,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let font = match move FontRef.fromIndex(bytes, index) {
+    Result<FontRef<'a>, ReadError>.Success { value } => value
+    _ => {
+      return false
+    }
+  }
+  let records = TableDirectory.tableRecords(FontRef.tableDirectory(&font))
+  let count = TableRecords.len(&records)
+  let mut sorted = true
+  let mut previous: u32 = 0
+  let mut at: usize = 0
+  while let Option<TableRecord<'a>>.Some { value } = TableRecords.get(&records, at) {
+    let tag = Tag.toU32(TableRecord.tag(&value))
+    if tag <= previous {
+      sorted = false
+    }
+    previous = tag
+    at = at + 1
+  }
+  let mut i: usize = 0
+  while i < MODEL_TABLE_TAGS.length {
+    let tag = MODEL_TABLE_TAGS[i]
+    let mut found = Option<TableRecord<'a>>.None
+    if sorted && count > 0 {
+      let mut base: usize = 0
+      let mut size = count
+      while size > 1 {
+        let half = size / 2
+        let mid = base + half
+        if let Option<TableRecord<'a>>.Some { value } = TableRecords.get(&records, mid) {
+          if Tag.toU32(TableRecord.tag(&value)) <= tag {
+            base = mid
+          }
+        }
+        size = size - half
+      }
+      if let Option<TableRecord<'a>>.Some { value } = TableRecords.get(&records, base) {
+        if Tag.toU32(TableRecord.tag(&value)) == tag {
+          found = Option<TableRecord<'a>>.some(value)
+        }
+      }
+    } else {
+      at = 0
+      while let Option<TableRecord<'a>>.Some { value } = TableRecords.get(&records, at) {
+        if Tag.toU32(TableRecord.tag(&value)) == tag {
+          found = Option<TableRecord<'a>>.some(value)
+          break
+        }
+        at = at + 1
+      }
+    }
+    if let Option<TableRecord<'a>>.Some { value } = move found {
+      let start = TableRecord.offset(&value)
+      if let Option<u32>.Some { value: end } = u32.checkedAdd(start, TableRecord.length(&value)) {
+        if u32.toUsize(end) <= bytes.length {
+          run List<BlobTableRange>.append(
+            &mut ranges,
+            BlobTableRange {
+              tag: Tag.fromU32(tag),
+              start: u32.toUsize(start),
+              end: u32.toUsize(end),
+            },
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  return true
+}

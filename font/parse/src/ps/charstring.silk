@@ -1,0 +1,2839 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// PostScript charstring evaluation with bounded recursion and instruction count.
+import model.error { Error }
+import ps.cff.index { Index }
+import ps.cff.charset { Charset }
+import ps.cff.v1 { Cff }
+import ps.cff.blend { BlendState }
+import ps.cff.stack { Stack }
+import ps.encoding { PredefinedEncoding }
+import ps.num { readInt }
+import ps.read { take, takeRead, require, Failed, catchError }
+import ps.transform { FontMatrix, Transform }
+import font_data { FontData, Cursor }
+import array { ScalarArray }
+import font_types.lib { Fixed, Point, BoundingBox, GlyphId, Matrix }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.usize
+
+pub const NESTING_DEPTH_LIMIT: u32 = 10
+
+const MAX_OPERATIONS: u32 = 1000000
+
+pub enum CharstringKind {
+  Type1,
+  Type2,
+}
+
+pub interface CharstringContext<'a> {
+  fn kind(self: &Self) -> CharstringKind {
+    return CharstringKind.Type2
+  }
+
+  fn seacComponents(self: &Self, baseCode: i32, accentCode: i32) -> Result<[&'a [u8]; 2], Error>
+
+  fn globalSubr(self: &Self, index: i32) -> Result<&'a [u8], Error>
+
+  fn subr(self: &Self, index: i32) -> Result<&'a [u8], Error>
+
+  fn weightVector(self: &Self) -> Option<&[Fixed]> {
+    return Option<&[Fixed]>.None
+  }
+
+  fn buildCharLen(self: &Self) -> usize {
+    return 0
+  }
+}
+
+pub struct CffContext<'a> {
+  pub data: &'a [u8],
+  pub charstrings: Index<'a>,
+  pub globalSubrs: Index<'a>,
+  pub subrs: Index<'a>,
+}
+
+impl<'a> Copy for CffContext<'a> {}
+
+impl<'a> CharstringContext<'a> for CffContext<'a> {
+  fn seacComponents(self: &Self, baseCode: i32, accentCode: i32) -> Result<[&'a [u8]; 2], Error> {
+    return run Effect.result(cffSeac(self, baseCode, accentCode))
+  }
+
+  fn globalSubr(self: &Self, index: i32) -> Result<&'a [u8], Error> with Intrinsic.inlineAlways() {
+    return subrAt(&self.globalSubrs, index)
+  }
+
+  fn subr(self: &Self, index: i32) -> Result<&'a [u8], Error> with Intrinsic.inlineAlways() {
+    return subrAt(&self.subrs, index)
+  }
+}
+
+fn subrAt<'a>(index: &Index<'a>, encoded: i32) -> Result<
+  &'a [u8],
+  Error
+> with Intrinsic.inlineAlways() {
+  // Wider arithmetic prevents a malformed signed index from overflowing.
+  let raw = i32.toI64(encoded) + i32.toI64(Index.subrBias(index))
+  if raw < 0 {
+    return Result<&'a [u8], Error>.failResult(Error.Malformed)
+  }
+  return match move Index.get(index, i64.toUsize(raw)) {
+    Option<&'a [u8]>.Some { value } => Result<&'a [u8], Error>.succeed(value)
+    _ => Result<&'a [u8], Error>.failResult(Error.Malformed)
+  }
+}
+
+effect fn cffSeac<'a>(ctx: &CffContext<'a>, baseCode: i32, accentCode: i32) -> [&'a [u8]; 2]
+  ! Error {
+  let cff = run takeRead(Cff.read(FontData.new(ctx.data)))
+  let mut charset = Cff.charset(&cff, 0)
+  if let Option<Charset<'a>>.None = &charset {
+    charset = Charset.new(FontData.new(ctx.data), 0, Index.count(&ctx.charstrings))
+  }
+  let chars = run require(move charset, Error.MissingResource)
+  let accent = run codeToGlyph(&chars, accentCode)
+  let base = run codeToGlyph(&chars, baseCode)
+  let accentData = run require(
+    Index.get(&ctx.charstrings, u32.toUsize(GlyphId.toU32(accent))),
+    Error.Malformed,
+  )
+  let baseData = run require(
+    Index.get(&ctx.charstrings, u32.toUsize(GlyphId.toU32(base))),
+    Error.Malformed,
+  )
+  return [baseData, accentData]
+}
+
+effect fn codeToGlyph<'a>(charset: &Charset<'a>, code: i32) -> GlyphId
+  ! Error {
+  let byte = run require(i32.checkedToU8(code), Error.InvalidOperation)
+  let sid = run require(
+    PredefinedEncoding.sid(&PredefinedEncoding.Standard, byte),
+    Error.InvalidOperation,
+  )
+  return run require(Charset.glyphId(charset, sid), Error.InvalidOperation)
+}
+
+pub interface CommandSink {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed)
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed)
+
+  fn curveTo(self: &mut Self, cx0: Fixed, cy0: Fixed, cx1: Fixed, cy1: Fixed, x: Fixed, y: Fixed)
+
+  fn close(self: &mut Self)
+
+  fn hstem(self: &mut Self, y: Fixed, dy: Fixed) {}
+
+  fn vstem(self: &mut Self, x: Fixed, dx: Fixed) {}
+
+  fn hintMask(self: &mut Self, mask: &[u8]) {}
+
+  fn counterMask(self: &mut Self, mask: &[u8]) {}
+
+  fn clearHints(self: &mut Self) {}
+
+  fn finish(self: &mut Self) {}
+}
+
+pub struct NullSink {}
+
+impl CommandSink for NullSink {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed) {}
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed) {}
+
+  fn curveTo(self: &mut Self, cx0: Fixed, cy0: Fixed, cx1: Fixed, cy1: Fixed, x: Fixed, y: Fixed) {}
+
+  fn close(self: &mut Self) {}
+}
+
+pub struct ControlBoundsSink {
+  hasBounds: bool,
+  bounds: BoundingBox<Fixed>,
+}
+
+impl ControlBoundsSink {
+  pub fn new() -> Self {
+    return Self {
+      hasBounds: false,
+      bounds: BoundingBox<Fixed> {
+        xMin: Fixed.zero(),
+        yMin: Fixed.zero(),
+        xMax: Fixed.zero(),
+        yMax: Fixed.zero(),
+      },
+    }
+  }
+
+  pub fn default() -> Self {
+    return ControlBoundsSink.new()
+  }
+
+  pub fn boundingBox(self: &Self) -> Option<BoundingBox<Fixed>> {
+    if self.hasBounds {
+      return Option<BoundingBox<Fixed>>.some(self.bounds)
+    }
+    return Option<BoundingBox<Fixed>>.None
+  }
+
+  fn update(self: &mut Self, x: Fixed, y: Fixed) {
+    if !self.hasBounds {
+      self.hasBounds = true
+      self.bounds = BoundingBox<Fixed> { xMin: x, yMin: y, xMax: x, yMax: y }
+      return
+    }
+    if Fixed.toBits(x) < Fixed.toBits(self.bounds.xMin) {
+      self.bounds.xMin = x
+    }
+    if Fixed.toBits(y) < Fixed.toBits(self.bounds.yMin) {
+      self.bounds.yMin = y
+    }
+    if Fixed.toBits(x) > Fixed.toBits(self.bounds.xMax) {
+      self.bounds.xMax = x
+    }
+    if Fixed.toBits(y) > Fixed.toBits(self.bounds.yMax) {
+      self.bounds.yMax = y
+    }
+  }
+}
+
+impl CommandSink for ControlBoundsSink {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed) {
+    ControlBoundsSink.update(&mut self, x, y)
+  }
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed) {
+    ControlBoundsSink.update(&mut self, x, y)
+  }
+
+  fn curveTo(self: &mut Self, cx0: Fixed, cy0: Fixed, cx1: Fixed, cy1: Fixed, x: Fixed, y: Fixed) {
+    ControlBoundsSink.update(&mut self, cx0, cy0)
+    ControlBoundsSink.update(&mut self, cx1, cy1)
+    ControlBoundsSink.update(&mut self, x, y)
+  }
+
+  fn close(self: &mut Self) {}
+}
+
+struct Evaluator<'a, 'c, 's> {
+  isType1: bool,
+  blend: Option<BlendState<'a, 'c>>,
+  isOpen: bool,
+  isFlexing: bool,
+  seenWidth: bool,
+  widthOnly: bool,
+  haveWidth: bool,
+  stemCount: usize,
+  x: Fixed,
+  y: Fixed,
+  sbx: Fixed,
+  wx: Fixed,
+  stack: &'s mut Stack,
+  stackIx: usize,
+  inSeac: bool,
+  opsDone: u32,
+  storage: [Fixed; 32],
+  buildCharCount: usize,
+  inlineBuildChar: [Fixed; 32],
+  heapBuildChar: List<Fixed>,
+}
+
+impl<'a, 'c, 's> Evaluator<'a, 'c, 's> {
+  fn new(
+    kind: CharstringKind,
+    blend: Option<BlendState<'a, 'c>>,
+    widthOnly: bool,
+    stack: &'s mut Stack,
+  ) -> Self with Intrinsic.inlineAlways() {
+    return Self {
+      isType1: kind == CharstringKind.Type1,
+      blend: move blend,
+      isOpen: false,
+      isFlexing: false,
+      seenWidth: false,
+      widthOnly: widthOnly,
+      haveWidth: false,
+      stemCount: 0,
+      x: Fixed.zero(),
+      y: Fixed.zero(),
+      sbx: Fixed.zero(),
+      wx: Fixed.zero(),
+      stack: move stack,
+      stackIx: 0,
+      inSeac: false,
+      opsDone: 0,
+      storage: [Fixed.zero(); 32],
+      buildCharCount: 0,
+      inlineBuildChar: [Fixed.zero(); 32],
+      heapBuildChar: List<Fixed>.make(),
+    }
+  }
+
+  fn reset(self: &mut Self) {
+    Stack.clear(&mut self.stack)
+    self.stackIx = 0
+  }
+
+  fn coordsRemaining(self: &Self) -> usize {
+    return usize.saturatingSubtract(Stack.len(&self.stack), self.stackIx)
+  }
+
+  effect fn readWidth(self: &mut Self) -> ()
+    ! Error {
+    self.wx = run take(Stack.getFixed(&self.stack, 0))
+    self.seenWidth = true
+    self.haveWidth = true
+  }
+}
+
+pub fn evaluate<'a, 'c, C: CharstringContext<'a>, S: CommandSink>(
+  context: &C,
+  blend: Option<BlendState<'a, 'c>>,
+  data: &[u8],
+  sink: &mut S,
+) -> Result<Option<Fixed>, Error> {
+  return match move run Intrinsic.catchFailure<Error>(
+    evaluateImpl(context, move blend, data, &mut sink, false),
+    catchError,
+  ) {
+    Option<Fixed> value => Result<Option<Fixed>, Error>.succeed(move value)
+    Failed { error } => Result<Option<Fixed>, Error>.failResult(error)
+  }
+}
+
+pub fn evaluateWidth<'a, 'c, C: CharstringContext<'a>>(
+  context: &C,
+  blend: Option<BlendState<'a, 'c>>,
+  data: &[u8],
+) -> Result<Option<Fixed>, Error> {
+  let mut sink = NullSink {}
+  return match move run Intrinsic.catchFailure<Error>(
+    evaluateImpl(context, move blend, data, &mut sink, true),
+    catchError,
+  ) {
+    Option<Fixed> value => Result<Option<Fixed>, Error>.succeed(move value)
+    Failed { error } => Result<Option<Fixed>, Error>.failResult(error)
+  }
+}
+
+effect fn evaluateImpl<'a, 'c, C: CharstringContext<'a>, S: CommandSink>(
+  context: &C,
+  blend: Option<BlendState<'a, 'c>>,
+  data: &[u8],
+  sink: &mut S,
+  widthOnly: bool,
+) -> Option<Fixed>
+  ! Error {
+  // The stack lives outside the evaluator: building it as a field copies it
+  // through a temporary (silk-lang/silk#2444).
+  let mut stack = Stack.new()
+  let mut state = Evaluator.new(CharstringContext.kind(context), move blend, widthOnly, &mut stack)
+  let ended = run evalProgram(&mut state, context, &mut sink, data, 0)
+  if !state.isType1 && !ended {
+    let mut cursor = FontData.cursor(&FontData.new(data))
+    drop run evalOp(&mut state, context, &mut sink, Operator.EndChar, &mut cursor, 0)
+  }
+  if state.isOpen {
+    CommandSink.close(&mut sink)
+  }
+  if !widthOnly {
+    CommandSink.finish(&mut sink)
+  }
+  if state.haveWidth {
+    return Option<Fixed>.some(state.wx)
+  }
+  return Option<Fixed>.None
+}
+
+effect fn evalProgram<'a, 'c, 's, 'd, C: CharstringContext<'a>, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  context: &C,
+  sink: &mut S,
+  data: &'d [u8],
+  depth: u32,
+) -> bool
+  ! Error {
+  if depth > NESTING_DEPTH_LIMIT {
+    fail Error.LimitExceeded
+  }
+  let mut cursor = FontData.cursor(&FontData.new(data))
+  let mut ended = false
+  while Cursor.remainingBytes(&cursor) != 0 {
+    if state.opsDone >= MAX_OPERATIONS {
+      fail Error.LimitExceeded
+    }
+    state.opsDone = state.opsDone + 1
+    let byte = run takeRead(Cursor<'d>.read<u8>(&mut cursor))
+    if byte == 28 || (byte >= 32 && byte <= 254) {
+      run take(Stack.push<i32>(&mut state.stack, run readInt(&mut cursor, byte)))
+    } else if byte == 255 {
+      let bits = run takeRead(Cursor<'d>.read<i32>(&mut cursor))
+      if state.isType1 {
+        run take(Stack.push<i32>(&mut state.stack, bits))
+      } else {
+        run take(Stack.push<Fixed>(&mut state.stack, Fixed.fromBits(bits)))
+      }
+    } else {
+      match move Operator.read(&mut cursor, byte) {
+        Option<Operator>.Some { value } => {
+          if value == Operator.EndChar {
+            ended = true
+          }
+          if !(run evalOp(&mut state, context, &mut sink, value, &mut cursor, depth)) {
+            break
+          }
+          if state.widthOnly && state.seenWidth {
+            break
+          }
+        }
+        _ => {
+          Evaluator.reset(&mut state)
+        }
+      }
+    }
+  }
+  return ended
+}
+
+fn ensureOpen<'a, 'c, 's, S: CommandSink>(state: &mut Evaluator<'a, 'c, 's>, sink: &mut S) {
+  if !state.isOpen {
+    CommandSink.moveTo(&mut sink, Fixed.zero(), Fixed.zero())
+    state.isOpen = true
+  }
+}
+
+fn emitLine<'a, 'c, 's, S: CommandSink>(state: &mut Evaluator<'a, 'c, 's>, sink: &mut S) {
+  ensureOpen(&mut state, &mut sink)
+  CommandSink.lineTo(&mut sink, state.x, state.y)
+}
+
+fn startContour<'a, 'c, 's, S: CommandSink>(state: &mut Evaluator<'a, 'c, 's>, sink: &mut S) {
+  if state.isOpen {
+    CommandSink.close(&mut sink)
+  } else {
+    state.isOpen = true
+  }
+  CommandSink.moveTo(&mut sink, state.x, state.y)
+  Evaluator.reset(&mut state)
+}
+
+enum PointMode {
+  DxDy,
+  XDy,
+  DxY,
+  DxInitialY,
+  DLargerCoordDist,
+  DxMaybeDy,
+  MaybeDxDy,
+}
+
+effect fn emitCurves<'a, 'c, 's, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  sink: &mut S,
+  modes: &[PointMode],
+  lastDelta: bool,
+) -> ()
+  ! Error {
+  let initialX = state.x
+  let initialY = state.y
+  let mut count: usize = 0
+  let mut points: [Point<Fixed>; 2] = [Point<Fixed> { x: Fixed.zero(), y: Fixed.zero() }; 2]
+  ensureOpen(&mut state, &mut sink)
+
+  // The pen position and stack index stay in locals: they would otherwise be
+  // stored field by field and reloaded together on every point, which defeats
+  // store forwarding.
+  let mut x = state.x
+  let mut y = state.y
+  let mut stackIx = state.stackIx
+  let mut i: usize = 0
+  while i < modes.length {
+    let mode = modes[i]
+    let mut used: usize = 1
+    let delta = run take(Stack.getFixed(&state.stack, stackIx))
+    match mode {
+      PointMode.DxDy => {
+        x = x + delta
+        y = y + run take(Stack.getFixed(&state.stack, stackIx + 1))
+        used = 2
+      }
+      PointMode.XDy => {
+        y = y + delta
+      }
+      PointMode.DxY => {
+        x = x + delta
+      }
+      PointMode.DxInitialY => {
+        x = x + delta
+        y = initialY
+      }
+      PointMode.DLargerCoordDist => {
+        if Fixed.toBits(Fixed.abs(x - initialX)) > Fixed.toBits(Fixed.abs(y - initialY)) {
+          x = x + delta
+          y = initialY
+        } else {
+          y = y + delta
+          x = initialX
+        }
+      }
+      PointMode.DxMaybeDy => {
+        x = x + delta
+        if lastDelta {
+          y = y + run take(Stack.getFixed(&state.stack, stackIx + 1))
+          used = 2
+        }
+      }
+      PointMode.MaybeDxDy => {
+        y = y + delta
+        if lastDelta {
+          x = x + run take(Stack.getFixed(&state.stack, stackIx + 1))
+          used = 2
+        }
+      }
+    }
+    stackIx = stackIx + used
+    if count == 2 {
+      CommandSink.curveTo(&mut sink, points[0].x, points[0].y, points[1].x, points[1].y, x, y)
+      count = 0
+    } else {
+      points[count] = Point<Fixed> { x: x, y: y }
+      count = count + 1
+    }
+    i = i + 1
+  }
+  state.x = x
+  state.y = y
+  state.stackIx = stackIx
+}
+
+// The all-DxDy curve (rrcurveto and friends) is the most common; reading its six
+// deltas directly avoids emitCurves' per-point mode dispatch.
+effect fn emitDxDyCurve<'a, 'c, 's, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  sink: &mut S,
+) -> ()
+  ! Error with Intrinsic.inlineAlways() {
+  ensureOpen(&mut state, &mut sink)
+  let ix = state.stackIx
+  let x1 = state.x + run take(Stack.getFixed(&state.stack, ix))
+  let y1 = state.y + run take(Stack.getFixed(&state.stack, ix + 1))
+  let x2 = x1 + run take(Stack.getFixed(&state.stack, ix + 2))
+  let y2 = y1 + run take(Stack.getFixed(&state.stack, ix + 3))
+  let x = x2 + run take(Stack.getFixed(&state.stack, ix + 4))
+  let y = y2 + run take(Stack.getFixed(&state.stack, ix + 5))
+  CommandSink.curveTo(&mut sink, x1, y1, x2, y2, x, y)
+  state.x = x
+  state.y = y
+  state.stackIx = ix + 6
+}
+
+enum Operator {
+  HStem,
+  VStem,
+  VMoveTo,
+  RLineTo,
+  HLineTo,
+  VLineTo,
+  RrCurveTo,
+  CallSubr,
+  Return,
+  Hsbw,
+  EndChar,
+  VariationStoreIndex,
+  Blend,
+  HStemHm,
+  HintMask,
+  CntrMask,
+  RMoveTo,
+  HMoveTo,
+  VStemHm,
+  RCurveLine,
+  RLineCurve,
+  VvCurveTo,
+  HhCurveTo,
+  CallGsubr,
+  VhCurveTo,
+  HvCurveTo,
+  DotSection,
+  VStem3,
+  HStem3,
+  Seac,
+  Sbw,
+  Div,
+  CallOtherSubr,
+  Pop,
+  SetCurrentPoint,
+  HFlex,
+  Flex,
+  HFlex1,
+  Flex1,
+  And,
+  Or,
+  Not,
+  Abs,
+  Add,
+  Sub,
+  Neg,
+  Eq,
+  Drop,
+  Put,
+  Get,
+  IfElse,
+  Mul,
+  Sqrt,
+  Dup,
+  Exch,
+  Index,
+  Roll,
+}
+
+impl Operator {
+  fn read<'d>(cursor: &mut Cursor<'d>, b0: u8) -> Option<Self> with Intrinsic.inlineAlways() {
+    if b0 != 12 {
+      return Operator.fromOpcode(b0)
+    }
+    let b1 = match move Cursor<'d>.read<u8>(&mut cursor) {
+      Result<u8, ReadError>.Success { value } => value
+      _ => {
+        return Option<Self>.None
+      }
+    }
+    return Operator.fromTwoByteOpcode(b1)
+  }
+
+  fn fromOpcode(opcode: u8) -> Option<Self> with Intrinsic.inlineAlways() {
+    return match opcode {
+      1 => Option<Self>.some(Operator.HStem)
+      3 => Option<Self>.some(Operator.VStem)
+      4 => Option<Self>.some(Operator.VMoveTo)
+      5 => Option<Self>.some(Operator.RLineTo)
+      6 => Option<Self>.some(Operator.HLineTo)
+      7 => Option<Self>.some(Operator.VLineTo)
+      8 => Option<Self>.some(Operator.RrCurveTo)
+      10 => Option<Self>.some(Operator.CallSubr)
+      11 => Option<Self>.some(Operator.Return)
+      13 => Option<Self>.some(Operator.Hsbw)
+      14 => Option<Self>.some(Operator.EndChar)
+      15 => Option<Self>.some(Operator.VariationStoreIndex)
+      16 => Option<Self>.some(Operator.Blend)
+      18 => Option<Self>.some(Operator.HStemHm)
+      19 => Option<Self>.some(Operator.HintMask)
+      20 => Option<Self>.some(Operator.CntrMask)
+      21 => Option<Self>.some(Operator.RMoveTo)
+      22 => Option<Self>.some(Operator.HMoveTo)
+      23 => Option<Self>.some(Operator.VStemHm)
+      24 => Option<Self>.some(Operator.RCurveLine)
+      25 => Option<Self>.some(Operator.RLineCurve)
+      26 => Option<Self>.some(Operator.VvCurveTo)
+      27 => Option<Self>.some(Operator.HhCurveTo)
+      29 => Option<Self>.some(Operator.CallGsubr)
+      30 => Option<Self>.some(Operator.VhCurveTo)
+      31 => Option<Self>.some(Operator.HvCurveTo)
+      _ => Option<Self>.None
+    }
+  }
+
+  fn fromTwoByteOpcode(opcode: u8) -> Option<Self> {
+    return match opcode {
+      0 => Option<Self>.some(Operator.DotSection)
+      1 => Option<Self>.some(Operator.VStem3)
+      2 => Option<Self>.some(Operator.HStem3)
+      3 => Option<Self>.some(Operator.And)
+      4 => Option<Self>.some(Operator.Or)
+      5 => Option<Self>.some(Operator.Not)
+      6 => Option<Self>.some(Operator.Seac)
+      7 => Option<Self>.some(Operator.Sbw)
+      9 => Option<Self>.some(Operator.Abs)
+      10 => Option<Self>.some(Operator.Add)
+      11 => Option<Self>.some(Operator.Sub)
+      12 => Option<Self>.some(Operator.Div)
+      14 => Option<Self>.some(Operator.Neg)
+      15 => Option<Self>.some(Operator.Eq)
+      18 => Option<Self>.some(Operator.Drop)
+      20 => Option<Self>.some(Operator.Put)
+      21 => Option<Self>.some(Operator.Get)
+      22 => Option<Self>.some(Operator.IfElse)
+      24 => Option<Self>.some(Operator.Mul)
+      26 => Option<Self>.some(Operator.Sqrt)
+      27 => Option<Self>.some(Operator.Dup)
+      28 => Option<Self>.some(Operator.Exch)
+      29 => Option<Self>.some(Operator.Index)
+      30 => Option<Self>.some(Operator.Roll)
+      16 => Option<Self>.some(Operator.CallOtherSubr)
+      17 => Option<Self>.some(Operator.Pop)
+      33 => Option<Self>.some(Operator.SetCurrentPoint)
+      34 => Option<Self>.some(Operator.HFlex)
+      35 => Option<Self>.some(Operator.Flex)
+      36 => Option<Self>.some(Operator.HFlex1)
+      37 => Option<Self>.some(Operator.Flex1)
+      _ => Option<Self>.None
+    }
+  }
+}
+
+effect fn evalOp<'a, 'c, 's, 'd, C: CharstringContext<'a>, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  context: &C,
+  sink: &mut S,
+  op: Operator,
+  cursor: &mut Cursor<'d>,
+  depth: u32,
+) -> bool
+  ! Error with Intrinsic.inlineAlways() {
+  if op == Operator.Flex {
+    run emitCurves(&mut state, &mut sink, &[PointMode.DxDy; 6], false)
+    Evaluator.reset(&mut state)
+  } else if op == Operator.HFlex {
+    run emitCurves(
+      &mut state,
+      &mut sink,
+      &[
+        PointMode.DxY,
+        PointMode.DxDy,
+        PointMode.DxY,
+        PointMode.DxY,
+        PointMode.DxInitialY,
+        PointMode.DxY,
+      ],
+      false,
+    )
+    Evaluator.reset(&mut state)
+  } else if op == Operator.HFlex1 {
+    run emitCurves(
+      &mut state,
+      &mut sink,
+      &[
+        PointMode.DxDy,
+        PointMode.DxDy,
+        PointMode.DxY,
+        PointMode.DxY,
+        PointMode.DxDy,
+        PointMode.DxInitialY,
+      ],
+      false,
+    )
+    Evaluator.reset(&mut state)
+  } else if op == Operator.Flex1 {
+    run emitCurves(
+      &mut state,
+      &mut sink,
+      &[
+        PointMode.DxDy,
+        PointMode.DxDy,
+        PointMode.DxDy,
+        PointMode.DxDy,
+        PointMode.DxDy,
+        PointMode.DLargerCoordDist,
+      ],
+      false,
+    )
+    Evaluator.reset(&mut state)
+  } else if op == Operator.VariationStoreIndex {
+    if !state.isType1 {
+      let mut blend = match &state.blend {
+        Option<BlendState<'a, 'c>>.Some { value } => value
+        _ => {
+          fail Error.MissingResource
+        }
+      }
+      let index = run take(Stack.popI32(&mut state.stack))
+      let result = BlendState.setStoreIndex(&mut blend, i32.toU16(index & 65535))
+      state.blend = Option<BlendState<'a, 'c>>.some(blend)
+      run take(move result)
+    }
+  } else if op == Operator.Blend {
+    if !state.isType1 {
+      let blend = match &state.blend {
+        Option<BlendState<'a, 'c>>.Some { value } => value
+        _ => {
+          fail Error.MissingResource
+        }
+      }
+      run take(Stack.applyBlend(&mut state.stack, &blend))
+    }
+  } else if op == Operator.Return {
+    return false
+  } else if op == Operator.EndChar {
+    let count = Stack.len(&state.stack)
+    if (count == 1 || count == 5) && !state.seenWidth {
+      run Evaluator.readWidth(&mut state)
+    }
+    state.seenWidth = true
+    if count > 1 && !state.widthOnly {
+      run handleSeac(&mut state, context, &mut sink, false, depth)
+    }
+    return false
+  } else if op == Operator.HStem || op == Operator.VStem || op == Operator.HStemHm
+    || op == Operator.VStemHm
+    || op == Operator.HintMask
+    || op == Operator.CntrMask {
+    let mut i: usize = 0
+    let mut count = Stack.len(&state.stack)
+    if Stack.lenIsOdd(&state.stack) && !state.seenWidth {
+      run Evaluator.readWidth(&mut state)
+      i = 1
+      count = count - 1
+    }
+    state.seenWidth = true
+    let mut u = Fixed.zero()
+    while i < Stack.len(&state.stack) {
+      let mut args: [Fixed; 2] = [Fixed.zero(); 2]
+      run take(Stack.fixedArray(&state.stack, i, &mut args))
+      u = u + args[0]
+      let v = u + args[1]
+      if op == Operator.HStem || op == Operator.HStemHm {
+        CommandSink.hstem(&mut sink, u, v)
+      } else {
+        CommandSink.vstem(&mut sink, u, v)
+      }
+      u = v
+      i = i + 2
+    }
+    state.stemCount = run require(usize.checkedAdd(state.stemCount, count / 2), Error.LimitExceeded)
+    if op == Operator.HintMask || op == Operator.CntrMask {
+      let bytes = state.stemCount / 8
+      let mut length = bytes
+      if state.stemCount % 8 != 0 {
+        length = length + 1
+      }
+      let mask = run takeRead(Cursor<'d>.readArray<u8>(&mut cursor, length))
+      let raw = FontData.asBytes(&ScalarArray<u8>.offsetData(&mask))
+      if op == Operator.HintMask {
+        CommandSink.hintMask(&mut sink, raw)
+      } else {
+        CommandSink.counterMask(&mut sink, raw)
+      }
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.RMoveTo {
+    if Stack.len(&state.stack) > 2 && !state.seenWidth {
+      run Evaluator.readWidth(&mut state)
+    }
+    state.seenWidth = true
+    if !state.isFlexing {
+      let dy = run take(Stack.popFixed(&mut state.stack))
+      let dx = run take(Stack.popFixed(&mut state.stack))
+      state.x = state.x + dx
+      state.y = state.y + dy
+      startContour(&mut state, &mut sink)
+    }
+  } else if op == Operator.HMoveTo || op == Operator.VMoveTo {
+    if Stack.len(&state.stack) > 1 && !state.seenWidth {
+      run Evaluator.readWidth(&mut state)
+    }
+    state.seenWidth = true
+    if state.isFlexing {
+      run take(Stack.push<i32>(&mut state.stack, 0))
+      if op == Operator.VMoveTo {
+        run take(Stack.exch(&mut state.stack))
+      }
+    } else {
+      let delta = run take(Stack.popFixed(&mut state.stack))
+      if op == Operator.HMoveTo {
+        state.x = state.x + delta
+      } else {
+        state.y = state.y + delta
+      }
+      startContour(&mut state, &mut sink)
+    }
+  } else if op == Operator.RLineTo {
+    let mut i: usize = 0
+    while i < Stack.len(&state.stack) {
+      let mut args: [Fixed; 2] = [Fixed.zero(); 2]
+      run take(Stack.fixedArray(&state.stack, i, &mut args))
+      state.x = state.x + args[0]
+      state.y = state.y + args[1]
+      emitLine(&mut state, &mut sink)
+      i = i + 2
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.HLineTo || op == Operator.VLineTo {
+    let mut isX = op == Operator.HLineTo
+    let mut i: usize = 0
+    while i < Stack.len(&state.stack) {
+      let delta = run take(Stack.getFixed(&state.stack, i))
+      if isX {
+        state.x = state.x + delta
+      } else {
+        state.y = state.y + delta
+      }
+      isX = !isX
+      emitLine(&mut state, &mut sink)
+      i = i + 1
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.HhCurveTo || op == Operator.VvCurveTo {
+    let count1 = Stack.len(&state.stack)
+    let count = count1 & usize.bitNot(2)
+    state.stackIx = count1 - count
+    while state.stackIx < count {
+      if (count - state.stackIx) & 1 != 0 {
+        let delta = run take(Stack.getFixed(&state.stack, state.stackIx))
+        if op == Operator.HhCurveTo {
+          state.y = state.y + delta
+        } else {
+          state.x = state.x + delta
+        }
+        state.stackIx = state.stackIx + 1
+      }
+      if op == Operator.HhCurveTo {
+        run emitCurves(
+          &mut state,
+          &mut sink,
+          &[PointMode.DxY, PointMode.DxDy, PointMode.DxY],
+          false,
+        )
+      } else {
+        run emitCurves(
+          &mut state,
+          &mut sink,
+          &[PointMode.XDy, PointMode.DxDy, PointMode.XDy],
+          false,
+        )
+      }
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.HvCurveTo || op == Operator.VhCurveTo {
+    let count1 = Stack.len(&state.stack)
+    let count = count1 & usize.bitNot(2)
+    state.stackIx = count1 - count
+    let mut horizontal = op == Operator.HvCurveTo
+    while state.stackIx < count {
+      let last = count - state.stackIx == 5
+      if horizontal {
+        run emitCurves(
+          &mut state,
+          &mut sink,
+          &[PointMode.DxY, PointMode.DxDy, PointMode.MaybeDxDy],
+          last,
+        )
+      } else {
+        run emitCurves(
+          &mut state,
+          &mut sink,
+          &[PointMode.XDy, PointMode.DxDy, PointMode.DxMaybeDy],
+          last,
+        )
+      }
+      horizontal = !horizontal
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.RrCurveTo || op == Operator.RCurveLine {
+    while Evaluator.coordsRemaining(&state) >= 6 {
+      run emitDxDyCurve(&mut state, &mut sink)
+    }
+    if op == Operator.RCurveLine {
+      let mut args: [Fixed; 2] = [Fixed.zero(); 2]
+      run take(Stack.fixedArray(&state.stack, state.stackIx, &mut args))
+      state.x = state.x + args[0]
+      state.y = state.y + args[1]
+      emitLine(&mut state, &mut sink)
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.RLineCurve {
+    while Evaluator.coordsRemaining(&state) > 6 {
+      let mut args: [Fixed; 2] = [Fixed.zero(); 2]
+      run take(Stack.fixedArray(&state.stack, state.stackIx, &mut args))
+      state.x = state.x + args[0]
+      state.y = state.y + args[1]
+      emitLine(&mut state, &mut sink)
+      state.stackIx = state.stackIx + 2
+    }
+    while Evaluator.coordsRemaining(&state) >= 6 {
+      run emitDxDyCurve(&mut state, &mut sink)
+    }
+    Evaluator.reset(&mut state)
+  } else if op == Operator.CallSubr || op == Operator.CallGsubr {
+    let index = run take(Stack.popI32(&mut state.stack))
+    let mut subData = dataEmpty(context)
+    if op == Operator.CallSubr {
+      subData = run take(CharstringContext.subr(context, index))
+    } else {
+      subData = run take(CharstringContext.globalSubr(context, index))
+    }
+    drop run evalProgram(&mut state, context, &mut sink, subData, depth + 1)
+  } else if op == Operator.Hsbw {
+    if state.isType1 {
+      let mut args: [Fixed; 2] = [Fixed.zero(); 2]
+      run take(Stack.fixedArray(&state.stack, 0, &mut args))
+      state.sbx = state.sbx + args[0]
+      state.x = state.x + args[0]
+      state.wx = args[1]
+      state.seenWidth = true
+      state.haveWidth = true
+      Evaluator.reset(&mut state)
+    }
+  } else if op == Operator.Sbw {
+    if state.isType1 {
+      let mut args: [Fixed; 4] = [Fixed.zero(); 4]
+      run take(Stack.fixedArray(&state.stack, 0, &mut args))
+      state.x = state.x + args[0]
+      state.y = state.y + args[1]
+      state.sbx = state.sbx + args[0]
+      state.wx = args[2]
+      state.seenWidth = true
+      state.haveWidth = true
+      Evaluator.reset(&mut state)
+    }
+  } else if op == Operator.Seac {
+    if !state.widthOnly {
+      run handleSeac(&mut state, context, &mut sink, true, depth)
+    }
+  } else if op == Operator.DotSection || op == Operator.Pop {} else if op == Operator.HStem3
+    || op == Operator.VStem3 {
+    Evaluator.reset(&mut state)
+  } else if op == Operator.Div {
+    run take(Stack.div(&mut state.stack, state.isType1))
+  } else if op == Operator.And || op == Operator.Or || op == Operator.Eq {
+    let b = Fixed.toBits(run take(Stack.popFixed(&mut state.stack)))
+    let a = Fixed.toBits(run take(Stack.popFixed(&mut state.stack)))
+    let mut answer = a == b
+    if op == Operator.And {
+      answer = a != 0 && b != 0
+    } else if op == Operator.Or {
+      answer = a != 0 || b != 0
+    }
+    let mut value: i32 = 0
+    if answer {
+      value = 1
+    }
+    run take(Stack.push<i32>(&mut state.stack, value))
+  } else if op == Operator.Not {
+    let a = run take(Stack.popFixed(&mut state.stack))
+    let mut value: i32 = 0
+    if Fixed.toBits(a) == 0 {
+      value = 1
+    }
+    run take(Stack.push<i32>(&mut state.stack, value))
+  } else if op == Operator.Abs || op == Operator.Neg {
+    let bits = Fixed.toBits(run take(Stack.popFixed(&mut state.stack)))
+    let mut answer: i32 = 2147483647
+    if bits != -2147483648 {
+      if op == Operator.Abs {
+        answer = bits
+        if answer < 0 {
+          answer = -answer
+        }
+      } else {
+        answer = -bits
+      }
+    }
+    run take(Stack.push<Fixed>(&mut state.stack, Fixed.fromBits(answer)))
+  } else if op == Operator.Add || op == Operator.Sub || op == Operator.Mul {
+    let b = run take(Stack.popFixed(&mut state.stack))
+    let a = run take(Stack.popFixed(&mut state.stack))
+    let mut value = a + b
+    if op == Operator.Sub {
+      value = a - b
+    } else if op == Operator.Mul {
+      value = a * b
+    }
+    run take(Stack.push<Fixed>(&mut state.stack, value))
+  } else if op == Operator.Sqrt {
+    let a = run take(Stack.popFixed(&mut state.stack))
+    run take(Stack.push<Fixed>(&mut state.stack, fixedSqrt(a)))
+  } else if op == Operator.Drop {
+    drop run take(Stack.popFixed(&mut state.stack))
+  } else if op == Operator.Dup {
+    let a = run take(Stack.popFixed(&mut state.stack))
+    run take(Stack.push<Fixed>(&mut state.stack, a))
+    run take(Stack.push<Fixed>(&mut state.stack, a))
+  } else if op == Operator.Exch {
+    run take(Stack.exch(&mut state.stack))
+  } else if op == Operator.Index {
+    let index = run take(Stack.popI32(&mut state.stack))
+    let count = Stack.len(&state.stack)
+    if count > 0 {
+      let mut fromBottom: usize = 0
+      if index < 0 {
+        fromBottom = count - 1
+      } else if i32.toUsize(index) < count {
+        fromBottom = count - 1 - i32.toUsize(index)
+      }
+      let value = run take(Stack.getFixed(&state.stack, fromBottom))
+      run take(Stack.push<Fixed>(&mut state.stack, value))
+    }
+  } else if op == Operator.Roll {
+    let shift = run take(Stack.popI32(&mut state.stack))
+    let count = run take(Stack.popI32(&mut state.stack))
+    run take(Stack.roll(&mut state.stack, count, shift))
+  } else if op == Operator.Put {
+    let index = run take(Stack.popI32(&mut state.stack))
+    let value = run take(Stack.popFixed(&mut state.stack))
+    if index >= 0 && index < 32 {
+      state.storage[i32.toUsize(index)] = value
+    }
+  } else if op == Operator.Get {
+    let index = run take(Stack.popI32(&mut state.stack))
+    if index >= 0 && index < 32 {
+      run take(Stack.push<Fixed>(&mut state.stack, state.storage[i32.toUsize(index)]))
+    }
+  } else if op == Operator.IfElse {
+    let cond2 = run take(Stack.popFixed(&mut state.stack))
+    let cond1 = run take(Stack.popFixed(&mut state.stack))
+    let arg2 = run take(Stack.popFixed(&mut state.stack))
+    let arg1 = run take(Stack.popFixed(&mut state.stack))
+    let mut value = arg2
+    if Fixed.toBits(cond1) <= Fixed.toBits(cond2) {
+      value = arg1
+    }
+    run take(Stack.push<Fixed>(&mut state.stack, value))
+  } else if op == Operator.SetCurrentPoint {
+    if state.isType1 {
+      let mut args: [Fixed; 2] = [Fixed.zero(); 2]
+      run take(Stack.fixedArray(&state.stack, 0, &mut args))
+      state.x = args[0]
+      state.y = args[1]
+      Evaluator.reset(&mut state)
+    }
+  } else if op == Operator.CallOtherSubr {
+    run handleOtherSubr(&mut state, context, &mut sink)
+  }
+
+  return true
+}
+
+fn dataEmpty<'a, C: CharstringContext<'a>>(context: &C) -> &'a [u8] {
+  return String.utf8Bytes("")
+}
+
+fn fixedSqrt(value: Fixed) -> Fixed {
+  if Fixed.toBits(value) <= 0 {
+    return Fixed.zero()
+  }
+  let mut root = value
+  if Fixed.toBits(value) >= 10 {
+    root = Fixed.fromBits(i32.shiftRight(Fixed.toBits(value), 1))
+  }
+  while true {
+    let bits = i32.toI64(Fixed.toBits(root)) + i32.toI64(Fixed.toBits(value / root)) + 1
+    let next = Fixed.fromBits(i64.toI32(i64.shiftRight(bits, 1)))
+    if Fixed.toBits(next) == Fixed.toBits(root) {
+      return next
+    }
+    root = next
+  }
+}
+
+effect fn handleSeac<'a, 'c, 's, C: CharstringContext<'a>, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  context: &C,
+  sink: &mut S,
+  explicit: bool,
+  depth: u32,
+) -> ()
+  ! Error {
+  if state.inSeac {
+    fail Error.LimitExceeded
+  }
+  state.inSeac = true
+  let accentCode = run take(Stack.popI32(&mut state.stack))
+  let baseCode = run take(Stack.popI32(&mut state.stack))
+  let chars = run take(CharstringContext.seacComponents(context, baseCode, accentCode))
+  let dy = run take(Stack.popFixed(&mut state.stack))
+  let dx = run take(Stack.popFixed(&mut state.stack))
+  let mut sb = Fixed.zero()
+  if state.isType1 {
+    sb = run take(Stack.popFixed(&mut state.stack))
+  } else if !Stack.isEmpty(&state.stack) && !state.seenWidth {
+    state.wx = run take(Stack.popFixed(&mut state.stack))
+    state.seenWidth = true
+  }
+  let mut savedSbx = state.sbx
+  let mut savedWx = state.wx
+  let savedSeen = state.seenWidth
+  let savedRead = state.haveWidth
+  let mut bx = state.x
+  let mut by = state.y
+  if explicit {
+    bx = Fixed.zero()
+    by = Fixed.zero()
+  }
+  let ax = dx + state.sbx - sb
+  let ay = dy
+  let mut i: usize = 0
+  while i < 2 {
+    let mut index = i
+    if !explicit {
+      index = 1 - i
+    }
+    Evaluator.reset(&mut state)
+    state.seenWidth = false
+    CommandSink.clearHints(&mut sink)
+    state.stemCount = 0
+    if index == 0 {
+      state.x = bx
+      state.y = by
+    } else {
+      state.x = ax
+      state.y = ay
+    }
+    drop run evalProgram(&mut state, context, &mut sink, chars[index], depth + 1)
+    if index == 0 && explicit && !savedSeen {
+      savedSbx = state.sbx
+      savedWx = state.wx
+    }
+    i = i + 1
+  }
+  state.seenWidth = savedSeen
+  state.haveWidth = savedRead
+  state.sbx = savedSbx
+  state.wx = savedWx
+  state.inSeac = false
+}
+
+effect fn handleFlex<'a, 'c, 's, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  sink: &mut S,
+) -> ()
+  ! Error {
+  let finalY = run take(Stack.popFixed(&mut state.stack))
+  let finalX = run take(Stack.popFixed(&mut state.stack))
+  drop run take(Stack.popFixed(&mut state.stack))
+  let mut args: [Fixed; 14] = [Fixed.zero(); 14]
+  let mut i: usize = 14
+  while i > 0 {
+    i = i - 1
+    args[i] = run take(Stack.popFixed(&mut state.stack))
+  }
+  Evaluator.reset(&mut state)
+  run take(Stack.push<Fixed>(&mut state.stack, args[2] + args[0]))
+  run take(Stack.push<Fixed>(&mut state.stack, args[3] + args[1]))
+  i = 4
+  while i < 8 {
+    run take(Stack.push<Fixed>(&mut state.stack, args[i]))
+    i = i + 1
+  }
+  run emitDxDyCurve(&mut state, &mut sink)
+  Evaluator.reset(&mut state)
+  i = 8
+  while i < 14 {
+    run take(Stack.push<Fixed>(&mut state.stack, args[i]))
+    i = i + 1
+  }
+  run emitDxDyCurve(&mut state, &mut sink)
+  Evaluator.reset(&mut state)
+  run take(Stack.push<Fixed>(&mut state.stack, finalX))
+  run take(Stack.push<Fixed>(&mut state.stack, finalY))
+}
+
+effect fn handleOtherSubr<'a, 'c, 's, C: CharstringContext<'a>, S: CommandSink>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  context: &C,
+  sink: &mut S,
+) -> ()
+  ! Error {
+  let index = run take(Stack.popI32(&mut state.stack))
+  let argRaw = run take(Stack.popI32(&mut state.stack))
+  let count = signedCount(i32.toI64(argRaw))
+  if index == 0 && count == 3 {
+    state.isFlexing = false
+    ensureOpen(&mut state, &mut sink)
+    run handleFlex(&mut state, &mut sink)
+  } else if index == 1 && count == 0 {
+    state.isFlexing = true
+  } else if index == 12 || index == 13 {
+    Evaluator.reset(&mut state)
+  } else if index >= 14 && index <= 18 {
+    let weights = run require(CharstringContext.weightVector(context), Error.InvalidOperation)
+    if weights.length == 0 {
+      fail Error.InvalidOperation
+    }
+    let mut points = i32.toUsize(index - 13)
+    if index == 18 {
+      points = points + 1
+    }
+    let total = run require(usize.checkedMultiply(points, weights.length), Error.Malformed)
+    if count != total {
+      fail Error.Malformed
+    }
+    let base = run require(
+      usize.checkedSubtract(Stack.len(&state.stack), count),
+      Error.InvalidOperation,
+    )
+    let mut delta = base + points
+    let mut i: usize = 0
+    while i < points {
+      let mut value = run take(Stack.getFixed(&state.stack, base + i))
+      let mut j: usize = 1
+      while j < weights.length {
+        value = value + (run take(Stack.getFixed(&state.stack, delta))) * weights[j]
+        delta = delta + 1
+        j = j + 1
+      }
+      run take(Stack.set<Fixed>(&mut state.stack, base + i, value))
+      i = i + 1
+    }
+    Stack.dropValues(&mut state.stack, usize.saturatingSubtract(count, points))
+  } else if (index >= 19 && index <= 25) || index == 27 {
+    run handleBuildChar(&mut state, context, index, count)
+  } else {
+    Stack.dropValues(&mut state.stack, count)
+  }
+}
+
+effect fn handleBuildChar<'a, 'c, 's, C: CharstringContext<'a>>(
+  state: &mut Evaluator<'a, 'c, 's>,
+  context: &C,
+  subr: i32,
+  count: usize,
+) -> ()
+  ! Error {
+  let empty: [Fixed; 0] = []
+  let weights = match move CharstringContext.weightVector(context) {
+    Option<&[Fixed]>.Some { value } => value
+    _ => &empty
+  }
+  let hasBlend = weights.length > 0
+  let length = CharstringContext.buildCharLen(context)
+  if subr == 19 && count == 1 && hasBlend {
+    let raw = run take(Stack.popI32(&mut state.stack))
+    let index = signedU32(raw)
+    if length < weights.length || length - weights.length < index {
+      fail Error.InvalidOperation
+    }
+    run ensureBuildChar(&mut state, length)
+    let mut i: usize = 0
+    while i < weights.length {
+      buildCharSet(&mut state, index + i, weights[i])
+      i = i + 1
+    }
+  } else if subr >= 20 && subr <= 23 && count == 2 {
+    let b = run take(Stack.popFixed(&mut state.stack))
+    let a = run take(Stack.popFixed(&mut state.stack))
+    let mut value = a + b
+    if subr == 21 {
+      value = a - b
+    } else if subr == 22 {
+      value = a * b
+    } else if subr == 23 {
+      if Fixed.toBits(b) == 0 {
+        fail Error.InvalidOperation
+      }
+      value = a / b
+    }
+    run take(Stack.push<Fixed>(&mut state.stack, value))
+  } else if subr == 24 && count == 2 && hasBlend {
+    let index = signedU32(run take(Stack.popI32(&mut state.stack)))
+    if index >= length {
+      fail Error.InvalidOperation
+    }
+    let value = run take(Stack.popFixed(&mut state.stack))
+    run ensureBuildChar(&mut state, length)
+    buildCharSet(&mut state, index, value)
+  } else if subr == 25 && count == 1 && hasBlend {
+    let index = signedU32(run take(Stack.popI32(&mut state.stack)))
+    if index >= length {
+      fail Error.InvalidOperation
+    }
+    run ensureBuildChar(&mut state, length)
+    let value = buildCharGet(&state, index)
+    run take(Stack.push<Fixed>(&mut state.stack, value))
+  } else if subr == 27 && count == 4 {
+    let d = run take(Stack.popFixed(&mut state.stack))
+    let c = run take(Stack.popFixed(&mut state.stack))
+    let b = run take(Stack.popFixed(&mut state.stack))
+    let a = run take(Stack.popFixed(&mut state.stack))
+    let mut value = b
+    if Fixed.toBits(c) <= Fixed.toBits(d) {
+      value = a
+    }
+    run take(Stack.push<Fixed>(&mut state.stack, value))
+  } else {
+    fail Error.InvalidOperation
+  }
+}
+
+fn signedU32(raw: i32) -> usize {
+  return i64.toUsize(i32.toI64(raw) & 4294967295)
+}
+
+import generated_support { signedCount }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+effect fn resizeBuildChar(list: &mut List<Fixed>, count: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  List.clear(&mut list)
+  let mut i: usize = 0
+  while i < count {
+    run List<Fixed>.append(&mut list, Fixed.zero())
+    i = i + 1
+  }
+}
+
+effect fn ensureBuildChar<'a, 'c, 's>(state: &mut Evaluator<'a, 'c, 's>, count: usize) -> ()
+  ! Error {
+  if state.buildCharCount == count {
+    return
+  }
+  if count <= 32 {
+    state.inlineBuildChar = [Fixed.zero(); 32]
+    List.clear(&mut state.heapBuildChar)
+  } else {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let result = run Effect.result(
+      resizeBuildChar(&mut state.heapBuildChar, count)
+        |> Effect.provideMut<Allocator>(&mut allocator),
+    )
+    if let Result<(), OutOfMemoryError>.Failure { error } = move result {
+      fail Error.InsufficientMemory
+    }
+  }
+  state.buildCharCount = count
+}
+
+fn buildCharGet<'a, 'c, 's>(state: &Evaluator<'a, 'c, 's>, index: usize) -> Fixed {
+  if state.buildCharCount <= 32 {
+    return state.inlineBuildChar[index]
+  }
+  return List<Fixed>.asSlice(&state.heapBuildChar)[index]
+}
+
+fn buildCharSet<'a, 'c, 's>(state: &mut Evaluator<'a, 'c, 's>, index: usize, value: Fixed) {
+  if state.buildCharCount <= 32 {
+    state.inlineBuildChar[index] = value
+  } else {
+    List<Fixed>.set(&mut state.heapBuildChar, index, value)
+  }
+}
+
+/// Applies the matrix between FreeType's two precision conversions.
+pub struct TransformSink<'s, S> {
+  inner: &'s mut S,
+  matrix: FontMatrix,
+  hasMatrix: bool,
+  scale: Option<Fixed>,
+}
+
+impl<'s, S> TransformSink<'s, S> {
+  pub fn new(sink: &'s mut S, transform: Transform) -> Self {
+    return TransformSink.fromMatrixScale(&mut sink, transform.matrix, move transform.scale)
+  }
+
+  pub fn fromMatrixScale(sink: &'s mut S, matrix: FontMatrix, scale: Option<Fixed>) -> Self {
+    let identity = Fixed.toBits(matrix.xx) == 65536 && Fixed.toBits(matrix.yx) == 0
+      && Fixed.toBits(matrix.xy) == 0
+      && Fixed.toBits(matrix.yy) == 65536
+      && Fixed.toBits(matrix.dx) == 0
+      && Fixed.toBits(matrix.dy) == 0
+    return Self { inner: move sink, matrix: matrix, hasMatrix: !identity, scale: move scale }
+  }
+
+  fn transform(self: &Self, x: Fixed, y: Fixed) -> Point<Fixed> with Intrinsic.inlineAlways() {
+    let ax = x * Fixed.fromBits(1024)
+    let ay = y * Fixed.fromBits(1024)
+    let bx = Fixed.fromBits(i32.shiftRight(Fixed.toBits(ax), 10))
+    let by = Fixed.fromBits(i32.shiftRight(Fixed.toBits(ay), 10))
+    let mut cx = bx
+    let mut cy = by
+    if self.hasMatrix {
+      cx = self.matrix.xx * bx + self.matrix.xy * by + self.matrix.dx
+      cy = self.matrix.yx * bx + self.matrix.yy * by + self.matrix.dy
+    }
+    if let Option<Fixed>.Some { value } = &self.scale {
+      return Point<Fixed> {
+        x: Fixed.fromBits(i32.shiftLeft(Fixed.toBits(cx * value), 10)),
+        y: Fixed.fromBits(i32.shiftLeft(Fixed.toBits(cy * value), 10)),
+      }
+    }
+    return Point<Fixed> {
+      x: Fixed.fromBits(i32.shiftLeft(Fixed.toBits(cx), 16)),
+      y: Fixed.fromBits(i32.shiftLeft(Fixed.toBits(cy), 16)),
+    }
+  }
+}
+
+impl<'s, S: CommandSink> CommandSink for TransformSink<'s, S> {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed) {
+    let p = TransformSink<'s, S>.transform(&self, x, y)
+    CommandSink.moveTo(&mut self.inner.*, p.x, p.y)
+  }
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed) {
+    let p = TransformSink<'s, S>.transform(&self, x, y)
+    CommandSink.lineTo(&mut self.inner.*, p.x, p.y)
+  }
+
+  fn curveTo(self: &mut Self, cx0: Fixed, cy0: Fixed, cx1: Fixed, cy1: Fixed, x: Fixed, y: Fixed) {
+    let a = TransformSink<'s, S>.transform(&self, cx0, cy0)
+    let b = TransformSink<'s, S>.transform(&self, cx1, cy1)
+    let p = TransformSink<'s, S>.transform(&self, x, y)
+    CommandSink.curveTo(&mut self.inner.*, a.x, a.y, b.x, b.y, p.x, p.y)
+  }
+
+  fn close(self: &mut Self) {
+    CommandSink.close(&mut self.inner.*)
+  }
+
+  fn hstem(self: &mut Self, y: Fixed, dy: Fixed) {
+    CommandSink.hstem(&mut self.inner.*, y, dy)
+  }
+
+  fn vstem(self: &mut Self, x: Fixed, dx: Fixed) {
+    CommandSink.vstem(&mut self.inner.*, x, dx)
+  }
+
+  fn hintMask(self: &mut Self, mask: &[u8]) {
+    CommandSink.hintMask(&mut self.inner.*, mask)
+  }
+
+  fn counterMask(self: &mut Self, mask: &[u8]) {
+    CommandSink.counterMask(&mut self.inner.*, mask)
+  }
+
+  fn clearHints(self: &mut Self) {
+    CommandSink.clearHints(&mut self.inner.*)
+  }
+
+  fn finish(self: &mut Self) {
+    CommandSink.finish(&mut self.inner.*)
+  }
+}
+
+/// Suppresses empty contours, duplicate lines, and an explicit closing line.
+pub struct NopFilterSink<'s, S> {
+  inner: &'s mut S,
+  isOpen: bool,
+  hasStart: bool,
+  start: Point<Fixed>,
+  pendingKind: u8,
+  pending: [Fixed; 6],
+}
+
+impl<'s, S> NopFilterSink<'s, S> {
+  pub fn new(inner: &'s mut S) -> Self {
+    return Self {
+      inner: move inner,
+      isOpen: false,
+      hasStart: false,
+      start: Point<Fixed> { x: Fixed.zero(), y: Fixed.zero() },
+      pendingKind: 0,
+      pending: [Fixed.zero(); 6],
+    }
+  }
+}
+
+fn flushPending<'s, S: CommandSink>(sink: &mut NopFilterSink<'s, S>, forClose: bool) {
+  let kind = sink.pendingKind
+  sink.pendingKind = 0
+  let p = sink.pending
+  if kind == 1 {
+    if !forClose {
+      sink.isOpen = true
+      CommandSink.moveTo(&mut sink.inner.*, p[4], p[5])
+      sink.start = Point<Fixed> { x: p[4], y: p[5] }
+      sink.hasStart = true
+    }
+  } else if kind == 2 {
+    if !forClose || !sink.hasStart || Fixed.toBits(sink.start.x) != Fixed.toBits(p[4])
+      || Fixed.toBits(sink.start.y) != Fixed.toBits(p[5]) {
+      CommandSink.lineTo(&mut sink.inner.*, p[4], p[5])
+    }
+  } else if kind == 3 {
+    CommandSink.curveTo(&mut sink.inner.*, p[0], p[1], p[2], p[3], p[4], p[5])
+  }
+}
+
+impl<'s, S: CommandSink> CommandSink for NopFilterSink<'s, S> {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed) {
+    self.pendingKind = 1
+    self.pending = [Fixed.zero(), Fixed.zero(), Fixed.zero(), Fixed.zero(), x, y]
+  }
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed) {
+    if self.pendingKind != 0 && Fixed.toBits(self.pending[4]) == Fixed.toBits(x)
+      && Fixed.toBits(self.pending[5]) == Fixed.toBits(y) {
+      return
+    }
+    flushPending(&mut self, false)
+    self.pendingKind = 2
+    self.pending = [Fixed.zero(), Fixed.zero(), Fixed.zero(), Fixed.zero(), x, y]
+  }
+
+  fn curveTo(self: &mut Self, cx0: Fixed, cy0: Fixed, cx1: Fixed, cy1: Fixed, x: Fixed, y: Fixed) {
+    flushPending(&mut self, false)
+    self.pendingKind = 3
+    self.pending = [cx0, cy0, cx1, cy1, x, y]
+  }
+
+  fn close(self: &mut Self) {
+    flushPending(&mut self, true)
+    if self.isOpen {
+      CommandSink.close(&mut self.inner.*)
+      self.isOpen = false
+    }
+  }
+
+  fn hstem(self: &mut Self, y: Fixed, dy: Fixed) {
+    CommandSink.hstem(&mut self.inner.*, y, dy)
+  }
+
+  fn vstem(self: &mut Self, x: Fixed, dx: Fixed) {
+    CommandSink.vstem(&mut self.inner.*, x, dx)
+  }
+
+  fn hintMask(self: &mut Self, mask: &[u8]) {
+    CommandSink.hintMask(&mut self.inner.*, mask)
+  }
+
+  fn counterMask(self: &mut Self, mask: &[u8]) {
+    CommandSink.counterMask(&mut self.inner.*, mask)
+  }
+
+  fn clearHints(self: &mut Self) {
+    CommandSink.clearHints(&mut self.inner.*)
+  }
+
+  fn finish(self: &mut Self) {
+    flushPending(&mut self, true)
+    if self.isOpen {
+      CommandSink.close(&mut self.inner.*)
+      self.isOpen = false
+    }
+    CommandSink.finish(&mut self.inner.*)
+  }
+}
+
+// Upstream charstring tests. Kept here to test private interpreter state.
+import silk.testing.testing { Testing, AssertionError }
+import generated_cff_fixtures { exampleCff2 }
+import tables.variations { ItemVariationStore }
+import font_types.lib { F2Dot14 }
+
+struct TestContext<'w> {
+  kind: CharstringKind,
+  weights: Option<&'w [Fixed]>,
+  buildLen: usize,
+}
+
+impl<'w> TestContext<'w> {
+  fn plain(kind: CharstringKind) -> Self {
+    return Self { kind: kind, weights: Option<&'w [Fixed]>.None, buildLen: 0 }
+  }
+}
+
+impl<'a, 'w> CharstringContext<'a> for TestContext<'w> {
+  fn kind(self: &Self) -> CharstringKind {
+    return self.kind
+  }
+
+  fn seacComponents(self: &Self, base: i32, accent: i32) -> Result<[&'a [u8]; 2], Error> {
+    return Result<[&'a [u8]; 2], Error>.failResult(Error.InvalidOperation)
+  }
+
+  fn subr(self: &Self, index: i32) -> Result<&'a [u8], Error> {
+    return Result<&'a [u8], Error>.failResult(Error.MissingResource)
+  }
+
+  fn globalSubr(self: &Self, index: i32) -> Result<&'a [u8], Error> {
+    return Result<&'a [u8], Error>.failResult(Error.MissingResource)
+  }
+
+  fn weightVector(self: &Self) -> Option<&[Fixed]> {
+    return match &self.weights {
+      Option<&'w [Fixed]>.Some { value } => Option<&[Fixed]>.some(value)
+      _ => Option<&[Fixed]>.None
+    }
+  }
+
+  fn buildCharLen(self: &Self) -> usize {
+    return self.buildLen
+  }
+}
+
+struct TestCommand {
+  kind: u8,
+  coords: [Fixed; 6],
+}
+
+impl Copy for TestCommand {}
+
+struct TestCapture {
+  items: [TestCommand; 256],
+  count: usize,
+  lastMove: Point<Fixed>,
+}
+
+impl TestCapture {
+  fn new() -> Self {
+    return Self {
+      items: [TestCommand { kind: 0, coords: [Fixed.zero(); 6] }; 256],
+      count: 0,
+      lastMove: Point<Fixed> { x: Fixed.zero(), y: Fixed.zero() },
+    }
+  }
+
+  fn add(self: &mut Self, kind: u8, coords: [Fixed; 6]) {
+    self.items[self.count] = TestCommand { kind: kind, coords: coords }
+    self.count = self.count + 1
+  }
+}
+
+impl CommandSink for TestCapture {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed) {
+    self.lastMove = Point<Fixed> { x: x, y: y }
+    TestCapture.add(&mut self, 1, [x, y, Fixed.zero(), Fixed.zero(), Fixed.zero(), Fixed.zero()])
+  }
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed) {
+    TestCapture.add(&mut self, 2, [x, y, Fixed.zero(), Fixed.zero(), Fixed.zero(), Fixed.zero()])
+  }
+
+  fn curveTo(self: &mut Self, a: Fixed, b: Fixed, c: Fixed, d: Fixed, x: Fixed, y: Fixed) {
+    TestCapture.add(&mut self, 3, [a, b, c, d, x, y])
+  }
+
+  fn close(self: &mut Self) {
+    let p = self.lastMove
+    TestCapture.add(
+      &mut self,
+      2,
+      [p.x, p.y, Fixed.zero(), Fixed.zero(), Fixed.zero(), Fixed.zero()],
+    )
+  }
+}
+
+effect fn mustCs<T, E>(result: Result<T, E>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, E>.Success { value } => move value
+    _ => {
+      run Testing.expect(false, "charstring operation succeeds")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+fn noBlendCs() -> Option<BlendState<'static, 'static>> {
+  return Option<BlendState<'static, 'static>>.None
+}
+
+fn testEvaluator<'s>(kind: CharstringKind, stack: &'s mut Stack) -> Evaluator<
+  'static,
+  'static,
+  's
+> {
+  return Evaluator.new(kind, noBlendCs(), false, move stack)
+}
+
+effect fn checkCommand(capture: &TestCapture, index: usize, kind: u8, coords: &[Fixed]) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(index < capture.count, "command exists")
+  run Testing.expect(capture.items[index].kind == kind, "command kind")
+  let mut i: usize = 0
+  while i < coords.length {
+    run Testing.expect(
+      Fixed.toBits(capture.items[index].coords[i]) == Fixed.toBits(coords[i]),
+      "command coordinate",
+    )
+    i = i + 1
+  }
+}
+
+effect fn evalTest(data: &[u8], kind: CharstringKind) -> TestCapture
+  ! AssertionError<'static> {
+  let ctx = TestContext.plain(kind)
+  let mut capture = TestCapture.new()
+  drop run mustCs(evaluate(&ctx, noBlendCs(), data, &mut capture))
+  return move capture
+}
+
+effect fn operatorTest<'w, 's>(
+  state: &mut Evaluator<'static, 'static, 's>,
+  ctx: &TestContext<'w>,
+  sink: &mut TestCapture,
+  op: Operator,
+) -> ()
+  ! AssertionError<'static> {
+  let mut cursor = FontData.cursor(&FontData.empty())
+  drop run mustCs(run Effect.result(evalOp(&mut state, ctx, &mut sink, op, &mut cursor, 0)))
+}
+
+effect fn pushInts<'s>(state: &mut Evaluator<'static, 'static, 's>, values: &[i32]) -> ()
+  ! AssertionError<'static> {
+  let mut i: usize = 0
+  while i < values.length {
+    run mustCs(Stack.push<i32>(&mut state.stack, values[i]))
+    i = i + 1
+  }
+}
+
+test effect fn cff2ExampleSubr()
+  ! AssertionError<'static> {
+  let bytes = exampleCff2()
+  let store = run mustCs(
+    ItemVariationStore.read(FontData.new(Slice.view<u8>(bytes, 18, bytes.length - 18))),
+  )
+  let coords = [F2Dot14.zero()]
+  let blend = run mustCs(BlendState.new(store, &coords, 0))
+  let ctx = TestContext.plain(CharstringKind.Type2)
+  let mut capture = TestCapture.new()
+  drop run mustCs(
+    evaluate(&ctx, Option<BlendState>.some(blend), Slice.view<u8>(bytes, 200, 26), &mut capture),
+  )
+  run Testing.expect(capture.count == 5, "CFF2 blended path length")
+  let expected: [[i32; 2]; 5] = [[50, 0], [550, 0], [550, 500], [50, 500], [50, 0]]
+  let mut i: usize = 0
+  while i < 5 {
+    let mut kind: u8 = 2
+    if i == 0 {
+      kind = 1
+    }
+    run checkCommand(
+      &capture,
+      i,
+      kind,
+      &[Fixed.fromI32(expected[i][0]), Fixed.fromI32(expected[i][1])],
+    )
+    i = i + 1
+  }
+}
+
+test effect fn allPathOps()
+  ! AssertionError<'static> {
+  let data: [u8; 147] = [
+    251,
+    29,
+    253,
+    12,
+    21,
+    173,
+    134,
+    159,
+    133,
+    5,
+    140,
+    141,
+    142,
+    6,
+    251,
+    71,
+    129,
+    142,
+    7,
+    109,
+    154,
+    161,
+    147,
+    89,
+    165,
+    125,
+    97,
+    98,
+    158,
+    124,
+    164,
+    8,
+    109,
+    154,
+    161,
+    147,
+    27,
+    147,
+    109,
+    154,
+    161,
+    147,
+    27,
+    163,
+    159,
+    154,
+    180,
+    181,
+    119,
+    153,
+    115,
+    114,
+    120,
+    125,
+    97,
+    98,
+    158,
+    124,
+    164,
+    31,
+    159,
+    4,
+    119,
+    153,
+    115,
+    114,
+    120,
+    125,
+    143,
+    144,
+    24,
+    119,
+    153,
+    115,
+    114,
+    120,
+    125,
+    143,
+    144,
+    25,
+    84,
+    116,
+    117,
+    80,
+    30,
+    109,
+    154,
+    161,
+    147,
+    26,
+    147,
+    109,
+    154,
+    161,
+    147,
+    26,
+    163,
+    159,
+    154,
+    180,
+    181,
+    119,
+    153,
+    115,
+    114,
+    120,
+    125,
+    97,
+    162,
+    12,
+    35,
+    163,
+    159,
+    154,
+    180,
+    181,
+    119,
+    153,
+    12,
+    34,
+    152,
+    22,
+    180,
+    181,
+    119,
+    153,
+    115,
+    114,
+    120,
+    125,
+    97,
+    12,
+    36,
+    154,
+    180,
+    181,
+    119,
+    153,
+    115,
+    114,
+    120,
+    125,
+    97,
+    147,
+    12,
+    37,
+    14,
+  ]
+  let capture = run evalTest(&data, CharstringKind.Type2)
+  run Testing.expect(capture.count == 37, "all path operators command count")
+  run checkCommand(&capture, 0, 1, &[Fixed.fromI32(-137), Fixed.fromI32(-632)])
+  run checkCommand(&capture, 1, 2, &[Fixed.fromI32(-103), Fixed.fromI32(-637)])
+  run checkCommand(&capture, 2, 2, &[Fixed.fromI32(-83), Fixed.fromI32(-643)])
+  run checkCommand(&capture, 3, 2, &[Fixed.fromI32(-82), Fixed.fromI32(-643)])
+  run checkCommand(&capture, 4, 2, &[Fixed.fromI32(-82), Fixed.fromI32(-641)])
+  run checkCommand(&capture, 5, 2, &[Fixed.fromI32(-79), Fixed.fromI32(-641)])
+  run checkCommand(&capture, 6, 2, &[Fixed.fromI32(-79), Fixed.fromI32(-820)])
+  run checkCommand(&capture, 7, 2, &[Fixed.fromI32(-89), Fixed.fromI32(-820)])
+  run checkCommand(&capture, 8, 2, &[Fixed.fromI32(-89), Fixed.fromI32(-817)])
+  run checkCommand(
+    &capture,
+    9,
+    3,
+    &[
+      Fixed.fromI32(-119),
+      Fixed.fromI32(-802),
+      Fixed.fromI32(-97),
+      Fixed.fromI32(-794),
+      Fixed.fromI32(-147),
+      Fixed.fromI32(-768),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    10,
+    3,
+    &[
+      Fixed.fromI32(-161),
+      Fixed.fromI32(-810),
+      Fixed.fromI32(-202),
+      Fixed.fromI32(-791),
+      Fixed.fromI32(-217),
+      Fixed.fromI32(-766),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    11,
+    3,
+    &[
+      Fixed.fromI32(-247),
+      Fixed.fromI32(-766),
+      Fixed.fromI32(-232),
+      Fixed.fromI32(-744),
+      Fixed.fromI32(-224),
+      Fixed.fromI32(-744),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    12,
+    3,
+    &[
+      Fixed.fromI32(-254),
+      Fixed.fromI32(-736),
+      Fixed.fromI32(-239),
+      Fixed.fromI32(-714),
+      Fixed.fromI32(-231),
+      Fixed.fromI32(-714),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    13,
+    3,
+    &[
+      Fixed.fromI32(-207),
+      Fixed.fromI32(-714),
+      Fixed.fromI32(-187),
+      Fixed.fromI32(-699),
+      Fixed.fromI32(-187),
+      Fixed.fromI32(-658),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    14,
+    3,
+    &[
+      Fixed.fromI32(-187),
+      Fixed.fromI32(-616),
+      Fixed.fromI32(-207),
+      Fixed.fromI32(-602),
+      Fixed.fromI32(-231),
+      Fixed.fromI32(-602),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    15,
+    3,
+    &[
+      Fixed.fromI32(-256),
+      Fixed.fromI32(-602),
+      Fixed.fromI32(-275),
+      Fixed.fromI32(-616),
+      Fixed.fromI32(-275),
+      Fixed.fromI32(-658),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    16,
+    3,
+    &[
+      Fixed.fromI32(-275),
+      Fixed.fromI32(-699),
+      Fixed.fromI32(-256),
+      Fixed.fromI32(-714),
+      Fixed.fromI32(-231),
+      Fixed.fromI32(-714),
+    ],
+  )
+  run checkCommand(&capture, 17, 2, &[Fixed.fromI32(-137), Fixed.fromI32(-632)])
+  run checkCommand(&capture, 18, 1, &[Fixed.fromI32(-231), Fixed.fromI32(-694)])
+  run checkCommand(
+    &capture,
+    19,
+    3,
+    &[
+      Fixed.fromI32(-251),
+      Fixed.fromI32(-680),
+      Fixed.fromI32(-275),
+      Fixed.fromI32(-705),
+      Fixed.fromI32(-294),
+      Fixed.fromI32(-719),
+    ],
+  )
+  run checkCommand(&capture, 20, 2, &[Fixed.fromI32(-290), Fixed.fromI32(-714)])
+  run checkCommand(&capture, 21, 2, &[Fixed.fromI32(-310), Fixed.fromI32(-700)])
+  run checkCommand(
+    &capture,
+    22,
+    3,
+    &[
+      Fixed.fromI32(-334),
+      Fixed.fromI32(-725),
+      Fixed.fromI32(-353),
+      Fixed.fromI32(-739),
+      Fixed.fromI32(-349),
+      Fixed.fromI32(-734),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    23,
+    3,
+    &[
+      Fixed.fromI32(-349),
+      Fixed.fromI32(-789),
+      Fixed.fromI32(-372),
+      Fixed.fromI32(-811),
+      Fixed.fromI32(-431),
+      Fixed.fromI32(-811),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    24,
+    3,
+    &[
+      Fixed.fromI32(-431),
+      Fixed.fromI32(-841),
+      Fixed.fromI32(-416),
+      Fixed.fromI32(-819),
+      Fixed.fromI32(-416),
+      Fixed.fromI32(-811),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    25,
+    3,
+    &[
+      Fixed.fromI32(-408),
+      Fixed.fromI32(-841),
+      Fixed.fromI32(-393),
+      Fixed.fromI32(-819),
+      Fixed.fromI32(-393),
+      Fixed.fromI32(-811),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    26,
+    3,
+    &[
+      Fixed.fromI32(-369),
+      Fixed.fromI32(-791),
+      Fixed.fromI32(-354),
+      Fixed.fromI32(-750),
+      Fixed.fromI32(-312),
+      Fixed.fromI32(-770),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    27,
+    3,
+    &[
+      Fixed.fromI32(-298),
+      Fixed.fromI32(-794),
+      Fixed.fromI32(-323),
+      Fixed.fromI32(-813),
+      Fixed.fromI32(-337),
+      Fixed.fromI32(-855),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    28,
+    3,
+    &[
+      Fixed.fromI32(-313),
+      Fixed.fromI32(-855),
+      Fixed.fromI32(-293),
+      Fixed.fromI32(-840),
+      Fixed.fromI32(-252),
+      Fixed.fromI32(-840),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    29,
+    3,
+    &[
+      Fixed.fromI32(-210),
+      Fixed.fromI32(-840),
+      Fixed.fromI32(-230),
+      Fixed.fromI32(-855),
+      Fixed.fromI32(-216),
+      Fixed.fromI32(-855),
+    ],
+  )
+  run checkCommand(&capture, 30, 2, &[Fixed.fromI32(-231), Fixed.fromI32(-694)])
+  run checkCommand(&capture, 31, 1, &[Fixed.fromI32(-203), Fixed.fromI32(-855)])
+  run checkCommand(
+    &capture,
+    32,
+    3,
+    &[
+      Fixed.fromI32(-162),
+      Fixed.fromI32(-813),
+      Fixed.fromI32(-182),
+      Fixed.fromI32(-799),
+      Fixed.fromI32(-206),
+      Fixed.fromI32(-799),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    33,
+    3,
+    &[
+      Fixed.fromI32(-231),
+      Fixed.fromI32(-799),
+      Fixed.fromI32(-250),
+      Fixed.fromI32(-813),
+      Fixed.fromI32(-292),
+      Fixed.fromI32(-855),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    34,
+    3,
+    &[
+      Fixed.fromI32(-277),
+      Fixed.fromI32(-814),
+      Fixed.fromI32(-235),
+      Fixed.fromI32(-834),
+      Fixed.fromI32(-221),
+      Fixed.fromI32(-858),
+    ],
+  )
+  run checkCommand(
+    &capture,
+    35,
+    3,
+    &[
+      Fixed.fromI32(-246),
+      Fixed.fromI32(-877),
+      Fixed.fromI32(-260),
+      Fixed.fromI32(-919),
+      Fixed.fromI32(-292),
+      Fixed.fromI32(-911),
+    ],
+  )
+  run checkCommand(&capture, 36, 2, &[Fixed.fromI32(-203), Fixed.fromI32(-855)])
+}
+
+test effect fn coordsRemainingAvoidOverflow()
+  ! AssertionError<'static> {
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type2, &mut stack)
+  let ctx = TestContext.plain(CharstringKind.Type2)
+  let mut capture = TestCapture.new()
+  run pushInts(&mut state, &[0, 0])
+  run operatorTest(&mut state, &ctx, &mut capture, Operator.HhCurveTo)
+}
+
+test effect fn ignoreReservedOperators()
+  ! AssertionError<'static> {
+  let capture = run evalTest(&[0, 32, 22, 2], CharstringKind.Type2)
+  run Testing.expect(capture.count == 2, "reserved operators reset and continue")
+  run checkCommand(&capture, 0, 1, &[Fixed.fromI32(-107), Fixed.zero()])
+  run checkCommand(&capture, 1, 2, &[Fixed.fromI32(-107), Fixed.zero()])
+}
+
+test effect fn operationLimit()
+  ! AssertionError<'static> {
+  let bytes: [u8; 1000001] = [0; 1000001]
+  let ctx = TestContext.plain(CharstringKind.Type2)
+  let mut sink = NullSink {}
+  drop run mustCs(evaluate(&ctx, noBlendCs(), Slice.view<u8>(&bytes, 0, 1000000), &mut sink))
+  let error = match move evaluate(&ctx, noBlendCs(), &bytes, &mut sink) {
+    Result<Option<Fixed>, Error>.Failure { error } => error
+    _ => {
+      run Testing.expect(false, "operation limit rejects extra instruction")
+      return
+    }
+  }
+  run Testing.expect(error == Error.LimitExceeded, "operation-limit error")
+}
+
+test effect fn opDiv()
+  ! AssertionError<'static> {
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type2, &mut stack)
+  let ctx = TestContext.plain(CharstringKind.Type2)
+  let mut capture = TestCapture.new()
+  run mustCs(Stack.push<Fixed>(&mut state.stack, Fixed.fromF64(512.5)))
+  run pushInts(&mut state, &[2])
+  run operatorTest(&mut state, &ctx, &mut capture, Operator.Div)
+  run Testing.expect(
+    Fixed.toBits(run mustCs(Stack.popFixed(&mut state.stack)))
+      == Fixed.toBits(Fixed.fromF64(256.25)),
+    "fixed division",
+  )
+}
+
+test effect fn opDivType1LargeInt()
+  ! AssertionError<'static> {
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+  let ctx = TestContext.plain(CharstringKind.Type1)
+  let mut capture = TestCapture.new()
+  run pushInts(&mut state, &[32001, 2])
+  run operatorTest(&mut state, &ctx, &mut capture, Operator.Div)
+  run Testing.expect(
+    Fixed.toBits(run mustCs(Stack.popFixed(&mut state.stack)))
+      == Fixed.toBits(Fixed.fromF64(16000.5)),
+    "large integer division",
+  )
+}
+
+effect fn checkSbw(op: Operator, kind: CharstringKind) -> ()
+  ! AssertionError<'static> {
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(kind, &mut stack)
+  let ctx = TestContext.plain(kind)
+  let mut capture = TestCapture.new()
+  run mustCs(Stack.push<Fixed>(&mut state.stack, Fixed.fromF64(42.5)))
+  if op == Operator.Sbw {
+    run pushInts(&mut state, &[0])
+  }
+  run pushInts(&mut state, &[501, 1000])
+  run operatorTest(&mut state, &ctx, &mut capture, op)
+  let mut sbx = Fixed.zero()
+  let mut wx = Fixed.zero()
+  if kind == CharstringKind.Type1 {
+    sbx = Fixed.fromF64(42.5)
+    wx = Fixed.fromI32(501)
+  }
+  run Testing.expect(
+    Fixed.toBits(state.sbx) == Fixed.toBits(sbx) && Fixed.toBits(state.wx) == Fixed.toBits(wx),
+    "Type 1 sidebearing and width only",
+  )
+}
+
+test effect fn opSbwType1()
+  ! AssertionError<'static> {
+  run checkSbw(Operator.Sbw, CharstringKind.Type1)
+}
+
+test effect fn opHsbwType1()
+  ! AssertionError<'static> {
+  run checkSbw(Operator.Hsbw, CharstringKind.Type1)
+}
+
+test effect fn opSbwType2NoEffect()
+  ! AssertionError<'static> {
+  run checkSbw(Operator.Sbw, CharstringKind.Type2)
+}
+
+test effect fn opHsbwType2NoEffect()
+  ! AssertionError<'static> {
+  run checkSbw(Operator.Hsbw, CharstringKind.Type2)
+}
+
+test effect fn opCallothersubrFlex()
+  ! AssertionError<'static> {
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+  let ctx = TestContext.plain(CharstringKind.Type1)
+  let mut sink = TestCapture.new()
+  run pushInts(&mut state, &[0, 1])
+  run operatorTest(&mut state, &ctx, &mut sink, Operator.CallOtherSubr)
+  let mut i: usize = 0
+  while i < 7 {
+    run pushInts(&mut state, &[1, 2])
+    run operatorTest(&mut state, &ctx, &mut sink, Operator.RMoveTo)
+    i = i + 1
+  }
+  run pushInts(&mut state, &[0, 100, 200, 3, 0])
+  run operatorTest(&mut state, &ctx, &mut sink, Operator.CallOtherSubr)
+  run operatorTest(&mut state, &ctx, &mut sink, Operator.SetCurrentPoint)
+  run Testing.expect(
+    Fixed.toI32(state.x) == 100 && Fixed.toI32(state.y) == 200 && sink.count == 3,
+    "legacy flex final position",
+  )
+  run checkCommand(&sink, 0, 1, &[Fixed.zero(), Fixed.zero()])
+  run checkCommand(
+    &sink,
+    1,
+    3,
+    &[
+      Fixed.fromI32(2),
+      Fixed.fromI32(4),
+      Fixed.fromI32(3),
+      Fixed.fromI32(6),
+      Fixed.fromI32(4),
+      Fixed.fromI32(8),
+    ],
+  )
+  run checkCommand(
+    &sink,
+    2,
+    3,
+    &[
+      Fixed.fromI32(5),
+      Fixed.fromI32(10),
+      Fixed.fromI32(6),
+      Fixed.fromI32(12),
+      Fixed.fromI32(7),
+      Fixed.fromI32(14),
+    ],
+  )
+}
+
+test effect fn nopFilterSink()
+  ! AssertionError<'static> {
+  let mut capture = TestCapture.new()
+  let sx = Fixed.fromF64(10.2)
+  let sy = Fixed.fromF64(20.4)
+  let mut filter = NopFilterSink.new(&mut capture)
+  CommandSink.moveTo(&mut filter, Fixed.zero(), Fixed.zero())
+  CommandSink.moveTo(&mut filter, sx, sy)
+  CommandSink.lineTo(&mut filter, sx, sy)
+  CommandSink.curveTo(
+    &mut filter,
+    Fixed.fromI32(5),
+    Fixed.fromI32(-5),
+    Fixed.fromF64(1.5),
+    Fixed.fromI32(2),
+    Fixed.fromF64(4.5),
+    Fixed.fromI32(-10),
+  )
+  CommandSink.lineTo(&mut filter, Fixed.fromF64(4.5), Fixed.fromI32(-10))
+  CommandSink.lineTo(&mut filter, sx, sy)
+  CommandSink.close(&mut filter)
+  drop move filter
+  run Testing.expect(capture.count == 3, "no empty contour or duplicate lines")
+  run checkCommand(&capture, 0, 1, &[sx, sy])
+  run checkCommand(
+    &capture,
+    1,
+    3,
+    &[
+      Fixed.fromI32(5),
+      Fixed.fromI32(-5),
+      Fixed.fromF64(1.5),
+      Fixed.fromI32(2),
+      Fixed.fromF64(4.5),
+      Fixed.fromI32(-10),
+    ],
+  )
+  run checkCommand(&capture, 2, 2, &[sx, sy])
+}
+
+fn testTransform() -> FontMatrix {
+  return Matrix.fromElements<Fixed>(
+    [Fixed.one(), Fixed.zero(), Fixed.fromBits(10945), Fixed.one(), Fixed.zero(), Fixed.zero()],
+  )
+}
+
+effect fn matrixTransformTest(scaled: bool) -> ()
+  ! AssertionError<'static> {
+  let input: [[i32; 2]; 4] = [[150, 46], [176, 8], [217, -13], [267, -13]]
+  let mut expected: [[i32; 2]; 4] = [[158, 46], [177, 8], [215, -13], [265, -13]]
+  let mut scale = Option<Fixed>.None
+  let mut shift: i32 = 16
+  if scaled {
+    expected = [[404, 118], [453, 20], [550, -33], [678, -33]]
+    scale = Option<Fixed>.some(Fixed.fromBits(167772))
+    shift = 10
+  }
+  let mut dummy = ()
+  let sink = TransformSink.fromMatrixScale(&mut dummy, testTransform(), move scale)
+  let mut i: usize = 0
+  while i < 4 {
+    let point = TransformSink.transform(
+      &sink,
+      Fixed.fromI32(input[i][0]),
+      Fixed.fromI32(input[i][1]),
+    )
+    run Testing.expect(
+      Fixed.toBits(point.x) == i32.shiftLeft(expected[i][0], shift)
+        && Fixed.toBits(point.y) == i32.shiftLeft(expected[i][1], shift),
+      "matrix transform precision",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn scaledMatrixTransformSink()
+  ! AssertionError<'static> {
+  run matrixTransformTest(true)
+}
+
+test effect fn unscaledMatrixTransformSink()
+  ! AssertionError<'static> {
+  run matrixTransformTest(false)
+}
+
+test effect fn unscaledTransformSinkProducesIntegers()
+  ! AssertionError<'static> {
+  let mut dummy = ()
+  let sink = TransformSink.new(&mut dummy, Transform.default())
+  let coords: [f64; 5] = [50.0, 50.1, 50.125, 50.5, 50.9]
+  let mut i: usize = 0
+  while i < 5 {
+    let p = TransformSink.transform(&sink, Fixed.fromF64(coords[i]), Fixed.zero())
+    run Testing.expect(Fixed.toBits(p.x) == 3276800, "integer outline units")
+    i = i + 1
+  }
+}
+
+test effect fn scaledTransformSink()
+  ! AssertionError<'static> {
+  let mut dummy = ()
+  let scale = Fixed.fromBits(1280) / Fixed.fromBits(1000)
+  let sink = TransformSink.fromMatrixScale(
+    &mut dummy,
+    Matrix.identity<Fixed>(),
+    Option<Fixed>.some(scale),
+  )
+  let inputs: [f64; 6] = [0.0, 8.0, 16.0, 32.0, 72.0, 128.0]
+  let expected: [f64; 6] = [0.0, 0.15625, 0.3125, 0.640625, 1.4375, 2.5625]
+  let mut i: usize = 0
+  while i < 6 {
+    let p = TransformSink.transform(&sink, Fixed.fromF64(inputs[i]), Fixed.zero())
+    run Testing.expect(
+      Fixed.toBits(p.x) == Fixed.toBits(Fixed.fromF64(expected[i])),
+      "26.6 intermediate scaling",
+    )
+    i = i + 1
+  }
+}
+
+effect fn otherSubrTest<'w, 's>(
+  state: &mut Evaluator<'static, 'static, 's>,
+  ctx: &TestContext<'w>,
+  args: &[i32],
+) -> ()
+  ! AssertionError<'static> {
+  run pushInts(&mut state, args)
+  let mut sink = TestCapture.new()
+  run operatorTest(&mut state, ctx, &mut sink, Operator.CallOtherSubr)
+}
+
+fn otherSubrFails<'w, 's>(
+  state: &mut Evaluator<'static, 'static, 's>,
+  ctx: &TestContext<'w>,
+  args: &[i32],
+) -> bool {
+  Stack.clear(&mut state.stack)
+  let mut i: usize = 0
+  while i < args.length {
+    drop Stack.push<i32>(&mut state.stack, args[i])
+    i = i + 1
+  }
+  let mut sink = TestCapture.new()
+  return match move run Effect.result(handleOtherSubr(&mut state, ctx, &mut sink)) {
+    Result<(), Error>.Failure { error } => true
+    _ => false
+  }
+}
+
+effect fn checkStack<'s>(state: &Evaluator<'static, 'static, 's>, expected: &[Fixed]) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(Stack.len(&state.stack) == expected.length, "operand stack length")
+  let mut i: usize = 0
+  while i < expected.length {
+    run Testing.expect(
+      Fixed.toBits(run mustCs(Stack.getFixed(&state.stack, i))) == Fixed.toBits(expected[i]),
+      "operand stack value",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn mmBlend()
+  ! AssertionError<'static> {
+  let weights = [Fixed.zero(), Fixed.fromF64(-0.25), Fixed.one()]
+  let ctx = TestContext {
+    kind: CharstringKind.Type1,
+    weights: Option<&[Fixed]>.some(&weights),
+    buildLen: 8,
+  }
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+  run otherSubrTest(&mut state, &ctx, &[1, 0, 2, 3, 4, -8, 6, 15])
+  run checkStack(&state, &[Fixed.fromF64(3.5), Fixed.fromI32(-9)])
+}
+
+test effect fn othersubrArithmetic()
+  ! AssertionError<'static> {
+  let weights = [Fixed.zero(); 3]
+  let ctx = TestContext {
+    kind: CharstringKind.Type1,
+    weights: Option<&[Fixed]>.some(&weights),
+    buildLen: 8,
+  }
+  let mut index: i32 = 20
+  let expected: [f64; 4] = [9.0, 5.0, 14.0, 3.5]
+  while index <= 23 {
+    let mut stack = Stack.new()
+    let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+    run otherSubrTest(&mut state, &ctx, &[7, 2, 2, index])
+    run checkStack(&state, &[Fixed.fromF64(expected[i32.toUsize(index - 20)])])
+    index = index + 1
+  }
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+  run otherSubrTest(&mut state, &ctx, &[1, 2, 3, 4, 4, 27])
+  run checkStack(&state, &[Fixed.one()])
+  Stack.clear(&mut state.stack)
+  run otherSubrTest(&mut state, &ctx, &[1, 2, 5, 4, 4, 27])
+  run checkStack(&state, &[Fixed.fromI32(2)])
+  run Testing.expect(
+    otherSubrFails(&mut state, &ctx, &[7, 0, 2, 23])
+      && otherSubrFails(&mut state, &ctx, &[7, 2, 1, 20]),
+    "division by zero and wrong count",
+  )
+}
+
+test effect fn othersubrBuildCharArray()
+  ! AssertionError<'static> {
+  let weights = [Fixed.fromF64(0.25), Fixed.fromF64(0.5), Fixed.fromF64(0.25)]
+  let ctx = TestContext {
+    kind: CharstringKind.Type1,
+    weights: Option<&[Fixed]>.some(&weights),
+    buildLen: 8,
+  }
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+  run otherSubrTest(&mut state, &ctx, &[5, 3, 2, 24])
+  run checkStack(&state, &[])
+  run otherSubrTest(&mut state, &ctx, &[3, 1, 25])
+  run checkStack(&state, &[Fixed.fromI32(5)])
+  Stack.clear(&mut state.stack)
+  run otherSubrTest(&mut state, &ctx, &[2, 1, 19])
+  run checkStack(&state, &[])
+  run otherSubrTest(&mut state, &ctx, &[3, 1, 25])
+  run checkStack(&state, &[Fixed.fromF64(0.5)])
+  Stack.clear(&mut state.stack)
+  run Testing.expect(
+    otherSubrFails(&mut state, &ctx, &[1, 8, 2, 24])
+      && otherSubrFails(&mut state, &ctx, &[8, 1, 25])
+      && otherSubrFails(&mut state, &ctx, &[6, 1, 19]),
+    "BuildChar bounds",
+  )
+
+  // Exercise the storage transition beyond the upstream inline capacity.
+  let large = TestContext {
+    kind: CharstringKind.Type1,
+    weights: Option<&[Fixed]>.some(&weights),
+    buildLen: 64,
+  }
+  let mut heapStack = Stack.new()
+  let mut heapState = testEvaluator(CharstringKind.Type1, &mut heapStack)
+  run otherSubrTest(&mut heapState, &large, &[7, 63, 2, 24])
+  run otherSubrTest(&mut heapState, &large, &[63, 1, 25])
+  run checkStack(&heapState, &[Fixed.fromI32(7)])
+}
+
+test effect fn othersubrsWithoutABlendFail()
+  ! AssertionError<'static> {
+  let ctx = TestContext.plain(CharstringKind.Type1)
+  let mut stack = Stack.new()
+  let mut state = testEvaluator(CharstringKind.Type1, &mut stack)
+  run Testing.expect(
+    otherSubrFails(&mut state, &ctx, &[1, 2, 2, 14])
+      && otherSubrFails(&mut state, &ctx, &[0, 1, 19])
+      && otherSubrFails(&mut state, &ctx, &[5, 0, 2, 24])
+      && otherSubrFails(&mut state, &ctx, &[0, 1, 25]),
+    "blend required",
+  )
+  Stack.clear(&mut state.stack)
+  run otherSubrTest(&mut state, &ctx, &[7, 2, 2, 20])
+  run checkStack(&state, &[Fixed.fromI32(9)])
+}
+
+effect fn moveTest(ops: &[u8], kind: CharstringKind) -> Point<Fixed>
+  ! AssertionError<'static> {
+  let mut bytes: [u8; 128] = [0; 128]
+  let mut i: usize = 0
+  while i < ops.length {
+    bytes[i] = ops[i]
+    i = i + 1
+  }
+  bytes[i] = 21
+  bytes[i + 1] = 14
+  let capture = run evalTest(Slice.view<u8>(&bytes, 0, i + 2), kind)
+  run Testing.expect(capture.count > 0 && capture.items[0].kind == 1, "computed move exists")
+  return Point<Fixed> { x: capture.items[0].coords[0], y: capture.items[0].coords[1] }
+}
+
+fn numberByte(value: i32) -> u8 {
+  return i32.toU8(value + 139)
+}
+
+effect fn binaryTest(a: i32, b: i32, op: u8) -> Fixed
+  ! AssertionError<'static> {
+  return (run moveTest(&[139, numberByte(a), numberByte(b), 12, op], CharstringKind.Type2)).y
+}
+
+effect fn checkMove(ops: &[u8], x: i32, y: i32) -> ()
+  ! AssertionError<'static> {
+  let p = run moveTest(ops, CharstringKind.Type2)
+  run Testing.expect(
+    Fixed.toBits(p.x) == Fixed.toBits(Fixed.fromI32(x))
+      && Fixed.toBits(p.y) == Fixed.toBits(Fixed.fromI32(y)),
+    "stack computation reaches move",
+  )
+}
+
+test effect fn arithmetic()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    Fixed.toBits(run binaryTest(7, 5, 10)) == Fixed.toBits(Fixed.fromI32(12))
+      && Fixed.toBits(run binaryTest(7, 5, 11)) == Fixed.toBits(Fixed.fromI32(2))
+      && Fixed.toBits(run binaryTest(7, 5, 24)) == Fixed.toBits(Fixed.fromI32(35))
+      && Fixed.toBits(run binaryTest(10, 4, 12)) == Fixed.toBits(Fixed.fromF64(2.5)),
+    "arithmetic operators",
+  )
+}
+
+test effect fn logicAnswersWithOneOrZero()
+  ! AssertionError<'static> {
+  let inputs: [[i32; 4]; 7] = [
+    [1, 1, 3, 1],
+    [1, 0, 3, 0],
+    [0, 0, 3, 0],
+    [1, 0, 4, 1],
+    [0, 0, 4, 0],
+    [5, 5, 15, 1],
+    [5, 6, 15, 0],
+  ]
+  let mut i: usize = 0
+  while i < inputs.length {
+    run Testing.expect(
+      Fixed.toBits(run binaryTest(inputs[i][0], inputs[i][1], i32.toU8(inputs[i][2])))
+        == Fixed.toBits(Fixed.fromI32(inputs[i][3])),
+      "logical operator result",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn unary()
+  ! AssertionError<'static> {
+  run checkMove(&[139, 139, 12, 5], 0, 1)
+  let input: [[i32; 3]; 4] = [[-5, 9, 5], [5, 9, 5], [5, 14, -5], [-5, 14, 5]]
+  let mut i: usize = 0
+  while i < 4 {
+    run checkMove(&[139, numberByte(input[i][0]), 12, i32.toU8(input[i][1])], 0, input[i][2])
+    i = i + 1
+  }
+}
+
+test effect fn sqrtOfASquareIsTheRoot()
+  ! AssertionError<'static> {
+  let input: [[i32; 2]; 5] = [[1, 1], [4, 2], [9, 3], [16, 4], [100, 10]]
+  let mut i: usize = 0
+  while i < 5 {
+    let point = run moveTest(&[139, numberByte(input[i][0]), 12, 26], CharstringKind.Type2)
+    let diff = i32.toI64(Fixed.toBits(point.y))
+      - i32.toI64(Fixed.toBits(Fixed.fromI32(input[i][1])))
+    run Testing.expect(diff >= -2 && diff <= 2, "Babylonian root precision")
+    i = i + 1
+  }
+  run checkMove(&[139, 139, 12, 26], 0, 0)
+  run checkMove(&[139, 135, 12, 26], 0, 0)
+}
+
+test effect fn theStackOperatorsRearrangeIt()
+  ! AssertionError<'static> {
+  run checkMove(&[139, 146, 12, 27], 7, 7)
+  run checkMove(&[142, 148, 12, 28], 9, 3)
+  run checkMove(&[143, 144, 145, 12, 18], 4, 5)
+  run checkMove(&[139, 147, 139, 12, 29], 8, 8)
+}
+
+test effect fn rollRotatesTheValuesItIsGiven()
+  ! AssertionError<'static> {
+  run checkMove(&[140, 141, 142, 142, 140, 12, 30], 1, 2)
+}
+
+test effect fn rollLeavesTheValuesBelowAlone()
+  ! AssertionError<'static> {
+  run checkMove(&[238, 140, 141, 141, 140, 12, 30], 2, 1)
+}
+
+test effect fn rollByTheMostNegativeShift()
+  ! AssertionError<'static> {
+  let point = run moveTest(&[140, 141, 141, 255, 128, 0, 0, 0, 12, 30], CharstringKind.Type1)
+  run Testing.expect(
+    Fixed.toI32(point.x) == 1 && Fixed.toI32(point.y) == 2,
+    "i32 MIN is a whole number of turns",
+  )
+}
+
+test effect fn theTransientArrayRemembersBetweenOperators()
+  ! AssertionError<'static> {
+  run checkMove(&[139, 181, 142, 12, 20, 142, 12, 21], 0, 42)
+}
+
+test effect fn aSlotTheArrayDoesNotHaveIsIgnored()
+  ! AssertionError<'static> {
+  run checkMove(&[142, 148, 238, 12, 20, 143], 3, 4)
+}
+
+test effect fn ifelsePicksTheFirstWhenTheConditionsAreOrdered()
+  ! AssertionError<'static> {
+  run checkMove(&[139, 150, 161, 140, 141, 12, 22], 0, 11)
+  run checkMove(&[139, 150, 161, 141, 140, 12, 22], 0, 22)
+  run checkMove(&[139, 150, 161, 141, 141, 12, 22], 0, 11)
+}
+
+import model.glyph.outline { PathSink }
+
+/// Explicit adapter for Rust's blanket CommandSink implementation on PathSink.
+pub struct PathSinkAdapter<'s, P> {
+  pub inner: &'s mut P,
+}
+
+impl<'s, P: PathSink> CommandSink for PathSinkAdapter<'s, P> {
+  fn moveTo(self: &mut Self, x: Fixed, y: Fixed) {
+    PathSink.moveTo(&mut self.inner.*, Fixed.toF32(x), Fixed.toF32(y))
+  }
+
+  fn lineTo(self: &mut Self, x: Fixed, y: Fixed) {
+    PathSink.lineTo(&mut self.inner.*, Fixed.toF32(x), Fixed.toF32(y))
+  }
+
+  fn curveTo(self: &mut Self, a: Fixed, b: Fixed, c: Fixed, d: Fixed, x: Fixed, y: Fixed) {
+    PathSink.curveTo(
+      &mut self.inner.*,
+      Fixed.toF32(a),
+      Fixed.toF32(b),
+      Fixed.toF32(c),
+      Fixed.toF32(d),
+      Fixed.toF32(x),
+      Fixed.toF32(y),
+    )
+  }
+
+  fn close(self: &mut Self) {
+    PathSink.close(&mut self.inner.*)
+  }
+}

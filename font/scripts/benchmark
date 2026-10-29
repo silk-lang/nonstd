@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Measure complete release font-dump CLI runs on a fixed corpus, serially."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import platform
+import statistics
+import subprocess
+import time
+import harness
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--fonts', type=Path)
+    parser.add_argument('--reference', type=Path, default=harness.ROOT / 'build/rust/release/rust-font-dump')
+    parser.add_argument('--silk-dumper', type=Path, default=harness.ROOT / 'build/llvm/x86_64-unknown-linux-gnu/release/font_dump')
+    parser.add_argument('--rounds', type=int, default=3)
+    parser.add_argument('--timeout', type=float, default=600)
+    parser.add_argument('--report', type=Path, required=True)
+    args = parser.parse_args()
+    if args.rounds < 1 or args.timeout <= 0:
+        parser.error('rounds and timeout must be positive')
+    fonts, inventory = harness.font_list(args.fonts)
+    binaries = {'rust': args.reference.resolve(), 'silk': args.silk_dumper.resolve()}
+    # Keep the same file order for both programs and every round. File and
+    # executable hashes make a repeated measurement auditable.
+    files = [{'path': harness.display(p), 'bytes': p.stat().st_size, 'sha256': digest(p)} for p in fonts]
+    report = {
+        'method': 'one subprocess per font; stdout=/dev/null; serial wall time; one whole-corpus warmup per binary; alternating program order by timed round',
+        'platform': platform.platform(),
+        'processor': platform.processor(),
+        'cpu_model': next((line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
+                           if line.startswith('model name')), '') if Path('/proc/cpuinfo').exists() else '',
+        'started_at': datetime.now(timezone.utc).isoformat(),
+        'format_version': 9,
+        'fonts': files,
+        'corpus_inventory': inventory,
+        'binaries': {name: {'path': harness.display(p), 'sha256': digest(p),
+                           'version': subprocess.check_output([str(p), '--version'], text=True).strip()}
+                     for name, p in binaries.items()},
+        'warmup': {}, 'rounds': [],
+    }
+    report['corpus_sha256'] = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+
+    def save():
+        temporary = args.report.with_suffix(args.report.suffix + '.tmp')
+        temporary.write_text(json.dumps(report, indent=2) + '\n')
+        temporary.replace(args.report)
+
+    def measure(name):
+        samples = []
+        started = time.perf_counter()
+        for font in fonts:
+            before = time.perf_counter()
+            try:
+                result = subprocess.run([str(binaries[name]), str(font)], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, timeout=args.timeout)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                report['failure'] = {'program': name, 'font': harness.display(font), 'error': str(error)}
+                save()
+                raise
+            elapsed = time.perf_counter() - before
+            if result.returncode != 0:
+                report['failure'] = {'program': name, 'font': harness.display(font),
+                                     'returncode': result.returncode, 'stderr': result.stderr.decode(errors='replace')}
+                save()
+                raise RuntimeError(f'{name} failed for {font}')
+            samples.append(elapsed)
+        return {'seconds': time.perf_counter() - started, 'per_font_seconds': samples}
+
+    save()
+    for name in binaries:
+        report['warmup'][name] = measure(name)
+        save()
+        print(f'warmup {name}: {report["warmup"][name]["seconds"]:.3f}s', flush=True)
+    for index in range(args.rounds):
+        order = ['rust', 'silk'] if index % 2 == 0 else ['silk', 'rust']
+        values = {'order': order}
+        for name in order:
+            values[name] = measure(name)
+            print(f'round {index + 1} {name}: {values[name]["seconds"]:.3f}s', flush=True)
+        report['rounds'].append(values)
+        save()
+    medians = {name: statistics.median(r[name]['seconds'] for r in report['rounds']) for name in binaries}
+    report['summary'] = {'fonts': len(fonts), 'rounds': args.rounds,
+                         'median_seconds': medians,
+                         'silk_over_rust_wall_time': medians['silk'] / medians['rust']}
+    save()
+    print(json.dumps(report['summary'], sort_keys=True), flush=True)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

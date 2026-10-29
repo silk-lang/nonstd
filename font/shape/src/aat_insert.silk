@@ -1,0 +1,479 @@
+//! AAT insertion keeps the upstream input/output cursor accounting. Rewinds
+//! spend work proportional to moved glyphs, and a failed sync retains input.
+import buffer { Buffer, Glyph }
+import view { View, offset }
+import aat { lookup }
+import aat_map { Range, flags as rangeFlags }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import silk.num.i64
+
+struct Output {
+  input: List<Glyph>,
+  output: List<Glyph>,
+  length: usize,
+  index: usize,
+  outLength: usize,
+  separate: bool,
+  successful: bool,
+  operations: i64,
+  maximum: usize,
+  flags: u32,
+}
+
+impl Output {
+  effect fn ensure(self: &mut Self, size: usize) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if size > self.maximum {
+      self.successful = false
+      return false
+    }
+    while List<Glyph>.length(&self.input) < size {
+      run List<Glyph>.append(&mut self.input, Glyph.new(0, 0))
+    }
+    while List<Glyph>.length(&self.output) < size {
+      run List<Glyph>.append(&mut self.output, Glyph.new(0, 0))
+    }
+    return true
+  }
+
+  fn spend(self: &mut Self, count: usize) -> bool {
+    self.operations = self.operations - usize.toI64(count)
+    if self.operations < 0 {
+      self.successful = false
+      return false
+    }
+    return true
+  }
+
+  effect fn room(self: &mut Self, numIn: usize, numOut: usize) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let required = usize.saturatingAdd(self.outLength, numOut)
+    if !run Output.ensure(&mut self, required) {
+      return false
+    }
+    if !self.separate && self.outLength + numOut > self.index + numIn {
+      self.separate = true
+      let mut i: usize = 0
+      while i < self.outLength {
+        List<Glyph>.set(&mut self.output, i, List<Glyph>.get(&self.input, i))
+        i = i + 1
+      }
+    }
+    return true
+  }
+
+  fn out(self: &Self, index: usize) -> Glyph {
+    if self.separate {
+      return List<Glyph>.get(&self.output, index)
+    }
+    return List<Glyph>.get(&self.input, index)
+  }
+
+  fn setOut(self: &mut Self, index: usize, value: Glyph) -> () {
+    if self.separate {
+      List<Glyph>.set(&mut self.output, index, value)
+    } else {
+      List<Glyph>.set(&mut self.input, index, value)
+    }
+  }
+
+  effect fn emit(self: &mut Self, value: Glyph, consume: bool) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut incoming: usize = 0
+    if consume {
+      incoming = 1
+    }
+    if !self.successful || !run Output.room(&mut self, incoming, 1) {
+      return false
+    }
+    let at = self.outLength
+    Output.setOut(&mut self, at, value)
+    self.outLength = self.outLength + 1
+    if consume {
+      self.index = self.index + 1
+    }
+    return true
+  }
+
+  effect fn next(self: &mut Self) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.index >= self.length {
+      return false
+    }
+    let item = List<Glyph>.get(&self.input, self.index)
+    return run Output.emit(&mut self, item, true)
+  }
+
+  effect fn moveTo(self: &mut Self, target: usize) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.successful || target > self.outLength + self.length - self.index {
+      return false
+    }
+    if target > self.outLength {
+      let count = target - self.outLength
+      if !(run Output.room(&mut self, count, count)) || !Output.spend(&mut self, count) {
+        return false
+      }
+      let mut i: usize = 0
+      while i < count {
+        let item = List<Glyph>.get(&self.input, self.index + i)
+        let destination = self.outLength + i
+        Output.setOut(&mut self, destination, item)
+        i = i + 1
+      }
+      self.index = self.index + count
+      self.outLength = target
+    } else if target < self.outLength {
+      let count = self.outLength - target
+      if self.index < count {
+        let shift = count - self.index
+        let required = usize.saturatingAdd(self.length, shift)
+        let moved = self.length - self.index
+        if !(run Output.ensure(&mut self, required)) || !Output.spend(&mut self, moved) {
+          return false
+        }
+        let mut i = self.length
+        while i > self.index {
+          i = i - 1
+          let item = List<Glyph>.get(&self.input, i)
+          List<Glyph>.set(&mut self.input, i + shift, item)
+        }
+        i = self.index
+        while i < self.index + shift {
+          List<Glyph>.set(&mut self.input, i, Glyph.new(0, 0))
+          i = i + 1
+        }
+        self.length = self.length + shift
+        self.index = self.index + shift
+      }
+      if !Output.spend(&mut self, count) {
+        return false
+      }
+      self.index = self.index - count
+      self.outLength = target
+      if self.separate || self.index <= self.outLength {
+        let mut i: usize = 0
+        while i < count {
+          let item = Output.out(&self.*, self.outLength + i)
+          List<Glyph>.set(&mut self.input, self.index + i, item)
+          i = i + 1
+        }
+      } else {
+        let mut i = count
+        while i > 0 {
+          i = i - 1
+          let item = Output.out(&self.*, self.outLength + i)
+          List<Glyph>.set(&mut self.input, self.index + i, item)
+        }
+      }
+    }
+    return true
+  }
+
+  fn logical(self: &Self, index: usize) -> Glyph {
+    if index < self.outLength {
+      return Output.out(self, index)
+    }
+    return List<Glyph>.get(&self.input, self.index + index - self.outLength)
+  }
+
+  fn unsafeBreak(self: &mut Self, start: usize, end: usize) -> () {
+    if start >= end || end > self.outLength + self.length - self.index || end - start > 255 {
+      return
+    }
+    let mut cluster: u32 = 4294967295
+    let mut i = start
+    while i < end {
+      let item = Output.logical(&self.*, i)
+      if item.info.cluster < cluster {
+        cluster = item.info.cluster
+      }
+      i = i + 1
+    }
+    let mut mask: u32 = 1
+    if (self.flags & 64) != 0 {
+      mask = 3
+    }
+    i = start
+    while i < end {
+      let mut item = Output.logical(&self.*, i)
+      if item.info.cluster != cluster {
+        item.info.flags = item.info.flags | mask
+      }
+      if i < self.outLength {
+        Output.setOut(&mut self, i, item)
+      } else {
+        List<Glyph>.set(&mut self.input, self.index + i - self.outLength, item)
+      }
+      i = i + 1
+    }
+  }
+}
+
+effect fn transition(out: &mut Output, glyphs: View, entry: View, mark: &mut usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bits = View.u16(&entry, 2)
+  let markLoc = out.outLength
+  let markedIndex = View.u16(&entry, 6)
+  if markedIndex != 65535 {
+    let count = u16.toUsize(bits & 31)
+    out.operations = out.operations - usize.toI64(count)
+    if out.operations <= 0 {
+      return
+    }
+    let before = (bits & 0x400) != 0
+    let end = out.outLength
+    if !run Output.moveTo(&mut out, mark.*) {
+      return
+    }
+    if out.index < out.length && !before {
+      let item = List<Glyph>.get(&out.input, out.index)
+      if !run Output.emit(&mut out, item, false) {
+        return
+      }
+    }
+    let mut i: usize = 0
+    while i < count {
+      let at = offset(0, u16.toUsize(markedIndex) + i, 2)
+      if at + 2 > View.len(&glyphs) || out.index >= out.length {
+        return
+      }
+      let mut item = List<Glyph>.get(&out.input, out.index)
+      item.info.glyphId = u16.toU32(View.u16(&glyphs, at))
+      item.substituted = true
+      if !run Output.emit(&mut out, item, false) {
+        return
+      }
+      i = i + 1
+    }
+    if out.index < out.length && !before {
+      out.index = out.index + 1
+    }
+    if !run Output.moveTo(&mut out, end + count) {
+      return
+    }
+    let mut limit = out.outLength
+    if out.index < out.length {
+      limit = limit + 1
+    }
+    Output.unsafeBreak(&mut out, mark.*, limit)
+  }
+  if (bits & 0x8000) != 0 {
+    mark.* = markLoc
+  }
+  let currentIndex = View.u16(&entry, 4)
+  if currentIndex != 65535 {
+    let count = u16.toUsize((bits & 0x3e0) / 32)
+    out.operations = out.operations - usize.toI64(count)
+    if out.operations < 0 {
+      return
+    }
+    let before = (bits & 0x800) != 0
+    let end = out.outLength
+    if out.index < out.length && !before {
+      let item = List<Glyph>.get(&out.input, out.index)
+      if !run Output.emit(&mut out, item, false) {
+        return
+      }
+    }
+    let mut i: usize = 0
+    while i < count {
+      let at = offset(0, u16.toUsize(currentIndex) + i, 2)
+      if at + 2 > View.len(&glyphs) || out.index >= out.length {
+        return
+      }
+      let mut item = List<Glyph>.get(&out.input, out.index)
+      item.info.glyphId = u16.toU32(View.u16(&glyphs, at))
+      item.substituted = true
+      if !run Output.emit(&mut out, item, false) {
+        return
+      }
+      i = i + 1
+    }
+    if out.index < out.length && !before {
+      out.index = out.index + 1
+    }
+    let mut target = end + count
+    if (bits & 0x4000) != 0 {
+      target = end
+    }
+    drop run Output.moveTo(&mut out, target)
+  }
+}
+
+fn actionable(entry: View) -> bool {
+  let bits = View.u16(&entry, 2)
+  return (bits & 0x3ff) != 0 && (View.u16(&entry, 4) != 65535 || View.u16(&entry, 6) != 65535)
+}
+
+pub effect fn apply(
+  buffer: &mut Buffer,
+  data: View,
+  legacy: bool,
+  budget: &mut usize,
+  ranges: &[Range],
+  mask: u32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut classes = View.offset32(&data, 4)
+  let mut states = View.offset32(&data, 8)
+  let mut entries = View.offset32(&data, 12)
+  let mut glyphs = View.offset32(&data, 16)
+  let mut classCount = u32.toUsize(View.u32(&data, 0))
+  if legacy {
+    classes = View.offset16(&data, 2)
+    states = View.offset16(&data, 4)
+    entries = View.offset16(&data, 6)
+    glyphs = View.offset16(&data, 8)
+    classCount = u16.toUsize(View.u16(&data, 0))
+  }
+  if classCount == 0 {
+    return
+  }
+  let length = Buffer.len(&buffer.*)
+  let mut out = Output {
+    input: Intrinsic.replace(buffer.glyphs, List<Glyph>.make()),
+    output: List<Glyph>.make(),
+    length: length,
+    index: 0,
+    outLength: 0,
+    separate: false,
+    successful: buffer.successful,
+    operations: usize.toI64(budget.*),
+    maximum: buffer.maxLength,
+    flags: buffer.flags,
+  }
+  let mut state: usize = 0
+  let mut mark: usize = 0
+  let mut flags: u32 = 0
+  while out.successful {
+    let atEnd = out.index == out.length
+    if !atEnd {
+      flags = rangeFlags(ranges, List<Glyph>.get(&out.input, out.index).info.cluster)
+    }
+    if (flags & mask) == 0 {
+      if atEnd {
+        break
+      }
+      state = 0
+      drop run Output.next(&mut out)
+      continue
+    }
+    let mut class: usize = 0
+    if !atEnd {
+      let glyph = List<Glyph>.get(&out.input, out.index).info.glyphId
+      class = u32.toUsize(lookup(classes, glyph))
+      if legacy {
+        let first = u16.toU32(View.u16(&classes, 0))
+        class = 1
+        if glyph >= first && glyph - first < u16.toU32(View.u16(&classes, 2)) {
+          class = u8.toUsize(View.u8(&classes, 4 + u32.toUsize(glyph - first)))
+        }
+      }
+      if glyph == 65535 {
+        class = 2
+      }
+      if class >= classCount {
+        class = 1
+      }
+    }
+    let at = offset(class, state, classCount)
+    let mut entryIndex: usize = 0
+    if legacy {
+      if at >= View.len(&states) {
+        out.successful = false
+        break
+      }
+      entryIndex = u8.toUsize(View.u8(&states, at))
+    } else {
+      if offset(2, at, 2) > View.len(&states) {
+        out.successful = false
+        break
+      }
+      entryIndex = u16.toUsize(View.u16(&states, at * 2))
+    }
+    let entry = View.tail(&entries, offset(0, entryIndex, 8))
+    if View.len(&entry) < 8 {
+      out.successful = false
+      break
+    }
+    let bits = View.u16(&entry, 2)
+    let mut nextState = u16.toUsize(View.u16(&entry, 0))
+    if legacy {
+      let stateOffset = u16.toUsize(View.u16(&data, 4))
+      if nextState < stateOffset {
+        out.successful = false
+        break
+      }
+      nextState = (nextState - stateOffset) / classCount
+    }
+    if out.outLength > 0 && !atEnd {
+      let mut firstIndex = u16.toUsize(View.u16(&states, class * 2))
+      let mut endIndex = u16.toUsize(View.u16(&states, state * classCount * 2))
+      if legacy {
+        firstIndex = u8.toUsize(View.u8(&states, class))
+        endIndex = u8.toUsize(View.u8(&states, state * classCount))
+      }
+      let first = View.tail(&entries, offset(0, firstIndex, 8))
+      let end = View.tail(&entries, offset(0, endIndex, 8))
+      let same = View.u16(&first, 0) == View.u16(&entry, 0)
+        && ((View.u16(&first, 2) & 0x4000) == (bits & 0x4000))
+      let safe = !actionable(entry)
+        && (state == 0 || ((bits & 0x4000) != 0 && nextState == 0) || (!actionable(first) && same))
+        && !actionable(end)
+      if !safe {
+        let start = out.outLength - 1
+        let end = out.outLength + 1
+        Output.unsafeBreak(&mut out, start, end)
+      }
+    }
+    run transition(&mut out, glyphs, entry, &mut mark)
+    state = nextState
+    if out.index >= out.length || !out.successful {
+      break
+    }
+    if (bits & 0x4000) == 0 {
+      drop run Output.next(&mut out)
+    } else {
+      if out.operations <= 0 {
+        drop run Output.next(&mut out)
+      }
+      out.operations = out.operations - 1
+    }
+  }
+  if out.successful {
+    while out.index < out.length {
+      if !run Output.next(&mut out) {
+        break
+      }
+    }
+  }
+  buffer.successful = out.successful
+  budget.* = 0
+  if out.operations > 0 {
+    budget.* = i64.toUsize(out.operations)
+  }
+  if out.successful && out.separate {
+    List<Glyph>.truncate(&mut out.output, out.outLength)
+    buffer.glyphs = move out.output
+  } else {
+    let mut length = out.length
+    if out.successful {
+      length = out.outLength
+    }
+    List<Glyph>.truncate(&mut out.input, length)
+    buffer.glyphs = move out.input
+  }
+}

@@ -1,0 +1,210 @@
+//! Diagnostic comparison, not a Unicode 18 normalization implementation.
+//! Reports every stdlib/raw-data disagreement and checks every canonical invariant
+//! in the pinned NormalizationTest, including all five input columns.
+import lib as Ucd
+import test_support as Scan
+import silk.text.unicode { Unicode }
+import silk.text.unicode_tables { UnicodeTables }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.host_input { HostInputError }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Format }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.text.string { String, InvalidUtf8 }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u8
+
+// Raw stdlib tables exclude algorithmic Hangul; NormalizationTest covers it.
+effect fn composition(first: u32, second: u32) -> usize
+  ! WriterError
+  ? &mut Writer {
+  if second == 0 {
+    return 0
+  }
+  let old = UnicodeTables.canonicalComposition(first, second)
+  let current = Ucd.composeRaw(first, second)
+  if old == current {
+    return 0
+  }
+  run Format.format(
+    "compose\t{first}\t{second}\t{old}\t{current}\n",
+    &.{ first: first, second: second, old: old, current: current },
+  )
+  return 1
+}
+
+effect fn scalars(field: &[u8], output: &mut List<u8>) -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  output.clear()
+  let mut at: usize = 0
+  while at < field.length {
+    let token = Scan.view(field, Scan.word(field, &mut at))
+    if token.length == 0 {
+      break
+    }
+    let parsed = Scan.number(token, 16)
+    run Testing.expect(parsed.isSome(), "normalization test scalar")
+    run Scan.appendScalar(move parsed |> Option<u32>.unwrapOr(0), &mut output)
+  }
+}
+
+effect fn compare(input: &[u8], expectedC: &[u8], expectedD: &[u8]) -> u8
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  match move String.fromUtf8(input) {
+    Result<string, InvalidUtf8>.Success { value: source } => {
+      let nfc = run Unicode.normalizeNfc(source)
+      let nfd = run Unicode.normalizeNfd(source)
+      let mut flags: u8 = 0
+      if !Scan.equal(String.utf8Bytes(String.view(&nfc)), expectedC) {
+        flags = flags | 1
+      }
+      if !Scan.equal(String.utf8Bytes(String.view(&nfd)), expectedD) {
+        flags = flags | 2
+      }
+      return flags
+    }
+    _ => {
+      run Testing.expect(false, "invalid encoded normalization input")
+      return 0
+    }
+  }
+}
+
+effect fn report() -> i32
+  ! OutOfMemoryError | AssertionError<'static> | FileError | HostInputError | WriterError
+  ? &mut Allocator | &mut Writer {
+  run Format.format("version\t{version}\n", &.{ version: Unicode.dataVersion() })
+  let mut cccDifferences: usize = 0
+  let mut decompositionDifferences: usize = 0
+  let mut compositionDifferences: usize = 0
+  let mut cp: u32 = 0
+  while cp <= 0x10ffff {
+    let old = Unicode.canonicalCombiningClass(cp)
+    let current = u8.toU32(Ucd.combiningClass(cp).number())
+    if old != current {
+      cccDifferences = cccDifferences + 1
+      run Format.format("ccc\t{cp}\t{old}\t{current}\n", &.{ cp: cp, old: old, current: current })
+    }
+    if cp < 0xac00 || cp > 0xd7a3 {
+      let before = UnicodeTables.canonicalDecomposition(cp)
+      let after = Ucd.decomposeRaw(cp)
+      if before.first != after.first || before.second != after.second {
+        decompositionDifferences = decompositionDifferences + 1
+        run Format.format(
+          "decomp\t{cp}\t{a}\t{b}\t{c}\t{d}\n",
+          &.{ cp: cp, a: before.first, b: before.second, c: after.first, d: after.second },
+        )
+      }
+      compositionDifferences = compositionDifferences + run composition(before.first, before.second)
+      if before.first != after.first || before.second != after.second {
+        compositionDifferences = compositionDifferences + run composition(after.first, after.second)
+      }
+    }
+    cp = cp + 1
+  }
+  let cwd = run NativeHostInput.workingDirectory()
+  let root = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let path = run Path.resolve(&root, "build/ucd/18.0.0/NormalizationTest.txt")
+  let mut files = run OsFileSystem.make("/")
+  let content = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  let data = Bytes.asSlice(&content)
+  let mut c1 = List<u8>.make()
+  let mut c2 = List<u8>.make()
+  let mut c3 = List<u8>.make()
+  let mut c4 = List<u8>.make()
+  let mut c5 = List<u8>.make()
+  let mut at: usize = 0
+  let mut line: usize = 0
+  let mut rows: usize = 0
+  let mut nfcDifferences: usize = 0
+  let mut nfdDifferences: usize = 0
+  while at < data.length {
+    let row = Scan.view(data, Scan.line(data, &mut at))
+    line = line + 1
+    let mut comment: usize = 0
+    let body = Scan.trim(Scan.view(row, Scan.field(row, &mut comment, 35)))
+    if body.length == 0 || body[0] == 64 {
+      continue
+    }
+    let mut field: usize = 0
+    run scalars(Scan.view(body, Scan.field(body, &mut field, 59)), &mut c1)
+    run scalars(Scan.view(body, Scan.field(body, &mut field, 59)), &mut c2)
+    run scalars(Scan.view(body, Scan.field(body, &mut field, 59)), &mut c3)
+    run scalars(Scan.view(body, Scan.field(body, &mut field, 59)), &mut c4)
+    run scalars(Scan.view(body, Scan.field(body, &mut field, 59)), &mut c5)
+    run Testing.expect(
+      c1.length() != 0 && c2.length() != 0 && c3.length() != 0 && c4.length() != 0
+        && c5.length() != 0,
+      "five normalization columns",
+    )
+    let flags = [
+      run compare(c1.asSlice(), c2.asSlice(), c3.asSlice()),
+      run compare(c2.asSlice(), c2.asSlice(), c3.asSlice()),
+      run compare(c3.asSlice(), c2.asSlice(), c3.asSlice()),
+      run compare(c4.asSlice(), c4.asSlice(), c5.asSlice()),
+      run compare(c5.asSlice(), c4.asSlice(), c5.asSlice()),
+    ]
+    let mut column: usize = 0
+    while column < 5 {
+      if (flags[column] & 1) != 0 {
+        nfcDifferences = nfcDifferences + 1
+      }
+      if (flags[column] & 2) != 0 {
+        nfdDifferences = nfdDifferences + 1
+      }
+      if flags[column] != 0 {
+        run Format.format(
+          "normalization\t{line}\t{column}\t{flags}\n",
+          &.{ line: line, column: column + 1, flags: flags[column] },
+        )
+      }
+      column = column + 1
+    }
+    rows = rows + 1
+  }
+  run Testing.expect(rows != 0, "normalization file has no cases")
+  run Format.format(
+    "summary\t{rows}\t{ccc}\t{decomp}\t{compose}\t{nfc}\t{nfd}\n",
+    &.{
+      rows: rows,
+      ccc: cccDifferences,
+      decomp: decompositionDifferences,
+      compose: compositionDifferences,
+      nfc: nfcDifferences,
+      nfd: nfdDifferences,
+    },
+  )
+  return 0
+}
+
+effect fn provided() -> i32
+  ! OutOfMemoryError | AssertionError<'static> | FileError | HostInputError | WriterError
+  ? &mut Allocator {
+  let mut writer = StdoutWriter.make()
+  return run report() |> Effect.provideMut<Writer>(&mut writer)
+}
+
+effect fn failed<E>(error: E) -> i32
+  ! WriterError {
+  drop error
+  let mut writer = StderrWriter.make()
+  run Writer.writeString("normalization-gap: invalid input or execution failure\n")
+    |> Effect.provideMut<Writer>(&mut writer)
+  return 2
+}
+
+pub effect fn main() -> i32
+  ! WriterError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(provided(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

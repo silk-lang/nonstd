@@ -1,0 +1,478 @@
+//! WebAssembly exports for harfrust shaping and read_fonts glyph outlines.
+//!
+//! The module keeps no state between calls. Each export takes the byte lengths of its inputs,
+//! allocates them, and asks the host to copy them in with `host.input(slot, pointer, length)`.
+//! Results go back through `host.output(kind, pointer, byteLength)` while they are still alive,
+//! so the host must copy them out before returning. See `js/` for the wrapper.
+import host { hostInput, hostOutput }
+import outline { Outlines, Recorder }
+import libm
+import harfrust.lib {
+  Buffer,
+  Direction,
+  Feature,
+  ParseError,
+  Script,
+  Shaper,
+  ShaperData,
+  DefaultFontFuncs,
+  ShapeError,
+  Variation,
+  GlyphInfo,
+  GlyphPosition,
+  shapeWithFeatures
+}
+import harfrust.script as ScriptTags
+import read_fonts.lib { FontRef, ReadError, TableProvider, Fvar }
+import read_fonts.tables.fvar { AxisInstanceArrays, VariationAxisRecord }
+import read_fonts.model.metrics.global { Metrics, LineBox }
+import read_fonts.model.name.glyph { GlyphNameMap, GlyphName }
+import font_types.lib { F2Dot14, F48Dot16, Fixed, GlyphId, Tag }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.effect { Effect }
+import silk.mem.pointer { Pointer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i16
+import silk.num.usize
+
+/// Input slots the host fills.
+const FONT: u32 = 0
+
+const TEXT: u32 = 1
+
+const FEATURES: u32 = 2
+
+const VARIATIONS: u32 = 3
+
+const DIRECTION: u32 = 4
+
+const SCRIPT: u32 = 5
+
+const LANGUAGE: u32 = 6
+
+/// Output kinds the host receives.
+const GLYPHS: u32 = 0
+
+const PATHS: u32 = 1
+
+const INFO: u32 = 2
+
+const NAMES: u32 = 3
+
+const COORDS: u32 = 4
+
+/// Status codes returned by the exports.
+const OK: i32 = 0
+
+const INVALID_FONT: i32 = 1
+
+const INVALID_TEXT: i32 = 2
+
+const INVALID_OPTION: i32 = 3
+
+const SHAPE_FAILED: i32 = 4
+
+const OUT_OF_MEMORY: i32 = 5
+
+/// Flags for `hr_shape`.
+const WANT_PATHS: u32 = 1
+
+const WANT_NAMES: u32 = 2
+
+pub fn main() -> i32 {
+  return 0
+}
+
+effect fn input(slot: u32, length: u32) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bytes = run Bytes.zeroed(u32.toUsize(length))
+  if length != 0 {
+    unsafe {
+      hostInput(slot, Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut bytes)), length)
+    }
+  }
+  return move bytes
+}
+
+fn output(kind: u32, bytes: &[u8]) -> () {
+  unsafe {
+    hostOutput(kind, Pointer.fromSlice<u8>(bytes), usize.toU32(bytes.length))
+  }
+}
+
+fn outputValues<T>(kind: u32, values: &[T], size: usize) -> () {
+  match move Pointer.nonNullMany<T>(Pointer.fromSlice<T>(values)) {
+    Option<[*]const T>.Some { value: first } => {
+      unsafe {
+        hostOutput(
+          kind,
+          Pointer.bytes<T>(Pointer.at<T>(first, 0)),
+          usize.toU32(values.length * size),
+        )
+      }
+    }
+    _ => {
+      let empty: [u8; 0] = []
+      output(kind, &empty)
+    }
+  }
+}
+
+fn outputI32(kind: u32, values: &[i32]) -> () {
+  outputValues<i32>(kind, values, 4)
+}
+
+fn outputF32(kind: u32, values: &[f32]) -> () {
+  outputValues<f32>(kind, values, 4)
+}
+
+fn readU32(bytes: &[u8], at: usize) -> u32 {
+  return u8.toU32(bytes[at]) | u8.toU32(bytes[at + 1]) * 0x100 | u8.toU32(bytes[at + 2]) * 0x10000
+    | u8.toU32(bytes[at + 3]) * 0x1000000
+}
+
+fn text(bytes: &Bytes) -> Option<string> {
+  return match move String.fromUtf8(Bytes.asSlice(bytes)) {
+    Result<string, InvalidUtf8>.Success { value } => Option<string>.some(value)
+    _ => Option<string>.None
+  }
+}
+
+/// Parses comma-separated HarfBuzz feature strings such as `-liga,ss01,kern[3:5]=0`.
+effect fn features(source: string) -> Option<List<Feature>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Feature>.make()
+  let bytes = String.utf8Bytes(source)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i <= bytes.length {
+    if i == bytes.length || bytes[i] == 44 {
+      if i > start {
+        match move Feature.parse(String.slice(source, start, i - start)) {
+          Result<Feature, ParseError>.Success { value } => {
+            run List<Feature>.append(&mut list, value)
+          }
+          _ => {
+            return Option<List<Feature>>.None
+          }
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return Option<List<Feature>>.some(move list)
+}
+
+/// Reads little-endian `(tag: u32, value: f32)` pairs.
+effect fn variations(bytes: &[u8]) -> List<Variation>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Variation>.make()
+  let mut at: usize = 0
+  while at + 8 <= bytes.length {
+    run List<Variation>.append(
+      &mut list,
+      Variation.new(Tag.fromU32(readU32(bytes, at)), f32.fromBits(readU32(bytes, at + 4))),
+    )
+    at = at + 8
+  }
+  return move list
+}
+
+effect fn shapeRequest(
+  fontLength: u32,
+  faceIndex: u32,
+  textLength: u32,
+  featuresLength: u32,
+  variationsLength: u32,
+  directionLength: u32,
+  scriptLength: u32,
+  languageLength: u32,
+  flags: u32,
+) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fontBytes = run input(FONT, fontLength)
+  let textBytes = run input(TEXT, textLength)
+  let featureBytes = run input(FEATURES, featuresLength)
+  let variationBytes = run input(VARIATIONS, variationsLength)
+  let directionBytes = run input(DIRECTION, directionLength)
+  let scriptBytes = run input(SCRIPT, scriptLength)
+  let languageBytes = run input(LANGUAGE, languageLength)
+  let font = match move FontRef.fromIndex(Bytes.asSlice(&fontBytes), faceIndex) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      return INVALID_FONT
+    }
+  }
+  let content = match move text(&textBytes) {
+    Option<string>.Some { value } => value
+    _ => {
+      return INVALID_TEXT
+    }
+  }
+  let featureText = match move text(&featureBytes) {
+    Option<string>.Some { value } => value
+    _ => {
+      return INVALID_OPTION
+    }
+  }
+  let parsedFeatures = match move run features(featureText) {
+    Option<List<Feature>>.Some { value } => move value
+    _ => {
+      return INVALID_OPTION
+    }
+  }
+  let parsedVariations = run variations(Bytes.asSlice(&variationBytes))
+
+  let data = ShaperData.new(&font)
+  let mut shaper = Shaper.withFuncs(&data, DefaultFontFuncs {})
+  run Shaper.setVariations(&mut shaper, List<Variation>.asSlice(&parsedVariations))
+
+  let mut buffer = Buffer.new()
+  run Buffer.pushStr(&mut buffer, content)
+  if directionLength != 0 {
+    if let Option<string>.Some { value } = text(&directionBytes) {
+      buffer.direction = Direction.parse(value)
+        |> Result<Direction, ParseError>.unwrapOr(Direction.Invalid)
+    }
+  }
+  if scriptLength != 0 {
+    if let Option<string>.Some { value } = text(&scriptBytes) {
+      if let Result<Script, ParseError>.Success { value: script } = ScriptTags.parse(value) {
+        buffer.script = script.value
+      }
+    }
+  }
+  if languageLength != 0 {
+    if let Option<string>.Some { value } = text(&languageBytes) {
+      run Buffer.setLanguage(&mut buffer, value)
+    }
+  }
+  Buffer.guessSegmentProperties(&mut buffer)
+  let result = run shapeWithFeatures(&shaper, &mut buffer, List<Feature>.asSlice(&parsedFeatures))
+  if let Result<(), ShapeError>.Failure { error } = move result {
+    return SHAPE_FAILED
+  }
+
+  // Six i32 per glyph: glyph id, cluster, x advance, y advance, x offset, y offset.
+  let infos = Buffer.glyphInfos(&buffer)
+  let positions = Buffer.glyphPositions(&buffer)
+  let count = infos.len()
+  let mut records = List<i32>.make()
+  run List<i32>.reserve(&mut records, count * 6 + 2)
+  run List<i32>.append(&mut records, directionCode(buffer.direction))
+  run List<i32>.append(&mut records, u32.wrappingToI32(buffer.script))
+  let mut i: usize = 0
+  while i < count {
+    let info = infos.get(i)
+      |> Option<GlyphInfo>.unwrapOr(GlyphInfo { glyphId: 0, cluster: 0, flags: 0 })
+    let position = positions.get(i) |> Option<GlyphPosition>.unwrapOr(GlyphPosition.zero())
+    run List<i32>.appendSlice(
+      &mut records,
+      &[
+        u32.wrappingToI32(info.glyphId),
+        u32.wrappingToI32(info.cluster),
+        position.xAdvance,
+        position.yAdvance,
+        position.xOffset,
+        position.yOffset,
+      ],
+    )
+    i = i + 1
+  }
+  outputI32(GLYPHS, List<i32>.asSlice(&records))
+
+  let coords = Shaper.normalizedCoords(&shaper)
+  if (flags & WANT_PATHS) != 0 {
+    let metrics = Metrics.fromSfnt(&font, coords)
+    let outlines = Outlines.new(&font, metrics.numGlyphs, metrics.unitsPerEm)
+    let mut commands = List<f32>.make()
+    i = 0
+    while i < count {
+      let glyph = List<i32>.get(&records, 2 + i * 6)
+
+      // Each glyph's outline is sent once per call, in first-use order.
+      let mut seen = false
+      let mut j: usize = 0
+      while j < i {
+        if List<i32>.get(&records, 2 + j * 6) == glyph {
+          seen = true
+          break
+        }
+        j = j + 1
+      }
+      if !seen {
+        List<f32>.clear(&mut commands)
+        run List<f32>.append(&mut commands, i32.toF32(glyph))
+        let mut sink = Recorder { out: &mut commands, failed: false }
+        let drawn = run Outlines.draw(&outlines, GlyphId.new(i32.toU32(glyph)), coords, &mut sink)
+        if sink.failed {
+          fail OutOfMemoryError {}
+        }
+        if !drawn {
+          List<f32>.truncate(&mut commands, 1)
+        }
+        outputF32(PATHS, List<f32>.asSlice(&commands))
+      }
+      i = i + 1
+    }
+  }
+  if (flags & WANT_NAMES) != 0 {
+    let names = GlyphNameMap.new(&font)
+    let mut joined = String.make()
+    i = 0
+    while i < count {
+      if i != 0 {
+        run String.append(&mut joined, "\n")
+      }
+      let glyph = GlyphId.new(i32.toU32(List<i32>.get(&records, 2 + i * 6)))
+      if let Option<GlyphName>.Some { value } = GlyphNameMap.glyphName(&names, glyph) {
+        run String.append(&mut joined, GlyphName.asStr(&value))
+      }
+      i = i + 1
+    }
+    output(NAMES, String.utf8Bytes(String.view(&joined)))
+  }
+  let mut coordBits = List<i32>.make()
+  i = 0
+  while i < coords.length {
+    run List<i32>.append(&mut coordBits, i16.toI32(F2Dot14.toBits(coords[i])))
+    i = i + 1
+  }
+  outputI32(COORDS, List<i32>.asSlice(&coordBits))
+  return OK
+}
+
+fn lineValue(value: F48Dot16) -> i32 {
+  return F48Dot16.toI32(value)
+}
+
+/// Font summary as i32 values: units per em, ascender, descender, line gap, glyph count, axis
+/// count, then per axis its tag and minimum, default and maximum as 16.16 fixed point.
+effect fn infoRequest(fontLength: u32, faceIndex: u32) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fontBytes = run input(FONT, fontLength)
+  let font = match move FontRef.fromIndex(Bytes.asSlice(&fontBytes), faceIndex) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      return INVALID_FONT
+    }
+  }
+  let none: [F2Dot14; 0] = []
+  let metrics = Metrics.fromSfnt(&font, &none)
+  let mut values = List<i32>.make()
+  run List<i32>.append(&mut values, u16.toI32(metrics.unitsPerEm))
+  match move Metrics.hLine(&metrics) {
+    Option<LineBox<F48Dot16>>.Some { value } => {
+      run List<i32>.appendSlice(
+        &mut values,
+        &[lineValue(value.ascender), lineValue(value.descender), lineValue(value.lineGap)],
+      )
+    }
+    _ => {
+      run List<i32>.appendSlice(
+        &mut values,
+        &[u32.wrappingToI32(u16.toU32(metrics.unitsPerEm)), 0, 0],
+      )
+    }
+  }
+  run List<i32>.append(&mut values, u32.wrappingToI32(metrics.numGlyphs))
+  if let Result<Fvar, ReadError>.Success { value: fvar } = TableProvider.fvar(&font) {
+    let mut count: usize = 0
+    let mut axisValues = List<i32>.make()
+    if let Result<AxisInstanceArrays, ReadError>.Success {
+      value: arrays
+    } = Fvar.axisInstanceArrays(&fvar) {
+      let axes = AxisInstanceArrays.axes(&arrays)
+      let mut i: usize = 0
+      while i < axes.len() {
+        if let Result<VariationAxisRecord, ReadError>.Success { value: axis } = axes.get(i) {
+          run List<i32>.appendSlice(
+            &mut axisValues,
+            &[
+              u32.wrappingToI32(Tag.toU32(VariationAxisRecord.axisTag(&axis))),
+              Fixed.toBits(VariationAxisRecord.minValue(&axis)),
+              Fixed.toBits(VariationAxisRecord.defaultValue(&axis)),
+              Fixed.toBits(VariationAxisRecord.maxValue(&axis)),
+            ],
+          )
+          count = count + 1
+        }
+        i = i + 1
+      }
+    }
+    run List<i32>.append(&mut values, usize.toI32(count))
+    run List<i32>.appendSlice(&mut values, List<i32>.asSlice(&axisValues))
+  } else {
+    run List<i32>.append(&mut values, 0)
+  }
+  outputI32(INFO, List<i32>.asSlice(&values))
+  return OK
+}
+
+effect fn outOfMemory(error: OutOfMemoryError) -> i32 {
+  drop error
+  return OUT_OF_MEMORY
+}
+
+/// Shapes the text and reports glyphs, then outlines and names when `flags` asks for them, then
+/// the normalized variation coordinates. Returns a status code.
+export "C" fn shape(
+  fontLength: u32,
+  faceIndex: u32,
+  textLength: u32,
+  featuresLength: u32,
+  variationsLength: u32,
+  directionLength: u32,
+  scriptLength: u32,
+  languageLength: u32,
+  flags: u32,
+) -> i32 as "hr_shape" {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    shapeRequest(
+      fontLength,
+      faceIndex,
+      textLength,
+      featuresLength,
+      variationsLength,
+      directionLength,
+      scriptLength,
+      languageLength,
+      flags,
+    ),
+    outOfMemory,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Reports the font summary described at `infoRequest`. Returns a status code.
+export "C" fn info(fontLength: u32, faceIndex: u32) -> i32 as "hr_font_info" {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(infoRequest(fontLength, faceIndex), outOfMemory)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn directionCode(direction: Direction) -> i32 {
+  return match direction {
+    Direction.LeftToRight => 1
+    Direction.RightToLeft => 2
+    Direction.TopToBottom => 3
+    Direction.BottomToTop => 4
+    _ => 0
+  }
+}
