@@ -1,0 +1,394 @@
+//! Records a [`Scene`] into render passes on an RGBA8Unorm target.
+//!
+//! A scene without layers draws every run in one instanced pass onto the target. With layers,
+//! the root and each layer and mask get their own texture; popping a layer copies its parent and
+//! composites the two in `shaders/compose.wgsl`, and the root is copied to the target at the end.
+import webgpu.resources as gpu
+import webgpu.resources { Buffer, RenderPipeline, Texture, TextureView, Queue, CommandEncoder }
+import webgpu.runtime { Adapter, Device, GpuError }
+import webgpu.descriptors {
+  BufferDescriptor, Color, RenderPassColorAttachment, RenderPassDescriptor, VertexState, FragmentState,
+  ColorTargetState, BlendComponent, BlendState, PrimitiveState, MultisampleState, RenderPipelineDescriptor,
+  BindGroupEntry, BindGroupDescriptor, TextureDescriptor, TextureViewDescriptor, Extent3D, TexelCopyTextureInfo,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import vector.pixmap { Rgba8 }
+import scene { Scene, COMMAND_BYTES, OP_DRAW, OP_PUSH, OP_POP_LAYER, OP_POP_MASK, NO_MASK, MASK_LUMINANCE }
+import generated_shaders as shaders
+
+/// The target format the pipeline renders to.
+pub const FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
+
+const NATIVE_FEATURES: [u32; 1] = [gpu.SHADER_MODULE_COMPILATION_OPTIONS]
+
+const WEB_FEATURES: [u32; 0] = []
+
+/// Strict math where the device has Dawn's compilation options (Metal needs it for exact image
+/// sampling); the ordinary module elsewhere. Vulkan and D3D compile WGSL without fast-math
+/// contraction, so lavapipe matches the CPU without it.
+effect fn sceneShader(device: &Device) -> gpu.ShaderModule
+  ! GpuError {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return run gpu.createShaderModule(device, b"vector scene", shaders.scene())
+  } else {
+    if device.hasFeature(gpu.SHADER_MODULE_COMPILATION_OPTIONS) {
+      return run gpu.createShaderModuleStrict(device, b"vector scene", shaders.scene())
+    }
+    return run gpu.createShaderModule(device, b"vector scene", shaders.scene())
+  }
+}
+
+pub struct SceneRenderer {
+  pipeline: RenderPipeline,
+  compose: RenderPipeline,
+  /// Layer textures kept between renders, all `layerWidth` x `layerHeight`; see [`Layers`].
+  layers: List<Layer>,
+  layerWidth: u32,
+  layerHeight: u32,
+  /// The scene's canvas, runs, alphas, paints and ramps buffers, kept between renders and
+  /// replaced only when a scene outgrows one.
+  buffers: List<Buffer>,
+  /// One 16-byte uniform per compose pass of a render, kept between renders.
+  params: List<Buffer>,
+}
+
+const COMPOSE_LAYER: u32 = 0
+const COMPOSE_MASK: u32 = 1
+const COMPOSE_COPY: u32 = 2
+const HAS_MASK: u32 = 1
+const LUMINANCE: u32 = 2
+
+/// A canvas-sized texture the renderer draws into and reads from.
+struct Layer {
+  texture: Texture,
+  view: TextureView,
+}
+
+fn readU32(bytes: &[u8], offset: usize) -> u32 {
+  return u8.toU32(bytes[offset]) | u32.shiftLeft(u8.toU32(bytes[offset + 1]), 8) | u32.shiftLeft(u8.toU32(bytes[offset + 2]), 16) | u32.shiftLeft(u8.toU32(bytes[offset + 3]), 24)
+}
+
+pub fn extent(width: u32, height: u32) -> Extent3D {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  return size
+}
+
+effect fn makeLayer(device: &Device, width: u32, height: u32) -> Layer ! GpuError {
+  let mut descriptor = TextureDescriptor.default().withLabel(b"scene layer")
+  descriptor.setSize(extent(width, height))
+  descriptor.setFormat(FORMAT)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopySrc | flags.WGPUTextureUsage_CopyDst)
+  let texture = run gpu.createTexture(device, &descriptor)
+  let view = run texture.createView(&TextureViewDescriptor.default())
+  return Layer { texture: move texture, view: move view }
+}
+
+fn colorOf(background: Rgba8) -> Color {
+  let premultiplied = background.premultiply()
+  let mut clear = Color.default()
+  clear.setR(u8.toF64(premultiplied.r) / 255.0)
+  clear.setG(u8.toF64(premultiplied.g) / 255.0)
+  clear.setB(u8.toF64(premultiplied.b) / 255.0)
+  clear.setA(u8.toF64(premultiplied.a) / 255.0)
+  return clear
+}
+
+/// A pass on `view` that clears it to `clear`, or keeps its contents when `load` is true, and
+/// draws runs `start .. end`.
+effect fn drawRuns(encoder: &mut CommandEncoder, view: &TextureView, pipeline: &RenderPipeline, group: &gpu.BindGroup, load: bool, clear: Color, start: u32, end: u32) -> () ! GpuError {
+  let mut color = RenderPassColorAttachment.default().withView(view)
+  color.setClearValue(clear)
+  color.setLoadOp(if load { flags.WGPULoadOp_Load } else { flags.WGPULoadOp_Clear })
+  color.setStoreOp(flags.WGPUStoreOp_Store)
+  let colors = [color]
+  let passDescriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+  let mut pass = run encoder.beginRenderPass(&passDescriptor)
+  if end > start {
+    pass.setPipeline(pipeline)
+    pass.setBindGroup(0, group, &[])
+    pass.draw(6, end - start, 0, start)
+  }
+  pass.end()
+}
+
+/// Premultiplied source-over: the blend unit computes `s + d (1 - as)` exactly for unorm8.
+fn premultipliedOver() -> BlendComponent {
+  let mut component = BlendComponent.default()
+  component.setOperation(flags.WGPUBlendOperation_Add)
+  component.setSrcFactor(flags.WGPUBlendFactor_One)
+  component.setDstFactor(flags.WGPUBlendFactor_OneMinusSrcAlpha)
+  return component
+}
+
+pub effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8], usage: u64) -> Buffer ! GpuError {
+  // Bindings must not be empty; keep at least 16 bytes.
+  let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(label, usize.toU64(size), usage | flags.WGPUBufferUsage_CopyDst, false))
+  if bytes.length > 0 && bytes.length % 4 == 0 { queue.writeBuffer(&buffer, 0, bytes) }
+  return move buffer
+}
+
+/// Writes `bytes` into buffer `index` of `slots`, replacing it with a bigger one (or appending
+/// it, when `index` is `slots.length()`) if it is too small. Shaders bound to these buffers
+/// read only the lengths the scene header gives, so a larger buffer is harmless.
+pub effect fn upload(device: &Device, queue: &Queue, slots: &mut List<Buffer>, index: usize, label: &[u8], bytes: &[u8], usage: u64)
+  -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+  if index < slots.length() {
+    let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
+    if slots.asSlice()[index].getSize() >= usize.toU64(size) {
+      if bytes.length > 0 && bytes.length % 4 == 0 { queue.writeBuffer(&slots.asSlice()[index], 0, bytes) }
+      return
+    }
+  }
+  let buffer = run storage(device, queue, label, bytes, usage)
+  if index < slots.length() {
+    slots.set(index, move buffer)
+  } else {
+    run slots.append(move buffer)
+  }
+}
+
+pub fn entry<'a>(binding: u32, buffer: &'a Buffer) -> BindGroupEntry<'a> {
+  let mut result = BindGroupEntry.default().withBuffer(buffer)
+  result.setBinding(binding)
+  result.setSize(buffer.getSize())
+  return result
+}
+
+pub fn textureEntry<'a>(binding: u32, view: &'a TextureView) -> BindGroupEntry<'a> {
+  let mut result = BindGroupEntry.default().withTextureView(view)
+  result.setBinding(binding)
+  return result
+}
+
+impl SceneRenderer {
+  /// Pass these features to `DeviceDescriptor.withRequiredFeatures` when creating the device:
+  /// Dawn's strict-math module option where `adapter` offers it (Metal), nothing elsewhere.
+  /// Browser WGSL has no equivalent feature, so exact CPU image parity is not promised there.
+  pub fn requiredFeatures(adapter: &Adapter) -> &'static [u32] {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return &WEB_FEATURES
+    } else {
+      if adapter.hasFeature(gpu.SHADER_MODULE_COMPILATION_OPTIONS) { return &NATIVE_FEATURES }
+      return &WEB_FEATURES
+    }
+  }
+
+  pub effect fn make(device: &Device) -> SceneRenderer
+    ! GpuError {
+    let shader = run sceneShader(device)
+    let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs")
+    let mut blend = BlendState.default()
+    blend.setColor(premultipliedOver())
+    blend.setAlpha(premultipliedOver())
+    let mut target: ColorTargetState = ColorTargetState.default().withBlend(&blend)
+    target.setFormat(FORMAT)
+    target.setWriteMask(flags.WGPUColorWriteMask_All)
+    let targets = [target]
+    let fragment = FragmentState.default().withModule(&shader).withEntryPoint(b"fs").withTargets(&targets)
+    let mut primitive: PrimitiveState = PrimitiveState.default()
+    primitive.setTopology(flags.WGPUPrimitiveTopology_TriangleList)
+    let mut multisample: MultisampleState = MultisampleState.default()
+    multisample.setCount(1)
+    let mut descriptor = RenderPipelineDescriptor.default().withVertex(vertex).withFragment(&fragment)
+    descriptor.setPrimitive(primitive)
+    descriptor.setMultisample(multisample)
+    let pipeline = run gpu.createRenderPipeline(device, &descriptor)
+
+    // Composition writes exact bytes, so it does not blend.
+    let composeShader = run gpu.createShaderModule(device, b"vector compose", shaders.compose())
+    let composeVertex = VertexState.default().withModule(&composeShader).withEntryPoint(b"vs")
+    let mut plain: ColorTargetState = ColorTargetState.default()
+    plain.setFormat(FORMAT)
+    plain.setWriteMask(flags.WGPUColorWriteMask_All)
+    let plainTargets = [plain]
+    let composeFragment = FragmentState.default().withModule(&composeShader).withEntryPoint(b"fs").withTargets(&plainTargets)
+    let mut composeDescriptor = RenderPipelineDescriptor.default().withVertex(composeVertex).withFragment(&composeFragment)
+    composeDescriptor.setPrimitive(primitive)
+    composeDescriptor.setMultisample(multisample)
+    let compose = run gpu.createRenderPipeline(device, &composeDescriptor)
+    return SceneRenderer { pipeline: move pipeline, compose: move compose, layers: List<Layer>.make(), layerWidth: 0, layerHeight: 0, buffers: List<Buffer>.make(), params: List<Buffer>.make() }
+  }
+
+  /// Clears `target` to the premultiplied form of `background` and draws `scene` on it, then
+  /// submits. `target` must be `scene.width()` x `scene.height()` and RGBA8Unorm.
+  pub effect fn render(self: &mut Self, device: &Device, queue: &Queue, scene: &Scene, target: &TextureView, background: Rgba8)
+    -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let mut header: [u8; 16] = [0; 16]
+    writeU32(&mut header, 0, scene.width())
+    writeU32(&mut header, 4, scene.height())
+    writeU32(&mut header, 8, scene.runCount())
+    let commands = scene.commands()
+    if commands.length != 0 { run self.reserveLayers(device, queue, scene) }
+    run upload(device, queue, &mut self.buffers, 0, b"scene canvas", &header, flags.WGPUBufferUsage_Uniform)
+    run upload(device, queue, &mut self.buffers, 1, b"scene runs", scene.runs(), flags.WGPUBufferUsage_Storage)
+    run upload(device, queue, &mut self.buffers, 2, b"scene alphas", scene.alphas(), flags.WGPUBufferUsage_Storage)
+    run upload(device, queue, &mut self.buffers, 3, b"scene paints", scene.paints(), flags.WGPUBufferUsage_Storage)
+    run upload(device, queue, &mut self.buffers, 4, b"scene ramps", scene.ramps(), flags.WGPUBufferUsage_Storage)
+    let layout = run self.pipeline.getBindGroupLayout(0)
+    let b = self.buffers.asSlice()
+    let entries = [entry(0, &b[0]), entry(1, &b[1]), entry(2, &b[2]), entry(3, &b[3]), entry(4, &b[4])]
+    let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+    let group = run gpu.createBindGroup(device, &groupDescriptor)
+
+    let mut encoder = run gpu.createCommandEncoder(device, b"vector scene")
+    if commands.length == 0 {
+      run drawRuns(&mut encoder, target, &self.pipeline, &group, false, colorOf(background), 0, scene.runCount())
+    } else {
+      run self.renderLayers(device, queue, &mut encoder, scene, &group, target, background)
+    }
+    let finished = run encoder.finish(b"vector scene")
+    queue.submit(&[finished.reference()])
+  }
+
+  /// Grows the pooled layers and compose uniforms to what `scene` uses: 0 is the root, 1 the copy of a parent being
+  /// composited onto, then one per pushed layer in push order, then one per mask. Every pass
+  /// clears or overwrites a layer before reading it, so reused textures need no clearing.
+  effect fn reserveLayers(self: &mut Self, device: &Device, queue: &Queue, scene: &Scene) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let width = scene.width()
+    let height = scene.height()
+    if width != self.layerWidth || height != self.layerHeight {
+      self.layers.clear()
+      self.layerWidth = width
+      self.layerHeight = height
+    }
+    let commands = scene.commands()
+    let count = commands.length / COMMAND_BYTES
+    let mut pushes: u32 = 0
+    let mut pops: usize = 0
+    let mut c: usize = 0
+    while c < count {
+      let op = readU32(commands, c * COMMAND_BYTES)
+      if op == OP_PUSH { pushes = pushes + 1 }
+      if op == OP_POP_LAYER || op == OP_POP_MASK { pops = pops + 1 }
+      c = c + 1
+    }
+    let total = u32.toUsize(2 + pushes + scene.maskCount())
+    while self.layers.length() < total {
+      let layer = run makeLayer(device, width, height)
+      run self.layers.append(move layer)
+    }
+    // Every pop composes once and the final copy once more.
+    let zeros: [u8; 16] = [0; 16]
+    while self.params.length() < pops + 1 {
+      let buffer = run storage(device, queue, b"compose params", &zeros, flags.WGPUBufferUsage_Uniform)
+      run self.params.append(move buffer)
+    }
+  }
+
+  effect fn renderLayers(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, scene: &Scene, group: &gpu.BindGroup, target: &TextureView, background: Rgba8)
+    -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let commands = scene.commands()
+    let count = commands.length / COMMAND_BYTES
+    let mut pushes: u32 = 0
+    let mut c: usize = 0
+    while c < count {
+      if readU32(commands, c * COMMAND_BYTES) == OP_PUSH { pushes = pushes + 1 }
+      c = c + 1
+    }
+    let width = scene.width()
+    let height = scene.height()
+    let layers = &self.layers
+    let maskBase = 2 + pushes
+    let transparent = colorOf(Rgba8.make(0, 0, 0, 0))
+    run drawRuns(&mut encoder, &layers.asSlice()[0].view, &self.pipeline, group, false, colorOf(background), 0, 0)
+    // Indices into `layers` of the open layers; the last is the current target.
+    let mut stack = List<u32>.make()
+    run stack.append(0)
+    let mut nextPush: u32 = 2
+    let mut pass: usize = 0
+    let mut drawn: u32 = 0
+    c = 0
+    while c < count {
+      let at = c * COMMAND_BYTES
+      let op = readU32(commands, at)
+      let a = readU32(commands, at + 4)
+      let b = readU32(commands, at + 8)
+      let d = readU32(commands, at + 12)
+      let current = u32.toUsize(stack.asSlice()[stack.length() - 1])
+      if op == OP_DRAW {
+        run drawRuns(&mut encoder, &layers.asSlice()[current].view, &self.pipeline, group, true, transparent, a, b)
+        drawn = b
+      } else if op == OP_PUSH {
+        run drawRuns(&mut encoder, &layers.asSlice()[u32.toUsize(nextPush)].view, &self.pipeline, group, false, transparent, 0, 0)
+        run stack.append(nextPush)
+        nextPush = nextPush + 1
+      } else if op == OP_POP_LAYER {
+        let ignored = stack.pop()
+        let parent = u32.toUsize(stack.asSlice()[stack.length() - 1])
+        let list = layers.asSlice()
+        let source = TexelCopyTextureInfo.default().withTexture(&list[parent].texture)
+        let copy = TexelCopyTextureInfo.default().withTexture(&list[1].texture)
+        encoder.copyTextureToTexture(&source, &copy, &extent(width, height))
+        let hasMask = d != NO_MASK
+        let mask = if hasMask { u32.toUsize(maskBase + d) } else { current }
+        run self.composePass(device, queue, &mut encoder, pass, &list[parent].view, COMPOSE_LAYER, a, b, if hasMask { HAS_MASK } else { 0 },
+          &list[1].view, &list[current].view, &list[mask].view)
+        pass = pass + 1
+      } else if op == OP_POP_MASK {
+        let ignored = stack.pop()
+        let list = layers.asSlice()
+        let hasMask = d != NO_MASK
+        let clip = if hasMask { u32.toUsize(maskBase + d) } else { current }
+        let mut maskFlags = if hasMask { HAS_MASK } else { 0 }
+        if b == MASK_LUMINANCE { maskFlags = maskFlags | LUMINANCE }
+        run self.composePass(device, queue, &mut encoder, pass, &list[u32.toUsize(maskBase + a)].view, COMPOSE_MASK, 0, 255, maskFlags,
+          &list[current].view, &list[current].view, &list[clip].view)
+        pass = pass + 1
+      }
+      c = c + 1
+    }
+    let list = layers.asSlice()
+    if scene.runCount() > drawn {
+      run drawRuns(&mut encoder, &list[0].view, &self.pipeline, group, true, transparent, drawn, scene.runCount())
+    }
+    run self.composePass(device, queue, &mut encoder, pass, target, COMPOSE_COPY, 0, 255, 0, &list[0].view, &list[0].view, &list[0].view)
+  }
+
+  /// A full-target pass of `shaders/compose.wgsl` writing `output`, with its parameters in
+  /// uniform `slot` (each pass of a render needs its own: writes land before the submit).
+  effect fn composePass(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, slot: usize, output: &TextureView, op: u32, mode: u32, opacity: u32, composeFlags: u32,
+    backdrop: &TextureView, layer: &TextureView, mask: &TextureView) -> () ! GpuError {
+    let mut header: [u8; 16] = [0; 16]
+    writeU32(&mut header, 0, op)
+    writeU32(&mut header, 4, mode)
+    writeU32(&mut header, 8, opacity)
+    writeU32(&mut header, 12, composeFlags)
+    let params = &self.params.asSlice()[slot]
+    queue.writeBuffer(params, 0, &header)
+    let layout = run self.compose.getBindGroupLayout(0)
+    let entries = [
+      entry(0, params), textureEntry(1, backdrop), textureEntry(2, layer), textureEntry(3, mask),
+    ]
+    let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+    let group = run gpu.createBindGroup(device, &groupDescriptor)
+    let mut color = RenderPassColorAttachment.default().withView(output)
+    color.setLoadOp(flags.WGPULoadOp_Clear)
+    color.setStoreOp(flags.WGPUStoreOp_Store)
+    let colors = [color]
+    let passDescriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+    let mut pass = run encoder.beginRenderPass(&passDescriptor)
+    pass.setPipeline(&self.compose)
+    pass.setBindGroup(0, &group, &[])
+    pass.draw(3, 1, 0, 0)
+    pass.end()
+  }
+}
+
+pub fn writeU32(bytes: &mut [u8], offset: usize, value: u32) -> () {
+  bytes[offset] = u32.toU8(value & 255)
+  bytes[offset + 1] = u32.toU8(u32.shiftRight(value, 8) & 255)
+  bytes[offset + 2] = u32.toU8(u32.shiftRight(value, 16) & 255)
+  bytes[offset + 3] = u32.toU8(u32.shiftRight(value, 24))
+}

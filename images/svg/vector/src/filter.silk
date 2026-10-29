@@ -1,0 +1,2214 @@
+//! Filter primitives (Filter Effects Module Level 1) on premultiplied RGBA8 pixmaps.
+//!
+//! Each primitive writes its whole `out` pixmap: pixels inside the primitive subregion
+//! `region` get the result, every other pixel is transparent black. Inputs and outputs have the
+//! canvas size. Pixels outside an input's own region are transparent, so blurs and offsets see
+//! transparent black past the edges (`edgeMode="none"`). Primitives work on whatever color
+//! space the caller rendered in: for `color-interpolation-filters: linearRGB` (the default),
+//! convert with [`toLinear`] before and [`toSrgb`] after.
+//!
+//! Integer primitives (flood, offset, blur, merge and the Porter-Duff composites) are exact, so
+//! the GPU versions match them byte for byte; the matrix and arithmetic ones compute in f32.
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.simd.simd
+import silk.simd.u8x16
+import silk.simd.u32x4
+import silk.simd.i32x4
+import silk.simd.f32x4
+import silk.num.usize
+import strips { minU32 }
+import pixmap { Pixmap, Rgba8, div255 }
+import layer as layering
+import geometry { Affine, Point }
+import color_space { srgbToLinear, linearToSrgb, pow, exp }
+
+/// A pixel rectangle `x0 .. x1` by `y0 .. y1`, the primitive subregion in device pixels.
+pub struct Region {
+  pub x0: u32,
+  pub y0: u32,
+  pub x1: u32,
+  pub y1: u32,
+}
+
+impl Copy for Region {}
+
+impl Region {
+  pub fn make(x0: u32, y0: u32, x1: u32, y1: u32) -> Region {
+    return Region { x0: x0, y0: y0, x1: x1, y1: y1 }
+  }
+
+  /// The whole of `pixmap`.
+  pub fn of(pixmap: &Pixmap) -> Region {
+    return Region { x0: 0, y0: 0, x1: pixmap.width(), y1: pixmap.height() }
+  }
+
+  /// The region limited to a `width` x `height` canvas.
+  pub fn clampTo(self: &Self, width: u32, height: u32) -> Region {
+    let x1 = minU32(self.x1, width)
+    let y1 = minU32(self.y1, height)
+    return Region { x0: minU32(self.x0, x1), y0: minU32(self.y0, y1), x1: x1, y1: y1 }
+  }
+
+  pub fn contains(self: &Self, x: u32, y: u32) -> bool {
+    return x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+  }
+}
+
+fn clear(out: &mut Pixmap) -> () {
+  out.clear(Rgba8.make(0, 0, 0, 0))
+}
+
+fn load(d: &[u8], i: usize) -> Rgba8 with Intrinsic.inlineAlways() {
+  return Rgba8 { r: d[i], g: d[i + 1], b: d[i + 2], a: d[i + 3] }
+}
+
+fn store(d: &mut [u8], i: usize, c: Rgba8) -> () with Intrinsic.inlineAlways() {
+  d[i] = c.r
+  d[i + 1] = c.g
+  d[i + 2] = c.b
+  d[i + 3] = c.a
+}
+
+/// `feFlood`: `color` (straight alpha) times `opacity` (0..=255) over the region.
+pub fn flood(out: &mut Pixmap, color: Rgba8, opacity: u8, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let a = div255(u8.toU32(color.a) * u8.toU32(opacity))
+  let c = Rgba8.make(color.r, color.g, color.b, u32.toU8(a)).premultiply()
+  let stride = u32.toUsize(out.width()) * 4
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, c)
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `feOffset` by whole device pixels (callers round `dx`, `dy` after the transform).
+pub fn offset(out: &mut Pixmap, input: &Pixmap, dx: i32, dy: i32, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let w = u32.toI64(input.width())
+  let h = u32.toI64(input.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let inStride = u32.toUsize(input.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let sy = u32.toI64(y) - i32.toI64(dy)
+    let mut x = r.x0
+    while x < r.x1 {
+      let sx = u32.toI64(x) - i32.toI64(dx)
+      if sx >= 0 && sy >= 0 && sx < w && sy < h {
+        let j = i64.toUsize(sy) * inStride + i64.toUsize(sx) * 4
+        store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, load(s, j))
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `feMerge` step: composites `input` source-over onto `out` inside the region. Start from a
+/// transparent `out` (or [`copy`] the first input) and call it once per `feMergeNode`.
+pub fn mergeOver(out: &mut Pixmap, input: &Pixmap, region: Region) -> () {
+  let r = region.clampTo(out.width(), out.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let inStride = u32.toUsize(input.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < minU32(r.y1, input.height()) {
+    let mut x = r.x0
+    while x < minU32(r.x1, input.width()) {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      let c = load(s, u32.toUsize(y) * inStride + u32.toUsize(x) * 4)
+      let inverse = 255 - u8.toU32(c.a)
+      let below = Rgba8 { r: d[i], g: d[i + 1], b: d[i + 2], a: d[i + 3] }
+      let merged = Rgba8 {
+        r: u32.toU8(u8.toU32(c.r) + div255(u8.toU32(below.r) * inverse)),
+        g: u32.toU8(u8.toU32(c.g) + div255(u8.toU32(below.g) * inverse)),
+        b: u32.toU8(u8.toU32(c.b) + div255(u8.toU32(below.b) * inverse)),
+        a: u32.toU8(u8.toU32(c.a) + div255(u8.toU32(below.a) * inverse)),
+      }
+      store(&mut d, i, merged)
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// Copies `input` into `out` inside the region; transparent elsewhere.
+pub fn copy(out: &mut Pixmap, input: &Pixmap, region: Region) -> () {
+  offset(&mut out, input, 0, 0, region)
+}
+
+pub const COMPOSITE_OVER: u8 = 0
+
+pub const COMPOSITE_IN: u8 = 1
+
+pub const COMPOSITE_OUT: u8 = 2
+
+pub const COMPOSITE_ATOP: u8 = 3
+
+pub const COMPOSITE_XOR: u8 = 4
+
+pub const COMPOSITE_LIGHTER: u8 = 5
+
+pub const COMPOSITE_ARITHMETIC: u8 = 6
+
+/// `feComposite` of `input` (`in`) with `backdrop` (`in2`). `k` holds k1..k4 for
+/// [`COMPOSITE_ARITHMETIC`] and is ignored otherwise.
+pub fn composite(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  backdrop: &Pixmap,
+  operator: u8,
+  k: [f32; 4],
+  region: Region,
+) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let b = backdrop.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      store(&mut d, i, compositePixel(load(s, i), load(b, i), operator, k))
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// One premultiplied pixel of [`composite`]: `s` is `in`, `b` is `in2`.
+pub fn compositePixel(s: Rgba8, b: Rgba8, operator: u8, k: [f32; 4]) -> Rgba8 {
+  let sa = u8.toU32(s.a)
+  let ba = u8.toU32(b.a)
+  if operator == COMPOSITE_ARITHMETIC {
+    let alpha = arithmetic(s.a, b.a, k, 1.0)
+    return Rgba8 {
+      r: arithmetic(s.r, b.r, k, u8.toF32(alpha) / 255.0),
+      g: arithmetic(s.g, b.g, k, u8.toF32(alpha) / 255.0),
+      b: arithmetic(s.b, b.b, k, u8.toF32(alpha) / 255.0),
+      a: alpha,
+    }
+  }
+  if operator == COMPOSITE_LIGHTER {
+    return Rgba8 {
+      r: sat(u8.toU32(s.r) + u8.toU32(b.r)),
+      g: sat(u8.toU32(s.g) + u8.toU32(b.g)),
+      b: sat(u8.toU32(s.b) + u8.toU32(b.b)),
+      a: sat(sa + ba),
+    }
+  }
+
+  // Fs and Fb: the source and backdrop factors of the Porter-Duff operator.
+  let mut fs: u32 = 255
+  let mut fb: u32 = 255 - sa
+  if operator == COMPOSITE_IN {
+    fs = ba
+    fb = 0
+  } else if operator == COMPOSITE_OUT {
+    fs = 255 - ba
+    fb = 0
+  } else if operator == COMPOSITE_ATOP {
+    fs = ba
+  } else if operator == COMPOSITE_XOR {
+    fs = 255 - ba
+  }
+  return Rgba8 {
+    r: sat(div255(u8.toU32(s.r) * fs) + div255(u8.toU32(b.r) * fb)),
+    g: sat(div255(u8.toU32(s.g) * fs) + div255(u8.toU32(b.g) * fb)),
+    b: sat(div255(u8.toU32(s.b) * fs) + div255(u8.toU32(b.b) * fb)),
+    a: sat(div255(sa * fs) + div255(ba * fb)),
+  }
+}
+
+fn sat(value: u32) -> u8 with Intrinsic.inlineAlways() {
+  return u32.toU8(minU32(value, 255))
+}
+
+/// `k1 i1 i2 + k2 i1 + k3 i2 + k4` on 0..=1 values, clamped to `0..=limit` (the result alpha for
+/// color channels, so the output stays premultiplied).
+fn arithmetic(i1: u8, i2: u8, k: [f32; 4], limit: f32) -> u8 {
+  let a = u8.toF32(i1) / 255.0
+  let b = u8.toF32(i2) / 255.0
+  let v = k[0] * a * b + k[1] * a + k[2] * b + k[3]
+  return f32.toU8(f32.min(f32.max(v, 0.0), limit) * 255.0 + 0.5)
+}
+
+/// `feBlend`: `input` blended onto `backdrop` (`in2`) with a `vector.layer` BLEND_ mode.
+pub fn blend(out: &mut Pixmap, input: &Pixmap, backdrop: &Pixmap, mode: u8, region: Region) -> () {
+  copy(&mut out, backdrop, region)
+  let r = region.clampTo(out.width(), out.height())
+  layering.compositeWithin(&mut out, input, mode, 255, r.x0, r.y0, r.x1, r.y1)
+}
+
+pub const MATRIX: u8 = 0
+
+pub const SATURATE: u8 = 1
+
+pub const HUE_ROTATE: u8 = 2
+
+pub const LUMINANCE_TO_ALPHA: u8 = 3
+
+/// The 4x5 matrix of an `feColorMatrix` `type` with its `values` (SVG's row-major order).
+pub fn colorMatrixOf(kind: u8, values: &[f32]) -> [f32; 20] {
+  let mut m: [f32; 20] = [
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+  ]
+  if kind == MATRIX {
+    if values.length == 20 {
+      let mut i: usize = 0
+      while i < 20 {
+        m[i] = values[i]
+        i = i + 1
+      }
+    }
+  } else if kind == SATURATE {
+    let one: f32 = 1.0
+    let s = if values.length > 0 {
+      values[0]
+    } else {
+      one
+    }
+    m = [
+      0.213 + 0.787 * s,
+      0.715 - 0.715 * s,
+      0.072 - 0.072 * s,
+      0.0,
+      0.0,
+      0.213 - 0.213 * s,
+      0.715 + 0.285 * s,
+      0.072 - 0.072 * s,
+      0.0,
+      0.0,
+      0.213 - 0.213 * s,
+      0.715 - 0.715 * s,
+      0.072 + 0.928 * s,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+    ]
+  } else if kind == HUE_ROTATE {
+    let zero: f32 = 0.0
+    let degrees = if values.length > 0 {
+      values[0]
+    } else {
+      zero
+    }
+    let radians = f32.toF64(degrees) * 3.141592653589793 / 180.0
+    let c = f64.toF32(f64.cos(radians))
+    let s = f64.toF32(f64.sin(radians))
+    m = [
+      0.213 + c * 0.787 - s * 0.213,
+      0.715 - c * 0.715 - s * 0.715,
+      0.072 - c * 0.072 + s * 0.928,
+      0.0,
+      0.0,
+      0.213 - c * 0.213 + s * 0.143,
+      0.715 + c * 0.285 + s * 0.140,
+      0.072 - c * 0.072 - s * 0.283,
+      0.0,
+      0.0,
+      0.213 - c * 0.213 - s * 0.787,
+      0.715 - c * 0.715 + s * 0.715,
+      0.072 + c * 0.928 + s * 0.072,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+    ]
+  } else {
+    m = [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.2125,
+      0.7154,
+      0.0721,
+      0.0,
+      0.0,
+    ]
+  }
+  return m
+}
+
+/// `feColorMatrix` with a matrix from [`colorMatrixOf`], on unpremultiplied 0..=1 values.
+pub fn colorMatrix(out: &mut Pixmap, input: &Pixmap, m: [f32; 20], region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut lastIn = Rgba8.make(0, 0, 0, 0)
+  let mut lastOut = matrixPixel(lastIn, m)
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+
+      // Runs of equal pixels (flat fills, transparent areas) reuse the last result.
+      let c = load(s, i)
+      if c.r != lastIn.r || c.g != lastIn.g || c.b != lastIn.b || c.a != lastIn.a {
+        lastIn = c
+        lastOut = matrixPixel(c, m)
+      }
+      store(&mut d, i, lastOut)
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+pub fn matrixPixel(c: Rgba8, m: [f32; 20]) -> Rgba8 with Intrinsic.inlineAlways() {
+  let a = u8.toF32(c.a) / 255.0
+  let mut r: f32 = 0.0
+  let mut g: f32 = 0.0
+  let mut b: f32 = 0.0
+  if c.a != 0 {
+    r = u8.toF32(c.r) / 255.0 / a
+    g = u8.toF32(c.g) / 255.0 / a
+    b = u8.toF32(c.b) / 255.0 / a
+  }
+  let ro = clamp01(m[0] * r + m[1] * g + m[2] * b + m[3] * a + m[4])
+  let go = clamp01(m[5] * r + m[6] * g + m[7] * b + m[8] * a + m[9])
+  let bo = clamp01(m[10] * r + m[11] * g + m[12] * b + m[13] * a + m[14])
+  let ao = clamp01(m[15] * r + m[16] * g + m[17] * b + m[18] * a + m[19])
+  return Rgba8 { r: byte(ro * ao), g: byte(go * ao), b: byte(bo * ao), a: byte(ao) }
+}
+
+fn clamp01(v: f32) -> f32 with Intrinsic.inlineAlways() {
+  return f32.min(f32.max(v, 0.0), 1.0)
+}
+
+/// `floor(v * 255 + 0.5)` for `v` in `0 ..= 1`, where the floor is the conversion's truncation
+/// (x86-64's baseline has no SSE4.1 round, so an explicit floor is a dozen instructions).
+fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() {
+  return f32.toU8(v * 255.0 + 0.5)
+}
+
+/// The passes of an `feGaussianBlur` along one axis with standard deviation `sigma` (device
+/// pixels): three box blurs for `sigma >= 2` as the spec prescribes, else one kernel of
+/// fixed-point weights.
+pub struct BlurPlan {
+  /// Box passes: size and left extent, `[size, left]` per pass; empty for a kernel.
+  boxes: List<u32>,
+  /// Kernel weights summing to 65536, from offset `-radius` to `radius`; empty for boxes.
+  weights: List<u32>,
+}
+
+impl BlurPlan {
+  pub effect fn make(sigma: f64) -> BlurPlan
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut boxes = List<u32>.make()
+    let mut weights = List<u32>.make()
+    if sigma >= 2.0 {
+      let d = f64.toU32(f64.floor(sigma * 3.0 * f64.sqrt(2.0 * 3.141592653589793) / 4.0 + 0.5))
+      if d % 2 == 1 {
+        let mut i: u32 = 0
+        while i < 3 {
+          run boxes.append(d)
+          run boxes.append(d / 2)
+          i = i + 1
+        }
+      } else {
+        // Two boxes of size d, offset half a pixel each way, then one of d + 1 centered.
+        run boxes.append(d)
+        run boxes.append(d / 2)
+        run boxes.append(d)
+        run boxes.append(d / 2 - 1)
+        run boxes.append(d + 1)
+        run boxes.append(d / 2)
+      }
+    } else if sigma > 0.0 {
+      let radius = f64.toU32(f64.ceil(sigma * 3.0))
+      let mut raw = List<f64>.make()
+      let mut total = 0.0
+      let mut i: u32 = 0
+      while i <= 2 * radius {
+        let t = u32.toF64(i) - u32.toF64(radius)
+        let w = exp(0.0 - t * t / (2.0 * sigma * sigma))
+        run raw.append(w)
+        total = total + w
+        i = i + 1
+      }
+      let mut sum: u32 = 0
+      i = 0
+      while i <= 2 * radius {
+        let w = f64.toU32(f64.floor(raw.asSlice()[u32.toUsize(i)] / total * 65536.0 + 0.5))
+        run weights.append(w)
+        sum = sum + w
+        i = i + 1
+      }
+
+      // Put the rounding remainder on the center tap so the weights sum to exactly 65536.
+      let center = u32.toUsize(radius)
+      let fixed = i64.toU32(u32.toI64(weights.asSlice()[center]) + 65536 - u32.toI64(sum))
+      weights.set(center, fixed)
+    }
+    return BlurPlan { boxes: move boxes, weights: move weights }
+  }
+
+  /// Box passes as `[size, left]` pairs.
+  pub fn boxPasses(self: &Self) -> &[u32] {
+    return self.boxes.asSlice()
+  }
+
+  /// Kernel weights (sum 65536), centered.
+  pub fn kernel(self: &Self) -> &[u32] {
+    return self.weights.asSlice()
+  }
+
+  pub fn isIdentity(self: &Self) -> bool {
+    return self.boxes.length() == 0 && self.weights.length() == 0
+  }
+
+  /// The farthest any pass reads from an element, in elements.
+  pub fn reach(self: &Self) -> usize {
+    let mut most = self.weights.length() / 2
+    let boxes = self.boxes.asSlice()
+    let mut p: usize = 0
+    while p < boxes.length {
+      let size = u32.toUsize(boxes[p])
+      if size > most {
+        most = size
+      }
+      p = p + 2
+    }
+    return most
+  }
+}
+
+/// `feGaussianBlur` with per-axis plans (`stdDeviation` x and y in device pixels). Pixels past
+/// the region read as transparent.
+pub effect fn gaussianBlur(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  horizontal: &BlurPlan,
+  vertical: &BlurPlan,
+  region: Region,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  copy(&mut out, input, region)
+  let r = region.clampTo(out.width(), out.height())
+  if r.x1 <= r.x0 || r.y1 <= r.y0 {
+    return
+  }
+  let stride = u32.toUsize(out.width()) * 4
+  let width = u32.toUsize(r.x1 - r.x0)
+  let height = u32.toUsize(r.y1 - r.y0)
+  let left = u32.toUsize(r.x0) * 4
+  let top = u32.toUsize(r.y0)
+  let d = out.dataMut()
+
+  // Every pass slides a window along a buffer of u32 lanes, one pixel (four lanes) per step
+  // across a row or a strip of up to STRIP pixels per step down the columns. Buffers are
+  // padded with transparent pixels on both ends, wide enough for every window, and the
+  // padding stays zero. Rows go first, then columns.
+  if !horizontal.isIdentity() {
+    let pad = horizontal.reach()
+    let mut first = List<u32>.make()
+    let mut second = List<u32>.make()
+    run first.appendRepeated(0, (width + 2 * pad) * 4)
+    run second.appendRepeated(0, (width + 2 * pad) * 4)
+    let mut sums = List<u32>.make()
+    run sums.appendRepeated(0, 4)
+    let mut y: usize = 0
+    while y < height {
+      let row = (top + y) * stride + left
+      widenRow(first.asMutSlice(), pad * 4, &d, row, width * 4)
+      let inFirst = blurPasses(
+        first.asMutSlice(),
+        second.asMutSlice(),
+        sums.asMutSlice(),
+        width,
+        4,
+        pad,
+        horizontal,
+      )
+      narrowRow(
+        &mut d,
+        row,
+        if inFirst {
+          first.asSlice()
+        } else {
+          second.asSlice()
+        },
+        pad * 4,
+        width * 4,
+      )
+      y = y + 1
+    }
+  }
+  if !vertical.isIdentity() {
+    let pad = vertical.reach()
+    let mut first = List<u32>.make()
+    let mut second = List<u32>.make()
+    run first.appendRepeated(0, (height + 2 * pad) * STRIP * 4)
+    run second.appendRepeated(0, (height + 2 * pad) * STRIP * 4)
+    let mut sums = List<u32>.make()
+    run sums.appendRepeated(0, STRIP * 4)
+    let mut x: usize = 0
+    while x < width {
+      let pixels = if x + STRIP < width {
+        STRIP
+      } else {
+        width - x
+      }
+      let unit = pixels * 4
+
+      // A narrower last strip moves the bottom padding into lanes earlier strips wrote.
+      if pixels < STRIP {
+        fillLanes(first.asMutSlice(), (pad + height) * unit, pad * unit)
+        fillLanes(second.asMutSlice(), (pad + height) * unit, pad * unit)
+      }
+      let mut y: usize = 0
+      while y < height {
+        widenRow(first.asMutSlice(), (pad + y) * unit, &d, (top + y) * stride + left + x * 4, unit)
+        y = y + 1
+      }
+      let inFirst = blurPasses(
+        first.asMutSlice(),
+        second.asMutSlice(),
+        sums.asMutSlice(),
+        height,
+        unit,
+        pad,
+        vertical,
+      )
+      let result = if inFirst {
+        first.asSlice()
+      } else {
+        second.asSlice()
+      }
+      y = 0
+      while y < height {
+        narrowRow(&mut d, (top + y) * stride + left + x * 4, result, (pad + y) * unit, unit)
+        y = y + 1
+      }
+      x = x + pixels
+    }
+  }
+}
+
+/// Pixels per column strip of [`gaussianBlur`].
+const STRIP: usize = 16
+
+fn fillLanes(d: &mut [u32], to: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = 0
+    i = i + 1
+  }
+}
+
+/// Copies `n` bytes of `s` from `from` into lanes of `d` from `to`.
+fn widenRow(d: &mut [u32], to: usize, s: &[u8], from: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let source = Slice.view(s, from, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = u8.toU32(source[i])
+    i = i + 1
+  }
+}
+
+/// Copies `n` lanes of `s` from `from`, each at most 255, into bytes of `d` from `to`.
+fn narrowRow(d: &mut [u8], to: usize, s: &[u32], from: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let source = Slice.view(s, from, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = u32.wrappingToU8(source[i])
+    i = i + 1
+  }
+}
+
+/// Runs `plan`'s passes over `count` steps of `unit` lanes (a multiple of 4) that start `pad`
+/// steps into `first`, alternating with `second`; returns whether the result ended in `first`.
+fn blurPasses(
+  first: &mut [u32],
+  second: &mut [u32],
+  sums: &mut [u32],
+  count: usize,
+  unit: usize,
+  pad: usize,
+  plan: &BlurPlan,
+) -> bool {
+  let passes = plan.boxPasses()
+  if passes.length == 0 {
+    kernelSlide(&first, &mut second, &mut sums, count, unit, pad, plan.kernel())
+    return false
+  }
+  let mut inFirst = true
+  let mut p: usize = 0
+  while p < passes.length {
+    if inFirst {
+      boxSlide(&first, &mut second, &mut sums, count, unit, pad, passes[p], passes[p + 1])
+    } else {
+      boxSlide(&second, &mut first, &mut sums, count, unit, pad, passes[p], passes[p + 1])
+    }
+    inFirst = !inFirst
+    p = p + 2
+  }
+  return inFirst
+}
+
+/// One box blur: output step `i` averages input steps `i - left .. i - left + size`, rounded
+/// to nearest.
+fn boxSlide(
+  input: &[u32],
+  output: &mut [u32],
+  sums: &mut [u32],
+  count: usize,
+  unit: usize,
+  pad: usize,
+  size: u32,
+  left: u32,
+) -> () {
+  let start = (pad - u32.toUsize(left)) * unit
+  let mut b: usize = 0
+  while b < unit {
+    u32x4.store(&mut sums, b, u32x4.splat(size / 2))
+    b = b + 4
+  }
+  let mut k: usize = 0
+  while k < u32.toUsize(size) {
+    let row = start + k * unit
+    b = 0
+    while b < unit {
+      let sum = u32x4.load(&sums, b)
+      u32x4.store(&mut sums, b, u32x4.wrappingAdd(sum, u32x4.load(input, row + b)))
+      b = b + 4
+    }
+    k = k + 1
+  }
+
+  // `floor(x / size)` for the sums x (which carry `size / 2` for rounding) in f32: the
+  // quotient `(x + 0.5) / size` is at least `0.5 / size` from an integer, and computed within
+  // 2^-15 of it while sizes are below 16384, so rounding it minus 0.5 to an integer (by adding
+  // 2^23 - 0.5 and reading the low mantissa bits) gives the floor. Wider boxes divide.
+  let fast = size < 16384
+  let inverse = f32x4.splat(1.0 / u32.toF32(size))
+  let halfLane = f32x4.splat(0.5)
+  let rounder = f32x4.splat(8388607.5)
+  let exponent = u32x4.splat(0x4B000000)
+  let mut i: usize = 0
+  while i < count {
+    let target = (pad + i) * unit
+    let leaving = start + i * unit
+    let entering = leaving + u32.toUsize(size) * unit
+    b = 0
+    while b < unit {
+      let sum = u32x4.load(&sums, b)
+      if fast {
+        let quotient = (i32x4.toF32x4(u32x4.bitcastToI32x4(sum)) + halfLane) * inverse + rounder
+        u32x4.store(
+          &mut output,
+          target + b,
+          u32x4.wrappingSubtract(f32x4.bitcastToU32x4(quotient), exponent),
+        )
+      } else {
+        u32x4.store(&mut output, target + b, sum / u32x4.splat(size))
+      }
+      let moved = u32x4.wrappingAdd(sum, u32x4.load(input, entering + b))
+      u32x4.store(&mut sums, b, u32x4.wrappingSubtract(moved, u32x4.load(input, leaving + b)))
+      b = b + 4
+    }
+    i = i + 1
+  }
+}
+
+/// One kernel pass with fixed-point weights summing to 65536, centered on each step.
+fn kernelSlide(
+  input: &[u32],
+  output: &mut [u32],
+  sums: &mut [u32],
+  count: usize,
+  unit: usize,
+  pad: usize,
+  weights: &[u32],
+) -> () {
+  let start = (pad - weights.length / 2) * unit
+  let shift = u32x4.splat(16)
+  let mut i: usize = 0
+  while i < count {
+    let mut b: usize = 0
+    while b < unit {
+      u32x4.store(&mut sums, b, u32x4.splat(32768))
+      b = b + 4
+    }
+    let mut k: usize = 0
+    while k < weights.length {
+      let w = u32x4.splat(weights[k])
+      let row = start + (i + k) * unit
+      b = 0
+      while b < unit {
+        let term = u32x4.wrappingMultiply(u32x4.load(input, row + b), w)
+        let sum = u32x4.load(&sums, b)
+        u32x4.store(&mut sums, b, u32x4.wrappingAdd(sum, term))
+        b = b + 4
+      }
+      k = k + 1
+    }
+    let target = (pad + i) * unit
+    b = 0
+    while b < unit {
+      u32x4.store(&mut output, target + b, u32x4.shiftRight(u32x4.load(&sums, b), shift))
+      b = b + 4
+    }
+    i = i + 1
+  }
+}
+
+/// sRGB to linear-light bytes (for `color-interpolation-filters: linearRGB`), applied to
+/// unpremultiplied color in place.
+pub fn toLinear(pixmap: &mut Pixmap) -> () {
+  convert(&mut pixmap, true)
+}
+
+/// Linear-light back to sRGB bytes.
+pub fn toSrgb(pixmap: &mut Pixmap) -> () {
+  convert(&mut pixmap, false)
+}
+
+fn convert(pixmap: &mut Pixmap, linear: bool) -> () {
+  let d = pixmap.dataMut()
+  let mut i: usize = 0
+  while i < d.length {
+    let a = d[i + 3]
+    if a != 0 {
+      d[i] = convertByte(d[i], a, linear)
+      d[i + 1] = convertByte(d[i + 1], a, linear)
+      d[i + 2] = convertByte(d[i + 2], a, linear)
+    }
+    i = i + 4
+  }
+}
+
+/// One premultiplied channel `c` of a pixel with alpha `a` (nonzero), converted to linear light
+/// when `linear` is true or back to sRGB otherwise.
+pub fn convertByte(c: u8, a: u8, linear: bool) -> u8 {
+  let af = u8.toF64(a) / 255.0
+  let v = f64.min(u8.toF64(c) / 255.0 / af, 1.0)
+  let t = if linear {
+    srgbToLinear(v)
+  } else {
+    linearToSrgb(v)
+  }
+  return f64.toU8(f64.floor(t * af * 255.0 + 0.5))
+}
+
+/// [`convertByte`] for every alpha and channel byte, at `a * 256 + c` (alpha 0 maps to 0), so
+/// other renderers can match the conversion exactly with a lookup.
+pub effect fn conversionTable(linear: bool) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut table = List<u8>.make()
+  run table.appendRepeated(0, 65536)
+  let t = table.asMutSlice()
+  let mut a: u32 = 1
+  while a < 256 {
+    let mut c: u32 = 0
+    while c < 256 {
+      t[u32.toUsize(a * 256 + c)] = convertByte(u32.toU8(c), u32.toU8(a), linear)
+      c = c + 1
+    }
+    a = a + 1
+  }
+  return move table
+}
+
+/// A premultiplied channel `c` of a pixel with alpha `a`, unpremultiplied to the nearest byte.
+pub fn unpremultiplyByte(c: u8, a: u8) -> u8 with Intrinsic.inlineAlways() {
+  if a == 0 {
+    return 0
+  }
+  return u32.toU8(minU32((u8.toU32(c) * 255 + u8.toU32(a) / 2) / u8.toU32(a), 255))
+}
+
+pub const MORPHOLOGY_ERODE: u8 = 0
+
+pub const MORPHOLOGY_DILATE: u8 = 1
+
+/// `feMorphology`: the per-channel minimum (erode) or maximum (dilate) over a
+/// `(2 rx + 1) x (2 ry + 1)` window. Pixels past the region read as transparent. A zero radius
+/// disables the primitive, which then copies its input.
+pub effect fn morphology(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  operator: u8,
+  rx: u32,
+  ry: u32,
+  region: Region,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  copy(&mut out, input, region)
+  if rx == 0 || ry == 0 {
+    return
+  }
+  let r = region.clampTo(out.width(), out.height())
+  if r.x1 <= r.x0 || r.y1 <= r.y0 {
+    return
+  }
+  let dilate = operator == MORPHOLOGY_DILATE
+  let stride = u32.toUsize(out.width()) * 4
+  let width = u32.toUsize(r.x1 - r.x0)
+  let height = u32.toUsize(r.y1 - r.y0)
+  let rowBytes = width * 4
+  let left = u32.toUsize(r.x0) * 4
+  let top = u32.toUsize(r.y0)
+
+  // Each axis copies its lines into a buffer padded with `radius` transparent elements on
+  // both sides (a zero is what both operators see past the region), widens each element to
+  // the extreme of the largest power-of-two run that fits the window, then takes the extreme
+  // of two overlapping runs per output.
+  let padX = u32.toUsize(rx)
+  let windowX = 2 * padX + 1
+  let mut line = List<u8>.make()
+  run line.appendRepeated(0, (width + 2 * padX) * 4)
+  let d = out.dataMut()
+  let mut y: usize = 0
+  while y < height {
+    let row = (top + y) * stride + left
+    let buffer = line.asMutSlice()
+
+    // Widening clobbered the previous row's padding.
+    fillBytes(&mut buffer, 0, padX * 4)
+    fillBytes(&mut buffer, padX * 4 + rowBytes, padX * 4)
+    copyBytes(&mut buffer, padX * 4, &d, row, rowBytes)
+    let span = widenPrefix(&mut buffer, width + windowX - 1, 4, windowX, dilate)
+    combineBytes(&mut d, row, &buffer, 0, (windowX - span) * 4, rowBytes, dilate)
+    y = y + 1
+  }
+
+  // The vertical pass runs on whole rows of the region at once.
+  let padY = u32.toUsize(ry)
+  let windowY = 2 * padY + 1
+  let mut rows = List<u8>.make()
+  run rows.appendRepeated(0, (height + 2 * padY) * rowBytes)
+  let buffer = rows.asMutSlice()
+  y = 0
+  while y < height {
+    copyBytes(&mut buffer, (padY + y) * rowBytes, &d, (top + y) * stride + left, rowBytes)
+    y = y + 1
+  }
+  let span = widenPrefix(&mut buffer, height + windowY - 1, rowBytes, windowY, dilate)
+  y = 0
+  while y < height {
+    combineBytes(
+      &mut d,
+      (top + y) * stride + left,
+      &buffer,
+      y * rowBytes,
+      (y + windowY - span) * rowBytes,
+      rowBytes,
+      dilate,
+    )
+    y = y + 1
+  }
+}
+
+fn maxU8(a: u8, b: u8) -> u8 with Intrinsic.inlineAlways() {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn minU8(a: u8, b: u8) -> u8 with Intrinsic.inlineAlways() {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+fn fillBytes(d: &mut [u8], to: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = 0
+    i = i + 1
+  }
+}
+
+/// Copies `n` bytes of `s` from `from` to `d` at `to`.
+fn copyBytes(d: &mut [u8], to: usize, s: &[u8], from: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let source = Slice.view(s, from, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = source[i]
+    i = i + 1
+  }
+}
+
+/// `d[to + i]` = the extreme of `s[a + i]` and `s[b + i]` for `i < n`.
+fn combineBytes(
+  d: &mut [u8],
+  to: usize,
+  s: &[u8],
+  a: usize,
+  b: usize,
+  n: usize,
+  dilate: bool,
+) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let first = Slice.view(s, a, n)
+  let second = Slice.view(s, b, n)
+  let mut i: usize = 0
+  while i + 16 <= n {
+    let x = u8x16.load(first, i)
+    let y = u8x16.load(second, i)
+    u8x16.store(
+      &mut target,
+      i,
+      if dilate {
+        u8x16.maximum(x, y)
+      } else {
+        u8x16.minimum(x, y)
+      },
+    )
+    i = i + 16
+  }
+  while i < n {
+    target[i] = if dilate {
+      maxU8(first[i], second[i])
+    } else {
+      minU8(first[i], second[i])
+    }
+    i = i + 1
+  }
+}
+
+/// Turns each of the `count` elements of `unit` bytes in `buffer` into the extreme of the
+/// largest power-of-two run of elements starting there that fits in `window`, and returns
+/// that run's length. Elements near the end keep shorter runs; callers read only those whose
+/// runs fit.
+fn widenPrefix(buffer: &mut [u8], count: usize, unit: usize, window: usize, dilate: bool) -> usize {
+  let mut span: usize = 1
+  while span * 2 <= window {
+    let shift = span * unit
+    let n = count * unit - shift
+
+    // Ascending, each step reads lanes at and past the ones it writes, which are not yet
+    // rewritten.
+    let mut i: usize = 0
+    while i + 16 <= n {
+      let x = u8x16.load(&buffer, i)
+      let y = u8x16.load(&buffer, i + shift)
+      u8x16.store(
+        &mut buffer,
+        i,
+        if dilate {
+          u8x16.maximum(x, y)
+        } else {
+          u8x16.minimum(x, y)
+        },
+      )
+      i = i + 16
+    }
+    while i < n {
+      buffer[i] = if dilate {
+        maxU8(buffer[i], buffer[i + shift])
+      } else {
+        minU8(buffer[i], buffer[i + shift])
+      }
+      i = i + 1
+    }
+    span = span * 2
+  }
+  return span
+}
+
+/// `feComponentTransfer` lookup tables, one per channel, on unpremultiplied bytes.
+pub struct ComponentTransfer {
+  pub r: [u8; 256],
+  pub g: [u8; 256],
+  pub b: [u8; 256],
+  pub a: [u8; 256],
+}
+
+impl ComponentTransfer {
+  pub fn identity() -> ComponentTransfer {
+    return ComponentTransfer {
+      r: transferIdentity(),
+      g: transferIdentity(),
+      b: transferIdentity(),
+      a: transferIdentity(),
+    }
+  }
+}
+
+/// The conversion truncates, which is the floor for these non-negative values.
+fn transferByte(v: f64) -> u8 with Intrinsic.inlineAlways() {
+  return f64.toU8(f64.min(f64.max(v, 0.0), 1.0) * 255.0 + 0.5)
+}
+
+/// `type="identity"`.
+pub fn transferIdentity() -> [u8; 256] {
+  let mut t: [u8; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    t[u32.toUsize(i)] = u32.toU8(i)
+    i = i + 1
+  }
+  return t
+}
+
+/// `type="table"` with `tableValues`; an empty list is the identity.
+pub fn transferTable(values: &[f32]) -> [u8; 256] {
+  if values.length == 0 {
+    return transferIdentity()
+  }
+  let mut t: [u8; 256] = [0; 256]
+  let n = values.length - 1
+  let mut i: u32 = 0
+  while i < 256 {
+    let c = u32.toF64(i) / 255.0
+    if n == 0 || i == 255 {
+      t[u32.toUsize(i)] = transferByte(f32.toF64(values[n]))
+    } else {
+      let k = minUsize(f64.toUsize(f64.floor(c * usize.toF64(n))), n - 1)
+      let v0 = f32.toF64(values[k])
+      let v1 = f32.toF64(values[k + 1])
+      t[u32.toUsize(i)] = transferByte(
+        v0 + (c - usize.toF64(k) / usize.toF64(n)) * usize.toF64(n) * (v1 - v0),
+      )
+    }
+    i = i + 1
+  }
+  return t
+}
+
+fn minUsize(a: usize, b: usize) -> usize with Intrinsic.inlineAlways() {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+/// `type="discrete"` with `tableValues`; an empty list is the identity.
+pub fn transferDiscrete(values: &[f32]) -> [u8; 256] {
+  if values.length == 0 {
+    return transferIdentity()
+  }
+  let mut t: [u8; 256] = [0; 256]
+  let n = values.length
+  let mut i: u32 = 0
+  while i < 256 {
+    let k = minUsize(f64.toUsize(f64.floor(u32.toF64(i) / 255.0 * usize.toF64(n))), n - 1)
+    t[u32.toUsize(i)] = transferByte(f32.toF64(values[k]))
+    i = i + 1
+  }
+  return t
+}
+
+/// `type="linear"`: `slope C + intercept`.
+pub fn transferLinear(slope: f32, intercept: f32) -> [u8; 256] {
+  let mut t: [u8; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    t[u32.toUsize(i)] = transferByte(f32.toF64(slope) * u32.toF64(i) / 255.0 + f32.toF64(intercept))
+    i = i + 1
+  }
+  return t
+}
+
+/// `type="gamma"`: `amplitude C^exponent + offset`.
+pub fn transferGamma(amplitude: f32, exponent: f32, offset: f32) -> [u8; 256] {
+  let mut t: [u8; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    let c = u32.toF64(i) / 255.0
+    let e = f32.toF64(exponent)
+    let p = if e == 0.0 {
+      1.0
+    } else if i == 0 {
+      0.0
+    } else {
+      pow(c, e)
+    }
+    t[u32.toUsize(i)] = transferByte(f32.toF64(amplitude) * p + f32.toF64(offset))
+    i = i + 1
+  }
+  return t
+}
+
+/// `feComponentTransfer` with `transfer`'s tables.
+pub fn componentTransfer(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  transfer: &ComponentTransfer,
+  region: Region,
+) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      store(&mut d, i, transferPixel(load(s, i), transfer))
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+pub fn transferPixel(c: Rgba8, transfer: &ComponentTransfer) -> Rgba8 {
+  let a = transfer.a[u8.toUsize(c.a)]
+  let level = u8.toU32(a)
+  return Rgba8 {
+    r: u32.toU8(div255(u8.toU32(transfer.r[u8.toUsize(unpremultiplyByte(c.r, c.a))]) * level)),
+    g: u32.toU8(div255(u8.toU32(transfer.g[u8.toUsize(unpremultiplyByte(c.g, c.a))]) * level)),
+    b: u32.toU8(div255(u8.toU32(transfer.b[u8.toUsize(unpremultiplyByte(c.b, c.a))]) * level)),
+    a: a,
+  }
+}
+
+/// `feTile`: repeats the `source` rectangle of `input` (its primitive subregion) across the region.
+pub fn tile(out: &mut Pixmap, input: &Pixmap, source: Region, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let t = source.clampTo(input.width(), input.height())
+  if t.x1 == t.x0 || t.y1 == t.y0 {
+    return
+  }
+  let w = t.x1 - t.x0
+  let h = t.y1 - t.y0
+  let stride = u32.toUsize(out.width()) * 4
+  let inStride = u32.toUsize(input.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let sy = t.y0 + wrap(y, t.y0, h)
+    let mut x = r.x0
+    while x < r.x1 {
+      let sx = t.x0 + wrap(x, t.x0, w)
+      store(
+        &mut d,
+        u32.toUsize(y) * stride + u32.toUsize(x) * 4,
+        load(s, u32.toUsize(sy) * inStride + u32.toUsize(sx) * 4),
+      )
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `(p - origin) mod size`, non-negative.
+fn wrap(p: u32, origin: u32, size: u32) -> u32 with Intrinsic.inlineAlways() {
+  if p >= origin {
+    return (p - origin) % size
+  }
+  let m = (origin - p) % size
+  return if m == 0 {
+    0
+  } else {
+    size - m
+  }
+}
+
+pub const EDGE_DUPLICATE: u8 = 0
+
+pub const EDGE_WRAP: u8 = 1
+
+pub const EDGE_NONE: u8 = 2
+
+/// The `feConvolveMatrix` parameters: `kernel` holds `orderX * orderY` values in SVG's
+/// row-major order, and `divisor` must be nonzero (SVG's default is the kernel sum, or 1).
+pub struct Convolution<'a> {
+  pub kernel: &'a [f32],
+  pub orderX: u32,
+  pub orderY: u32,
+  pub divisor: f32,
+  pub bias: f32,
+  pub targetX: u32,
+  pub targetY: u32,
+  pub edgeMode: u8,
+  pub preserveAlpha: bool,
+}
+
+/// The pixel at `(x, y)` of the region `r` of `s`, extended past `r` by `edgeMode`.
+fn edgePixel(s: &[u8], stride: usize, r: Region, x: i64, y: i64, edgeMode: u8) -> Rgba8 {
+  let x0 = u32.toI64(r.x0)
+  let y0 = u32.toI64(r.y0)
+  let w = u32.toI64(r.x1 - r.x0)
+  let h = u32.toI64(r.y1 - r.y0)
+  let mut px = x - x0
+  let mut py = y - y0
+  if px < 0 || py < 0 || px >= w || py >= h {
+    if edgeMode == EDGE_NONE {
+      return Rgba8.make(0, 0, 0, 0)
+    }
+    if edgeMode == EDGE_DUPLICATE {
+      px = if px < 0 {
+        0
+      } else if px >= w {
+        w - 1
+      } else {
+        px
+      }
+      py = if py < 0 {
+        0
+      } else if py >= h {
+        h - 1
+      } else {
+        py
+      }
+    } else {
+      px = ((px % w) + w) % w
+      py = ((py % h) + h) % h
+    }
+  }
+  return load(s, i64.toUsize(y0 + py) * stride + i64.toUsize(x0 + px) * 4)
+}
+
+/// `feConvolveMatrix` over the region, which is also the input image's extent for `edgeMode`.
+/// Computes in f32: `sum / divisor + bias` on premultiplied values (bias scaled by the result
+/// alpha), or on unpremultiplied color with the source alpha kept when `preserveAlpha` is set.
+pub effect fn convolveMatrix(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  convolution: &Convolution,
+  region: Region,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  if r.x1 == r.x0 || r.y1 == r.y0 {
+    return
+  }
+  let stride = u32.toUsize(out.width()) * 4
+  let k = convolution
+
+  // Taps in reading order with their weights (the kernel rotated by 180 degrees) and byte
+  // offsets from the pixel at the kernel's top-left.
+  let taps = u32.toUsize(k.orderX * k.orderY)
+  let mut weights = List<f32>.make()
+  let mut offsets = List<usize>.make()
+  let mut i: u32 = 0
+  while i < k.orderY {
+    let mut j: u32 = 0
+    while j < k.orderX {
+      run weights.append(k.kernel[u32.toUsize((k.orderY - i - 1) * k.orderX + (k.orderX - j - 1))])
+      run offsets.append(u32.toUsize(i) * stride + u32.toUsize(j) * 4)
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let w = weights.asSlice()
+  let o = offsets.asSlice()
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let rowInside = y >= r.y0 + k.targetY && y + k.orderY - k.targetY <= r.y1
+    let mut x = r.x0
+    while x < r.x1 {
+      let at = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      if rowInside && x >= r.x0 + k.targetX && x + k.orderX - k.targetX <= r.x1 {
+        let base = u32.toUsize(y - k.targetY) * stride + u32.toUsize(x - k.targetX) * 4
+        store(&mut d, at, convolveInside(s, base, w, o, taps, k, s[at + 3]))
+      } else {
+        store(&mut d, at, convolvePixel(s, stride, r, x, y, k))
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// [`convolvePixel`] where every tap is inside the region, with the same f32 operations.
+fn convolveInside(
+  s: &[u8],
+  base: usize,
+  w: &[f32],
+  o: &[usize],
+  taps: usize,
+  k: &Convolution,
+  alpha: u8,
+) -> Rgba8 {
+  let mut sr: f32 = 0.0
+  let mut sg: f32 = 0.0
+  let mut sb: f32 = 0.0
+  let mut sa: f32 = 0.0
+  let mut t: usize = 0
+  if k.preserveAlpha {
+    while t < taps {
+      let p = Slice.view(s, base + o[t], 4)
+      let weight = w[t]
+      sr = sr + weight * u8.toF32(unpremultiplyByte(p[0], p[3]))
+      sg = sg + weight * u8.toF32(unpremultiplyByte(p[1], p[3]))
+      sb = sb + weight * u8.toF32(unpremultiplyByte(p[2], p[3]))
+      t = t + 1
+    }
+    return convolveResult(sr, sg, sb, sa, k, alpha)
+  }
+  while t < taps {
+    let p = Slice.view(s, base + o[t], 4)
+    let weight = w[t]
+    sr = sr + weight * u8.toF32(p[0])
+    sg = sg + weight * u8.toF32(p[1])
+    sb = sb + weight * u8.toF32(p[2])
+    sa = sa + weight * u8.toF32(p[3])
+    t = t + 1
+  }
+  return convolveResult(sr, sg, sb, sa, k, alpha)
+}
+
+/// Sums are of weights times bytes; they scale to 0..=1 here, once.
+fn convolveResult(
+  byteR: f32,
+  byteG: f32,
+  byteB: f32,
+  byteA: f32,
+  k: &Convolution,
+  sourceAlpha: u8,
+) -> Rgba8 with Intrinsic.inlineAlways() {
+  let sr = byteR / 255.0
+  let sg = byteG / 255.0
+  let sb = byteB / 255.0
+  let sa = byteA / 255.0
+  if k.preserveAlpha {
+    let level = u8.toU32(sourceAlpha)
+    return Rgba8 {
+      r: u32.toU8(div255(u8.toU32(byte(clamp01(sr / k.divisor + k.bias))) * level)),
+      g: u32.toU8(div255(u8.toU32(byte(clamp01(sg / k.divisor + k.bias))) * level)),
+      b: u32.toU8(div255(u8.toU32(byte(clamp01(sb / k.divisor + k.bias))) * level)),
+      a: sourceAlpha,
+    }
+  }
+  let alpha = clamp01(sa / k.divisor + k.bias)
+  return Rgba8 {
+    r: byte(f32.min(clamp01(sr / k.divisor + k.bias * alpha), alpha)),
+    g: byte(f32.min(clamp01(sg / k.divisor + k.bias * alpha), alpha)),
+    b: byte(f32.min(clamp01(sb / k.divisor + k.bias * alpha), alpha)),
+    a: byte(alpha),
+  }
+}
+
+fn convolvePixel(s: &[u8], stride: usize, r: Region, x: u32, y: u32, k: &Convolution) -> Rgba8 {
+  let mut sr: f32 = 0.0
+  let mut sg: f32 = 0.0
+  let mut sb: f32 = 0.0
+  let mut sa: f32 = 0.0
+  let mut i: u32 = 0
+  while i < k.orderY {
+    let mut j: u32 = 0
+    while j < k.orderX {
+      let c = edgePixel(
+        s,
+        stride,
+        r,
+        u32.toI64(x) - u32.toI64(k.targetX) + u32.toI64(j),
+        u32.toI64(y) - u32.toI64(k.targetY) + u32.toI64(i),
+        k.edgeMode,
+      )
+      let w = k.kernel[u32.toUsize((k.orderY - i - 1) * k.orderX + (k.orderX - j - 1))]
+      if k.preserveAlpha {
+        sr = sr + w * u8.toF32(unpremultiplyByte(c.r, c.a))
+        sg = sg + w * u8.toF32(unpremultiplyByte(c.g, c.a))
+        sb = sb + w * u8.toF32(unpremultiplyByte(c.b, c.a))
+      } else {
+        sr = sr + w * u8.toF32(c.r)
+        sg = sg + w * u8.toF32(c.g)
+        sb = sb + w * u8.toF32(c.b)
+        sa = sa + w * u8.toF32(c.a)
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return convolveResult(sr, sg, sb, sa, k, load(s, u32.toUsize(y) * stride + u32.toUsize(x) * 4).a)
+}
+
+pub const CHANNEL_R: u8 = 0
+
+pub const CHANNEL_G: u8 = 1
+
+pub const CHANNEL_B: u8 = 2
+
+pub const CHANNEL_A: u8 = 3
+
+/// The displacement in whole pixels for each map byte: `round(scale (C - 0.5))`.
+pub fn displacementTable(scale: f32) -> [i32; 256] {
+  let mut t: [i32; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    t[u32.toUsize(i)] = f64.toI32(f64.floor(f32.toF64(scale) * (u32.toF64(i) / 255.0 - 0.5) + 0.5))
+    i = i + 1
+  }
+  return t
+}
+
+fn channelOf(c: Rgba8, channel: u8) -> u8 with Intrinsic.inlineAlways() {
+  if channel == CHANNEL_A {
+    return c.a
+  }
+  let v = if channel == CHANNEL_R {
+    c.r
+  } else if channel == CHANNEL_G {
+    c.g
+  } else {
+    c.b
+  }
+  return unpremultiplyByte(v, c.a)
+}
+
+/// `feDisplacementMap`: each pixel takes the `input` pixel displaced by `table` (from
+/// [`displacementTable`]) of the map's `xChannel` and `yChannel` (unpremultiplied), nearest
+/// neighbor; samples past the canvas are transparent.
+pub fn displacementMap(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  map: &Pixmap,
+  table: &[i32; 256],
+  xChannel: u8,
+  yChannel: u8,
+  region: Region,
+) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let w = u32.toI64(input.width())
+  let h = u32.toI64(input.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let m = map.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      let c = load(m, i)
+      let sx = u32.toI64(x) + i32.toI64(table[u8.toUsize(channelOf(c, xChannel))])
+      let sy = u32.toI64(y) + i32.toI64(table[u8.toUsize(channelOf(c, yChannel))])
+      if sx >= 0 && sy >= 0 && sx < w && sy < h {
+        store(&mut d, i, load(s, i64.toUsize(sy) * stride + i64.toUsize(sx) * 4))
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `feTurbulence` attributes. Frequencies and the tile (the primitive subregion, for
+/// `stitchTiles`) are in user space.
+pub struct TurbulenceSettings {
+  pub baseFrequencyX: f64,
+  pub baseFrequencyY: f64,
+  pub octaves: u32,
+  pub fractalNoise: bool,
+  pub stitchTiles: bool,
+  pub tileX: f64,
+  pub tileY: f64,
+  pub tileWidth: f64,
+  pub tileHeight: f64,
+}
+
+impl Copy for TurbulenceSettings {}
+
+/// Base frequencies adjusted for stitching and the stitch lattice extents of the first octave
+/// (the spec's `StitchInfo`); `enabled` is false without `stitchTiles`.
+pub struct Stitch {
+  pub frequencyX: f64,
+  pub frequencyY: f64,
+  pub enabled: bool,
+  pub width: i64,
+  pub height: i64,
+  pub wrapX: i64,
+  pub wrapY: i64,
+}
+
+impl Copy for Stitch {}
+
+const PERLIN_N: i64 = 4096
+
+const LATTICE: usize = 514
+
+fn stitchFrequency(frequency: f64, size: f64) -> f64 {
+  if frequency == 0.0 {
+    return frequency
+  }
+  let lo = f64.floor(size * frequency) / size
+  let hi = f64.ceil(size * frequency) / size
+  return if frequency / lo < hi / frequency {
+    lo
+  } else {
+    hi
+  }
+}
+
+pub fn stitchOf(settings: &TurbulenceSettings) -> Stitch {
+  if !settings.stitchTiles {
+    return Stitch {
+      frequencyX: settings.baseFrequencyX,
+      frequencyY: settings.baseFrequencyY,
+      enabled: false,
+      width: 0,
+      height: 0,
+      wrapX: 0,
+      wrapY: 0,
+    }
+  }
+  let fx = stitchFrequency(settings.baseFrequencyX, settings.tileWidth)
+  let fy = stitchFrequency(settings.baseFrequencyY, settings.tileHeight)
+  let width = f64.toI64(f64.trunc(settings.tileWidth * fx + 0.5))
+  let height = f64.toI64(f64.trunc(settings.tileHeight * fy + 0.5))
+  return Stitch {
+    frequencyX: fx,
+    frequencyY: fy,
+    enabled: true,
+    width: width,
+    height: height,
+    wrapX: f64.toI64(f64.trunc(settings.tileX * fx + i64.toF64(PERLIN_N + width))),
+    wrapY: f64.toI64(f64.trunc(settings.tileY * fy + i64.toF64(PERLIN_N + height))),
+  }
+}
+
+/// The lattice and gradients of the spec's reference noise for one `seed`.
+pub struct Turbulence {
+  latticeList: List<u32>,
+  /// `(channel * 514 + index) * 2 + component`.
+  gradientList: List<f64>,
+  /// The same gradients as `(index * 2 + component) * 4 + channel`, for the CPU's four
+  /// channels at once.
+  quadList: List<f64>,
+}
+
+fn nextRandom(seed: i64) -> i64 {
+  let result = 16807 * (seed % 127773) - 2836 * (seed / 127773)
+  return if result <= 0 {
+    result + 2147483647
+  } else {
+    result
+  }
+}
+
+impl Turbulence {
+  /// `seed` is the attribute value, rounded like the spec's `setup_seed` input.
+  pub effect fn make(seed: f64) -> Turbulence
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut s = f64.toI64(f64.round(seed))
+    if s <= 0 {
+      s = 0 - (s % (2147483647 - 1)) + 1
+    }
+    if s > 2147483647 - 1 {
+      s = 2147483647 - 1
+    }
+    let mut lattice = List<u32>.make()
+    run lattice.appendRepeated(0, LATTICE)
+    let mut gradients = List<f64>.make()
+    run gradients.appendRepeated(0.0, 4 * LATTICE * 2)
+    let l = lattice.asMutSlice()
+    let g = gradients.asMutSlice()
+    let mut k: usize = 0
+    while k < 4 {
+      let mut i: usize = 0
+      while i < 256 {
+        l[i] = usize.toU32(i)
+        s = nextRandom(s)
+        let gx = i64.toF64((s % 512) - 256) / 256.0
+        s = nextRandom(s)
+        let gy = i64.toF64((s % 512) - 256) / 256.0
+        let length = f64.sqrt(gx * gx + gy * gy)
+        g[(k * LATTICE + i) * 2] = gx / length
+        g[(k * LATTICE + i) * 2 + 1] = gy / length
+        i = i + 1
+      }
+      k = k + 1
+    }
+    let mut i: usize = 255
+    while i > 0 {
+      let t = l[i]
+      s = nextRandom(s)
+      let j = i64.toUsize(s % 256)
+      l[i] = l[j]
+      l[j] = t
+      i = i - 1
+    }
+    i = 0
+    while i < 258 {
+      l[256 + i] = l[i]
+      k = 0
+      while k < 4 {
+        g[(k * LATTICE + 256 + i) * 2] = g[(k * LATTICE + i) * 2]
+        g[(k * LATTICE + 256 + i) * 2 + 1] = g[(k * LATTICE + i) * 2 + 1]
+        k = k + 1
+      }
+      i = i + 1
+    }
+    let mut quads = List<f64>.make()
+    run quads.appendRepeated(0.0, 4 * LATTICE * 2)
+    let q = quads.asMutSlice()
+    i = 0
+    while i < LATTICE {
+      k = 0
+      while k < 4 {
+        q[(i * 2) * 4 + k] = g[(k * LATTICE + i) * 2]
+        q[(i * 2 + 1) * 4 + k] = g[(k * LATTICE + i) * 2 + 1]
+        k = k + 1
+      }
+      i = i + 1
+    }
+    return Turbulence {
+      latticeList: move lattice,
+      gradientList: move gradients,
+      quadList: move quads,
+    }
+  }
+
+  /// The permutation, 514 entries.
+  pub fn lattice(self: &Self) -> &[u32] {
+    return self.latticeList.asSlice()
+  }
+
+  /// Unit gradients, `(channel * 514 + index) * 2 + component`.
+  pub fn gradients(self: &Self) -> &[f64] {
+    return self.gradientList.asSlice()
+  }
+
+  /// The spec's `noise2` for all four channels at once: the lattice cell and its weights do not
+  /// depend on the channel, so they are found once.
+  fn noise4(
+    self: &Self,
+    vx: f64,
+    vy: f64,
+    stitch: &Stitch,
+    width: i64,
+    height: i64,
+    wrapX: i64,
+    wrapY: i64,
+  ) -> [f64; 4] with Intrinsic.inlineAlways() {
+    // The conversion truncates, and converting back is exact, so these are the spec's
+    // `(int)t` and `t - (int)t` without a separate trunc.
+    let tx = vx + i64.toF64(PERLIN_N)
+    let mut bx0 = f64.toI64(tx)
+    let rx0 = tx - i64.toF64(bx0)
+    let rx1 = rx0 - 1.0
+    let ty = vy + i64.toF64(PERLIN_N)
+    let mut by0 = f64.toI64(ty)
+    let ry0 = ty - i64.toF64(by0)
+    let ry1 = ry0 - 1.0
+
+    // Compared before masking (resvg and browsers do; SVG 1.1's listing masks first, which
+    // turns stitching off).
+    let mut bx1 = bx0 + 1
+    let mut by1 = by0 + 1
+    if stitch.enabled {
+      if bx0 >= wrapX {
+        bx0 = bx0 - width
+      }
+      if bx1 >= wrapX {
+        bx1 = bx1 - width
+      }
+      if by0 >= wrapY {
+        by0 = by0 - height
+      }
+      if by1 >= wrapY {
+        by1 = by1 - height
+      }
+    }
+    let l = self.latticeList.asSlice()
+    let i = u32.toUsize(l[i64.toUsize(bx0 & 255)])
+    let j = u32.toUsize(l[i64.toUsize(bx1 & 255)])
+    let y0 = i64.toUsize(by0 & 255)
+    let y1 = i64.toUsize(by1 & 255)
+    let b00 = u32.toUsize(l[i + y0])
+    let b10 = u32.toUsize(l[j + y0])
+    let b01 = u32.toUsize(l[i + y1])
+    let b11 = u32.toUsize(l[j + y1])
+    let sx = rx0 * rx0 * (3.0 - 2.0 * rx0)
+    let sy = ry0 * ry0 * (3.0 - 2.0 * ry0)
+    let q = self.quadList.asSlice()
+    let g00 = Slice.view(q, b00 * 8, 8)
+    let g10 = Slice.view(q, b10 * 8, 8)
+    let g01 = Slice.view(q, b01 * 8, 8)
+    let g11 = Slice.view(q, b11 * 8, 8)
+    let mut result: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    let mut channel: usize = 0
+    while channel < 4 {
+      let u0 = rx0 * g00[channel] + ry0 * g00[4 + channel]
+      let v0 = rx1 * g10[channel] + ry0 * g10[4 + channel]
+      let a = u0 + sx * (v0 - u0)
+      let u1 = rx0 * g01[channel] + ry1 * g01[4 + channel]
+      let v1 = rx1 * g11[channel] + ry1 * g11[4 + channel]
+      let b = u1 + sx * (v1 - u1)
+      result[channel] = a + sy * (b - a)
+      channel = channel + 1
+    }
+    return result
+  }
+
+  /// The spec's `turbulence(channel, point)` at a user-space point, for the four channels.
+  pub fn sample(
+    self: &Self,
+    x: f64,
+    y: f64,
+    settings: &TurbulenceSettings,
+    stitch: &Stitch,
+  ) -> [f64; 4] {
+    let mut vx = x * stitch.frequencyX
+    let mut vy = y * stitch.frequencyY
+    let mut sum: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+
+    // Dividing by the power-of-two ratio is exact, so multiplying by its inverse is the same.
+    let mut inverse = 1.0
+    let mut width = stitch.width
+    let mut height = stitch.height
+    let mut wrapX = stitch.wrapX
+    let mut wrapY = stitch.wrapY
+    let mut octave: u32 = 0
+    while octave < settings.octaves {
+      let n = self.noise4(vx, vy, stitch, width, height, wrapX, wrapY)
+      let mut c: usize = 0
+      while c < 4 {
+        sum[c] = sum[c]
+          + (if settings.fractalNoise {
+            n[c]
+          } else {
+            f64.abs(n[c])
+          })
+            * inverse
+        c = c + 1
+      }
+      vx = vx * 2.0
+      vy = vy * 2.0
+      inverse = inverse * 0.5
+      width = width * 2
+      wrapX = 2 * wrapX - PERLIN_N
+      height = height * 2
+      wrapY = 2 * wrapY - PERLIN_N
+      octave = octave + 1
+    }
+    return sum
+  }
+}
+
+/// `feTurbulence` over the region; `toUser` maps device pixels to user space, where the
+/// noise is defined (each pixel samples at its top-left corner).
+pub fn turbulence(
+  out: &mut Pixmap,
+  noise: &Turbulence,
+  settings: &TurbulenceSettings,
+  toUser: &Affine,
+  region: Region,
+) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let stitch = stitchOf(settings)
+  let stride = u32.toUsize(out.width()) * 4
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let p = toUser.apply(Point.make(u32.toF64(x), u32.toF64(y)))
+      let values = noise.sample(p.x, p.y, settings, &stitch)
+      let mut c: [u8; 4] = [0; 4]
+      let mut channel: usize = 0
+      while channel < 4 {
+        let mut v = values[channel]
+        if settings.fractalNoise {
+          v = (v + 1.0) / 2.0
+        }
+        c[channel] = transferByte(v)
+        channel = channel + 1
+      }
+      store(
+        &mut d,
+        u32.toUsize(y) * stride + u32.toUsize(x) * 4,
+        Rgba8.make(c[0], c[1], c[2], c[3]).premultiply(),
+      )
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+pub const LIGHT_DISTANT: u8 = 0
+
+pub const LIGHT_POINT: u8 = 1
+
+pub const LIGHT_SPOT: u8 = 2
+
+/// A light source in device space: `feDistantLight` (degrees), `fePointLight` or `feSpotLight`
+/// (positions in device pixels, z scaled like x). `limitingConeAngle` is in degrees; a negative
+/// value means no cone.
+pub struct Light {
+  pub kind: u8,
+  pub azimuth: f64,
+  pub elevation: f64,
+  pub x: f64,
+  pub y: f64,
+  pub z: f64,
+  pub pointsAtX: f64,
+  pub pointsAtY: f64,
+  pub pointsAtZ: f64,
+  pub specularExponent: f64,
+  pub limitingConeAngle: f64,
+}
+
+impl Copy for Light {}
+
+/// `feDiffuseLighting` (`specular` false: `constant` is kd) or `feSpecularLighting` (`constant`
+/// is ks, with `exponent`). `color` is the straight `lighting-color`.
+pub struct Lighting {
+  pub specular: bool,
+  pub surfaceScale: f32,
+  pub constant: f32,
+  pub exponent: f32,
+  pub color: Rgba8,
+  pub light: Light,
+}
+
+impl Copy for Lighting {}
+
+/// The f32 light parameters both renderers use: the unit vector of a distant light, the
+/// position, the unit spot direction, the cone cosine (or -2 without a cone) and the spot
+/// exponent.
+pub struct LightSetup {
+  pub kind: u8,
+  pub direction: [f32; 3],
+  pub position: [f32; 3],
+  pub spot: [f32; 3],
+  pub coneCosine: f32,
+  pub spotExponent: f32,
+  /// The lighting color's channels on 0..=1 (set by [`lighting`]; zero from [`lightSetupOf`]).
+  pub color: [f32; 3],
+}
+
+impl Copy for LightSetup {}
+
+pub fn lightSetupOf(light: &Light) -> LightSetup {
+  let radians = 3.141592653589793 / 180.0
+  let az = light.azimuth * radians
+  let el = light.elevation * radians
+  let direction: [f32; 3] = [
+    f64.toF32(f64.cos(az) * f64.cos(el)),
+    f64.toF32(f64.sin(az) * f64.cos(el)),
+    f64.toF32(f64.sin(el)),
+  ]
+  let sx = light.pointsAtX - light.x
+  let sy = light.pointsAtY - light.y
+  let sz = light.pointsAtZ - light.z
+  let length = f64.sqrt(sx * sx + sy * sy + sz * sz)
+  let spot: [f32; 3] = if length > 0.0 {
+    [f64.toF32(sx / length), f64.toF32(sy / length), f64.toF32(sz / length)]
+  } else {
+    [0.0, 0.0, 0.0]
+  }
+  let cone: f64 = if light.limitingConeAngle >= 0.0 {
+    f64.cos(light.limitingConeAngle * radians)
+  } else {
+    -2.0
+  }
+  return LightSetup {
+    kind: light.kind,
+    direction: direction,
+    position: [f64.toF32(light.x), f64.toF32(light.y), f64.toF32(light.z)],
+    spot: spot,
+    coneCosine: f64.toF32(cone),
+    spotExponent: f64.toF32(light.specularExponent),
+    color: [0.0, 0.0, 0.0],
+  }
+}
+
+/// [`lightSetupOf`] with the lighting color.
+pub fn lightingSetupOf(lighting: &Lighting) -> LightSetup {
+  let mut setup = lightSetupOf(&lighting.light)
+  setup.color = [
+    u8.toF32(lighting.color.r) / 255.0,
+    u8.toF32(lighting.color.g) / 255.0,
+    u8.toF32(lighting.color.b) / 255.0,
+  ]
+  return setup
+}
+
+/// `base ^ power` in f32 for `base` in `0 ..= 1` (both renderers round the same f64 result
+/// differently only past the last bit).
+pub fn powUnit(base: f32, power: f32) -> f32 {
+  if power == 0.0 {
+    return 1.0
+  }
+  if base <= 0.0 {
+    return 0.0
+  }
+  return f64.toF32(pow(f32.toF64(base), f32.toF64(power)))
+}
+
+fn alphaAt(s: &[u8], stride: usize, x: u32, y: u32) -> i32 with Intrinsic.inlineAlways() {
+  return u8.toI32(s[u32.toUsize(y) * stride + u32.toUsize(x) * 4 + 3])
+}
+
+/// The scale from a Sobel sum of alpha bytes over `span` columns and rows of total `weight` to
+/// the normal's component: `-surfaceScale * 2 / (span * weight)` on 0..=1 alpha.
+fn normalComponent(
+  sum: i32,
+  span: u32,
+  weight: i32,
+  surfaceScale: f32,
+) -> f32 with Intrinsic.inlineAlways() {
+  return 0.0 - surfaceScale * 2.0 / (i32.toF32(u32.toI32(span) * weight) * 255.0) * i32.toF32(sum)
+}
+
+/// The surface normal's x and y (before normalizing with z = 1) at `(x, y)` of the region `r`,
+/// with the spec's Sobel kernels: one-sided differences and their factors at the edges.
+pub fn surfaceNormal(
+  s: &[u8],
+  stride: usize,
+  r: Region,
+  x: u32,
+  y: u32,
+  surfaceScale: f32,
+) -> [f32; 2] {
+  let left = if x > r.x0 {
+    x - 1
+  } else {
+    x
+  }
+  let right = if x + 1 < r.x1 {
+    x + 1
+  } else {
+    x
+  }
+  let top = if y > r.y0 {
+    y - 1
+  } else {
+    y
+  }
+  let bottom = if y + 1 < r.y1 {
+    y + 1
+  } else {
+    y
+  }
+  let mut nx: f32 = 0.0
+  if right > left {
+    // Rows y - 1, y, y + 1 weighted 1, 2, 1 where they exist.
+    let mut weight: i32 = 2
+    let mut sum = 2 * (alphaAt(s, stride, right, y) - alphaAt(s, stride, left, y))
+    if top < y {
+      sum = sum + (alphaAt(s, stride, right, top) - alphaAt(s, stride, left, top))
+      weight = weight + 1
+    }
+    if bottom > y {
+      sum = sum + (alphaAt(s, stride, right, bottom) - alphaAt(s, stride, left, bottom))
+      weight = weight + 1
+    }
+    nx = normalComponent(sum, right - left, weight, surfaceScale)
+  }
+  let mut ny: f32 = 0.0
+  if bottom > top {
+    let mut weight: i32 = 2
+    let mut sum = 2 * (alphaAt(s, stride, x, bottom) - alphaAt(s, stride, x, top))
+    if left < x {
+      sum = sum + (alphaAt(s, stride, left, bottom) - alphaAt(s, stride, left, top))
+      weight = weight + 1
+    }
+    if right > x {
+      sum = sum + (alphaAt(s, stride, right, bottom) - alphaAt(s, stride, right, top))
+      weight = weight + 1
+    }
+    ny = normalComponent(sum, bottom - top, weight, surfaceScale)
+  }
+  return [nx, ny]
+}
+
+/// [`surfaceNormal`] away from the region's edges; `at` is the pixel's byte offset.
+fn interiorNormal(
+  s: &[u8],
+  stride: usize,
+  at: usize,
+  surfaceScale: f32,
+) -> [f32; 2] with Intrinsic.inlineAlways() {
+  let top = Slice.view(s, at - stride - 4, 12)
+  let middle = Slice.view(s, at - 4, 12)
+  let bottom = Slice.view(s, at + stride - 4, 12)
+  let nxSum = 2 * (u8.toI32(middle[11]) - u8.toI32(middle[3]))
+    + (u8.toI32(top[11]) - u8.toI32(top[3]))
+    + (u8.toI32(bottom[11]) - u8.toI32(bottom[3]))
+  let nySum = 2 * (u8.toI32(bottom[7]) - u8.toI32(top[7]))
+    + (u8.toI32(bottom[3]) - u8.toI32(top[3]))
+    + (u8.toI32(bottom[11]) - u8.toI32(top[11]))
+  return [normalComponent(nxSum, 2, 4, surfaceScale), normalComponent(nySum, 2, 4, surfaceScale)]
+}
+
+/// `feDiffuseLighting` or `feSpecularLighting` over the region, with the input's alpha as the
+/// bump map. Computes in f32.
+pub fn lighting(out: &mut Pixmap, input: &Pixmap, lighting: &Lighting, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let setup = lightingSetupOf(lighting)
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+
+  // The surface height of each alpha byte, as the GPU computes it.
+  let mut heights: [f32; 256] = [0.0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    heights[u32.toUsize(i)] = lighting.surfaceScale * u32.toF32(i) / 255.0
+    i = i + 1
+  }
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let n = if x > r.x0 && x + 1 < r.x1 && y > r.y0 && y + 1 < r.y1 {
+        interiorNormal(
+          s,
+          stride,
+          u32.toUsize(y) * stride + u32.toUsize(x) * 4,
+          lighting.surfaceScale,
+        )
+      } else {
+        surfaceNormal(s, stride, r, x, y, lighting.surfaceScale)
+      }
+      let z = heights[i32.toUsize(alphaAt(s, stride, x, y))]
+      store(
+        &mut d,
+        u32.toUsize(y) * stride + u32.toUsize(x) * 4,
+        lightPixel(n[0], n[1], u32.toF32(x), u32.toF32(y), z, lighting, &setup),
+      )
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// One lit pixel; `setup` comes from [`lightingSetupOf`].
+pub fn lightPixel(
+  nx: f32,
+  ny: f32,
+  x: f32,
+  y: f32,
+  z: f32,
+  lighting: &Lighting,
+  setup: &LightSetup,
+) -> Rgba8 with Intrinsic.inlineAlways() {
+  let nLength = f32.sqrt(nx * nx + ny * ny + 1.0)
+  let mut lx = setup.direction[0]
+  let mut ly = setup.direction[1]
+  let mut lz = setup.direction[2]
+  if setup.kind != LIGHT_DISTANT {
+    lx = setup.position[0] - x
+    ly = setup.position[1] - y
+    lz = setup.position[2] - z
+    let length = f32.sqrt(lx * lx + ly * ly + lz * lz)
+    if length > 0.0 {
+      let inverse = 1.0 / length
+      lx = lx * inverse
+      ly = ly * inverse
+      lz = lz * inverse
+    }
+  }
+
+  // The light color, attenuated by a spot light's direction and cone.
+  let mut scale: f32 = 1.0
+  if setup.kind == LIGHT_SPOT {
+    let minusLDotS = 0.0 - (lx * setup.spot[0] + ly * setup.spot[1] + lz * setup.spot[2])
+    if minusLDotS <= 0.0 || minusLDotS < setup.coneCosine {
+      scale = 0.0
+    } else {
+      scale = powUnit(minusLDotS, setup.spotExponent)
+    }
+  }
+  let mut factor: f32 = 0.0
+  if lighting.specular {
+    let hx = lx
+    let hy = ly
+    let hz = lz + 1.0
+    let hLength = f32.sqrt(hx * hx + hy * hy + hz * hz)
+    if hLength > 0.0 {
+      let nDotH = (nx * hx + ny * hy + hz) / (nLength * hLength)
+      factor = lighting.constant * powUnit(f32.min(f32.max(nDotH, 0.0), 1.0), lighting.exponent)
+    }
+  } else {
+    let nDotL = (nx * lx + ny * ly + lz) / nLength
+    factor = lighting.constant * f32.max(nDotL, 0.0)
+  }
+  let k = factor * scale
+  let r = clamp01(k * setup.color[0])
+  let g = clamp01(k * setup.color[1])
+  let b = clamp01(k * setup.color[2])
+  if !lighting.specular {
+    return Rgba8.make(byte(r), byte(g), byte(b), 255)
+  }
+  let a = f32.max(r, f32.max(g, b))
+  return Rgba8.make(byte(r), byte(g), byte(b), byte(a)).premultiply()
+}

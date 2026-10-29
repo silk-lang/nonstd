@@ -1,0 +1,483 @@
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import silk.num.i64
+import silk.collections.list { List }
+import pixmap { Pixmap, Rgba8 }
+import layer { BLEND_MULTIPLY }
+import geometry { Affine }
+import filter {
+  Region, BlurPlan, flood, offset, mergeOver, copy, composite, compositePixel, blend, colorMatrix, colorMatrixOf, matrixPixel,
+  gaussianBlur, toLinear, toSrgb, COMPOSITE_OVER, COMPOSITE_IN, COMPOSITE_OUT, COMPOSITE_ATOP, COMPOSITE_XOR, COMPOSITE_LIGHTER,
+  COMPOSITE_ARITHMETIC, MATRIX, SATURATE, HUE_ROTATE, LUMINANCE_TO_ALPHA, morphology, MORPHOLOGY_ERODE, MORPHOLOGY_DILATE,
+  ComponentTransfer, componentTransfer, transferPixel, transferTable, transferDiscrete, transferLinear, transferGamma, tile,
+  Convolution, convolveMatrix, EDGE_DUPLICATE, EDGE_WRAP, EDGE_NONE, displacementMap, displacementTable, CHANNEL_R, CHANNEL_A,
+  Turbulence, TurbulenceSettings, turbulence, Light, Lighting, lighting, surfaceNormal, LIGHT_DISTANT, LIGHT_POINT, LIGHT_SPOT,
+}
+
+fn close(a: u8, b: u8) -> bool {
+  let d = u8.toI32(a) - u8.toI32(b)
+  return d <= 1 && 0 - d <= 1
+}
+
+fn same(c: Rgba8, r: u8, g: u8, b: u8, a: u8) -> bool { return close(c.r, r) && close(c.g, g) && close(c.b, b) && close(c.a, a) }
+
+fn exact(c: Rgba8, r: u8, g: u8, b: u8, a: u8) -> bool { return c.r == r && c.g == g && c.b == b && c.a == a }
+
+test effect fn floodFillsOnlyTheRegion() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut out = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut out, Rgba8.make(255, 0, 0, 255), 128, Region.make(2, 2, 6, 5))
+  run Testing.expect(exact(out.pixel(2, 2), 128, 0, 0, 128), "premultiplied flood at half opacity")
+  run Testing.expect(exact(out.pixel(5, 4), 128, 0, 0, 128), "last pixel of the region")
+  run Testing.expect(exact(out.pixel(6, 4), 0, 0, 0, 0), "right of the region is clear")
+  run Testing.expect(exact(out.pixel(1, 1), 0, 0, 0, 0), "outside is clear")
+}
+
+test effect fn offsetMovesAndClips() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(0, 255, 0, 255), 255, Region.make(1, 1, 2, 2))
+  let mut out = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  offset(&mut out, &input, 3, -1, Region.of(&input))
+  run Testing.expect(exact(out.pixel(4, 0), 0, 255, 0, 255), "moved by (3, -1)")
+  run Testing.expect(exact(out.pixel(1, 1), 0, 0, 0, 0), "origin is empty")
+  offset(&mut out, &input, 3, -1, Region.make(0, 1, 8, 8))
+  run Testing.expect(exact(out.pixel(4, 0), 0, 0, 0, 0), "clipped by the region")
+}
+
+test effect fn porterDuffOperators() -> () ! AssertionError<'static> {
+  let s = Rgba8.make(200, 0, 0, 200)
+  let b = Rgba8.make(0, 0, 100, 100)
+  let k: [f32; 4] = [0.0, 0.0, 0.0, 0.0]
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_OVER, k), 200, 0, 22, 222), "over")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_IN, k), 78, 0, 0, 78), "in: s * ab")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_OUT, k), 122, 0, 0, 122), "out: s * (1 - ab)")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_ATOP, k), 78, 0, 22, 100), "atop keeps backdrop alpha")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_XOR, k), 122, 0, 22, 144), "xor")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_LIGHTER, k), 200, 0, 100, 255), "lighter saturates")
+  let identity: [f32; 4] = [0.0, 1.0, 0.0, 0.0]
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_ARITHMETIC, identity), 200, 0, 0, 200), "arithmetic k2 = 1 is in")
+  let sum: [f32; 4] = [0.0, 1.0, 1.0, 0.0]
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_ARITHMETIC, sum), 200, 0, 100, 255), "arithmetic clamps color to alpha")
+}
+
+test effect fn colorMatricesFollowTheSpec() -> () ! AssertionError<'static> {
+  let red = Rgba8.make(255, 0, 0, 255)
+  let none: [f32; 0] = []
+  run Testing.expect(exact(matrixPixel(red, colorMatrixOf(MATRIX, &none)), 255, 0, 0, 255), "identity")
+  let zero: [f32; 1] = [0.0]
+  run Testing.expect(same(matrixPixel(red, colorMatrixOf(SATURATE, &zero)), 54, 54, 54, 255), "saturate 0 gives luminance gray")
+  let full: [f32; 1] = [360.0]
+  run Testing.expect(same(matrixPixel(red, colorMatrixOf(HUE_ROTATE, &full)), 255, 0, 0, 255), "hue-rotate 360 is identity")
+  let white = Rgba8.make(255, 255, 255, 255)
+  run Testing.expect(same(matrixPixel(white, colorMatrixOf(LUMINANCE_TO_ALPHA, &none)), 0, 0, 0, 255), "luminanceToAlpha")
+  // Unpremultiplied first: a half-transparent red stays red.
+  run Testing.expect(same(matrixPixel(Rgba8.make(128, 0, 0, 128), colorMatrixOf(MATRIX, &none)), 128, 0, 0, 128), "premultiplied round trip")
+}
+
+test effect fn blurPlansFollowTheSpec() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  // sigma 3: d = floor(3 * 3 * sqrt(2 pi) / 4 + 0.5) = 6, even: boxes 6, 6 and 7.
+  let wide = run BlurPlan.make(3.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let boxes = wide.boxPasses()
+  run Testing.expect(boxes.length == 6 && boxes[0] == 6 && boxes[1] == 3 && boxes[2] == 6 && boxes[3] == 2 && boxes[4] == 7 && boxes[5] == 3, "even d box passes")
+  let odd = run BlurPlan.make(2.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(odd.boxPasses().length == 6 && odd.boxPasses()[0] == 4, "sigma 2 gives d = 4")
+  let small = run BlurPlan.make(1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let weights = small.kernel()
+  let mut total: u32 = 0
+  let mut i: usize = 0
+  while i < weights.length {
+    total = total + weights[i]
+    i = i + 1
+  }
+  run Testing.expect(weights.length == 7 && total == 65536, "kernel radius 3 sums to 65536")
+  run Testing.expect(weights[0] == weights[6] && weights[2] == weights[4] && weights[3] > weights[2], "symmetric bell")
+  // exp(-0.5) / sum: the tap next to the center is 0.2420 / 0.9987 of the mass.
+  run Testing.expect(weights[2] > 15800 && weights[2] < 16000, "gaussian weights")
+}
+
+test effect fn blurSpreadsAndKeepsMass() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(40, 40) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(255, 255, 255, 255), 255, Region.make(10, 10, 30, 30))
+  let mut out = run Pixmap.make(40, 40) |> Effect.provideMut<Allocator>(&mut allocator)
+  let plan = run BlurPlan.make(3.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run gaussianBlur(&mut out, &input, &plan, &plan, Region.of(&input)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(exact(out.pixel(20, 20), 255, 255, 255, 255), "interior stays opaque")
+  run Testing.expect(out.pixel(5, 20).a > 0 && out.pixel(5, 20).a < 40, "blur reaches past the edge")
+  let edge = out.pixel(10, 20).a
+  run Testing.expect(edge > 110 && edge < 150, "about half at the edge")
+  let mut before: u32 = 0
+  let mut after: u32 = 0
+  let mut y: u32 = 0
+  while y < 40 {
+    let mut x: u32 = 0
+    while x < 40 {
+      before = before + u8.toU32(input.pixel(x, y).a)
+      after = after + u8.toU32(out.pixel(x, y).a)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  let drift = if after > before { after - before } else { before - after }
+  run Testing.expect(drift * 100 < before, "mass kept within 1%")
+}
+
+test effect fn mergeAndBlendCompose() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut a = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut a, Rgba8.make(255, 0, 0, 255), 255, Region.make(0, 0, 4, 4))
+  let mut b = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut b, Rgba8.make(0, 0, 255, 128), 255, Region.make(0, 0, 2, 4))
+  let mut merged = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  copy(&mut merged, &a, Region.of(&a))
+  mergeOver(&mut merged, &b, Region.of(&a))
+  run Testing.expect(same(merged.pixel(0, 0), 127, 0, 128, 255), "merge composites in order")
+  run Testing.expect(exact(merged.pixel(3, 0), 255, 0, 0, 255), "merge keeps the first input elsewhere")
+  let mut gray = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut gray, Rgba8.make(128, 128, 128, 255), 255, Region.make(0, 0, 4, 4))
+  let mut out = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  blend(&mut out, &gray, &a, BLEND_MULTIPLY, Region.make(0, 0, 2, 2))
+  run Testing.expect(same(out.pixel(0, 0), 128, 0, 0, 255), "feBlend multiply")
+  run Testing.expect(exact(out.pixel(3, 3), 0, 0, 0, 0), "feBlend outside the region is clear")
+}
+
+test effect fn linearRgbRoundTrips() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  p.clear(Rgba8.make(128, 188, 255, 255))
+  toLinear(&mut p)
+  // sRGB 128 -> 0.2158 linear (55), 188 -> 0.5029 (128).
+  run Testing.expect(same(p.pixel(0, 0), 55, 128, 255, 255), "to linear")
+  toSrgb(&mut p)
+  run Testing.expect(same(p.pixel(0, 0), 128, 188, 255, 255), "and back")
+}
+
+test effect fn morphologyGrowsAndShrinks() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(12, 12) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(0, 0, 255, 255), 255, Region.make(4, 4, 8, 8))
+  let mut out = run Pixmap.make(12, 12) |> Effect.provideMut<Allocator>(&mut allocator)
+  run morphology(&mut out, &input, MORPHOLOGY_DILATE, 1, 2, Region.make(0, 0, 12, 12)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(out.pixel(3, 2).a == 255 && out.pixel(8, 9).a == 255 && out.pixel(2, 4).a == 0 && out.pixel(4, 1).a == 0, "dilate by 1 x 2")
+  run morphology(&mut out, &input, MORPHOLOGY_ERODE, 1, 1, Region.make(0, 0, 12, 12)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(out.pixel(5, 5).a == 255 && out.pixel(6, 6).a == 255 && out.pixel(4, 5).a == 0 && out.pixel(7, 6).a == 0, "erode by 1")
+  run morphology(&mut out, &input, MORPHOLOGY_ERODE, 1, 1, Region.make(4, 4, 8, 8)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(out.pixel(4, 4).a == 0 && out.pixel(5, 5).a == 255, "past the region is transparent")
+}
+
+/// One axis of a blur plan over `values`, straight from the definitions.
+effect fn blurReference(values: &List<u32>, plan: &BlurPlan) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let n = values.length()
+  let mut current = List<u32>.make()
+  let mut i: usize = 0
+  while i < n {
+    run current.append(values.asSlice()[i])
+    i = i + 1
+  }
+  let boxes = plan.boxPasses()
+  let weights = plan.kernel()
+  let mut p: usize = 0
+  while p < boxes.length || (p == 0 && weights.length > 0) {
+    let mut next = List<u32>.make()
+    i = 0
+    while i < n {
+      let mut sum: u32 = 0
+      if boxes.length > 0 {
+        let size = boxes[p]
+        let mut k: u32 = 0
+        while k < size {
+          let j = usize.toI64(i) + u32.toI64(k) - u32.toI64(boxes[p + 1])
+          if j >= 0 && j < usize.toI64(n) { sum = sum + current.asSlice()[i64.toUsize(j)] }
+          k = k + 1
+        }
+        run next.append((sum + size / 2) / size)
+      } else {
+        sum = 32768
+        let mut k: usize = 0
+        while k < weights.length {
+          let j = usize.toI64(i) + usize.toI64(k) - usize.toI64(weights.length / 2)
+          if j >= 0 && j < usize.toI64(n) { sum = sum + current.asSlice()[i64.toUsize(j)] * weights[k] }
+          k = k + 1
+        }
+        run next.append(u32.shiftRight(sum, 16))
+      }
+      i = i + 1
+    }
+    current = move next
+    p = p + 2
+  }
+  return move current
+}
+
+test effect fn blurMatchesTheDefinition() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let width: u32 = 37
+  let height: u32 = 23
+  let mut input = run Pixmap.make(width, height) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut seed: u32 = 777
+  let data = input.dataMut()
+  let mut k: usize = 0
+  while k < data.length {
+    seed = u32.wrappingAdd(u32.wrappingMultiply(seed, 1103515245), 12345)
+    data[k] = u32.toU8(u32.shiftRight(seed, 16) & 255)
+    k = k + 1
+  }
+  let mut out = run Pixmap.make(width, height) |> Effect.provideMut<Allocator>(&mut allocator)
+  let sigmas: [f64; 4] = [0.0, 0.7, 3.0, 5.5]
+  let mut a: usize = 0
+  while a < 4 {
+    let mut b: usize = 0
+    while b < 4 {
+      let horizontal = run BlurPlan.make(sigmas[a]) |> Effect.provideMut<Allocator>(&mut allocator)
+      let vertical = run BlurPlan.make(sigmas[b]) |> Effect.provideMut<Allocator>(&mut allocator)
+      let region = if (a + b) % 2 == 0 { Region.make(0, 0, width, height) } else { Region.make(3, 2, 33, 20) }
+      run gaussianBlur(&mut out, &input, &horizontal, &vertical, region) |> Effect.provideMut<Allocator>(&mut allocator)
+      let rw = u32.toUsize(region.x1 - region.x0)
+      let rh = u32.toUsize(region.y1 - region.y0)
+      // Rows, then columns, of each channel.
+      let mut c: usize = 0
+      while c < 4 {
+        let mut grid = List<u32>.make()
+        let mut y: usize = 0
+        while y < rh {
+          let mut line = List<u32>.make()
+          let mut x: usize = 0
+          while x < rw {
+            let at = ((u32.toUsize(region.y0) + y) * u32.toUsize(width) + u32.toUsize(region.x0) + x) * 4 + c
+            run line.append(u8.toU32(input.data()[at])) |> Effect.provideMut<Allocator>(&mut allocator)
+            x = x + 1
+          }
+          let blurred = run blurReference(&line, &horizontal) |> Effect.provideMut<Allocator>(&mut allocator)
+          x = 0
+          while x < rw {
+            run grid.append(blurred.asSlice()[x]) |> Effect.provideMut<Allocator>(&mut allocator)
+            x = x + 1
+          }
+          y = y + 1
+        }
+        let mut x: usize = 0
+        while x < rw {
+          let mut line = List<u32>.make()
+          y = 0
+          while y < rh {
+            run line.append(grid.asSlice()[y * rw + x]) |> Effect.provideMut<Allocator>(&mut allocator)
+            y = y + 1
+          }
+          let blurred = run blurReference(&line, &vertical) |> Effect.provideMut<Allocator>(&mut allocator)
+          y = 0
+          while y < rh {
+            let at = ((u32.toUsize(region.y0) + y) * u32.toUsize(width) + u32.toUsize(region.x0) + x) * 4 + c
+            run Testing.expect(u8.toU32(out.data()[at]) == blurred.asSlice()[y], "blur matches the definition")
+            y = y + 1
+          }
+          x = x + 1
+        }
+        c = c + 1
+      }
+      b = b + 1
+    }
+    a = a + 1
+  }
+}
+
+/// The spec's window, one pixel and channel at a time.
+fn morphologyReference(input: &Pixmap, dilate: bool, rx: u32, ry: u32, r: Region, x: u32, y: u32, c: usize) -> u8 {
+  let mut v: u32 = if dilate { 0 } else { 255 }
+  let mut j: i32 = 0 - u32.toI32(ry)
+  while j <= u32.toI32(ry) {
+    let mut i: i32 = 0 - u32.toI32(rx)
+    while i <= u32.toI32(rx) {
+      let px = u32.toI32(x) + i
+      let py = u32.toI32(y) + j
+      let inside = px >= u32.toI32(r.x0) && px < u32.toI32(r.x1) && py >= u32.toI32(r.y0) && py < u32.toI32(r.y1)
+      let value: u32 = if inside { u8.toU32(input.data()[(i32.toUsize(py) * u32.toUsize(input.width()) + i32.toUsize(px)) * 4 + c]) } else { 0 }
+      if dilate { if value > v { v = value } } else if value < v { v = value }
+      i = i + 1
+    }
+    j = j + 1
+  }
+  return u32.toU8(v)
+}
+
+test effect fn morphologyMatchesTheWindow() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(23, 17) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut seed: u32 = 12345
+  let data = input.dataMut()
+  let mut k: usize = 0
+  while k < data.length {
+    seed = u32.wrappingAdd(u32.wrappingMultiply(seed, 1103515245), 12345)
+    data[k] = u32.toU8(u32.shiftRight(seed, 16) & 255)
+    k = k + 1
+  }
+  let mut out = run Pixmap.make(23, 17) |> Effect.provideMut<Allocator>(&mut allocator)
+  let radii: [u32; 6] = [1, 2, 3, 5, 6, 13]
+  let mut a: usize = 0
+  while a < 6 {
+    let mut b: usize = 0
+    while b < 6 {
+      let mut op: u8 = 0
+      while op < 2 {
+        let region = if b % 2 == 0 { Region.make(0, 0, 23, 17) } else { Region.make(3, 2, 20, 13) }
+        run morphology(&mut out, &input, op, radii[a], radii[b], region) |> Effect.provideMut<Allocator>(&mut allocator)
+        let mut y = region.y0
+        while y < region.y1 {
+          let mut x = region.x0
+          while x < region.x1 {
+            let mut c: usize = 0
+            while c < 4 {
+              let want = morphologyReference(&input, op == MORPHOLOGY_DILATE, radii[a], radii[b], region, x, y, c)
+              run Testing.expect(out.data()[(u32.toUsize(y) * 23 + u32.toUsize(x)) * 4 + c] == want, "morphology window")
+              c = c + 1
+            }
+            x = x + 1
+          }
+          y = y + 1
+        }
+        op = op + 1
+      }
+      b = b + 1
+    }
+    a = a + 1
+  }
+}
+
+test effect fn componentTransferFunctions() -> () ! AssertionError<'static> {
+  let mut t = ComponentTransfer.identity()
+  t.r = transferLinear(0.5, 0.0)
+  t.g = transferGamma(1.0, 2.0, 0.0)
+  let steps: [f32; 2] = [0.0, 1.0]
+  t.b = transferDiscrete(&steps)
+  run Testing.expect(exact(transferPixel(Rgba8.make(200, 128, 127, 255), &t), 100, 64, 0, 255), "linear, gamma and discrete")
+  run Testing.expect(transferDiscrete(&steps)[128] == 255, "discrete steps up at the midpoint")
+  run Testing.expect(transferTable(&steps)[77] == 77 && transferTable(&steps)[255] == 255, "two-entry table is the identity")
+  let inverse: [f32; 2] = [1.0, 0.0]
+  run Testing.expect(transferTable(&inverse)[0] == 255 && transferTable(&inverse)[51] == 204, "inverting table")
+  // Unpremultiplied first: half-transparent 50% red stays 50% red at the same alpha.
+  t.r = transferTable(&steps)
+  run Testing.expect(same(transferPixel(Rgba8.make(64, 0, 0, 128), &t), 64, 0, 0, 128), "premultiplied round trip")
+}
+
+test effect fn tileRepeatsTheSource() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(255, 0, 0, 255), 255, Region.make(1, 1, 2, 3))
+  let mut green = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut green, Rgba8.make(0, 255, 0, 255), 255, Region.make(2, 1, 3, 3))
+  mergeOver(&mut input, &green, Region.of(&green))
+  let mut out = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  tile(&mut out, &input, Region.make(1, 1, 3, 3), Region.make(0, 0, 8, 8))
+  run Testing.expect(exact(out.pixel(0, 0), 0, 255, 0, 255) && exact(out.pixel(3, 0), 255, 0, 0, 255) && exact(out.pixel(7, 7), 255, 0, 0, 255), "tiles on both sides of the source")
+}
+
+test effect fn convolveMatrixFollowsTheSpec() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(200, 100, 0, 255), 128, Region.make(2, 2, 3, 3))
+  let mut out = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  // The kernel is applied rotated by 180 degrees: weight on its last entry reads the pixel up-left.
+  let shift: [f32; 9] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+  let k = Convolution { kernel: &shift, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_NONE, preserveAlpha: false }
+  run convolveMatrix(&mut out, &input, &k, Region.of(&input)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(exact(out.pixel(3, 3), 100, 50, 0, 128) && out.pixel(2, 2).a == 0, "shifts down-right")
+  let box: [f32; 9] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  let blur = Convolution { kernel: &box, orderX: 3, orderY: 3, divisor: 9.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_DUPLICATE, preserveAlpha: true }
+  run convolveMatrix(&mut out, &input, &blur, Region.of(&input)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(same(out.pixel(2, 2), 11, 6, 0, 128) && out.pixel(3, 3).a == 0, "preserveAlpha keeps the source alpha")
+  let wrapped = Convolution { kernel: &shift, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_WRAP, preserveAlpha: false }
+  run convolveMatrix(&mut out, &input, &wrapped, Region.make(2, 2, 6, 6)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(exact(out.pixel(2, 2), 0, 0, 0, 0) && exact(out.pixel(3, 3), 100, 50, 0, 128), "wrap stays inside the region")
+}
+
+test effect fn displacementMovesBySelectedChannels() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(0, 0, 255, 255), 255, Region.make(8, 0, 9, 4))
+  let mut map = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  // Red 255 at half alpha unpremultiplies to 1: displacement +5 for scale 10; alpha 128 is 0.
+  flood(&mut map, Rgba8.make(255, 0, 0, 128), 255, Region.make(0, 0, 16, 4))
+  let table = displacementTable(10.0)
+  run Testing.expect(table[255] == 5 && table[0] == -5 && table[128] == 0, "displacement table")
+  let mut out = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  displacementMap(&mut out, &input, &map, &table, CHANNEL_R, CHANNEL_A, Region.of(&map))
+  run Testing.expect(exact(out.pixel(3, 1), 0, 0, 255, 255) && out.pixel(8, 1).a == 0, "x displaced by +5, y by 0")
+}
+
+test effect fn turbulenceMatchesTheSpecReference() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  // Expected bytes come from a direct transliteration of the spec's C reference code.
+  let mut out = run Pixmap.make(128, 96) |> Effect.provideMut<Allocator>(&mut allocator)
+  let noise = run Turbulence.make(2.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let plain = TurbulenceSettings {
+    baseFrequencyX: 0.05, baseFrequencyY: 0.08, octaves: 3, fractalNoise: false, stitchTiles: false, tileX: 0.0, tileY: 0.0, tileWidth: 128.0, tileHeight: 96.0,
+  }
+  turbulence(&mut out, &noise, &plain, &Affine.identity(), Region.make(0, 0, 128, 96))
+  run Testing.expect(exact(out.pixel(10, 7), 7, 8, 5, 22) && exact(out.pixel(33, 50), 19, 33, 30, 91), "turbulence, seed 2")
+  let stitched = run Turbulence.make(-7.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let fractal = TurbulenceSettings {
+    baseFrequencyX: 0.031, baseFrequencyY: 0.031, octaves: 4, fractalNoise: true, stitchTiles: true, tileX: 4.0, tileY: 3.0, tileWidth: 100.0, tileHeight: 80.0,
+  }
+  turbulence(&mut out, &stitched, &fractal, &Affine.identity(), Region.make(4, 3, 104, 83))
+  run Testing.expect(exact(out.pixel(21, 64), 58, 73, 56, 139) && exact(out.pixel(99, 77), 59, 89, 95, 158), "stitched fractal noise, seed -7")
+  run Testing.expect(exact(out.pixel(2, 2), 0, 0, 0, 0), "outside the region")
+  // Stitched noise repeats with the tile: a pixel one tile width to the right matches.
+  let wide = TurbulenceSettings {
+    baseFrequencyX: 0.031, baseFrequencyY: 0.031, octaves: 4, fractalNoise: true, stitchTiles: true, tileX: 4.0, tileY: 3.0, tileWidth: 50.0, tileHeight: 80.0,
+  }
+  turbulence(&mut out, &stitched, &wide, &Affine.identity(), Region.make(0, 0, 128, 96))
+  run Testing.expect(exact(out.pixel(10, 20), out.pixel(60, 20).r, out.pixel(60, 20).g, out.pixel(60, 20).b, out.pixel(60, 20).a)
+    && exact(out.pixel(30, 5), out.pixel(30, 85).r, out.pixel(30, 85).g, out.pixel(30, 85).b, out.pixel(30, 85).a), "tiles stitch")
+}
+
+fn light(kind: u8, azimuth: f64, elevation: f64, x: f64, y: f64, z: f64) -> Light {
+  return Light { kind: kind, azimuth: azimuth, elevation: elevation, x: x, y: y, z: z, pointsAtX: x, pointsAtY: y, pointsAtZ: 0.0, specularExponent: 1.0, limitingConeAngle: -1.0 }
+}
+
+test effect fn lightingFollowsTheSpec() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(16, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(0, 0, 0, 255), 255, Region.make(0, 0, 16, 16))
+  let mut out = run Pixmap.make(16, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  let white = Rgba8.make(255, 255, 255, 255)
+  let overhead = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: light(LIGHT_DISTANT, 0.0, 90.0, 0.0, 0.0, 0.0) }
+  lighting(&mut out, &input, &overhead, Region.make(0, 0, 16, 16))
+  run Testing.expect(exact(out.pixel(0, 0), 255, 255, 255, 255) && exact(out.pixel(7, 9), 255, 255, 255, 255), "flat surface, light overhead")
+  let low = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: light(LIGHT_DISTANT, 0.0, 30.0, 0.0, 0.0, 0.0) }
+  lighting(&mut out, &input, &low, Region.make(0, 0, 16, 16))
+  run Testing.expect(exact(out.pixel(5, 5), 128, 128, 128, 255), "N.L = sin 30")
+  let shiny = Lighting { specular: true, surfaceScale: 1.0, constant: 0.5, exponent: 8.0, color: Rgba8.make(255, 128, 0, 255), light: light(LIGHT_DISTANT, 0.0, 90.0, 0.0, 0.0, 0.0) }
+  lighting(&mut out, &input, &shiny, Region.make(0, 0, 16, 16))
+  run Testing.expect(same(out.pixel(5, 5), 64, 32, 0, 128), "specular alpha is the max channel")
+  let above = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: light(LIGHT_POINT, 0.0, 0.0, 8.0, 8.0, 9.0) }
+  lighting(&mut out, &input, &above, Region.make(0, 0, 16, 16))
+  run Testing.expect(exact(out.pixel(8, 8), 255, 255, 255, 255) && out.pixel(0, 8).r < 200, "point light falls off with angle")
+  let mut spot = light(LIGHT_SPOT, 0.0, 0.0, 8.0, 8.0, 20.0)
+  spot.pointsAtX = 8.0
+  spot.pointsAtY = 8.0
+  spot.limitingConeAngle = 10.0
+  let cone = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: spot }
+  lighting(&mut out, &input, &cone, Region.make(0, 0, 16, 16))
+  run Testing.expect(out.pixel(8, 8).r > 250 && out.pixel(0, 0).r == 0, "spot cone")
+  // A ramp in x: interior Nx = -surfaceScale / 4 * 4 * (A(x+1) - A(x-1)).
+  let mut ramp = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let bytes = ramp.dataMut()
+  let mut i: usize = 0
+  while i < 64 {
+    bytes[i * 4 + 3] = usize.toU8((i % 16) * 10)
+    i = i + 1
+  }
+  let mut column = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  copy(&mut column, &ramp, Region.make(0, 0, 16, 4))
+  let n = surfaceNormal(column.data(), 64, Region.make(0, 0, 16, 4), 5, 1, 2.0)
+  run Testing.expect(n[0] < -0.1567 && n[0] > -0.1571 && n[1] == 0.0, "interior Sobel normal")
+  let edge = surfaceNormal(column.data(), 64, Region.make(0, 0, 16, 4), 0, 0, 2.0)
+  // Top-left corner: factor 2/3 over (2 dA + dA) with one-pixel differences.
+  run Testing.expect(edge[0] < -0.1567 && edge[0] > -0.1571, "corner Sobel normal")
+}
