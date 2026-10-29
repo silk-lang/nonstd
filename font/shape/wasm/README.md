@@ -1,15 +1,17 @@
-# hr_wasm
+# font-shape-wasm
 
-harfrust shaping and read_fonts glyph outlines, built for `wasm32-unknown-unknown`, with a
-TypeScript wrapper (`js/`).
+[font-shape](..) and [font-parse](../../parse) glyph outlines, built for
+`wasm32-unknown-unknown`, with a TypeScript wrapper in `js/`. A web page can shape text and
+draw the glyphs without any native code.
+
+Build and test from the repository root:
 
 ```sh
-SILK_CLANG=$(scripts/install-llvm) font/scripts/build-wasm   # writes font/shape/wasm/js/dist/harfrust.wasm
-cd font/shape/wasm/js && npm ci && npm test                     # compares against native hr_shape output
+font/scripts/build-wasm                      # writes font/shape/wasm/js/dist/harfrust.wasm
+cd font/shape/wasm/js && npm ci && npm test  # compares against native font-shape-cli output
 ```
 
-Linking needs `wasm-ld` on `PATH` (`apt-get install lld`); the clang from `scripts/install-llvm`
-does not include it.
+Linking needs `wasm-ld` on `PATH`.
 
 ## JavaScript
 
@@ -50,5 +52,5 @@ memory.
   i32 F2Dot14 bits.
 
 The module also imports `math.sin`, `math.cos`, `math.tan` and `math.hypot` (f64), because
-read_fonts calls libm's `sinf`, `cosf`, `tanf` and `hypotf` for COLR transforms and the
+font-parse calls libm's `sinf`, `cosf`, `tanf` and `hypotf` for COLR transforms and the
 standalone wasm runtime links no C library. `src/libm.silk` forwards them to the host.
