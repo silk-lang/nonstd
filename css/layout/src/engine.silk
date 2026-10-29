@@ -1,14 +1,14 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.usize
 import silk.core.effect { Effect }
-import geometry { Layout, Size, Point, Rect, ResolvedEdges, OptionalSize, AvailableSpace, AvailableKind, Measure, MeasureRequest, NaturalDimensions, ScrollbarRequest, BaselineSet, MarginStrut, max, min, clamp, EMPTY_EXTENT }
+import geometry { Layout, Size, Point, Rect, ResolvedEdges, OptionalSize, AvailableSpace, AvailableKind, Measure, MeasureRequest, NaturalDimensions, ScrollbarRequest, BaselineSet, MarginStrut, max, min, clamp, sameOverflow, EMPTY_EXTENT }
 import style { Style, Display, Dimension, Edges, DimensionKind, DisplayOutside, DisplayInside, Float, Position, WritingMode, Direction, FlexDirection, FlexWrap, Align, Overflow, ScrollbarWidth, ScrollbarGutter, BoxDecorationBreak, BaselineSource }
-import tree { Tree, LayoutTree, LayoutStats, Measurement, NO_NODE }
+import tree { Tree, LayoutTree, LayoutStats, CutoffMiss, Measurement, NO_NODE }
 import context { Input, ResolvedBox, resolveBox, resolveBoxEdges, resolves, withGutter, scrollbarGutter, edges, isFlex, isGrid, outOfFlow, establishesContext, selfCollapsingSize, scrollable, overflowForAxis, usedOverflowForAxis, blockContentOffset, effectiveDisplay, blockJustification, UNBOUNDED }
 import block { layoutBlock, leafBlockInto }
 import flex { layoutFlex, emptyFlexSize, FlexScratch }
 import grid { layoutGrid }
-import positioned { positionTree, positionVisits, reachableLimits, addOverflow, propagatedOverflow, subtreeOverflow }
+import positioned { positionTree, positionVisits, reachableLimits, addOverflow, propagatedOverflow, subtreeOverflow, absoluteContainingBlock }
 import bfc { BfcState }
 import silk.core.option { Option }
 import layout_pass { LayoutPass, CacheKind, FullBoxGeometry, REUSE_INDEPENDENT, REUSE_IN_FLOW }
@@ -1704,6 +1704,29 @@ fn staticSubtree(nodes: &BoxTree, id: usize, seen: &mut usize) -> bool {
   return true
 }
 
+// Whether a box is absolutely positioned in its parent, a block or flex box,
+// in one piece.
+fn placedAlone(nodes: &BoxTree, id: usize) -> bool {
+  let parent = nodes.node(id).parent
+  if parent == NO_NODE || nodes.style(id).position != Position.Absolute || absoluteContainingBlock(nodes, id) != parent { return false }
+  let kind = nodes.node(parent).kind
+  return (kind == BoxKind.Block || kind == BoxKind.Flex) && nodes.node(id).nextContinuation == NO_NODE && nodes.node(id).previousContinuation == NO_NODE
+}
+// staticSubtree for the box's children, and the rest of its conditions on
+// the box itself but its position.
+fn staticBelow(nodes: &BoxTree, id: usize, seen: &mut usize) -> bool {
+  seen.* = seen.* + 1
+  let node = nodes.node(id)
+  let style = nodes.style(id)
+  if style.float != Float.None || style.overflowX != Overflow.Visible || style.overflowY != Overflow.Visible || node.interruptionFirst != NO_NODE { return false }
+  let mut child = node.firstChild
+  while child != NO_NODE {
+    if !staticSubtree(nodes, child, &mut seen) { return false }
+    child = nodes.node(child).nextSibling
+  }
+  return true
+}
+
 // The block or flex box that lays out a text box's lines.
 fn textContainer(nodes: &BoxTree, id: usize) -> usize {
   let mut box = nodes.node(id).parent
@@ -1734,15 +1757,17 @@ fn contains(values: &[usize], value: usize) -> bool {
   return false
 }
 
-// Whether every changed source is a box in `alone` or text one of them lays out.
+// Whether every changed source is a box in `alone`, or inside one of them.
 fn allAlone(nodes: &BoxTree, changes: &[usize], alone: &[usize]) -> bool {
   let mut at: usize = 0
   while at < changes.length {
     let box = nodes.firstBySource.get(changes[at])
     at = at + 1
     if box == NO_NODE || nodes.node(box).nextContinuation != NO_NODE { return false }
-    if contains(alone, box) { continue }
-    if nodes.node(box).kind != BoxKind.Text || !contains(alone, textContainer(nodes, box)) { return false }
+    // Laid out alone, or inside a box that was.
+    let mut ancestor = box
+    while ancestor != NO_NODE && !contains(alone, ancestor) { ancestor = nodes.node(ancestor).parent }
+    if ancestor == NO_NODE { return false }
   }
   return true
 }
@@ -1786,21 +1811,29 @@ effect fn cutoffCandidates(tree: &Tree, since: usize, nodes: &BoxTree, output: &
       while other < changes.length && changes[other] != nodes.node(id).source { other = other + 1 }
       if other < changes.length { continue }
     } else {
-      // Its parent reads its outer style: a change there needs the parent.
-      if tree.outerChangedAt(changes[at - 1]) > since { continue }
       // A block parent places the box by its padding and border, which come
       // out the same when its size does; its float origin matters to no float.
       // A flex parent sees them only through a size they cannot change (see
       // Tree.setStyle).
       insets = tree.insetsChangedAt(changes[at - 1]) > since
-      if insets && !blockPlaced(nodes, id) && nodes.node(nodes.node(id).parent).kind != BoxKind.Flex { continue }
-      insets = insets && nodes.node(nodes.node(id).parent).kind != BoxKind.Flex
+      // Its parent reads its outer style: a change there needs the parent,
+      // laid out alone in its place (see cutoffAncestor).
+      if tree.outerChangedAt(changes[at - 1]) > since || insets && !blockPlaced(nodes, id) && nodes.node(nodes.node(id).parent).kind != BoxKind.Flex {
+        // An absolutely positioned box is placed after its parent's layout,
+        // which reads none of it: by itself, from its size, insets and
+        // margins, and laid out alone when only its padding or border changed.
+        if !(placedAlone(nodes, id) && tree.placedChangedAt(changes[at - 1]) <= since) {
+          id = cutoffAncestor(nodes, changes, boxes.asSlice(), id)
+          if id == NO_NODE { continue }
+        }
+        insets = false
+      } else { insets = insets && nodes.node(nodes.node(id).parent).kind != BoxKind.Flex }
     }
     if inheritedGridItem(nodes, id) { continue }
     let range = output.cache.keptRange(id)
     if !range.valid || range.floatCount != 0 || range.end > output.fragments.values.length() || output.fragments.values.get(range.start).box != id { continue }
     let mut seen: usize = 0
-    if !staticSubtree(nodes, id, &mut seen) { continue }
+    if !(placedAlone(nodes, id) && staticBelow(nodes, id, &mut seen)) && !staticSubtree(nodes, id, &mut seen) { continue }
     // Ancestors that probed may have probed this box: it must be reached only
     // through cached probes (an independent box), all of them reproduced.
     let mut eligible = true
@@ -1825,6 +1858,7 @@ effect fn cutoffCandidates(tree: &Tree, since: usize, nodes: &BoxTree, output: &
     }
     if !eligible { continue }
     if probed && (insets || output.cache.result(id).beside) { continue }
+    if resting(output.cutoffMisses.asSlice(), id) { continue }
     let mark = probes.length()
     if !run output.cache.probesOf(id, previous, &mut probes) {
       probes.truncate(mark)
@@ -1836,6 +1870,92 @@ effect fn cutoffCandidates(tree: &Tree, since: usize, nodes: &BoxTree, output: &
   }
 }
 
+// The ancestor to lay out alone for a changed box whose parent reads the
+// change: the nearest block or flex box whose width and height its content
+// cannot change, else the parent, so long as its subtree is static (see
+// staticSubtree); never the root box or the viewport's, a changed box, or
+// one around or inside another box laid out alone.
+fn cutoffAncestor(nodes: &BoxTree, changes: &[usize], boxes: &[usize], id: usize) -> usize {
+  let mut found = NO_NODE
+  let mut box = nodes.node(id).parent
+  while box != NO_NODE && box != 0 && nodes.node(box).parent != 0 {
+    let node = nodes.node(box)
+    if node.kind != BoxKind.Block && node.kind != BoxKind.Flex { break }
+    if contains(changes, node.source) { break }
+    let mut seen: usize = 0
+    if !staticSubtree(nodes, box, &mut seen) { break }
+    if found == NO_NODE { found = box }
+    if fixedSize(nodes.style(box)) {
+      found = box
+      break
+    }
+    box = node.parent
+  }
+  if found == NO_NODE { return NO_NODE }
+  let mut at: usize = 0
+  while at < boxes.length {
+    if inside(nodes, boxes[at], found) || inside(nodes, found, boxes[at]) { return NO_NODE }
+    at = at + 1
+  }
+  return found
+}
+// Whether the width and height take no part of the box's content.
+fn fixedSize(style: &Style) -> bool {
+  return (style.width.kind == DimensionKind.Length || style.width.kind == DimensionKind.Percent)
+    && (style.height.kind == DimensionKind.Length || style.height.kind == DimensionKind.Percent)
+}
+// Whether `id` is `ancestor` or one of its descendants.
+fn inside(nodes: &BoxTree, id: usize, ancestor: usize) -> bool {
+  let mut box = id
+  while box != NO_NODE {
+    if box == ancestor { return true }
+    box = nodes.node(box).parent
+  }
+  return false
+}
+
+// Whether the box's early cutoff failed lately and waits a few computes.
+fn resting(misses: &[CutoffMiss], id: usize) -> bool {
+  let mut at: usize = 0
+  while at < misses.length {
+    if misses[at].box == id { return misses[at].skip != 0 }
+    at = at + 1
+  }
+  return false
+}
+// Counts down the computes the boxes whose cutoff failed wait.
+fn restMisses(misses: &mut List<CutoffMiss>) {
+  let values = misses.asMutSlice()
+  let mut at: usize = 0
+  while at < values.length {
+    if values[at].skip != 0 { values[at].skip = values[at].skip - 1 }
+    at = at + 1
+  }
+}
+// Notes whether a box's early cutoff held. After n failures in a row it
+// waits 2^n - 1 computes, at most 15, before it is tried again: a change
+// its parent reads every time costs little more than a compute without
+// the cutoff.
+effect fn noteCutoff(misses: &mut List<CutoffMiss>, id: usize, held: bool) ! OutOfMemoryError ? &mut Allocator {
+  let mut at: usize = 0
+  while at < misses.length() && misses.get(at).box != id { at = at + 1 }
+  if held {
+    if at < misses.length() { drop misses.remove(at) }
+    return
+  }
+  if at == misses.length() {
+    if misses.length() == CUTOFF_MISSES { misses.clear() }
+    run misses.append(CutoffMiss { box: id, failures: 0, skip: 0 })
+    at = misses.length() - 1
+  }
+  let mut miss = misses.get(at)
+  miss.failures = miss.failures + 1
+  miss.skip = 15
+  if miss.failures < 4 { miss.skip = usize.shiftLeft(1, miss.failures) - 1 }
+  misses.set(at, miss)
+}
+const CUTOFF_MISSES: usize = 32
+
 // Whether a box's baselines can reach its ancestors: unless its parent is a
 // block or flex container that aligns nothing by baseline and the box sits
 // between in-flow siblings that have baselines of their own, which the
@@ -1843,6 +1963,8 @@ effect fn cutoffCandidates(tree: &Tree, since: usize, nodes: &BoxTree, output: &
 fn baselinesMatter(nodes: &BoxTree, fragments: &FragmentArena, id: usize, fragment: usize) -> bool {
   let parent = nodes.node(id).parent
   if parent == NO_NODE { return true }
+  // An absolutely positioned box gives its parent no baseline.
+  if placedAlone(nodes, id) { return false }
   let kind = nodes.node(parent).kind
   if kind != BoxKind.Block && kind != BoxKind.Flex { return true }
   let parentStyle = nodes.style(parent)
@@ -1857,6 +1979,24 @@ fn baselinesMatter(nodes: &BoxTree, fragments: &FragmentArena, id: usize, fragme
   let before = nodes.style(values[previous].box)
   let after = nodes.style(values[next].box)
   return outOfFlow(before) || outOfFlow(after) || before.float != Float.None || after.float != Float.None || before.order != 0 || after.order != 0
+}
+
+// Whether a box's new scrollable overflow leaves its ancestors' as it was:
+// it is the same as before, or, for an unmoved or absolutely positioned box
+// of a block or flex parent, both lie inside the parent's padding box,
+// which the parent's overflow covers anyway (see overflowGeometry).
+fn overflowStays(nodes: &BoxTree, output: &LayoutTree, id: usize, overflow: Rect, previous: Rect) -> bool {
+  let layout = &output.boxes.asSlice()[id]
+  if sameOverflow(overflow, previous, layout.size) { return true }
+  let parent = nodes.node(id).parent
+  if parent == NO_NODE || !unmoved(nodes.style(id)) && !placedAlone(nodes, id) { return false }
+  let kind = nodes.node(parent).kind
+  if kind != BoxKind.Block && kind != BoxKind.Flex { return false }
+  let padding = output.boxes.asSlice()[parent].paddingRect()
+  return within(overflow.translated(layout.location), padding) && within(previous.translated(layout.location), padding)
+}
+fn within(rect: Rect, area: Rect) -> bool {
+  return rect.x >= area.x && rect.y >= area.y && rect.x + rect.width <= area.x + area.width && rect.y + rect.height <= area.y + area.height
 }
 
 // Gives each box of the subtree its layout from `scratch` and makes its
@@ -1876,6 +2016,16 @@ fn adoptSubtree(nodes: &BoxTree, output: &mut LayoutTree, scratch: &[Layout], id
   }
 }
 
+// Unsets the box chains of a subtree laid out alone in the scratch arena.
+fn unsetSubtree(nodes: &BoxTree, fragments: &mut FragmentArena, id: usize) {
+  fragments.unsetChains(id)
+  let mut child = nodes.node(id).firstChild
+  while child != NO_NODE {
+    unsetSubtree(nodes, &mut fragments, child)
+    child = nodes.node(child).nextSibling
+  }
+}
+
 // Lays out a candidate alone and, when its parent would see no change,
 // splices it into the previous output; see cutoffCandidates.
 effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>, output: &mut LayoutTree, facts: &mut BoxFacts, measurer: &mut M, id: usize, range: FinalRange, probes: &[CachedProbe], first: usize, end: usize) -> bool ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
@@ -1885,7 +2035,7 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
   let have = scratchBoxes.length()
   if have < count { run scratchBoxes.appendRepeated(Layout.zero(), count - have) }
   let mut scratchFragments = Intrinsic.replace(output.scratchFragments, FragmentArena.make())
-  run scratchFragments.prepare(count)
+  run scratchFragments.prepareUnset(count)
   let mut same = true
   let mut pass = run LayoutPass.make(scratchBoxes.asMutSlice(), &mut scratchFragments, nodes.sources)
   pass.cache = Intrinsic.replace(output.cache, LayoutCache.make())
@@ -1898,7 +2048,8 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
   let mut at = first
   while at < end && same {
     run probeNode(nodes, &mut pass, &mut measurer, id, &probes[at].input)
-    same = Layout.sameOutside(&pass.boxes[id], &probes[at].layout, baselines)
+    // A parent reads a probe's overflow nowhere.
+    same = Layout.sameBesideOverflow(&pass.boxes[id], &probes[at].layout, baselines)
     at = at + 1
   }
   if same {
@@ -1913,8 +2064,10 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
       && recorded.valid && recorded.start == 0 && recorded.end == length && recorded.floatCount == 0
       && pass.fragments.values.length() == length
       && pass.fragments.texts.length() == output.fragments.textsBefore(range.end) - output.fragments.textsBefore(range.start)
-      && Layout.sameOutside(&pass.boxes[id], &output.boxes.asSlice()[id], baselines)
-      && Fragment.sameOutside(&pass.fragments.values.asSlice()[0], &output.fragments.values.asSlice()[range.start], baselines)
+      && Layout.sameBesideOverflow(&pass.boxes[id], &output.boxes.asSlice()[id], baselines)
+      && Fragment.sameBesideOverflow(&pass.fragments.values.asSlice()[0], &output.fragments.values.asSlice()[range.start], baselines)
+      && overflowStays(nodes, &output, id, pass.boxes[id].scrollableOverflow, output.boxes.asSlice()[id].scrollableOverflow)
+      && overflowStays(nodes, &output, id, pass.fragments.values.asSlice()[0].scrollableOverflow, output.fragments.values.asSlice()[range.start].scrollableOverflow)
   }
   if same { run pass.keepTexts() }
   output.cache = Intrinsic.replace(pass.cache, LayoutCache.make())
@@ -1928,6 +2081,7 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
     output.fragments.spliceFrom(range.start, range.end, &scratchFragments)
     adoptSubtree(nodes, &mut output, scratchBoxes.asSlice(), id, id, range.start)
   }
+  unsetSubtree(nodes, &mut scratchFragments, id)
   output.scratchBoxes = move scratchBoxes
   output.scratchFragments = move scratchFragments
   return same
@@ -1969,6 +2123,7 @@ pub effect fn compute<'source, M: Measure + TextMeasure>(tree: &'source Tree, ou
   let mut aloneRanges = List<FinalRange>.make()
   let mut aloneProbes = List<CachedProbe>.make()
   let mut aloneEnds = List<usize>.make()
+  if !sameBoxes { output.cutoffMisses.clear() }
   if sameBoxes {
     run output.cache.rotateFinals()
     if logged { run cutoffCandidates(tree, since, &nodes, &output, changes.asSlice(), &mut alone, &mut aloneRanges, &mut aloneProbes, &mut aloneEnds) }
@@ -2018,13 +2173,16 @@ pub effect fn compute<'source, M: Measure + TextMeasure>(tree: &'source Tree, ou
     run Incremental.indexStyleSources(tree, &nodes, &mut facts.styledOffsets, &mut facts.styledBoxes)
   }
   // Changed boxes laid out alone first; see cutoffCandidates.
+  restMisses(&mut output.cutoffMisses)
   if alone.length() != 0 { output.suspendReuse() }
   let mut allCut = alone.length() != 0
   let mut candidate: usize = 0
   while candidate < alone.length() {
     let mut first: usize = 0
     if candidate > 0 { first = aloneEnds.get(candidate - 1) }
-    if !run cutoffBox(&nodes, &mut output, &mut facts, &mut measurer, alone.get(candidate), aloneRanges.get(candidate), aloneProbes.asSlice(), first, aloneEnds.get(candidate)) {
+    let held = run cutoffBox(&nodes, &mut output, &mut facts, &mut measurer, alone.get(candidate), aloneRanges.get(candidate), aloneProbes.asSlice(), first, aloneEnds.get(candidate))
+    run noteCutoff(&mut output.cutoffMisses, alone.get(candidate), held)
+    if !held {
       Incremental.invalidateBox(&nodes, &mut output.cache, alone.get(candidate), true)
       allCut = false
     }
