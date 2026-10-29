@@ -21,7 +21,7 @@ import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = HERE.parents[2]
 # Also permits loading this module directly from unittest's file-based loader.
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
