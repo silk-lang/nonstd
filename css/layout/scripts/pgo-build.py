@@ -4,7 +4,7 @@
 Builds an instrumented CLI, trains it on the comparison workloads (fresh layouts and
 incremental update cycles) and a third of the spec fixtures, merges the raw profiles
 with llvm-profdata, and builds again with the profile. The result replaces the usual
-release binary at build/llvm/<triple>/release/silk_layout_cli in the nonstd root.
+release binary at build/llvm/<triple>/release/css-layout-cli in the nonstd root.
 
   SILK_CLANG=/path/to/llvm/bin/clang python3 scripts/pgo-build.py [--docs DIR]
 
@@ -32,7 +32,7 @@ import workloads as W  # noqa: E402
 import updates as U  # noqa: E402
 
 TRIPLE = "x86_64-unknown-linux-gnu"
-BINARY = ROOT.parents[1] / "build" / "llvm" / TRIPLE / "release" / "silk_layout_cli"
+BINARY = ROOT.parents[1] / "build" / "llvm" / TRIPLE / "release" / "css-layout-cli"
 TRAINING = ["deep-random-1k", "flex-grow-1k", "flex-wrap-10k", "block-stack-10k", "nested-chain-200",
             "measured-wrap-1k", "app-cards-500"]
 
@@ -79,13 +79,13 @@ def main():
         raw = Path(scratch) / "raw"
         raw.mkdir()
         build(dict(os.environ, SILK_PROFILE_GENERATE=str(raw)))
-        instrumented = Path(scratch) / "silk_layout_cli"
+        instrumented = Path(scratch) / "css-layout-cli"
         shutil.copy2(BINARY, instrumented)
         train(instrumented, dict(os.environ, LLVM_PROFILE_FILE=str(raw / "%p.profraw")), args.docs)
         profiles = sorted(raw.glob("*.profraw"))
         if not profiles:
             sys.exit("training wrote no profiles: is this Silk new enough for SILK_PROFILE_GENERATE?")
-        merged = Path(scratch) / "silk_layout_cli.profdata"
+        merged = Path(scratch) / "css-layout-cli.profdata"
         subprocess.run([profdata(), "merge", "-o", str(merged)] + [str(p) for p in profiles], check=True)
         build(dict(os.environ, SILK_PROFILE_USE=str(merged)))
     print(BINARY)

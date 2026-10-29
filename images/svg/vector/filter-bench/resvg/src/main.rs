@@ -46,7 +46,7 @@ fn median_ms(tree: &usvg::Tree, frames: usize, target: &mut Pixmap) -> f64 {
 
 fn main() {
     let frames: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(15);
-    let source = std::fs::read("vector-source.rgba").expect("run filter_bench first");
+    let source = std::fs::read("vector-source.rgba").expect("run images-svg-vector-filter-bench first");
     let image = Pixmap::from_vec(source, resvg::tiny_skia::IntSize::from_wh(SIZE, SIZE).unwrap()).unwrap();
     image.save_png("source.png").unwrap();
     let mut options = usvg::Options::default();

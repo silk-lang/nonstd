@@ -14,7 +14,7 @@ compute takes for them:
   grid    a separate stream with grid templates, placement and flow changes
   subgrid a separate stream with inherited axes, local names and gap transitions
 
-  python3 scripts/fuzz-updates.py --cli build/.../silk_layout_cli [--seeds 200] [--mode inner,text]
+  python3 scripts/fuzz-updates.py --cli build/.../css-layout-cli [--seeds 200] [--mode inner,text]
 """
 import argparse
 import copy

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Move into silk-lang/nonstd as `gpu/metal` (package `gpu-metal`; examples `gpu-metal-compute`, `gpu-metal-headless-render`).
+- Move into silk-lang/nonstd as `gpu/metal` (package `gpu-metal`; examples `gpu-metal-examples-compute`, `gpu-metal-examples-headless-render`).
 - Pin to Silk `0.1.0-dev.29+94cf9559bf47` and follow the dev.27 stdlib moves (`silk.mem.pointer`, `silk.core.ownership`).
 - Pin the library and examples to Silk `0.1.0-dev.17+1120049495d3`.
 - Migrate manifests to `package.source`, `package.main`, `package.kind`, and `[native].link`; add required struct-field comma separators.

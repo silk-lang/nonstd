@@ -96,9 +96,10 @@ def build(package_path, release=False, extra_links=(), target=None):
             lines.append(f"{key} = {quoted(value)}")
     lines.extend(["", "[dependencies]"])
     for name, dependency in manifest.get("dependencies", {}).items():
-        if set(dependency) != {"path"}:
+        if "path" not in dependency or not set(dependency) <= {"path", "package"}:
             raise ValueError(f"Expected a local dependency: {name}")
-        lines.append(f"{name} = {{ path = {quoted((package_path / dependency['path']).resolve())} }}")
+        renamed = f", package = {quoted(dependency['package'])}" if "package" in dependency else ""
+        lines.append(f"{name} = {{ path = {quoted((package_path / dependency['path']).resolve())}{renamed} }}")
     links = []
     if not wasm:
         dawn = command_path("install-webgpu")
