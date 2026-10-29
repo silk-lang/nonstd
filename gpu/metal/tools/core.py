@@ -104,6 +104,7 @@ for cls in dict.fromkeys(m[0] for m in methods):
 for cls,name,ret,pars,body,notes in methods:
     args=', '.join(f'{n}: '+('u8' if t=='bool' else T[t][0]) for n,t in pars)
     cb=[n for n,t in pars if t in ['callback','eventcb']]
-    silk.append(f'unsafe extern "C" fn metal_{cls}_{name}({args}) -> '+('u8' if ret=='bool' else T[ret][0])+(' with Intrinsic.foreign(callbacks: ("'+cb[0]+'",))' if cb else ''))
+    if cb: silk.append('@callbacks("'+cb[0]+'")')
+    silk.append(f'unsafe extern "C" fn metal_{cls}_{name}({args}) -> '+('u8' if ret=='bool' else T[ret][0]))
 for path,text in [('src/core.silk','\n'.join(silk)+'\n'),('native/core.m','\n'.join(c)+'\n'),('api/core.json',json.dumps(entries,indent=2)+'\n')]:
     dest=ROOT/path; dest.parent.mkdir(parents=True,exist_ok=True); dest.write_text(text)
