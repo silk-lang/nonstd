@@ -1,0 +1,461 @@
+//! Cascade4 declaration compilation and origin-aware winner selection.
+import tokens { TokenBuffer, TokenRange, Span, Limits, CssError }
+import tokens
+import syntax
+import selectors { Specificity }
+import selectors
+import properties { Property }
+import properties
+import values { Store, ValueId, Wide, Mode, Value }
+import values
+import input { Input }
+import condition_cursor
+import declaration_values
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub enum Origin {
+  UserAgent,
+  User,
+  Author,
+  Animation,
+  Transition
+}
+
+pub struct Priority {
+  pub origin: Origin,
+  pub important: bool,
+  pub encapsulationDepth: usize,
+  pub specificity: Specificity,
+  pub inline: bool,
+  pub order: usize,
+}
+
+impl Copy for Priority {}
+
+impl Priority {
+  pub fn make(origin: Origin, order: usize) -> Priority {
+    return Priority {
+      origin: origin,
+      important: false,
+      encapsulationDepth: 0,
+      specificity: Specificity { ids: 0, classes: 0, types: 0 },
+      inline: false,
+      order: order,
+    }
+  }
+}
+
+pub struct Name {
+  pub buffer: usize,
+  pub span: Span
+}
+
+impl Copy for Name {}
+
+pub union Target {
+  Property { pub property: Property },
+  Custom { pub name: Name }
+}
+
+impl Copy for Target {}
+
+pub union Specified {
+  Wide { pub keyword: Wide },
+  Parsed { pub value: ValueId },
+  Pending { pub range: TokenRange, pub mode: Mode },
+}
+
+impl Copy for Specified {}
+
+pub struct Declaration {
+  pub target: Target,
+  pub specified: Specified,
+  pub buffer: usize,
+  pub important: bool
+}
+
+impl Copy for Declaration {}
+
+pub struct Candidate {
+  pub declaration: usize,
+  pub priority: Priority
+}
+
+impl Copy for Candidate {}
+
+fn rank(priority: Priority) -> u8 {
+  return match priority.origin {
+    Origin.Transition => 7
+    Origin.Animation => 3
+    Origin.UserAgent => if priority.important {
+      6
+    } else {
+      0
+    }
+    Origin.User => if priority.important {
+      5
+    } else {
+      1
+    }
+    Origin.Author => if priority.important {
+      4
+    } else {
+      2
+    }
+  }
+}
+
+// https://www.w3.org/TR/css-cascade-4/#cascade-sort
+pub fn compare(a: Priority, b: Priority) -> i32 {
+  let x = rank(a)
+  let y = rank(b)
+  if x != y {
+    return if x > y {
+      1
+    } else {
+      -1
+    }
+  }
+  if a.encapsulationDepth != b.encapsulationDepth {
+    let greater = if a.important {
+      a.encapsulationDepth > b.encapsulationDepth
+    } else {
+      a.encapsulationDepth < b.encapsulationDepth
+    }
+    return if greater {
+      1
+    } else {
+      -1
+    }
+  }
+  if a.inline != b.inline {
+    return if a.inline {
+      1
+    } else {
+      -1
+    }
+  }
+  let specificity = selectors.compare(a.specificity, b.specificity)
+  if specificity != 0 {
+    return specificity
+  }
+  return if a.order == b.order {
+    0
+  } else if a.order > b.order {
+    1
+  } else {
+    -1
+  }
+}
+
+fn originBit(origin: Origin) -> u8 {
+  return match origin {
+    Origin.UserAgent => 1
+    Origin.User => 2
+    Origin.Author => 4
+    Origin.Animation => 8
+    Origin.Transition => 16
+  }
+}
+
+// UA revert is unset, not a chance for a lower-priority author declaration.
+// Author rollback includes animations; user rollback also removes author rules.
+// https://www.w3.org/TR/css-cascade-4/#default
+pub fn revertMask(origin: Origin) -> u8 {
+  return match origin {
+    Origin.UserAgent => 31
+    Origin.User => 14
+    Origin.Author => 12
+    Origin.Animation => 12
+    Origin.Transition => 16
+  }
+}
+
+pub fn covers(declaration: &Declaration, property: Property) -> bool {
+  match &declaration.target {
+    Target.Property { property: source } => {
+      let target = properties.canonical(property)
+      let count = properties.longhandCount(source)
+      let mut i: usize = 0
+      while i < count {
+        if properties.longhandAt(source, i) == target {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    _ => {}
+  }
+  return false
+}
+
+pub fn sameName(buffers: &[TokenBuffer], a: Name, b: Name) -> bool {
+  if a.buffer >= buffers.length || b.buffer >= buffers.length {
+    return false
+  }
+  return tokens.equal(buffers[a.buffer].text(a.span), buffers[b.buffer].text(b.span))
+}
+
+fn reverted(declaration: &Declaration) -> bool {
+  return match &declaration.specified {
+    Specified.Wide { keyword } => keyword == Wide.Revert
+    _ => false
+  }
+}
+
+pub fn select(
+  catalog: &[Declaration],
+  candidates: &[Candidate],
+  property: Property,
+  excluded: u8,
+) -> Option<Candidate> {
+  let mut skip = excluded
+  while true {
+    let mut best = Option<Candidate>.None
+    let mut i: usize = 0
+    while i < candidates.length {
+      let mut candidate = candidates[i]
+      if candidate.declaration < catalog.length {
+        let declaration = &catalog[candidate.declaration]
+        if (skip & originBit(candidate.priority.origin)) == 0 && covers(declaration, property) {
+          candidate.priority.important = declaration.important
+          let replace = match &best {
+            Option<Candidate>.Some { value } => compare(candidate.priority, value.priority) >= 0
+            _ => true
+          }
+          if replace {
+            best = Option<Candidate>.some(candidate)
+          }
+        }
+      }
+      i = i + 1
+    }
+    match &best {
+      Option<Candidate>.Some { value } => {
+        if reverted(&catalog[value.declaration]) {
+          skip = skip | revertMask(value.priority.origin)
+        } else {
+          return best
+        }
+      }
+      _ => {
+        return best
+      }
+    }
+  }
+}
+
+pub fn selectCustom(
+  buffers: &[TokenBuffer],
+  catalog: &[Declaration],
+  candidates: &[Candidate],
+  name: Name,
+  excluded: u8,
+) -> Option<Candidate> {
+  let mut skip = excluded
+  while true {
+    let mut best = Option<Candidate>.None
+    let mut i: usize = 0
+    while i < candidates.length {
+      let mut candidate = candidates[i]
+      if candidate.declaration < catalog.length {
+        let declaration = &catalog[candidate.declaration]
+        let matches = match &declaration.target {
+          Target.Custom { name: other } => sameName(buffers, name, other)
+          _ => false
+        }
+        if matches && (skip & originBit(candidate.priority.origin)) == 0 {
+          candidate.priority.important = declaration.important
+          let replace = match &best {
+            Option<Candidate>.Some { value } => compare(candidate.priority, value.priority) >= 0
+            _ => true
+          }
+          if replace {
+            best = Option<Candidate>.some(candidate)
+          }
+        }
+      }
+      i = i + 1
+    }
+    match &best {
+      Option<Candidate>.Some { value } => {
+        if reverted(&catalog[value.declaration]) {
+          skip = skip | revertMask(value.priority.origin)
+        } else {
+          return best
+        }
+      }
+      _ => {
+        return best
+      }
+    }
+  }
+}
+
+pub fn wide(input: &Input) -> Option<Wide> {
+  let first = condition_cursor.skip(input, 0, input.length())
+  if first >= input.length()
+    || condition_cursor.skip(input, first + 1, input.length()) != input.length() {
+    return Option<Wide>.None
+  }
+  if condition_cursor.ident(input, first, b"initial") {
+    return Option<Wide>.some(Wide.Initial)
+  }
+  if condition_cursor.ident(input, first, b"inherit") {
+    return Option<Wide>.some(Wide.Inherit)
+  }
+  if condition_cursor.ident(input, first, b"unset") {
+    return Option<Wide>.some(Wide.Unset)
+  }
+  if condition_cursor.ident(input, first, b"revert") {
+    return Option<Wide>.some(Wide.Revert)
+  }
+  return Option<Wide>.None
+}
+
+effect fn compileValue(
+  store: &mut Store,
+  buffers: &[TokenBuffer],
+  buffer: usize,
+  target: Target,
+  range: TokenRange,
+  mode: Mode,
+  important: bool,
+  limits: &Limits,
+) -> Option<Declaration>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if buffer >= buffers.length || range.start > range.end || range.end > buffers[buffer].all().end {
+    return Option<Declaration>.None
+  }
+  let input = Input.Contiguous { buffer: &buffers[buffer], range: range }
+  let structure = run condition_cursor.inspect(&input, limits)
+  let validation = declaration_values.validateRange(&input, &structure, 0, input.length())
+  if !validation.valid {
+    return Option<Declaration>.None
+  }
+  match &target {
+    Target.Property { property } => {
+      if declaration_values.mixedTopLevelBlock(&input, &structure, 0, input.length()) {
+        return Option<Declaration>.None
+      }
+    }
+    _ => {}
+  }
+  let keyword = wide(&input)
+  match &keyword {
+    Option<Wide>.Some { value } => {
+      return Option<Declaration>.some(
+        Declaration {
+          target: target,
+          specified: Specified.Wide { keyword: value },
+          buffer: buffer,
+          important: important,
+        },
+      )
+    }
+    _ => {}
+  }
+  match &target {
+    Target.Property { property } => {
+      if !validation.hasVariables {
+        let parsed = run values.parse(&mut store.*, property, &input, mode)
+        match &parsed {
+          Option<ValueId>.Some { value } => {
+            return Option<Declaration>.some(
+              Declaration {
+                target: target,
+                specified: Specified.Parsed { value: value },
+                buffer: buffer,
+                important: important,
+              },
+            )
+          }
+          _ => {
+            return Option<Declaration>.None
+          }
+        }
+      }
+    }
+    _ => {}
+  }
+  return Option<Declaration>.some(
+    Declaration {
+      target: target,
+      specified: Specified.Pending { range: range, mode: mode },
+      buffer: buffer,
+      important: important,
+    },
+  )
+}
+
+pub effect fn compile(
+  store: &mut Store,
+  buffers: &[TokenBuffer],
+  buffer: usize,
+  declaration: &syntax.Declaration,
+  limits: &Limits,
+) -> Option<Declaration>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if buffer >= buffers.length {
+    return Option<Declaration>.None
+  }
+  let name = buffers[buffer].text(declaration.name)
+  if declaration_values.customName(name) {
+    return run compileValue(
+      &mut store.*,
+      buffers,
+      buffer,
+      Target.Custom { name: Name { buffer: buffer, span: declaration.name } },
+      declaration.value,
+      Mode.Css,
+      declaration.important,
+      limits,
+    )
+  }
+  let property = properties.lookup(name)
+  match &property {
+    Option<Property>.Some { value } => {
+      return run compileValue(
+        &mut store.*,
+        buffers,
+        buffer,
+        Target.Property { property: properties.canonical(value) },
+        declaration.value,
+        Mode.Css,
+        declaration.important,
+        limits,
+      )
+    }
+    _ => {
+      return Option<Declaration>.None
+    }
+  }
+}
+
+pub effect fn compilePresentation(
+  store: &mut Store,
+  buffers: &[TokenBuffer],
+  buffer: usize,
+  property: Property,
+  limits: &Limits,
+) -> Option<Declaration>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if buffer >= buffers.length {
+    return Option<Declaration>.None
+  }
+  return run compileValue(
+    &mut store.*,
+    buffers,
+    buffer,
+    Target.Property { property: properties.canonical(property) },
+    buffers[buffer].all(),
+    Mode.Presentation,
+    false,
+    limits,
+  )
+}

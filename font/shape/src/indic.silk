@@ -1,0 +1,690 @@
+//! Indic base selection, masks, and initial/final reordering.
+import buffer { Buffer, Glyph, reverseRange }
+import font { ConfiguredShaper, FontFuncs, Shaper, ShaperData }
+import plan { OtPlan }
+import complex { consonant, moveGlyph, dotted }
+import syllable
+import ot
+import set_digest { SetDigest }
+import unicode
+import view { View }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.num.usize
+import silk.num.i32
+
+fn virama(script: u32) -> u32 {
+  return match script {
+    0x44657661 => 0x094d
+    0x42656e67 => 0x09cd
+    0x47757275 => 0x0a4d
+    0x47756a72 => 0x0acd
+    0x4f727961 => 0x0b4d
+    0x54616d6c => 0x0bcd
+    0x54656c75 => 0x0c4d
+    0x4b6e6461 => 0x0ccd
+    0x4d6c796d => 0x0d4d
+    _ => 0
+  }
+}
+
+fn rephPosition(script: u32) -> u8 {
+  return match script {
+    0x42656e67 => 9
+    0x47757275 => 7
+    0x4f727961 => 5
+    0x4d6c796d => 5
+    0x54616d6c => 12
+    0x54656c75 => 12
+    0x4b6e6461 => 12
+    _ => 10
+  }
+}
+
+fn oldSpec<F: FontFuncs>(font: &ConfiguredShaper<F>, script: u32) -> bool {
+  let modern: u32 = match script {
+    0x42656e67 => 0x626e6732
+    0x44657661 => 0x64657632
+    0x47756a72 => 0x676a7232
+    0x47757275 => 0x67757232
+    0x4b6e6461 => 0x6b6e6432
+    0x4d6c796d => 0x6d6c6d32
+    0x4f727961 => 0x6f727932
+    0x54616d6c => 0x746d6c32
+    0x54656c75 => 0x74656c32
+    _ => 0
+  }
+  let list = View.offset16(&font.data.gsub, 4)
+  let mut i: usize = 0
+  while i < u16.toUsize(View.u16(&list, 0)) {
+    if View.u32(&list, 2 + i * 6) == modern {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn joiner(item: &Glyph) -> bool {
+  return !item.ligated && (item.category == 5 || item.category == 6)
+}
+
+fn halant(item: &Glyph) -> bool {
+  return !item.ligated && item.category == 4
+}
+
+fn matra(item: &Glyph) -> bool {
+  return !item.ligated && (item.category == 7 || item.category == 13)
+}
+
+fn setOrder(buffer: &mut Buffer, at: usize, order: u8) -> () {
+  let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  slots[at].order = order
+}
+
+fn mask(buffer: &mut Buffer, at: usize, bits: u32) -> () {
+  let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  slots[at].featureMask = slots[at].featureMask | bits
+}
+
+/// Digests of the features that consonant positions and reph forms probe, kept by the plan so
+/// most probes are rejected without scanning it.
+struct Probes {
+  blwf: SetDigest,
+  vatu: SetDigest,
+  pstf: SetDigest,
+  pref: SetDigest,
+  rphf: SetDigest,
+}
+
+effect fn probe<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  plan: &OtPlan,
+  tag: u32,
+  digest: &SetDigest,
+  a: u32,
+  b: u32,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  if !SetDigest.mayHave(digest, a) {
+    return false
+  }
+  return (run ot.wouldSubstitute(font, plan, tag, &[a, b]))
+}
+
+pub effect fn initial<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &mut Buffer,
+  plan: &OtPlan,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let v = ConfiguredShaper.glyphFor(font, virama(buffer.script))
+  let old = oldSpec(font, buffer.script)
+  let probes = Probes {
+    blwf: plan.probeDigests[0],
+    vatu: plan.probeDigests[1],
+    pstf: plan.probeDigests[2],
+    pref: plan.probeDigests[3],
+    rphf: plan.probeDigests[4],
+  }
+  let viramaMapped = ConfiguredShaper.mappedGlyphExists(font, virama(buffer.script), v)
+  let mut i: usize = 0
+  while viramaMapped && i < Buffer.len(&buffer.*) {
+    let slots = List<Glyph>.asSlice(&buffer.glyphs)
+    if slots[i].order == 4 {
+      let c = slots[i].info.glyphId
+      if (run probe(font, plan, 0x626c7766, &probes.blwf, v, c))
+        || (run probe(font, plan, 0x626c7766, &probes.blwf, c, v))
+        || (run probe(font, plan, 0x76617475, &probes.vatu, v, c))
+        || (run probe(font, plan, 0x76617475, &probes.vatu, c, v)) {
+        setOrder(&mut buffer, i, 8)
+      } else if (run probe(font, plan, 0x70737466, &probes.pstf, v, c))
+        || (run probe(font, plan, 0x70737466, &probes.pstf, c, v))
+        || (run probe(font, plan, 0x70726566, &probes.pref, v, c))
+        || (run probe(font, plan, 0x70726566, &probes.pref, c, v)) {
+        setOrder(&mut buffer, i, 11)
+      }
+    }
+    i = i + 1
+  }
+  run dotted(font, &mut buffer, 4, 11, 14)
+  let mut start: usize = 0
+  while start < Buffer.len(&buffer.*) {
+    let end = syllable.next(&buffer.*, start)
+    let kind = List<Glyph>.get(&buffer.glyphs, start).syllable & 15
+    if kind != 3 && kind != 5 {
+      run initialSyllable(font, &mut buffer, plan, &probes, start, end, old)
+    }
+    start = end
+  }
+}
+
+effect fn initialSyllable<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &mut Buffer,
+  plan: &OtPlan,
+  probes: &Probes,
+  start: usize,
+  end: usize,
+  old: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if start >= end {
+    return
+  }
+  if buffer.script == 0x4b6e6461 && start + 3 <= end
+    && List<Glyph>.get(&buffer.glyphs, start).category == 15
+    && List<Glyph>.get(&buffer.glyphs, start + 1).category == 4
+    && List<Glyph>.get(&buffer.glyphs, start + 2).category == 6 {
+    Buffer.mergeClusters(&mut buffer, start + 1, start + 3)
+    moveGlyph(&mut buffer, start + 2, start + 1)
+  }
+  let mut base = end
+  let mut limit = start
+  let mut reph = false
+  let explicit = buffer.script == 0x54656c75
+  let logical = buffer.script == 0x4d6c796d
+  if !logical && start + 3 <= end
+    && ((!explicit && !joiner(&List<Glyph>.asSlice(&buffer.glyphs)[start + 2]))
+      || (explicit && List<Glyph>.get(&buffer.glyphs, start + 2).category == 6)) {
+    let a = List<Glyph>.get(&buffer.glyphs, start).info.glyphId
+    let b = List<Glyph>.get(&buffer.glyphs, start + 1).info.glyphId
+    let c = List<Glyph>.get(&buffer.glyphs, start + 2).info.glyphId
+    if (run probe(font, plan, 0x72706866, &probes.rphf, a, b))
+      || (explicit && (run ot.wouldSubstitute(font, plan, 0x72706866, &[a, b, c]))) {
+      limit = start + 2
+      while limit < end && joiner(&List<Glyph>.asSlice(&buffer.glyphs)[limit]) {
+        limit = limit + 1
+      }
+      base = start
+      reph = true
+    }
+  } else if logical && List<Glyph>.get(&buffer.glyphs, start).category == 14 {
+    limit = start + 1
+    while limit < end && joiner(&List<Glyph>.asSlice(&buffer.glyphs)[limit]) {
+      limit = limit + 1
+    }
+    base = start
+    reph = true
+  }
+  let mut i = end
+  let mut below = false
+  while i > limit {
+    i = i - 1
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    if consonant(&item) {
+      base = i
+      if item.order != 8 && (item.order != 11 || below) {
+        break
+      }
+      if item.order == 8 {
+        below = true
+      }
+    } else if i > start && item.category == 6
+      && List<Glyph>.get(&buffer.glyphs, i - 1).category == 4 {
+      break
+    }
+  }
+  if reph && base == start && limit - base <= 2 {
+    reph = false
+  }
+  i = start
+  while i < base {
+    let order = List<Glyph>.get(&buffer.glyphs, i).order
+    if order > 3 {
+      setOrder(&mut buffer, i, 3)
+    }
+    i = i + 1
+  }
+  if base < end {
+    setOrder(&mut buffer, base, 4)
+  }
+  if reph {
+    setOrder(&mut buffer, start, 1)
+  }
+  if old && base < end {
+    i = base + 1
+    while i < end {
+      if List<Glyph>.get(&buffer.glyphs, i).category == 4 {
+        let mut j = end - 1
+        while j > i {
+          let item = List<Glyph>.get(&buffer.glyphs, j)
+          if consonant(&item) || (buffer.script == 0x4b6e6461 && item.category == 4) {
+            break
+          }
+          j = j - 1
+        }
+        if j > i && List<Glyph>.get(&buffer.glyphs, j).category != 4 {
+          moveGlyph(&mut buffer, i, j)
+        }
+        break
+      }
+      i = i + 1
+    }
+  }
+  let mut last: u8 = 0
+  i = start
+  while i < end {
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    let c = item.category
+    if c == 5 || c == 6 || c == 3 || c == 12 || c == 16 || c == 4 {
+      let mut pos = last
+      if c == 4 && pos == 2 {
+        let mut j = i
+        while j > start {
+          j = j - 1
+          let prev = List<Glyph>.get(&buffer.glyphs, j).order
+          if prev != 2 {
+            pos = prev
+            break
+          }
+        }
+      }
+      setOrder(&mut buffer, i, pos)
+    } else if item.order != 13 {
+      if c == 13 && i > start && List<Glyph>.get(&buffer.glyphs, i - 1).category == 8 {
+        setOrder(&mut buffer, i - 1, item.order)
+      }
+      last = item.order
+    }
+    i = i + 1
+  }
+  let mut previous = base
+  i = base + 1
+  while i < end {
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    if consonant(&item) {
+      let mut j = previous + 1
+      while j < i {
+        if List<Glyph>.get(&buffer.glyphs, j).order < 13 {
+          setOrder(&mut buffer, j, item.order)
+        }
+        j = j + 1
+      }
+      previous = i
+    } else if matra(&item) {
+      previous = i
+    }
+    i = i + 1
+  }
+  i = start
+  while i < end {
+    let updated = usize.toI32(i - start)
+    let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+    slots[i].attach = updated
+    i = i + 1
+  }
+  i = start + 1
+  while i < end {
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    let mut j = i
+    while j > start && List<Glyph>.get(&buffer.glyphs, j - 1).order > item.order {
+      j = j - 1
+    }
+    if i != j {
+      moveGlyph(&mut buffer, i, j)
+    }
+    i = i + 1
+  }
+  base = end
+  let mut firstMatra = end
+  let mut lastMatra = end
+  i = start
+  while i < end {
+    let order = List<Glyph>.get(&buffer.glyphs, i).order
+    if order == 4 {
+      base = i
+      break
+    }
+    if order == 2 {
+      if firstMatra == end {
+        firstMatra = i
+      }
+      lastMatra = i
+    }
+    i = i + 1
+  }
+  if firstMatra < lastMatra {
+    reverseRange(&mut buffer.glyphs, firstMatra, lastMatra + 1)
+    let mut j = firstMatra
+    i = firstMatra
+    while i <= lastMatra {
+      if matra(&List<Glyph>.asSlice(&buffer.glyphs)[i]) {
+        reverseRange(&mut buffer.glyphs, j, i + 1)
+        j = i + 1
+      }
+      i = i + 1
+    }
+  }
+  if old || end - start > 127 {
+    Buffer.mergeClusters(&mut buffer, base, end)
+  } else {
+    i = base
+    while i < end {
+      let order = List<Glyph>.get(&buffer.glyphs, i).attach
+      if order >= 0 {
+        let mut lo = i
+        let mut hi = i
+        let mut j = start + i32.toUsize(order)
+        let mut budget = end - start
+        while j != i && j < end && budget > 0 {
+          budget = budget - 1
+          if j < lo {
+            lo = j
+          }
+          if j > hi {
+            hi = j
+          }
+          let mut item = List<Glyph>.get(&buffer.glyphs, j)
+          let next = item.attach
+          item.attach = -1
+          List<Glyph>.set(&mut buffer.glyphs, j, item)
+          if next < 0 {
+            break
+          }
+          j = start + i32.toUsize(next)
+        }
+        if lo < base {
+          lo = base
+        }
+        Buffer.mergeClusters(&mut buffer, lo, hi + 1)
+      }
+      i = i + 1
+    }
+  }
+  i = start
+  while i < end {
+    let mut item = List<Glyph>.get(&buffer.glyphs, i)
+    item.attach = 0
+    if item.order == 1 {
+      item.featureMask = item.featureMask | 1
+    }
+    if i < base {
+      item.featureMask = item.featureMask | 64
+      if !old && buffer.script != 0x54656c75 && buffer.script != 0x4b6e6461 {
+        item.featureMask = item.featureMask | 4
+      }
+    }
+    if i > base {
+      item.featureMask = item.featureMask | 28
+    }
+    List<Glyph>.set(&mut buffer.glyphs, i, item)
+    i = i + 1
+  }
+  if old && buffer.script == 0x44657661 {
+    i = start
+    while i + 1 < base {
+      if List<Glyph>.get(&buffer.glyphs, i).category == 15
+        && List<Glyph>.get(&buffer.glyphs, i + 1).category == 4
+        && (i + 2 == base || List<Glyph>.get(&buffer.glyphs, i + 2).category != 6) {
+        mask(&mut buffer, i, 4)
+        mask(&mut buffer, i + 1, 4)
+      }
+      i = i + 1
+    }
+  }
+  i = base + 1
+  while i + 1 < end {
+    if (run probe(
+      font,
+      plan,
+      0x70726566,
+      &probes.pref,
+      List<Glyph>.get(&buffer.glyphs, i).info.glyphId,
+      List<Glyph>.get(&buffer.glyphs, i + 1).info.glyphId,
+    )) {
+      mask(&mut buffer, i, 2)
+      mask(&mut buffer, i + 1, 2)
+      break
+    }
+    i = i + 1
+  }
+  i = start + 1
+  while i < end {
+    if List<Glyph>.get(&buffer.glyphs, i).category == 5 {
+      let mut j = i
+      while j > start {
+        j = j - 1
+        let mut item = List<Glyph>.get(&buffer.glyphs, j)
+        item.featureMask = item.featureMask & 4294967231
+        List<Glyph>.set(&mut buffer.glyphs, j, item)
+        if consonant(&item) {
+          break
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+pub fn final<F: FontFuncs>(font: &ConfiguredShaper<F>, buffer: &mut Buffer) -> () {
+  let v = ConfiguredShaper.glyphFor(font, virama(buffer.script))
+  if ConfiguredShaper.mappedGlyphExists(font, virama(buffer.script), v) {
+    let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+    let mut i: usize = 0
+    while i < slots.length {
+      if slots[i].info.glyphId == v && slots[i].ligated && slots[i].multiplied {
+        slots[i].category = 4
+        slots[i].ligated = false
+        slots[i].multiplied = false
+      }
+      i = i + 1
+    }
+  }
+  let mut start: usize = 0
+  while start < Buffer.len(&buffer.*) {
+    let end = syllable.next(&buffer.*, start)
+    finalSyllable(&mut buffer, start, end)
+    start = end
+  }
+}
+
+fn finalSyllable(buffer: &mut Buffer, start: usize, end: usize) -> () {
+  let mut tryPref = true
+  let mut base = start
+  while base < end {
+    if List<Glyph>.get(&buffer.glyphs, base).order >= 4 {
+      let mut i = base + 1
+      while i < end {
+        let item = List<Glyph>.get(&buffer.glyphs, i)
+        if (item.featureMask & 2) != 0 {
+          if !(item.substituted && item.ligated && !item.multiplied) {
+            base = i
+            while base < end && halant(&List<Glyph>.asSlice(&buffer.glyphs)[base]) {
+              base = base + 1
+            }
+            if base < end {
+              setOrder(&mut buffer, base, 4)
+            }
+            tryPref = false
+          }
+          break
+        }
+        i = i + 1
+      }
+      if buffer.script == 0x4d6c796d {
+        i = base + 1
+        while i < end {
+          while i < end && joiner(&List<Glyph>.asSlice(&buffer.glyphs)[i]) {
+            i = i + 1
+          }
+          if i == end || !halant(&List<Glyph>.asSlice(&buffer.glyphs)[i]) {
+            break
+          }
+          i = i + 1
+          while i < end && joiner(&List<Glyph>.asSlice(&buffer.glyphs)[i]) {
+            i = i + 1
+          }
+          if i < end {
+            let item = List<Glyph>.get(&buffer.glyphs, i)
+            if consonant(&item) && item.order == 8 {
+              base = i
+              setOrder(&mut buffer, i, 4)
+            }
+          }
+          i = i + 1
+        }
+      }
+      if start < base && base < end && List<Glyph>.get(&buffer.glyphs, base).order > 4 {
+        base = base - 1
+      }
+      break
+    }
+    base = base + 1
+  }
+  if base == end && start < base && List<Glyph>.get(&buffer.glyphs, base - 1).category == 6 {
+    base = base - 1
+  }
+  if base < end {
+    while start < base {
+      let item = List<Glyph>.get(&buffer.glyphs, base)
+      if item.ligated || (item.category != 3 && item.category != 4) {
+        break
+      }
+      base = base - 1
+    }
+  }
+  let simple = buffer.script == 0x4d6c796d || buffer.script == 0x54616d6c
+  if start + 1 < end && start < base {
+    let mut target = base - 1
+    if base == end {
+      target = base - 2
+    }
+    if !simple {
+      while true {
+        while target > start && !matra(&List<Glyph>.asSlice(&buffer.glyphs)[target])
+          && !halant(&List<Glyph>.asSlice(&buffer.glyphs)[target]) {
+          target = target - 1
+        }
+        let item = List<Glyph>.get(&buffer.glyphs, target)
+        if halant(&item) && item.order != 2 {
+          if target + 1 < end && List<Glyph>.get(&buffer.glyphs, target + 1).category == 6
+            && target > start {
+            target = target - 1
+            continue
+          }
+        } else {
+          target = start
+        }
+        break
+      }
+    }
+    let mut mergeEnd = base + 1
+    if mergeEnd > end {
+      mergeEnd = end
+    }
+    if start < target && List<Glyph>.get(&buffer.glyphs, target).order != 2 {
+      let mut i = target + 1
+      while i > start {
+        i = i - 1
+        if List<Glyph>.get(&buffer.glyphs, i).order == 2 {
+          if i < base && base <= target {
+            base = base - 1
+          }
+          moveGlyph(&mut buffer, i, target)
+          Buffer.mergeClusters(&mut buffer, target, mergeEnd)
+          if target > start {
+            target = target - 1
+          }
+        }
+      }
+    } else {
+      let mut i = start
+      while i < base {
+        if List<Glyph>.get(&buffer.glyphs, i).order == 2 {
+          Buffer.mergeClusters(&mut buffer, i, mergeEnd)
+          break
+        }
+        i = i + 1
+      }
+    }
+  }
+  let first = List<Glyph>.get(&buffer.glyphs, start)
+  if start + 1 < end && first.order == 1
+    && ((first.category == 14) != (first.ligated && !first.multiplied)) {
+    let pos = rephPosition(buffer.script)
+    let mut target = start + 1
+    while target < base && !halant(&List<Glyph>.asSlice(&buffer.glyphs)[target]) {
+      target = target + 1
+    }
+    let found = target < base && halant(&List<Glyph>.asSlice(&buffer.glyphs)[target])
+    if found {
+      if target + 1 < base && joiner(&List<Glyph>.asSlice(&buffer.glyphs)[target + 1]) {
+        target = target + 1
+      }
+    } else if pos == 5 || pos == 9 {
+      target = base
+      while target + 1 < end {
+        let order = List<Glyph>.get(&buffer.glyphs, target + 1).order
+        if (pos == 5 && order > 5) || (pos == 9 && (order == 11 || order == 12 || order == 13)) {
+          break
+        }
+        target = target + 1
+      }
+    } else {
+      target = end
+    }
+    if target >= end {
+      target = end - 1
+      while target > start && List<Glyph>.get(&buffer.glyphs, target).order == 13 {
+        target = target - 1
+      }
+      if halant(&List<Glyph>.asSlice(&buffer.glyphs)[target]) {
+        let mut i = base + 1
+        while i < target {
+          if matra(&List<Glyph>.asSlice(&buffer.glyphs)[i]) {
+            target = target - 1
+          }
+          i = i + 1
+        }
+      }
+    }
+    Buffer.mergeClusters(&mut buffer, start, target + 1)
+    moveGlyph(&mut buffer, start, target)
+    if start < base && base <= target {
+      base = base - 1
+    }
+  }
+  if tryPref && base + 1 < end {
+    let mut i = base + 1
+    while i < end {
+      let item = List<Glyph>.get(&buffer.glyphs, i)
+      if (item.featureMask & 2) != 0 {
+        if item.ligated && !item.multiplied {
+          let mut target = base
+          if !simple {
+            while target > start && !matra(&List<Glyph>.asSlice(&buffer.glyphs)[target - 1])
+              && !halant(&List<Glyph>.asSlice(&buffer.glyphs)[target - 1]) {
+              target = target - 1
+            }
+          }
+          if target > start && halant(&List<Glyph>.asSlice(&buffer.glyphs)[target - 1])
+            && target < end
+            && joiner(&List<Glyph>.asSlice(&buffer.glyphs)[target]) {
+            target = target + 1
+          }
+          Buffer.mergeClusters(&mut buffer, target, i + 1)
+          moveGlyph(&mut buffer, i, target)
+        }
+        break
+      }
+      i = i + 1
+    }
+  }
+  if List<Glyph>.get(&buffer.glyphs, start).order == 2 {
+    let mut word = start == 0
+    if start > 0 {
+      let gc = unicode.generalCategory(List<Glyph>.get(&buffer.glyphs, start - 1).codepoint)
+      word = gc < 1 || gc > 12
+    }
+    if word {
+      mask(&mut buffer, start, 128)
+    } else {
+      Buffer.unsafeToBreak(&mut buffer, start - 1, start + 1)
+    }
+  }
+}

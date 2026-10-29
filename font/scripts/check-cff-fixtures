@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Compare CFF indexes, dictionaries, charstrings and malformed font prefixes."""
+import argparse
+import ast
+from pathlib import Path
+import re
+import struct
+import tempfile
+import harness
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def sfnt(tag, data, glyphs=32):
+    tables = {tag: data, b'maxp': struct.pack('>IH', 0x5000, glyphs)}
+    out = bytearray(struct.pack('>IHHHH', 0x4f54544f, len(tables), 0, 0, 0) + bytes(16 * len(tables)))
+    for i, (tag, value) in enumerate(sorted(tables.items())):
+        struct.pack_into('>4sIII', out, 12 + i * 16, tag, 0, len(out), len(value))
+        out.extend(value)
+        out.extend(bytes(-len(out) % 4))
+    return bytes(out)
+
+
+def index(objects, width=2):
+    if not objects:
+        return b'\0\0'
+    offsets = [1]
+    for item in objects:
+        offsets.append(offsets[-1] + len(item))
+    return struct.pack('>HB', len(objects), width) + b''.join(x.to_bytes(width, 'big') for x in offsets) + b''.join(objects)
+
+
+def integer(value):
+    return b'\x1d' + struct.pack('>i', value)
+
+
+def number(value):
+    if -107 <= value <= 107:
+        return bytes([value + 139])
+    if -32768 <= value <= 32767:
+        return b'\x1c' + struct.pack('>h', value)
+    return b'\xff' + struct.pack('>i', value)
+
+
+def font(programs, extra=b'', private=b'', local=(), global_subrs=(), charset=b'', encoding=b''):
+    if local:
+        private += integer(len(private) + 6) + b'\x13'
+    local_data = index(local) if local else b''
+    chars = index(programs)
+    names = index([b'Fixture'])
+    global_data = index(global_subrs)
+    def dictionary(char_offset, private_offset, charset_offset, encoding_offset):
+        result = integer(char_offset) + b'\x11' + integer(len(private)) + integer(private_offset) + b'\x12'
+        if charset:
+            result += integer(charset_offset) + b'\x0f'
+        if encoding:
+            result += integer(encoding_offset) + b'\x10'
+        return result + extra
+    top = dictionary(0, 0, 0, 0)
+    prefix_size = 4 + len(names) + len(index([top])) + 2 + len(global_data)
+    private_offset = prefix_size + len(chars)
+    charset_offset = private_offset + len(private) + len(local_data)
+    top = dictionary(prefix_size, private_offset, charset_offset, charset_offset + len(charset))
+    return b'\x01\x00\x04\x02' + names + index([top]) + b'\0\0' + global_data + chars + private + local_data + charset + encoding
+
+
+def seeds():
+    source = (ROOT / 'font/parse/src/generated_cff_fixtures.silk').read_text()
+    for name in ('exampleCff2', 'notoSerifTable', 'cantarellTable', 'iconsTable', 'iconsMatrixTable', 'notoSansCffTable', 'notoSansCff2Table'):
+        literal = re.search(r'fn ' + name + r'\(\)[^{]*\{\s*return (b"(?:\\.|[^"\\])*")', source).group(1)
+        data = ast.literal_eval(literal)
+        yield name, b'CFF2' if data[0] == 2 else b'CFF ', data
+    move = number(10) + number(20) + b'\x15'
+    line = number(30) + number(-40) + b'\x05'
+    basic = move + line + b'\x0e'
+    programs = {
+        'empty': b'', 'end': b'\x0e', 'path': basic,
+        'reserved': b'\x00\x02' + basic + b'\x0c\xff',
+        'truncatedNumber': b'\xff\x01', 'escapeEnd': b'\x0c',
+        'stack513': bytes([139]) * 513 + b'\x0e',
+        'stack514': bytes([139]) * 514 + b'\x0e',
+        'missingBlend': b'\x8b\x10', 'missingVsIndex': b'\x8b\x0f',
+        'missingLocal': b'\x20\x0a', 'missingGlobal': b'\x20\x1d',
+        'negativeLocal': number(-32768) + b'\x0a',
+        'hintMask': b'\x8b\x95\x01\x13\x80' + basic,
+        'truncatedMask': b'\x8b\x95\x01\x13',
+        'emptyCurve': b'\x8b\x8b\x1b',
+        'degenerateContour': move + b'\x8b\x8b\x05\x0e',
+    }
+    for name, program in programs.items():
+        yield name, b'CFF ', font([b'\x0e', program])
+    for name, program in [('local', b'\x20\x0a\x0e'), ('recursiveLocal', b'\x20\x0a')]:
+        sub = basic[:-1] + b'\x0b' if name == 'local' else program
+        yield name, b'CFF ', font([program], local=[sub])
+    yield 'global', b'CFF ', font([b'\x20\x1d\x0e'], global_subrs=[basic[:-1] + b'\x0b'])
+    yield 'recursiveGlobal', b'CFF ', font([b'\x20\x1d'], global_subrs=[b'\x20\x1d'])
+    for format, charset in [(0, b'\0\0\x22'), (1, b'\x01\0\x22\0'), (2, b'\x02\0\x22\0\0')]:
+        yield f'charset{format}', b'CFF ', font([b'\x0e', basic], charset=charset)
+    for name, encoding in [('format0', b'\0\x01\x41'), ('format1', b'\x01\x01\x41\0'), ('supplement', b'\x80\x01\x41\x01\x42\0\x22')]:
+        yield f'encoding-{name}', b'CFF ', font([b'\x0e', basic], charset=b'\0\0\x22', encoding=encoding)
+    for op in [b'\x0f', b'\x10', b'\x11', b'\x0c\x24', b'\x0c\x25', b'\x18']:
+        for value in [-2147483648, -1, 0, 1, 2147483647]:
+            yield f'offset-{op.hex()}-{value}', b'CFF ', font([basic], extra=integer(value) + op)
+    for value in [-2147483648, -1, 0, 1, 2147483647]:
+        yield f'private-subr-{value}', b'CFF ', font([b'\x20\x0a'], private=integer(value) + b'\x13')
+        yield f'private-size-{value}', b'CFF ', font([basic], extra=integer(value) + integer(0) + b'\x12')
+    yield 'dict-overflow-bcd', b'CFF ', font([basic], extra=b'\x1e' + b'\x99' * 40 + b'\xff\x0c\x09')
+    yield 'private-widths', b'CFF ', font([b'\x0e', number(5) + basic], private=integer(500) + b'\x14' + integer(100) + b'\x15')
+    components = [b'\x0e'] * 130
+    components[34] = basic
+    components[125] = number(3) + number(4) + b'\x15' + line + b'\x0e'
+    components[1] = number(10) + number(20) + number(65) + number(194) + b'\x0e'
+    yield 'seac', b'CFF ', font(components)
+    components[34] = components[1]
+    yield 'recursive-seac', b'CFF ', font(components)
+
+
+def fixtures(seeds_only=False):
+    for name, tag, data in seeds():
+        yield name + '-full', sfnt(tag, data)
+        if seeds_only:
+            continue
+        cuts = set(range(min(len(data), 257)))
+        cuts.update(range(max(0, len(data) - 8), len(data)))
+        cuts.update(len(data) * i // 32 for i in range(1, 32))
+        for length in sorted(cuts):
+            yield f'{name}-prefix-{length}', sfnt(tag, data[:length])
+        # Deterministic header-byte mutations exercise count and offset dispatch.
+        for pos in range(min(12, len(data))):
+            for value in (0, 255):
+                if data[pos] != value:
+                    damaged = bytearray(data)
+                    damaged[pos] = value
+                    yield f'{name}-byte-{pos}-{value}', sfnt(tag, damaged)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference', type=Path, default=harness.REFERENCE)
+    parser.add_argument('--silk-dumper', type=Path)
+    parser.add_argument('--report', type=Path)
+    parser.add_argument('--seeds-only', action='store_true')
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='font-cff-fixtures-') as temporary:
+        paths = []
+        for name, data in fixtures(args.seeds_only):
+            path = Path(temporary) / f'{name}.otf'
+            path.write_bytes(data)
+            paths.append(path)
+        assert len(paths) == len(set(paths)), 'fixture names must be unique'
+        return harness.compare(paths, args.reference, args.silk_dumper or harness.silk_binary(), 30, args.report)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

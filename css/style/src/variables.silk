@@ -1,0 +1,775 @@
+//! Sparse inherited custom-property scopes and bounded token-reference substitution.
+import cascade { Name, Declaration, Candidate, Target, Specified, Origin }
+import cascade
+import values { Wide }
+import tokens { Token, TokenBuffer, TokenRange, Span, Kind, Limits, CssError, CssErrorKind }
+import tokens
+import input { Input, TokenRef }
+import declaration_values
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub struct ScopeId {
+  pub index: usize
+}
+
+impl Copy for ScopeId {}
+
+struct Entry {
+  name: Name,
+  value: Option<TokenRange>
+}
+
+impl Copy for Entry {}
+
+struct Scope {
+  parent: Option<ScopeId>,
+  entries: TokenRange
+}
+
+impl Copy for Scope {}
+
+pub struct VariableStore {
+  closingBuffer: usize,
+  scopes: List<Scope>,
+  entries: List<Entry>,
+  refs: List<TokenRef>,
+}
+
+struct Node {
+  name: Name,
+  buffer: usize,
+  raw: TokenRange,
+  value: Option<TokenRange>,
+  resolved: bool,
+  edges: TokenRange,
+  visited: bool,
+  number: usize,
+  low: usize,
+  stacked: bool,
+  cyclic: bool,
+  origin: Origin,
+  excluded: u8,
+}
+
+impl Copy for Node {}
+
+struct Work {
+  nodes: List<Node>,
+  edges: List<usize>,
+  parent: Option<ScopeId>,
+  retry: bool
+}
+
+struct Budget {
+  remaining: usize
+}
+
+impl Budget {
+  effect fn spend(self: &mut Budget, amount: usize) -> ()
+    ! CssError {
+    if amount > self.remaining {
+      fail CssError { kind: CssErrorKind.MatchLimit, offset: 0 }
+    }
+    self.remaining = self.remaining - amount
+  }
+}
+
+pub effect fn appendClosingBuffer(buffers: &mut List<TokenBuffer>) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut buffer = TokenBuffer.make()
+  let empty = Span { start: 0, end: 0 }
+  run buffer.tokens.append(Token { kind: Kind.CloseParen, source: empty, matching: 0 })
+  run buffer.tokens.append(Token { kind: Kind.CloseSquare, source: empty, matching: 1 })
+  run buffer.tokens.append(Token { kind: Kind.CloseBrace, source: empty, matching: 2 })
+  run buffer.tokens.append(Token { kind: Kind.Eof, source: empty, matching: 3 })
+  let index = buffers.length()
+  run buffers.append(move buffer)
+  return index
+}
+
+fn closing(kind: &Kind) -> Option<usize> {
+  return match &kind.* {
+    Kind.Function { name } => Option<usize>.some(0)
+    Kind.OpenParen => Option<usize>.some(0)
+    Kind.OpenSquare => Option<usize>.some(1)
+    Kind.OpenBrace => Option<usize>.some(2)
+    _ => Option<usize>.None
+  }
+}
+
+fn skip(buffer: &TokenBuffer, start: usize, end: usize) -> usize {
+  let mut i = start
+  while i < end {
+    match &buffer.tokens.asSlice()[i].kind {
+      Kind.Whitespace => {
+        i = i + 1
+      }
+      _ => {
+        return i
+      }
+    }
+  }
+  return i
+}
+
+fn variable(buffer: &TokenBuffer, index: usize) -> bool {
+  return match &buffer.tokens.asSlice()[index].kind {
+    Kind.Function { name } => tokens.insensitive(buffer.text(name), b"var")
+    _ => false
+  }
+}
+
+fn variableName(buffer: &TokenBuffer, source: usize, index: usize, end: usize) -> Option<Name> {
+  let first = skip(buffer, index + 1, end)
+  if first >= end {
+    return Option<Name>.None
+  }
+  return match &buffer.tokens.asSlice()[first].kind {
+    Kind.Ident { text } => Option<Name>.some(Name { buffer: source, span: text })
+    _ => Option<Name>.None
+  }
+}
+
+fn local(work: &Work, buffers: &[TokenBuffer], name: Name) -> Option<usize> {
+  let mut i: usize = 0
+  while i < work.nodes.length() {
+    if cascade.sameName(buffers, name, work.nodes.asSlice()[i].name) {
+      return Option<usize>.some(i)
+    }
+    i = i + 1
+  }
+  return Option<usize>.None
+}
+
+effect fn push(
+  out: &mut List<TokenRef>,
+  reference: TokenRef,
+  limits: &Limits,
+  budget: &mut Budget,
+) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  run budget.spend(1)
+  if out.length() >= limits.maxTokens {
+    fail CssError { kind: CssErrorKind.TokenLimit, offset: out.length() }
+  }
+  if out.length() >= limits.maxStorageBytes / 16 {
+    fail CssError { kind: CssErrorKind.StorageLimit, offset: out.length() }
+  }
+  run out.append(reference)
+}
+
+impl VariableStore {
+  pub fn make(closingBuffer: usize) -> VariableStore {
+    return VariableStore {
+      closingBuffer: closingBuffer,
+      scopes: List<Scope>.make(),
+      entries: List<Entry>.make(),
+      refs: List<TokenRef>.make(),
+    }
+  }
+
+  pub fn references(self: &VariableStore) -> &[TokenRef] {
+    return self.refs.asSlice()
+  }
+
+  pub fn lookup(
+    self: &VariableStore,
+    buffers: &[TokenBuffer],
+    scope: ScopeId,
+    name: Name,
+  ) -> Option<TokenRange> {
+    let mut current = Option<ScopeId>.some(scope)
+    while true {
+      match &current {
+        Option<ScopeId>.Some { value } => {
+          if value.index >= self.scopes.length() {
+            return Option<TokenRange>.None
+          }
+          let item = self.scopes.asSlice()[value.index]
+          let mut i = item.entries.start
+          while i < item.entries.end {
+            let entry = self.entries.asSlice()[i]
+            if cascade.sameName(buffers, name, entry.name) {
+              return entry.value
+            }
+            i = i + 1
+          }
+          current = item.parent
+        }
+        _ => {
+          return Option<TokenRange>.None
+        }
+      }
+    }
+  }
+
+  effect fn inherited(
+    self: &VariableStore,
+    buffers: &[TokenBuffer],
+    parent: Option<ScopeId>,
+    name: Name,
+    budget: &mut Budget,
+  ) -> Option<TokenRange>
+    ! CssError {
+    let mut current = parent
+    while true {
+      match &current {
+        Option<ScopeId>.Some { value } => {
+          run budget.spend(1)
+          if value.index >= self.scopes.length() {
+            return Option<TokenRange>.None
+          }
+          let item = self.scopes.asSlice()[value.index]
+          let mut i = item.entries.start
+          while i < item.entries.end {
+            run budget.spend(1)
+            let entry = self.entries.asSlice()[i]
+            if cascade.sameName(buffers, name, entry.name) {
+              return entry.value
+            }
+            i = i + 1
+          }
+          current = item.parent
+        }
+        _ => {
+          return Option<TokenRange>.None
+        }
+      }
+    }
+  }
+
+  pub effect fn build(
+    self: &mut VariableStore,
+    buffers: &[TokenBuffer],
+    catalog: &[Declaration],
+    candidates: &[Candidate],
+    parent: Option<ScopeId>,
+    limits: &Limits,
+  ) -> ScopeId
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut budget = Budget { remaining: limits.maxTokens }
+    let mut work = Work {
+      nodes: List<Node>.make(),
+      edges: List<usize>.make(),
+      parent: parent,
+      retry: false,
+    }
+    let mut i: usize = 0
+    while i < candidates.length {
+      run budget.spend(1)
+      let candidate = candidates[i]
+      if candidate.declaration < catalog.length {
+        match &catalog[candidate.declaration].target {
+          Target.Custom { name } => {
+            run budget.spend(work.nodes.length())
+            let existing = local(&work, buffers, name)
+            let absent = match &existing {
+              Option<usize>.None => true
+              _ => false
+            }
+            if absent {
+              if work.nodes.length() >= limits.maxDeclarations {
+                fail CssError { kind: CssErrorKind.DeclarationLimit, offset: i }
+              }
+              let node = Node {
+                name: name,
+                buffer: 0,
+                raw: TokenRange { start: 0, end: 0 },
+                value: Option<TokenRange>.None,
+                resolved: true,
+                edges: TokenRange { start: 0, end: 0 },
+                visited: false,
+                number: 0,
+                low: 0,
+                stacked: false,
+                cyclic: false,
+                origin: Origin.Author,
+                excluded: 0,
+              }
+              if work.nodes.length() >= limits.maxStorageBytes / 128 {
+                fail CssError { kind: CssErrorKind.StorageLimit, offset: i }
+              }
+              run work.nodes.append(node)
+            }
+          }
+          _ => {}
+        }
+      }
+      i = i + 1
+    }
+    if work.nodes.length() == 0 {
+      match &parent {
+        Option<ScopeId>.Some { value } => {
+          return value
+        }
+        _ => {}
+      }
+    }
+    let referenceStart = self.refs.length()
+    while true {
+      work.retry = false
+      work.edges.truncate(0)
+      self.refs.truncate(referenceStart)
+      i = 0
+      while i < work.nodes.length() {
+        let mut node = work.nodes.asSlice()[i]
+        run budget.spend(candidates.length)
+        let winner = cascade.selectCustom(buffers, catalog, candidates, node.name, node.excluded)
+        node.resolved = true
+        node.value = Option<TokenRange>.None
+        node.visited = false
+        node.stacked = false
+        node.cyclic = false
+        let mut inherit = true
+        match &winner {
+          Option<Candidate>.Some { value } => {
+            let declaration = &catalog[value.declaration]
+            node.buffer = declaration.buffer
+            node.origin = value.priority.origin
+            match &declaration.specified {
+              Specified.Pending { range, mode } => {
+                node.raw = range
+                node.resolved = false
+                inherit = false
+              }
+              Specified.Wide { keyword } => {
+                inherit = keyword != Wide.Initial
+              }
+              _ => {
+                inherit = false
+              }
+            }
+          }
+          _ => {}
+        }
+        if inherit {
+          node.value = run self.inherited(buffers, parent, node.name, &mut budget)
+        }
+        let mut nodes = work.nodes.asMutSlice()
+        nodes[i] = node
+        i = i + 1
+      }
+
+      // Scan every var(), including unused fallbacks, before any value substitution.
+      i = 0
+      while i < work.nodes.length() {
+        let node = work.nodes.asSlice()[i]
+        let start = work.edges.length()
+        if !node.resolved {
+          if node.buffer >= buffers.length || node.raw.start > node.raw.end
+            || node.raw.end > buffers[node.buffer].all().end {
+            let mut nodes = work.nodes.asMutSlice()
+            nodes[i].resolved = true
+          } else {
+            let buffer = &buffers[node.buffer]
+            let mut position = node.raw.start
+            while position < node.raw.end {
+              run budget.spend(1)
+              if variable(buffer, position) {
+                let name = variableName(buffer, node.buffer, position, node.raw.end)
+                match &name {
+                  Option<Name>.Some { value } => {
+                    run budget.spend(work.nodes.length())
+                    let target = local(&work, buffers, value)
+                    match &target {
+                      Option<usize>.Some { value: index } => {
+                        if work.edges.length() >= limits.maxTokens
+                          || work.edges.length() >= limits.maxStorageBytes / 8 {
+                          fail CssError { kind: CssErrorKind.StorageLimit, offset: position }
+                        }
+                        run work.edges.append(index)
+                      }
+                      _ => {}
+                    }
+                  }
+                  _ => {}
+                }
+              }
+              position = position + 1
+            }
+          }
+        }
+        let edges = TokenRange { start: start, end: work.edges.length() }
+        let mut nodes = work.nodes.asMutSlice()
+        nodes[i].edges = edges
+        i = i + 1
+      }
+      let mut stack = List<usize>.make()
+      let mut sequence: usize = 0
+      i = 0
+      while i < work.nodes.length() {
+        if !work.nodes.asSlice()[i].visited {
+          run connect(&mut work, i, &mut stack, &mut sequence, 0, limits, &mut budget)
+        }
+        i = i + 1
+      }
+      i = 0
+      while i < work.nodes.length() {
+        run self.resolve(&mut work, buffers, i, 0, limits, &mut budget)
+        if work.retry {
+          break
+        }
+        i = i + 1
+      }
+      if !work.retry {
+        break
+      }
+    }
+    if self.scopes.length() >= limits.maxRules
+      || self.entries.length() > limits.maxStorageBytes / 48
+      || work.nodes.length() > limits.maxStorageBytes / 48 - self.entries.length() {
+      fail CssError { kind: CssErrorKind.StorageLimit, offset: self.entries.length() }
+    }
+    let start = self.entries.length()
+    i = 0
+    while i < work.nodes.length() {
+      let node = work.nodes.asSlice()[i]
+      run self.entries.append(Entry { name: node.name, value: node.value })
+      i = i + 1
+    }
+    let id = ScopeId { index: self.scopes.length() }
+    run self.scopes.append(
+      Scope { parent: parent, entries: TokenRange { start: start, end: self.entries.length() } },
+    )
+    return id
+  }
+
+  effect fn resolve(
+    self: &mut VariableStore,
+    work: &mut Work,
+    buffers: &[TokenBuffer],
+    index: usize,
+    depth: usize,
+    limits: &Limits,
+    budget: &mut Budget,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    run budget.spend(1)
+    let node = work.nodes.asSlice()[index]
+    if node.resolved {
+      return
+    }
+    if depth >= limits.maxDepth {
+      fail CssError { kind: CssErrorKind.NestingLimit, offset: index }
+    }
+    if node.cyclic {
+      let mut nodes = work.nodes.asMutSlice()
+      nodes[index].resolved = true
+      return
+    }
+    let mut i = node.edges.start
+    while i < node.edges.end {
+      let dependency = work.edges.asSlice()[i]
+      run self.resolve(&mut work.*, buffers, dependency, depth + 1, limits, &mut budget.*)
+      if work.retry {
+        return
+      }
+      i = i + 1
+    }
+    let mut out = List<TokenRef>.make()
+    let valid = run expand(
+      &self.*,
+      &work.*,
+      buffers,
+      node.buffer,
+      node.raw,
+      0,
+      &mut out,
+      limits,
+      &mut budget.*,
+    )
+    if valid {
+      let expanded = Input.Expanded { buffers: buffers, references: out.asSlice() }
+      let keyword = cascade.wide(&expanded)
+      match &keyword {
+        Option<Wide>.Some { value } => {
+          if value == Wide.Revert {
+            let mut nodes = work.nodes.asMutSlice()
+            nodes[index].excluded = node.excluded | cascade.revertMask(node.origin)
+            work.retry = true
+          } else if value != Wide.Initial {
+            let inherited = run self.inherited(buffers, work.parent, node.name, &mut budget.*)
+            let mut nodes = work.nodes.asMutSlice()
+            nodes[index].value = inherited
+          }
+          let mut nodes = work.nodes.asMutSlice()
+          nodes[index].resolved = true
+          return
+        }
+        _ => {}
+      }
+      if self.refs.length() > limits.maxStorageBytes / 16
+        || out.length() > limits.maxStorageBytes / 16 - self.refs.length() {
+        fail CssError { kind: CssErrorKind.StorageLimit, offset: index }
+      }
+      let start = self.refs.length()
+      i = 0
+      while i < out.length() {
+        run self.refs.append(out.asSlice()[i])
+        i = i + 1
+      }
+      let mut nodes = work.nodes.asMutSlice()
+      nodes[index].value = Option<TokenRange>.some(
+        TokenRange { start: start, end: self.refs.length() },
+      )
+    }
+    let mut nodes = work.nodes.asMutSlice()
+    nodes[index].resolved = true
+  }
+
+  pub effect fn substitute(
+    self: &VariableStore,
+    buffers: &[TokenBuffer],
+    scope: ScopeId,
+    buffer: usize,
+    range: TokenRange,
+    limits: &Limits,
+  ) -> Option<List<TokenRef>>
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    if buffer >= buffers.length || range.start > range.end || range.end > buffers[buffer].all().end
+      || scope.index >= self.scopes.length() {
+      return Option<List<TokenRef>>.None
+    }
+    let input = Input.Contiguous { buffer: &buffers[buffer], range: range }
+    let validation = run declaration_values.validate(&input, limits)
+    if !validation.valid {
+      return Option<List<TokenRef>>.None
+    }
+    let work = Work {
+      nodes: List<Node>.make(),
+      edges: List<usize>.make(),
+      parent: Option<ScopeId>.some(scope),
+      retry: false,
+    }
+    let mut budget = Budget { remaining: limits.maxTokens }
+    let mut out = List<TokenRef>.make()
+    let valid = run expand(self, &work, buffers, buffer, range, 0, &mut out, limits, &mut budget)
+    if !valid {
+      return Option<List<TokenRef>>.None
+    }
+    return Option<List<TokenRef>>.some(move out)
+  }
+}
+
+// Tarjan SCCs retain completed DFS children on the component stack, so cross
+// edges also invalidate every member of a cycle, not merely a back-edge path.
+// https://www.w3.org/TR/css-variables-1/#cycles
+effect fn connect(
+  work: &mut Work,
+  index: usize,
+  stack: &mut List<usize>,
+  sequence: &mut usize,
+  depth: usize,
+  limits: &Limits,
+  budget: &mut Budget,
+) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  run budget.spend(1)
+  if depth >= limits.maxDepth {
+    fail CssError { kind: CssErrorKind.NestingLimit, offset: index }
+  }
+  let mut initialNodes = work.nodes.asMutSlice()
+  initialNodes[index].visited = true
+  initialNodes[index].number = sequence.*
+  initialNodes[index].low = sequence.*
+  initialNodes[index].stacked = true
+  drop initialNodes
+  sequence.* = sequence.* + 1
+  run stack.append(index)
+  let edges = work.nodes.asSlice()[index].edges
+  let mut edge = edges.start
+  let mut selfEdge = false
+  while edge < edges.end {
+    run budget.spend(1)
+    let target = work.edges.asSlice()[edge]
+    if target == index {
+      selfEdge = true
+    }
+    if !work.nodes.asSlice()[target].visited {
+      run connect(
+        &mut work.*,
+        target,
+        &mut stack.*,
+        &mut sequence.*,
+        depth + 1,
+        limits,
+        &mut budget.*,
+      )
+      let low = work.nodes.asSlice()[target].low
+      if low < work.nodes.asSlice()[index].low {
+        let mut nodes = work.nodes.asMutSlice()
+        nodes[index].low = low
+      }
+    } else if work.nodes.asSlice()[target].stacked {
+      let number = work.nodes.asSlice()[target].number
+      if number < work.nodes.asSlice()[index].low {
+        let mut nodes = work.nodes.asMutSlice()
+        nodes[index].low = number
+      }
+    }
+    edge = edge + 1
+  }
+  let node = work.nodes.asSlice()[index]
+  if node.low == node.number {
+    let mut start = stack.length()
+    while start > 0 {
+      start = start - 1
+      if stack.asSlice()[start] == index {
+        break
+      }
+    }
+    let cyclic = selfEdge || stack.length() - start > 1
+    let mut i = start
+    while i < stack.length() {
+      let member = stack.asSlice()[i]
+      let mut nodes = work.nodes.asMutSlice()
+      nodes[member].cyclic = cyclic
+      nodes[member].stacked = false
+      i = i + 1
+    }
+    stack.truncate(start)
+  }
+}
+
+// Splice token references, never bytes. Every implicit block end is materialized
+// before another sequence is appended, including implicit ends inside fallback.
+effect fn expand(
+  store: &VariableStore,
+  work: &Work,
+  buffers: &[TokenBuffer],
+  source: usize,
+  range: TokenRange,
+  depth: usize,
+  out: &mut List<TokenRef>,
+  limits: &Limits,
+  budget: &mut Budget,
+) -> bool
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth >= limits.maxDepth {
+    fail CssError { kind: CssErrorKind.NestingLimit, offset: range.start }
+  }
+  if source >= buffers.length || range.start > range.end || range.end > buffers[source].all().end {
+    return false
+  }
+  let buffer = &buffers[source]
+  let mut position = range.start
+  while position < range.end {
+    run budget.spend(1)
+    let token = &buffer.tokens.asSlice()[position]
+    let close = closing(&token.kind)
+    match &close {
+      Option<usize>.Some { value: closingIndex } => {
+        let end = if token.matching < range.end {
+          token.matching
+        } else {
+          range.end
+        }
+        if end <= position {
+          return false
+        }
+        if variable(buffer, position) {
+          let named = variableName(buffer, source, position, end)
+          let name = match &named {
+            Option<Name>.Some { value } => value
+            _ => {
+              return false
+            }
+          }
+          run budget.spend(work.nodes.length())
+          let target = local(work, buffers, name)
+          let value = match &target {
+            Option<usize>.Some { value } => work.nodes.asSlice()[value].value
+            _ => run store.inherited(buffers, work.parent, name, &mut budget.*)
+          }
+          match &value {
+            Option<TokenRange>.Some { value: resolved } => {
+              let mut i = resolved.start
+              while i < resolved.end {
+                run push(&mut out.*, store.refs.asSlice()[i], limits, &mut budget.*)
+                i = i + 1
+              }
+            }
+            _ => {
+              let first = skip(buffer, position + 1, end)
+              let comma = skip(buffer, first + 1, end)
+              if comma >= end {
+                return false
+              }
+              let isComma = match &buffer.tokens.asSlice()[comma].kind {
+                Kind.Comma => true
+                _ => false
+              }
+              if !isComma {
+                return false
+              }
+              let valid = run expand(
+                store,
+                work,
+                buffers,
+                source,
+                TokenRange { start: comma + 1, end: end },
+                depth + 1,
+                &mut out.*,
+                limits,
+                &mut budget.*,
+              )
+              if !valid {
+                return false
+              }
+            }
+          }
+        } else {
+          run push(&mut out.*, TokenRef { buffer: source, token: position }, limits, &mut budget.*)
+          let valid = run expand(
+            store,
+            work,
+            buffers,
+            source,
+            TokenRange { start: position + 1, end: end },
+            depth + 1,
+            &mut out.*,
+            limits,
+            &mut budget.*,
+          )
+          if !valid {
+            return false
+          }
+          if end < range.end {
+            run push(&mut out.*, TokenRef { buffer: source, token: end }, limits, &mut budget.*)
+          } else {
+            if store.closingBuffer >= buffers.length
+              || closingIndex >= buffers[store.closingBuffer].tokens.length() {
+              return false
+            }
+            run push(
+              &mut out.*,
+              TokenRef { buffer: store.closingBuffer, token: closingIndex },
+              limits,
+              &mut budget.*,
+            )
+          }
+        }
+        position = if end < range.end {
+          end + 1
+        } else {
+          end
+        }
+      }
+      _ => {
+        run push(&mut out.*, TokenRef { buffer: source, token: position }, limits, &mut budget.*)
+        position = position + 1
+      }
+    }
+  }
+  return true
+}

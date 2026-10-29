@@ -1,0 +1,2183 @@
+//! Static XML selectors. The owned AST keeps spans into its immutable TokenBuffer.
+//! Normative grammar and specificity: pinned Selectors 4 #grammar / #specificity-rules.
+import tokens { Span, TokenRange, TokenBuffer, Kind, Limits, CssError, CssErrorKind }
+import tokens
+import element { ElementTree, MatchContext, NO_ELEMENT }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.usize
+import silk.num.u8
+import silk.num.f64
+import silk.num.i64
+
+const NONE: usize = usize.MAX
+
+pub struct NamespaceBinding {
+  pub prefix: Span,
+  pub uri: Span
+}
+
+impl Copy for NamespaceBinding {}
+
+pub struct Specificity {
+  pub ids: usize,
+  pub classes: usize,
+  pub types: usize
+}
+
+impl Copy for Specificity {}
+
+pub fn compare(a: Specificity, b: Specificity) -> i32 {
+  if a.ids != b.ids {
+    return if a.ids > b.ids {
+      1
+    } else {
+      -1
+    }
+  }
+  if a.classes != b.classes {
+    return if a.classes > b.classes {
+      1
+    } else {
+      -1
+    }
+  }
+  return if a.types == b.types {
+    0
+  } else if a.types > b.types {
+    1
+  } else {
+    -1
+  }
+}
+
+fn zero() -> Specificity {
+  return Specificity { ids: 0, classes: 0, types: 0 }
+}
+
+fn add(a: Specificity, b: Specificity) -> Specificity {
+  return Specificity {
+    ids: a.ids + b.ids,
+    classes: a.classes + b.classes,
+    types: a.types + b.types,
+  }
+}
+
+fn maximum(a: Specificity, b: Specificity) -> Specificity {
+  return if compare(a, b) > 0 {
+    a
+  } else {
+    b
+  }
+}
+
+fn emptySpan() -> Span {
+  return Span { start: 0, end: 0 }
+}
+
+// Namespace mode: Any does not impose a namespace, Exact includes the empty URI.
+enum NamespaceMode {
+  Any,
+  Exact
+}
+
+struct Namespace {
+  mode: NamespaceMode,
+  uri: Span
+}
+
+impl Copy for Namespace {}
+
+fn anyNamespace() -> Namespace {
+  return Namespace { mode: NamespaceMode.Any, uri: emptySpan() }
+}
+
+fn noNamespace() -> Namespace {
+  return Namespace { mode: NamespaceMode.Exact, uri: emptySpan() }
+}
+
+enum Combinator {
+  None,
+  Descendant,
+  Child,
+  Adjacent,
+  Sibling
+}
+
+enum AttributeOp {
+  Present,
+  Equal,
+  Word,
+  Hyphen,
+  Prefix,
+  Suffix,
+  Contains
+}
+
+enum Pseudo {
+  Host,
+  Root,
+  Empty,
+  Scope,
+  Target,
+  Link,
+  Never,
+  FirstChild,
+  LastChild,
+  OnlyChild,
+  FirstType,
+  LastType,
+  OnlyType
+}
+
+enum FunctionKind {
+  Is,
+  Not,
+  Has,
+  Host,
+  HostContext
+}
+
+union Test {
+  Id { text: Span },
+  Class { text: Span },
+  Attribute { namespace: Namespace, name: Span, value: Span, op: AttributeOp, insensitive: bool },
+  State { pseudo: Pseudo },
+  Function { kind: FunctionKind, list: usize },
+  Nth { a: f64, b: f64, reverse: bool, ofType: bool, list: usize },
+  Language { range: TokenRange },
+}
+
+impl Copy for Test {}
+
+struct Simple {
+  test: Test,
+  next: usize
+}
+
+impl Copy for Simple {}
+
+struct Compound {
+  namespace: Namespace,
+  name: Span,
+  named: bool,
+  explicitType: bool,
+  hostEligible: bool,
+  first: usize,
+  previous: usize,
+  relation: Combinator,
+}
+
+impl Copy for Compound {}
+
+struct Arm {
+  tail: usize,
+  next: usize,
+  specificity: Specificity
+}
+
+impl Copy for Arm {}
+
+pub struct SelectorList {
+  simples: List<Simple>,
+  compounds: List<Compound>,
+  arms: List<Arm>,
+  head: usize,
+  maxDepth: usize,
+}
+
+/// A necessary subject condition, not a substitute for matching the complete selector.
+pub enum SubjectKind {
+  Any,
+  Id,
+  Class,
+  LocalName
+}
+
+pub struct SubjectKey {
+  pub kind: SubjectKind,
+  pub text: Span,
+}
+
+impl Copy for SubjectKey {}
+
+pub struct SubjectKeys<'a> {
+  selectors: &'a SelectorList,
+  nextArm: usize,
+}
+
+impl SelectorList {
+  /// One conservative key per top-level arm. Functional-only subjects remain unkeyed.
+  pub fn subjectKeys<'a>(self: &'a Self) -> SubjectKeys<'a> {
+    return SubjectKeys<'a> { selectors: self, nextArm: self.head }
+  }
+}
+
+impl<'a> SubjectKeys<'a> {
+  pub fn next(self: &mut Self) -> Option<SubjectKey> {
+    if self.nextArm == NONE {
+      return Option<SubjectKey>.None
+    }
+    let arm = &self.selectors.arms.asSlice()[self.nextArm]
+    let compound = &self.selectors.compounds.asSlice()[arm.tail]
+    self.nextArm = arm.next
+    let mut key = SubjectKey {
+      kind: if compound.named {
+        SubjectKind.LocalName
+      } else {
+        SubjectKind.Any
+      },
+      text: compound.name,
+    }
+    let mut simple = compound.first
+    while simple != NONE {
+      let entry = &self.selectors.simples.asSlice()[simple]
+      match &entry.test {
+        Test.Id { text } => {
+          return Option<SubjectKey>.Some { value: SubjectKey { kind: SubjectKind.Id, text: text }, }
+        }
+        Test.Class { text } => {
+          if key.kind != SubjectKind.Class {
+            key = SubjectKey { kind: SubjectKind.Class, text: text }
+          }
+        }
+        _ => {}
+      }
+      simple = entry.next
+    }
+    return Option<SubjectKey>.Some { value: key }
+  }
+}
+
+struct Parsed {
+  valid: bool,
+  head: usize,
+  specificity: Specificity
+}
+
+impl Copy for Parsed {}
+
+fn rejected() -> Parsed {
+  return Parsed { valid: false, head: NONE, specificity: zero() }
+}
+
+struct Name {
+  valid: bool,
+  next: usize,
+  namespace: Namespace,
+  text: Span,
+  named: bool
+}
+
+impl Copy for Name {}
+
+fn whitespace(buffer: &TokenBuffer, at: usize, end: usize) -> bool {
+  return at < end
+    && match &buffer.tokens.asSlice()[at].kind {
+      Kind.Whitespace => true
+      _ => false
+    }
+}
+
+fn spaces(buffer: &TokenBuffer, at: usize, end: usize) -> usize {
+  let mut result = at
+  while whitespace(buffer, result, end) {
+    result = result + 1
+  }
+  return result
+}
+
+fn delim(buffer: &TokenBuffer, at: usize, end: usize, scalar: u32) -> bool {
+  return at < end
+    && match &buffer.tokens.asSlice()[at].kind {
+      Kind.Delim { scalar: found } => found == scalar
+      _ => false
+    }
+}
+
+fn ident(buffer: &TokenBuffer, at: usize, end: usize, word: &[u8]) -> bool {
+  return at < end
+    && match &buffer.tokens.asSlice()[at].kind {
+      Kind.Ident { text } => tokens.insensitive(buffer.text(text), word)
+      _ => false
+    }
+}
+
+fn isComma(buffer: &TokenBuffer, at: usize) -> bool {
+  return match &buffer.tokens.asSlice()[at].kind {
+    Kind.Comma => true
+    _ => false
+  }
+}
+
+fn implicitEnd(buffer: &TokenBuffer, close: usize, end: usize) -> bool {
+  return close == end && end < buffer.tokens.length()
+    && match &buffer.tokens.asSlice()[end].kind {
+      Kind.Eof => true
+      _ => false
+    }
+}
+
+fn defaultNamespace(bindings: &[NamespaceBinding]) -> Namespace {
+  let mut i = bindings.length
+  while i > 0 {
+    i = i - 1
+    if bindings[i].prefix.start == bindings[i].prefix.end {
+      return Namespace { mode: NamespaceMode.Exact, uri: bindings[i].uri }
+    }
+  }
+  return anyNamespace()
+}
+
+fn qualifiedName(
+  buffer: &TokenBuffer,
+  start: usize,
+  end: usize,
+  bindings: &[NamespaceBinding],
+  attribute: bool,
+) -> Name {
+  let mut result = Name {
+    valid: false,
+    next: start,
+    namespace: if attribute {
+      noNamespace()
+    } else {
+      defaultNamespace(bindings)
+    },
+    text: emptySpan(),
+    named: false,
+  }
+  if start >= end {
+    return result
+  }
+  let mut at = start
+  let mut prefix = emptySpan()
+  let mut prefixIdent = false
+  let mut firstName = false
+  match &buffer.tokens.asSlice()[at].kind {
+    Kind.Ident { text } => {
+      prefix = text
+      prefixIdent = true
+      firstName = true
+    }
+    Kind.Delim { scalar } => {
+      firstName = scalar == 42
+    }
+    _ => {}
+  }
+  let hasPrefix = firstName && delim(buffer, at + 1, end, 124) && !delim(buffer, at + 2, end, 61)
+  if hasPrefix {
+    result.namespace = anyNamespace()
+    if prefixIdent {
+      let mut i = bindings.length
+      let mut found = false
+      while i > 0 {
+        i = i - 1
+        if tokens.equal(buffer.text(bindings[i].prefix), buffer.text(prefix)) {
+          result.namespace = Namespace { mode: NamespaceMode.Exact, uri: bindings[i].uri }
+          found = true
+          break
+        }
+      }
+      if !found {
+        return result
+      }
+    }
+    at = at + 2
+  } else if delim(buffer, at, end, 124) {
+    result.namespace = noNamespace()
+    at = at + 1
+  }
+  if at >= end {
+    return result
+  }
+  match &buffer.tokens.asSlice()[at].kind {
+    Kind.Ident { text } => {
+      result.text = text
+      result.named = true
+    }
+    Kind.Delim { scalar } => {
+      if scalar != 42 || attribute {
+        return result
+      }
+    }
+    _ => {
+      return result
+    }
+  }
+  result.next = at + 1
+  result.valid = true
+  return result
+}
+
+effect fn appendSimple(ast: &mut SelectorList, compound: usize, test: Test) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let previous = ast.compounds.asSlice()[compound].first
+  let index = ast.simples.length()
+  run ast.simples.append(Simple { test: move test, next: previous })
+  let mut compounds = ast.compounds.asMutSlice()
+  compounds[compound].first = index
+}
+
+// Namespace bindings are stylesheet-local. Last binding for each prefix wins.
+// Invalid grammar returns None; resource exhaustion is never swallowed by forgiving lists.
+pub effect fn parse(
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  namespaces: &[NamespaceBinding],
+  limits: &Limits,
+) -> Option<SelectorList>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if range.start > range.end || range.end > buffer.tokens.length() {
+    return Option<SelectorList>.None
+  }
+  if range.end - range.start > limits.maxTokens {
+    fail CssError { kind: CssErrorKind.TokenLimit, offset: range.start }
+  }
+  let mut ast = SelectorList {
+    simples: List<Simple>.make(),
+    compounds: List<Compound>.make(),
+    arms: List<Arm>.make(),
+    head: NONE,
+    maxDepth: limits.maxDepth,
+  }
+  let parsed = run parseList(
+    &mut ast,
+    buffer,
+    range,
+    namespaces,
+    limits,
+    0,
+    false,
+    false,
+    false,
+    false,
+    false,
+  )
+  if !parsed.valid {
+    return Option<SelectorList>.None
+  }
+  ast.head = parsed.head
+  return Option<SelectorList>.Some { value: move ast }
+}
+
+effect fn parseList(
+  ast: &mut SelectorList,
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  bindings: &[NamespaceBinding],
+  limits: &Limits,
+  depth: usize,
+  forgiving: bool,
+  relative: bool,
+  insideHas: bool,
+  subjectExempt: bool,
+  compoundOnly: bool,
+) -> Parsed
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth >= limits.maxDepth {
+    fail CssError { kind: CssErrorKind.NestingLimit, offset: range.start }
+  }
+  let mut result = Parsed { valid: true, head: NONE, specificity: zero() }
+  let mut at = range.start
+  let mut start = at
+  let mut last = NONE
+  while at <= range.end {
+    if at == range.end || isComma(buffer, at) {
+      let parsed = run parseArm(
+        &mut ast.*,
+        buffer,
+        TokenRange { start: start, end: at },
+        bindings,
+        limits,
+        depth,
+        relative,
+        insideHas,
+        subjectExempt,
+        compoundOnly,
+      )
+      if !parsed.valid {
+        if !forgiving {
+          return rejected()
+        }
+      } else {
+        if result.head == NONE {
+          result.head = parsed.head
+        } else {
+          let mut arms = ast.arms.asMutSlice()
+          arms[last].next = parsed.head
+        }
+        last = parsed.head
+        result.specificity = maximum(result.specificity, parsed.specificity)
+      }
+      start = at + 1
+    } else {
+      let token = &buffer.tokens.asSlice()[at]
+      match &token.kind {
+        Kind.Function { name } => {
+          if token.matching > at && token.matching <= range.end {
+            at = if token.matching == range.end {
+              range.end - 1
+            } else {
+              token.matching
+            }
+          }
+        }
+        Kind.OpenSquare => {
+          if token.matching > at && token.matching <= range.end {
+            at = if token.matching == range.end {
+              range.end - 1
+            } else {
+              token.matching
+            }
+          }
+        }
+        Kind.OpenParen => {
+          if token.matching > at && token.matching <= range.end {
+            at = if token.matching == range.end {
+              range.end - 1
+            } else {
+              token.matching
+            }
+          }
+        }
+        Kind.OpenBrace => {
+          if token.matching > at && token.matching <= range.end {
+            at = if token.matching == range.end {
+              range.end - 1
+            } else {
+              token.matching
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+    at = at + 1
+  }
+  return result
+}
+
+fn combinator(buffer: &TokenBuffer, at: usize, end: usize) -> Combinator {
+  if delim(buffer, at, end, 62) {
+    return Combinator.Child
+  }
+  if delim(buffer, at, end, 43) {
+    return Combinator.Adjacent
+  }
+  if delim(buffer, at, end, 126) {
+    return Combinator.Sibling
+  }
+  return Combinator.None
+}
+
+effect fn parseArm(
+  ast: &mut SelectorList,
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  bindings: &[NamespaceBinding],
+  limits: &Limits,
+  depth: usize,
+  relative: bool,
+  insideHas: bool,
+  subjectExempt: bool,
+  compoundOnly: bool,
+) -> Parsed
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = spaces(buffer, range.start, range.end)
+  let mut previous = NONE
+  let mut relation = if relative {
+    Combinator.Descendant
+  } else {
+    Combinator.None
+  }
+  let leading = combinator(buffer, at, range.end)
+  if leading != Combinator.None {
+    if !relative {
+      return rejected()
+    }
+    relation = leading
+    at = spaces(buffer, at + 1, range.end)
+  }
+  let mut specificity = zero()
+  let mut count: usize = 0
+  let mut pseudoElement = false
+  while at < range.end {
+    count = count + 1
+    if depth + count >= limits.maxDepth {
+      fail CssError { kind: CssErrorKind.NestingLimit, offset: at }
+    }
+    let name = qualifiedName(buffer, at, range.end, bindings, false)
+    let compound = ast.compounds.length()
+    run ast.compounds.append(
+      Compound {
+        namespace: if name.valid {
+          name.namespace
+        } else {
+          defaultNamespace(bindings)
+        },
+        name: name.text,
+        named: name.named,
+        explicitType: name.valid,
+        hostEligible: false,
+        first: NONE,
+        previous: previous,
+        relation: relation,
+      },
+    )
+    let begin = at
+    if name.valid {
+      at = name.next
+      if name.named {
+        specificity.types = specificity.types + 1
+      }
+    }
+    while at < range.end && !whitespace(buffer, at, range.end)
+      && combinator(buffer, at, range.end) == Combinator.None {
+      if pseudoElement {
+        return rejected()
+      }
+      match &buffer.tokens.asSlice()[at].kind {
+        Kind.Hash { text, identifier } => {
+          if !identifier {
+            return rejected()
+          }
+          run appendSimple(&mut ast.*, compound, Test.Id { text: text })
+          specificity.ids = specificity.ids + 1
+          at = at + 1
+        }
+        Kind.Delim { scalar } => {
+          if scalar != 46 || at + 1 >= range.end {
+            return rejected()
+          }
+          match &buffer.tokens.asSlice()[at + 1].kind {
+            Kind.Ident { text } => {
+              run appendSimple(&mut ast.*, compound, Test.Class { text: text })
+            }
+            _ => {
+              return rejected()
+            }
+          }
+          specificity.classes = specificity.classes + 1
+          at = at + 2
+        }
+        Kind.OpenSquare => {
+          let close = buffer.tokens.asSlice()[at].matching
+          if close <= at || close > range.end
+            || (close == range.end && !implicitEnd(buffer, close, range.end)) {
+            return rejected()
+          }
+          if !run parseAttribute(
+            &mut ast.*,
+            compound,
+            buffer,
+            TokenRange { start: at + 1, end: close },
+            bindings,
+          ) {
+            return rejected()
+          }
+          specificity.classes = specificity.classes + 1
+          at = if close < range.end {
+            close + 1
+          } else {
+            close
+          }
+        }
+        Kind.Colon => {
+          at = at + 1
+          if at >= range.end {
+            return rejected()
+          }
+          let doubled = match &buffer.tokens.asSlice()[at].kind {
+            Kind.Colon => true
+            _ => false
+          }
+          if doubled {
+            at = at + 1
+          }
+          if at >= range.end {
+            return rejected()
+          }
+          match &buffer.tokens.asSlice()[at].kind {
+            Kind.Ident { text } => {
+              let word = buffer.text(text)
+              let generated = tokens.insensitive(word, b"before")
+                || tokens.insensitive(word, b"after")
+                || tokens.insensitive(word, b"first-line")
+                || tokens.insensitive(word, b"first-letter")
+              if generated {
+                if depth != 0 || relative || insideHas {
+                  return rejected()
+                }
+                pseudoElement = true
+                specificity.types = specificity.types + 1
+                run appendSimple(&mut ast.*, compound, Test.State { pseudo: Pseudo.Never })
+              } else {
+                if doubled {
+                  return rejected()
+                }
+                let state = pseudo(word)
+                match &state {
+                  Option<Pseudo>.Some { value } => {
+                    run appendSimple(&mut ast.*, compound, Test.State { pseudo: value })
+                  }
+                  _ => {
+                    return rejected()
+                  }
+                }
+                specificity.classes = specificity.classes + 1
+              }
+              at = at + 1
+            }
+            Kind.Function { name: functionName } => {
+              if doubled {
+                return rejected()
+              }
+              let close = buffer.tokens.asSlice()[at].matching
+              if close <= at || close > range.end
+                || (close == range.end && !implicitEnd(buffer, close, range.end)) {
+                return rejected()
+              }
+              let functional = run parseFunction(
+                &mut ast.*,
+                compound,
+                buffer,
+                functionName,
+                TokenRange { start: at + 1, end: close },
+                bindings,
+                limits,
+                depth + count,
+                insideHas,
+                compoundOnly,
+              )
+              if !functional.valid {
+                return rejected()
+              }
+              specificity = add(specificity, functional.specificity)
+              at = if close < range.end {
+                close + 1
+              } else {
+                close
+              }
+            }
+            _ => {
+              return rejected()
+            }
+          }
+        }
+        _ => {
+          return rejected()
+        }
+      }
+    }
+    if at == begin {
+      return rejected()
+    }
+    let hostEligible = hostCompoundEligible(&ast.*, compound)
+    let mut compounds = ast.compounds.asMutSlice()
+    compounds[compound].hostEligible = hostEligible
+    drop compounds
+    previous = compound
+    let next = spaces(buffer, at, range.end)
+    if next == range.end {
+      at = next
+      break
+    }
+    if compoundOnly {
+      return rejected()
+    }
+    if pseudoElement {
+      return rejected()
+    }
+    relation = combinator(buffer, next, range.end)
+    if relation == Combinator.None {
+      if next == at {
+        return rejected()
+      }
+      relation = Combinator.Descendant
+      at = next
+    } else {
+      at = spaces(buffer, next + 1, range.end)
+    }
+    if at == range.end {
+      return rejected()
+    }
+  }
+  if previous == NONE {
+    return rejected()
+  }
+  if subjectExempt && !ast.compounds.asSlice()[previous].explicitType {
+    let mut compounds = ast.compounds.asMutSlice()
+    compounds[previous].namespace = anyNamespace()
+  }
+  let index = ast.arms.length()
+  run ast.arms.append(Arm { tail: previous, next: NONE, specificity: specificity })
+  return Parsed { valid: true, head: index, specificity: specificity }
+}
+
+// Selectors 4 #featureless-elements: eligibility is syntactic, not a match result.
+// Cache it once so nested logical selectors do not rescan the AST on every node.
+fn hostListEligible(ast: &SelectorList, list: usize) -> bool {
+  let mut arm = list
+  while arm != NONE {
+    let entry = &ast.arms.asSlice()[arm]
+    if ast.compounds.asSlice()[entry.tail].hostEligible {
+      return true
+    }
+    arm = entry.next
+  }
+  return false
+}
+
+fn hostCompoundEligible(ast: &SelectorList, index: usize) -> bool {
+  let compound = &ast.compounds.asSlice()[index]
+  if compound.explicitType {
+    return false
+  }
+  let mut other = false
+  let mut simple = compound.first
+  while simple != NONE {
+    let entry = &ast.simples.asSlice()[simple]
+    match &entry.test {
+      Test.State { pseudo } => {
+        if pseudo != Pseudo.Host {
+          return false
+        }
+        other = true
+      }
+      Test.Function { kind, list } => {
+        if kind != FunctionKind.Has {
+          if kind != FunctionKind.Host && kind != FunctionKind.HostContext
+            && !hostListEligible(ast, list) {
+            return false
+          }
+          other = true
+        }
+      }
+      _ => {
+        return false
+      }
+    }
+    simple = entry.next
+  }
+  return other
+}
+
+effect fn parseAttribute(
+  ast: &mut SelectorList,
+  compound: usize,
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  bindings: &[NamespaceBinding],
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let name = qualifiedName(
+    buffer,
+    spaces(buffer, range.start, range.end),
+    range.end,
+    bindings,
+    true,
+  )
+  if !name.valid {
+    return false
+  }
+  let mut at = spaces(buffer, name.next, range.end)
+  let mut op = AttributeOp.Present
+  let mut value = emptySpan()
+  let mut insensitive = false
+  if at < range.end {
+    if delim(buffer, at, range.end, 61) {
+      op = AttributeOp.Equal
+      at = at + 1
+    } else {
+      if !delim(buffer, at + 1, range.end, 61) {
+        return false
+      }
+      op = if delim(buffer, at, range.end, 126) {
+        AttributeOp.Word
+      } else if delim(buffer, at, range.end, 124) {
+        AttributeOp.Hyphen
+      } else if delim(buffer, at, range.end, 94) {
+        AttributeOp.Prefix
+      } else if delim(buffer, at, range.end, 36) {
+        AttributeOp.Suffix
+      } else if delim(buffer, at, range.end, 42) {
+        AttributeOp.Contains
+      } else {
+        return false
+      }
+      at = at + 2
+    }
+    at = spaces(buffer, at, range.end)
+    if at >= range.end {
+      return false
+    }
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Ident { text } => {
+        value = text
+      }
+      Kind.String { text } => {
+        value = text
+      }
+      _ => {
+        return false
+      }
+    }
+    at = spaces(buffer, at + 1, range.end)
+    if at < range.end {
+      if ident(buffer, at, range.end, b"i") {
+        insensitive = true
+      } else if !ident(buffer, at, range.end, b"s") {
+        return false
+      }
+      at = spaces(buffer, at + 1, range.end)
+    }
+  }
+  if at != range.end {
+    return false
+  }
+  run appendSimple(
+    &mut ast.*,
+    compound,
+    Test.Attribute {
+      namespace: name.namespace,
+      name: name.text,
+      value: value,
+      op: op,
+      insensitive: insensitive,
+    },
+  )
+  return true
+}
+
+fn pseudo(word: &[u8]) -> Option<Pseudo> {
+  if tokens.insensitive(word, b"host") {
+    return Option<Pseudo>.Some { value: Pseudo.Host }
+  }
+  if tokens.insensitive(word, b"root") {
+    return Option<Pseudo>.Some { value: Pseudo.Root }
+  }
+  if tokens.insensitive(word, b"empty") {
+    return Option<Pseudo>.Some { value: Pseudo.Empty }
+  }
+  if tokens.insensitive(word, b"scope") {
+    return Option<Pseudo>.Some { value: Pseudo.Scope }
+  }
+  if tokens.insensitive(word, b"target") {
+    return Option<Pseudo>.Some { value: Pseudo.Target }
+  }
+  if tokens.insensitive(word, b"link") || tokens.insensitive(word, b"any-link") {
+    return Option<Pseudo>.Some { value: Pseudo.Link }
+  }
+  if tokens.insensitive(word, b"first-child") {
+    return Option<Pseudo>.Some { value: Pseudo.FirstChild }
+  }
+  if tokens.insensitive(word, b"last-child") {
+    return Option<Pseudo>.Some { value: Pseudo.LastChild }
+  }
+  if tokens.insensitive(word, b"only-child") {
+    return Option<Pseudo>.Some { value: Pseudo.OnlyChild }
+  }
+  if tokens.insensitive(word, b"first-of-type") {
+    return Option<Pseudo>.Some { value: Pseudo.FirstType }
+  }
+  if tokens.insensitive(word, b"last-of-type") {
+    return Option<Pseudo>.Some { value: Pseudo.LastType }
+  }
+  if tokens.insensitive(word, b"only-of-type") {
+    return Option<Pseudo>.Some { value: Pseudo.OnlyType }
+  }
+  if tokens.insensitive(word, b"hover") || tokens.insensitive(word, b"active")
+    || tokens.insensitive(word, b"focus")
+    || tokens.insensitive(word, b"focus-visible")
+    || tokens.insensitive(word, b"focus-within")
+    || tokens.insensitive(word, b"visited")
+    || tokens.insensitive(word, b"enabled")
+    || tokens.insensitive(word, b"disabled")
+    || tokens.insensitive(word, b"checked")
+    || tokens.insensitive(word, b"indeterminate") {
+    return Option<Pseudo>.Some { value: Pseudo.Never }
+  }
+  return Option<Pseudo>.None
+}
+
+effect fn parseFunction(
+  ast: &mut SelectorList,
+  compound: usize,
+  buffer: &TokenBuffer,
+  name: Span,
+  range: TokenRange,
+  bindings: &[NamespaceBinding],
+  limits: &Limits,
+  depth: usize,
+  insideHas: bool,
+  compoundOnly: bool,
+) -> Parsed
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let word = buffer.text(name)
+  let matches = tokens.insensitive(word, b"is")
+  let zeroSpecificity = tokens.insensitive(word, b"where")
+  let negation = tokens.insensitive(word, b"not")
+  let has = tokens.insensitive(word, b"has")
+  let host = tokens.insensitive(word, b"host")
+  let hostContext = tokens.insensitive(word, b"host-context")
+  if host || hostContext {
+    let parsed = run parseList(
+      &mut ast.*,
+      buffer,
+      range,
+      bindings,
+      limits,
+      depth,
+      false,
+      false,
+      insideHas,
+      false,
+      true,
+    )
+    if !parsed.valid || parsed.head == NONE || ast.arms.asSlice()[parsed.head].next != NONE {
+      return rejected()
+    }
+    run appendSimple(
+      &mut ast.*,
+      compound,
+      Test.Function {
+        kind: if host {
+          FunctionKind.Host
+        } else {
+          FunctionKind.HostContext
+        },
+        list: parsed.head,
+      },
+    )
+    return Parsed {
+      valid: true,
+      head: NONE,
+      specificity: add(Specificity { ids: 0, classes: 1, types: 0 }, parsed.specificity),
+    }
+  }
+  if matches || zeroSpecificity || negation || has {
+    if has && insideHas {
+      return rejected()
+    }
+    let parsed = run parseList(
+      &mut ast.*,
+      buffer,
+      range,
+      bindings,
+      limits,
+      depth,
+      matches || zeroSpecificity,
+      has,
+      insideHas || has,
+      !has,
+      compoundOnly && !has,
+    )
+    if !parsed.valid {
+      return rejected()
+    }
+    run appendSimple(
+      &mut ast.*,
+      compound,
+      Test.Function {
+        kind: if has {
+          FunctionKind.Has
+        } else if negation {
+          FunctionKind.Not
+        } else {
+          FunctionKind.Is
+        },
+        list: parsed.head,
+      },
+    )
+    return Parsed {
+      valid: true,
+      head: NONE,
+      specificity: if zeroSpecificity {
+        zero()
+      } else {
+        parsed.specificity
+      },
+    }
+  }
+  if tokens.insensitive(word, b"lang") {
+    let mut at = spaces(buffer, range.start, range.end)
+    if at == range.end {
+      return rejected()
+    }
+    while at < range.end {
+      match &buffer.tokens.asSlice()[at].kind {
+        Kind.Ident { text } => {}
+        Kind.String { text } => {}
+        _ => {
+          return rejected()
+        }
+      }
+      at = spaces(buffer, at + 1, range.end)
+      if at == range.end {
+        break
+      }
+      if !isComma(buffer, at) {
+        return rejected()
+      }
+      at = spaces(buffer, at + 1, range.end)
+      if at == range.end {
+        return rejected()
+      }
+    }
+    run appendSimple(&mut ast.*, compound, Test.Language { range: range })
+    return Parsed {
+      valid: true,
+      head: NONE,
+      specificity: Specificity { ids: 0, classes: 1, types: 0 },
+    }
+  }
+  let child = tokens.insensitive(word, b"nth-child")
+  let lastChild = tokens.insensitive(word, b"nth-last-child")
+  let ofType = tokens.insensitive(word, b"nth-of-type")
+  let lastType = tokens.insensitive(word, b"nth-last-of-type")
+  if child || lastChild || ofType || lastType {
+    let mut of = range.end
+    let mut at = range.start
+    while at < range.end {
+      if ident(buffer, at, range.end, b"of") {
+        of = at
+        break
+      }
+      at = at + 1
+    }
+    let formula = nthFormula(buffer, TokenRange { start: range.start, end: of })
+    if !formula.valid {
+      return rejected()
+    }
+    let mut list = NONE
+    let mut specificity = Specificity { ids: 0, classes: 1, types: 0 }
+    if of < range.end {
+      if ofType || lastType || of == range.start || !whitespace(buffer, of - 1, range.end)
+        || !whitespace(buffer, of + 1, range.end) {
+        return rejected()
+      }
+      let parsed = run parseList(
+        &mut ast.*,
+        buffer,
+        TokenRange { start: of + 1, end: range.end },
+        bindings,
+        limits,
+        depth,
+        false,
+        false,
+        insideHas,
+        false,
+        false,
+      )
+      if !parsed.valid {
+        return rejected()
+      }
+      list = parsed.head
+      specificity = add(specificity, parsed.specificity)
+    }
+    run appendSimple(
+      &mut ast.*,
+      compound,
+      Test.Nth {
+        a: formula.a,
+        b: formula.b,
+        reverse: lastChild || lastType,
+        ofType: ofType || lastType,
+        list: list,
+      },
+    )
+    return Parsed { valid: true, head: NONE, specificity: specificity }
+  }
+  return rejected()
+}
+
+struct Formula {
+  valid: bool,
+  a: f64,
+  b: f64
+}
+
+impl Copy for Formula {}
+
+fn badFormula() -> Formula {
+  return Formula { valid: false, a: 0.0, b: 0.0 }
+}
+
+fn clampInteger(value: f64) -> f64 {
+  // CSS Syntax permits a supported integer range; keep exact arithmetic within that range.
+  return if value > 2147483647.0 {
+    2147483647.0
+  } else if value < -2147483647.0 {
+    -2147483647.0
+  } else {
+    value
+  }
+}
+
+fn unsignedInteger(buffer: &TokenBuffer, at: usize, end: usize) -> Option<f64> {
+  if at >= end {
+    return Option<f64>.None
+  }
+  let token = &buffer.tokens.asSlice()[at]
+  let text = buffer.text(token.source)
+  if text.length == 0 || text[0] == 43 || text[0] == 45 {
+    return Option<f64>.None
+  }
+  return match &token.kind {
+    Kind.Number { value, integer } => if integer {
+      Option<f64>.Some { value: clampInteger(value) }
+    } else {
+      Option<f64>.None
+    }
+    _ => Option<f64>.None
+  }
+}
+
+fn nthFormula(buffer: &TokenBuffer, range: TokenRange) -> Formula {
+  let mut at = spaces(buffer, range.start, range.end)
+  let mut end = range.end
+  while end > at && whitespace(buffer, end - 1, end) {
+    end = end - 1
+  }
+  if at == end {
+    return badFormula()
+  }
+  if ident(buffer, at, end, b"odd") || ident(buffer, at, end, b"even") {
+    if at + 1 != end {
+      return badFormula()
+    }
+    return Formula {
+      valid: true,
+      a: 2.0,
+      b: if ident(buffer, at, end, b"odd") {
+        1.0
+      } else {
+        0.0
+      },
+    }
+  }
+  let mut plus = false
+  if delim(buffer, at, end, 43) {
+    plus = true
+    at = at + 1
+  }
+  if at == end {
+    return badFormula()
+  }
+  let mut result = Formula { valid: true, a: 1.0, b: 0.0 }
+  let mut unit = emptySpan()
+  let mut dimension = false
+  match &buffer.tokens.asSlice()[at].kind {
+    Kind.Number { value, integer } => {
+      if plus || !integer || at + 1 != end {
+        return badFormula()
+      }
+      return Formula { valid: true, a: 0.0, b: clampInteger(value) }
+    }
+    Kind.Dimension { value, integer, unit: text } => {
+      dimension = true
+      if plus || !integer {
+        return badFormula()
+      }
+      result.a = clampInteger(value)
+      unit = text
+    }
+    Kind.Ident { text } => {
+      unit = text
+    }
+    _ => {
+      return badFormula()
+    }
+  }
+  let letters = buffer.text(unit)
+  let mut i: usize = 0
+  if letters.length > 0 && letters[0] == 45 {
+    if plus || dimension {
+      return badFormula()
+    }
+    result.a = -1.0
+    i = 1
+  }
+  if i >= letters.length || (letters[i] != 110 && letters[i] != 78) {
+    return badFormula()
+  }
+  i = i + 1
+  let mut negativeSuffix = false
+  if i < letters.length {
+    if letters[i] != 45 {
+      return badFormula()
+    }
+    negativeSuffix = true
+    i = i + 1
+    if i < letters.length {
+      let mut value: f64 = 0.0
+      while i < letters.length {
+        if letters[i] < 48 || letters[i] > 57 {
+          return badFormula()
+        }
+        value = clampInteger(value * 10.0 + u8.toF64(letters[i] - 48))
+        i = i + 1
+      }
+      if at + 1 != end {
+        return badFormula()
+      }
+      result.b = -value
+      return result
+    }
+  }
+  at = spaces(buffer, at + 1, end)
+  if at == end {
+    return if negativeSuffix {
+      badFormula()
+    } else {
+      result
+    }
+  }
+  if negativeSuffix {
+    match &unsignedInteger(buffer, at, end) {
+      Option<f64>.Some { value } => {
+        result.b = -value
+      }
+      _ => {
+        return badFormula()
+      }
+    }
+    if at + 1 != end {
+      return badFormula()
+    }
+    return result
+  }
+  let negative = delim(buffer, at, end, 45)
+  if negative || delim(buffer, at, end, 43) {
+    at = spaces(buffer, at + 1, end)
+    match &unsignedInteger(buffer, at, end) {
+      Option<f64>.Some { value } => {
+        result.b = if negative {
+          -value
+        } else {
+          value
+        }
+      }
+      _ => {
+        return badFormula()
+      }
+    }
+  } else {
+    let token = &buffer.tokens.asSlice()[at]
+    let spelling = buffer.text(token.source)
+    if spelling.length == 0 || (spelling[0] != 43 && spelling[0] != 45) {
+      return badFormula()
+    }
+    match &token.kind {
+      Kind.Number { value, integer } => {
+        if !integer {
+          return badFormula()
+        }
+        result.b = clampInteger(value)
+      }
+      _ => {
+        return badFormula()
+      }
+    }
+  }
+  if at + 1 != end {
+    return badFormula()
+  }
+  return result
+}
+
+effect fn spend(context: &mut MatchContext) -> ()
+  ! CssError {
+  run context.spend(1)
+}
+
+effect fn depthLimit(ast: &SelectorList, depth: usize) -> ()
+  ! CssError {
+  if depth >= ast.maxDepth {
+    fail CssError { kind: CssErrorKind.NestingLimit, offset: 0 }
+  }
+}
+
+// Every arm is examined: the first match need not be the most specific match.
+pub effect fn matchElement<T: ElementTree>(
+  selectors: &SelectorList,
+  buffer: &TokenBuffer,
+  tree: &T,
+  node: usize,
+  context: &mut MatchContext,
+) -> Option<Specificity>
+  ! CssError {
+  let mut result = Option<Specificity>.None
+  let mut arm = selectors.head
+  while arm != NONE {
+    run spend(&mut context.*)
+    let entry = &selectors.arms.asSlice()[arm]
+    if run matchComplex(selectors, buffer, tree, entry.tail, node, NONE, &mut context.*, 0) {
+      let best = match &result {
+        Option<Specificity>.Some { value } => maximum(value, entry.specificity)
+        _ => entry.specificity
+      }
+      result = Option<Specificity>.Some { value: best }
+    }
+    arm = entry.next
+  }
+  return result
+}
+
+effect fn matchesAny<T: ElementTree>(
+  ast: &SelectorList,
+  buffer: &TokenBuffer,
+  tree: &T,
+  list: usize,
+  node: usize,
+  anchor: usize,
+  context: &mut MatchContext,
+  depth: usize,
+) -> bool
+  ! CssError {
+  run depthLimit(ast, depth)
+  let mut arm = list
+  while arm != NONE {
+    run spend(&mut context.*)
+    let entry = &ast.arms.asSlice()[arm]
+    if run matchComplex(ast, buffer, tree, entry.tail, node, anchor, &mut context.*, depth) {
+      return true
+    }
+    arm = entry.next
+  }
+  return false
+}
+
+effect fn namespaceMatches(
+  buffer: &TokenBuffer,
+  namespace: Namespace,
+  actual: &[u8],
+  context: &mut MatchContext,
+) -> bool
+  ! CssError {
+  return namespace.mode == NamespaceMode.Any
+    || run equalValue(buffer.text(namespace.uri), actual, false, &mut context.*)
+}
+
+effect fn sameType<T: ElementTree>(tree: &T, a: usize, b: usize, context: &mut MatchContext) -> bool
+  ! CssError {
+  return (run equalValue(
+    ElementTree.localName(tree, a),
+    ElementTree.localName(tree, b),
+    false,
+    &mut context.*,
+  ))
+    && (run equalValue(
+      ElementTree.namespaceUri(tree, a),
+      ElementTree.namespaceUri(tree, b),
+      false,
+      &mut context.*,
+    ))
+}
+
+// Raw parent links include shadow boundaries. Ordinary traversal sees only the
+// current scope and its featureless host, never the host's parent or siblings.
+fn visible<T: ElementTree>(tree: &T, node: usize, host: usize) -> bool {
+  return node != NO_ELEMENT && (node == host || ElementTree.containingHost(tree, node) == host)
+}
+
+fn scopedParent<T: ElementTree>(tree: &T, node: usize, host: usize) -> usize {
+  if node == host {
+    return NO_ELEMENT
+  }
+  let parent = ElementTree.parent(tree, node)
+  return if visible(tree, parent, host) {
+    parent
+  } else {
+    NO_ELEMENT
+  }
+}
+
+// Providers may link light and shadow children under the same raw parent.
+// Filter those lists by tree scope, charging skipped links as matching work.
+effect fn scopedSibling<T: ElementTree>(
+  tree: &T,
+  node: usize,
+  forward: bool,
+  context: &mut MatchContext,
+) -> usize
+  ! CssError {
+  if node == context.shadowHost {
+    return NO_ELEMENT
+  }
+  let mut sibling = if forward {
+    ElementTree.nextSibling(tree, node)
+  } else {
+    ElementTree.previousSibling(tree, node)
+  }
+  while sibling != NO_ELEMENT {
+    run spend(&mut context.*)
+    if sibling == context.shadowHost {
+      return NO_ELEMENT
+    }
+    if ElementTree.containingHost(tree, sibling) == context.shadowHost {
+      return sibling
+    }
+    sibling = if forward {
+      ElementTree.nextSibling(tree, sibling)
+    } else {
+      ElementTree.previousSibling(tree, sibling)
+    }
+  }
+  return NO_ELEMENT
+}
+
+effect fn scopedChild<T: ElementTree>(tree: &T, node: usize, context: &mut MatchContext) -> usize
+  ! CssError {
+  let child = ElementTree.firstChild(tree, node)
+  if child == NO_ELEMENT || child == context.shadowHost {
+    return NO_ELEMENT
+  }
+  run spend(&mut context.*)
+  if ElementTree.containingHost(tree, child) == context.shadowHost {
+    return child
+  }
+  return run scopedSibling(tree, child, true, &mut context.*)
+}
+
+effect fn matchComplex<T: ElementTree>(
+  ast: &SelectorList,
+  buffer: &TokenBuffer,
+  tree: &T,
+  index: usize,
+  node: usize,
+  anchor: usize,
+  context: &mut MatchContext,
+  depth: usize,
+) -> bool
+  ! CssError {
+  run depthLimit(ast, depth)
+  run spend(&mut context.*)
+  if !visible(tree, node, context.shadowHost) {
+    return false
+  }
+  let compound = &ast.compounds.asSlice()[index]
+  if node == context.shadowHost {
+    if !compound.hostEligible {
+      return false
+    }
+  } else {
+    if !run namespaceMatches(
+      buffer,
+      compound.namespace,
+      ElementTree.namespaceUri(tree, node),
+      &mut context.*,
+    ) {
+      return false
+    }
+    if compound.named
+      && !run equalValue(
+        buffer.text(compound.name),
+        ElementTree.localName(tree, node),
+        false,
+        &mut context.*,
+      ) {
+      return false
+    }
+  }
+  let mut simple = compound.first
+  while simple != NONE {
+    run spend(&mut context.*)
+    let entry = &ast.simples.asSlice()[simple]
+    if !run matchTest(ast, buffer, tree, &entry.test, node, &mut context.*, depth + 1) {
+      return false
+    }
+    simple = entry.next
+  }
+  if compound.previous == NONE {
+    if compound.relation == Combinator.None {
+      return true
+    }
+    return run anchored(tree, node, anchor, compound.relation, &mut context.*)
+  }
+  let siblings = compound.relation == Combinator.Adjacent || compound.relation == Combinator.Sibling
+  let mut candidate = if siblings {
+    run scopedSibling(tree, node, false, &mut context.*)
+  } else {
+    scopedParent(tree, node, context.shadowHost)
+  }
+  while candidate != NO_ELEMENT {
+    run spend(&mut context.*)
+    if run matchComplex(
+      ast,
+      buffer,
+      tree,
+      compound.previous,
+      candidate,
+      anchor,
+      &mut context.*,
+      depth + 1,
+    ) {
+      return true
+    }
+    if compound.relation == Combinator.Child || compound.relation == Combinator.Adjacent {
+      break
+    }
+    candidate = if siblings {
+      run scopedSibling(tree, candidate, false, &mut context.*)
+    } else {
+      scopedParent(tree, candidate, context.shadowHost)
+    }
+  }
+  return false
+}
+
+effect fn anchored<T: ElementTree>(
+  tree: &T,
+  node: usize,
+  anchor: usize,
+  relation: Combinator,
+  context: &mut MatchContext,
+) -> bool
+  ! CssError {
+  if anchor == NO_ELEMENT {
+    return false
+  }
+  let siblings = relation == Combinator.Adjacent || relation == Combinator.Sibling
+  let mut candidate = if siblings {
+    run scopedSibling(tree, node, false, &mut context.*)
+  } else {
+    scopedParent(tree, node, context.shadowHost)
+  }
+  while candidate != NO_ELEMENT {
+    run spend(&mut context.*)
+    if candidate == anchor {
+      return true
+    }
+    if relation == Combinator.Child || relation == Combinator.Adjacent {
+      return false
+    }
+    candidate = if siblings {
+      run scopedSibling(tree, candidate, false, &mut context.*)
+    } else {
+      scopedParent(tree, candidate, context.shadowHost)
+    }
+  }
+  return false
+}
+
+// Relative selectors are evaluated right-to-left against candidates in the anchor's
+// following-sibling subtrees and own subtree. Traversal is iterative and allocation-free.
+// Testing the left edge against the anchor prevents unrelated descendants from matching.
+effect fn hasRelative<T: ElementTree>(
+  ast: &SelectorList,
+  buffer: &TokenBuffer,
+  tree: &T,
+  list: usize,
+  anchor: usize,
+  context: &mut MatchContext,
+  depth: usize,
+) -> bool
+  ! CssError {
+  let mut subtree = anchor
+  while subtree != NO_ELEMENT {
+    let mut candidate = subtree
+    while candidate != NO_ELEMENT {
+      run spend(&mut context.*)
+      if candidate != anchor
+        && run matchesAny(ast, buffer, tree, list, candidate, anchor, &mut context.*, depth) {
+        return true
+      }
+      let child = run scopedChild(tree, candidate, &mut context.*)
+      if child != NO_ELEMENT {
+        candidate = child
+      } else {
+        let mut next = NO_ELEMENT
+        while candidate != subtree {
+          next = run scopedSibling(tree, candidate, true, &mut context.*)
+          if next != NO_ELEMENT {
+            break
+          }
+          run spend(&mut context.*)
+          candidate = scopedParent(tree, candidate, context.shadowHost)
+          if candidate == NO_ELEMENT {
+            return false
+          }
+        }
+        candidate = next
+      }
+    }
+    subtree = run scopedSibling(tree, subtree, true, &mut context.*)
+  }
+  return false
+}
+
+// Evaluate each host argument in that element's own tree scope. Only the small
+// context record is local: the budget is returned even when matching raises.
+// The caller's scope/target/host never change, including during error unwinding.
+effect fn matchNormal<T: ElementTree>(
+  ast: &SelectorList,
+  buffer: &TokenBuffer,
+  tree: &T,
+  list: usize,
+  node: usize,
+  context: &mut MatchContext,
+  depth: usize,
+) -> bool
+  ! CssError {
+  let mut normal = MatchContext {
+    scope: context.scope,
+    target: context.target,
+    shadowHost: ElementTree.containingHost(tree, node),
+    remainingSteps: context.remainingSteps,
+  }
+  let result = run Effect.result(
+    matchesAny(ast, buffer, tree, list, node, NONE, &mut normal, depth),
+  )
+  context.remainingSteps = normal.remainingSteps
+  match &result {
+    Result<bool, CssError>.Success { value } => {
+      return value
+    }
+    Result<bool, CssError>.Failure { error } => {
+      fail CssError { kind: error.kind, offset: error.offset }
+    }
+  }
+}
+
+effect fn matchTest<T: ElementTree>(
+  ast: &SelectorList,
+  buffer: &TokenBuffer,
+  tree: &T,
+  test: &Test,
+  node: usize,
+  context: &mut MatchContext,
+  depth: usize,
+) -> bool
+  ! CssError {
+  match &test.* {
+    Test.Id { text } => {
+      let mut i: usize = 0
+      while i < ElementTree.attributeCount(tree, node) {
+        run spend(&mut context.*)
+        if ElementTree.attributeIsId(tree, node, i)
+          && (run equalValue(
+            ElementTree.attributeValue(tree, node, i),
+            buffer.text(text),
+            false,
+            &mut context.*,
+          )) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+    Test.Class { text } => {
+      return run namedAttribute(
+        buffer,
+        tree,
+        node,
+        b"class",
+        buffer.text(text),
+        AttributeOp.Word,
+        &mut context.*,
+      )
+    }
+    Test.Attribute { namespace, name, value, op, insensitive } => {
+      let mut i: usize = 0
+      while i < ElementTree.attributeCount(tree, node) {
+        run spend(&mut context.*)
+        if (run namespaceMatches(
+          buffer,
+          namespace,
+          ElementTree.attributeNamespace(tree, node, i),
+          &mut context.*,
+        ))
+          && (run equalValue(
+            buffer.text(name),
+            ElementTree.attributeName(tree, node, i),
+            false,
+            &mut context.*,
+          ))
+          && (run attributeMatches(
+            ElementTree.attributeValue(tree, node, i),
+            buffer.text(value),
+            op,
+            insensitive,
+            &mut context.*,
+          )) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+    Test.State { pseudo: state } => {
+      return run matchState(tree, node, state, &mut context.*)
+    }
+    Test.Function { kind, list } => {
+      if kind == FunctionKind.Host || kind == FunctionKind.HostContext {
+        if context.shadowHost == NO_ELEMENT || node != context.shadowHost {
+          return false
+        }
+        let mut candidate = node
+        while candidate != NO_ELEMENT {
+          run spend(&mut context.*)
+          if run matchNormal(ast, buffer, tree, list, candidate, &mut context.*, depth) {
+            return true
+          }
+          if kind == FunctionKind.Host {
+            return false
+          }
+          candidate = ElementTree.parent(tree, candidate)
+        }
+        return false
+      }
+      if kind == FunctionKind.Has {
+        return run hasRelative(ast, buffer, tree, list, node, &mut context.*, depth)
+      }
+      let matched = run matchesAny(ast, buffer, tree, list, node, NONE, &mut context.*, depth)
+      return if kind == FunctionKind.Not {
+        !matched
+      } else {
+        matched
+      }
+    }
+    Test.Nth { a, b, reverse, ofType, list } => {
+      if list != NONE
+        && !run matchesAny(ast, buffer, tree, list, node, NONE, &mut context.*, depth) {
+        return false
+      }
+      let mut count: usize = 1
+      let mut candidate = if reverse {
+        run scopedSibling(tree, node, true, &mut context.*)
+      } else {
+        run scopedSibling(tree, node, false, &mut context.*)
+      }
+      while candidate != NO_ELEMENT {
+        run spend(&mut context.*)
+        if (!ofType || run sameType(tree, node, candidate, &mut context.*))
+          && (list == NONE
+            || run matchesAny(ast, buffer, tree, list, candidate, NONE, &mut context.*, depth)) {
+          count = count + 1
+        }
+        candidate = if reverse {
+          run scopedSibling(tree, candidate, true, &mut context.*)
+        } else {
+          run scopedSibling(tree, candidate, false, &mut context.*)
+        }
+      }
+      let difference = usize.toF64(count) - b
+      if a == 0.0 {
+        return difference == 0.0
+      }
+      let quotient = difference / a
+      return quotient >= 0.0 && quotient == i64.toF64(f64.toI64(quotient))
+    }
+    Test.Language { range } => {
+      let actual = ElementTree.language(tree, node)
+      let mut at = range.start
+      while at < range.end {
+        run spend(&mut context.*)
+        match &buffer.tokens.asSlice()[at].kind {
+          Kind.Ident { text } => {
+            if run languageMatches(actual, buffer.text(text), &mut context.*) {
+              return true
+            }
+          }
+          Kind.String { text } => {
+            if run languageMatches(actual, buffer.text(text), &mut context.*) {
+              return true
+            }
+          }
+          _ => {}
+        }
+        at = at + 1
+      }
+      return false
+    }
+  }
+}
+
+effect fn namedAttribute<T: ElementTree>(
+  buffer: &TokenBuffer,
+  tree: &T,
+  node: usize,
+  name: &[u8],
+  value: &[u8],
+  op: AttributeOp,
+  context: &mut MatchContext,
+) -> bool
+  ! CssError {
+  let mut i: usize = 0
+  while i < ElementTree.attributeCount(tree, node) {
+    run spend(&mut context.*)
+    if ElementTree.attributeNamespace(tree, node, i).length == 0
+      && (run equalValue(ElementTree.attributeName(tree, node, i), name, false, &mut context.*))
+      && (run attributeMatches(
+        ElementTree.attributeValue(tree, node, i),
+        value,
+        op,
+        false,
+        &mut context.*,
+      )) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn asciiSpace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 12
+}
+
+fn fold(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 {
+    byte + 32
+  } else {
+    byte
+  }
+}
+
+effect fn equalValue(a: &[u8], b: &[u8], insensitive: bool, context: &mut MatchContext) -> bool
+  ! CssError {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    run spend(&mut context.*)
+    if if insensitive {
+      fold(a[i]) != fold(b[i])
+    } else {
+      a[i] != b[i]
+    } {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn attributeMatches(
+  actual: &[u8],
+  expected: &[u8],
+  op: AttributeOp,
+  insensitive: bool,
+  context: &mut MatchContext,
+) -> bool
+  ! CssError {
+  if op == AttributeOp.Present {
+    return true
+  }
+  if op == AttributeOp.Equal {
+    return run equalValue(actual, expected, insensitive, &mut context.*)
+  }
+  if op == AttributeOp.Hyphen {
+    if run equalValue(actual, expected, insensitive, &mut context.*) {
+      return true
+    }
+    return actual.length > expected.length && actual[expected.length] == 45
+      && run equalValue(
+        Slice.view<u8>(actual, 0, expected.length),
+        expected,
+        insensitive,
+        &mut context.*,
+      )
+  }
+  if expected.length == 0 || expected.length > actual.length {
+    return false
+  }
+  if op == AttributeOp.Prefix {
+    return run equalValue(
+      Slice.view<u8>(actual, 0, expected.length),
+      expected,
+      insensitive,
+      &mut context.*,
+    )
+  }
+  if op == AttributeOp.Suffix {
+    return run equalValue(
+      Slice.view<u8>(actual, actual.length - expected.length, expected.length),
+      expected,
+      insensitive,
+      &mut context.*,
+    )
+  }
+  if op == AttributeOp.Word {
+    let mut at: usize = 0
+    while at < actual.length {
+      run spend(&mut context.*)
+      if asciiSpace(actual[at]) {
+        at = at + 1
+      } else {
+        let start = at
+        while at < actual.length && !asciiSpace(actual[at]) {
+          run spend(&mut context.*)
+          at = at + 1
+        }
+        if run equalValue(
+          Slice.view<u8>(actual, start, at - start),
+          expected,
+          insensitive,
+          &mut context.*,
+        ) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+  let mut at: usize = 0
+  while at <= actual.length - expected.length {
+    run spend(&mut context.*)
+    if run equalValue(
+      Slice.view<u8>(actual, at, expected.length),
+      expected,
+      insensitive,
+      &mut context.*,
+    ) {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn matchState<T: ElementTree>(
+  tree: &T,
+  node: usize,
+  state: Pseudo,
+  context: &mut MatchContext,
+) -> bool
+  ! CssError {
+  if state == Pseudo.Host {
+    return context.shadowHost != NO_ELEMENT && node == context.shadowHost
+  }
+  if state == Pseudo.Root {
+    return ElementTree.isRoot(tree, node)
+  }
+  if state == Pseudo.Empty {
+    return ElementTree.isEmpty(tree, node)
+  }
+  if state == Pseudo.Scope {
+    return node == context.scope
+  }
+  if state == Pseudo.Target {
+    return node == context.target
+  }
+  if state == Pseudo.Link {
+    return ElementTree.isLink(tree, node)
+  }
+  if state == Pseudo.Never {
+    return false
+  }
+  let typed = state == Pseudo.FirstType || state == Pseudo.LastType || state == Pseudo.OnlyType
+  let first = state == Pseudo.FirstChild || state == Pseudo.OnlyChild || state == Pseudo.FirstType
+    || state == Pseudo.OnlyType
+  let last = state == Pseudo.LastChild || state == Pseudo.OnlyChild || state == Pseudo.LastType
+    || state == Pseudo.OnlyType
+  if first {
+    let mut candidate = run scopedSibling(tree, node, false, &mut context.*)
+    while candidate != NO_ELEMENT {
+      run spend(&mut context.*)
+      if !typed || run sameType(tree, node, candidate, &mut context.*) {
+        return false
+      }
+      candidate = run scopedSibling(tree, candidate, false, &mut context.*)
+    }
+  }
+  if last {
+    let mut candidate = run scopedSibling(tree, node, true, &mut context.*)
+    while candidate != NO_ELEMENT {
+      run spend(&mut context.*)
+      if !typed || run sameType(tree, node, candidate, &mut context.*) {
+        return false
+      }
+      candidate = run scopedSibling(tree, candidate, true, &mut context.*)
+    }
+  }
+  return true
+}
+
+effect fn subtagEnd(text: &[u8], at: usize, context: &mut MatchContext) -> usize
+  ! CssError {
+  let mut end = at
+  while end < text.length && text[end] != 45 {
+    run spend(&mut context.*)
+    end = end + 1
+  }
+  return end
+}
+
+// RFC4647 extended filtering, required by Selectors4 #lang-pseudo.
+effect fn languageMatches(language: &[u8], range: &[u8], context: &mut MatchContext) -> bool
+  ! CssError {
+  if range.length == 0 {
+    return language.length == 0
+  }
+  if language.length == 0 {
+    return false
+  }
+  let mut r: usize = 0
+  let mut l: usize = 0
+  let firstRange = run subtagEnd(range, 0, &mut context.*)
+  let firstLanguage = run subtagEnd(language, 0, &mut context.*)
+  if !(firstRange == 1 && range[0] == 42)
+    && !run equalValue(
+      Slice.view<u8>(range, 0, firstRange),
+      Slice.view<u8>(language, 0, firstLanguage),
+      true,
+      &mut context.*,
+    ) {
+    return false
+  }
+  r = firstRange
+  l = firstLanguage
+  while r < range.length {
+    run spend(&mut context.*)
+    r = r + 1
+    let end = run subtagEnd(range, r, &mut context.*)
+    if end == r {
+      return false
+    }
+    if end == r + 1 && range[r] == 42 {
+      r = end
+    } else {
+      let mut found = false
+      while l < language.length {
+        run spend(&mut context.*)
+        l = l + 1
+        let languageEnd = run subtagEnd(language, l, &mut context.*)
+        if run equalValue(
+          Slice.view<u8>(range, r, end - r),
+          Slice.view<u8>(language, l, languageEnd - l),
+          true,
+          &mut context.*,
+        ) {
+          l = languageEnd
+          found = true
+          break
+        }
+        if languageEnd - l == 1 {
+          return false
+        }
+        l = languageEnd
+      }
+      if !found {
+        return false
+      }
+      r = end
+    }
+  }
+  return true
+}

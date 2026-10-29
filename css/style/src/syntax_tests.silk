@@ -1,0 +1,205 @@
+//! CSS Syntax parser behavior against verified pinned anchors.
+import lexer
+import syntax { RuleKind, Rule, Declaration }
+import syntax
+import tokens { Kind, Limits, CssError, CssErrorKind, TokenRange, equal }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+// https://www.w3.org/TR/css-syntax-3/#consume-at-rule
+// https://www.w3.org/TR/css-syntax-3/#consume-qualified-rule
+// https://www.w3.org/TR/css-syntax-3/#consume-a-component-value
+test effect fn genericRulesAndNestedSemicolons() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(
+    b"<!-- @import url(a); @unknown f(;{}) { x:y } a[b=';'] {fill:red} --> @last",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let rules = run syntax.parseRules(&buffer, buffer.all(), true, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let rs = rules.asSlice()
+  run Testing.expect(rs.length == 4, "top-level CDO/CDC ignored and EOF terminates at-rule")
+  run Testing.expect(
+    rs[0].kind == RuleKind.AtStatement && equal(buffer.text(rs[0].name), b"import"),
+    "at statement name excludes at sign",
+  )
+  run Testing.expect(
+    rs[1].kind == RuleKind.AtBlock && equal(buffer.text(rs[1].name), b"unknown"),
+    "nested component punctuation cannot terminate prelude",
+  )
+  run Testing.expect(
+    rs[2].kind == RuleKind.Qualified && rs[2].body.start < rs[2].body.end,
+    "qualified rule retains body range",
+  )
+  run Testing.expect(
+    rs[3].kind == RuleKind.AtStatement && equal(buffer.text(rs[3].name), b"last"),
+    "unterminated at statement retained",
+  )
+  let declarations = run syntax.parseDeclarations(&buffer, rs[2].body, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    declarations.length() == 1 && equal(buffer.text(declarations.asSlice()[0].name), b"fill"),
+    "rule body ranges feed declaration parser without copying",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-a-declaration
+// https://www.w3.org/TR/css-syntax-3/#consume-the-remnants-of-a-bad-declaration
+test effect fn declarationRecoveryAndImportant() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(
+    b"wrong f(a;b); fill : rgb(1;2;3) ! /**/ ImPoRtAnT ; --Case: a/**/b ; opacity: f(!important); @unknown {ignored:x} stroke: blue;",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let declarations = run syntax.parseDeclarations(&buffer, buffer.all(), &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ds = declarations.asSlice()
+  run Testing.expect(
+    ds.length == 4,
+    "invalid declaration and at-rule recovery respect component blocks",
+  )
+  run Testing.expect(
+    equal(buffer.text(ds[0].name), b"fill") && ds[0].important,
+    "important recognizes whitespace comments and ASCII case",
+  )
+  run Testing.expect(
+    equal(buffer.text(ds[1].name), b"--Case") && !ds[1].important,
+    "custom property case retained",
+  )
+  let mut identCount: usize = 0
+  let mut i = ds[1].value.start
+  while i < ds[1].value.end {
+    if match &buffer.tokens.asSlice()[i].kind {
+      Kind.Ident { text } => true
+      _ => false
+    } {
+      identCount = identCount + 1
+    }
+    i = i + 1
+  }
+  run Testing.expect(identCount == 2, "comment-separated identifiers remain two tokens")
+  run Testing.expect(
+    !ds[2].important && equal(buffer.text(ds[3].name), b"stroke"),
+    "nested important is not a declaration flag and block at-rule does not swallow next declaration",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-a-simple-block
+// https://www.w3.org/TR/css-syntax-3/#consume-a-declaration
+// https://www.w3.org/TR/css-syntax-3/#consume-qualified-rule
+test effect fn eofRecoveryAndCurlyRestrictions() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(
+    b"--bad: hover {} a { --x: {} tail; bad: {} tail; whole: {}; fill: f(red",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let rules = run syntax.parseRules(&buffer, buffer.all(), true, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(rules.length() == 1, "custom-property-shaped qualified rule discarded")
+  let declarations = run syntax.parseDeclarations(&buffer, rules.asSlice()[0].body, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ds = declarations.asSlice()
+  run Testing.expect(
+    ds.length == 3,
+    "custom values allow mixed curly blocks; ordinary properties only a whole curly block",
+  )
+  run Testing.expect(
+    equal(buffer.text(ds[2].name), b"fill") && ds[2].value.end == buffer.all().end,
+    "EOF implicitly closes declaration function and rule",
+  )
+  let incomplete = run lexer.tokenize(b"a[b]", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let discarded = run syntax.parseRules(&incomplete, incomplete.all(), true, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(discarded.length() == 0, "qualified rule without body is discarded")
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-at-rule
+// https://www.w3.org/TR/css-syntax-3/#consume-a-declaration
+test effect fn parserResourceBoundaries() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut limits = Limits.make()
+  let rulesBuffer = run lexer.tokenize(b"a{}b{}", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  limits.maxRules = 1
+  let rules = run Effect.result(
+    syntax.parseRules(&rulesBuffer, rulesBuffer.all(), true, &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &rules {
+      Result<List<Rule>, CssError | OutOfMemoryError>.Failure { error } => match &error {
+        CssError problem => problem.kind == CssErrorKind.RuleLimit
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "rule limit rejects rather than truncates",
+  )
+  let declBuffer = run lexer.tokenize(b"a:b;c:d", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  limits.maxDeclarations = 1
+  let declarations = run Effect.result(
+    syntax.parseDeclarations(&declBuffer, declBuffer.all(), &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &declarations {
+      Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => match &error {
+        CssError problem => problem.kind == CssErrorKind.DeclarationLimit
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+      }
+      _ => false
+    },
+    "declaration limit rejects rather than truncates",
+  )
+}
+
+// https://www.w3.org/TR/css-syntax-3/#consume-a-declaration
+test effect fn whitespaceTrimmingAndEmptyValues() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(
+    b"--Empty: ; --Priority: ! important ; --Internal: a b ; fill: red !important junk; stroke: red !important/**/;",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let declarations = run syntax.parseDeclarations(&buffer, buffer.all(), &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ds = declarations.asSlice()
+  run Testing.expect(ds.length == 5, "empty custom values remain declarations")
+  run Testing.expect(
+    ds[0].value.start == ds[0].value.end && !ds[0].important,
+    "whitespace-only custom value trims to empty rather than disappearing",
+  )
+  run Testing.expect(
+    ds[1].value.start == ds[1].value.end && ds[1].important,
+    "priority removal may leave a valid empty value",
+  )
+  run Testing.expect(
+    ds[2].value.end - ds[2].value.start == 3,
+    "outer whitespace trims but internal whitespace token remains",
+  )
+  run Testing.expect(
+    !ds[3].important && ds[4].important,
+    "important only recognized at value end, even with trailing comments",
+  )
+}

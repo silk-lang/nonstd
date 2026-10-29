@@ -1,0 +1,1224 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// Unified zero-copy CFF and CFF2 fonts, private dictionaries and metadata.
+import ps.cff.index { Index }
+import ps.cff.v1 { Cff }
+import ps.cff.v2 { Cff2 }
+import ps.cff.charset { Charset }
+import ps.cff.encoding { Encoding as RawEncoding }
+import ps.cff.fd_select { FdSelect }
+import ps.cff.dict { Entry, Entries, entries, unhintedPrivateEntries }
+import ps.cff.blend { BlendState }
+import ps.encoding { PredefinedEncoding }
+import ps.string { Sid }
+import ps.hinting { HintingParams }
+import ps.transform { ScaledFontMatrix, Transform }
+import ps.read { take, takeRead, require, Failed, catchError }
+import tables.variations { ItemVariationStore }
+import font_types.lib { Fixed, F2Dot14, GlyphId, BoundingBox, Matrix }
+import font_data { FontData }
+import table_ref { ByteRange }
+import model.error { Error }
+import model.optional { Maybe }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.slice { Slice }
+import silk.num.usize
+import silk.num.u32
+import silk.num.u16
+
+fn optionOf<T: Copy>(value: &Maybe<T>) -> Option<T> {
+  return match &value.* {
+    Maybe<T>.Some { value: item } => Option<T>.some(item)
+    _ => Option<T>.None
+  }
+}
+
+fn copyOption<T: Copy>(value: &Option<T>) -> Option<T> {
+  return match &value.* {
+    Option<T>.Some { value: item } => Option<T>.some(item)
+    _ => Option<T>.None
+  }
+}
+
+fn ok<T, E>(result: Result<T, E>) -> Option<T> {
+  return match move result {
+    Result<T, E>.Success { value } => Option<T>.some(move value)
+    _ => Option<T>.None
+  }
+}
+
+fn lowU32(value: usize) -> u32 {
+  return usize.toU32(value & 4294967295)
+}
+
+fn tail<'a>(data: &'a [u8], offset: usize) -> Option<&'a [u8]> {
+  return match move FontData.splitOff(&FontData.new(data), offset) {
+    Option<FontData<'a>>.Some { value } => Option<&'a [u8]>.some(FontData.asBytes(&value))
+    _ => Option<&'a [u8]>.None
+  }
+}
+
+fn rangeData<'a>(data: &'a [u8], range: ByteRange) -> Option<&'a [u8]> {
+  return match move FontData.slice(&FontData.new(data), range.start, range.end) {
+    Option<FontData<'a>>.Some { value } => Option<&'a [u8]>.some(FontData.asBytes(&value))
+    _ => Option<&'a [u8]>.None
+  }
+}
+
+fn parseIndex<'a>(data: &'a [u8], offset: usize, v2: bool) -> Option<Index<'a>> {
+  return match move tail(data, offset) {
+    Option<&'a [u8]>.Some { value } => ok(Index.new(value, v2))
+    _ => Option<Index<'a>>.None
+  }
+}
+
+union CffFontKind<'a> {
+  Sid { strings: Index<'a>, privateDict: ByteRange },
+  Cid { fdArray: Index<'a>, fdSelect: Maybe<FdSelect<'a>> },
+  Cff2 { fdArray: Index<'a>, fdSelect: Maybe<FdSelect<'a>> },
+}
+
+// Copy, so model snapshots can hold a parsed font instead of re-parsing it per glyph.
+// Optional fields are Maybe because Option is not Copy (silk-lang/silk#2434).
+impl<'a> Copy for CffFontKind<'a> {}
+
+struct TopDict<'a> {
+  charstrings: Index<'a>,
+  charsetOffset: u32,
+  encodingOffset: u32,
+  matrix: Maybe<ScaledFontMatrix>,
+  varStore: Maybe<ItemVariationStore<'a>>,
+  kind: CffFontKind<'a>,
+}
+
+impl<'a> Copy for TopDict<'a> {}
+
+impl<'a> TopDict<'a> {
+  fn new(data: &'a [u8], dict: &'a [u8], strings: Index<'a>, v2: bool) -> Result<Self, Error> {
+    return run Effect.result(newImpl(data, dict, strings, v2))
+  }
+}
+
+effect fn newImpl<'a>(data: &'a [u8], dict: &'a [u8], strings: Index<'a>, v2: bool) -> TopDict<'a>
+  ! Error {
+  let mut hasRos = false
+  let mut charstrings = Option<Index<'a>>.None
+  let mut charsetOffset: u32 = 0
+  let mut encodingOffset: u32 = 0
+  if v2 {
+    charsetOffset = 4294967295
+    encodingOffset = 4294967295
+  }
+  let mut fdArray = Option<Index<'a>>.None
+  let mut fdSelect = Option<FdSelect<'a>>.None
+  let mut privateRange = ByteRange { start: 0, end: 0 }
+  let mut matrix = Option<ScaledFontMatrix>.None
+  let mut varStore = Option<ItemVariationStore<'a>>.None
+  let mut iter = entries(dict, Option<BlendState<'a, 'static>>.None)
+  while true {
+    let result = match move Entries.next(&mut iter) {
+      Option<Result<Entry, Error>>.Some { value } => move value
+      _ => {
+        break
+      }
+    }
+    let entry = match move result {
+      Result<Entry, Error>.Success { value } => value
+      _ => {
+        continue
+      }
+    }
+    match entry {
+      Entry.Ros { registry, ordering, supplement } => {
+        hasRos = true
+      }
+      Entry.CharstringsOffset { value } => {
+        charstrings = parseIndex(data, value, v2)
+      }
+      Entry.Charset { value } => {
+        charsetOffset = lowU32(value)
+      }
+      Entry.Encoding { value } => {
+        encodingOffset = lowU32(value)
+      }
+      Entry.FdArrayOffset { value } => {
+        fdArray = parseIndex(data, value, v2)
+      }
+      Entry.FdSelectOffset { value } => {
+        fdSelect = match move tail(data, value) {
+          Option<&'a [u8]>.Some { value: bytes } => ok(FdSelect.read(FontData.new(bytes)))
+          _ => Option<FdSelect<'a>>.None
+        }
+      }
+      Entry.PrivateDictRange { value } => {
+        drop run require(rangeData(data, value), Error.Malformed)
+        privateRange = value
+      }
+      Entry.FontMatrix { value } => {
+        matrix = Option<ScaledFontMatrix>.some(ScaledFontMatrix.normalize(&value))
+      }
+      Entry.VariationStoreOffset { value } => {
+        if v2 {
+          let offset = run require(usize.checkedAdd(value, 2), Error.Malformed)
+          let bytes: &'a [u8] = match move tail(data, offset) {
+            Option<&'a [u8]>.Some { value: rest } => rest
+            _ => Slice.view<u8>(data, 0, 0)
+          }
+          varStore = Option<ItemVariationStore<'a>>.some(
+            run takeRead(ItemVariationStore.read(FontData.new(bytes))),
+          )
+        }
+      }
+      _ => {}
+    }
+  }
+  let chars = run require(move charstrings, Error.MissingResource)
+  let mut kind = CffFontKind<'a>.Sid {
+    strings: strings,
+    privateDict: ByteRange {
+      start: u32.toUsize(lowU32(privateRange.start)),
+      end: u32.toUsize(lowU32(privateRange.end)),
+    }
+  }
+  match move fdArray {
+    Option<Index<'a>>.Some { value } => {
+      if v2 {
+        kind = CffFontKind<'a>.Cff2 {
+          fdArray: value,
+          fdSelect: Maybe<FdSelect<'a>>.fromOption(move fdSelect),
+        }
+      } else {
+        kind = CffFontKind<'a>.Cid {
+          fdArray: value,
+          fdSelect: Maybe<FdSelect<'a>>.fromOption(move fdSelect),
+        }
+      }
+    }
+    _ => {
+      if hasRos || v2 {
+        fail Error.MissingResource
+      }
+    }
+  }
+  return TopDict<'a> {
+    charstrings: chars,
+    charsetOffset: charsetOffset,
+    encodingOffset: encodingOffset,
+    matrix: Maybe<ScaledFontMatrix>.fromOption(move matrix),
+    varStore: Maybe<ItemVariationStore<'a>>.fromOption(move varStore),
+    kind: kind,
+  }
+}
+
+struct FontDict {
+  privateRange: ByteRange,
+  matrix: Option<ScaledFontMatrix>,
+}
+
+effect fn readFontDict<'a>(dict: &'a [u8]) -> FontDict
+  ! Error {
+  let mut range = Option<ByteRange>.None
+  let mut matrix = Option<ScaledFontMatrix>.None
+  let mut iter = entries(dict, Option<BlendState<'a, 'static>>.None)
+  while let Option<Entry>.Some { value: entry } = run Entries.nextImpl(&mut iter) {
+    match entry {
+      Entry.PrivateDictRange { value } => {
+        range = Option<ByteRange>.some(value)
+      }
+      Entry.FontMatrix { value } => {
+        matrix = Option<ScaledFontMatrix>.some(value)
+      }
+      _ => {}
+    }
+  }
+  return FontDict {
+    privateRange: run require(move range, Error.MissingResource),
+    matrix: move matrix,
+  }
+}
+
+pub struct Subfont {
+  _subrsOffset: u32,
+  _defaultWidth: Option<Fixed>,
+  _nominalWidth: Fixed,
+  _matrix: Option<ScaledFontMatrix>,
+  _vsIndex: u16,
+}
+
+pub struct HintedSubfont {
+  pub subfont: Subfont,
+  pub hinting: HintingParams,
+}
+
+impl Subfont {
+  pub fn default() -> Self {
+    return Self {
+      _subrsOffset: 0,
+      _defaultWidth: Option<Fixed>.None,
+      _nominalWidth: Fixed.zero(),
+      _matrix: Option<ScaledFontMatrix>.None,
+      _vsIndex: 0,
+    }
+  }
+
+  pub fn new<'a, 'c>(
+    data: &'a [u8],
+    range: ByteRange,
+    blend: Option<BlendState<'a, 'c>>,
+    matrix: Option<ScaledFontMatrix>,
+  ) -> Result<Self, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      readUnhintedSubfont(data, range, move blend, move matrix),
+      catchError,
+    ) {
+      Subfont value => Result<Subfont, Error>.succeed(move value)
+      Failed { error } => Result<Subfont, Error>.failResult(error)
+    }
+  }
+
+  pub fn newHinted<'a, 'c>(
+    data: &'a [u8],
+    range: ByteRange,
+    blend: Option<BlendState<'a, 'c>>,
+    matrix: Option<ScaledFontMatrix>,
+  ) -> Result<HintedSubfont, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      readHintedSubfont(data, range, move blend, move matrix),
+      catchError,
+    ) {
+      HintedSubfont value => Result<HintedSubfont, Error>.succeed(move value)
+      Failed { error } => Result<HintedSubfont, Error>.failResult(error)
+    }
+  }
+
+  pub fn subrsOffset(self: &Self) -> u32 {
+    return self._subrsOffset
+  }
+
+  pub fn defaultWidth(self: &Self) -> Option<Fixed> {
+    return copyOption(&self._defaultWidth)
+  }
+
+  pub fn nominalWidth(self: &Self) -> Fixed {
+    return self._nominalWidth
+  }
+
+  pub fn matrix(self: &Self) -> Option<ScaledFontMatrix> {
+    return copyOption(&self._matrix)
+  }
+
+  pub fn vsIndex(self: &Self) -> u16 {
+    return self._vsIndex
+  }
+}
+
+// The unhinted reader skips the hinting parameters entirely: carrying them
+// would copy a few hundred bytes through every return.
+effect fn readUnhintedSubfont<'a, 'c>(
+  data: &'a [u8],
+  range: ByteRange,
+  blend: Option<BlendState<'a, 'c>>,
+  matrix: Option<ScaledFontMatrix>,
+) -> Subfont
+  ! Error {
+  let bytes = run require(rangeData(data, range), Error.Malformed)
+  let mut sub = Subfont.default()
+  sub._matrix = move matrix
+  let mut iter = unhintedPrivateEntries(bytes, move blend)
+  while true {
+    // Like the iterator, a malformed entry is skipped and parsing goes on.
+    let next = run Intrinsic.catchFailure<Error>(Entries.nextImpl(&mut iter), catchError)
+    let entry = match move next {
+      Option<Entry> value => match move value {
+        Option<Entry>.Some { value: entry } => entry
+        _ => {
+          break
+        }
+      }
+      Failed { error } => {
+        continue
+      }
+    }
+    match entry {
+      Entry.SubrsOffset { value } => {
+        sub._subrsOffset = lowU32(
+          run require(usize.checkedAdd(range.start, value), Error.Malformed),
+        )
+      }
+      Entry.VariationStoreIndex { value } => {
+        sub._vsIndex = value
+      }
+      Entry.DefaultWidthX { value } => {
+        sub._defaultWidth = Option<Fixed>.some(Fixed.floor(value))
+      }
+      Entry.NominalWidthX { value } => {
+        sub._nominalWidth = Fixed.floor(value)
+      }
+      _ => {}
+    }
+  }
+  return move sub
+}
+
+effect fn readHintedSubfont<'a, 'c>(
+  data: &'a [u8],
+  range: ByteRange,
+  blend: Option<BlendState<'a, 'c>>,
+  matrix: Option<ScaledFontMatrix>,
+) -> HintedSubfont
+  ! Error {
+  let bytes = run require(rangeData(data, range), Error.Malformed)
+  let mut sub = Subfont.default()
+  sub._matrix = move matrix
+  let mut params = HintingParams.default()
+  let mut iter = entries(bytes, move blend)
+  while true {
+    // Like the iterator, a malformed entry is skipped and parsing goes on.
+    let next = run Intrinsic.catchFailure<Error>(Entries.nextImpl(&mut iter), catchError)
+    let entry = match move next {
+      Option<Entry> value => match move value {
+        Option<Entry>.Some { value: entry } => entry
+        _ => {
+          break
+        }
+      }
+      Failed { error } => {
+        continue
+      }
+    }
+    match entry {
+      Entry.SubrsOffset { value } => {
+        sub._subrsOffset = lowU32(
+          run require(usize.checkedAdd(range.start, value), Error.Malformed),
+        )
+      }
+      Entry.VariationStoreIndex { value } => {
+        sub._vsIndex = value
+      }
+      Entry.DefaultWidthX { value } => {
+        sub._defaultWidth = Option<Fixed>.some(Fixed.floor(value))
+      }
+      Entry.NominalWidthX { value } => {
+        sub._nominalWidth = Fixed.floor(value)
+      }
+      Entry.BlueValues { value } => {
+        params.blues = value
+      }
+      Entry.FamilyBlues { value } => {
+        params.familyBlues = value
+      }
+      Entry.OtherBlues { value } => {
+        params.otherBlues = value
+      }
+      Entry.FamilyOtherBlues { value } => {
+        params.familyOtherBlues = value
+      }
+      Entry.BlueScale { value } => {
+        params.blueScale = value
+      }
+      Entry.BlueShift { value } => {
+        params.blueShift = value
+      }
+      Entry.BlueFuzz { value } => {
+        params.blueFuzz = value
+      }
+      Entry.LanguageGroup { value } => {
+        params.languageGroup = value
+      }
+      _ => {}
+    }
+  }
+  return HintedSubfont { subfont: move sub, hinting: params }
+}
+
+pub struct CffFontRef<'a> {
+  _data: &'a [u8],
+  isCff2: bool,
+  _upem: i32,
+  _globalSubrs: Index<'a>,
+  topDict: TopDict<'a>,
+  topDictIndex: u16,
+}
+
+impl<'a> Copy for CffFontRef<'a> {}
+
+impl<'a> CffFontRef<'a> {
+  pub fn new(data: &'a [u8], topDictIndex: u32, upem: Option<i32>) -> Result<Self, Error> {
+    let version = match move FontData<'a>.readAt<u8>(&FontData.new(data), 0) {
+      Result<u8, ReadError>.Success { value } => value
+      _ => {
+        return Result<Self, Error>.failResult(Error.Malformed)
+      }
+    }
+    if version == 1 {
+      return CffFontRef.newCff(data, topDictIndex, move upem)
+    }
+    if version == 2 {
+      return CffFontRef.newCff2(data, move upem)
+    }
+    return Result<Self, Error>.failResult(Error.Malformed)
+  }
+
+  pub fn newCff(data: &'a [u8], index: u32, upem: Option<i32>) -> Result<Self, Error> {
+    return run Effect.result(readCffFont(data, index, move upem, false))
+  }
+
+  pub fn newCff2(data: &'a [u8], upem: Option<i32>) -> Result<Self, Error> {
+    return run Effect.result(readCffFont(data, 0, move upem, true))
+  }
+
+  pub fn data(self: &Self) -> &'a [u8] {
+    return self._data
+  }
+
+  pub fn version(self: &Self) -> u16 {
+    if self.isCff2 {
+      return 2
+    }
+    return 1
+  }
+
+  pub fn metadata(self: &Self) -> Option<Metadata<'a>> {
+    return Metadata.new(self._data, self.topDictIndex)
+  }
+
+  pub fn isCid(self: &Self) -> bool {
+    return match &self.topDict.kind {
+      CffFontKind<'a>.Cid { fdArray, fdSelect } => true
+      _ => false
+    }
+  }
+
+  pub fn globalSubrs(self: &Self) -> Index<'a> {
+    return self._globalSubrs
+  }
+
+  pub fn numGlyphs(self: &Self) -> u32 {
+    return Index.count(&self.topDict.charstrings)
+  }
+
+  pub fn charstrings(self: &Self) -> Index<'a> {
+    return self.topDict.charstrings
+  }
+
+  pub fn strings(self: &Self) -> Option<Index<'a>> {
+    return match &self.topDict.kind {
+      CffFontKind<'a>.Sid { strings, privateDict } => Option<Index<'a>>.some(strings)
+      _ => Option<Index<'a>>.None
+    }
+  }
+
+  pub fn string(self: &Self, sid: Sid) -> Option<&'a [u8]> {
+    return match move Sid.resolveStandard(sid) {
+      Result<&'static [u8], usize>.Success { value } => Option<&'a [u8]>.some(value)
+      Result<&'static [u8], usize>.Failure { error } => match move CffFontRef.strings(self) {
+        Option<Index<'a>>.Some { value } => Index.get(&value, error)
+        _ => Option<&'a [u8]>.None
+      }
+    }
+  }
+
+  pub fn charset(self: &Self) -> Option<Charset<'a>> {
+    if self.topDict.charsetOffset == 4294967295 {
+      return Option<Charset<'a>>.None
+    }
+    return Charset.new(
+      FontData.new(self._data),
+      u32.toUsize(self.topDict.charsetOffset),
+      CffFontRef.numGlyphs(self),
+    )
+  }
+
+  pub fn encoding(self: &Self) -> Option<Encoding<'a>> {
+    let charset = match move CffFontRef.charset(self) {
+      Option<Charset<'a>>.Some { value } => value
+      _ => {
+        return Option<Encoding<'a>>.None
+      }
+    }
+    if self.topDict.encodingOffset == 4294967295 {
+      return Option<Encoding<'a>>.None
+    }
+    return match move RawEncoding.new(self._data, u32.toUsize(self.topDict.encodingOffset)) {
+      Option<RawEncoding<'a>>.Some { value } => Option<Encoding<'a>>.some(
+        Encoding<'a> { encoding: value, _charset: charset },
+      )
+      _ => Option<Encoding<'a>>.None
+    }
+  }
+
+  pub fn matrix(self: &Self) -> Option<ScaledFontMatrix> {
+    return optionOf(&self.topDict.matrix)
+  }
+
+  pub fn upem(self: &Self) -> i32 {
+    return self._upem
+  }
+
+  pub fn varStore(self: &Self) -> Option<ItemVariationStore<'a>> {
+    return optionOf(&self.topDict.varStore)
+  }
+
+  pub fn numSubfonts(self: &Self) -> u16 {
+    return match &self.topDict.kind {
+      CffFontKind<'a>.Sid { strings, privateDict } => 1
+      CffFontKind<'a>.Cid { fdArray, fdSelect } => u32.toU16(Index.count(&fdArray) & 65535)
+      CffFontKind<'a>.Cff2 { fdArray, fdSelect } => u32.toU16(Index.count(&fdArray) & 65535)
+    }
+  }
+
+  pub fn subfontIndex(self: &Self, gid: GlyphId) -> Option<u16> {
+    return match &self.topDict.kind {
+      CffFontKind<'a>.Sid { strings, privateDict } => Option<u16>.some(0)
+      CffFontKind<'a>.Cid { fdArray, fdSelect } => selectFont(&fdSelect, gid)
+      CffFontKind<'a>.Cff2 { fdArray, fdSelect } => selectFont(&fdSelect, gid)
+    }
+  }
+
+  pub fn sidPrivateDictRange(self: &Self) -> Option<ByteRange> {
+    return match &self.topDict.kind {
+      CffFontKind<'a>.Sid { strings, privateDict } => Option<ByteRange>.some(privateDict)
+      _ => Option<ByteRange>.None
+    }
+  }
+
+  pub fn subfont<'c>(self: &Self, index: u16, coords: &'c [F2Dot14]) -> Result<Subfont, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      readUnhinted(self, index, coords),
+      catchError,
+    ) {
+      Subfont value => Result<Subfont, Error>.succeed(move value)
+      Failed { error } => Result<Subfont, Error>.failResult(error)
+    }
+  }
+
+  pub fn subfontHinted<'c>(self: &Self, index: u16, coords: &'c [F2Dot14]) -> Result<
+    HintedSubfont,
+    Error
+  > {
+    return match move run Intrinsic.catchFailure<Error>(
+      readHinted(self, index, coords),
+      catchError,
+    ) {
+      HintedSubfont value => Result<HintedSubfont, Error>.succeed(move value)
+      Failed { error } => Result<HintedSubfont, Error>.failResult(error)
+    }
+  }
+
+  pub fn blendState<'c>(self: &Self, index: u16, coords: &'c [F2Dot14]) -> Option<
+    BlendState<'a, 'c>
+  > {
+    return match &self.topDict.varStore {
+      Maybe<ItemVariationStore<'a>>.Some { value } => ok(BlendState.new(value, coords, index))
+      _ => Option<BlendState<'a, 'c>>.None
+    }
+  }
+
+  pub fn transform(self: &Self, subfont: &Subfont, ppem: Option<f32>) -> Transform {
+    let mut scale = match move ppem {
+      Option<f32>.Some { value } => Option<Fixed>.some(Transform.computeScale(value, self._upem))
+      _ => Option<Fixed>.None
+    }
+    let scaled = match &self.topDict.matrix {
+      Maybe<ScaledFontMatrix>.Some { value: top } => match &subfont._matrix {
+        Option<ScaledFontMatrix>.Some { value: sub } => Option<ScaledFontMatrix>.some(
+          ScaledFontMatrix.combine(&top, &sub),
+        )
+        _ => Option<ScaledFontMatrix>.some(top)
+      }
+      _ => match &subfont._matrix {
+        Option<ScaledFontMatrix>.Some { value: sub } => Option<ScaledFontMatrix>.some(
+          ScaledFontMatrix.normalize(&sub),
+        )
+        _ => Option<ScaledFontMatrix>.None
+      }
+    }
+    let mut matrix = Matrix.identity<Fixed>()
+    if let Option<ScaledFontMatrix>.Some { value } = move scaled {
+      matrix = value.matrix
+      if value.scale != self._upem {
+        let original = Option<Fixed>.unwrapOr(move scale, Fixed.fromI32(64))
+        scale = Option<Fixed>.some(
+          Fixed.mulDiv(&original, Fixed.fromBits(self._upem), Fixed.fromBits(value.scale)),
+        )
+      }
+    }
+    return Transform { matrix: matrix, scale: move scale }
+  }
+}
+
+fn selectFont<'a>(select: &Maybe<FdSelect<'a>>, gid: GlyphId) -> Option<u16> {
+  return match &select.* {
+    Maybe<FdSelect<'a>>.Some { value } => FdSelect.fontIndex(&value, gid)
+    _ => Option<u16>.some(0)
+  }
+}
+
+effect fn fontDictFor<'a>(font: &CffFontRef<'a>, index: u16) -> FontDict
+  ! Error {
+  return match &font.topDict.kind {
+    CffFontKind<'a>.Sid { strings, privateDict } => FontDict {
+      privateRange: privateDict,
+      matrix: Option<ScaledFontMatrix>.None,
+    }
+    CffFontKind<'a>.Cid { fdArray, fdSelect } => {
+      return run readFontDict(run require(Index.get(&fdArray, u16.toUsize(index)), Error.Malformed))
+    }
+    CffFontKind<'a>.Cff2 { fdArray, fdSelect } => {
+      return run readFontDict(run require(Index.get(&fdArray, u16.toUsize(index)), Error.Malformed))
+    }
+  }
+}
+
+effect fn readUnhinted<'a, 'c>(font: &CffFontRef<'a>, index: u16, coords: &'c [F2Dot14]) -> Subfont
+  ! Error {
+  let dict = run fontDictFor(font, index)
+  return run readUnhintedSubfont(
+    font._data,
+    dict.privateRange,
+    CffFontRef.blendState(font, 0, coords),
+    move dict.matrix,
+  )
+}
+
+effect fn readHinted<'a, 'c>(
+  font: &CffFontRef<'a>,
+  index: u16,
+  coords: &'c [F2Dot14],
+) -> HintedSubfont
+  ! Error {
+  let dict = run fontDictFor(font, index)
+  return run take(
+    Subfont.newHinted(
+      font._data,
+      dict.privateRange,
+      CffFontRef.blendState(font, 0, coords),
+      move dict.matrix,
+    ),
+  )
+}
+
+effect fn readCffFont<'a>(data: &'a [u8], index: u32, upem: Option<i32>, v2: bool) -> CffFontRef<'a>
+  ! Error {
+  let mut topData: &'a [u8] = data
+  let mut strings: Index<'a> = Index<'a>.Empty
+  let mut globals: Index<'a> = Index<'a>.Empty
+  let mut topIndex: u16 = 0
+  if v2 {
+    let cff = run takeRead(Cff2.read(FontData.new(data)))
+    topData = Cff2.topDictData(&cff)
+    globals = Index<'a>.Format2 { value: Cff2.globalSubrs(&cff) }
+  } else {
+    let cff = run takeRead(Cff.read(FontData.new(data)))
+    topData = run require(
+      Index.get(&Index<'a>.Format1 { value: Cff.topDicts(&cff) }, u32.toUsize(index)),
+      Error.Malformed,
+    )
+    topIndex = run require(u32.checkedToU16(index), Error.Malformed)
+    strings = Index<'a>.Format1 { value: Cff.strings(&cff) }
+    globals = Index<'a>.Format1 { value: Cff.globalSubrs(&cff) }
+  }
+  let topDict = run take(TopDict.new(data, topData, strings, v2))
+  let units = match &topDict.matrix {
+    Maybe<ScaledFontMatrix>.Some { value } => value.scale
+    _ => 1000
+  }
+  return CffFontRef<'a> {
+    _data: data,
+    isCff2: v2,
+    _upem: Option<i32>.unwrapOr(move upem, units),
+    _globalSubrs: globals,
+    topDict: move topDict,
+    topDictIndex: topIndex,
+  }
+}
+
+pub struct Encoding<'a> {
+  encoding: RawEncoding<'a>,
+  _charset: Charset<'a>,
+}
+
+impl<'a> Copy for Encoding<'a> {}
+
+impl<'a> Encoding<'a> {
+  pub fn predefined(self: &Self) -> Option<PredefinedEncoding> {
+    return match self.encoding {
+      RawEncoding<'a>.Predefined { value } => Option<PredefinedEncoding>.some(value)
+      _ => Option<PredefinedEncoding>.None
+    }
+  }
+
+  pub fn charset(self: &Self) -> Charset<'a> {
+    return self._charset
+  }
+
+  pub fn map(self: &Self, code: u8) -> Option<GlyphId> {
+    return RawEncoding.map(&self.encoding, &self._charset, code)
+  }
+}
+
+pub struct Metadata<'a> {
+  _name: Option<string<'a>>,
+  _version: Option<string<'a>>,
+  _notice: Option<string<'a>>,
+  _copyright: Option<string<'a>>,
+  _fullName: Option<string<'a>>,
+  _familyName: Option<string<'a>>,
+  _weight: Option<string<'a>>,
+  _bbox: BoundingBox<Fixed>,
+  _italicAngle: Fixed,
+  _isFixedPitch: bool,
+  _underlinePosition: Fixed,
+  _underlineThickness: Fixed,
+}
+
+impl<'a> Metadata<'a> {
+  pub fn default() -> Self {
+    return Self {
+      _name: Option<string<'a>>.None,
+      _version: Option<string<'a>>.None,
+      _notice: Option<string<'a>>.None,
+      _copyright: Option<string<'a>>.None,
+      _fullName: Option<string<'a>>.None,
+      _familyName: Option<string<'a>>.None,
+      _weight: Option<string<'a>>.None,
+      _bbox: BoundingBox<Fixed> {
+        xMin: Fixed.zero(),
+        yMin: Fixed.zero(),
+        xMax: Fixed.zero(),
+        yMax: Fixed.zero(),
+      },
+      _italicAngle: Fixed.zero(),
+      _isFixedPitch: false,
+      _underlinePosition: Fixed.fromI32(-100),
+      _underlineThickness: Fixed.fromI32(50),
+    }
+  }
+
+  pub fn new(data: &'a [u8], topIndex: u16) -> Option<Self> {
+    let cff = match move Cff.read(FontData.new(data)) {
+      Result<Cff<'a>, ReadError>.Success { value } => value
+      _ => {
+        return Option<Self>.None
+      }
+    }
+    let dict = match move Index.get(
+      &Index<'a>.Format1 { value: Cff.topDicts(&cff) },
+      u16.toUsize(topIndex),
+    ) {
+      Option<&'a [u8]>.Some { value } => value
+      _ => {
+        return Option<Self>.None
+      }
+    }
+    let mut meta: Metadata<'a> = Metadata.default()
+    meta._name = utf8(Cff.name(&cff, u16.toUsize(topIndex)))
+    let mut iter = entries(dict, Option<BlendState<'a, 'static>>.None)
+    while true {
+      let result = match move Entries.next(&mut iter) {
+        Option<Result<Entry, Error>>.Some { value } => move value
+        _ => {
+          break
+        }
+      }
+      let entry = match move result {
+        Result<Entry, Error>.Success { value } => value
+        _ => {
+          continue
+        }
+      }
+      match entry {
+        Entry.Version { value } => {
+          meta._version = utf8(Cff.string(&cff, value))
+        }
+        Entry.Notice { value } => {
+          meta._notice = utf8(Cff.string(&cff, value))
+        }
+        Entry.Copyright { value } => {
+          meta._copyright = utf8(Cff.string(&cff, value))
+        }
+        Entry.FullName { value } => {
+          meta._fullName = utf8(Cff.string(&cff, value))
+        }
+        Entry.FamilyName { value } => {
+          meta._familyName = utf8(Cff.string(&cff, value))
+        }
+        Entry.Weight { value } => {
+          meta._weight = utf8(Cff.string(&cff, value))
+        }
+        Entry.FontBbox { value } => {
+          meta._bbox = BoundingBox<Fixed> {
+            xMin: value[0],
+            yMin: value[1],
+            xMax: value[2],
+            yMax: value[3],
+          }
+        }
+        Entry.ItalicAngle { value } => {
+          meta._italicAngle = value
+        }
+        Entry.IsFixedPitch { value } => {
+          meta._isFixedPitch = value
+        }
+        Entry.UnderlinePosition { value } => {
+          meta._underlinePosition = value
+        }
+        Entry.UnderlineThickness { value } => {
+          meta._underlineThickness = value
+        }
+        _ => {}
+      }
+    }
+    return Option<Self>.some(move meta)
+  }
+
+  pub fn name(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._name)
+  }
+
+  pub fn version(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._version)
+  }
+
+  pub fn notice(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._notice)
+  }
+
+  pub fn copyright(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._copyright)
+  }
+
+  pub fn fullName(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._fullName)
+  }
+
+  pub fn familyName(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._familyName)
+  }
+
+  pub fn weight(self: &Self) -> Option<string<'a>> {
+    return copyOption(&self._weight)
+  }
+
+  pub fn bbox(self: &Self) -> BoundingBox<Fixed> {
+    return self._bbox
+  }
+
+  pub fn italicAngle(self: &Self) -> Fixed {
+    return self._italicAngle
+  }
+
+  pub fn isFixedPitch(self: &Self) -> bool {
+    return self._isFixedPitch
+  }
+
+  pub fn underlinePosition(self: &Self) -> Fixed {
+    return self._underlinePosition
+  }
+
+  pub fn underlineThickness(self: &Self) -> Fixed {
+    return self._underlineThickness
+  }
+}
+
+fn utf8<'a>(bytes: Option<&'a [u8]>) -> Option<string<'a>> {
+  return match move bytes {
+    Option<&'a [u8]>.Some { value } => ok(String.fromUtf8(value))
+    _ => Option<string<'a>>.None
+  }
+}
+
+import ps.charstring {
+  CffContext,
+  CommandSink,
+  NullSink,
+  ControlBoundsSink,
+  NopFilterSink,
+  TransformSink,
+  PathSinkAdapter,
+  evaluate,
+  evaluateWidth as readCharstringWidth
+}
+import model.glyph.outline { PathSink }
+
+struct EvaluationData<'a> {
+  context: CffContext<'a>,
+  charstring: &'a [u8],
+}
+
+effect fn prepareEvaluation<'a>(
+  font: &CffFontRef<'a>,
+  subfont: &Subfont,
+  gid: GlyphId,
+) -> EvaluationData<'a>
+  ! Error {
+  let mut subrs: Index<'a> = Index<'a>.Empty
+  if subfont._subrsOffset != 0 {
+    let bytes = run require(tail(font._data, u32.toUsize(subfont._subrsOffset)), Error.Malformed)
+    subrs = run take(Index.new(bytes, font.isCff2))
+  }
+  let charstring = run require(
+    Index.get(&font.topDict.charstrings, u32.toUsize(GlyphId.toU32(gid))),
+    Error.Malformed,
+  )
+  return EvaluationData<'a> {
+    context: CffContext<'a> {
+      data: font._data,
+      charstrings: font.topDict.charstrings,
+      globalSubrs: font._globalSubrs,
+      subrs: subrs,
+    },
+    charstring: charstring,
+  }
+}
+
+fn resolveWidth(subfont: &Subfont, width: Option<Fixed>) -> Option<Fixed> {
+  return match move width {
+    Option<Fixed>.Some { value } => Option<Fixed>.some(value + subfont._nominalWidth)
+    _ => copyOption(&subfont._defaultWidth)
+  }
+}
+
+effect fn readWidth<'a, 'c>(
+  font: &CffFontRef<'a>,
+  subfont: &Subfont,
+  gid: GlyphId,
+  coords: &'c [F2Dot14],
+) -> Option<Fixed>
+  ! Error {
+  let data = run prepareEvaluation(font, subfont, gid)
+  let width = run take(
+    readCharstringWidth(
+      &data.context,
+      CffFontRef.blendState(font, subfont._vsIndex, coords),
+      data.charstring,
+    ),
+  )
+  return resolveWidth(subfont, move width)
+}
+
+effect fn evalCharstring<'a, 'c, S: CommandSink>(
+  font: &CffFontRef<'a>,
+  subfont: &Subfont,
+  gid: GlyphId,
+  coords: &'c [F2Dot14],
+  sink: &mut S,
+) -> Option<Fixed>
+  ! Error {
+  let data = run prepareEvaluation(font, subfont, gid)
+  let width = run take(
+    evaluate(
+      &data.context,
+      CffFontRef.blendState(font, subfont._vsIndex, coords),
+      data.charstring,
+      &mut sink,
+    ),
+  )
+  return resolveWidth(subfont, move width)
+}
+
+effect fn measure<'a, 'c>(
+  font: &CffFontRef<'a>,
+  subfont: &Subfont,
+  gid: GlyphId,
+  coords: &'c [F2Dot14],
+  ppem: Option<f32>,
+) -> Option<BoundingBox<Fixed>>
+  ! Error {
+  let mut bounds = ControlBoundsSink.new()
+  let mut filter = NopFilterSink.new(&mut bounds)
+  let mut transformer = TransformSink.new(
+    &mut filter,
+    CffFontRef.transform(font, subfont, move ppem),
+  )
+  drop run evalCharstring(font, subfont, gid, coords, &mut transformer)
+  drop move transformer
+  drop move filter
+  return ControlBoundsSink.boundingBox(&bounds)
+}
+
+fn transformWidth(transform: &Transform, width: Option<Fixed>) -> Option<f32> {
+  return match move width {
+    Option<Fixed>.Some { value } => {
+      let mut result = Fixed.toF32(Transform.transformHMetric(transform, value))
+      if result < 0.0 {
+        result = 0.0
+      }
+      return Option<f32>.some(result)
+    }
+    _ => Option<f32>.None
+  }
+}
+
+effect fn advanceWidth<'a, 'c>(
+  font: &CffFontRef<'a>,
+  subfont: &Subfont,
+  gid: GlyphId,
+  coords: &'c [F2Dot14],
+  ppem: Option<f32>,
+) -> Option<f32>
+  ! Error {
+  let transform = CffFontRef.transform(font, subfont, move ppem)
+  return transformWidth(&transform, run readWidth(font, subfont, gid, coords))
+}
+
+effect fn drawGlyph<'a, 'c, P: PathSink>(
+  font: &CffFontRef<'a>,
+  subfont: &Subfont,
+  gid: GlyphId,
+  coords: &'c [F2Dot14],
+  ppem: Option<f32>,
+  sink: &mut P,
+) -> Option<f32>
+  ! Error {
+  let transform = CffFontRef.transform(font, subfont, move ppem)
+  let mut adapter = PathSinkAdapter { inner: move sink }
+  let mut filter = NopFilterSink.new(&mut adapter)
+  let mut transformer = TransformSink.fromMatrixScale(
+    &mut filter,
+    transform.matrix,
+    copyOption(&transform.scale),
+  )
+  let width = run evalCharstring(font, subfont, gid, coords, &mut transformer)
+  return transformWidth(&transform, move width)
+}
+
+impl<'a> CffFontRef<'a> {
+  pub fn evaluateCharstring<'c, S: CommandSink>(
+    self: &Self,
+    subfont: &Subfont,
+    gid: GlyphId,
+    coords: &'c [F2Dot14],
+    sink: &mut S,
+  ) -> Result<Option<Fixed>, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      evalCharstring(self, subfont, gid, coords, &mut sink),
+      catchError,
+    ) {
+      Option<Fixed> value => Result<Option<Fixed>, Error>.succeed(move value)
+      Failed { error } => Result<Option<Fixed>, Error>.failResult(error)
+    }
+  }
+
+  pub fn evaluateWidth<'c>(
+    self: &Self,
+    subfont: &Subfont,
+    gid: GlyphId,
+    coords: &'c [F2Dot14],
+  ) -> Result<Option<Fixed>, Error> {
+    let transform = CffFontRef.transform(self, subfont, Option<f32>.None)
+    let outcome = match move run Intrinsic.catchFailure<Error>(
+      readWidth(self, subfont, gid, coords),
+      catchError,
+    ) {
+      Option<Fixed> value => Result<Option<Fixed>, Error>.succeed(move value)
+      Failed { error } => Result<Option<Fixed>, Error>.failResult(error)
+    }
+    return match move outcome {
+      Result<Option<Fixed>, Error>.Success { value: Option<Fixed>.Some { value } } => Result<
+        Option<Fixed>,
+        Error
+      >.succeed(Option<Fixed>.some(Transform.transformHMetric(&transform, value)))
+      Result<Option<Fixed>, Error>.Success { value: Option<Fixed>.None } => Result<
+        Option<Fixed>,
+        Error
+      >.succeed(Option<Fixed>.None)
+      Result<Option<Fixed>, Error>.Failure { error } => Result<Option<Fixed>, Error>.failResult(
+        error,
+      )
+    }
+  }
+
+  pub fn advance<'c>(
+    self: &Self,
+    subfont: &Subfont,
+    gid: GlyphId,
+    coords: &'c [F2Dot14],
+    ppem: Option<f32>,
+  ) -> Result<Option<f32>, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      advanceWidth(self, subfont, gid, coords, move ppem),
+      catchError,
+    ) {
+      Option<f32> value => Result<Option<f32>, Error>.succeed(move value)
+      Failed { error } => Result<Option<f32>, Error>.failResult(error)
+    }
+  }
+
+  pub fn evaluateExtents<'c>(
+    self: &Self,
+    subfont: &Subfont,
+    gid: GlyphId,
+    coords: &'c [F2Dot14],
+  ) -> Result<Option<BoundingBox<Fixed>>, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      measure(self, subfont, gid, coords, Option<f32>.None),
+      catchError,
+    ) {
+      Option<BoundingBox<Fixed>> value => Result<Option<BoundingBox<Fixed>>, Error>.succeed(
+        move value,
+      )
+      Failed { error } => Result<Option<BoundingBox<Fixed>>, Error>.failResult(error)
+    }
+  }
+
+  pub fn extents<'c>(
+    self: &Self,
+    subfont: &Subfont,
+    gid: GlyphId,
+    coords: &'c [F2Dot14],
+    ppem: Option<f32>,
+  ) -> Result<Option<BoundingBox<f32>>, Error> {
+    let outcome = match move run Intrinsic.catchFailure<Error>(
+      measure(self, subfont, gid, coords, move ppem),
+      catchError,
+    ) {
+      Option<BoundingBox<Fixed>> value => Result<Option<BoundingBox<Fixed>>, Error>.succeed(
+        move value,
+      )
+      Failed { error } => Result<Option<BoundingBox<Fixed>>, Error>.failResult(error)
+    }
+    return match move outcome {
+      Result<Option<BoundingBox<Fixed>>, Error>.Success {
+        value: Option<BoundingBox<Fixed>>.Some { value }
+      } => Result<Option<BoundingBox<f32>>, Error>.succeed(
+        Option<BoundingBox<f32>>.some(
+          BoundingBox<f32> {
+            xMin: Fixed.toF32(value.xMin),
+            yMin: Fixed.toF32(value.yMin),
+            xMax: Fixed.toF32(value.xMax),
+            yMax: Fixed.toF32(value.yMax),
+          },
+        ),
+      )
+      Result<Option<BoundingBox<Fixed>>, Error>.Success {
+        value: Option<BoundingBox<Fixed>>.None
+      } => Result<Option<BoundingBox<f32>>, Error>.succeed(Option<BoundingBox<f32>>.None)
+      Result<Option<BoundingBox<Fixed>>, Error>.Failure { error } => Result<
+        Option<BoundingBox<f32>>,
+        Error
+      >.failResult(error)
+    }
+  }
+
+  pub fn draw<'c, P: PathSink>(
+    self: &Self,
+    subfont: &Subfont,
+    gid: GlyphId,
+    coords: &'c [F2Dot14],
+    ppem: Option<f32>,
+    sink: &mut P,
+  ) -> Result<Option<f32>, Error> {
+    return match move run Intrinsic.catchFailure<Error>(
+      drawGlyph(self, subfont, gid, coords, move ppem, &mut sink),
+      catchError,
+    ) {
+      Option<f32> value => Result<Option<f32>, Error>.succeed(move value)
+      Failed { error } => Result<Option<f32>, Error>.failResult(error)
+    }
+  }
+}

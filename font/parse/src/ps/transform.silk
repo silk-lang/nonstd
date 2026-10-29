@@ -1,0 +1,230 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import ps.num { parseFixedDynamic, DynamicFixed, BCD_POWER_TENS }
+import model.error { Error }
+import font_data { Cursor }
+import font_types.lib { Matrix, Fixed }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.i32
+import silk.num.i64
+import silk.num.f32
+
+pub type FontMatrix = Matrix<Fixed>
+
+pub fn combineScaled(a: &FontMatrix, b: &FontMatrix, scale: i32) -> FontMatrix {
+  let aa = Matrix.elements<Fixed>(a)
+  let bb = Matrix.elements<Fixed>(b)
+  let value = Fixed.fromI32(scale)
+  let xx = Fixed.mulDiv(&aa[0], bb[0], value) + Fixed.mulDiv(&aa[2], bb[1], value)
+  let yx = Fixed.mulDiv(&aa[1], bb[0], value) + Fixed.mulDiv(&aa[3], bb[1], value)
+  let xy = Fixed.mulDiv(&aa[0], bb[2], value) + Fixed.mulDiv(&aa[2], bb[3], value)
+  let yy = Fixed.mulDiv(&aa[1], bb[2], value) + Fixed.mulDiv(&aa[3], bb[3], value)
+  let dx = Fixed.mulDiv(&bb[4], aa[0], value) + Fixed.mulDiv(&bb[5], aa[2], value)
+  let dy = Fixed.mulDiv(&bb[4], aa[1], value) + Fixed.mulDiv(&bb[5], aa[3], value)
+  return Matrix.fromElements<Fixed>([xx, yx, xy, yy, dx, dy])
+}
+
+fn abs64(value: i64) -> i64 {
+  if value < 0 {
+    return -value
+  }
+  return value
+}
+
+pub fn isDegenerate(matrix: &FontMatrix) -> bool {
+  let mut xx = i32.toI64(Fixed.toBits(matrix.xx))
+  let mut yx = i32.toI64(Fixed.toBits(matrix.yx))
+  let mut xy = i32.toI64(Fixed.toBits(matrix.xy))
+  let mut yy = i32.toI64(Fixed.toBits(matrix.yy))
+  let value = abs64(xx) | abs64(yx) | abs64(xy) | abs64(yy)
+  if value == 0 || value > 2147483647 {
+    return true
+  }
+  let mut msb: i64 = 0
+  let mut bits = value
+  while bits > 1 {
+    bits = i64.shiftRight(bits, 1)
+    msb = msb + 1
+  }
+  let shift = msb - 12
+  if shift > 0 {
+    xx = i64.shiftRight(xx, shift)
+    xy = i64.shiftRight(xy, shift)
+    yx = i64.shiftRight(yx, shift)
+    yy = i64.shiftRight(yy, shift)
+  }
+  return 32 * abs64(xx * yy - xy * yx) <= xx * xx + xy * xy + yx * yx + yy * yy
+}
+
+pub struct Transform {
+  pub matrix: FontMatrix,
+  pub scale: Option<Fixed>,
+}
+
+impl Transform {
+  pub fn identity() -> Self {
+    return Self { matrix: Matrix.identity<Fixed>(), scale: Option<Fixed>.None }
+  }
+
+  pub fn default() -> Self {
+    return Transform.identity()
+  }
+
+  pub fn computeScale(ppem: f32, upem: i32) -> Fixed {
+    let scaled = ppem * 64.0
+    let mut bits: i32 = 0
+    if f32.isNaN(scaled) {
+      bits = 0
+    } else if scaled >= 2147483648.0 {
+      bits = 2147483647
+    } else if scaled <= -2147483648.0 {
+      bits = -2147483648
+    } else {
+      bits = f32.toI32(scaled)
+    }
+    let mut units = upem
+    if units < 1 {
+      units = 1
+    }
+    return Fixed.fromBits(bits) / Fixed.fromBits(units)
+  }
+
+  pub fn transformHMetric(self: &Self, metric: Fixed) -> Fixed {
+    let mut value = Fixed.fromBits(Fixed.toI32(metric))
+    if Fixed.toBits(self.matrix.xx) != 65536 {
+      value = value * self.matrix.xx
+    }
+    value = value + self.matrix.dx
+    return match &self.scale {
+      Option<Fixed>.Some { value: scale } => Fixed.fromBits(
+        i32.shiftLeft(Fixed.toBits(value * scale), 10),
+      )
+      _ => Fixed.fromBits(i32.shiftLeft(Fixed.toBits(value), 16))
+    }
+  }
+}
+
+pub struct ScaledFontMatrix {
+  pub matrix: FontMatrix,
+  pub scale: i32,
+}
+
+impl Copy for ScaledFontMatrix {}
+
+impl ScaledFontMatrix {
+  pub fn parse<'a>(cursor: &mut Cursor<'a>) -> Option<Self> {
+    let mut values: [Fixed; 6] = [Fixed.zero(); 6]
+    let mut scalings: [i32; 6] = [0; 6]
+    let mut maxScaling: i32 = -2147483648
+    let mut minScaling: i32 = 2147483647
+    let mut i: usize = 0
+    while i < 6 {
+      let parsed = match move parseFixedDynamic(&mut cursor) {
+        Result<DynamicFixed, Error>.Success { value } => value
+        _ => {
+          return Option<Self>.None
+        }
+      }
+      if Fixed.toBits(parsed.value) != 0 {
+        if parsed.scale > maxScaling {
+          maxScaling = parsed.scale
+        }
+        if parsed.scale < minScaling {
+          minScaling = parsed.scale
+        }
+      }
+      values[i] = parsed.value
+      scalings[i] = parsed.scale
+      i = i + 1
+    }
+    let spread = i32.toI64(maxScaling) - i32.toI64(minScaling)
+    if maxScaling < -9 || maxScaling > 0 || spread < 0 || spread > 9 {
+      return Option<Self>.None
+    }
+    i = 0
+    while i < 6 {
+      if Fixed.toBits(values[i]) != 0 {
+        let divisor = BCD_POWER_TENS[i32.toUsize(maxScaling - scalings[i])]
+        let half = i32.shiftRight(divisor, 1)
+        let bits = Fixed.toBits(values[i])
+        if Fixed.toBits(values[i]) < 0 {
+          if -2147483648 + half < bits {
+            values[i] = Fixed.fromBits((bits - half) / divisor)
+          } else {
+            values[i] = Fixed.fromBits(-2147483648 / divisor)
+          }
+        } else if 2147483647 - half > bits {
+          values[i] = Fixed.fromBits((bits + half) / divisor)
+        } else {
+          values[i] = Fixed.fromBits(2147483647 / divisor)
+        }
+      }
+      i = i + 1
+    }
+    let matrix = Matrix.fromElements<Fixed>(values)
+    if isDegenerate(&matrix) {
+      return Option<Self>.None
+    }
+    return Option<Self>.some(
+      Self { matrix: matrix, scale: BCD_POWER_TENS[i32.toUsize(-maxScaling)] },
+    )
+  }
+
+  pub fn combine(self: &Self, sub: &ScaledFontMatrix) -> Self {
+    let mut scaling: i32 = 1
+    if self.scale > 1 && sub.scale > 1 {
+      scaling = self.scale
+      if sub.scale < scaling {
+        scaling = sub.scale
+      }
+    }
+    let matrix = combineScaled(&self.matrix, &sub.matrix, scaling)
+    let scale = Fixed.mulDiv(
+      &Fixed.fromBits(sub.scale),
+      Fixed.fromBits(self.scale),
+      Fixed.fromBits(scaling),
+    )
+    return ScaledFontMatrix.normalize(&Self { matrix: matrix, scale: Fixed.toBits(scale) })
+  }
+
+  pub fn normalize(self: &Self) -> Self {
+    let mut matrix = Matrix.elements<Fixed>(&self.matrix)
+    let mut scaledUpem = self.scale
+    let mut factor = Fixed.abs(matrix[3])
+    if Fixed.toBits(matrix[3]) == 0 {
+      factor = Fixed.abs(matrix[1])
+    }
+    if Fixed.toBits(factor) != 65536 {
+      scaledUpem = Fixed.toBits(Fixed.fromBits(scaledUpem) / factor)
+      let mut i: usize = 0
+      while i < 6 {
+        matrix[i] = matrix[i] / factor
+        i = i + 1
+      }
+    }
+    matrix[4] = Fixed.fromBits(i32.shiftRight(Fixed.toBits(matrix[4]), 16))
+    matrix[5] = Fixed.fromBits(i32.shiftRight(Fixed.toBits(matrix[5]), 16))
+    return Self { matrix: Matrix.fromElements<Fixed>(matrix), scale: scaledUpem }
+  }
+}
+
+import silk.core.equal { Equal }
+
+impl Equal for ScaledFontMatrix {
+  fn equals(a: &ScaledFontMatrix, b: &ScaledFontMatrix) -> bool {
+    if a.scale != b.scale {
+      return false
+    }
+    let aa = Matrix.elements<Fixed>(&a.matrix)
+    let bb = Matrix.elements<Fixed>(&b.matrix)
+    let mut i: usize = 0
+    while i < 6 {
+      if Fixed.toBits(aa[i]) != Fixed.toBits(bb[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+}

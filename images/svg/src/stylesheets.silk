@@ -1,0 +1,914 @@
+//! Stylesheet-local namespaces, conditional imports and ordered cascade candidates.
+import url { Url, UrlError }
+import resources {
+  Resolver,
+  Response,
+  ResourceKind,
+  ResourceError,
+  Policy,
+  ProcessingMode,
+  Limits as ResourceLimits
+}
+import resources
+import svg_css.tokens {
+  TokenBuffer,
+  TokenRange,
+  Span,
+  Kind,
+  Limits,
+  CssError,
+  CssErrorKind,
+  equal,
+  insensitive
+}
+import svg_css.lexer
+import svg_css.syntax { RuleKind }
+import svg_css.syntax
+import svg_css.input { Input }
+import svg_css.selectors { SelectorList, NamespaceBinding, Specificity }
+import svg_css.selectors
+import svg_css.element { ElementTree, MatchContext }
+import svg_css.selector_index { CandidateIndex }
+import svg_css.cascade { Declaration, Candidate, Priority, Origin }
+import svg_css.cascade
+import svg_css.computed { Engine }
+import svg_css.variables
+import svg_css.properties { Property }
+import svg_css.media_features { Environment }
+import svg_css.media_queries
+import svg_css.supports
+import svg_css.encoding { Encoding }
+import svg_css.encoding
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.usize
+
+pub struct RuleSetId {
+  pub index: usize,
+}
+
+impl Copy for RuleSetId {}
+
+struct RuleSet {
+  base: usize,
+  policy: Policy,
+  rules: List<usize>,
+  index: CandidateIndex,
+}
+
+struct Source {
+  url: usize,
+  encoding: Encoding,
+  ruleSet: RuleSetId,
+}
+
+impl Copy for Source {}
+
+struct Cached {
+  request: usize,
+  url: usize,
+  bytes: Bytes,
+  protocol: Option<Encoding>,
+  supported: bool,
+}
+
+struct StyleRule {
+  selectors: SelectorList,
+  buffer: usize,
+  declarations: TokenRange,
+  origin: Origin,
+}
+
+pub struct Catalog {
+  pub buffers: List<TokenBuffer>,
+  pub declarations: List<Declaration>,
+  pub engine: Engine,
+  sources: List<Source>,
+  urls: List<Url>,
+  cache: List<Cached>,
+  rules: List<StyleRule>,
+  sets: List<RuleSet>,
+  active: List<usize>,
+  inputBytes: usize,
+  storageBytes: usize,
+  tokenCount: usize,
+  ruleCount: usize,
+  declarationCount: usize,
+}
+
+struct SheetMetadata {
+  protocol: Option<Encoding>,
+  supported: bool,
+}
+
+effect fn sheetMetadata(address: &Url, response: &Response) -> SheetMetadata
+  ! ResourceError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = SheetMetadata { protocol: Option<Encoding>.None, supported: true }
+  if equal(Url.scheme(address), b"data") {
+    let metadata = run resources.inspectData(address)
+    result.supported = run metadata.matchesMediaType(b"text/css")
+    if result.supported {
+      let charset = run metadata.decodedCharset()
+      if let Option<Bytes>.Some { value } = &charset {
+        result.protocol = encoding.label(Bytes.asSlice(&value))
+      }
+    }
+  } else {
+    if let Option<Bytes>.Some { value } = &response.mediaType {
+      result.supported = insensitive(Bytes.asSlice(&value), b"text/css")
+    }
+    if let Option<Bytes>.Some { value } = &response.charset {
+      result.protocol = encoding.label(Bytes.asSlice(&value))
+    }
+  }
+  return move result
+}
+
+// Every sheet, import occurrence and inline block consumes the same aggregate budget.
+effect fn charge(total: &mut usize, count: usize, maximum: usize, kind: CssErrorKind) -> ()
+  ! CssError {
+  if total.* > maximum || count > maximum - total.* {
+    fail CssError { kind: kind, offset: 0 }
+  }
+  total.* = total.* + count
+}
+
+fn skip(buffer: &TokenBuffer, start: usize, end: usize) -> usize {
+  let mut at = start
+  while at < end
+    && match &buffer.tokens.asSlice()[at].kind {
+      Kind.Whitespace => true
+      _ => false
+    } {
+    at = at + 1
+  }
+  return at
+}
+
+struct Address {
+  text: Span,
+  next: usize,
+  valid: bool
+}
+
+impl Copy for Address {}
+
+fn address(buffer: &TokenBuffer, start: usize, end: usize) -> Address {
+  let at = skip(buffer, start, end)
+  let rejected = Address { text: Span { start: 0, end: 0 }, next: end, valid: false }
+  if at >= end {
+    return rejected
+  }
+  let token = &buffer.tokens.asSlice()[at]
+  match &token.kind {
+    Kind.String { text } => {
+      return Address { text: text, next: at + 1, valid: true }
+    }
+    Kind.Url { text } => {
+      return Address { text: text, next: at + 1, valid: true }
+    }
+    Kind.Function { name } => {
+      if !insensitive(buffer.text(name), b"url") || token.matching > end {
+        return rejected
+      }
+      let inner = skip(buffer, at + 1, token.matching)
+      if inner >= token.matching || skip(buffer, inner + 1, token.matching) != token.matching {
+        return rejected
+      }
+      match &buffer.tokens.asSlice()[inner].kind {
+        Kind.String { text } => {
+          return Address {
+            text: text,
+            next: if token.matching < end {
+              token.matching + 1
+            } else {
+              end
+            },
+            valid: true,
+          }
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  return rejected
+}
+
+fn namespace(buffer: &TokenBuffer, range: TokenRange) -> Option<NamespaceBinding> {
+  let mut at = skip(buffer, range.start, range.end)
+  let mut prefix = Span { start: 0, end: 0 }
+  if at < range.end {
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Ident { text } => {
+        prefix = text
+        at = at + 1
+      }
+      _ => {}
+    }
+  }
+  let uri = address(buffer, at, range.end)
+  if !uri.valid || skip(buffer, uri.next, range.end) != range.end {
+    return Option<NamespaceBinding>.None
+  }
+  return Option<NamespaceBinding>.Some { value: NamespaceBinding { prefix: prefix, uri: uri.text } }
+}
+
+impl Catalog {
+  pub effect fn make() -> Catalog
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut buffers = List<TokenBuffer>.make()
+    let closing = run variables.appendClosingBuffer(&mut buffers)
+    let mut sources = List<Source>.make()
+    run sources.append(
+      Source { url: usize.MAX, encoding: Encoding.Utf8, ruleSet: RuleSetId { index: 0 } },
+    )
+    let mut sets = List<RuleSet>.make()
+    run sets.append(
+      RuleSet {
+        base: usize.MAX,
+        policy: Policy { mode: ProcessingMode.SecureStatic, limits: ResourceLimits.defaults() },
+        rules: List<usize>.make(),
+        index: CandidateIndex.make(),
+      },
+    )
+    return Catalog {
+      buffers: move buffers,
+      declarations: List<Declaration>.make(),
+      engine: Engine.make(closing),
+      sources: move sources,
+      urls: List<Url>.make(),
+      cache: List<Cached>.make(),
+      rules: List<StyleRule>.make(),
+      sets: move sets,
+      active: List<usize>.make(),
+      inputBytes: 0,
+      storageBytes: 0,
+      tokenCount: 0,
+      ruleCount: 0,
+      declarationCount: 0,
+    }
+  }
+
+  pub effect fn createRuleSet(self: &mut Self, base: usize, policy: Policy) -> RuleSetId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let result = RuleSetId { index: self.sets.length() }
+    run self.sets.append(
+      RuleSet {
+        base: base,
+        policy: policy,
+        rules: List<usize>.make(),
+        index: CandidateIndex.make(),
+      },
+    )
+    return result
+  }
+
+  // Fragment-only CSS URLs retain the document that supplied their declaration.
+  pub fn sourceDocument(self: &Self, buffer: usize) -> Option<&Url> {
+    if buffer >= self.sources.length() {
+      return Option<&Url>.None
+    }
+    let rules = self.sources.asSlice()[buffer].ruleSet
+    return self.registeredBase(self.sets.asSlice()[rules.index].base)
+  }
+
+  pub fn base(self: &Self, buffer: usize) -> Option<&Url> {
+    if buffer >= self.sources.length() {
+      return Option<&Url>.None
+    }
+    let index = self.sources.asSlice()[buffer].url
+    if index >= self.urls.length() {
+      return Option<&Url>.None
+    }
+    return Option<&Url>.Some { value: &self.urls.asSlice()[index] }
+  }
+
+  pub fn registeredBase(self: &Self, base: usize) -> Option<&Url> {
+    if base >= self.urls.length() {
+      return Option<&Url>.None
+    }
+    return Option<&Url>.Some { value: &self.urls.asSlice()[base] }
+  }
+
+  pub effect fn matchesMedia(
+    self: &mut Self,
+    bytes: &[u8],
+    base: usize,
+    environment: &Environment,
+    limits: &Limits,
+  ) -> bool
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    if bytes.length == 0 {
+      return true
+    }
+    if base >= self.urls.length() {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    let buffer = run self.buffer(
+      bytes,
+      Source { url: base, encoding: Encoding.Utf8, ruleSet: RuleSetId { index: 0 } },
+      limits,
+    )
+    let source = &self.buffers.asSlice()[buffer]
+    let input = Input.Contiguous { buffer: source, range: source.all() }
+    return run media_queries.matches(&input, environment, limits)
+  }
+
+  effect fn buffer(self: &mut Self, bytes: &[u8], source: Source, limits: &Limits) -> usize
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    run charge(&mut self.inputBytes, bytes.length, limits.maxInputBytes, CssErrorKind.InputLimit)
+    run charge(&mut self.storageBytes, 0, limits.maxStorageBytes, CssErrorKind.StorageLimit)
+    run charge(&mut self.tokenCount, 0, limits.maxTokens, CssErrorKind.TokenLimit)
+    let mut available = limits.*
+    available.maxStorageBytes = limits.maxStorageBytes - self.storageBytes
+    available.maxTokens = limits.maxTokens - self.tokenCount
+    let tokens = run lexer.tokenize(bytes, &available)
+    run charge(
+      &mut self.storageBytes,
+      Bytes.length(&tokens.data),
+      limits.maxStorageBytes,
+      CssErrorKind.StorageLimit,
+    )
+    run charge(
+      &mut self.tokenCount,
+      tokens.tokens.length(),
+      limits.maxTokens,
+      CssErrorKind.TokenLimit,
+    )
+    let result = self.buffers.length()
+    run self.buffers.append(move tokens)
+    run self.sources.append(source)
+    return result
+  }
+
+  pub effect fn registerBase(self: &mut Self, base: Url) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let index = self.urls.length()
+    run self.urls.append(move base)
+    return index
+  }
+
+  // Embedded XML style text is already decoded. Imported sheets use decodeStylesheet.
+  pub effect fn addSheet(
+    self: &mut Self,
+    rules: RuleSetId,
+    bytes: &[u8],
+    base: usize,
+    environmentEncoding: Encoding,
+    origin: Origin,
+    environment: &Environment,
+    limits: &Limits,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if base >= self.urls.length() || rules.index >= self.sets.length() {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    let buffer = run self.buffer(
+      bytes,
+      Source { url: base, encoding: environmentEncoding, ruleSet: rules },
+      limits,
+    )
+    run self.active.append(base)
+    let bindings = List<NamespaceBinding>.make()
+    let range = self.buffers.asSlice()[buffer].all()
+    run self.collect(buffer, range, bindings.asSlice(), true, origin, environment, limits, 0)
+    let removed = self.active.pop()
+  }
+
+  pub effect fn addInline(
+    self: &mut Self,
+    rules: RuleSetId,
+    bytes: &[u8],
+    base: usize,
+    limits: &Limits,
+  ) -> TokenRange
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    if base >= self.urls.length() || rules.index >= self.sets.length() {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    let buffer = run self.buffer(
+      bytes,
+      Source { url: base, encoding: Encoding.Utf8, ruleSet: rules },
+      limits,
+    )
+    let range = self.buffers.asSlice()[buffer].all()
+    return run self.declarationsIn(buffer, range, limits)
+  }
+
+  pub effect fn addPresentation(
+    self: &mut Self,
+    rules: RuleSetId,
+    bytes: &[u8],
+    base: usize,
+    property: Property,
+    limits: &Limits,
+  ) -> Option<usize>
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    if base >= self.urls.length() || rules.index >= self.sets.length() {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    run charge(&mut self.declarationCount, 1, limits.maxDeclarations, CssErrorKind.DeclarationLimit)
+    let buffer = run self.buffer(
+      bytes,
+      Source { url: base, encoding: Encoding.Utf8, ruleSet: rules },
+      limits,
+    )
+    let parsed = run cascade.compilePresentation(
+      &mut self.engine.values,
+      self.buffers.asSlice(),
+      buffer,
+      property,
+      limits,
+    )
+    match move parsed {
+      Option<Declaration>.Some { value } => {
+        let index = self.declarations.length()
+        run self.declarations.append(move value)
+        return Option<usize>.Some { value: index }
+      }
+      _ => {
+        return Option<usize>.None
+      }
+    }
+  }
+
+  pub effect fn addExternal(
+    self: &mut Self,
+    rules: RuleSetId,
+    url: Url,
+    environmentEncoding: Encoding,
+    origin: Origin,
+    environment: &Environment,
+    limits: &Limits,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    run self.loadSheet(rules, move url, environmentEncoding, origin, environment, limits, 0)
+  }
+
+  effect fn declarationsIn(
+    self: &mut Self,
+    buffer: usize,
+    range: TokenRange,
+    limits: &Limits,
+  ) -> TokenRange
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let parsed = run syntax.parseDeclarations(&self.buffers.asSlice()[buffer], range, limits)
+    run charge(
+      &mut self.declarationCount,
+      parsed.length(),
+      limits.maxDeclarations,
+      CssErrorKind.DeclarationLimit,
+    )
+    let start = self.declarations.length()
+    let mut i: usize = 0
+    while i < parsed.length() {
+      let declaration = run cascade.compile(
+        &mut self.engine.values,
+        self.buffers.asSlice(),
+        buffer,
+        &parsed.asSlice()[i],
+        limits,
+      )
+      match move declaration {
+        Option<Declaration>.Some { value } => {
+          run self.declarations.append(move value)
+        }
+        _ => {}
+      }
+      i = i + 1
+    }
+    return TokenRange { start: start, end: self.declarations.length() }
+  }
+
+  effect fn collect(
+    self: &mut Self,
+    buffer: usize,
+    range: TokenRange,
+    inheritedBindings: &[NamespaceBinding],
+    topLevel: bool,
+    origin: Origin,
+    environment: &Environment,
+    limits: &Limits,
+    depth: usize,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if depth >= limits.maxDepth {
+      fail CssError { kind: CssErrorKind.NestingLimit, offset: range.start }
+    }
+    let parsed = run syntax.parseRules(&self.buffers.asSlice()[buffer], range, topLevel, limits)
+    run charge(&mut self.ruleCount, parsed.length(), limits.maxRules, CssErrorKind.RuleLimit)
+    let mut bindings = List<NamespaceBinding>.make()
+    let mut b: usize = 0
+    while b < inheritedBindings.length {
+      run bindings.append(inheritedBindings[b])
+      b = b + 1
+    }
+    let mut importsAllowed = topLevel
+    let mut namespacesAllowed = topLevel
+    let mut i: usize = 0
+    while i < parsed.length() {
+      let rule = &parsed.asSlice()[i]
+      if rule.kind == RuleKind.Qualified {
+        let selector = run selectors.parse(
+          &self.buffers.asSlice()[buffer],
+          rule.prelude,
+          bindings.asSlice(),
+          limits,
+        )
+        match move selector {
+          Option<SelectorList>.Some { value } => {
+            importsAllowed = false
+            namespacesAllowed = false
+            let declarations = run self.declarationsIn(buffer, rule.body, limits)
+            let index = self.rules.length()
+            let set = self.sources.asSlice()[buffer].ruleSet
+            run self.sets.asMutSlice()[set.index].rules.append(index)
+            run self.rules.append(
+              StyleRule {
+                selectors: move value,
+                buffer: buffer,
+                declarations: declarations,
+                origin: origin,
+              },
+            )
+          }
+          _ => {}
+        }
+      } else {
+        let name = self.buffers.asSlice()[buffer].text(rule.name)
+        if insensitive(name, b"import") {
+          if importsAllowed && rule.kind == RuleKind.AtStatement {
+            run self.importSheet(buffer, rule.prelude, origin, environment, limits, depth + 1)
+          }
+        } else if insensitive(name, b"namespace") {
+          if namespacesAllowed && rule.kind == RuleKind.AtStatement {
+            let binding = namespace(&self.buffers.asSlice()[buffer], rule.prelude)
+            match &binding {
+              Option<NamespaceBinding>.Some { value } => {
+                run bindings.append(value)
+                importsAllowed = false
+              }
+              _ => {}
+            }
+          }
+        } else if insensitive(name, b"media") && rule.kind == RuleKind.AtBlock {
+          // Invalid media-query arms are replaced by not all, not discarded at-rules.
+          importsAllowed = false
+          namespacesAllowed = false
+          let input = Input.Contiguous {
+            buffer: &self.buffers.asSlice()[buffer],
+            range: rule.prelude,
+          }
+          if run media_queries.matches(&input, environment, limits) {
+            run self.collect(
+              buffer,
+              rule.body,
+              bindings.asSlice(),
+              false,
+              origin,
+              environment,
+              limits,
+              depth + 1,
+            )
+          }
+        } else if insensitive(name, b"supports") && rule.kind == RuleKind.AtBlock {
+          let input = Input.Contiguous {
+            buffer: &self.buffers.asSlice()[buffer],
+            range: rule.prelude,
+          }
+          let result = run supports.evaluate(&input, &mut self.engine.values, limits)
+          if result.valid {
+            importsAllowed = false
+            namespacesAllowed = false
+            if result.value {
+              run self.collect(
+                buffer,
+                rule.body,
+                bindings.asSlice(),
+                false,
+                origin,
+                environment,
+                limits,
+                depth + 1,
+              )
+            }
+          }
+        } else if (insensitive(name, b"font-face") || insensitive(name, b"keyframes"))
+          && rule.kind == RuleKind.AtBlock {
+          importsAllowed = false
+          namespacesAllowed = false
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn importSheet(
+    self: &mut Self,
+    buffer: usize,
+    range: TokenRange,
+    origin: Origin,
+    environment: &Environment,
+    limits: &Limits,
+    depth: usize,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let sheet = &self.buffers.asSlice()[buffer]
+    let reference = address(sheet, range.start, range.end)
+    if !reference.valid {
+      return
+    }
+    let mut at = skip(sheet, reference.next, range.end)
+    if at < range.end {
+      let token = &sheet.tokens.asSlice()[at]
+      match &token.kind {
+        Kind.Function { name } => {
+          if insensitive(sheet.text(name), b"supports") {
+            if token.matching > range.end {
+              return
+            }
+            let input = Input.Contiguous {
+              buffer: sheet,
+              range: TokenRange { start: at + 1, end: token.matching },
+            }
+            let result = run supports.evaluateImport(&input, &mut self.engine.values, limits)
+            if !result.valid || !result.value {
+              return
+            }
+            at = if token.matching < range.end {
+              token.matching + 1
+            } else {
+              range.end
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+    let media = Input.Contiguous { buffer: sheet, range: TokenRange { start: at, end: range.end } }
+    if !run media_queries.matches(&media, environment, limits) {
+      return
+    }
+    if depth >= limits.maxDepth {
+      fail CssError { kind: CssErrorKind.NestingLimit, offset: range.start }
+    }
+    let parent = self.sources.asSlice()[buffer]
+    let resolved = run Effect.result(
+      Url.resolve(&self.urls.asSlice()[parent.url], sheet.text(reference.text)),
+    )
+    let url = match move resolved {
+      Result<Url, UrlError | OutOfMemoryError>.Success { value } => move value
+      Result<Url, UrlError | OutOfMemoryError>.Failure { error } => match move error {
+        UrlError invalid => {
+          if invalid == UrlError.InputLimit {
+            fail CssError { kind: CssErrorKind.InputLimit, offset: range.start }
+          }
+          return
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    run self.loadSheet(
+      parent.ruleSet,
+      move url,
+      parent.encoding,
+      origin,
+      environment,
+      limits,
+      depth,
+    )
+  }
+
+  effect fn loadSheet(
+    self: &mut Self,
+    rules: RuleSetId,
+    url: Url,
+    environmentEncoding: Encoding,
+    origin: Origin,
+    environment: &Environment,
+    limits: &Limits,
+    depth: usize,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if rules.index >= self.sets.length() {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    let policy = self.sets.asSlice()[rules.index].policy
+
+    // Authorization belongs to the consumer, even when raw bytes are cached.
+    if policy.mode.isSecure() && !equal(Url.scheme(&url), b"data") {
+      return
+    }
+    if depth >= limits.maxDepth {
+      fail CssError { kind: CssErrorKind.NestingLimit, offset: 0 }
+    }
+    let mut active: usize = 0
+    while active < self.active.length() {
+      if equal(
+        Url.withoutFragment(&url),
+        Url.withoutFragment(&self.urls.asSlice()[self.active.asSlice()[active]]),
+      ) {
+        return
+      }
+      active = active + 1
+    }
+    let mut cached: usize = 0
+    while cached < self.cache.length() {
+      if equal(
+        Url.withoutFragment(&url),
+        Url.withoutFragment(&self.urls.asSlice()[self.cache.asSlice()[cached].request]),
+      )
+        || equal(
+          Url.withoutFragment(&url),
+          Url.withoutFragment(&self.urls.asSlice()[self.cache.asSlice()[cached].url]),
+        ) {
+        break
+      }
+      cached = cached + 1
+    }
+    if cached == self.cache.length() {
+      let fetched = run Effect.result(
+        resources.fetchWithPolicy(&url, ResourceKind.StyleSheet, &policy),
+      )
+      let response = match move fetched {
+        Result<Response, ResourceError | OutOfMemoryError>.Success { value } => move value
+        Result<Response, ResourceError | OutOfMemoryError>.Failure { error } => match move error {
+          ResourceError failure => {
+            if failure == ResourceError.TooLarge {
+              fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+            }
+            return
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+      if Bytes.length(&response.bytes) > limits.maxInputBytes - self.inputBytes {
+        fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+      }
+      run charge(
+        &mut self.storageBytes,
+        Bytes.length(&response.bytes),
+        limits.maxStorageBytes,
+        CssErrorKind.StorageLimit,
+      )
+      let inspected = run Effect.result(sheetMetadata(&url, &response))
+      let metadata = match move inspected {
+        Result<SheetMetadata, ResourceError | OutOfMemoryError>.Success { value } => move value
+        Result<SheetMetadata, ResourceError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          ResourceError invalid => {
+            return
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+      let request = self.urls.length()
+      run self.urls.append(move url)
+      let base = match move response.finalUrl {
+        Option<Url>.Some { value } => run self.registerBase(move value)
+        _ => request
+      }
+      run self.cache.append(
+        Cached {
+          request: request,
+          url: base,
+          bytes: move response.bytes,
+          protocol: metadata.protocol,
+          supported: metadata.supported,
+        },
+      )
+    }
+    let entry = &self.cache.asSlice()[cached]
+    if Bytes.length(&entry.bytes) > policy.limits.maxResourceBytes {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    if !entry.supported {
+      return
+    }
+    let urlIndex = entry.url
+
+    // A redirect can close an import cycle even when its request URL did not.
+    active = 0
+    while active < self.active.length() {
+      if equal(
+        Url.withoutFragment(&self.urls.asSlice()[urlIndex]),
+        Url.withoutFragment(&self.urls.asSlice()[self.active.asSlice()[active]]),
+      ) {
+        return
+      }
+      active = active + 1
+    }
+    let decoded = run encoding.decodeStylesheet(
+      Bytes.asSlice(&entry.bytes),
+      entry.protocol,
+      Option<Encoding>.Some { value: environmentEncoding },
+      limits.maxInputBytes - self.inputBytes,
+    )
+    let imported = run self.buffer(
+      Bytes.asSlice(&decoded.bytes),
+      Source { url: urlIndex, encoding: decoded.encoding, ruleSet: rules },
+      limits,
+    )
+    run self.active.append(urlIndex)
+    let bindings = List<NamespaceBinding>.make()
+    let all = self.buffers.asSlice()[imported].all()
+    run self.collect(imported, all, bindings.asSlice(), true, origin, environment, limits, depth)
+    let removed = self.active.pop()
+  }
+
+  effect fn prepareIndex(self: &mut Self, rules: RuleSetId) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let set = &mut self.sets.asMutSlice()[rules.index]
+    if set.index.ready(set.rules.length()) {
+      return
+    }
+    set.index.clear()
+    let mut i: usize = 0
+    while i < set.rules.length() {
+      let rule = &self.rules.asSlice()[set.rules.asSlice()[i]]
+      run set.index.add(&rule.selectors, &self.buffers.asSlice()[rule.buffer])
+      i = i + 1
+    }
+    run set.index.finish()
+  }
+
+  pub effect fn matching<T: ElementTree>(
+    self: &mut Self,
+    rules: RuleSetId,
+    tree: &T,
+    node: usize,
+    context: &mut MatchContext,
+  ) -> List<Candidate>
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    if rules.index >= self.sets.length() {
+      fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+    }
+    let mut result = List<Candidate>.make()
+    let mut selected: usize = 0
+    while true {
+      let id = RuleSetId { index: selected }
+      run self.prepareIndex(id)
+      let set = &mut self.sets.asMutSlice()[selected]
+      run set.index.collect(tree, node, &mut context.*)
+      let indices = set.index.candidates()
+      let mut i: usize = 0
+      while i < indices.length {
+        let rule = &self.rules.asSlice()[set.rules.asSlice()[indices[i]]]
+        let specificity = run selectors.matchElement(
+          &rule.selectors,
+          &self.buffers.asSlice()[rule.buffer],
+          tree,
+          node,
+          &mut context.*,
+        )
+        match &specificity {
+          Option<Specificity>.Some { value } => {
+            let mut declaration = rule.declarations.start
+            while declaration < rule.declarations.end {
+              let mut priority = Priority.make(rule.origin, declaration + 1)
+              priority.specificity = value
+              run result.append(Candidate { declaration: declaration, priority: priority })
+              declaration = declaration + 1
+            }
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+      if selected == rules.index {
+        break
+      }
+      selected = rules.index
+    }
+    return move result
+  }
+}

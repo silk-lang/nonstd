@@ -1,0 +1,148 @@
+//! PNG encoding only: straight-alpha RGBA8, noninterlaced, sRGB perceptual intent.
+//! DEFLATE, zlib framing/Adler-32 and PNG CRC-32 come from the installed Silk stdlib.
+// LIMITATION-5: no stdlib PNG codec: https://github.com/silk-lang/silk/issues/2564.
+import image { Image, ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.compress.checksum { CompressionChecksum }
+import silk.compress.deflate { Deflate, EncodeError }
+import silk.compress.inflate { Format }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// Encodes an owned image without copying its premultiplied source storage.
+pub effect fn encode(image: &Image) -> Bytes
+  ! ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  return run encodePixels(Image.width(image), Image.height(image), Image.data(image))
+}
+
+/// Encodes borrowed, tightly packed, top-to-bottom premultiplied sRGB RGBA8 as one PNG.
+/// Validates dimensions and exact slice length before allocation; source storage is unchanged.
+/// RGB is demultiplied with nearest-integer rounding; alpha-zero pixels become black.
+/// Channels above alpha saturate to 255 rather than trapping.
+/// Uses filter type None for every scanline. No image decoding is provided here.
+///
+/// With n = width * height * 4 + height filtered bytes, temporary scanlines use n bytes,
+/// the returned buffer reserves n + ceil(n / 8) + 78 bytes, and stdlib compression uses
+/// 32768 usize entries. Image's pixel ceiling keeps each allocation below 2^31 bytes.
+/// InvalidDimensions, TooLarge and LengthMismatch reject invalid input before allocation.
+/// OutOfMemoryError propagates; CompressionFailed reports an exhausted stdlib output bound.
+pub effect fn encodePixels(pixelWidth: u32, pixelHeight: u32, source: &[u8]) -> Bytes
+  ! ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let length = run Image.validateSize(pixelWidth, pixelHeight)
+  if source.length != length {
+    fail ImageError.LengthMismatch
+  }
+  let width = u32.toUsize(pixelWidth)
+  let height = u32.toUsize(pixelHeight)
+
+  // Size validation proves: 1 <= width,height and width*height <= 2^26.
+  // Thus source.length <= 2^28, rawLength <= 5*2^26; all sums fit wasm32 usize.
+  let rawLength = source.length + height
+  let mut scanlines = run Bytes.zeroed(rawLength)
+  let mut raw = Bytes.asMutSlice(&mut scanlines)
+  let mut sourceOffset: usize = 0
+  let mut targetOffset: usize = 0
+  let mut row: usize = 0
+  while row < height {
+    // The zeroed byte is the PNG None filter selector for this row.
+    targetOffset = targetOffset + 1
+    let mut column: usize = 0
+    while column < width {
+      let alpha = source[sourceOffset + 3]
+      raw[targetOffset] = straight(source[sourceOffset], alpha)
+      raw[targetOffset + 1] = straight(source[sourceOffset + 1], alpha)
+      raw[targetOffset + 2] = straight(source[sourceOffset + 2], alpha)
+      raw[targetOffset + 3] = alpha
+      sourceOffset = sourceOffset + 4
+      targetOffset = targetOffset + 4
+      column = column + 1
+    }
+    row = row + 1
+  }
+  drop raw
+
+  // dev.27 Deflate uses one fixed-Huffman block. Literals cost at most 9 bits;
+  // A match costs at most 9 bits per replaced byte (length 3: at most 25 bits).
+  // Add 3 block-header bits, 7 end bits, byte padding and 6 zlib wrapper bytes.
+  // LIMITATION-3: no capacity API: https://github.com/silk-lang/silk/issues/2565.
+  let compressedBound = rawLength + usize.divide(rawLength + 7, 8) + 8
+
+  // Compress directly into the final IDAT payload, avoiding a compressed-buffer copy.
+  // Signature + IHDR + sRGB precede its eight-byte header; CRC + IEND follow it.
+  let mut output = run Bytes.zeroed(compressedBound + 70)
+  let mut bytes = Bytes.asMutSlice(&mut output)
+  let compressedLength = run Effect.catch<EncodeError>(
+    Deflate.encode(
+      Bytes.asSlice(&scanlines),
+      Slice.viewMut<u8>(&mut bytes, 54, compressedBound),
+      Format.Zlib,
+    ),
+    compressionFailed,
+  )
+  drop scanlines
+
+  let signature = b"\x89PNG\r\n\x1a\n"
+  let mut index: usize = 0
+  while index < signature.length {
+    bytes[index] = signature[index]
+    index = index + 1
+  }
+  write32(&mut bytes, 16, pixelWidth)
+  write32(&mut bytes, 20, pixelHeight)
+  bytes[24] = 8
+  bytes[25] = 6
+
+  // IHDR compression, filtering and interlace methods are the initialized zeros.
+  finishChunk(&mut bytes, 8, 13, b"IHDR")
+
+  // The one-byte sRGB rendering intent is zero (perceptual).
+  finishChunk(&mut bytes, 33, 1, b"sRGB")
+  finishChunk(&mut bytes, 46, compressedLength, b"IDAT")
+  finishChunk(&mut bytes, 58 + compressedLength, 0, b"IEND")
+  drop bytes
+  Bytes.truncate(&mut output, compressedLength + 70)
+  return move output
+}
+
+fn straight(channel: u8, alpha: u8) -> u8 {
+  if alpha == 0 {
+    return 0
+  }
+  if channel >= alpha {
+    return 255
+  }
+  let a = u8.toU32(alpha)
+  return u32.toU8(u32.divide(u8.toU32(channel) * 255 + u32.divide(a, 2), a))
+}
+
+effect fn compressionFailed(error: EncodeError) -> usize
+  ! ImageError {
+  fail ImageError.CompressionFailed
+}
+
+fn write32(output: &mut [u8], offset: usize, value: u32) -> () {
+  output[offset] = u32.toU8(u32.shiftRight(value, 24))
+  output[offset + 1] = u32.toU8(u32.bitAnd(u32.shiftRight(value, 16), 255))
+  output[offset + 2] = u32.toU8(u32.bitAnd(u32.shiftRight(value, 8), 255))
+  output[offset + 3] = u32.toU8(u32.bitAnd(value, 255))
+}
+
+// Every caller supplies a preallocated range and a fixed four-byte chunk type.
+// The image limit proves length < 2^31, including the worst-case IDAT bound.
+fn finishChunk(output: &mut [u8], offset: usize, length: usize, name: &[u8]) -> () {
+  write32(&mut output, offset, usize.toU32(length))
+  let mut index: usize = 0
+  while index < 4 {
+    output[offset + 4 + index] = name[index]
+    index = index + 1
+  }
+  let end = offset + 8 + length
+  let crc = CompressionChecksum.crc32(Slice.view<u8>(&output, offset + 4, end - offset - 4))
+  write32(&mut output, end, crc)
+}

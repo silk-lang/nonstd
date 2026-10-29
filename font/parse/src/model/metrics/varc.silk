@@ -1,0 +1,1243 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Variable composite control bounds, following model/glyph/outline/varc.rs.
+import model.metrics.base_outline { BaseOutlines, ControlBounds }
+import model.optional { Maybe }
+import model.error { Error }
+import table_provider { TableProvider }
+import tables.varc {
+  Varc,
+  VarcGlyph,
+  VarcComponent,
+  VarcComponentIter,
+  VarcFlags,
+  DecomposedTransform,
+  MultiItemVariationStore,
+  MultiItemVariationData,
+  SparseVariationRegionList,
+  SparseVariationRegion,
+  ConditionList
+}
+import tables.layout { CoverageTable, Condition }
+import tables.fvar { Fvar }
+import tables.gvar { Gvar, GvarExtended }
+import tables.cff2 { Cff2 }
+import tables.variations {
+  PackedDeltas,
+  DeltaRunIter,
+  PackedDeltaFetcher,
+  ItemVariationStore,
+  VariationRegionList
+}
+import ps.cff.font { CffFontRef }
+import ps.cff.index { Index2 }
+import font_data { FontData }
+import font_types.lib { GlyphId, F2Dot14, Offset32, Matrix, BoundingBox }
+import array { ScalarArray }
+import offset_array { ArrayOfOffsets }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.num.u16
+import silk.num.u32
+import silk.num.i32
+import silk.num.f32
+import silk.num.f64
+
+pub struct VarcOutlines<'a> {
+  table: Varc<'a>,
+  coverage: CoverageTable<'a>,
+  store: Maybe<MultiItemVariationStore<'a>>,
+  regions: Maybe<SparseVariationRegionList<'a>>,
+  axisCount: usize,
+}
+
+impl<'a> Copy for VarcOutlines<'a> {}
+
+effect fn read<T>(result: Result<T, ReadError>) -> T
+  ! Error {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    _ => {
+      fail Error.Malformed
+    }
+  }
+}
+
+effect fn require<T>(option: Option<T>) -> T
+  ! Error {
+  return match move option {
+    Option<T>.Some { value } => move value
+    _ => {
+      fail Error.Malformed
+    }
+  }
+}
+
+effect fn optional<T: Copy>(option: Option<Result<T, ReadError>>) -> Maybe<T>
+  ! Error {
+  if let Option<Result<T, ReadError>>.Some { value } = move option {
+    return Maybe<T>.Some { value: run read(move value) }
+  }
+  return Maybe<T>.None
+}
+
+impl<'a> VarcOutlines<'a> {
+  pub fn read<P: TableProvider<'a>>(provider: &P) -> Maybe<Self> {
+    return Maybe<Self>.fromResult(run Effect.result(VarcOutlines.fromProvider(provider)))
+  }
+
+  effect fn fromProvider<P: TableProvider<'a>>(provider: &P) -> Self
+    ! Error {
+    let table = run read(TableProvider.varc(provider))
+    let mut axes: usize = 0
+    if let Result<Fvar<'a>, ReadError>.Success { value } = TableProvider.fvar(provider) {
+      axes = u16.toUsize(Fvar.axisCount(&value))
+    }
+    if let Result<Gvar<'a>, ReadError>.Success { value } = TableProvider.gvar(provider) {
+      let count = u16.toUsize(Gvar.axisCount(&value))
+      if count > axes {
+        axes = count
+      }
+    }
+    if let Result<GvarExtended<'a>, ReadError>.Success { value } = TableProvider.gvarExtended(
+      provider,
+    ) {
+      let count = u16.toUsize(GvarExtended.axisCount(&value))
+      if count > axes {
+        axes = count
+      }
+    }
+    if let Result<Cff2<'a>, ReadError>.Success { value } = TableProvider.cff2(provider) {
+      if let Result<CffFontRef<'a>, Error>.Success { value: font } = CffFontRef.new(
+        FontData.asBytes(&Cff2.offsetData(&value)),
+        0,
+        Option<i32>.None,
+      ) {
+        if let Option<ItemVariationStore<'a>>.Some { value: store } = CffFontRef.varStore(&font) {
+          if let Result<VariationRegionList<'a>, ReadError>.Success {
+            value: regions
+          } = ItemVariationStore.variationRegionList(&store) {
+            let count = u16.toUsize(VariationRegionList.axisCount(&regions))
+            if count > axes {
+              axes = count
+            }
+          }
+        }
+      }
+    }
+    return run VarcOutlines.new(table, axes)
+  }
+
+  pub effect fn new(table: Varc<'a>, axisCount: usize) -> Self
+    ! Error {
+    let coverage = run read(Varc.coverage(&table))
+    let store = run optional(Varc.multiVarStore(&table))
+    let mut regions = Maybe<SparseVariationRegionList<'a>>.None
+    if let Maybe<MultiItemVariationStore<'a>>.Some { value } = store {
+      regions = Maybe<SparseVariationRegionList<'a>>.Some {
+        value: run read(MultiItemVariationStore.regionList(&value))
+      }
+    }
+    drop run optional(Varc.axisIndicesList(&table))
+    return Self {
+      table: table,
+      coverage: coverage,
+      store: store,
+      regions: regions,
+      axisCount: axisCount,
+    }
+  }
+
+  pub fn covers(self: &Self, glyph: GlyphId) -> bool {
+    return match move CoverageTable.get(&self.coverage, glyph) {
+      Option<u32>.Some { value } => true
+      _ => false
+    }
+  }
+
+  pub effect fn controlBox(
+    self: &Self,
+    base: &BaseOutlines<'a>,
+    glyph: GlyphId,
+    coords: &[F2Dot14],
+  ) -> BoundingBox<f32>
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    let index = run require(CoverageTable.get(&self.coverage, glyph))
+    let mut walk = Walk.new()
+    run VarcOutlines.measure(self, glyph, index, &mut walk)
+    walk = Walk.new()
+    let mut sink = ControlBounds.new(Matrix.identity<f32>())
+    run VarcOutlines.draw(
+      self,
+      base,
+      glyph,
+      index,
+      coords,
+      coords,
+      Matrix.identity<f32>(),
+      &mut walk,
+      &mut sink,
+    )
+    return ControlBounds.finish(&sink)
+  }
+
+  effect fn measure(self: &Self, glyph: GlyphId, index: u32, walk: &mut Walk) -> ()
+    ! Error {
+    run Walk.push(&mut walk, glyph)
+    let record = run read(Varc.glyph(&self.table, u32.toUsize(index)))
+    let mut components = VarcGlyph.components(&record)
+    while let Option<Result<VarcComponent<'a>, ReadError>>.Some { value } = VarcComponentIter.next(
+      &mut components,
+    ) {
+      let component = run read(move value)
+      let gid = VarcComponent.gid(&component)
+      if &gid != &glyph {
+        if let Option<u32>.Some { value: child } = CoverageTable.get(&self.coverage, gid) {
+          if !Walk.contains(&walk, gid) {
+            run VarcOutlines.measure(self, gid, child, &mut walk)
+            continue
+          }
+        }
+      }
+      run Walk.edge(&mut walk)
+    }
+    walk.depth = walk.depth - 1
+  }
+
+  effect fn draw(
+    self: &Self,
+    base: &BaseOutlines<'a>,
+    glyph: GlyphId,
+    index: u32,
+    coords: &[F2Dot14],
+    root: &[F2Dot14],
+    matrix: Matrix<f32>,
+    walk: &mut Walk,
+    sink: &mut ControlBounds,
+  ) -> ()
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    run Walk.push(&mut walk, glyph)
+    let record = run read(Varc.glyph(&self.table, u32.toUsize(index)))
+    let mut components = VarcGlyph.components(&record)
+    while let Option<Result<VarcComponent<'a>, ReadError>>.Some { value } = VarcComponentIter.next(
+      &mut components,
+    ) {
+      let component = run read(move value)
+      if !(run VarcOutlines.condition(self, &component, coords)) {
+        continue
+      }
+      let flags = VarcComponent.flags(&component)
+      let same = !VarcFlags.contains(&flags, VarcFlags.haveAxes())
+        && !VarcFlags.contains(&flags, VarcFlags.resetUnspecifiedAxes())
+      let mut changed = List<F2Dot14>.make()
+      if !same {
+        changed = run VarcOutlines.componentCoords(self, &component, coords, root)
+      }
+      let mut childCoords = coords
+      if !same {
+        childCoords = List<F2Dot14>.asSlice(&changed)
+      }
+      let transform = run VarcOutlines.transform(self, &component, coords)
+      let childMatrix = matrix * DecomposedTransform.matrix(&transform)
+      let gid = VarcComponent.gid(&component)
+      if &gid != &glyph {
+        if let Option<u32>.Some { value: child } = CoverageTable.get(&self.coverage, gid) {
+          if !Walk.contains(&walk, gid) {
+            run VarcOutlines.draw(
+              self,
+              base,
+              gid,
+              child,
+              childCoords,
+              root,
+              childMatrix,
+              &mut walk,
+              &mut sink,
+            )
+          } else {
+            run Walk.edge(&mut walk)
+          }
+          continue
+        }
+      }
+      run Walk.edge(&mut walk)
+      sink.matrix = childMatrix
+      run BaseOutlines.draw(base, gid, childCoords, &mut sink)
+    }
+    walk.depth = walk.depth - 1
+  }
+
+  effect fn componentCoords(
+    self: &Self,
+    component: &VarcComponent<'a>,
+    coords: &[F2Dot14],
+    root: &[F2Dot14],
+  ) -> List<F2Dot14>
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    let mut source = coords
+    if VarcFlags.contains(&VarcComponent.flags(component), VarcFlags.resetUnspecifiedAxes()) {
+      source = root
+    }
+    let mut out = List<F2Dot14>.make()
+    let mut i: usize = 0
+    while i < self.axisCount {
+      let mut coord = F2Dot14.zero()
+      if i < source.length {
+        coord = source[i]
+      }
+      run List<F2Dot14>.append(&mut out, coord)
+      i = i + 1
+    }
+    if !VarcFlags.contains(&VarcComponent.flags(component), VarcFlags.haveAxes()) {
+      return move out
+    }
+    let index = run require(VarcComponent.axisIndicesIndex(component))
+    let packed = run read(Varc.axisIndices(&self.table, u32.toUsize(index)))
+    let mut indices = List<u16>.make()
+    let mut iter = PackedDeltas.iter(&packed)
+    while let Option<i32>.Some { value } = DeltaRunIter.next(&mut iter) {
+      if value < 0 || value > 65535 {
+        fail Error.Malformed
+      }
+      run List<u16>.append(&mut indices, i32.toU16(value))
+    }
+    let valuesPacked = match move VarcComponent.axisValues(component) {
+      Option<PackedDeltas<'a>>.Some { value } => value
+      _ => {
+        return move out
+      }
+    }
+    let mut values = List<f64>.make()
+    let mut valuesIter = PackedDeltas.iter(&valuesPacked)
+    i = 0
+    while i < List<u16>.length(&indices) {
+      let value = DeltaRunIter.next(&mut valuesIter) |> Option<i32>.unwrapOr(0)
+      run List<f64>.append(&mut values, i32.toF64(value))
+      i = i + 1
+    }
+    if let Option<u32>.Some { value: varIndex } = VarcComponent.axisValuesVarIndex(component) {
+      if varIndex != 4294967295 && List<f64>.length(&values) != 0 {
+        let mut deltas = List<f64>.make()
+        i = 0
+        while i < List<f64>.length(&values) {
+          run List<f64>.append(&mut deltas, 0.0)
+          i = i + 1
+        }
+        run VarcOutlines.deltas(self, varIndex, coords, List<f64>.asMutSlice(&mut deltas))
+        i = 0
+        while i < List<f64>.length(&values) {
+          let sum = List<f64>.get(&values, i) + List<f64>.get(&deltas, i)
+          List<f64>.set(&mut values, i, sum)
+          i = i + 1
+        }
+      }
+    }
+    i = 0
+    while i < List<u16>.length(&indices) {
+      let axis = u16.toUsize(List<u16>.get(&indices, i))
+      if axis >= self.axisCount {
+        fail Error.Malformed
+      }
+      let mut value = f64.round(List<f64>.get(&values, i))
+      if value < -32768.0 {
+        value = -32768.0
+      }
+      if value > 32767.0 {
+        value = 32767.0
+      }
+      List<F2Dot14>.set(&mut out, axis, F2Dot14.fromBits(f64.toI16(value)))
+      i = i + 1
+    }
+    return move out
+  }
+
+  effect fn condition(self: &Self, component: &VarcComponent<'a>, coords: &[F2Dot14]) -> bool
+    ! Error {
+    let index = match move VarcComponent.conditionIndex(component) {
+      Option<u32>.Some { value } => u32.toUsize(value)
+      _ => {
+        return true
+      }
+    }
+    let list = run read(run require(Varc.conditionList(&self.table)))
+    let offsets = ConditionList.conditionOffsets(&list)
+    if Offset32.toU32(run require(ScalarArray<Offset32>.get(&offsets, index))) == 0 {
+      return true
+    }
+    let condition = run read(
+      ArrayOfOffsets<'a, (), Condition<'a>, Offset32>.get(&ConditionList.conditions(&list), index),
+    )
+    return match move Condition.evaluate(
+      &condition,
+      coords,
+      fn(index: u32) -> Result<f64, Error> {
+        let mut delta = [0.0]
+        let result = run Effect.result(VarcOutlines.deltas(self, index, coords, &mut delta))
+        return match move result {
+          Result<(), Error>.Success { value } => Result<f64, Error>.succeed(delta[0])
+          Result<(), Error>.Failure { error } => Result<f64, Error>.failResult(error)
+        }
+      },
+    ) {
+      Result<bool, Error>.Success { value } => value
+      Result<bool, Error>.Failure { error } => {
+        fail error
+      }
+    }
+  }
+
+  effect fn deltas(self: &Self, index: u32, coords: &[F2Dot14], out: &mut [f64]) -> ()
+    ! Error {
+    let mut i: usize = 0
+    while i < out.length {
+      out[i] = 0.0
+      i = i + 1
+    }
+    if out.length == 0 || index == 4294967295 {
+      return
+    }
+    let store = match self.store {
+      Maybe<MultiItemVariationStore<'a>>.Some { value } => value
+      _ => {
+        fail Error.Malformed
+      }
+    }
+    let regions = match self.regions {
+      Maybe<SparseVariationRegionList<'a>>.Some { value } => SparseVariationRegionList.regions(
+        &value,
+      )
+      _ => {
+        fail Error.Malformed
+      }
+    }
+    let data = run read(
+      ArrayOfOffsets<'a, (), MultiItemVariationData<'a>, Offset32>.get(
+        &MultiItemVariationStore.variationData(&store),
+        u32.toUsize(u32.shiftRight(index, 16)),
+      ),
+    )
+    let packed = run read(
+      MultiItemVariationData.deltaSet(&data, u32.toUsize(u32.bitAnd(index, 65535))),
+    )
+    let mut fetcher = PackedDeltas.fetcher(&packed)
+    let indices = MultiItemVariationData.regionIndices(&data)
+    let mut skip: usize = 0
+    i = 0
+    while i < ScalarArray<u16>.len(&indices) {
+      let regionIndex = u16.toUsize(run require(ScalarArray<u16>.get(&indices, i)))
+      let region = run read(
+        ArrayOfOffsets<'a, (), SparseVariationRegion<'a>, Offset32>.get(&regions, regionIndex),
+      )
+      let scalar = SparseVariationRegion.computeScalarF32(&region, coords)
+      if scalar == 0.0 {
+        skip = run require(usize.checkedAdd(skip, out.length))
+      } else {
+        if skip != 0 {
+          drop run read(PackedDeltaFetcher.skip(&mut fetcher, skip))
+          skip = 0
+        }
+        drop run read(PackedDeltaFetcher.addToF64Scaled(&mut fetcher, &mut out, f32.toF64(scalar)))
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn transform(
+    self: &Self,
+    component: &VarcComponent<'a>,
+    coords: &[F2Dot14],
+  ) -> DecomposedTransform
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    let mut transform = VarcComponent.transform(component)
+    let index = match move VarcComponent.transformVarIndex(component) {
+      Option<u32>.Some { value } => value
+      _ => {
+        return transform
+      }
+    }
+    let flags = VarcComponent.flags(component)
+    let fields = [
+      VarcFlags.haveTranslateX(),
+      VarcFlags.haveTranslateY(),
+      VarcFlags.haveRotation(),
+      VarcFlags.haveScaleX(),
+      VarcFlags.haveScaleY(),
+      VarcFlags.haveSkewX(),
+      VarcFlags.haveSkewY(),
+      VarcFlags.haveTcenterX(),
+      VarcFlags.haveTcenterY(),
+    ]
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < 9 {
+      if VarcFlags.contains(&flags, fields[i]) {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    if count == 0 || index == 4294967295 {
+      return transform
+    }
+    let mut deltas = [0.0; 9]
+
+    // A fixed scratch array avoids allocation in condition callbacks as well.
+    let mut packed = List<f64>.make()
+    i = 0
+    while i < count {
+      run List<f64>.append(&mut packed, 0.0)
+      i = i + 1
+    }
+    run VarcOutlines.deltas(self, index, coords, List<f64>.asMutSlice(&mut packed))
+    let mut at: usize = 0
+    i = 0
+    while i < 9 {
+      if VarcFlags.contains(&flags, fields[i]) {
+        deltas[i] = List<f64>.get(&packed, at)
+        at = at + 1
+      }
+      i = i + 1
+    }
+    let prior = transform
+    DecomposedTransform.setTranslateX(
+      &mut transform,
+      DecomposedTransform.translateX(&prior) + f64.toF32(deltas[0]),
+    )
+    DecomposedTransform.setTranslateY(
+      &mut transform,
+      DecomposedTransform.translateY(&prior) + f64.toF32(deltas[1]),
+    )
+    DecomposedTransform.setRotation(
+      &mut transform,
+      DecomposedTransform.rotation(&prior) + f64.toF32(deltas[2]) / 4096.0,
+    )
+    DecomposedTransform.setScaleX(
+      &mut transform,
+      DecomposedTransform.scaleX(&prior) + f64.toF32(deltas[3]) / 1024.0,
+    )
+    DecomposedTransform.setScaleY(
+      &mut transform,
+      DecomposedTransform.scaleY(&prior) + f64.toF32(deltas[4]) / 1024.0,
+    )
+    DecomposedTransform.setSkewX(
+      &mut transform,
+      DecomposedTransform.skewX(&prior) + f64.toF32(deltas[5]) / 4096.0,
+    )
+    DecomposedTransform.setSkewY(
+      &mut transform,
+      DecomposedTransform.skewY(&prior) + f64.toF32(deltas[6]) / 4096.0,
+    )
+    DecomposedTransform.setCenterX(
+      &mut transform,
+      DecomposedTransform.centerX(&prior) + f64.toF32(deltas[7]),
+    )
+    DecomposedTransform.setCenterY(
+      &mut transform,
+      DecomposedTransform.centerY(&prior) + f64.toF32(deltas[8]),
+    )
+    if !VarcFlags.contains(&flags, VarcFlags.haveScaleY()) {
+      let scale = DecomposedTransform.scaleX(&transform)
+      DecomposedTransform.setScaleY(&mut transform, scale)
+    }
+    return transform
+  }
+}
+
+struct Walk {
+  stack: [GlyphId; 64],
+  depth: usize,
+  edges: usize,
+}
+
+impl Walk {
+  fn new() -> Self {
+    return Self { stack: [GlyphId.new(0); 64], depth: 0, edges: 2048 }
+  }
+
+  effect fn edge(self: &mut Self) -> ()
+    ! Error {
+    if self.edges == 0 {
+      fail Error.LimitExceeded
+    }
+    self.edges = self.edges - 1
+  }
+
+  effect fn push(self: &mut Self, glyph: GlyphId) -> ()
+    ! Error {
+    if self.depth >= 64 {
+      fail Error.LimitExceeded
+    }
+    run Walk.edge(&mut self)
+    self.stack[self.depth] = glyph
+    self.depth = self.depth + 1
+  }
+
+  fn contains(self: &Self, glyph: GlyphId) -> bool {
+    let mut i: usize = 0
+    while i < self.depth {
+      if &self.stack[i] == &glyph {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+}
+
+// Upstream model/glyph/outline/varc.rs tests; scratch-layout-only tests do not
+// apply to the allocator-backed metrics traversal.
+import font { FontRef }
+import generated_misc_table_fixtures as ModelFixtures
+import silk.testing.testing { Testing, AssertionError }
+
+effect fn vmMust<T>(result: Result<T, Error>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, Error>.Success { value } => move value
+    _ => {
+      run Testing.expect(false, "VARC model operation succeeds")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+effect fn vmRead<T>(result: Result<T, ReadError>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    _ => {
+      run Testing.expect(false, "VARC model fixture reads")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+effect fn vmReal() -> VarcOutlines<'static>
+  ! AssertionError<'static> {
+  let font = run vmRead(FontRef.new(ModelFixtures.varcCjkFont()))
+  return match VarcOutlines.read(&font) {
+    Maybe<VarcOutlines<'static>>.Some { value } => value
+    _ => {
+      run Testing.expect(false, "VARC source")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+effect fn vmTable<'b>(bytes: &'b [u8], axes: usize) -> VarcOutlines<'b>
+  ! AssertionError<'static> {
+  let table = run vmRead(Varc.read(FontData.new(bytes)))
+  return run vmMust(run Effect.result(VarcOutlines.new(table, axes)))
+}
+
+effect fn vmFirst<'b>(outlines: &VarcOutlines<'b>) -> VarcComponent<'b>
+  ! AssertionError<'static> {
+  let glyph = run vmRead(Varc.glyph(&outlines.table, 0))
+  let mut iter = VarcGlyph.components(&glyph)
+  return match move VarcComponentIter.next(&mut iter) {
+    Option<Result<VarcComponent<'b>, ReadError>>.Some { value } => run vmRead(move value)
+    _ => {
+      run Testing.expect(false, "component")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+fn vmLimit<T>(result: Result<T, Error>) -> bool {
+  return match move result {
+    Result<T, Error>.Failure { error: Error.LimitExceeded } => true
+    _ => false
+  }
+}
+
+fn vmError<T>(result: Result<T, Error>) -> bool {
+  return match move result {
+    Result<T, Error>.Failure { error } => true
+    _ => false
+  }
+}
+
+fn vmBase<'b>() -> BaseOutlines<'b> {
+  return BaseOutlines<'b> {
+    glyf: Maybe<GlyfLoca<'b>>.None,
+    gvar: Maybe<SelectedGvar<'b>>.None,
+    hMetrics: GlyphMetricRecords.default(),
+    vMetrics: GlyphMetricRecords.default(),
+    glyphCount: 0,
+    ascender: 0,
+    descender: 0,
+    cff: Maybe<CffFontRef<'b>>.None,
+    cff2: Maybe<CffFontRef<'b>>.None,
+    standalone: Maybe<&'b CffFontRef<'b>>.None,
+    upem: 1000,
+    order: GlyphSourceOrder.baseOutlines(),
+  }
+}
+
+import table_provider { GlyfLoca }
+import tables.gvar { SelectedGvar }
+import tables.hmtx { GlyphMetricRecords }
+import model.glyph { GlyphSourceOrder }
+
+test effect fn computeTupleDeltasNoVariationIndexZeroesTheTuple() -> ()
+  ! AssertionError<'static> {
+  let outlines = run vmReal()
+  let mut out = [42.0; 3]
+  drop run vmMust(
+    run Effect.result(VarcOutlines.deltas(&outlines, 4294967295, &[F2Dot14.zero()], &mut out)),
+  )
+  run Testing.expect(out[0] == 0.0 && out[1] == 0.0 && out[2] == 0.0, "no variation zeroes tuple")
+  let mut empty: [f64; 0] = []
+  drop run vmMust(run Effect.result(VarcOutlines.deltas(&outlines, 4294967295, &[], &mut empty)))
+}
+
+test effect fn computeTupleDeltasInvalidOuterIndexErrors() -> ()
+  ! AssertionError<'static> {
+  let outlines = run vmReal()
+  let mut out = [0.0]
+  run Testing.expect(
+    vmError(run Effect.result(VarcOutlines.deltas(&outlines, 4294901760, &[], &mut out))),
+    "invalid outer errors",
+  )
+}
+
+test effect fn computeTupleDeltasMatchesManualDecode() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmManualDeltas() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vmManualDeltas() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let outlines = run vmReal()
+  let store = match outlines.store {
+    Maybe<MultiItemVariationStore<'static>>.Some { value } => value
+    _ => {
+      run Testing.expect(false, "store")
+      return
+    }
+  }
+  let regions = match outlines.regions {
+    Maybe<SparseVariationRegionList<'static>>.Some { value } => SparseVariationRegionList.regions(
+      &value,
+    )
+    _ => {
+      run Testing.expect(false, "regions")
+      return
+    }
+  }
+  let coords = [F2Dot14.fromF32(0.5); 8]
+  let allData = MultiItemVariationStore.variationData(&store)
+  let mut outer: usize = 0
+  let mut tried: usize = 0
+  while outer
+    < ArrayOfOffsets<'static, (), MultiItemVariationData<'static>, Offset32>.len(&allData) {
+    let data = run vmRead(
+      ArrayOfOffsets<'static, (), MultiItemVariationData<'static>, Offset32>.get(&allData, outer),
+    )
+    let indices = MultiItemVariationData.regionIndices(&data)
+    let regionCount = ScalarArray<u16>.len(&indices)
+    let mut inner: usize = 0
+    let sets = run vmRead(MultiItemVariationData.deltaSets(&data))
+    let mut count = u32.toUsize(Index2.count(&sets))
+    if count > 3 {
+      count = 3
+    }
+    while regionCount != 0 && inner < count {
+      let packed = run vmRead(MultiItemVariationData.deltaSet(&data, inner))
+      let mut iter = PackedDeltas.iter(&packed)
+      let mut decoded = List<i32>.make()
+      while let Option<i32>.Some { value } = DeltaRunIter.next(&mut iter) {
+        run List<i32>.append(&mut decoded, value)
+      }
+      let length = List<i32>.length(&decoded)
+      if length != 0 && length % regionCount == 0 {
+        let tupleLength = length / regionCount
+        let mut actual = List<f64>.make()
+        let mut expected = List<f64>.make()
+        let mut i: usize = 0
+        while i < tupleLength {
+          run List<f64>.append(&mut actual, 42.0)
+          run List<f64>.append(&mut expected, 0.0)
+          i = i + 1
+        }
+        drop run vmMust(
+          run Effect.result(
+            VarcOutlines.deltas(
+              &outlines,
+              usize.toU32(outer * 65536 + inner),
+              &coords,
+              List<f64>.asMutSlice(&mut actual),
+            ),
+          ),
+        )
+        let mut r: usize = 0
+        while r < regionCount {
+          let regionIndex = ScalarArray<u16>.get(&indices, r) |> Option<u16>.unwrapOr(0)
+          let region = run vmRead(
+            ArrayOfOffsets<'static, (), SparseVariationRegion<'static>, Offset32>.get(
+              &regions,
+              u16.toUsize(regionIndex),
+            ),
+          )
+          let scalar = SparseVariationRegion.computeScalarF32(&region, &coords)
+          i = 0
+          while i < tupleLength {
+            let sum = List<f64>.get(&expected, i)
+              + i32.toF64(List<i32>.get(&decoded, r * tupleLength + i)) * f32.toF64(scalar)
+            List<f64>.set(&mut expected, i, sum)
+            i = i + 1
+          }
+          r = r + 1
+        }
+        i = 0
+        while i < tupleLength {
+          run Testing.expect(
+            List<f64>.get(&actual, i) == List<f64>.get(&expected, i),
+            "packed fetch equals manual region accumulation",
+          )
+          i = i + 1
+        }
+        tried = tried + 1
+      }
+      inner = inner + 1
+    }
+    outer = outer + 1
+  }
+  run Testing.expect(tried > 0, "nonempty tuples exercised")
+}
+
+test effect fn componentConditionsWithoutVariationsDoNotRequireAStore() -> ()
+  ! AssertionError<'static> {
+  let cases = [
+    ModelFixtures.varcNoStoreCondition0(),
+    ModelFixtures.varcNoStoreCondition1(),
+    ModelFixtures.varcNoStoreCondition2(),
+    ModelFixtures.varcNoStoreCondition3(),
+    ModelFixtures.varcNoStoreCondition4(),
+    ModelFixtures.varcNoStoreCondition5(),
+    ModelFixtures.varcNoStoreCondition6(),
+  ]
+  let expected = [false, false, false, true, false, false, true]
+  let mut i: usize = 0
+  while i < 7 {
+    let outlines = run vmTable(cases[i], 1)
+    let component = run vmFirst(&outlines)
+    let result = run vmMust(
+      run Effect.result(VarcOutlines.condition(&outlines, &component, &[F2Dot14.fromF32(0.75)])),
+    )
+    run Testing.expect(result == expected[i], "condition without store")
+    i = i + 1
+  }
+}
+
+test effect fn nullConditionOffsetsAreUnconditional() -> ()
+  ! AssertionError<'static> {
+  let cases = [
+    ModelFixtures.varcNullCondition(),
+    ModelFixtures.varcNullChild0(),
+    ModelFixtures.varcNullChild1(),
+    ModelFixtures.varcNullChild2(),
+    ModelFixtures.varcNullChild3(),
+    ModelFixtures.varcNullChild4(),
+    ModelFixtures.varcNullChild5(),
+    ModelFixtures.varcNullChild6(),
+  ]
+  let expected = [true, true, true, false, false, false, true, true]
+  let mut i: usize = 0
+  while i < 8 {
+    let outlines = run vmTable(cases[i], 1)
+    let component = run vmFirst(&outlines)
+    run Testing.expect(
+      (run vmMust(
+        run Effect.result(VarcOutlines.condition(&outlines, &component, &[F2Dot14.fromF32(0.75)])),
+      ))
+        == expected[i],
+      "null condition is unconditional",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn componentZeroDeltasDoNotRequireAStore() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmZeroDeltas() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vmZeroDeltas() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let cases = [
+    ModelFixtures.varcZeroDelta0(),
+    ModelFixtures.varcZeroDelta1(),
+    ModelFixtures.varcZeroDelta2(),
+  ]
+  let expected: [f32; 3] = [0.25, 0.5, 0.5]
+  let translation: [f32; 3] = [0.0, 0.0, 7.0]
+  let mut i: usize = 0
+  while i < 3 {
+    let outlines = run vmTable(cases[i], 1)
+    let component = run vmFirst(&outlines)
+    let result = run Effect.result(
+      VarcOutlines.componentCoords(
+        &outlines,
+        &component,
+        &[F2Dot14.fromF32(0.5)],
+        &[F2Dot14.fromF32(0.5)],
+      ),
+    )
+    let values = run vmAlloc(move result)
+    run Testing.expect(
+      F2Dot14.toF32(List<F2Dot14>.get(&values, 0)) == expected[i],
+      "zero tuple needs no store",
+    )
+    let transform = run vmAlloc(
+      run Effect.result(VarcOutlines.transform(&outlines, &component, &[F2Dot14.fromF32(0.5)])),
+    )
+    run Testing.expect(
+      DecomposedTransform.translateX(&transform) == translation[i],
+      "zero transform needs no store",
+    )
+    i = i + 1
+  }
+}
+
+effect fn vmAlloc<T>(result: Result<T, Error | OutOfMemoryError>) -> T
+  ! AssertionError<'static> | OutOfMemoryError {
+  return match move result {
+    Result<T, Error | OutOfMemoryError>.Success { value } => move value
+    Result<T, Error | OutOfMemoryError>.Failure { error } => match move error {
+      Error problem => {
+        run Testing.expect(false, "VARC operation succeeds")
+        return Intrinsic.trap("assertion")
+      }
+      OutOfMemoryError problem => {
+        fail move problem
+      }
+    }
+  }
+}
+
+test effect fn measuringRespectsTotalEdgeBudget() -> ()
+  ! AssertionError<'static> {
+  let outlines = run vmTable(ModelFixtures.varcCycle(), 0)
+  let mut walk = Walk.new()
+  walk.edges = 0
+  run Testing.expect(
+    vmLimit(run Effect.result(VarcOutlines.measure(&outlines, GlyphId.new(1), 0, &mut walk))),
+    "root consumes edge",
+  )
+}
+
+test effect fn drawGlyphRespectsTotalEdgeBudget() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmDrawBudget() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vmDrawBudget() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let outlines = run vmTable(ModelFixtures.varcCycle(), 0)
+  let mut walk = Walk.new()
+  walk.edges = 1
+  let mut sink = ControlBounds.new(Matrix.identity<f32>())
+  let result = run Effect.result(
+    VarcOutlines.draw(
+      &outlines,
+      &vmBase(),
+      GlyphId.new(1),
+      0,
+      &[],
+      &[],
+      Matrix.identity<f32>(),
+      &mut walk,
+      &mut sink,
+    ),
+  )
+  run Testing.expect(
+    match move result {
+      Result<(), Error | OutOfMemoryError>.Failure { error } => match move error {
+        Error problem => problem == Error.LimitExceeded
+        _ => false
+      }
+      _ => false
+    },
+    "recursive edge rejected",
+  )
+}
+
+test effect fn leafComponentsCountAgainstTheEdgeLimit() -> ()
+  ! AssertionError<'static> {
+  let outlines = run vmTable(ModelFixtures.varcManyLeaves(), 0)
+  let mut walk = Walk.new()
+  run Testing.expect(
+    vmLimit(run Effect.result(VarcOutlines.measure(&outlines, GlyphId.new(0), 0, &mut walk))),
+    "flat leaf graph is limited",
+  )
+}
+
+test effect fn varcDepthAndHiddenMalformedComponentsAreValidated() -> ()
+  ! AssertionError<'static> {
+  let deep = run vmTable(ModelFixtures.varcDeepTree(), 0)
+  let mut walk = Walk.new()
+  run Testing.expect(
+    vmLimit(run Effect.result(VarcOutlines.measure(&deep, GlyphId.new(0), 0, &mut walk))),
+    "nested tree is limited",
+  )
+  let hidden = run vmTable(ModelFixtures.varcHiddenMalformed(), 1)
+  walk = Walk.new()
+  run Testing.expect(
+    vmError(run Effect.result(VarcOutlines.measure(&hidden, GlyphId.new(0), 0, &mut walk))),
+    "false condition cannot hide malformed component",
+  )
+}
+
+test effect fn repeatedAxisListsMayExceedAxisCount() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmRepeatedAxis() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vmRepeatedAxis() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let outlines = run vmTable(ModelFixtures.varcRepeatedAxis(), 1)
+  let component = run vmFirst(&outlines)
+  let coords = run vmAlloc(
+    run Effect.result(VarcOutlines.componentCoords(&outlines, &component, &[], &[])),
+  )
+  run Testing.expect(
+    List<F2Dot14>.length(&coords) == 1 && F2Dot14.toF32(List<F2Dot14>.get(&coords, 0)) == 0.5,
+    "last repeated index wins",
+  )
+}
+
+test effect fn evalConditionBoundsRecursionDepth() -> ()
+  ! AssertionError<'static> {
+  let outlines = run vmTable(ModelFixtures.varcDeepCondition(), 1)
+  let component = run vmFirst(&outlines)
+  run Testing.expect(
+    vmLimit(run Effect.result(VarcOutlines.condition(&outlines, &component, &[]))),
+    "deep condition is bounded",
+  )
+}
+
+test effect fn evalConditionShallowIsCorrect() -> ()
+  ! AssertionError<'static> {
+  let leaf = run vmTable(ModelFixtures.varcNoStoreCondition0(), 1)
+  let component = run vmFirst(&leaf)
+  run Testing.expect(
+    run vmMust(
+      run Effect.result(VarcOutlines.condition(&leaf, &component, &[F2Dot14.fromF32(0.5)])),
+    ),
+    "in axis range",
+  )
+  run Testing.expect(
+    !(run vmMust(
+      run Effect.result(VarcOutlines.condition(&leaf, &component, &[F2Dot14.fromF32(1.5)])),
+    )),
+    "outside axis range",
+  )
+  let negate = run vmTable(ModelFixtures.varcNoStoreCondition6(), 1)
+  let negated = run vmFirst(&negate)
+  run Testing.expect(
+    !(run vmMust(
+      run Effect.result(VarcOutlines.condition(&negate, &negated, &[F2Dot14.fromF32(0.5)])),
+    )),
+    "negated range",
+  )
+}
+
+test effect fn expandCoordsPadsAndTruncates() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmExpandCoords() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vmExpandCoords() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let axes: [usize; 2] = [4, 1]
+  let coords = [F2Dot14.fromF32(0.25), F2Dot14.fromF32(-0.5)]
+  let root = [F2Dot14.fromF32(0.75)]
+  let mut i: usize = 0
+  while i < 2 {
+    let outlines = run vmTable(ModelFixtures.varcPadCoords(), axes[i])
+    let component = run vmFirst(&outlines)
+    let out = run vmAlloc(
+      run Effect.result(VarcOutlines.componentCoords(&outlines, &component, &coords, &root)),
+    )
+    run Testing.expect(
+      List<F2Dot14>.length(&out) == axes[i] && F2Dot14.toF32(List<F2Dot14>.get(&out, 0)) == 0.25,
+      "pad or truncate",
+    )
+    if axes[i] == 4 {
+      run Testing.expect(
+        F2Dot14.toF32(List<F2Dot14>.get(&out, 1)) == -0.5
+          && F2Dot14.toF32(List<F2Dot14>.get(&out, 2)) == 0.0
+          && F2Dot14.toF32(List<F2Dot14>.get(&out, 3)) == 0.0,
+        "padded coordinates",
+      )
+    }
+    i = i + 1
+  }
+  let reset = run vmTable(ModelFixtures.varcResetCoords(), 4)
+  let component = run vmFirst(&reset)
+  let out = run vmAlloc(
+    run Effect.result(VarcOutlines.componentCoords(&reset, &component, &coords, &root)),
+  )
+  run Testing.expect(
+    F2Dot14.toF32(List<F2Dot14>.get(&out, 0)) == 0.75
+      && F2Dot14.toF32(List<F2Dot14>.get(&out, 1)) == 0.0,
+    "reset uses font coordinates",
+  )
+}
+
+import generated_model_fixtures as ModelExpected
+import tables.maxp { Maxp }
+
+test effect fn aCycleDrawsNothing() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmCycle() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn vmCycle() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let outlines = run vmTable(ModelFixtures.varcCycle(), 0)
+  let font = run vmRead(FontRef.new(ModelExpected.materialSymbols()))
+  let mut base = vmBase()
+  base.glyf = Maybe<GlyfLoca<'static>>.Some {
+    value: run vmRead(TableProvider.selectedGlyfLoca(&font, Option<bool>.None))
+  }
+  base.hMetrics = run vmRead(TableProvider.hGlyphMetricRecords(&font))
+  base.glyphCount = u16.toU32(Maxp.numGlyphs(&run vmRead(TableProvider.maxp(&font))))
+  let actual = run vmAlloc(
+    run Effect.result(VarcOutlines.controlBox(&outlines, &base, GlyphId.new(1), &[])),
+  )
+  let mut sink = ControlBounds.new(Matrix.identity<f32>())
+  drop run vmAlloc(run Effect.result(BaseOutlines.draw(&base, GlyphId.new(2), &[], &mut sink)))
+  let expected = ControlBounds.finish(&sink)
+  run Testing.expect(
+    actual.xMin == expected.xMin && actual.yMin == expected.yMin && actual.xMax == expected.xMax
+      && actual.yMax == expected.yMax
+      && expected.xMax > expected.xMin,
+    "cycle skips back edge and keeps other leaf",
+  )
+}
+
+test effect fn applyTransformVariationsMatchesReferencePath() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run vmTransformReference() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn vmTransformValues(t: &DecomposedTransform) -> [f32; 9] {
+  return [
+    DecomposedTransform.translateX(t),
+    DecomposedTransform.translateY(t),
+    DecomposedTransform.rotation(t),
+    DecomposedTransform.scaleX(t),
+    DecomposedTransform.scaleY(t),
+    DecomposedTransform.skewX(t),
+    DecomposedTransform.skewY(t),
+    DecomposedTransform.centerX(t),
+    DecomposedTransform.centerY(t),
+  ]
+}
+
+effect fn vmTransformReference() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let outlines = run vmReal()
+  let mut coords = List<F2Dot14>.make()
+  let pattern: [f32; 4] = [0.5, -0.5, 0.25, -0.25]
+  let mut i: usize = 0
+  while i < outlines.axisCount {
+    run List<F2Dot14>.append(&mut coords, F2Dot14.fromF32(pattern[i % 4]))
+    i = i + 1
+  }
+  let mut gid: u32 = 0
+  let mut tried: usize = 0
+  while gid < 65536 && tried < 32 {
+    let index = CoverageTable.get(&outlines.coverage, GlyphId.new(gid))
+    gid = gid + 1
+    if let Option<u32>.Some { value } = move index {
+      let glyph = run vmRead(Varc.glyph(&outlines.table, u32.toUsize(value)))
+      let mut components = VarcGlyph.components(&glyph)
+      while let Option<Result<VarcComponent<'static>, ReadError>>.Some {
+        value: item
+      } = VarcComponentIter.next(&mut components) {
+        let component = run vmRead(move item)
+        let index = VarcComponent.transformVarIndex(&component)
+        if let Option<u32>.Some { value: varIndex } = move index {
+          let masks: [u32; 9] = [16, 32, 64, 256, 512, 8192, 16384, 1024, 2048]
+          let divisors: [f32; 9] = [1.0, 1.0, 4096.0, 1024.0, 1024.0, 4096.0, 4096.0, 1.0, 1.0]
+          let flags = VarcFlags.bits(&VarcComponent.flags(&component))
+          let mut deltas = List<f64>.make()
+          i = 0
+          while i < 9 {
+            if u32.bitAnd(flags, masks[i]) != 0 {
+              run List<f64>.append(&mut deltas, 0.0)
+            }
+            i = i + 1
+          }
+          let mut expected = vmTransformValues(&VarcComponent.transform(&component))
+          if List<f64>.length(&deltas) != 0 && varIndex != 4294967295 {
+            drop run vmMust(
+              run Effect.result(
+                VarcOutlines.deltas(
+                  &outlines,
+                  varIndex,
+                  List<F2Dot14>.asSlice(&coords),
+                  List<f64>.asMutSlice(&mut deltas),
+                ),
+              ),
+            )
+            let mut at: usize = 0
+            i = 0
+            while i < 9 {
+              if u32.bitAnd(flags, masks[i]) != 0 {
+                expected[i] = expected[i] + f64.toF32(List<f64>.get(&deltas, at)) / divisors[i]
+                at = at + 1
+              }
+              i = i + 1
+            }
+            if u32.bitAnd(flags, 512) == 0 {
+              expected[4] = expected[3]
+            }
+          }
+          let actual = vmTransformValues(
+            &run vmAlloc(
+              run Effect.result(
+                VarcOutlines.transform(&outlines, &component, List<F2Dot14>.asSlice(&coords)),
+              ),
+            ),
+          )
+          i = 0
+          while i < 9 {
+            run Testing.expect(actual[i] == expected[i], "transform delta field order and scaling")
+            i = i + 1
+          }
+          tried = tried + 1
+          if tried >= 32 {
+            break
+          }
+        }
+      }
+    }
+  }
+  run Testing.expect(tried > 0, "varied component transforms exercised")
+}

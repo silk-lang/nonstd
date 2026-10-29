@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Compare variation prefixes, malformed offsets, glyph scopes and extended headers."""
+import argparse
+from pathlib import Path
+import struct
+import tempfile
+import harness
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def sfnt(tables):
+    out = bytearray(struct.pack('>IHHHH', 0x10000, len(tables), 0, 0, 0) + bytes(16 * len(tables)))
+    for index, (tag, payload) in enumerate(sorted(tables.items())):
+        struct.pack_into('>4sIII', out, 12 + index * 16, tag, 0, len(out), len(payload))
+        out.extend(payload)
+        out.extend(bytes(-len(out) % 4))
+    return bytes(out)
+
+
+def tables(data):
+    count = struct.unpack_from('>H', data, 4)[0]
+    result = {}
+    for index in range(count):
+        tag, _, start, size = struct.unpack_from('>4sIII', data, 12 + 16 * index)
+        result[tag] = data[start:start + size]
+    return result
+
+
+def gvar(extended, long_offsets, wide=False):
+    # Two distinct glyph payloads with the same byte extent, one shared peak.
+    count = 3
+    header_len = 21 if extended else 20
+    width = 4 if long_offsets else 2
+    shared = header_len + (count + 1) * width
+    body = shared + 2
+    payloads = []
+    for delta in (20, 40):
+        data_offset = 65537 if wide else (9 if extended else 8)
+        payload = bytearray(struct.pack('>H', 1) + data_offset.to_bytes(3 if extended else 2, 'big'))
+        payload.extend(struct.pack('>HH', 7, 0x2000))
+        payload.extend(bytes(data_offset - len(payload)))
+        payload.extend(bytes([0, 1, delta, 0, 1, 0, delta]))
+        if not long_offsets:
+            payload.extend(bytes(len(payload) % 2))
+        payloads.append(bytes(payload))
+    out = struct.pack('>HHHHI', 1, 0, 1, 1, shared) + count.to_bytes(3 if extended else 2, 'big') + struct.pack('>HI', int(long_offsets), body)
+    offsets = [0, 0, len(payloads[0]), sum(map(len, payloads))]
+    out += b''.join((n if long_offsets else n // 2).to_bytes(width, 'big') for n in offsets)
+    return out + struct.pack('>h', 16384) + b''.join(payloads)
+
+
+def fixtures():
+    tags = {b'fvar', b'avar', b'HVAR', b'VVAR', b'MVAR', b'gvar', b'glyf', b'loca', b'vhea', b'vmtx', b'VORG'}
+    for name in ('vazirmatn_var_trimmed.ttf', 'avar2checker.ttf', 'Amstelvar-avar2.A.ttf', 'vorg.ttf'):
+        original = tables((ROOT / 'font/parse/upstream/font-test-data/test_data/ttf' / name).read_bytes())
+        for tag in sorted(original.keys() & tags):
+            payload = original[tag]
+            # Every prefix for compact tables; dense header prefixes and evenly
+            # distributed lengths for larger outlines and variation stores.
+            lengths = set(range(min(len(payload), 160) + 1))
+            if len(payload) <= 512:
+                lengths.update(range(len(payload) + 1))
+            else:
+                lengths.update(range(0, len(payload), max(1, len(payload) // 32)))
+                lengths.update((len(payload) - 1, len(payload)))
+            dependencies = {key: original[key] for key in (b'head', b'maxp', b'hhea', b'vhea', b'glyf', b'loca') if key in original and key != tag}
+            # Keep only dependencies needed to resolve argument-bearing views.
+            if tag not in (b'glyf', b'loca', b'vmtx'):
+                dependencies = {key: value for key, value in dependencies.items() if key in (b'head', b'maxp')}
+            for length in sorted(lengths):
+                yield f'{name}-{tag.decode()}-{length}', sfnt(dependencies | {tag: payload[:length]})
+    for extended in (False, True):
+        tag = b'GVAR' if extended else b'gvar'
+        for long_offsets in (False, True):
+            payload = gvar(extended, long_offsets)
+            for length in range(len(payload) + 1):
+                yield f'{tag.decode()}-{long_offsets}-{length}', sfnt({tag: payload[:length]})
+            for offset in (0, 1, 0xffffffff):
+                broken = bytearray(payload)
+                struct.pack_into('>I', broken, 17 if extended else 16, offset)
+                yield f'{tag.decode()}-{long_offsets}-base-{offset}', sfnt({tag: broken})
+            for first, last in ((8, 4), (65530, 65528), (65530, 65530)):
+                broken = bytearray(payload)
+                header_len = 21 if extended else 20
+                width = 4 if long_offsets else 2
+                broken[header_len:header_len + 2 * width] = (
+                    first.to_bytes(width, 'big') + last.to_bytes(width, 'big'))
+                yield f'{tag.decode()}-{long_offsets}-empty-range-{first}-{last}', sfnt({tag: broken})
+        if extended:
+            yield 'GVAR-wide-data-offset', sfnt({tag: gvar(True, True, True)})
+    # Same-sized glyphs must be parsed separately, not deduplicated by length.
+    head = bytearray(54)
+    struct.pack_into('>I', head, 0, 0x10000)
+    struct.pack_into('>h', head, 50, 1)
+    glyphs = b''.join(struct.pack('>hhhhhH', 0, minimum, 0, 100, 100, 0) for minimum in (1, 2))
+    for extended in (False, True):
+        gt, lt = (b'GLYF', b'LOCA') if extended else (b'glyf', b'loca')
+        for offsets in ((0, 12, 24), (0, 24, 12), (0xffffffff,) * 3, (0, 12, 99999)):
+            loc = struct.pack('>3I', *offsets)
+            yield f'{gt.decode()}-scopes-{offsets}', sfnt({b'head': head, gt: glyphs, lt: loc})
+        yield f'{lt.decode()}-unaligned', sfnt({b'head': head, gt: glyphs, lt: b'\0'})
+    # A declared avar map range and its unbounded accessor have different roles.
+    yield 'avar-trailing-map', sfnt({b'avar': bytes.fromhex('00010000000000010000000100004000')})
+    for tag in (b'vhea', b'VHEA'):
+        width = 4 if tag == b'VHEA' else 2
+        for count in (0, 1, 65535, 0xffffffff if width == 4 else 65534):
+            header = struct.pack('>I', 0x11000) + bytes(30) + count.to_bytes(width, 'big')
+            mt = b'VMTX' if width == 4 else b'vmtx'
+            mp = b'MAXP' if width == 4 else b'maxp'
+            for length in range(len(header) + 1):
+                yield f'{tag.decode()}-{count}-{length}', sfnt({tag: header[:length], mt: struct.pack('>HhHh', 900, -12, 800, 20), mp: struct.pack('>I', 0x5000) + (3).to_bytes(3 if width == 4 else 2, 'big')})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--reference', type=Path, default=harness.REFERENCE)
+    parser.add_argument('--silk-dumper', type=Path)
+    parser.add_argument('--report', type=Path)
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix='font-variation-fixtures-') as temporary:
+        paths = []
+        for name, data in fixtures():
+            path = Path(temporary) / f'{name}.ttf'
+            path.write_bytes(data)
+            paths.append(path)
+        return harness.compare(paths, args.reference, args.silk_dumper or harness.silk_binary(), 30, args.report)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

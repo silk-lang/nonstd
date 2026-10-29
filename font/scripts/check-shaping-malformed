@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Deterministic, bounded malformed-font and CLI checks. Save failing inputs."""
+import argparse
+from pathlib import Path
+import random
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+UPSTREAM = ROOT / 'font/shape/test-data/harfrust/harfrust'
+FONTS = [
+    'benches/fonts/Roboto-Regular.ttf',
+    'benches/fonts/NotoNastaliqUrdu-Regular.ttf',
+    'benches/fonts/NotoSansDevanagari-Regular.ttf',
+    'benches/fonts/SourceSerifVariable-Roman.ttf',
+    'tests/fonts/text-rendering-tests/AdobeVFPrototype-Subset.otf',
+    'tests/fonts/text-rendering-tests/TestAATMort.ttf',
+    'tests/fonts/text-rendering-tests/TestAATMorx.ttf',
+    'tests/fonts/text-rendering-tests/TestKERNOne.otf',
+]
+TEXTS = ['a\u0301office AV', '\u0644\u0627\u0651', '\u0915\u094d\u0937', 'ABCEFGXuT']
+
+
+def mutations(original, rng, count):
+    yield b''
+    yield b'\0'
+    yield b'OTTO'
+    yield b'ttcf'
+    for length in (12, 64, len(original) // 2):
+        yield original[:length]
+    # Hit the directory and table headers as well as whole-file random bytes.
+    offsets = [0]
+    if len(original) >= 12:
+        tables = int.from_bytes(original[4:6], 'big')
+        for index in range(min(tables, (len(original) - 12) // 16)):
+            record = 12 + 16 * index
+            start = int.from_bytes(original[record + 8:record + 12], 'big')
+            if start < len(original):
+                offsets.append(start)
+    for index in range(count):
+        data = bytearray(original)
+        start = rng.choice(offsets) if index % 2 else 0
+        end = min(len(data), start + 32) if index % 2 else len(data)
+        for _ in range(8):
+            data[rng.randrange(start, end)] = rng.choice((0, 255, rng.randrange(256)))
+        yield data
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--binary', type=Path, default=ROOT / 'build/llvm/x86_64-unknown-linux-gnu/release/hr_shape')
+    parser.add_argument('--mutations-per-font', type=int, default=8)
+    parser.add_argument('--all-fonts', action='store_true', help='weekly campaign over every pinned SFNT')
+    parser.add_argument('--timeout', type=float, default=10)
+    parser.add_argument('--failures', type=Path, default=ROOT / 'build/shaping-malformed-failures')
+    args = parser.parse_args()
+    rng = random.Random(21)
+    fonts = [UPSTREAM / path for path in FONTS]
+    if args.all_fonts:
+        fonts = sorted({*UPSTREAM.rglob('*.ttf'), *UPSTREAM.rglob('*.otf')})
+    checked = 0
+    with tempfile.TemporaryDirectory(prefix='silk-shaping-') as directory:
+        target = Path(directory) / 'font.ttf'
+        for font in fonts:
+            for index, data in enumerate(mutations(font.read_bytes(), rng, args.mutations_per_font)):
+                target.write_bytes(data)
+                text = TEXTS[index % len(TEXTS)]
+                error = None
+                try:
+                    result = subprocess.run([str(args.binary), str(target), text], cwd=ROOT,
+                                            capture_output=True, timeout=args.timeout)
+                    if result.returncode not in (0, 2):
+                        error = f'exit {result.returncode}: {result.stderr.decode(errors="replace")[:2000]}'
+                except subprocess.TimeoutExpired:
+                    error = f'timeout after {args.timeout}s'
+                if error:
+                    args.failures.mkdir(parents=True, exist_ok=True)
+                    saved = args.failures / f'{font.stem}-{index}.ttf'
+                    saved.write_bytes(data)
+                    saved.with_suffix('.txt').write_text(f'{font}\n{text!r}\n{error}\n')
+                    raise SystemExit(f'{font.name} mutation {index}: {error}; saved {saved}')
+                checked += 1
+    invalid = ('--font-size=' + '9' * 200, '--face-index=-1', '--cluster-level=9',
+               '--features=kern[', '--unicodes-before=110000', '--font-size=no',
+               '--font-ptem=NaN', '--variations=wght=no', '--face-index=4294967296')
+    for option in invalid:
+        result = subprocess.run([str(args.binary), str(fonts[0]), 'a', option], cwd=ROOT,
+                                capture_output=True, timeout=args.timeout)
+        if result.returncode != 2:
+            raise SystemExit(f'invalid option {option[:40]}: expected rejection, got {result.returncode}')
+    print(f'{checked} malformed fonts and {len(invalid)} invalid options passed')
+
+
+if __name__ == '__main__':
+    main()

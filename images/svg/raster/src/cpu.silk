@@ -1,0 +1,807 @@
+//! CPU execution of retained SVG commands through the pinned vector backend.
+//! Solids retain one alpha quantization; referenced paints share cached backend ramps.
+//! Group opacity is applied exactly once to an isolated premultiplied surface.
+import svg_core.scene {
+  DisplayList,
+  Command,
+  RenderError,
+  FillRule,
+  LineCap,
+  LineJoin,
+  Brush,
+  PaintInstance
+}
+import svg_geometry.geometry { Path }
+import svg_core.mapping { Mapping, ProjectionClip }
+import svg_core.mapping
+import svg_core.vector_path
+import vector.path { Path as VectorPath }
+import vector.geometry { Rect as VectorRect }
+import vector.projective { Homography, HalfPlane }
+import vector.projective
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
+import vector.stroke as strokes
+import vector.stroke { Stroker, Stroke as VectorStroke }
+import vector.flatten { Line, TOLERANCE }
+import vector.flatten as flattening
+import vector.layer as layers
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.f64
+import silk.num.u32
+import checked
+import paints
+import patterns
+
+struct Prepared {
+  ready: bool,
+  path: VectorPath,
+}
+
+struct ClipPlanes {
+  selected: Option<usize>,
+  planes: List<HalfPlane>,
+}
+
+impl ClipPlanes {
+  fn make() -> ClipPlanes {
+    return ClipPlanes { selected: Option<usize>.None, planes: List<HalfPlane>.make() }
+  }
+
+  effect fn select(
+    self: &mut ClipPlanes,
+    index: Option<usize>,
+    clips: &[ProjectionClip],
+    placement: Option<Mapping>,
+  ) -> ()
+    ! RenderError | OutOfMemoryError
+    ? &mut Allocator {
+    let same = match &index {
+      Option<usize>.Some { value } => match &self.selected {
+        Option<usize>.Some { value: previous } => value == previous
+        _ => false
+      }
+      _ => match &self.selected {
+        Option<usize>.None => true
+        _ => false
+      }
+    }
+    let root = match &placement {
+      Option<Mapping>.None => true
+      _ => false
+    }
+    if same && root {
+      return
+    }
+    self.planes.clear()
+    let mut cursor = index
+    while true {
+      let next = match &cursor {
+        Option<usize>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      let mut plane = clips[next].plane
+      match &placement {
+        Option<Mapping>.Some { value: placed } => match &placed {
+          Mapping.Affine { value } => {
+            plane = HalfPlane {
+              x: plane.x / value.a,
+              y: plane.y / value.d,
+              w: plane.w - plane.x * value.e / value.a - plane.y * value.f / value.d,
+            }
+            if !f64.isFinite(plane.x) || !f64.isFinite(plane.y) || !f64.isFinite(plane.w) {
+              fail RenderError.InvalidGeometry
+            }
+          }
+          _ => {
+            fail RenderError.InvalidGeometry
+          }
+        }
+        _ => {}
+      }
+      run self.planes.append(plane)
+      cursor = clips[next].parent
+    }
+    self.selected = index
+  }
+}
+
+struct Layer {
+  pixels: Pixmap,
+  opacity: u8,
+  linearRgb: bool,
+}
+
+/// Executes a display list without copying the returned vector-owned pixel buffer.
+/// Invalid dimensions, command stacks, path/dash indices and unrepresentable vector
+/// arithmetic fail before the relevant backend operation. Scratch and isolated
+/// surfaces are reused across commands and overflow copies. Pattern dependencies
+/// are cycle-checked iteratively, then rendered once per device-resolution key.
+///
+/// `crispEdges` and `optimizeSpeed` select binary coverage before paint application.
+/// Exact source ellipses and curvature-aware joins are delegated to vector.
+pub effect fn execute(list: &DisplayList) -> Pixmap
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<GeometryError>(executeChecked(list), geometryFailure)
+}
+
+effect fn geometryFailure(error: GeometryError) -> Pixmap
+  ! RenderError {
+  drop error
+  fail RenderError.InvalidGeometry
+}
+
+effect fn executeChecked(list: &DisplayList) -> Pixmap
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run checked.dimensions(list.width, list.height)
+  run paints.validate(list)
+  run validateClips(list.projectionClips.asSlice())
+  run validateCommands(list, list.commands.asSlice(), list.width, list.height)
+  let mut resource: usize = 0
+  while resource < list.patterns.length() {
+    let picture = &list.patterns.asSlice()[resource]
+    if !picture.tile.isValid() || picture.tile.xMin != 0.0 || picture.tile.yMin != 0.0
+      || picture.tile.xMax <= 0.0
+      || picture.tile.yMax <= 0.0
+      || !picture.contentBounds.isValid() {
+      fail RenderError.InvalidGeometry
+    }
+    run validateCommands(list, picture.commands.asSlice(), 1, 1)
+    resource = resource + 1
+  }
+  run validateCycles(list)
+  let mut paintCache = run paints.make(list)
+  let mut cache = List<Prepared>.make()
+  let sourcePaths = list.paths.asSlice()
+  let mut p: usize = 0
+  while p < sourcePaths.length {
+    run cache.append(Prepared { ready: false, path: VectorPath.make() })
+    p = p + 1
+  }
+  let mut textures = run patterns.make(list.patterns.length())
+  run patterns.surface(&mut textures, u32.toUsize(list.width) * u32.toUsize(list.height))
+  return run picture(
+    list,
+    list.commands.asSlice(),
+    list.width,
+    list.height,
+    &patterns.root(),
+    true,
+    &mut cache,
+    &mut paintCache,
+    &mut textures,
+  )
+}
+
+effect fn picture(
+  list: &DisplayList,
+  commands: &[Command],
+  width: u32,
+  height: u32,
+  copies: &patterns.Copies,
+  root: bool,
+  cache: &mut List<Prepared>,
+  paintCache: &mut paints.Cache,
+  textures: &mut patterns.Cache,
+) -> Pixmap
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let sourcePaths = list.paths.asSlice()
+  let mut stack = List<Layer>.make()
+  let mut spare = List<Pixmap>.make()
+  let pixels = run Pixmap.make(width, height)
+  run stack.append(Layer { pixels: move pixels, opacity: 255, linearRgb: false })
+  let mut rasterizer = Rasterizer.make()
+  let mut coverage = Coverage.make(width, height)
+  let mut stroker = Stroker.make()
+  let mut strokeStyle = VectorStroke.make(1.0)
+  let mut dashIndex = list.dashes.length()
+  let mut outline = VectorPath.make()
+  let mut lines = List<Line>.make()
+  let mut planes = ClipPlanes.make()
+  let viewport = VectorRect.make(0.0, 0.0, u32.toF64(width), u32.toF64(height))
+  let mut row: usize = 0
+  while row < copies.rows {
+    let mut column: usize = 0
+    while column < copies.columns {
+      let placement = if root {
+        Option<Mapping>.None
+      } else {
+        Option<Mapping>.some(run patterns.placement(copies, column, row))
+      }
+      let mut i: usize = 0
+      while i < commands.length {
+        match &commands[i] {
+          Command.FillPath {
+            path,
+            transform,
+            clip,
+            bounds,
+            brush,
+            opacity,
+            linearRgb,
+            rule,
+            crispEdges
+          } => {
+            let texture = run prepareBrush(
+              &brush,
+              placement,
+              width,
+              height,
+              list,
+              &mut cache.*,
+              &mut paintCache.*,
+              &mut textures.*,
+            )
+            run planes.select(clip, list.projectionClips.asSlice(), placement)
+            let placed = run placedMapping(&transform, placement)
+            run prepare(&sourcePaths[path], &mut cache.asMutSlice()[path])
+            let prepared = &cache.asSlice()[path].path
+            let fillRule = if rule == FillRule.EvenOdd {
+              EVENODD
+            } else {
+              NONZERO
+            }
+            run fill(
+              prepared,
+              &placed,
+              viewport,
+              planes.planes.asSlice(),
+              fillRule,
+              TOLERANCE,
+              &mut rasterizer,
+              &mut coverage,
+              &mut lines,
+            )
+            if crispEdges {
+              coverage.binarize()
+            }
+            let target = stack.length() - 1
+            run paints.fill(
+              &mut paintCache.*,
+              &mut stack.asMutSlice()[target].pixels,
+              &coverage,
+              &brush,
+              opacity,
+              linearRgb,
+              list,
+              placement,
+              &textures.*,
+              texture,
+            )
+          }
+          Command.StrokePath {
+            path,
+            transform,
+            strokeSpace,
+            clip,
+            bounds,
+            brush,
+            opacity,
+            linearRgb,
+            stroke,
+            crispEdges
+          } => {
+            let texture = run prepareBrush(
+              &brush,
+              placement,
+              width,
+              height,
+              list,
+              &mut cache.*,
+              &mut paintCache.*,
+              &mut textures.*,
+            )
+            run planes.select(clip, list.projectionClips.asSlice(), placement)
+            let placed = run placedMapping(&transform, placement)
+            run prepare(&sourcePaths[path], &mut cache.asMutSlice()[path])
+            let prepared = &cache.asSlice()[path].path
+            let dashes = list.dashes.asSlice()[stroke.dashIndex].asSlice()
+            run checked.stroke(stroke, dashes)
+            strokeStyle.width = stroke.width
+            strokeStyle.miterLimit = stroke.miterLimit
+            strokeStyle.dashOffset = stroke.dashOffset
+            strokeStyle.cap = match stroke.cap {
+              LineCap.Butt => strokes.CAP_BUTT
+              LineCap.Round => strokes.CAP_ROUND
+              LineCap.Square => strokes.CAP_SQUARE
+            }
+            strokeStyle.join = match stroke.join {
+              LineJoin.Miter => strokes.JOIN_MITER
+              LineJoin.Round => strokes.JOIN_ROUND
+              LineJoin.Bevel => strokes.JOIN_BEVEL
+              LineJoin.MiterClip => strokes.JOIN_MITER_CLIP
+              LineJoin.Arcs => strokes.JOIN_ARCS
+            }
+            if dashIndex != stroke.dashIndex {
+              run strokeStyle.setDashes(dashes)
+              dashIndex = stroke.dashIndex
+            }
+            outline.clear()
+            let mut outlinePlacement = placed
+            match &strokeSpace {
+              Option<usize>.Some { value: index } => {
+                let space = &list.strokeSpaces.asSlice()[index]
+                let centerline = match &space.pathToHost {
+                  Mapping.Affine { value } => Homography.fromAffine(&mapping.affine(value))
+                  Mapping.Projective { value } => value
+                }
+                let host = run placedMapping(&space.hostToDevice, placement)
+                let hostPlacement = match &host {
+                  Mapping.Affine { value } => Homography.fromAffine(&mapping.affine(value))
+                  Mapping.Projective { value } => value
+                }
+                run stroker.strokeInSpace(
+                  prepared,
+                  &strokeStyle,
+                  &centerline,
+                  &hostPlacement,
+                  viewport,
+                  TOLERANCE * 0.5,
+                  &mut outline,
+                )
+                outlinePlacement = host
+              }
+              _ => {
+                match &placed {
+                  Mapping.Affine { value } => {
+                    run stroker.stroke(
+                      prepared,
+                      &strokeStyle,
+                      &mapping.affine(value),
+                      TOLERANCE * 0.5,
+                      &mut outline,
+                    )
+                  }
+                  Mapping.Projective { value } => {
+                    run stroker.strokeProjective(
+                      prepared,
+                      &strokeStyle,
+                      &value,
+                      viewport,
+                      TOLERANCE * 0.5,
+                      &mut outline,
+                    )
+                  }
+                }
+              }
+            }
+            run fill(
+              &outline,
+              &outlinePlacement,
+              viewport,
+              planes.planes.asSlice(),
+              NONZERO,
+              TOLERANCE * 0.5,
+              &mut rasterizer,
+              &mut coverage,
+              &mut lines,
+            )
+            if crispEdges {
+              coverage.binarize()
+            }
+            let target = stack.length() - 1
+            run paints.fill(
+              &mut paintCache.*,
+              &mut stack.asMutSlice()[target].pixels,
+              &coverage,
+              &brush,
+              opacity,
+              linearRgb,
+              list,
+              placement,
+              &textures.*,
+              texture,
+            )
+          }
+          Command.PushLayer { opacity, bounds, linearRgb } => {
+            let available = spare.length()
+            let pixels = if available > 0 {
+              let mut reused = spare.remove(available - 1)
+              reused.clear(Rgba8.make(0, 0, 0, 0))
+              move reused
+            } else {
+              run patterns.surface(&mut textures.*, u32.toUsize(width) * u32.toUsize(height))
+              run Pixmap.make(width, height)
+            }
+            run stack.append(
+              Layer {
+                pixels: move pixels,
+                opacity: run checked.unit(opacity),
+                linearRgb: linearRgb,
+              },
+            )
+          }
+          Command.PopLayer => {
+            let top = stack.length() - 1
+            let layer = stack.remove(top)
+            let target = stack.length() - 1
+            if layer.linearRgb {
+              layers.compositeLinearRgb(
+                &mut stack.asMutSlice()[target].pixels,
+                &layer.pixels,
+                layers.BLEND_NORMAL,
+                layer.opacity,
+              )
+            } else {
+              layers.composite(
+                &mut stack.asMutSlice()[target].pixels,
+                &layer.pixels,
+                layers.BLEND_NORMAL,
+                layer.opacity,
+              )
+            }
+            run spare.append(move layer.pixels)
+          }
+        }
+        i = i + 1
+      }
+      column = column + 1
+    }
+    row = row + 1
+  }
+  textures.surfaces = textures.surfaces - spare.length() * u32.toUsize(width) * u32.toUsize(height)
+  let output = stack.remove(0)
+  return move output.pixels
+}
+
+effect fn placedMapping(matrix: &Mapping, placement: Option<Mapping>) -> Mapping
+  ! GeometryError {
+  return match &placement {
+    Option<Mapping>.Some { value } => run value.compose(matrix)
+    _ => matrix.*
+  }
+}
+
+fn patternBrush(brush: &Brush, list: &DisplayList) -> Option<usize> {
+  match &brush.* {
+    Brush.Server { index } => match &list.paints.asSlice()[index] {
+      PaintInstance.Pattern { pattern, transform: _ } => {
+        return Option<usize>.some(pattern)
+      }
+      _ => {}
+    }
+    _ => {}
+  }
+  return Option<usize>.None
+}
+
+effect fn prepareBrush(
+  brush: &Brush,
+  placement: Option<Mapping>,
+  width: u32,
+  height: u32,
+  list: &DisplayList,
+  paths: &mut List<Prepared>,
+  paintCache: &mut paints.Cache,
+  textures: &mut patterns.Cache,
+) -> Option<usize>
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  match &brush.* {
+    Brush.Server { index } => match &list.paints.asSlice()[index] {
+      PaintInstance.Pattern { pattern, transform } => {
+        let mut i: usize = 0
+        while i < textures.active.length() {
+          if textures.active.asSlice()[i] == pattern {
+            fail RenderError.InvalidGeometry
+          }
+          i = i + 1
+        }
+        let placed = run placedMapping(&transform, placement)
+        let resource = &list.patterns.asSlice()[pattern]
+        let size = run patterns.size(&placed, resource, width, height)
+        let mut cursor = textures.heads.asSlice()[pattern]
+        while true {
+          let cachedIndex = match &cursor {
+            Option<usize>.Some { value } => value
+            _ => {
+              break
+            }
+          }
+          let cached = &textures.textures.asSlice()[cachedIndex]
+          if cached.pixels.width() == size.width && cached.pixels.height() == size.height {
+            return Option<usize>.some(cachedIndex)
+          }
+          cursor = cached.next
+        }
+        if textures.active.length() >= 256 {
+          fail RenderError.TooLarge
+        }
+        let copies = run patterns.copies(resource, &size, &mut textures.*, list)
+        run patterns.reserve(
+          &mut textures.*,
+          u32.toUsize(size.width) * u32.toUsize(size.height),
+          list,
+        )
+        run textures.active.append(pattern)
+        let pixels = run picture(
+          list,
+          resource.commands.asSlice(),
+          size.width,
+          size.height,
+          &copies,
+          false,
+          &mut paths.*,
+          &mut paintCache.*,
+          &mut textures.*,
+        )
+        let activeIndex = textures.active.length() - 1
+        drop textures.active.remove(activeIndex)
+        let result = textures.textures.length()
+        run textures.textures.append(
+          patterns.Texture { next: textures.heads.asSlice()[pattern], pixels: move pixels },
+        )
+        let mut heads = textures.heads.asMutSlice()
+        heads[pattern] = Option<usize>.some(result)
+        return Option<usize>.some(result)
+      }
+      _ => {}
+    }
+    _ => {}
+  }
+  return Option<usize>.None
+}
+
+struct ResourceVisit {
+  pattern: usize,
+  command: usize,
+}
+
+// Validate every picture, including unreachable ones. Iterative DFS prevents a
+// malicious exported DisplayList from exhausting the executor's native stack.
+effect fn validateCycles(list: &DisplayList) -> ()
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut state = List<u8>.make()
+  let mut stack = List<ResourceVisit>.make()
+  let mut i: usize = 0
+  while i < list.patterns.length() {
+    run state.append(0)
+    i = i + 1
+  }
+  i = 0
+  while i < list.patterns.length() {
+    if state.asSlice()[i] != 0 {
+      i = i + 1
+      continue
+    }
+    let mut rootMarks = state.asMutSlice()
+    rootMarks[i] = 1
+    run stack.append(ResourceVisit { pattern: i, command: 0 })
+    while stack.length() != 0 {
+      let top = stack.length() - 1
+      let index = stack.asSlice()[top].pattern
+      let command = stack.asSlice()[top].command
+      let commands = list.patterns.asSlice()[index].commands.asSlice()
+      if command == commands.length {
+        let mut completedMarks = state.asMutSlice()
+        completedMarks[index] = 2
+        drop stack.remove(top)
+        continue
+      }
+      let mut visits = stack.asMutSlice()
+      visits[top].command = command + 1
+      let child = match &commands[command] {
+        Command.FillPath {
+          path: _,
+          transform: _,
+          clip: _,
+          bounds: _,
+          brush,
+          opacity: _,
+          linearRgb: _,
+          rule: _,
+          crispEdges: _
+        } => patternBrush(&brush, list)
+        Command.StrokePath {
+          path: _,
+          transform: _,
+          strokeSpace: _,
+          clip: _,
+          bounds: _,
+          brush,
+          opacity: _,
+          linearRgb: _,
+          stroke: _,
+          crispEdges: _
+        } => patternBrush(&brush, list)
+        _ => Option<usize>.None
+      }
+      match &child {
+        Option<usize>.Some { value } => {
+          if state.asSlice()[value] == 1 {
+            fail RenderError.InvalidGeometry
+          }
+          if state.asSlice()[value] == 0 {
+            let mut childMarks = state.asMutSlice()
+            childMarks[value] = 1
+            run stack.append(ResourceVisit { pattern: value, command: 0 })
+          }
+        }
+        _ => {}
+      }
+    }
+    i = i + 1
+  }
+}
+
+effect fn validateClips(clips: &[ProjectionClip]) -> ()
+  ! RenderError {
+  let mut c: usize = 0
+  while c < clips.length {
+    let plane = &clips[c].plane
+    if !f64.isFinite(plane.x) || !f64.isFinite(plane.y) || !f64.isFinite(plane.w) {
+      fail RenderError.InvalidGeometry
+    }
+
+    // Parents precede children: this also rules out cycles before traversal.
+    match &clips[c].parent {
+      Option<usize>.Some { value } => {
+        if value >= c {
+          fail RenderError.InvalidGeometry
+        }
+      }
+      _ => {}
+    }
+    c = c + 1
+  }
+}
+
+effect fn validateCommands(list: &DisplayList, commands: &[Command], width: u32, height: u32) -> ()
+  ! RenderError {
+  let clips = list.projectionClips.asSlice()
+
+  // dimensions() established a positive, checked pixel count before this call.
+  let surfaceLimit = checked.MAX_SURFACE_PIXELS / (u32.toUsize(width) * u32.toUsize(height))
+  let mut depth: usize = 0
+  let mut i: usize = 0
+  while i < commands.length {
+    match &commands[i] {
+      Command.FillPath {
+        path,
+        transform,
+        clip,
+        bounds,
+        brush,
+        opacity,
+        linearRgb,
+        rule,
+        crispEdges
+      } => {
+        if path >= list.paths.length() {
+          fail RenderError.InvalidGeometry
+        }
+        run clipIndex(clip, clips.length)
+        if !transform.isFinite() || !bounds.isValid() {
+          fail RenderError.InvalidGeometry
+        }
+        run paints.validateBrush(&brush, list)
+        drop run checked.unit(opacity)
+      }
+      Command.StrokePath {
+        path,
+        transform,
+        strokeSpace,
+        clip,
+        bounds,
+        brush,
+        opacity,
+        linearRgb,
+        stroke,
+        crispEdges
+      } => {
+        if path >= list.paths.length() || stroke.dashIndex >= list.dashes.length() {
+          fail RenderError.InvalidGeometry
+        }
+        run checked.stroke(stroke, list.dashes.asSlice()[stroke.dashIndex].asSlice())
+        if let Option<usize>.Some { value } = &strokeSpace {
+          if value >= list.strokeSpaces.length() {
+            fail RenderError.InvalidGeometry
+          }
+          let space = &list.strokeSpaces.asSlice()[value]
+          if !space.pathToHost.isFinite() || !space.hostToDevice.isFinite() {
+            fail RenderError.InvalidGeometry
+          }
+        }
+        run clipIndex(clip, clips.length)
+        if !transform.isFinite() || !bounds.isValid() {
+          fail RenderError.InvalidGeometry
+        }
+        run paints.validateBrush(&brush, list)
+        drop run checked.unit(opacity)
+      }
+      Command.PushLayer { opacity, bounds, linearRgb } => {
+        drop run checked.unit(opacity)
+        if !bounds.isValid() {
+          fail RenderError.InvalidGeometry
+        }
+        depth = depth + 1
+        if depth >= surfaceLimit {
+          fail RenderError.TooLarge
+        }
+      }
+      Command.PopLayer => {
+        if depth == 0 {
+          fail RenderError.InvalidGeometry
+        }
+        depth = depth - 1
+      }
+    }
+    i = i + 1
+  }
+  if depth != 0 {
+    fail RenderError.InvalidGeometry
+  }
+}
+
+effect fn clipIndex(index: Option<usize>, count: usize) -> ()
+  ! RenderError {
+  match &index {
+    Option<usize>.Some { value } => {
+      if value >= count {
+        fail RenderError.InvalidGeometry
+      }
+    }
+    _ => {}
+  }
+}
+
+effect fn prepare(source: &Path, prepared: &mut Prepared) -> ()
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  if !prepared.ready {
+    prepared.path = run vector_path.convert(source)
+    prepared.ready = true
+  }
+}
+
+effect fn fill(
+  path: &VectorPath,
+  matrix: &Mapping,
+  clip: VectorRect,
+  planes: &[HalfPlane],
+  rule: u8,
+  tolerance: f64,
+  rasterizer: &mut Rasterizer,
+  coverage: &mut Coverage,
+  lines: &mut List<Line>,
+) -> ()
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  lines.clear()
+  match &matrix.* {
+    Mapping.Affine { value } => {
+      let affine = mapping.affine(value)
+      if planes.length == 0 {
+        run flattening.fillClipped(path, &affine, &clip, tolerance, &mut lines)
+      } else {
+        run projective.fillWithPlanes(
+          path,
+          &Homography.fromAffine(&affine),
+          clip,
+          planes,
+          tolerance,
+          &mut lines,
+        )
+      }
+    }
+    Mapping.Projective { value } => {
+      run projective.fillWithPlanes(path, &value, clip, planes, tolerance, &mut lines)
+    }
+  }
+  run checked.lines(lines.asSlice(), coverage.width(), coverage.height())
+
+  // Current vector has no checked fill/borrowed-line entry point: fillPolylines
+  // copies these validated lines into its reusable internal scratch. This extra
+  // List<Line> is necessary until upstream exposes checked fill without the copy.
+  run rasterizer.fillPolylines(lines.asSlice(), rule, &mut coverage)
+}

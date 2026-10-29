@@ -1,0 +1,333 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import font_data { Cursor }
+import model.error { Error }
+import ps.read { take, takeRead, require }
+import font_types.lib { Fixed }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+
+pub const BCD_POWER_TENS: [i32; 10] = [
+  1,
+  10,
+  100,
+  1000,
+  10000,
+  100000,
+  1000000,
+  10000000,
+  100000000,
+  1000000000,
+]
+
+pub fn parseInt<'a>(cursor: &mut Cursor<'a>, b0: u8) -> Result<i32, Error> {
+  return run Effect.result(readInt(&mut cursor, b0))
+}
+
+/// Effect form of `parseInt` for hot parsing loops.
+pub effect fn readInt<'a>(cursor: &mut Cursor<'a>, b0: u8) -> i32
+  ! Error with Intrinsic.inlineAlways() {
+  if b0 >= 32 && b0 <= 246 {
+    return u8.toI32(b0) - 139
+  }
+  if b0 >= 247 && b0 <= 250 {
+    return (u8.toI32(b0) - 247) * 256 + u8.toI32(run takeRead(Cursor<'a>.read<u8>(&mut cursor)))
+      + 108
+  }
+  if b0 >= 251 && b0 <= 254 {
+    return -(u8.toI32(b0) - 251) * 256 - u8.toI32(run takeRead(Cursor<'a>.read<u8>(&mut cursor)))
+      - 108
+  }
+  if b0 == 28 {
+    return i16.toI32(run takeRead(Cursor<'a>.read<i16>(&mut cursor)))
+  }
+  if b0 == 29 {
+    return run takeRead(Cursor<'a>.read<i32>(&mut cursor))
+  }
+  fail Error.Malformed
+}
+
+pub struct DynamicFixed {
+  pub value: Fixed,
+  pub scale: i32,
+}
+
+impl Copy for DynamicFixed {}
+
+pub struct BcdComponents {
+  hasError: bool,
+  error: Fixed,
+  number: i32,
+  sign: i32,
+  exponent: i32,
+  exponentAdd: i32,
+  integerLen: i32,
+  fractionLen: i32,
+}
+
+impl Copy for BcdComponents {}
+
+impl BcdComponents {
+  pub fn default() -> Self {
+    return Self {
+      hasError: false,
+      error: Fixed.zero(),
+      number: 0,
+      sign: 0,
+      exponent: 0,
+      exponentAdd: 0,
+      integerLen: 0,
+      fractionLen: 0,
+    }
+  }
+
+  pub fn fromFixed(value: Fixed) -> Self {
+    let mut result = BcdComponents.default()
+    result.hasError = true
+    result.error = value
+    return result
+  }
+
+  pub fn parse<'a>(cursor: &mut Cursor<'a>) -> Result<Self, Error> {
+    return run Effect.result(BcdComponents.parseImpl(&mut cursor))
+  }
+
+  effect fn parseImpl<'a>(cursor: &mut Cursor<'a>) -> Self
+    ! Error {
+    let mut phase: u8 = 0
+    let mut sign: i32 = 1
+    let mut exponentSign: i32 = 1
+    let mut number: i32 = 0
+    let mut exponent: i32 = 0
+    let mut exponentAdd: i32 = 0
+    let mut integerLen: i32 = 0
+    let mut fractionLen: i32 = 0
+    let mut overflow = false
+    let mut ended = false
+    while !ended {
+      let byte = run takeRead(Cursor<'a>.read<u8>(&mut cursor))
+      let nibbles: [u8; 2] = [u8.shiftRight(byte, 4) & 15, byte & 15]
+      let mut index: usize = 0
+      while index < 2 && !ended {
+        let nibble = nibbles[index]
+        index = index + 1
+        if phase == 0 {
+          if nibble <= 9 {
+            if number >= 214748364 {
+              exponentAdd = run require(i32.checkedAdd(exponentAdd, 1), Error.Malformed)
+            } else if nibble != 0 || number != 0 {
+              number = number * 10 + u8.toI32(nibble)
+              integerLen = integerLen + 1
+            }
+          } else if nibble == 14 {
+            sign = -1
+          } else if nibble == 10 {
+            phase = 1
+          } else if nibble == 11 {
+            phase = 2
+          } else if nibble == 12 {
+            phase = 2
+            exponentSign = -1
+          } else {
+            ended = true
+          }
+        } else if phase == 1 {
+          if nibble <= 9 {
+            if nibble == 0 && number == 0 {
+              exponentAdd = run require(i32.checkedSubtract(exponentAdd, 1), Error.Malformed)
+            } else if number < 214748364 && fractionLen < 9 {
+              number = number * 10 + u8.toI32(nibble)
+              fractionLen = fractionLen + 1
+            }
+          } else if nibble == 11 {
+            phase = 2
+          } else if nibble == 12 {
+            phase = 2
+            exponentSign = -1
+          } else {
+            ended = true
+          }
+        } else {
+          if nibble <= 9 {
+            if exponent > 1000 {
+              overflow = true
+            } else {
+              exponent = exponent * 10 + u8.toI32(nibble)
+            }
+          } else {
+            ended = true
+          }
+        }
+      }
+    }
+    if overflow && number != 0 {
+      let mut error = Fixed.fromBits(2147483647 * sign)
+      if exponentSign == -1 {
+        error = Fixed.zero()
+      }
+      return BcdComponents.fromFixed(error)
+    }
+    return Self {
+      hasError: false,
+      error: Fixed.zero(),
+      number: number,
+      sign: sign,
+      exponent: exponent * exponentSign,
+      exponentAdd: exponentAdd,
+      integerLen: integerLen,
+      fractionLen: fractionLen,
+    }
+  }
+
+  pub fn value(self: &Self, scaleBy1000: bool) -> Fixed {
+    if self.hasError {
+      return self.error
+    }
+    let mut number = self.number
+    if number == 0 {
+      return Fixed.zero()
+    }
+
+    // Wider intermediates keep arbitrarily long zero/overflow sequences safe.
+    let mut exponent = i32.toI64(self.exponent) + i32.toI64(self.exponentAdd)
+    if scaleBy1000 {
+      exponent = exponent + 3
+    }
+    let integerLen = i32.toI64(self.integerLen) + exponent
+    let mut fractionLen = i32.toI64(self.fractionLen) - exponent
+    if integerLen > 5 {
+      return Fixed.fromBits(2147483647)
+    }
+    if integerLen < -5 {
+      return Fixed.zero()
+    }
+    if integerLen < 0 {
+      number = number / BCD_POWER_TENS[i64.toUsize(-integerLen)]
+      fractionLen = fractionLen + integerLen
+    }
+    if fractionLen == 10 {
+      number = number / 10
+      fractionLen = fractionLen - 1
+    }
+    let mut result: i32 = 0
+    if fractionLen > 0 {
+      if fractionLen > 9 {
+        return Fixed.zero()
+      }
+      let divisor = BCD_POWER_TENS[i64.toUsize(fractionLen)]
+      if number / divisor <= 32767 {
+        result = Fixed.toBits(Fixed.fromBits(number) / Fixed.fromBits(divisor))
+      }
+    } else {
+      if fractionLen < -9 {
+        return Fixed.fromBits(2147483647)
+      }
+      number = i32.wrappingMultiply(number, BCD_POWER_TENS[i64.toUsize(-fractionLen)])
+      if number > 32767 {
+        return Fixed.fromBits(2147483647)
+      }
+      result = i32.shiftLeft(number, 16)
+    }
+    if scaleBy1000 {
+      result = Fixed.toBits(Fixed.fromBits(result) / Fixed.fromI32(1000))
+    }
+    return Fixed.fromBits(i32.wrappingMultiply(result, self.sign))
+  }
+
+  pub fn dynamicallyScaledValue(self: &Self) -> DynamicFixed {
+    if self.hasError {
+      return DynamicFixed { value: self.error, scale: 0 }
+    }
+    let mut number = self.number
+    if number == 0 {
+      return DynamicFixed { value: Fixed.zero(), scale: 0 }
+    }
+    let mut exponent = i32.saturatingAdd(self.exponent, self.exponentAdd)
+    let fractionLen = self.fractionLen + self.integerLen
+    exponent = i32.saturatingAdd(exponent, self.integerLen)
+    let mut result = Fixed.zero()
+    let mut scaling: i32 = 0
+    if fractionLen <= 5 {
+      if number > 32767 {
+        result = Fixed.fromBits(number) / Fixed.fromBits(10)
+        scaling = i32.saturatingAdd(i32.saturatingSubtract(exponent, fractionLen), 1)
+      } else {
+        if exponent > 0 {
+          let mut newFractionLen = exponent
+          if newFractionLen > 5 {
+            newFractionLen = 5
+          }
+          let shift = newFractionLen - fractionLen
+          if shift > 0 {
+            exponent = exponent - newFractionLen
+            number = number * BCD_POWER_TENS[i32.toUsize(shift)]
+            if number > 32767 {
+              number = number / 10
+              exponent = exponent + 1
+            }
+          } else {
+            exponent = exponent - fractionLen
+          }
+        } else {
+          exponent = i32.saturatingSubtract(exponent, fractionLen)
+        }
+        result = Fixed.fromI32(number)
+        scaling = exponent
+      }
+    } else if number / BCD_POWER_TENS[i32.toUsize(fractionLen - 5)] > 32767 {
+      result = Fixed.fromBits(number) / Fixed.fromBits(BCD_POWER_TENS[i32.toUsize(fractionLen - 4)])
+      scaling = i32.saturatingSubtract(exponent, 4)
+    } else {
+      result = Fixed.fromBits(number) / Fixed.fromBits(BCD_POWER_TENS[i32.toUsize(fractionLen - 5)])
+      scaling = i32.saturatingSubtract(exponent, 5)
+    }
+    return DynamicFixed {
+      value: Fixed.fromBits(i32.wrappingMultiply(Fixed.toBits(result), self.sign)),
+      scale: scaling,
+    }
+  }
+}
+
+pub fn parseFixedDynamic<'a>(cursor: &mut Cursor<'a>) -> Result<DynamicFixed, Error> {
+  return run Effect.result(parseFixedDynamicImpl(&mut cursor))
+}
+
+effect fn parseFixedDynamicImpl<'a>(cursor: &mut Cursor<'a>) -> DynamicFixed
+  ! Error {
+  let b0 = run takeRead(Cursor<'a>.read<u8>(&mut cursor))
+  if b0 == 30 {
+    let components = run take(BcdComponents.parse(&mut cursor))
+    return BcdComponents.dynamicallyScaledValue(&components)
+  }
+  if b0 == 28 || b0 == 29 || (b0 >= 32 && b0 <= 254) {
+    let num = run readInt(&mut cursor, b0)
+    if num > 32767 {
+      let mut intLen: usize = 10
+      let mut i: usize = 5
+      while i < 10 {
+        if num < BCD_POWER_TENS[i] {
+          intLen = i
+          break
+        }
+        i = i + 1
+      }
+      let mut scaling = intLen - 5
+      if num - BCD_POWER_TENS[intLen - 5] > 32767 {
+        scaling = intLen - 4
+      }
+      return DynamicFixed {
+        value: Fixed.fromBits(num) / Fixed.fromBits(BCD_POWER_TENS[scaling]),
+        scale: usize.toI32(scaling),
+      }
+    }
+    return DynamicFixed { value: Fixed.fromI32(num), scale: 0 }
+  }
+  fail Error.Malformed
+}
+
+import silk.num.usize

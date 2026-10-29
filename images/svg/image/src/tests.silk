@@ -1,0 +1,392 @@
+//! PNG encoding contracts; URLs resolve to the copy pinned in images/svg/specs.lock.json.
+import image { Image, ImageError }
+import png
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.compress.checksum { CompressionChecksum }
+import silk.compress.inflate { Decoder, DecodeError, Format, Limits, Progress, Status }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+
+fn equalBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < a.length {
+    if a[index] != b[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn read32(data: &[u8], offset: usize) -> u32 {
+  return u8.toU32(data[offset]) * 16777216 + u8.toU32(data[offset + 1]) * 65536
+    + u8.toU32(data[offset + 2]) * 256
+    + u8.toU32(data[offset + 3])
+}
+
+effect fn rejectedSize(width: u32, height: u32, expected: ImageError) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let result = run Effect.result(Image.make(width, height))
+  return match &result {
+    Result<Image, ImageError | OutOfMemoryError>.Success { value: _ } => false
+    Result<Image, ImageError | OutOfMemoryError>.Failure { error } => match &error {
+      ImageError problem => problem == expected
+      OutOfMemoryError problem => {
+        fail OutOfMemoryError {}
+      }
+    }
+  }
+}
+
+// https://www.w3.org/TR/png-3/#11IHDR
+// Resource bounds are stricter library policy and are checked before allocation.
+test effect fn imageRejectsZeroAndOverflowingDimensions() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run rejectedSize(0, 1, ImageError.InvalidDimensions)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "zero width",
+  )
+  run Testing.expect(
+    run rejectedSize(1, 0, ImageError.InvalidDimensions)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "zero height",
+  )
+  run Testing.expect(
+    run rejectedSize(4294967295, 4294967295, ImageError.InvalidDimensions)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "PNG dimensions cannot exceed 31 bits",
+  )
+  run Testing.expect(
+    run rejectedSize(2147483647, 2147483647, ImageError.TooLarge)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "pixel product cannot wrap",
+  )
+  run Testing.expect(
+    run rejectedSize(67108865, 1, ImageError.TooLarge)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "one pixel beyond allocation ceiling",
+  )
+}
+
+// Validate PNG framing, concatenate IDAT chunks and decode scanline filters.
+// Chunk splitting and filter selection are encoder choices, not pixel contracts.
+effect fn decodedSamples(encoded: &[u8], width: u32, height: u32) -> Bytes
+  ! AssertionError<'static> | OutOfMemoryError | DecodeError
+  ? &mut Allocator {
+  run Testing.expect(encoded.length >= 8, "complete PNG signature")
+  run Testing.expect(
+    equalBytes(Slice.view<u8>(encoded, 0, 8), b"\x89PNG\r\n\x1a\n"),
+    "PNG signature",
+  )
+  let mut position: usize = 8
+  let mut ended = false
+  let mut compressed = run Bytes.zeroed(encoded.length)
+  let mut stream = Bytes.asMutSlice(&mut compressed)
+  let mut idatLength: usize = 0
+  while position < encoded.length {
+    run Testing.expect(encoded.length - position >= 12, "complete chunk framing")
+    let length = u32.toUsize(read32(encoded, position))
+    run Testing.expect(length <= encoded.length - position - 12, "chunk data in bounds")
+    let name = Slice.view<u8>(encoded, position + 4, 4)
+    let dataStart = position + 8
+    let dataEnd = dataStart + length
+    run Testing.expect(
+      CompressionChecksum.crc32(Slice.view<u8>(encoded, position + 4, dataEnd - position - 4))
+        == read32(encoded, dataEnd),
+      "CRC covers type and payload, excludes length",
+    )
+    if position == 8 {
+      run Testing.expect(equalBytes(name, b"IHDR") && length == 13, "IHDR first, thirteen bytes")
+      run Testing.expect(
+        read32(encoded, dataStart) == width && read32(encoded, dataStart + 4) == height,
+        "big-endian IHDR dimensions",
+      )
+      run Testing.expect(
+        equalBytes(
+          Slice.view<u8>(encoded, dataStart + 8, dataEnd - dataStart - 8),
+          b"\x08\x06\x00\x00\x00",
+        ),
+        "RGBA8, deflate, filter method zero, noninterlaced",
+      )
+    } else if equalBytes(name, b"sRGB") {
+      run Testing.expect(
+        length == 1 && encoded[dataStart] <= 3 && idatLength == 0,
+        "valid sRGB intent before image data",
+      )
+    } else if equalBytes(name, b"IDAT") {
+      let mut index: usize = 0
+      while index < length {
+        stream[idatLength + index] = encoded[dataStart + index]
+        index = index + 1
+      }
+      idatLength = idatLength + length
+    } else if equalBytes(name, b"IEND") {
+      run Testing.expect(
+        length == 0 && dataEnd + 4 == encoded.length,
+        "empty IEND terminates the file",
+      )
+      ended = true
+    }
+    position = dataEnd + 4
+  }
+  drop stream
+  run Testing.expect(ended, "PNG ends with IEND")
+  let size = (u32.toUsize(width) * 4 + 1) * u32.toUsize(height)
+  let mut decoded = run Bytes.zeroed(size + 1)
+  let limits = Limits {
+    maxInputBytes: usize.toU64(idatLength),
+    maxOutputBytes: usize.toU64(size),
+    maxMembers: 1,
+    maxHeaderBytes: 2,
+    maxMemoryBytes: 65536,
+  }
+  let mut decoder = run Decoder.make(Format.Zlib, move limits)
+  let status = Decoder.step(
+    &mut decoder,
+    Slice.view<u8>(Bytes.asSlice(&compressed), 0, idatLength),
+    Bytes.asMutSlice(&mut decoded),
+    true,
+  )
+  match &status {
+    Result<Progress, DecodeError>.Success { value } => {
+      run Testing.expect(
+        value.status == Status.Finished && value.written == size && value.consumed == idatLength,
+        "complete zlib stream with verified Adler-32",
+      )
+    }
+    Result<Progress, DecodeError>.Failure { error } => {
+      fail DecodeError { kind: error.kind, consumed: error.consumed, written: error.written }
+    }
+  }
+  Bytes.truncate(&mut decoded, size)
+  return run unfilter(Bytes.asSlice(&decoded), u32.toUsize(width), u32.toUsize(height))
+}
+
+fn distance(a: u32, b: u32) -> u32 {
+  return if a >= b {
+    a - b
+  } else {
+    b - a
+  }
+}
+
+fn paeth(left: u32, above: u32, corner: u32) -> u32 {
+  let a = distance(above, corner)
+  let b = distance(left, corner)
+  let c = distance(left + above, 2 * corner)
+  return if a <= b && a <= c {
+    left
+  } else if b <= c {
+    above
+  } else {
+    corner
+  }
+}
+
+effect fn unfilter(raw: &[u8], width: usize, height: usize) -> Bytes
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let stride = width * 4
+  let mut result = run Bytes.zeroed(stride * height)
+  let mut pixels = Bytes.asMutSlice(&mut result)
+  let mut row: usize = 0
+  while row < height {
+    let source = row * (stride + 1)
+    let target = row * stride
+    let filter = raw[source]
+    run Testing.expect(filter <= 4, "defined PNG scanline filter")
+    let mut column: usize = 0
+    while column < stride {
+      let left = if column >= 4 {
+        u8.toU32(pixels[target + column - 4])
+      } else {
+        0
+      }
+      let above = if row > 0 {
+        u8.toU32(pixels[target + column - stride])
+      } else {
+        0
+      }
+      let corner = if row > 0 && column >= 4 {
+        u8.toU32(pixels[target + column - stride - 4])
+      } else {
+        0
+      }
+      let predictor = if filter == 1 {
+        left
+      } else if filter == 2 {
+        above
+      } else if filter == 3 {
+        u32.divide(left + above, 2)
+      } else if filter == 4 {
+        paeth(left, above, corner)
+      } else {
+        0
+      }
+      pixels[target + column] = u32.toU8(
+        u32.bitAnd(u8.toU32(raw[source + column + 1]) + predictor, 255),
+      )
+      column = column + 1
+    }
+    row = row + 1
+  }
+  drop pixels
+  return move result
+}
+
+// https://www.w3.org/TR/png-3/#5PNG-file-signature
+// https://www.w3.org/TR/png-3/#5Chunk-layout
+// https://www.w3.org/TR/png-3/#5CRC-algorithm
+// https://www.w3.org/TR/png-3/#11IHDR
+// https://www.w3.org/TR/png-3/#11sRGB
+// https://www.w3.org/TR/png-3/#10CompressionFSL
+// https://www.w3.org/TR/png-3/#6AlphaRepresentation
+// https://www.w3.org/TR/png-3/#7Scanline
+// https://www.w3.org/TR/png-3/#9Filter-types
+test effect fn pngFramesDemultipliedRowsAndPreservesSource() -> ()
+  ! AssertionError<'static> | ImageError | OutOfMemoryError | DecodeError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut value = run Image.make(3, 2) |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Opaque, half alpha, transparent, low alpha, odd alpha and rounded channels.
+  let source = b"\x12\x34\x56\xff\x40\x20\x80\x80\x00\x00\x00\x00\x01\x00\x01\x01\x01\x02\x03\x03\x01\x7e\xfe\xfe"
+  let mut writable = Image.dataMut(&mut value)
+  let mut index: usize = 0
+  while index < source.length {
+    writable[index] = source[index]
+    index = index + 1
+  }
+  drop writable
+  let encoded = run png.encode(&value) |> Effect.provideMut<Allocator>(&mut allocator)
+  let raw = run decodedSamples(Bytes.asSlice(&encoded), 3, 2)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let expected = b"\x12\x34\x56\xff\x80\x40\xff\x80\x00\x00\x00\x00\xff\x00\xff\x01\x55\xaa\xff\x03\x01\x7e\xff\xfe"
+  run Testing.expect(
+    equalBytes(Bytes.asSlice(&raw), expected),
+    "top-to-bottom nearest-rounded straight-alpha RGBA",
+  )
+  run Testing.expect(
+    equalBytes(Image.data(&value), source),
+    "encoding does not mutate premultiplied source",
+  )
+}
+
+effect fn rejectedPixels(width: u32, height: u32, pixels: &[u8], expected: ImageError) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let result = run Effect.result(png.encodePixels(width, height, pixels))
+  return match &result {
+    Result<Bytes, ImageError | OutOfMemoryError>.Success { value: _ } => false
+    Result<Bytes, ImageError | OutOfMemoryError>.Failure { error } => match &error {
+      ImageError problem => problem == expected
+      OutOfMemoryError problem => {
+        fail OutOfMemoryError {}
+      }
+    }
+  }
+}
+
+// https://www.w3.org/TR/png-3/#11IHDR
+// https://www.w3.org/TR/png-3/#7Scanline
+// Exact borrowed slice length and the allocation ceiling are library policy.
+test effect fn borrowedPixelsRequireExactCheckedLength() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run rejectedPixels(1, 1, b"\x00\x00\x00", ImageError.LengthMismatch)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "short RGBA input",
+  )
+  run Testing.expect(
+    run rejectedPixels(1, 1, b"\x00\x00\x00\x00\x00", ImageError.LengthMismatch)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "long RGBA input",
+  )
+  run Testing.expect(
+    run rejectedPixels(0, 1, b"", ImageError.InvalidDimensions)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "zero dimensions rejected before encoding",
+  )
+  run Testing.expect(
+    run rejectedPixels(2147483647, 2147483647, b"", ImageError.TooLarge)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "oversized dimensions rejected before slice length",
+  )
+}
+
+// https://www.w3.org/TR/png-3/#6AlphaRepresentation
+// https://www.w3.org/TR/png-3/#10CompressionFSL
+// Hidden transparent RGB is cleared, and channels above alpha saturate by library policy.
+test effect fn borrowedPixelsCanonicalizeAlpha() -> ()
+  ! AssertionError<'static> | ImageError | OutOfMemoryError | DecodeError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let source = b"\x05\x0a\x0f\x0f\x12\x34\x56\x00\xff\x02\x00\x01"
+  let encoded = run png.encodePixels(3, 1, source) |> Effect.provideMut<Allocator>(&mut allocator)
+  let raw = run decodedSamples(Bytes.asSlice(&encoded), 3, 1)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equalBytes(Bytes.asSlice(&raw), b"\x55\xaa\xff\x0f\x00\x00\x00\x00\xff\xff\x00\x01"),
+    "borrowed premultiplied input becomes canonical straight-alpha samples",
+  )
+}
+
+// https://www.w3.org/TR/png-3/#11IHDR
+// The upper allocation boundary is library policy, validated without allocating 256 MiB.
+test effect fn imageSizeCeilingIsInclusive() -> ()
+  ! AssertionError<'static> | ImageError {
+  run Testing.expect(
+    (run Image.validateSize(67108864, 1)) == 268435456,
+    "largest permitted single row",
+  )
+}
+
+// https://www.w3.org/TR/png-3/#10CompressionCM0
+// https://www.w3.org/TR/png-3/#7Scanline
+// https://www.w3.org/TR/png-3/#11IHDR
+test effect fn pngEncodesWideHighEntropyRowsAcrossTheDeflateWindow() -> ()
+  ! AssertionError<'static> | ImageError | OutOfMemoryError | DecodeError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut source = run Bytes.zeroed(257 * 33 * 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut pixels = Bytes.asMutSlice(&mut source)
+  let mut state: u32 = 0x12345678
+  let mut row: usize = 0
+  while row < 33 {
+    let mut column: usize = 0
+    while column < 257 {
+      let pixel = (row * 257 + column) * 4
+      let mut channel: usize = 0
+      while channel < 3 {
+        state = u32.bitXor(state, u32.shiftLeft(state, 13))
+        state = u32.bitXor(state, u32.shiftRight(state, 17))
+        state = u32.bitXor(state, u32.shiftLeft(state, 5))
+        let value = u32.toU8(u32.bitAnd(state, 255))
+        pixels[pixel + channel] = value
+        channel = channel + 1
+      }
+      pixels[pixel + 3] = 255
+      column = column + 1
+    }
+    row = row + 1
+  }
+  drop pixels
+  let encoded = run png.encodePixels(257, 33, Bytes.asSlice(&source))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let raw = run decodedSamples(Bytes.asSlice(&encoded), 257, 33)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equalBytes(Bytes.asSlice(&raw), Bytes.asSlice(&source)),
+    "all high-entropy opaque channels survive compression",
+  )
+}

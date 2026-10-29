@@ -1,0 +1,417 @@
+// Ports of upstream packed point/delta decoding tests.
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import generated_variations {
+  PackedPointNumbers,
+  PackedPointNumbersIter,
+  PackedDeltas,
+  DeltaRunIter,
+  PackedDeltaFetcher
+}
+import font_data { FontData, Cursor }
+import read { ReadError }
+import font_types.lib { Fixed }
+import silk.testing.testing { Testing, AssertionError }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.u32
+import silk.num.usize
+import silk.num.i32
+import silk.num.f32
+
+effect fn must<T>(value: Result<T, ReadError>) -> T
+  ! AssertionError<'static> {
+  return match move value {
+    Result<T, ReadError>.Success { value: item } => move item
+    _ => {
+      run Testing.expect(false, "packed data succeeds")
+      return Intrinsic.trap("test assertion")
+    }
+  }
+}
+
+effect fn some<T>(value: Option<T>) -> T
+  ! AssertionError<'static> {
+  return match move value {
+    Option<T>.Some { value: item } => move item
+    _ => {
+      run Testing.expect(false, "packed value present")
+      return Intrinsic.trap("test assertion")
+    }
+  }
+}
+
+fn isNone<T>(value: Option<T>) -> bool {
+  return match move value {
+    Option<T>.None => true
+    _ => false
+  }
+}
+
+fn isOob<T>(value: Result<T, ReadError>) -> bool {
+  return match move value {
+    Result<T, ReadError>.Failure { error: ReadError.OutOfBounds } => true
+    _ => false
+  }
+}
+
+fn shortData() -> FontData<'static> {
+  return FontData.new(b"\x83\x40\x01\x02\x01\x81\x80")
+}
+
+fn specData() -> FontData<'static> {
+  return FontData.new(b"\x03\x0a\x97\x00\xc6\x87\x41\x10\x22\xfb\x34")
+}
+
+fn specValues() -> [i32; 14] {
+  return [10, -105, 0, -58, 0, 0, 0, 0, 0, 0, 0, 0, 4130, -1228]
+}
+
+effect fn points(bytes: &[u8], expected: &[u16]) -> ()
+  ! AssertionError<'static> {
+  let split = PackedPointNumbers.splitOffFront(FontData.new(bytes))
+  let mut iter = PackedPointNumbers.iter(&split.points)
+  let mut i: usize = 0
+  while i < expected.length {
+    run Testing.expect(
+      (run some(PackedPointNumbersIter.next(&mut iter))) == expected[i],
+      "decoded point",
+    )
+    i = i + 1
+  }
+  run Testing.expect(isNone(PackedPointNumbersIter.next(&mut iter)), "points exhausted")
+}
+
+effect fn deltas<'a>(mut iter: DeltaRunIter<'a>, expected: &[i32]) -> ()
+  ! AssertionError<'static> {
+  let mut i: usize = 0
+  while i < expected.length {
+    run Testing.expect((run some(DeltaRunIter.next(&mut iter))) == expected[i], "decoded delta")
+    i = i + 1
+  }
+  run Testing.expect(isNone(DeltaRunIter.next(&mut iter)), "deltas exhausted")
+}
+
+test effect fn packedPoints() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    PackedPointNumbers.count(&PackedPointNumbers.splitOffFront(FontData.new(b"\x00")).points) == 0
+      && PackedPointNumbers.count(
+        &PackedPointNumbers.splitOffFront(FontData.new(b"\x80\x00")).points,
+      )
+        == 0,
+    "all points encodings",
+  )
+  run points(b"\x02\x01\x09\x06", &[9, 15])
+  run points(b"\x02\x81\xbe\xef\x0c\x0f", &[48879, 51966])
+  run points(b"\x01\x00\x07", &[7])
+  run points(b"\x01\x80\x00\x07", &[7])
+  run points(b"\x01\x80\xff\xff", &[65535])
+  run points(b"\x04\x01\x07\x01\x01\xff\x02", &[7, 8, 263, 265])
+}
+
+test effect fn packedPointByteLen() -> ()
+  ! AssertionError<'static> {
+  let cases: [&[u8]; 8] = [
+    b"\x00",
+    b"\x80\x00",
+    b"\x02\x01\x09\x06",
+    b"\x02\x81\xbe\xef\x0c\x0f",
+    b"\x01\x00\x07",
+    b"\x01\x80\x00\x07",
+    b"\x01\x80\xff\xff",
+    b"\x04\x01\x07\x01\x01\xff\x02",
+  ]
+  let mut i: usize = 0
+  while i < 8 {
+    let split = PackedPointNumbers.splitOffFront(FontData.new(cases[i]))
+    run Testing.expect(
+      PackedPointNumbers.totalLen(&split.points) == cases[i].length,
+      "encoded length",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn packedDeltas() -> ()
+  ! AssertionError<'static> {
+  let data = PackedDeltas.consumeAll(shortData())
+  run Testing.expect(PackedDeltas.countOrCompute(&data) == 7, "delta count")
+  run deltas(PackedDeltas.iter(&data), &[0, 0, 0, 0, 258, -127, -128])
+  run deltas(PackedDeltas.iter(&PackedDeltas.consumeAll(FontData.new(b"\x81"))), &[0, 0])
+}
+
+test effect fn packedDeltasSpec() -> ()
+  ! AssertionError<'static> {
+  let data = PackedDeltas.consumeAll(specData())
+  run Testing.expect(PackedDeltas.countOrCompute(&data) == 14, "spec delta count")
+  run deltas(PackedDeltas.iter(&data), &specValues())
+}
+
+effect fn repeated(value: f32, count: usize) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<f32>.make()
+  let mut i: usize = 0
+  while i < count {
+    run List<f32>.append(&mut result, value)
+    i = i + 1
+  }
+  return move result
+}
+
+effect fn skipSuffix() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let data = PackedDeltas.consumeAll(specData())
+  let expected = specValues()
+  let mut skip: usize = 0
+  while skip <= 14 {
+    let mut fetcher = PackedDeltas.fetcher(&data)
+    drop run must(PackedDeltaFetcher.skip(&mut fetcher, skip))
+    let mut out = run repeated(0.0, 14 - skip)
+    drop run must(
+      PackedDeltaFetcher.addToF32Scaled(&mut fetcher, List<f32>.asMutSlice(&mut out), 1.0),
+    )
+    let mut i: usize = 0
+    while i < 14 - skip {
+      run Testing.expect(List<f32>.get(&out, i) == i32.toF32(expected[skip + i]), "fetch suffix")
+      i = i + 1
+    }
+    skip = skip + 1
+  }
+  let mut fetcher = PackedDeltas.fetcher(&data)
+  run Testing.expect(isOob(PackedDeltaFetcher.skip(&mut fetcher, 15)), "skip beyond stream")
+}
+
+test effect fn packedDeltaFetcherSkipMatchesIteratorSuffix() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run skipSuffix() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn packedDeltaFetcherScaledAddAndExhaustion() -> ()
+  ! AssertionError<'static> {
+  let mut fetcher = PackedDeltas.fetcher(&PackedDeltas.new(specData(), 4))
+  let mut out: [f32; 4] = [1.0; 4]
+  drop run must(PackedDeltaFetcher.addToF32Scaled(&mut fetcher, &mut out, 0.5))
+  run Testing.expect(
+    out[0] == 6.0 && out[1] == -51.5 && out[2] == 1.0 && out[3] == -28.0,
+    "scaled addition",
+  )
+  let mut extra: [f32; 1] = [0.0]
+  run Testing.expect(
+    isOob(PackedDeltaFetcher.addToF32Scaled(&mut fetcher, &mut extra, 1.0)),
+    "bounded exhaustion",
+  )
+}
+
+test effect fn packedDeltaFetcherF64PreservesI32Residuals() -> ()
+  ! AssertionError<'static> {
+  let mut fetcher = PackedDeltas.fetcher(
+    &PackedDeltas.new(FontData.new(b"\xc1\x01\x00\x00\x01\xff\x00\x00\x00"), 2),
+  )
+  let mut out: [f64; 1] = [0.0]
+  drop run must(PackedDeltaFetcher.addToF64Scaled(&mut fetcher, &mut out, 0.5))
+  drop run must(PackedDeltaFetcher.addToF64Scaled(&mut fetcher, &mut out, 0.5))
+  run Testing.expect(
+    out[0] == 0.5 && isOob(PackedDeltaFetcher.addToF64Scaled(&mut fetcher, &mut out, 1.0)),
+    "32-bit cancellation preserves residual",
+  )
+}
+
+test effect fn packedDeltaFetcherSkipThenAddBounded() -> ()
+  ! AssertionError<'static> {
+  let mut fetcher = PackedDeltas.fetcher(&PackedDeltas.new(shortData(), 7))
+  drop run must(PackedDeltaFetcher.skip(&mut fetcher, 3))
+  let mut out: [f32; 4] = [0.0; 4]
+  drop run must(PackedDeltaFetcher.addToF32Scaled(&mut fetcher, &mut out, 1.0))
+  run Testing.expect(
+    out[0] == 0.0 && out[1] == 258.0 && out[2] == -127.0 && out[3] == -128.0,
+    "skip then add",
+  )
+}
+
+test effect fn deltaRunIterEndExhaustsUnboundedData() -> ()
+  ! AssertionError<'static> {
+  let end = DeltaRunIter.end(PackedDeltas.iter(&PackedDeltas.consumeAll(shortData())))
+  run Testing.expect(Cursor.remainingBytes(&end) == 0, "unbounded end")
+}
+
+test effect fn deltaRunIterEndRespectsBoundedCount() -> ()
+  ! AssertionError<'static> {
+  let iter = PackedDeltas.iter(&PackedDeltas.new(shortData(), 4))
+  let end = DeltaRunIter.end(iter)
+  let skipped = DeltaRunIter.end(DeltaRunIter.skipFast(iter, 4))
+  run Testing.expect(
+    Cursor.remainingBytes(&end) == 6 && Cursor.remainingBytes(&skipped) == 6,
+    "bounded end remains at header",
+  )
+}
+
+test effect fn deltaRunIterEndMatchesManualIterationForBoundedData() -> ()
+  ! AssertionError<'static> {
+  let iter = PackedDeltas.iter(&PackedDeltas.new(specData(), 6))
+  run deltas(iter, &[10, -105, 0, -58, 0, 0])
+  let end = DeltaRunIter.end(iter)
+  let skipped = DeltaRunIter.end(DeltaRunIter.skipFast(iter, 6))
+  run Testing.expect(
+    Cursor.remainingBytes(&end) == Cursor.remainingBytes(&skipped),
+    "bounded end equals skip",
+  )
+}
+
+struct Stream {
+  bytes: [u8; 198],
+  length: usize,
+  values: [i32; 48],
+  count: usize,
+}
+
+fn nextRandom(state: &mut u32) -> u32 {
+  state.* = u32.wrappingAdd(u32.wrappingMultiply(state.*, 1664525), 1013904223)
+  return state.*
+}
+
+fn generatedStream(seed: u32) -> Stream {
+  let mut state = seed
+  let mut stream = Stream { bytes: [0; 198], length: 0, values: [0; 48], count: 0 }
+  let runs = nextRandom(&mut state) % 6 + 1
+  let mut r: u32 = 0
+  while r < runs {
+    let kind = nextRandom(&mut state) % 4
+    let len = nextRandom(&mut state) % 8 + 1
+    stream.bytes[stream.length] = u32.toU8(kind * 64 + len - 1)
+    stream.length = stream.length + 1
+    let mut i: u32 = 0
+    while i < len {
+      let mut value: i32 = 0
+      let mut width: usize = 0
+      if kind == 0 {
+        value = u32.toI32(nextRandom(&mut state) % 255) - 127
+        width = 1
+      } else if kind == 1 {
+        value = u32.toI32(nextRandom(&mut state) % 65535) - 32767
+        width = 2
+      } else if kind == 3 {
+        value = u32.toI32(nextRandom(&mut state) % 2000001) - 1000000
+        width = 4
+      }
+      let bytes = Fixed.toBeBytes(Fixed.fromBits(value))
+      let mut j: usize = 0
+      while j < width {
+        stream.bytes[stream.length] = bytes[4 - width + j]
+        stream.length = stream.length + 1
+        j = j + 1
+      }
+      stream.values[stream.count] = value
+      stream.count = stream.count + 1
+      i = i + 1
+    }
+    r = r + 1
+  }
+  return move stream
+}
+
+test effect fn generatedPackedDeltasIterMatchesExpected() -> ()
+  ! AssertionError<'static> {
+  let mut seed: u32 = 1
+  while seed <= 64 {
+    let stream = generatedStream(seed)
+    let data = PackedDeltas.consumeAll(FontData.new(Slice.view(&stream.bytes, 0, stream.length)))
+    run Testing.expect(PackedDeltas.countOrCompute(&data) == stream.count, "generated count")
+    run deltas(PackedDeltas.iter(&data), Slice.view(&stream.values, 0, stream.count))
+    seed = seed + 1
+  }
+}
+
+effect fn generatedFetches() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let mut seed: u32 = 1
+  while seed <= 64 {
+    let stream = generatedStream(seed)
+    let mut fetcher = PackedDeltas.fetcher(
+      &PackedDeltas.new(FontData.new(Slice.view(&stream.bytes, 0, stream.length)), stream.count),
+    )
+    let skip = u32.toUsize(seed) * 7 % (stream.count + 1)
+    drop run must(PackedDeltaFetcher.skip(&mut fetcher, skip))
+    let mut scale: f32 = -0.5
+    if seed % 2 == 0 {
+      scale = 0.25
+    }
+    let mut out = run repeated(10.0, stream.count - skip)
+    drop run must(
+      PackedDeltaFetcher.addToF32Scaled(&mut fetcher, List<f32>.asMutSlice(&mut out), scale),
+    )
+    let mut i: usize = 0
+    while i < stream.count - skip {
+      run Testing.expect(
+        f32.abs(List<f32>.get(&out, i) - (10.0 + i32.toF32(stream.values[skip + i]) * scale))
+          <= 0.000001,
+        "generated fetch",
+      )
+      i = i + 1
+    }
+    let mut extra: [f32; 1] = [0.0]
+    run Testing.expect(
+      isOob(PackedDeltaFetcher.addToF32Scaled(&mut fetcher, &mut extra, 1.0)),
+      "generated exhaustion",
+    )
+    seed = seed + 1
+  }
+}
+
+test effect fn generatedFetcherSkipScaledMatchesExpected() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run generatedFetches() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn packedPointSplit() -> ()
+  ! AssertionError<'static> {
+  let data = FontData.new(b"\x02\x01\x01\x02\x01\xcd\x8f\x01\x08\x00\x01\xca\x3b\x01\xff\x00")
+  let split = PackedPointNumbers.splitOffFront(data)
+  run Testing.expect(
+    PackedPointNumbers.count(&split.points) == 2 && PackedPointNumbers.totalLen(&split.points) == 4
+      && FontData.len(&split.remainder) == 12,
+    "split packed points",
+  )
+  run points(FontData.asBytes(&data), &[1, 3])
+}
+
+test effect fn packedPointsDontPanic() -> ()
+  ! AssertionError<'static> {
+  let mut iter = PackedPointNumbers.iter(
+    &PackedPointNumbers.splitOffFront(FontData.new(b"\x00")).points,
+  )
+  let mut count: usize = 0
+  while !isNone(PackedPointNumbersIter.next(&mut iter)) {
+    count = count + 1
+  }
+  run Testing.expect(count == 65535, "all points stops before overflowing")
+}
+
+test effect fn packedDeltaRunCrossesCoordBoundary() -> ()
+  ! AssertionError<'static> {
+  let data = PackedDeltas.consumeAll(
+    FontData.new(b"\x05\x00\x01\x02\x03\x04\x05\x41\x00\x06\x00\x07"),
+  )
+  run Testing.expect(PackedDeltas.countOrCompute(&data) == 8, "crossing count")
+  run deltas(PackedDeltas.xDeltas(&data), &[0, 1, 2, 3])
+  run deltas(PackedDeltas.yDeltas(&data), &[4, 5, 6, 7])
+}
+
+test effect fn packedPointNumbersAvoidOverflow() -> ()
+  ! AssertionError<'static> {
+  let bytes: [u8; 65535] = [255; 65535]
+  let mut iter = PackedPointNumbersIter.new(65535, FontData.cursor(&FontData.new(&bytes)))
+  let mut count: usize = 0
+  while !isNone(PackedPointNumbersIter.next(&mut iter)) {
+    count = count + 1
+  }
+  run Testing.expect(count == 1, "overflow terminates point iteration")
+}

@@ -1,0 +1,552 @@
+//! Host-extensible, allocation-bounded resource loading. No network, filesystem, or cache.
+//! RFC 2397 data decoding is strict: malformed escapes, headers and noncanonical Base64 fail.
+import url { Url }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+
+pub enum ResourceKind {
+  StyleSheet,
+  Document,
+  Image,
+  Font,
+  ColorProfile,
+}
+
+pub enum ResourceError {
+  UnsupportedScheme,
+  InvalidData,
+  TooLarge,
+  BlockedLocation,
+  Io,
+}
+
+pub struct Limits {
+  /// Maximum decoded bytes for one resource; checked before allocating the decoded buffer.
+  pub maxResourceBytes: usize,
+}
+
+impl Copy for Limits {}
+
+impl Limits {
+  pub fn defaults() -> Limits {
+    return Limits { maxResourceBytes: 67108864 }
+  }
+}
+
+pub enum ProcessingMode {
+  Static,
+  Animated,
+  SecureStatic,
+  SecureAnimated,
+}
+
+impl ProcessingMode {
+  pub fn isSecure(self: Self) -> bool {
+    return self == ProcessingMode.SecureStatic || self == ProcessingMode.SecureAnimated
+  }
+}
+
+pub struct Policy {
+  pub mode: ProcessingMode,
+  pub limits: Limits,
+}
+
+impl Copy for Policy {}
+
+/// Transport metadata is absent when the transport supplies none. MIME types are
+/// parsed essences without parameters; charset labels are decoded parameter values.
+/// finalUrl supplies the response base after redirects; its fragment is not a target.
+/// Data-URL metadata stays in the request URL and is available through inspectData,
+/// avoiding redundant header allocation and decoding.
+pub struct Response {
+  pub bytes: Bytes,
+  pub finalUrl: Option<Url>,
+  pub mediaType: Option<Bytes>,
+  pub charset: Option<Bytes>,
+}
+
+impl Response {
+  pub fn fromBytes(bytes: Bytes) -> Response {
+    return Response {
+      bytes: move bytes,
+      finalUrl: Option<Url>.None,
+      mediaType: Option<Bytes>.None,
+      charset: Option<Bytes>.None,
+    }
+  }
+}
+
+/// Hosts can implement arbitrary schemes by supplying their own mutable provider.
+/// Callers enforce processing policy before dispatch; transports enforce their own
+/// access controls on every redirect hop. Aggregate budgets and cycles remain caller-owned.
+pub service Resolver {
+  effect fn fetch(url: &Url, kind: ResourceKind) -> Response
+    ! ResourceError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator
+}
+
+/// Portable default provider: only RFC 2397 data URLs are supported.
+pub struct DataOnly {
+  pub limits: Limits,
+}
+
+impl DataOnly {
+  pub fn make(limits: Limits) -> DataOnly {
+    return DataOnly { limits: limits }
+  }
+
+  pub effect fn fetch(self: &mut Self, url: &Url, kind: ResourceKind) -> Response
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    let metadata = run inspectData(url)
+    let bytes = if metadata.base64 {
+      run decodeBase64(metadata.payload, self.limits.maxResourceBytes)
+    } else {
+      run decodePercent(metadata.payload, self.limits.maxResourceBytes)
+    }
+    return Response.fromBytes(move bytes)
+  }
+}
+
+impl Resolver for DataOnly {
+  fetch: DataOnly.fetch
+}
+
+/// Fetches a subresource only after mode authorization. Same-document element
+/// references must be resolved in the document arena, without fetching bytes.
+/// Data URLs are always decoded locally, never delegated to arbitrary host code.
+pub effect fn fetchWithPolicy(url: &Url, kind: ResourceKind, policy: &Policy) -> Response
+  ! ResourceError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  if equal(Url.scheme(url), b"data") {
+    let mut provider = DataOnly.make(policy.limits)
+    return run provider.fetch(url, kind)
+  }
+  if policy.mode.isSecure() {
+    fail ResourceError.BlockedLocation
+  }
+  let response = run Resolver.fetch(url, kind)
+  if Bytes.length(&response.bytes) > policy.limits.maxResourceBytes {
+    fail ResourceError.TooLarge
+  }
+  return move response
+}
+
+/// Borrowed RFC 2397 metadata. `mediaType`, `charset` and `parameters` preserve
+/// percent escapes from the URL; they are not decoded MIME strings. Use the decoded
+/// accessors before interpreting a charset or comparing an escaped media type.
+/// An omitted type defaults to text/plain and US-ASCII; an explicit type has no
+/// implicit charset. For repeated charset parameters, the first wins.
+pub struct DataMetadata<'a> {
+  pub mediaType: &'a [u8],
+  pub charset: Option<&'a [u8]>,
+  /// Raw semicolon-prefixed MIME parameters, excluding the terminal ;base64 marker.
+  pub parameters: &'a [u8],
+  /// Serialized URL bytes after the first comma, including any query, excluding fragment.
+  pub payload: &'a [u8],
+  pub base64: bool,
+}
+
+impl<'a> DataMetadata<'a> {
+  pub effect fn decodedMediaType(self: &Self) -> Bytes
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    return run decodePercent(self.mediaType, self.mediaType.length)
+  }
+
+  pub effect fn matchesMediaType(self: &Self, expected: &[u8]) -> bool
+    ! ResourceError {
+    return run decodedEqual(self.mediaType, expected)
+  }
+
+  pub effect fn decodedCharset(self: &Self) -> Option<Bytes>
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &self.charset {
+      Option<&[u8]>.Some { value } => {
+        let bytes = run decodePercent(value, value.length)
+        return Option<Bytes>.Some { value: move bytes }
+      }
+      Option<&[u8]>.None => Option<Bytes>.None
+    }
+  }
+}
+
+/// Validates the data header without allocating or decoding its payload. Parameter
+/// names are ASCII-case-insensitive after percent decoding. Base64 is recognized
+/// only as a final bare ;base64 marker, never as a parameter with an equals sign.
+pub effect fn inspectData<'a>(url: &'a Url) -> DataMetadata<'a>
+  ! ResourceError {
+  if !equal(Url.scheme(url), b"data") {
+    fail ResourceError.UnsupportedScheme
+  }
+
+  // RFC 2397 data is URL serialization, not just Url.path: '?' is payload data.
+  let serialized = Url.withoutFragment(url)
+  if serialized.length < 5 {
+    fail ResourceError.InvalidData
+  }
+  let data = Slice.view<u8>(serialized, 5, serialized.length - 5)
+  let mut comma: usize = 0
+  while comma < data.length && data[comma] != 44 {
+    comma = comma + 1
+  }
+  if comma == data.length {
+    fail ResourceError.InvalidData
+  }
+  let header = Slice.view<u8>(data, 0, comma)
+  let mut typeEnd: usize = 0
+  while typeEnd < header.length && header[typeEnd] != 59 {
+    typeEnd = typeEnd + 1
+  }
+  let mut mediaType: &'a [u8] = b"text/plain"
+  let mut charset: Option<&'a [u8]> = Option<&'a [u8]>.None
+  if typeEnd == 0 {
+    charset = Option<&[u8]>.Some { value: b"US-ASCII" }
+  } else {
+    mediaType = Slice.view<u8>(header, 0, typeEnd)
+    run validateMediaType(mediaType)
+  }
+  let mut foundCharset = false
+  let mut base64 = false
+  let mut parametersEnd = header.length
+  let mut cursor = typeEnd
+  while cursor < header.length {
+    let separator = cursor
+    cursor = cursor + 1
+    let start = cursor
+    while cursor < header.length && header[cursor] != 59 {
+      cursor = cursor + 1
+    }
+    let parameter = Slice.view<u8>(header, start, cursor - start)
+    if parameter.length == 0 {
+      fail ResourceError.InvalidData
+    }
+    let mut equals: usize = 0
+    while equals < parameter.length && parameter[equals] != 61 {
+      equals = equals + 1
+    }
+    if equals == parameter.length {
+      if cursor != header.length || !asciiEqual(parameter, b"base64") {
+        fail ResourceError.InvalidData
+      }
+      base64 = true
+      parametersEnd = separator
+    } else {
+      let name = Slice.view<u8>(parameter, 0, equals)
+      let value = Slice.view<u8>(parameter, equals + 1, parameter.length - equals - 1)
+      run validateToken(name)
+      run validateParameterValue(value)
+      if !foundCharset && run decodedEqual(name, b"charset") {
+        charset = Option<&[u8]>.Some { value: value }
+        foundCharset = true
+      }
+    }
+  }
+  return DataMetadata<'a> {
+    mediaType: mediaType,
+    charset: move charset,
+    parameters: Slice.view<u8>(header, typeEnd, parametersEnd - typeEnd),
+    payload: Slice.view<u8>(data, comma + 1, data.length - comma - 1),
+    base64: base64,
+  }
+}
+
+fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < a.length {
+    if a[index] != b[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn lower(value: u8) -> u8 {
+  if value >= 65 && value <= 90 {
+    return value + 32
+  }
+  return value
+}
+
+fn asciiEqual(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < a.length {
+    if lower(a[index]) != lower(b[index]) {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn hex(value: u8) -> u8 {
+  if value >= 48 && value <= 57 {
+    return value - 48
+  }
+  if value >= 65 && value <= 70 {
+    return value - 55
+  }
+  if value >= 97 && value <= 102 {
+    return value - 87
+  }
+  return 255
+}
+
+// RFC 2397 imports RFC 2396 urlchar: reserved, unreserved, or a percent triplet.
+fn urlByte(value: u8) -> bool {
+  if (value >= 48 && value <= 57) || (value >= 65 && value <= 90) || (value >= 97 && value <= 122) {
+    return true
+  }
+  return value == 45 || value == 95 || value == 46 || value == 33 || value == 126 || value == 42
+    || value == 39
+    || value == 40
+    || value == 41
+    || value == 59
+    || value == 47
+    || value == 63
+    || value == 58
+    || value == 64
+    || value == 38
+    || value == 61
+    || value == 43
+    || value == 36
+    || value == 44
+}
+
+// No allocation and no unchecked lookahead. Unlike generic URL percent decoding,
+// a malformed percent escape is a resource syntax error, not a literal percent.
+effect fn nextPercent(data: &[u8], cursor: &mut usize) -> u8
+  ! ResourceError {
+  if cursor.* >= data.length {
+    fail ResourceError.InvalidData
+  }
+  let byte = data[cursor.*]
+  if byte != 37 {
+    if !urlByte(byte) {
+      fail ResourceError.InvalidData
+    }
+    cursor.* = cursor.* + 1
+    return byte
+  }
+  if data.length - cursor.* < 3 {
+    fail ResourceError.InvalidData
+  }
+  let high = hex(data[cursor.* + 1])
+  let low = hex(data[cursor.* + 2])
+  if high == 255 || low == 255 {
+    fail ResourceError.InvalidData
+  }
+  cursor.* = cursor.* + 3
+  return high * 16 + low
+}
+
+effect fn decodedEqual(data: &[u8], expected: &[u8]) -> bool
+  ! ResourceError {
+  let mut cursor: usize = 0
+  let mut index: usize = 0
+  while cursor < data.length {
+    let byte = run nextPercent(data, &mut cursor)
+    if index >= expected.length || lower(byte) != lower(expected[index]) {
+      return false
+    }
+    index = index + 1
+  }
+  return index == expected.length
+}
+
+fn tokenByte(value: u8) -> bool {
+  if value <= 32 || value >= 127 {
+    return false
+  }
+  return value != 40 && value != 41 && value != 60 && value != 62 && value != 64 && value != 44
+    && value != 59
+    && value != 58
+    && value != 92
+    && value != 34
+    && value != 47
+    && value != 91
+    && value != 93
+    && value != 63
+    && value != 61
+}
+
+effect fn validateToken(data: &[u8]) -> ()
+  ! ResourceError {
+  if data.length == 0 {
+    fail ResourceError.InvalidData
+  }
+  let mut cursor: usize = 0
+  while cursor < data.length {
+    if !tokenByte(run nextPercent(data, &mut cursor)) {
+      fail ResourceError.InvalidData
+    }
+  }
+}
+
+effect fn validateMediaType(data: &[u8]) -> ()
+  ! ResourceError {
+  let mut slash: usize = 0
+  while slash < data.length && data[slash] != 47 {
+    slash = slash + 1
+  }
+  if slash == data.length {
+    fail ResourceError.InvalidData
+  }
+  run validateToken(Slice.view<u8>(data, 0, slash))
+  run validateToken(Slice.view<u8>(data, slash + 1, data.length - slash - 1))
+}
+
+effect fn validateParameterValue(data: &[u8]) -> ()
+  ! ResourceError {
+  if data.length == 0 {
+    fail ResourceError.InvalidData
+  }
+  let mut cursor: usize = 0
+  while cursor < data.length {
+    let escaped = data[cursor] == 37
+    let byte = run nextPercent(data, &mut cursor)
+
+    // RFC 2397 replaces quoted-string tspecials with URL escaped encoding.
+    if escaped {
+      if byte < 32 || byte >= 127 {
+        fail ResourceError.InvalidData
+      }
+    } else if !tokenByte(byte) {
+      fail ResourceError.InvalidData
+    }
+  }
+}
+
+effect fn percentLength(data: &[u8], maximum: usize) -> usize
+  ! ResourceError {
+  let mut cursor: usize = 0
+  let mut length: usize = 0
+  while cursor < data.length {
+    let byte = run nextPercent(data, &mut cursor)
+    if length == maximum {
+      fail ResourceError.TooLarge
+    }
+    length = length + 1
+  }
+  return length
+}
+
+effect fn decodePercent(data: &[u8], maximum: usize) -> Bytes
+  ! ResourceError | OutOfMemoryError
+  ? &mut Allocator {
+  let length = run percentLength(data, maximum)
+  if length == data.length {
+    return run Bytes.copy(data)
+  }
+  let mut result = run Bytes.zeroed(length)
+  let mut output = Bytes.asMutSlice(&mut result)
+  let mut cursor: usize = 0
+  let mut index: usize = 0
+  while cursor < data.length {
+    output[index] = run nextPercent(data, &mut cursor)
+    index = index + 1
+  }
+  drop output
+  return move result
+}
+
+effect fn base64Length(data: &[u8]) -> usize
+  ! ResourceError {
+  let result = Base64.decodedLength(data)
+  return match &result {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => {
+      fail ResourceError.InvalidData
+    }
+  }
+}
+
+effect fn base64Into(data: &[u8], output: &mut [u8]) -> usize
+  ! ResourceError {
+  let result = Base64.decodeInto(move output, data)
+  return match &result {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => {
+      fail ResourceError.InvalidData
+    }
+  }
+}
+
+// Consume percent escapes before Base64, using only a four-byte stack quantum.
+// A padded quantum is terminal, including when the padding was percent-encoded.
+effect fn readQuantum(data: &[u8], cursor: &mut usize, quantum: &mut [u8; 4]) -> ()
+  ! ResourceError {
+  let mut index: usize = 0
+  while index < 4 {
+    quantum[index] = run nextPercent(data, &mut cursor.*)
+    index = index + 1
+  }
+  if (quantum[2] == 61 || quantum[3] == 61) && cursor.* != data.length {
+    fail ResourceError.InvalidData
+  }
+}
+
+effect fn decodeBase64(data: &[u8], maximum: usize) -> Bytes
+  ! ResourceError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut escaped = false
+  let mut scan: usize = 0
+  while scan < data.length {
+    if data[scan] == 37 {
+      escaped = true
+      break
+    }
+    scan = scan + 1
+  }
+  if !escaped {
+    let length = run base64Length(data)
+    if length > maximum {
+      fail ResourceError.TooLarge
+    }
+    let mut direct = run Bytes.zeroed(length)
+    let written = run base64Into(data, Bytes.asMutSlice(&mut direct))
+    return move direct
+  }
+
+  // Complete validation and exact size accounting precede every allocation.
+  // Each increment is tested against the remaining budget before addition.
+  let mut cursor: usize = 0
+  let mut length: usize = 0
+  let mut quantum: [u8; 4] = [0; 4]
+  while cursor < data.length {
+    run readQuantum(data, &mut cursor, &mut quantum)
+    let count = run base64Length(&quantum)
+    if count > maximum - length {
+      fail ResourceError.TooLarge
+    }
+    length = length + count
+  }
+  let mut result = run Bytes.zeroed(length)
+  let mut output = Bytes.asMutSlice(&mut result)
+  cursor = 0
+  let mut written: usize = 0
+  while cursor < data.length {
+    run readQuantum(data, &mut cursor, &mut quantum)
+    let mut available = length - written
+    if available > 3 {
+      available = 3
+    }
+    let count = run base64Into(&quantum, Slice.viewMut<u8>(&mut output, written, available))
+    written = written + count
+  }
+  drop output
+  return move result
+}

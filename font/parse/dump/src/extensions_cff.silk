@@ -1,0 +1,1064 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import read_fonts.lib { FontRef, FontData, ReadError }
+import read_fonts.tables.head { Head }
+import read_fonts.ps.cff.v1 { Cff, CffHeader }
+import read_fonts.ps.cff.v2 { Cff2, Cff2Header }
+import read_fonts.ps.cff.font { CffFontRef, Subfont, HintedSubfont, Metadata, Encoding }
+import read_fonts.ps.cff.charset { Charset, CharsetKind }
+import read_fonts.ps.cff.index { Index }
+import read_fonts.ps.cff.dict { Entry, Entries, entries }
+import read_fonts.ps.cff.blend { BlendState }
+import read_fonts.ps.cff.encoding { CustomEncoding, Range1, Supplement }
+import read_fonts.ps.cff.v1 { FdSelect }
+import read_fonts.lib { ComputedArray, ScalarArray }
+import read_fonts.ps.string { Sid }
+import read_fonts.ps.encoding { PredefinedEncoding }
+import read_fonts.ps.hinting { Blues, StemSnaps, HintingParams }
+import read_fonts.ps.transform { ScaledFontMatrix }
+import read_fonts.tables.variations { ItemVariationStore, VariationRegionList }
+import read_fonts.model.error { Error }
+import font_types.lib { Fixed, F2Dot14, BoundingBox, Matrix, GlyphId, Tag }
+import generated_dump_cff
+import generated_dump_cff2
+import generated_dump_variations
+import dump_support { DumpPath, DumpValue, scalar, absent, readError, bytes }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.text.string { String }
+import silk.collections.slice { Slice }
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+effect fn field<T: DumpValue>(path: &mut DumpPath, name: string<'static>, value: T) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, name)
+  run scalar(&path, move value)
+  DumpPath.pop(&mut path)
+}
+
+effect fn optional<T: DumpValue>(path: &DumpPath, input: Option<T>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  match move input {
+    Option<T>.Some { value } => run scalar(path, move value)
+    _ => run absent(path)
+  }
+}
+
+effect fn optionalField<T: DumpValue>(
+  path: &mut DumpPath,
+  name: string<'static>,
+  value: Option<T>,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, name)
+  run optional(&path, move value)
+  DumpPath.pop(&mut path)
+}
+
+effect fn maybeBytes(path: &DumpPath, input: Option<&[u8]>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  match move input {
+    Option<&[u8]>.Some { value } => run bytes(path, value)
+    _ => run absent(path)
+  }
+}
+
+effect fn bytesField(path: &mut DumpPath, name: string<'static>, value: Option<&[u8]>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, name)
+  run maybeBytes(&path, move value)
+  DumpPath.pop(&mut path)
+}
+
+effect fn textField(path: &mut DumpPath, name: string<'static>, input: Option<string>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, name)
+  match move input {
+    Option<string>.Some { value } => run bytes(&path, String.utf8Bytes(value))
+    _ => run absent(&path)
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn modelError(path: &mut DumpPath, error: Error) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let message = match error {
+    Error.Malformed => "Malformed"
+    Error.MissingResource => "MissingResource"
+    Error.InvalidOperation => "InvalidOperation"
+    Error.LimitExceeded => "LimitExceeded"
+    Error.InsufficientMemory => "InsufficientMemory"
+  }
+  run field(&mut path, "error", message)
+}
+
+fn widthBits(input: Option<Fixed>) -> Option<i32> {
+  return match move input {
+    Option<Fixed>.Some { value } => Option<i32>.some(Fixed.toBits(value))
+    _ => Option<i32>.None
+  }
+}
+
+effect fn matrix(path: &mut DumpPath, input: Option<ScaledFontMatrix>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mat = match move input {
+    Option<ScaledFontMatrix>.Some { value } => value
+    _ => {
+      run absent(&path)
+      return
+    }
+  }
+  run field(&mut path, "scale", mat.scale)
+  DumpPath.push(&mut path, "elements")
+  let values = Matrix.elements<Fixed>(&mat.matrix)
+  let mut i: usize = 0
+  while i < 6 {
+    DumpPath.setIndex(&mut path, i)
+    run scalar(&path, Fixed.toBits(values[i]))
+    i = i + 1
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn bbox(path: &mut DumpPath, input: Option<BoundingBox<Fixed>>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let box = match move input {
+    Option<BoundingBox<Fixed>>.Some { value } => value
+    _ => {
+      run absent(&path)
+      return
+    }
+  }
+  run field(&mut path, "xMin", Fixed.toBits(box.xMin))
+  run field(&mut path, "yMin", Fixed.toBits(box.yMin))
+  run field(&mut path, "xMax", Fixed.toBits(box.xMax))
+  run field(&mut path, "yMax", Fixed.toBits(box.yMax))
+}
+
+effect fn index<'a>(path: &mut DumpPath, input: Index<'a>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.beginTable(&mut path)
+  DumpPath.push(&mut path, "raw")
+  match input {
+    Index<'a>.Empty => run scalar(&path, "empty")
+    Index<'a>.Format1 { value } => run generated_dump_cff.dumpIndex(&mut path, value)
+    Index<'a>.Format2 { value } => run generated_dump_cff2.dumpIndex(&mut path, value)
+  }
+  DumpPath.pop(&mut path)
+  run field(&mut path, "count", Index.count(&input))
+  run field(&mut path, "subrBias", Index.subrBias(&input))
+  run optionalField(&mut path, "sizeInBytes", Index.sizeInBytes(&input))
+  let mut count = Index.count(&input)
+  if count > 65536 {
+    count = 65536
+  }
+  run field(&mut path, "probeCount", count)
+  let mut i: usize = 0
+  while i <= u32.toUsize(count) {
+    DumpPath.push(&mut path, "offsets")
+    DumpPath.setIndex(&mut path, i)
+    run optional(&path, Index.getOffset(&input, i))
+    DumpPath.pop(&mut path)
+    DumpPath.push(&mut path, "objects")
+    DumpPath.setIndex(&mut path, i)
+    run maybeBytes(&path, Index.get(&input, i))
+    DumpPath.pop(&mut path)
+    i = i + 1
+  }
+}
+
+pub effect fn dump<'a>(path: &mut DumpPath, font: &FontRef<'a>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, "CFF")
+  run table(&mut path, font, false)
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "CFF2")
+  run table(&mut path, font, true)
+  DumpPath.pop(&mut path)
+}
+
+effect fn table<'a>(path: &mut DumpPath, font: &FontRef<'a>, v2: bool) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut tag = Cff.tag()
+  if v2 {
+    tag = Cff2.tag()
+  }
+  DumpPath.beginTable(&mut path)
+  let data = match move FontRef.tableData(font, tag) {
+    Option<FontData<'a>>.Some { value } => value
+    _ => {
+      run readError(&path, ReadError.TableIsMissing { tag: tag })
+      return
+    }
+  }
+  let upem = match move FontRef.head(font) {
+    Result<Head<'a>, ReadError>.Success { value } => Option<i32>.some(
+      u16.toI32(Head.unitsPerEm(&value)),
+    )
+    _ => Option<i32>.None
+  }
+  DumpPath.push(&mut path, "header")
+  if v2 {
+    match move Cff2Header.read(data) {
+      Result<Cff2Header<'a>, ReadError>.Success { value } => run generated_dump_cff2.dumpCff2Header(
+        &mut path,
+        value,
+      )
+      Result<Cff2Header<'a>, ReadError>.Failure { error } => run readError(&path, error)
+    }
+  } else {
+    match move CffHeader.read(data) {
+      Result<CffHeader<'a>, ReadError>.Success { value } => run generated_dump_cff.dumpCffHeader(
+        &mut path,
+        value,
+      )
+      Result<CffHeader<'a>, ReadError>.Failure { error } => run readError(&path, error)
+    }
+  }
+  DumpPath.pop(&mut path)
+  let mut count: u32 = 1
+  if v2 {
+    let cff = match move Cff2.read(data) {
+      Result<Cff2<'a>, ReadError>.Success { value } => value
+      Result<Cff2<'a>, ReadError>.Failure { error } => {
+        DumpPath.push(&mut path, "container")
+        run readError(&path, error)
+        DumpPath.pop(&mut path)
+        return
+      }
+    }
+    run bytesField(&mut path, "topDict", Option<&[u8]>.some(Cff2.topDictData(&cff)))
+    DumpPath.push(&mut path, "globalSubrs")
+    run index(&mut path, Index<'a>.Format2 { value: Cff2.globalSubrs(&cff) })
+    DumpPath.pop(&mut path)
+  } else {
+    let cff = match move Cff.read(data) {
+      Result<Cff<'a>, ReadError>.Success { value } => value
+      Result<Cff<'a>, ReadError>.Failure { error } => {
+        DumpPath.push(&mut path, "container")
+        run readError(&path, error)
+        DumpPath.pop(&mut path)
+        return
+      }
+    }
+    DumpPath.push(&mut path, "names")
+    run index(&mut path, Index<'a>.Format1 { value: Cff.names(&cff) })
+    DumpPath.pop(&mut path)
+    let dicts = Index<'a>.Format1 { value: Cff.topDicts(&cff) }
+    count = Index.count(&dicts)
+    DumpPath.push(&mut path, "topDicts")
+    run index(&mut path, dicts)
+    DumpPath.pop(&mut path)
+    DumpPath.push(&mut path, "strings")
+    run index(&mut path, Index<'a>.Format1 { value: Cff.strings(&cff) })
+    DumpPath.pop(&mut path)
+    DumpPath.push(&mut path, "globalSubrs")
+    run index(&mut path, Index<'a>.Format1 { value: Cff.globalSubrs(&cff) })
+    DumpPath.pop(&mut path)
+  }
+  DumpPath.push(&mut path, "fonts")
+  let mut i: u32 = 0
+  while i < count {
+    DumpPath.setIndex(&mut path, u32.toUsize(i))
+    let units = match &upem {
+      Option<i32>.Some { value } => Option<i32>.some(value)
+      _ => Option<i32>.None
+    }
+    DumpPath.push(&mut path, "dictionary")
+    if v2 {
+      match move Cff2.read(data) {
+        Result<Cff2<'a>, ReadError>.Success { value } => run dictionary(
+          &mut path,
+          data,
+          Cff2.topDictData(&value),
+          true,
+          0,
+          0,
+        )
+        _ => {}
+      }
+    } else {
+      match move Cff.read(data) {
+        Result<Cff<'a>, ReadError>.Success { value } => {
+          let dicts = Index<'a>.Format1 { value: Cff.topDicts(&value) }
+          match move Index.get(&dicts, u32.toUsize(i)) {
+            Option<&'a [u8]>.Some { value: dict } => run dictionary(
+              &mut path,
+              data,
+              dict,
+              false,
+              0,
+              0,
+            )
+            _ => run absent(&path)
+          }
+        }
+        _ => {}
+      }
+    }
+    DumpPath.pop(&mut path)
+    match move CffFontRef.new(FontData.asBytes(&data), i, move units) {
+      Result<CffFontRef<'a>, Error>.Success { value } => run fontValues(&mut path, &value)
+      Result<CffFontRef<'a>, Error>.Failure { error } => run modelError(&mut path, error)
+    }
+    i = i + 1
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn fontValues<'a>(path: &mut DumpPath, font: &CffFontRef<'a>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run field(&mut path, "version", CffFontRef.version(font))
+  run field(&mut path, "isCid", CffFontRef.isCid(font))
+  run field(&mut path, "upem", CffFontRef.upem(font))
+  run field(&mut path, "numGlyphs", CffFontRef.numGlyphs(font))
+  run field(&mut path, "numSubfonts", CffFontRef.numSubfonts(font))
+  DumpPath.push(&mut path, "matrix")
+  run matrix(&mut path, CffFontRef.matrix(font))
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "metadata")
+  match move CffFontRef.metadata(font) {
+    Option<Metadata<'a>>.Some { value: m } => {
+      run textField(&mut path, "name", Metadata.name(&m))
+      run textField(&mut path, "version", Metadata.version(&m))
+      run textField(&mut path, "notice", Metadata.notice(&m))
+      run textField(&mut path, "copyright", Metadata.copyright(&m))
+      run textField(&mut path, "fullName", Metadata.fullName(&m))
+      run textField(&mut path, "familyName", Metadata.familyName(&m))
+      run textField(&mut path, "weight", Metadata.weight(&m))
+      DumpPath.push(&mut path, "bbox")
+      run bbox(&mut path, Option<BoundingBox<Fixed>>.some(Metadata.bbox(&m)))
+      DumpPath.pop(&mut path)
+      run field(&mut path, "italicAngle", Fixed.toBits(Metadata.italicAngle(&m)))
+      run field(&mut path, "isFixedPitch", Metadata.isFixedPitch(&m))
+      run field(&mut path, "underlinePosition", Fixed.toBits(Metadata.underlinePosition(&m)))
+      run field(&mut path, "underlineThickness", Fixed.toBits(Metadata.underlineThickness(&m)))
+    }
+    _ => run absent(&path)
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "charstrings")
+  run index(&mut path, CffFontRef.charstrings(font))
+  DumpPath.pop(&mut path)
+  let mut count = CffFontRef.numGlyphs(font)
+  if count > 65536 {
+    count = 65536
+  }
+  run field(&mut path, "glyphProbeCount", count)
+  let charset = CffFontRef.charset(font)
+  DumpPath.push(&mut path, "charset")
+  match &charset {
+    Option<Charset<'a>>.Some { value } => {
+      match Charset.kind(&value) {
+        CharsetKind<'a>.IsoAdobe => run field(&mut path, "kind", "IsoAdobe")
+        CharsetKind<'a>.Expert => run field(&mut path, "kind", "Expert")
+        CharsetKind<'a>.ExpertSubset => run field(&mut path, "kind", "ExpertSubset")
+        CharsetKind<'a>.Custom { value: custom } => {
+          run field(&mut path, "kind", "Custom")
+          DumpPath.beginTable(&mut path)
+          DumpPath.push(&mut path, "raw")
+          run generated_dump_cff.dumpCustomCharset(&mut path, custom)
+          DumpPath.pop(&mut path)
+        }
+      }
+    }
+    _ => run absent(&path)
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "names")
+  let mut gid: u32 = 0
+  while gid <= count {
+    DumpPath.setIndex(&mut path, u32.toUsize(gid))
+    let sid = match &charset {
+      Option<Charset<'a>>.Some { value } => Charset.stringId(&value, GlyphId.new(gid))
+      _ => Option<Sid>.None
+    }
+    let id = match &sid {
+      Option<Sid>.Some { value } => Option<u16>.some(Sid.toU16(value))
+      _ => Option<u16>.None
+    }
+    run optionalField(&mut path, "sid", move id)
+    let name = match &sid {
+      Option<Sid>.Some { value } => CffFontRef.string(font, value)
+      _ => Option<&'a [u8]>.None
+    }
+    run bytesField(&mut path, "name", move name)
+    let reverse = match move sid {
+      Option<Sid>.Some { value: identifier } => match &charset {
+        Option<Charset<'a>>.Some { value } => Charset.glyphId(&value, identifier)
+        _ => Option<GlyphId>.None
+      }
+      _ => Option<GlyphId>.None
+    }
+    let mapped = match move reverse {
+      Option<GlyphId>.Some { value } => Option<u32>.some(GlyphId.toU32(value))
+      _ => Option<u32>.None
+    }
+    run optionalField(&mut path, "reverseGlyph", move mapped)
+    gid = gid + 1
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "encoding")
+  match move CffFontRef.encoding(font) {
+    Option<Encoding<'a>>.Some { value: enc } => {
+      DumpPath.push(&mut path, "predefined")
+      match move Encoding.predefined(&enc) {
+        Option<PredefinedEncoding>.Some { value } => {
+          let name = match value {
+            PredefinedEncoding.Standard => "Standard"
+            PredefinedEncoding.Expert => "Expert"
+            PredefinedEncoding.IsoLatin1 => "IsoLatin1"
+          }
+          run scalar(&path, name)
+        }
+        _ => run absent(&path)
+      }
+      DumpPath.pop(&mut path)
+      DumpPath.push(&mut path, "codes")
+      let mut code: u16 = 0
+      while code <= 255 {
+        DumpPath.setIndex(&mut path, u16.toUsize(code))
+        let value = match move Encoding.map(&enc, u16.toU8(code)) {
+          Option<GlyphId>.Some { value } => Option<u32>.some(GlyphId.toU32(value))
+          _ => Option<u32>.None
+        }
+        run optional(&path, move value)
+        code = code + 1
+      }
+      DumpPath.pop(&mut path)
+    }
+    _ => run absent(&path)
+  }
+  DumpPath.pop(&mut path)
+  let mut axes: usize = 0
+  DumpPath.push(&mut path, "varStore")
+  match move CffFontRef.varStore(font) {
+    Option<ItemVariationStore<'a>>.Some { value } => {
+      axes = match move ItemVariationStore.variationRegionList(&value) {
+        Result<VariationRegionList<'a>, ReadError>.Success { value: regions } => u16.toUsize(
+          VariationRegionList.axisCount(&regions),
+        )
+        _ => 0
+      }
+      DumpPath.beginTable(&mut path)
+      run generated_dump_variations.dumpItemVariationStore(&mut path, value)
+    }
+    _ => run absent(&path)
+  }
+  DumpPath.pop(&mut path)
+  let locations: [i16; 4] = [0, -8192, 8192, 16384]
+  let mut coordinates = [F2Dot14.zero(); 65535]
+  let mut location: usize = 0
+  DumpPath.push(&mut path, "locations")
+  while location < 4 {
+    DumpPath.setIndex(&mut path, location)
+    run field(&mut path, "coord", locations[location])
+    let mut axis: usize = 0
+    while axis < axes {
+      coordinates[axis] = F2Dot14.fromBits(locations[location])
+      axis = axis + 1
+    }
+    let coords = Slice.view<F2Dot14>(&coordinates, 0, axes)
+    DumpPath.push(&mut path, "subfonts")
+    let mut i: u32 = 0
+    while i <= u16.toU32(CffFontRef.numSubfonts(font)) {
+      DumpPath.setIndex(&mut path, u32.toUsize(i))
+      match move CffFontRef.subfont(font, u32.toU16(i), coords) {
+        Result<Subfont, Error>.Success { value } => run subfont(&mut path, &value)
+        Result<Subfont, Error>.Failure { error } => run modelError(&mut path, error)
+      }
+      match move CffFontRef.subfontHinted(font, u32.toU16(i), coords) {
+        Result<HintedSubfont, Error>.Success { value } => {
+          DumpPath.push(&mut path, "hinted")
+          run subfont(&mut path, &value.subfont)
+          DumpPath.pop(&mut path)
+          DumpPath.push(&mut path, "hints")
+          run hinting(&mut path, &value.hinting)
+          DumpPath.pop(&mut path)
+        }
+        Result<HintedSubfont, Error>.Failure { error } => {
+          DumpPath.push(&mut path, "hinted")
+          run modelError(&mut path, error)
+          DumpPath.pop(&mut path)
+        }
+      }
+      i = i + 1
+    }
+    DumpPath.pop(&mut path)
+    DumpPath.push(&mut path, "glyphs")
+    gid = 0
+    while gid <= count {
+      DumpPath.setIndex(&mut path, u32.toUsize(gid))
+      run glyph(&mut path, font, GlyphId.new(gid), coords)
+      gid = gid + 1
+    }
+    DumpPath.pop(&mut path)
+    location = location + 1
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn glyph<'a>(
+  path: &mut DumpPath,
+  font: &CffFontRef<'a>,
+  gid: GlyphId,
+  coords: &[F2Dot14],
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, "subfont")
+  let mut selected: u16 = 0
+  match move CffFontRef.subfontIndex(font, gid) {
+    Option<u16>.Some { value } => {
+      run scalar(&path, value)
+      selected = value
+    }
+    _ => {
+      run absent(&path)
+      DumpPath.pop(&mut path)
+      return
+    }
+  }
+  DumpPath.pop(&mut path)
+  let sub = match move CffFontRef.subfont(font, selected, coords) {
+    Result<Subfont, Error>.Success { value } => move value
+    Result<Subfont, Error>.Failure { error } => {
+      run modelError(&mut path, error)
+      return
+    }
+  }
+  DumpPath.push(&mut path, "width")
+  match move CffFontRef.evaluateWidth(font, &sub, gid, coords) {
+    Result<Option<Fixed>, Error>.Success { value } => run optional(&path, widthBits(move value))
+    Result<Option<Fixed>, Error>.Failure { error } => run modelError(&mut path, error)
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "bounds")
+  match move CffFontRef.evaluateExtents(font, &sub, gid, coords) {
+    Result<Option<BoundingBox<Fixed>>, Error>.Success { value } => run bbox(&mut path, move value)
+    Result<Option<BoundingBox<Fixed>>, Error>.Failure { error } => run modelError(&mut path, error)
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn subfont(path: &mut DumpPath, sub: &Subfont) -> ()
+  ! WriterError
+  ? &mut Writer {
+  run field(&mut path, "subrsOffset", Subfont.subrsOffset(sub))
+  run optionalField(&mut path, "defaultWidth", widthBits(Subfont.defaultWidth(sub)))
+  run field(&mut path, "nominalWidth", Fixed.toBits(Subfont.nominalWidth(sub)))
+  run field(&mut path, "vsIndex", Subfont.vsIndex(sub))
+  DumpPath.push(&mut path, "matrix")
+  run matrix(&mut path, Subfont.matrix(sub))
+  DumpPath.pop(&mut path)
+}
+
+effect fn blues(path: &mut DumpPath, value: Blues) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let values = Blues.values(&value)
+  run field(&mut path, "length", values.length)
+  let mut i: usize = 0
+  while i < values.length {
+    DumpPath.setIndex(&mut path, i)
+    run field(&mut path, "first", Fixed.toBits(values[i].first))
+    run field(&mut path, "second", Fixed.toBits(values[i].second))
+    i = i + 1
+  }
+  DumpPath.clearIndex(&mut path)
+}
+
+effect fn hinting(path: &mut DumpPath, h: &HintingParams) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, "blues")
+  run blues(&mut path, h.blues)
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "familyBlues")
+  run blues(&mut path, h.familyBlues)
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "otherBlues")
+  run blues(&mut path, h.otherBlues)
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "familyOtherBlues")
+  run blues(&mut path, h.familyOtherBlues)
+  DumpPath.pop(&mut path)
+  run field(&mut path, "blueScale", Fixed.toBits(h.blueScale))
+  run field(&mut path, "blueShift", Fixed.toBits(h.blueShift))
+  run field(&mut path, "blueFuzz", Fixed.toBits(h.blueFuzz))
+  run field(&mut path, "languageGroup", h.languageGroup)
+}
+
+// Only top -> font -> private DICT links are followed, so font offsets cannot recurse.
+effect fn dictionary<'a>(
+  path: &mut DumpPath,
+  data: FontData<'a>,
+  dict: &'a [u8],
+  v2: bool,
+  level: u8,
+  base: usize,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, "entries")
+  let mut iter = entries(dict, Option<BlendState<'a, 'static>>.None)
+  let mut i: usize = 0
+  while true {
+    let result = match move Entries.next(&mut iter) {
+      Option<Result<Entry, Error>>.Some { value } => move value
+      _ => {
+        break
+      }
+    }
+    DumpPath.setIndex(&mut path, i)
+    i = i + 1
+    let entry = match move result {
+      Result<Entry, Error>.Success { value } => value
+      Result<Entry, Error>.Failure { error } => {
+        run modelError(&mut path, error)
+        continue
+      }
+    }
+    run dictionaryEntry(&mut path, entry)
+    DumpPath.push(&mut path, "resolved")
+    match entry {
+      Entry.PrivateDictRange { value } => {
+        if level < 2 {
+          match move FontData.slice(&data, value.start, value.end) {
+            Option<FontData<'a>>.Some { value: part } => run dictionary(
+              &mut path,
+              data,
+              FontData.asBytes(&part),
+              v2,
+              2,
+              value.start,
+            )
+            _ => run modelError(&mut path, Error.Malformed)
+          }
+        }
+      }
+      Entry.FdArrayOffset { value: offset } => {
+        if level == 0 {
+          let part = FontData.splitOff(&data, offset)
+          let result = match move part {
+            Option<FontData<'a>>.Some { value } => Index.new(FontData.asBytes(&value), v2)
+            _ => Result<Index<'a>, Error>.failResult(Error.Malformed)
+          }
+          match move result {
+            Result<Index<'a>, Error>.Success { value: ix } => {
+              run index(&mut path, ix)
+              let mut count = Index.count(&ix)
+              if count > 65536 {
+                count = 65536
+              }
+              DumpPath.push(&mut path, "dictionaries")
+              let mut n: usize = 0
+              while n < u32.toUsize(count) {
+                DumpPath.setIndex(&mut path, n)
+                match move Index.get(&ix, n) {
+                  Option<&'a [u8]>.Some { value } => run dictionary(
+                    &mut path,
+                    data,
+                    value,
+                    v2,
+                    1,
+                    0,
+                  )
+                  _ => run absent(&path)
+                }
+                n = n + 1
+              }
+              DumpPath.pop(&mut path)
+            }
+            Result<Index<'a>, Error>.Failure { error } => run modelError(&mut path, error)
+          }
+        }
+      }
+      Entry.FdSelectOffset { value: offset } => {
+        if level == 0 {
+          DumpPath.beginTable(&mut path)
+          let result = match move FontData.splitOff(&data, offset) {
+            Option<FontData<'a>>.Some { value } => FdSelect.read(value)
+            _ => Result<FdSelect<'a>, ReadError>.failResult(ReadError.OutOfBounds)
+          }
+          match move result {
+            Result<FdSelect<'a>, ReadError>.Success {
+              value
+            } => run generated_dump_cff.dumpFdSelect(&mut path, value)
+            Result<FdSelect<'a>, ReadError>.Failure { error } => run readError(&path, error)
+          }
+        }
+      }
+      Entry.SubrsOffset { value: relative } => {
+        if level == 2 {
+          let offset = usize.checkedAdd(base, relative)
+          let part = match move offset {
+            Option<usize>.Some { value } => FontData.splitOff(&data, value)
+            _ => Option<FontData<'a>>.None
+          }
+          let result = match move part {
+            Option<FontData<'a>>.Some { value } => Index.new(FontData.asBytes(&value), v2)
+            _ => Result<Index<'a>, Error>.failResult(Error.Malformed)
+          }
+          match move result {
+            Result<Index<'a>, Error>.Success { value } => run index(&mut path, value)
+            Result<Index<'a>, Error>.Failure { error } => run modelError(&mut path, error)
+          }
+        }
+      }
+      Entry.Encoding { value } => {
+        if level == 0 && value > 1 {
+          run customEncoding(&mut path, data, value)
+        }
+      }
+      _ => {}
+    }
+    DumpPath.pop(&mut path)
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn customEncoding<'a>(path: &mut DumpPath, data: FontData<'a>, offset: usize) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let encoding = match move FontData.splitOff(&data, offset) {
+    Option<FontData<'a>>.Some { value } => CustomEncoding.new(FontData.asBytes(&value))
+    _ => Option<CustomEncoding<'a>>.None
+  }
+  let encodingValue = match move encoding {
+    Option<CustomEncoding<'a>>.Some { value } => value
+    _ => {
+      run absent(&path)
+      return
+    }
+  }
+  let supplements = run encodingBody(&mut path, data, encodingValue)
+  DumpPath.push(&mut path, "supplements")
+  let count = ComputedArray<'a, (), Supplement<'a>>.len(&supplements)
+  run field(&mut path, "length", count)
+  let mut i: usize = 0
+  while i < count {
+    DumpPath.setIndex(&mut path, i)
+    match move ComputedArray<'a, (), Supplement<'a>>.get(&supplements, i) {
+      Result<Supplement<'a>, ReadError>.Success {
+        value
+      } => run generated_dump_cff.dumpEncodingSupplement(&mut path, value, data)
+      Result<Supplement<'a>, ReadError>.Failure { error } => run readError(&path, error)
+    }
+    i = i + 1
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn encodingBody<'a>(
+  path: &mut DumpPath,
+  data: FontData<'a>,
+  input: CustomEncoding<'a>,
+) -> ComputedArray<'a, (), Supplement<'a>>
+  ! WriterError
+  ? &mut Writer {
+  return match input {
+    CustomEncoding<'a>.Format0 { codes, supplements } => {
+      run field(&mut path, "format", 0)
+      DumpPath.push(&mut path, "codes")
+      run bytes(&path, FontData.asBytes(&ScalarArray<u8>.offsetData(&codes)))
+      DumpPath.pop(&mut path)
+      return supplements
+    }
+    CustomEncoding<'a>.Format1 { ranges, supplements } => {
+      run field(&mut path, "format", 1)
+      DumpPath.push(&mut path, "ranges")
+      let count = ComputedArray<'a, (), Range1<'a>>.len(&ranges)
+      run field(&mut path, "length", count)
+      let mut i: usize = 0
+      while i < count {
+        DumpPath.setIndex(&mut path, i)
+        match move ComputedArray<'a, (), Range1<'a>>.get(&ranges, i) {
+          Result<Range1<'a>, ReadError>.Success {
+            value
+          } => run generated_dump_cff.dumpEncodingRange1(&mut path, value, data)
+          Result<Range1<'a>, ReadError>.Failure { error } => run readError(&path, error)
+        }
+        i = i + 1
+      }
+      DumpPath.pop(&mut path)
+      return supplements
+    }
+  }
+}
+
+effect fn dictionaryEntry(path: &mut DumpPath, entry: Entry) -> ()
+  ! WriterError
+  ? &mut Writer {
+  match entry {
+    Entry.Version { value } => {
+      run field(&mut path, "kind", "Version")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.Notice { value } => {
+      run field(&mut path, "kind", "Notice")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.FullName { value } => {
+      run field(&mut path, "kind", "FullName")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.FamilyName { value } => {
+      run field(&mut path, "kind", "FamilyName")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.Weight { value } => {
+      run field(&mut path, "kind", "Weight")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.FontBbox { value } => {
+      run field(&mut path, "kind", "FontBbox")
+      DumpPath.push(&mut path, "value")
+      let values = &value
+      run field(&mut path, "length", values.length)
+      let mut i: usize = 0
+      while i < values.length {
+        DumpPath.setIndex(&mut path, i)
+        run scalar(&path, Fixed.toBits(values[i]))
+        i = i + 1
+      }
+      DumpPath.pop(&mut path)
+    }
+    Entry.CharstringsOffset { value } => {
+      run field(&mut path, "kind", "CharstringsOffset")
+      run field(&mut path, "value", value)
+    }
+    Entry.PrivateDictRange { value } => {
+      run field(&mut path, "kind", "PrivateDictRange")
+      run field(&mut path, "start", value.start)
+      run field(&mut path, "end", value.end)
+    }
+    Entry.VariationStoreOffset { value } => {
+      run field(&mut path, "kind", "VariationStoreOffset")
+      run field(&mut path, "value", value)
+    }
+    Entry.Copyright { value } => {
+      run field(&mut path, "kind", "Copyright")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.IsFixedPitch { value } => {
+      run field(&mut path, "kind", "IsFixedPitch")
+      run field(&mut path, "value", value)
+    }
+    Entry.ItalicAngle { value } => {
+      run field(&mut path, "kind", "ItalicAngle")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.UnderlinePosition { value } => {
+      run field(&mut path, "kind", "UnderlinePosition")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.UnderlineThickness { value } => {
+      run field(&mut path, "kind", "UnderlineThickness")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.PaintType { value } => {
+      run field(&mut path, "kind", "PaintType")
+      run field(&mut path, "value", value)
+    }
+    Entry.CharstringType { value } => {
+      run field(&mut path, "kind", "CharstringType")
+      run field(&mut path, "value", value)
+    }
+    Entry.FontMatrix { value } => {
+      run field(&mut path, "kind", "FontMatrix")
+      DumpPath.push(&mut path, "value")
+      run matrix(&mut path, Option<ScaledFontMatrix>.some(value))
+      DumpPath.pop(&mut path)
+    }
+    Entry.StrokeWidth { value } => {
+      run field(&mut path, "kind", "StrokeWidth")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.FdArrayOffset { value } => {
+      run field(&mut path, "kind", "FdArrayOffset")
+      run field(&mut path, "value", value)
+    }
+    Entry.FdSelectOffset { value } => {
+      run field(&mut path, "kind", "FdSelectOffset")
+      run field(&mut path, "value", value)
+    }
+    Entry.BlueValues { value } => {
+      run field(&mut path, "kind", "BlueValues")
+      DumpPath.push(&mut path, "value")
+      run blues(&mut path, value)
+      DumpPath.pop(&mut path)
+    }
+    Entry.OtherBlues { value } => {
+      run field(&mut path, "kind", "OtherBlues")
+      DumpPath.push(&mut path, "value")
+      run blues(&mut path, value)
+      DumpPath.pop(&mut path)
+    }
+    Entry.FamilyBlues { value } => {
+      run field(&mut path, "kind", "FamilyBlues")
+      DumpPath.push(&mut path, "value")
+      run blues(&mut path, value)
+      DumpPath.pop(&mut path)
+    }
+    Entry.FamilyOtherBlues { value } => {
+      run field(&mut path, "kind", "FamilyOtherBlues")
+      DumpPath.push(&mut path, "value")
+      run blues(&mut path, value)
+      DumpPath.pop(&mut path)
+    }
+    Entry.SubrsOffset { value } => {
+      run field(&mut path, "kind", "SubrsOffset")
+      run field(&mut path, "value", value)
+    }
+    Entry.VariationStoreIndex { value } => {
+      run field(&mut path, "kind", "VariationStoreIndex")
+      run field(&mut path, "value", value)
+    }
+    Entry.BlueScale { value } => {
+      run field(&mut path, "kind", "BlueScale")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.BlueShift { value } => {
+      run field(&mut path, "kind", "BlueShift")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.BlueFuzz { value } => {
+      run field(&mut path, "kind", "BlueFuzz")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.LanguageGroup { value } => {
+      run field(&mut path, "kind", "LanguageGroup")
+      run field(&mut path, "value", value)
+    }
+    Entry.ExpansionFactor { value } => {
+      run field(&mut path, "kind", "ExpansionFactor")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.Encoding { value } => {
+      run field(&mut path, "kind", "Encoding")
+      run field(&mut path, "value", value)
+    }
+    Entry.Charset { value } => {
+      run field(&mut path, "kind", "Charset")
+      run field(&mut path, "value", value)
+    }
+    Entry.UniqueId { value } => {
+      run field(&mut path, "kind", "UniqueId")
+      run field(&mut path, "value", value)
+    }
+    Entry.Xuid => {
+      run field(&mut path, "kind", "Xuid")
+    }
+    Entry.SyntheticBase { value } => {
+      run field(&mut path, "kind", "SyntheticBase")
+      run field(&mut path, "value", value)
+    }
+    Entry.PostScript { value } => {
+      run field(&mut path, "kind", "PostScript")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.BaseFontName { value } => {
+      run field(&mut path, "kind", "BaseFontName")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.BaseFontBlend => {
+      run field(&mut path, "kind", "BaseFontBlend")
+    }
+    Entry.Ros { registry, ordering, supplement } => {
+      run field(&mut path, "kind", "Ros")
+      run field(&mut path, "registry", Sid.toU16(registry))
+      run field(&mut path, "ordering", Sid.toU16(ordering))
+      run field(&mut path, "supplement", Fixed.toBits(supplement))
+    }
+    Entry.CidFontVersion { value } => {
+      run field(&mut path, "kind", "CidFontVersion")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.CidFontRevision { value } => {
+      run field(&mut path, "kind", "CidFontRevision")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.CidFontType { value } => {
+      run field(&mut path, "kind", "CidFontType")
+      run field(&mut path, "value", value)
+    }
+    Entry.CidCount { value } => {
+      run field(&mut path, "kind", "CidCount")
+      run field(&mut path, "value", value)
+    }
+    Entry.UidBase { value } => {
+      run field(&mut path, "kind", "UidBase")
+      run field(&mut path, "value", value)
+    }
+    Entry.FontName { value } => {
+      run field(&mut path, "kind", "FontName")
+      run field(&mut path, "value", Sid.toU16(value))
+    }
+    Entry.StdHw { value } => {
+      run field(&mut path, "kind", "StdHw")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.StdVw { value } => {
+      run field(&mut path, "kind", "StdVw")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.DefaultWidthX { value } => {
+      run field(&mut path, "kind", "DefaultWidthX")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.NominalWidthX { value } => {
+      run field(&mut path, "kind", "NominalWidthX")
+      run field(&mut path, "value", Fixed.toBits(value))
+    }
+    Entry.StemSnapH { value } => {
+      run field(&mut path, "kind", "StemSnapH")
+      DumpPath.push(&mut path, "value")
+      let values = StemSnaps.values(&value)
+      run field(&mut path, "length", values.length)
+      let mut i: usize = 0
+      while i < values.length {
+        DumpPath.setIndex(&mut path, i)
+        run scalar(&path, Fixed.toBits(values[i]))
+        i = i + 1
+      }
+      DumpPath.pop(&mut path)
+    }
+    Entry.StemSnapV { value } => {
+      run field(&mut path, "kind", "StemSnapV")
+      DumpPath.push(&mut path, "value")
+      let values = StemSnaps.values(&value)
+      run field(&mut path, "length", values.length)
+      let mut i: usize = 0
+      while i < values.length {
+        DumpPath.setIndex(&mut path, i)
+        run scalar(&path, Fixed.toBits(values[i]))
+        i = i + 1
+      }
+      DumpPath.pop(&mut path)
+    }
+    Entry.ForceBold { value } => {
+      run field(&mut path, "kind", "ForceBold")
+      run field(&mut path, "value", value)
+    }
+    Entry.InitialRandomSeed { value } => {
+      run field(&mut path, "kind", "InitialRandomSeed")
+      run field(&mut path, "value", value)
+    }
+  }
+}

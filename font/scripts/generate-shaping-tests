@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Extract literal upstream shaping cases to a compact, length-prefixed fixture.
+
+Format: HRS1, u32 case count, then five u32-length-prefixed UTF-8 strings per
+case (name, font relative to font/shape/, text, options, expected). Integers are
+big endian. Nonliteral regression assertions run via hr_shape --regressions.
+"""
+from pathlib import Path
+import argparse
+import json
+import re
+import struct
+
+ROOT = Path(__file__).resolve().parents[2]
+SOURCE = ROOT / "font/shape/test-data/harfrust/harfrust/tests/shaping"
+STRING = r'"(?:[^"\\]|\\.)*"'
+CASE = re.compile(rf'fn (\w+)\(\)\s*\{{\s*assert_eq!\(\s*(?:crate::)?shape\(\s*({STRING}),\s*({STRING}),\s*({STRING}),?\s*\),\s*({STRING})\s*\);\s*\}}', re.S)
+SMOKE = re.compile(rf'fn (\w+)\(\)\s*\{{\s*shape\(\s*({STRING}),\s*({STRING}),\s*({STRING}),?\s*\);\s*\}}', re.S)
+
+
+def rust_string(literal):
+    """Decode Rust's Unicode escapes and escaped physical line continuations."""
+    literal = re.sub(r"\\\n\s*", "", literal)
+    literal = re.sub(r"\\u\{([0-9a-fA-F_]+)\}", lambda m: json.dumps(chr(int(m[1].replace("_", ""), 16)), ensure_ascii=False)[1:-1], literal)
+    literal = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: f"\\u00{m[1]}", literal)
+    return json.loads(literal.replace(r"\0", r"\u0000"))
+
+
+def cases():
+    result = []
+    for module in ("in_house", "aots", "text_rendering_tests", "custom", "regressions"):
+        text = (SOURCE / f"{module}.rs").read_text()
+        matches = list(CASE.finditer(text))
+        smoke = list(SMOKE.finditer(text))
+        if module != "regressions":
+            count = len(re.findall(r"#\[test\]", text))
+            if len(matches) + len(smoke) != count:
+                raise ValueError(f"{module}: extracted {len(matches)} of {count}; unsupported source syntax")
+        for match in matches:
+            result.append((f"{module}::{match[1]}", *(rust_string(v) for v in match.groups()[1:])))
+        for match in smoke:
+            result.append((f"{module}::{match[1]}", *(rust_string(v) for v in match.groups()[1:]), ""))
+    # Upstream loops over these exact variants; expand only data, never expectations.
+    for suffix, font, options, expected in [
+        ("gsub", "text-rendering-tests/AdobeVFPrototype-Subset.otf", ["", "--variations=wght=1000", "--variations=wght=999", "--variations=wght=500"], ["[2=0+560]"] * 3 + ["[1=0+510]"]),
+        ("gpos", "default-gpos-variations.ttf", ["", "--variations=TEST=0", "--variations=TEST=0.125", "--variations=TEST=0.5"], ["[1=0+600]"] * 3 + ["[1=0+510]"]),
+    ]:
+        for i, (option, output) in enumerate(zip(options, expected)):
+            result.append((f"feature_variations::{suffix}_{i}", f"tests/fonts/{font}", "$" if suffix == "gsub" else "A", option + " --no-glyph-names", output))
+    for suffix in ("f1", "f2"):
+        result.append((f"regressions::ligature_digest_{suffix}", f"tests/fonts/aots/gsub4_1_multiple_ligatures_{suffix}.otf", "\x12\x15", "--features=test --no-clusters --no-glyph-names --ned --show-flags --unsafe-to-concat", "[18#2|21@1500,0#2]"))
+    # Exact results for upstream smoke cases found by the Rust differential check.
+    # Store repeated glyphs compactly; the native runner still compares every byte.
+    regressions = json.loads((ROOT / "font/shape/tests/differential.json").read_text())
+    found = set()
+    for index, (name, font, text, options, expected) in enumerate(result):
+        if name in regressions:
+            if expected:
+                raise ValueError(f"{name}: upstream now supplies an expectation")
+            expected = "".join(part if isinstance(part, str) else part[1] * part[0] for part in regressions[name])
+            result[index] = (name, font, text, options, expected)
+            found.add(name)
+    if found != set(regressions):
+        raise ValueError("stale differential regression names")
+    names = [row[0] for row in result]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate case names")
+    for name, font, *_ in result:
+        if not (SOURCE.parent.parent / font).is_file():
+            raise ValueError(f"{name}: missing pinned font {font}")
+    return result
+
+
+def encode(rows):
+    out = bytearray(b"HRS1" + struct.pack(">I", len(rows)))
+    for row in rows:
+        for value in row:
+            data = value.encode()
+            out.extend(struct.pack(">I", len(data)))
+            out.extend(data)
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    rows = cases()
+    path = ROOT / "font/shape/tests/shaping.bin"
+    data = encode(rows)
+    if args.check:
+        if not path.is_file() or path.read_bytes() != data:
+            raise SystemExit("shaping fixture is stale; run font/scripts/generate-shaping-tests")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    print(f"{len(rows)} shaping cases, {len(data)} bytes; macOS system fonts excluded")
+
+
+if __name__ == "__main__":
+    main()

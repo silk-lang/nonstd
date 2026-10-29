@@ -1,0 +1,1498 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! COLR metrics from clip boxes and bounded paint-graph traversal.
+import model.metrics.base_outline { BaseOutlines, ControlBounds, minNumber, maxNumber }
+import model.metrics.varc { VarcOutlines }
+import model.metrics.color_bounds { Bounds, transformBounds }
+import model.metrics.extents { GlyphExtents, exactExtents }
+import model.glyph { GlyphSource, GlyphSourceOrder, GlyphSources }
+import model.optional { Maybe }
+import model.error { Error }
+import table_provider { TableProvider }
+import tables.colr {
+  Colr,
+  ClipBox,
+  ClipBoxFormat1,
+  ClipBoxFormat2,
+  Paint,
+  PaintWithId,
+  ColorLayer,
+  PaintColrLayers,
+  PaintSolid,
+  PaintVarSolid,
+  PaintLinearGradient,
+  PaintVarLinearGradient,
+  PaintRadialGradient,
+  PaintVarRadialGradient,
+  PaintSweepGradient,
+  PaintVarSweepGradient,
+  PaintGlyph,
+  PaintGlyph2,
+  PaintColrGlyph,
+  PaintTransform,
+  PaintVarTransform,
+  Affine2x3,
+  VarAffine2x3,
+  PaintTranslate,
+  PaintVarTranslate,
+  PaintScale,
+  PaintVarScale,
+  PaintScaleAroundCenter,
+  PaintVarScaleAroundCenter,
+  PaintScaleUniform,
+  PaintVarScaleUniform,
+  PaintScaleUniformAroundCenter,
+  PaintVarScaleUniformAroundCenter,
+  PaintRotate,
+  PaintVarRotate,
+  PaintRotateAroundCenter,
+  PaintVarRotateAroundCenter,
+  PaintSkew,
+  PaintVarSkew,
+  PaintSkewAroundCenter,
+  PaintVarSkewAroundCenter,
+  PaintComposite,
+  CompositeMode,
+  ColorLine,
+  VarColorLine,
+  ColorStop,
+  VarColorStop,
+  Extend
+}
+import tables.variations { ItemVariationStore, DeltaSetIndexMap, DeltaSetIndex }
+import font_types.lib {
+  BoundingBox,
+  Matrix,
+  F48Dot16,
+  F2Dot14,
+  FWord,
+  Fixed,
+  GlyphId,
+  GlyphId16,
+  GlyphId24
+}
+import array { ComputedArray }
+import table_ref { ByteRange }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+unsafe extern "C" fn sinf(value: f32) -> f32
+
+unsafe extern "C" fn cosf(value: f32) -> f32
+
+unsafe extern "C" fn tanf(value: f32) -> f32
+
+pub struct ColorSources<'a> {
+  table: Colr<'a>,
+  store: Maybe<ItemVariationStore<'a>>,
+  map: Maybe<DeltaSetIndexMap<'a>>,
+}
+
+impl<'a> Copy for ColorSources<'a> {}
+
+fn optional<T: Copy>(value: Option<Result<T, ReadError>>) -> Maybe<T> {
+  if let Option<Result<T, ReadError>>.Some { value: result } = move value {
+    return Maybe<T>.fromResult(move result)
+  }
+  return Maybe<T>.None
+}
+
+effect fn read<T>(result: Result<T, ReadError>) -> T
+  ! Error {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    _ => {
+      fail Error.Malformed
+    }
+  }
+}
+
+effect fn require<T>(option: Option<T>) -> T
+  ! Error {
+  return match move option {
+    Option<T>.Some { value } => move value
+    _ => {
+      fail Error.Malformed
+    }
+  }
+}
+
+impl<'a> ColorSources<'a> {
+  pub fn read<P: TableProvider<'a>>(provider: &P) -> Maybe<Self> {
+    if let Result<Colr<'a>, ReadError>.Success { value } = TableProvider.colr(provider) {
+      return Maybe<Self>.Some {
+        value: Self {
+          table: value,
+          store: optional(Colr.itemVariationStore(&value)),
+          map: optional(Colr.varIndexMap(&value)),
+        }
+      }
+    }
+    return Maybe<Self>.None
+  }
+
+  pub effect fn extents(
+    self: &Self,
+    base: BaseOutlines<'a>,
+    varc: Maybe<VarcOutlines<'a>>,
+    glyph: GlyphId,
+    coords: &[F2Dot14],
+  ) -> Option<GlyphExtents<F48Dot16>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let instance = ColorInstance { sources: self.*, coords: coords }
+    let outlines = ColorOutlines.new(base, varc)
+    let result = run Effect.result(ColorInstance.measure(&instance, &outlines, glyph))
+    return match move result {
+      Result<BoundingBox<f32>, Error | OutOfMemoryError>.Success { value } => Option<
+        GlyphExtents<F48Dot16>
+      >.some(exactExtents(GlyphExtents<f32>.fromBounds(value)))
+      Result<BoundingBox<f32>, Error | OutOfMemoryError>.Failure { error } => match move error {
+        Error problem => Option<GlyphExtents<F48Dot16>>.None
+        OutOfMemoryError problem => {
+          fail move problem
+        }
+      }
+    }
+  }
+}
+
+struct ColorOutlines<'a> {
+  base: BaseOutlines<'a>,
+  varc: Maybe<VarcOutlines<'a>>,
+}
+
+impl<'a> ColorOutlines<'a> {
+  fn new(mut base: BaseOutlines<'a>, varc: Maybe<VarcOutlines<'a>>) -> Self {
+    if !BaseOutlines.available(&base) {
+      base.order = GlyphSourceOrder.default()
+    }
+    let mut active = false
+    let mut found = false
+    let mut sources = GlyphSourceOrder.iter(base.order)
+    while let Option<GlyphSource>.Some { value } = GlyphSources.next(&mut sources) {
+      if value == GlyphSource.Varc {
+        active = true
+      }
+      if value == GlyphSource.Glyf || value == GlyphSource.Cff || value == GlyphSource.Cff2 {
+        let mut single = base
+        single.order = GlyphSourceOrder.new(&[value])
+        if BaseOutlines.available(&single) {
+          found = true
+          break
+        }
+      }
+    }
+    let mut selected = Maybe<VarcOutlines<'a>>.None
+    if active && found {
+      selected = varc
+    }
+    return Self { base: base, varc: selected }
+  }
+
+  effect fn clip(self: &Self, glyph: GlyphId, coords: &[F2Dot14], matrix: Matrix<f32>) -> Bounds
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if GlyphId.toU32(glyph) >= self.base.glyphCount {
+      return Bounds.Empty
+    }
+    let result = run Effect.result(ColorOutlines.controlBox(self, glyph, coords))
+    return match move result {
+      Result<BoundingBox<f32>, Error | OutOfMemoryError>.Success { value } => Bounds.of(
+        transformBounds(matrix, value),
+      )
+      Result<BoundingBox<f32>, Error | OutOfMemoryError>.Failure { error } => match move error {
+        Error problem => Bounds.Empty
+        OutOfMemoryError problem => {
+          fail move problem
+        }
+      }
+    }
+  }
+
+  effect fn controlBox(self: &Self, glyph: GlyphId, coords: &[F2Dot14]) -> BoundingBox<f32>
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    if let Maybe<VarcOutlines<'a>>.Some { value } = self.varc {
+      if VarcOutlines.covers(&value, glyph) {
+        return run VarcOutlines.controlBox(&value, &self.base, glyph, coords)
+      }
+    }
+    let mut sink = ControlBounds.new(Matrix.identity<f32>())
+    run BaseOutlines.draw(&self.base, glyph, coords, &mut sink)
+    return ControlBounds.finish(&sink)
+  }
+}
+
+struct ColorInstance<'a, 'c> {
+  sources: ColorSources<'a>,
+  coords: &'c [F2Dot14],
+}
+
+impl<'a, 'c> ColorInstance<'a, 'c> {
+  fn deltas(self: &Self, base: u32, count: usize) -> [F48Dot16; 6] {
+    let mut out = [F48Dot16.zero(); 6]
+    if self.coords.length == 0 || base == 4294967295 {
+      return out
+    }
+    if let Maybe<ItemVariationStore<'a>>.Some { value: store } = self.sources.store {
+      let mut i: usize = 0
+      while i < count && i < 6 && i < u32.toUsize(4294967295 - base) {
+        let index = base + usize.toU32(i)
+        let mut deltaIndex = DeltaSetIndex.fromU32(index)
+        if let Maybe<DeltaSetIndexMap<'a>>.Some { value: map } = self.sources.map {
+          deltaIndex = match move DeltaSetIndexMap.get(&map, index) {
+            Result<DeltaSetIndex, ReadError>.Success { value } => value
+            _ => {
+              i = i + 1
+              continue
+            }
+          }
+        }
+        out[i] = ItemVariationStore.computeDelta(&store, deltaIndex, self.coords)
+          |> Option<F48Dot16>.unwrapOr(F48Dot16.zero())
+        i = i + 1
+      }
+    }
+    return out
+  }
+
+  fn clipBox(self: &Self, box: ClipBox<'a>, round: bool) -> BoundingBox<f32> {
+    let mut deltas = [F48Dot16.zero(); 6]
+    if let ClipBox<'a>.Format2 { value } = box {
+      deltas = ColorInstance.deltas(self, ClipBoxFormat2.varIndexBase(&value), 4)
+    }
+    let fields = [ClipBox.xMin(&box), ClipBox.yMin(&box), ClipBox.xMax(&box), ClipBox.yMax(&box)]
+    let mut values: [f32; 4] = [0.0; 4]
+    let mut i: usize = 0
+    while i < 4 {
+      if round {
+        values[i] = FWord.applyDelta(fields[i], F48Dot16.zero())
+          + f32.round(F48Dot16.toF32(deltas[i]))
+      } else {
+        values[i] = FWord.applyDelta(fields[i], deltas[i])
+      }
+      i = i + 1
+    }
+    return BoundingBox<f32> { xMin: values[0], yMin: values[1], xMax: values[2], yMax: values[3] }
+  }
+
+  effect fn measure(self: &Self, outlines: &ColorOutlines<'a>, glyph: GlyphId) -> BoundingBox<f32>
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<PaintWithId<'a>>.Some { value } = Colr.v1BaseGlyph(&self.sources.table, glyph) {
+      if let Option<ClipBox<'a>>.Some { value: box } = Colr.v1ClipBox(&self.sources.table, glyph) {
+        return ColorInstance.clipBox(self, box, true)
+      }
+      let mut state = ColorWalk.new()
+      run ColorWalk.enter(&mut state, value.id)
+      let paint = run ColorInstance.resolve(self, value.paint, &mut state)
+      let bounds = run ColorInstance.walk(
+        self,
+        outlines,
+        paint,
+        Matrix.identity<f32>(),
+        Bounds.Unbounded,
+        0,
+        &mut state,
+      )
+      return Bounds.finish(bounds)
+    }
+    let range = run require(Colr.v0BaseGlyph(&self.sources.table, glyph))
+    if let Option<ClipBox<'a>>.Some { value: box } = Colr.v1ClipBox(&self.sources.table, glyph) {
+      return ColorInstance.clipBox(self, box, true)
+    }
+    let mut bounds = Bounds.Empty
+    let mut i = range.start
+    while i < range.end {
+      let layer = run require(Colr.v0Layer(&self.sources.table, i))
+      let clip = run ColorOutlines.clip(
+        outlines,
+        GlyphId.new(GlyphId16.toU32(layer.glyphId)),
+        self.coords,
+        Matrix.identity<f32>(),
+      )
+      bounds = Bounds.unionValue(bounds, clip)
+      i = i + 1
+    }
+    return Bounds.finish(bounds)
+  }
+
+  effect fn walk(
+    self: &Self,
+    outlines: &ColorOutlines<'a>,
+    paint: ResolvedPaint<'a>,
+    matrix: Matrix<f32>,
+    clip: Bounds,
+    depth: usize,
+    state: &mut ColorWalk,
+  ) -> Bounds
+    ! Error | OutOfMemoryError
+    ? &mut Allocator {
+    if depth >= 64 {
+      fail Error.LimitExceeded
+    }
+    match paint {
+      ResolvedPaint<'a>.Brush { renders } => {
+        if renders {
+          return clip
+        }
+        return Bounds.Empty
+      }
+      ResolvedPaint<'a>.Layers { start, end } => {
+        let mut result = Bounds.Empty
+        let mut i = start
+        while i < end {
+          let layer = run require(Colr.v1Layer(&self.sources.table, i))
+          run ColorWalk.enter(&mut state, layer.id)
+          let next = run ColorInstance.resolve(self, layer.paint, &mut state)
+          let bounds = run ColorInstance.walk(
+            self,
+            outlines,
+            next,
+            matrix,
+            clip,
+            depth + 1,
+            &mut state,
+          )
+          state.depth = state.depth - 1
+          result = Bounds.unionValue(result, bounds)
+          i = i + 1
+        }
+        return result
+      }
+      ResolvedPaint<'a>.Glyph { glyph, child } => {
+        let mut next = run ColorInstance.resolve(self, child, &mut state)
+        let mut intermediate = Matrix.identity<f32>()
+        while let ResolvedPaint<'a>.Transform { transform, child: inner } = next {
+          intermediate = intermediate * transform
+          next = run ColorInstance.resolve(self, inner, &mut state)
+        }
+        if let ResolvedPaint<'a>.Brush { renders } = next {
+          if !renders {
+            return Bounds.Empty
+          }
+          let glyphClip = run ColorOutlines.clip(outlines, glyph, self.coords, matrix)
+          return Bounds.intersect(clip, glyphClip)
+        }
+        let glyphClip = run ColorOutlines.clip(outlines, glyph, self.coords, matrix)
+        return run ColorInstance.walk(
+          self,
+          outlines,
+          next,
+          matrix * intermediate,
+          Bounds.intersect(clip, glyphClip),
+          depth + 1,
+          &mut state,
+        )
+      }
+      ResolvedPaint<'a>.ColrGlyph { glyph } => {
+        let root = run require(Colr.v1BaseGlyph(&self.sources.table, glyph))
+        run ColorWalk.enter(&mut state, root.id)
+        let mut nestedClip = clip
+        if let Option<ClipBox<'a>>.Some { value } = Colr.v1ClipBox(&self.sources.table, glyph) {
+          nestedClip = Bounds.intersect(
+            clip,
+            Bounds.of(transformBounds(matrix, ColorInstance.clipBox(self, value, false))),
+          )
+        }
+        let next = run ColorInstance.resolve(self, root.paint, &mut state)
+        let result = run ColorInstance.walk(
+          self,
+          outlines,
+          next,
+          matrix,
+          nestedClip,
+          depth + 1,
+          &mut state,
+        )
+        state.depth = state.depth - 1
+        return result
+      }
+      ResolvedPaint<'a>.Transform { transform, child } => {
+        let next = run ColorInstance.resolve(self, child, &mut state)
+        return run ColorInstance.walk(
+          self,
+          outlines,
+          next,
+          matrix * transform,
+          clip,
+          depth + 1,
+          &mut state,
+        )
+      }
+      ResolvedPaint<'a>.Composite { source, backdrop, mode } => {
+        let back = run ColorInstance.resolve(self, backdrop, &mut state)
+        let b = run ColorInstance.walk(self, outlines, back, matrix, clip, depth + 1, &mut state)
+        let front = run ColorInstance.resolve(self, source, &mut state)
+        let s = run ColorInstance.walk(self, outlines, front, matrix, clip, depth + 1, &mut state)
+        return Bounds.composite(b, s, mode)
+      }
+    }
+  }
+}
+
+union ResolvedPaint<'a> {
+  Brush { renders: bool },
+  Layers { start: usize, end: usize },
+  Glyph { glyph: GlyphId, child: Paint<'a> },
+  ColrGlyph { glyph: GlyphId },
+  Transform { transform: Matrix<f32>, child: Paint<'a> },
+  Composite { source: Paint<'a>, backdrop: Paint<'a>, mode: CompositeMode },
+}
+
+impl<'a> Copy for ResolvedPaint<'a> {}
+
+struct ColorWalk {
+  nodes: u32,
+  ids: [usize; 64],
+  depth: usize,
+}
+
+impl ColorWalk {
+  fn new() -> Self {
+    return Self { nodes: 16384, ids: [0; 64], depth: 0 }
+  }
+
+  effect fn enter(self: &mut Self, id: usize) -> ()
+    ! Error {
+    if self.depth >= 64 {
+      fail Error.LimitExceeded
+    }
+    let mut i: usize = 0
+    while i < self.depth {
+      if self.ids[i] == id {
+        fail Error.LimitExceeded
+      }
+      i = i + 1
+    }
+    self.ids[self.depth] = id
+    self.depth = self.depth + 1
+  }
+}
+
+struct Stops {
+  count: usize,
+  first: f32,
+  last: f32,
+  extend: Extend,
+}
+
+impl Copy for Stops {}
+
+impl Stops {
+  fn new(extend: Extend) -> Self {
+    return Self { count: 0, first: 0.0, last: 0.0, extend: extend }
+  }
+
+  fn add(self: &mut Self, offset: f32) {
+    if self.count == 0 {
+      self.first = offset
+      self.last = offset
+    } else {
+      self.first = minNumber(self.first, offset)
+      self.last = maxNumber(self.last, offset)
+    }
+    self.count = self.count + 1
+  }
+
+  fn renders(self: &Self) -> bool {
+    return self.count != 0 && (self.last != self.first || self.extend == Extend.Pad)
+  }
+}
+
+impl<'a, 'c> ColorInstance<'a, 'c> {
+  effect fn stops(self: &Self, line: ColorLine<'a>) -> Stops
+    ! Error {
+    let mut stops = Stops.new(ColorLine.extend(&line))
+    let records = ColorLine.colorStops(&line)
+    let mut i: usize = 0
+    while i < ComputedArray<'a, (), ColorStop<'a>>.len(&records) {
+      let stop = run read(ComputedArray<'a, (), ColorStop<'a>>.get(&records, i))
+      Stops.add(&mut stops, F2Dot14.toF32(ColorStop.stopOffset(&stop)))
+      i = i + 1
+    }
+    return stops
+  }
+
+  effect fn varStops(self: &Self, line: VarColorLine<'a>) -> Stops
+    ! Error {
+    let mut stops = Stops.new(VarColorLine.extend(&line))
+    let records = VarColorLine.colorStops(&line)
+    let mut i: usize = 0
+    while i < ComputedArray<'a, (), VarColorStop<'a>>.len(&records) {
+      let stop = run read(ComputedArray<'a, (), VarColorStop<'a>>.get(&records, i))
+      let deltas = ColorInstance.deltas(self, VarColorStop.varIndexBase(&stop), 2)
+      Stops.add(&mut stops, F2Dot14.applyDelta(VarColorStop.stopOffset(&stop), deltas[0]))
+      i = i + 1
+    }
+    return stops
+  }
+
+  effect fn resolve(self: &Self, paint: Paint<'a>, state: &mut ColorWalk) -> ResolvedPaint<'a>
+    ! Error {
+    if state.nodes == 0 {
+      fail Error.LimitExceeded
+    }
+    state.nodes = state.nodes - 1
+    match paint {
+      Paint<'a>.ColrLayers { value } => {
+        let start = u32.toUsize(PaintColrLayers.firstLayerIndex(&value))
+        let end = run require(
+          usize.checkedAdd(start, u8.toUsize(PaintColrLayers.numLayers(&value))),
+        )
+        return ResolvedPaint<'a>.Layers { start: start, end: end }
+      }
+      Paint<'a>.Solid { value } => {
+        return ResolvedPaint<'a>.Brush { renders: true }
+      }
+      Paint<'a>.VarSolid { value } => {
+        return ResolvedPaint<'a>.Brush { renders: true }
+      }
+      Paint<'a>.Glyph { value } => {
+        return ResolvedPaint<'a>.Glyph {
+          glyph: GlyphId.new(GlyphId16.toU32(PaintGlyph.glyphId(&value))),
+          child: run read(PaintGlyph.paint(&value))
+        }
+      }
+      Paint<'a>.Glyph2 { value } => {
+        return ResolvedPaint<'a>.Glyph {
+          glyph: GlyphId.new(GlyphId24.toU32(PaintGlyph2.glyphId(&value))),
+          child: run read(PaintGlyph2.paint(&value))
+        }
+      }
+      Paint<'a>.ColrGlyph { value } => {
+        return ResolvedPaint<'a>.ColrGlyph {
+          glyph: GlyphId.new(GlyphId16.toU32(PaintColrGlyph.glyphId(&value)))
+        }
+      }
+      Paint<'a>.Composite { value } => {
+        return ResolvedPaint<'a>.Composite {
+          source: run read(PaintComposite.sourcePaint(&value)),
+          backdrop: run read(PaintComposite.backdropPaint(&value)),
+          mode: PaintComposite.compositeMode(&value)
+        }
+      }
+      Paint<'a>.LinearGradient { value } => {
+        let line = run read(PaintLinearGradient.colorLine(&value))
+        let stops = run ColorInstance.stops(self, line)
+        let x0 = FWord.applyDelta(PaintLinearGradient.x0(&value), F48Dot16.zero())
+        let y0 = FWord.applyDelta(PaintLinearGradient.y0(&value), F48Dot16.zero())
+        let x1 = FWord.applyDelta(PaintLinearGradient.x1(&value), F48Dot16.zero())
+        let y1 = FWord.applyDelta(PaintLinearGradient.y1(&value), F48Dot16.zero())
+        let x2 = FWord.applyDelta(PaintLinearGradient.x2(&value), F48Dot16.zero())
+        let y2 = FWord.applyDelta(PaintLinearGradient.y2(&value), F48Dot16.zero())
+        let cross = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+        if (x1 == x0 && y1 == y0) || (x2 == x0 && y2 == y0) || cross == 0.0 {
+          return ResolvedPaint<'a>.Brush { renders: stops.count != 0 }
+        }
+        return ResolvedPaint<'a>.Brush { renders: Stops.renders(&stops) }
+      }
+      Paint<'a>.VarLinearGradient { value } => {
+        let line = run read(PaintVarLinearGradient.colorLine(&value))
+        let stops = run ColorInstance.varStops(self, line)
+        let deltas = ColorInstance.deltas(self, PaintVarLinearGradient.varIndexBase(&value), 6)
+        let x0 = FWord.applyDelta(PaintVarLinearGradient.x0(&value), deltas[0])
+        let y0 = FWord.applyDelta(PaintVarLinearGradient.y0(&value), deltas[1])
+        let x1 = FWord.applyDelta(PaintVarLinearGradient.x1(&value), deltas[2])
+        let y1 = FWord.applyDelta(PaintVarLinearGradient.y1(&value), deltas[3])
+        let x2 = FWord.applyDelta(PaintVarLinearGradient.x2(&value), deltas[4])
+        let y2 = FWord.applyDelta(PaintVarLinearGradient.y2(&value), deltas[5])
+        let cross = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)
+        if (x1 == x0 && y1 == y0) || (x2 == x0 && y2 == y0) || cross == 0.0 {
+          return ResolvedPaint<'a>.Brush { renders: stops.count != 0 }
+        }
+        return ResolvedPaint<'a>.Brush { renders: Stops.renders(&stops) }
+      }
+      Paint<'a>.RadialGradient { value } => {
+        let line = run read(PaintRadialGradient.colorLine(&value))
+        let stops = run ColorInstance.stops(self, line)
+        return ResolvedPaint<'a>.Brush { renders: Stops.renders(&stops) }
+      }
+      Paint<'a>.VarRadialGradient { value } => {
+        let line = run read(PaintVarRadialGradient.colorLine(&value))
+        let stops = run ColorInstance.varStops(self, line)
+        return ResolvedPaint<'a>.Brush { renders: Stops.renders(&stops) }
+      }
+      Paint<'a>.SweepGradient { value } => {
+        let line = run read(PaintSweepGradient.colorLine(&value))
+        let stops = run ColorInstance.stops(self, line)
+        let startAngle = F2Dot14.applyDelta(PaintSweepGradient.startAngle(&value), F48Dot16.zero())
+        let endAngle = F2Dot14.applyDelta(PaintSweepGradient.endAngle(&value), F48Dot16.zero())
+        let start = startAngle * 180.0 + 180.0
+        let end = endAngle * 180.0 + 180.0
+        let sector = end - start
+        let first = 360.0 - (start + sector * stops.first)
+        let last = 360.0 - (start + sector * stops.last)
+        if first == last && stops.extend != Extend.Pad {
+          return ResolvedPaint<'a>.Brush { renders: false }
+        }
+        return ResolvedPaint<'a>.Brush { renders: Stops.renders(&stops) }
+      }
+      Paint<'a>.VarSweepGradient { value } => {
+        let line = run read(PaintVarSweepGradient.colorLine(&value))
+        let stops = run ColorInstance.varStops(self, line)
+        let deltas = ColorInstance.deltas(self, PaintVarSweepGradient.varIndexBase(&value), 4)
+        let startAngle = F2Dot14.applyDelta(PaintVarSweepGradient.startAngle(&value), deltas[2])
+        let endAngle = F2Dot14.applyDelta(PaintVarSweepGradient.endAngle(&value), deltas[3])
+        let start = startAngle * 180.0 + 180.0
+        let end = endAngle * 180.0 + 180.0
+        let sector = end - start
+        let first = 360.0 - (start + sector * stops.first)
+        let last = 360.0 - (start + sector * stops.last)
+        if first == last && stops.extend != Extend.Pad {
+          return ResolvedPaint<'a>.Brush { renders: false }
+        }
+        return ResolvedPaint<'a>.Brush { renders: Stops.renders(&stops) }
+      }
+      Paint<'a>.Transform { value } => {
+        let affine = run read(PaintTransform.transform(&value))
+        let child = run read(PaintTransform.paint(&value))
+        return ResolvedPaint<'a>.Transform {
+          transform: Matrix<f32> {
+            xx: Fixed.applyDelta(Affine2x3.xx(&affine), F48Dot16.zero()),
+            yx: Fixed.applyDelta(Affine2x3.yx(&affine), F48Dot16.zero()),
+            xy: Fixed.applyDelta(Affine2x3.xy(&affine), F48Dot16.zero()),
+            yy: Fixed.applyDelta(Affine2x3.yy(&affine), F48Dot16.zero()),
+            dx: Fixed.applyDelta(Affine2x3.dx(&affine), F48Dot16.zero()),
+            dy: Fixed.applyDelta(Affine2x3.dy(&affine), F48Dot16.zero()),
+          },
+          child: child
+        }
+      }
+      Paint<'a>.VarTransform { value } => {
+        let affine = run read(PaintVarTransform.transform(&value))
+        let child = run read(PaintVarTransform.paint(&value))
+        let deltas = ColorInstance.deltas(self, VarAffine2x3.varIndexBase(&affine), 6)
+        return ResolvedPaint<'a>.Transform {
+          transform: Matrix<f32> {
+            xx: Fixed.applyDelta(VarAffine2x3.xx(&affine), deltas[0]),
+            yx: Fixed.applyDelta(VarAffine2x3.yx(&affine), deltas[1]),
+            xy: Fixed.applyDelta(VarAffine2x3.xy(&affine), deltas[2]),
+            yy: Fixed.applyDelta(VarAffine2x3.yy(&affine), deltas[3]),
+            dx: Fixed.applyDelta(VarAffine2x3.dx(&affine), deltas[4]),
+            dy: Fixed.applyDelta(VarAffine2x3.dy(&affine), deltas[5]),
+          },
+          child: child
+        }
+      }
+      Paint<'a>.Translate { value } => {
+        let dx = FWord.applyDelta(PaintTranslate.dx(&value), F48Dot16.zero())
+        let dy = FWord.applyDelta(PaintTranslate.dy(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        matrix.dx = dx
+        matrix.dy = dy
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintTranslate.paint(&value))
+        }
+      }
+      Paint<'a>.VarTranslate { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarTranslate.varIndexBase(&value), 2)
+        let dx = FWord.applyDelta(PaintVarTranslate.dx(&value), deltas[0])
+        let dy = FWord.applyDelta(PaintVarTranslate.dy(&value), deltas[1])
+        let mut matrix = Matrix.identity<f32>()
+        matrix.dx = dx
+        matrix.dy = dy
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarTranslate.paint(&value))
+        }
+      }
+      Paint<'a>.Scale { value } => {
+        let scaleX = F2Dot14.applyDelta(PaintScale.scaleX(&value), F48Dot16.zero())
+        let scaleY = F2Dot14.applyDelta(PaintScale.scaleY(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scaleX
+        matrix.yy = scaleY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintScale.paint(&value))
+        }
+      }
+      Paint<'a>.VarScale { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarScale.varIndexBase(&value), 2)
+        let scaleX = F2Dot14.applyDelta(PaintVarScale.scaleX(&value), deltas[0])
+        let scaleY = F2Dot14.applyDelta(PaintVarScale.scaleY(&value), deltas[1])
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scaleX
+        matrix.yy = scaleY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarScale.paint(&value))
+        }
+      }
+      Paint<'a>.ScaleAroundCenter { value } => {
+        let scaleX = F2Dot14.applyDelta(PaintScaleAroundCenter.scaleX(&value), F48Dot16.zero())
+        let scaleY = F2Dot14.applyDelta(PaintScaleAroundCenter.scaleY(&value), F48Dot16.zero())
+        let centerX = FWord.applyDelta(PaintScaleAroundCenter.centerX(&value), F48Dot16.zero())
+        let centerY = FWord.applyDelta(PaintScaleAroundCenter.centerY(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scaleX
+        matrix.yy = scaleY
+        matrix.dx = centerX - scaleX * centerX
+        matrix.dy = centerY - scaleY * centerY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintScaleAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.VarScaleAroundCenter { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarScaleAroundCenter.varIndexBase(&value), 4)
+        let scaleX = F2Dot14.applyDelta(PaintVarScaleAroundCenter.scaleX(&value), deltas[0])
+        let scaleY = F2Dot14.applyDelta(PaintVarScaleAroundCenter.scaleY(&value), deltas[1])
+        let centerX = FWord.applyDelta(PaintVarScaleAroundCenter.centerX(&value), deltas[2])
+        let centerY = FWord.applyDelta(PaintVarScaleAroundCenter.centerY(&value), deltas[3])
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scaleX
+        matrix.yy = scaleY
+        matrix.dx = centerX - scaleX * centerX
+        matrix.dy = centerY - scaleY * centerY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarScaleAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.ScaleUniform { value } => {
+        let scale = F2Dot14.applyDelta(PaintScaleUniform.scale(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scale
+        matrix.yy = scale
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintScaleUniform.paint(&value))
+        }
+      }
+      Paint<'a>.VarScaleUniform { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarScaleUniform.varIndexBase(&value), 1)
+        let scale = F2Dot14.applyDelta(PaintVarScaleUniform.scale(&value), deltas[0])
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scale
+        matrix.yy = scale
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarScaleUniform.paint(&value))
+        }
+      }
+      Paint<'a>.ScaleUniformAroundCenter { value } => {
+        let scale = F2Dot14.applyDelta(PaintScaleUniformAroundCenter.scale(&value), F48Dot16.zero())
+        let centerX = FWord.applyDelta(
+          PaintScaleUniformAroundCenter.centerX(&value),
+          F48Dot16.zero(),
+        )
+        let centerY = FWord.applyDelta(
+          PaintScaleUniformAroundCenter.centerY(&value),
+          F48Dot16.zero(),
+        )
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scale
+        matrix.yy = scale
+        matrix.dx = centerX - scale * centerX
+        matrix.dy = centerY - scale * centerY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintScaleUniformAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.VarScaleUniformAroundCenter { value } => {
+        let deltas = ColorInstance.deltas(
+          self,
+          PaintVarScaleUniformAroundCenter.varIndexBase(&value),
+          3,
+        )
+        let scale = F2Dot14.applyDelta(PaintVarScaleUniformAroundCenter.scale(&value), deltas[0])
+        let centerX = FWord.applyDelta(PaintVarScaleUniformAroundCenter.centerX(&value), deltas[1])
+        let centerY = FWord.applyDelta(PaintVarScaleUniformAroundCenter.centerY(&value), deltas[2])
+        let mut matrix = Matrix.identity<f32>()
+        matrix.xx = scale
+        matrix.yy = scale
+        matrix.dx = centerX - scale * centerX
+        matrix.dy = centerY - scale * centerY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarScaleUniformAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.Rotate { value } => {
+        let angle = F2Dot14.applyDelta(PaintRotate.angle(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        let radians = (angle * 180.0) * 0.017453292519943295
+        let sine = unsafe sinf(radians)
+        let cosine = unsafe cosf(radians)
+        matrix.xx = cosine
+        matrix.xy = -sine
+        matrix.yx = sine
+        matrix.yy = cosine
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintRotate.paint(&value))
+        }
+      }
+      Paint<'a>.VarRotate { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarRotate.varIndexBase(&value), 1)
+        let angle = F2Dot14.applyDelta(PaintVarRotate.angle(&value), deltas[0])
+        let mut matrix = Matrix.identity<f32>()
+        let radians = (angle * 180.0) * 0.017453292519943295
+        let sine = unsafe sinf(radians)
+        let cosine = unsafe cosf(radians)
+        matrix.xx = cosine
+        matrix.xy = -sine
+        matrix.yx = sine
+        matrix.yy = cosine
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarRotate.paint(&value))
+        }
+      }
+      Paint<'a>.RotateAroundCenter { value } => {
+        let angle = F2Dot14.applyDelta(PaintRotateAroundCenter.angle(&value), F48Dot16.zero())
+        let centerX = FWord.applyDelta(PaintRotateAroundCenter.centerX(&value), F48Dot16.zero())
+        let centerY = FWord.applyDelta(PaintRotateAroundCenter.centerY(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        let radians = (angle * 180.0) * 0.017453292519943295
+        let sine = unsafe sinf(radians)
+        let cosine = unsafe cosf(radians)
+        matrix.xx = cosine
+        matrix.xy = -sine
+        matrix.yx = sine
+        matrix.yy = cosine
+        matrix.dx = sine * centerY + (1.0 - cosine) * centerX
+        matrix.dy = -sine * centerX + (1.0 - cosine) * centerY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintRotateAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.VarRotateAroundCenter { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarRotateAroundCenter.varIndexBase(&value), 3)
+        let angle = F2Dot14.applyDelta(PaintVarRotateAroundCenter.angle(&value), deltas[0])
+        let centerX = FWord.applyDelta(PaintVarRotateAroundCenter.centerX(&value), deltas[1])
+        let centerY = FWord.applyDelta(PaintVarRotateAroundCenter.centerY(&value), deltas[2])
+        let mut matrix = Matrix.identity<f32>()
+        let radians = (angle * 180.0) * 0.017453292519943295
+        let sine = unsafe sinf(radians)
+        let cosine = unsafe cosf(radians)
+        matrix.xx = cosine
+        matrix.xy = -sine
+        matrix.yx = sine
+        matrix.yy = cosine
+        matrix.dx = sine * centerY + (1.0 - cosine) * centerX
+        matrix.dy = -sine * centerX + (1.0 - cosine) * centerY
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarRotateAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.Skew { value } => {
+        let xSkewAngle = F2Dot14.applyDelta(PaintSkew.xSkewAngle(&value), F48Dot16.zero())
+        let ySkewAngle = F2Dot14.applyDelta(PaintSkew.ySkewAngle(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        let tx = unsafe tanf((xSkewAngle * 180.0) * 0.017453292519943295)
+        let ty = unsafe tanf((ySkewAngle * 180.0) * 0.017453292519943295)
+        matrix.xy = -tx
+        matrix.yx = ty
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintSkew.paint(&value))
+        }
+      }
+      Paint<'a>.VarSkew { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarSkew.varIndexBase(&value), 2)
+        let xSkewAngle = F2Dot14.applyDelta(PaintVarSkew.xSkewAngle(&value), deltas[0])
+        let ySkewAngle = F2Dot14.applyDelta(PaintVarSkew.ySkewAngle(&value), deltas[1])
+        let mut matrix = Matrix.identity<f32>()
+        let tx = unsafe tanf((xSkewAngle * 180.0) * 0.017453292519943295)
+        let ty = unsafe tanf((ySkewAngle * 180.0) * 0.017453292519943295)
+        matrix.xy = -tx
+        matrix.yx = ty
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarSkew.paint(&value))
+        }
+      }
+      Paint<'a>.SkewAroundCenter { value } => {
+        let xSkewAngle = F2Dot14.applyDelta(
+          PaintSkewAroundCenter.xSkewAngle(&value),
+          F48Dot16.zero(),
+        )
+        let ySkewAngle = F2Dot14.applyDelta(
+          PaintSkewAroundCenter.ySkewAngle(&value),
+          F48Dot16.zero(),
+        )
+        let centerX = FWord.applyDelta(PaintSkewAroundCenter.centerX(&value), F48Dot16.zero())
+        let centerY = FWord.applyDelta(PaintSkewAroundCenter.centerY(&value), F48Dot16.zero())
+        let mut matrix = Matrix.identity<f32>()
+        let tx = unsafe tanf((xSkewAngle * 180.0) * 0.017453292519943295)
+        let ty = unsafe tanf((ySkewAngle * 180.0) * 0.017453292519943295)
+        matrix.xy = -tx
+        matrix.yx = ty
+        matrix.dx = tx * centerY
+        matrix.dy = -ty * centerX
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintSkewAroundCenter.paint(&value))
+        }
+      }
+      Paint<'a>.VarSkewAroundCenter { value } => {
+        let deltas = ColorInstance.deltas(self, PaintVarSkewAroundCenter.varIndexBase(&value), 4)
+        let xSkewAngle = F2Dot14.applyDelta(PaintVarSkewAroundCenter.xSkewAngle(&value), deltas[0])
+        let ySkewAngle = F2Dot14.applyDelta(PaintVarSkewAroundCenter.ySkewAngle(&value), deltas[1])
+        let centerX = FWord.applyDelta(PaintVarSkewAroundCenter.centerX(&value), deltas[2])
+        let centerY = FWord.applyDelta(PaintVarSkewAroundCenter.centerY(&value), deltas[3])
+        let mut matrix = Matrix.identity<f32>()
+        let tx = unsafe tanf((xSkewAngle * 180.0) * 0.017453292519943295)
+        let ty = unsafe tanf((ySkewAngle * 180.0) * 0.017453292519943295)
+        matrix.xy = -tx
+        matrix.yx = ty
+        matrix.dx = tx * centerY
+        matrix.dy = -ty * centerX
+        return ResolvedPaint<'a>.Transform {
+          transform: matrix,
+          child: run read(PaintVarSkewAroundCenter.paint(&value))
+        }
+      }
+    }
+  }
+}
+
+// The model's bounds dependencies retain the upstream paint graph regressions.
+import font { FontRef }
+import font_data { FontData }
+import model.charmap { Charmap }
+import model.metrics.global { Metrics }
+import table_provider { GlyfLoca }
+import tables.gvar { SelectedGvar }
+import tables.hmtx { GlyphMetricRecords }
+import ps.cff.font { CffFontRef }
+import generated_misc_table_fixtures as ColorFixtures
+import generated_model_fixtures as ColorExpected
+import silk.testing.testing { Testing, AssertionError }
+
+effect fn cmRead<T>(result: Result<T, ReadError>) -> T
+  ! AssertionError<'static> {
+  return match move result {
+    Result<T, ReadError>.Success { value } => move value
+    _ => {
+      run Testing.expect(false, "color fixture reads")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+effect fn cmSome<T>(option: Option<T>) -> T
+  ! AssertionError<'static> {
+  return match move option {
+    Option<T>.Some { value } => move value
+    _ => {
+      run Testing.expect(false, "color fixture value exists")
+      return Intrinsic.trap("assertion")
+    }
+  }
+}
+
+effect fn cmAlloc<T>(result: Result<T, Error | OutOfMemoryError>) -> T
+  ! AssertionError<'static> | OutOfMemoryError {
+  return match move result {
+    Result<T, Error | OutOfMemoryError>.Success { value } => move value
+    Result<T, Error | OutOfMemoryError>.Failure { error } => match move error {
+      Error problem => {
+        run Testing.expect(false, "color operation succeeds")
+        return Intrinsic.trap("assertion")
+      }
+      OutOfMemoryError problem => {
+        fail move problem
+      }
+    }
+  }
+}
+
+fn cmSources<'b>(table: Colr<'b>) -> ColorSources<'b> {
+  return ColorSources<'b> {
+    table: table,
+    store: optional(Colr.itemVariationStore(&table)),
+    map: optional(Colr.varIndexMap(&table)),
+  }
+}
+
+fn cmBase<'b>(font: &FontRef<'b>) -> BaseOutlines<'b> {
+  let global = Metrics.fromSfnt(font, &[])
+  return BaseOutlines<'b> {
+    glyf: Maybe<GlyfLoca<'b>>.fromResult(TableProvider.selectedGlyfLoca(font, Option<bool>.None)),
+    gvar: Maybe<SelectedGvar<'b>>.fromResult(TableProvider.selectedGvar(font)),
+    hMetrics: TableProvider.hGlyphMetricRecords(font)
+      |> Result<GlyphMetricRecords<'b>, ReadError>.unwrapOr(GlyphMetricRecords.default()),
+    vMetrics: TableProvider.vGlyphMetricRecords(font)
+      |> Result<GlyphMetricRecords<'b>, ReadError>.unwrapOr(GlyphMetricRecords.default()),
+    glyphCount: global.numGlyphs,
+    ascender: 0,
+    descender: 0,
+    cff: Maybe<CffFontRef<'b>>.None,
+    cff2: Maybe<CffFontRef<'b>>.None,
+    standalone: Maybe<&'b CffFontRef<'b>>.None,
+    upem: global.unitsPerEm,
+    order: GlyphSourceOrder.default(),
+  }
+}
+
+effect fn cmFont() -> FontRef<'static>
+  ! AssertionError<'static> {
+  return run cmRead(FontRef.new(ColorFixtures.variableColrFont()))
+}
+
+effect fn cmMapped(font: &FontRef, ch: u32) -> GlyphId
+  ! AssertionError<'static> {
+  return run cmSome(Charmap.mapUnicode(&Charmap.new(font), ch))
+}
+
+effect fn cmWalk<'b, 'd>(
+  instance: &ColorInstance<'b, 'd>,
+  outlines: &ColorOutlines<'b>,
+  glyph: GlyphId,
+  budget: u32,
+) -> u32
+  ! Error | OutOfMemoryError
+  ? &mut Allocator {
+  let root = run require(Colr.v1BaseGlyph(&instance.sources.table, glyph))
+  let mut state = ColorWalk.new()
+  state.nodes = budget
+  run ColorWalk.enter(&mut state, root.id)
+  let paint = run ColorInstance.resolve(instance, root.paint, &mut state)
+  drop run ColorInstance.walk(
+    instance,
+    outlines,
+    paint,
+    Matrix.identity<f32>(),
+    Bounds.Unbounded,
+    0,
+    &mut state,
+  )
+  return budget - state.nodes
+}
+
+fn cmLimit<T>(result: Result<T, Error | OutOfMemoryError>) -> bool {
+  return match move result {
+    Result<T, Error | OutOfMemoryError>.Failure { error } => match move error {
+      Error problem => problem == Error.LimitExceeded
+      _ => false
+    }
+    _ => false
+  }
+}
+
+test effect fn varDeltaIndexOverflow() -> ()
+  ! AssertionError<'static> {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords = [F2Dot14.fromF32(0.5)]
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let deltas = ColorInstance.deltas(&instance, 4294967294, 4)
+  run Testing.expect(
+    F48Dot16.toBits(deltas[1]) == 0 && F48Dot16.toBits(deltas[2]) == 0
+      && F48Dot16.toBits(deltas[3]) == 0,
+    "variation index stops before overflow",
+  )
+}
+
+test effect fn aMinimalColrReadsWithoutVariationTables() -> ()
+  ! AssertionError<'static> {
+  let bytes: [u8; 14] = [0; 14]
+  let sources = cmSources(run cmRead(Colr.read(FontData.new(&bytes))))
+  run Testing.expect(
+    match sources.store {
+      Maybe<ItemVariationStore>.None => true
+      _ => false
+    },
+    "no variation store",
+  )
+  run Testing.expect(
+    match sources.map {
+      Maybe<DeltaSetIndexMap>.None => true
+      _ => false
+    },
+    "no variation map",
+  )
+}
+
+test effect fn visitedNodesLimit() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmNodeBudget() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmNodeBudget() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  let count = run cmAlloc(run Effect.result(cmWalk(&instance, &outlines, GlyphId.new(120), 16384)))
+  run Testing.expect(count > 0, "paint graph consumes nodes")
+  run Testing.expect(
+    cmLimit(run Effect.result(cmWalk(&instance, &outlines, GlyphId.new(120), count - 1))),
+    "reduced node budget fails",
+  )
+}
+
+test effect fn paintColrGlyphCycleFails() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmCycle() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmCycle() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  let glyph = run cmMapped(&font, 0xf1100)
+  run Testing.expect(
+    cmLimit(run Effect.result(cmWalk(&instance, &outlines, glyph, 16384))),
+    "paint cycle exceeds limit",
+  )
+}
+
+test effect fn extentsAreTheClipBoxWhereThereIsOne() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmClipExtents() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmClipExtents() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  let mut ch: u32 = 0xf0c00
+  while ch <= 0xf0c04 {
+    let glyph = run cmMapped(&font, ch)
+    let clip = run cmSome(Colr.v1ClipBox(&sources.table, glyph))
+    let expected = ColorInstance.clipBox(&instance, clip, false)
+    let actual = run cmAlloc(run Effect.result(ColorInstance.measure(&instance, &outlines, glyph)))
+    run Testing.expect(cmBoxEqual(actual, expected), "extent equals clip box")
+    ch = ch + 1
+  }
+}
+
+fn cmBoxEqual(a: BoundingBox<f32>, b: BoundingBox<f32>) -> bool {
+  return a.xMin == b.xMin && a.yMin == b.yMin && a.xMax == b.xMax && a.yMax == b.yMax
+}
+
+test effect fn extentsOfLayeredOutlinesAreTheirUnion() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmLayerUnion() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmLayerUnion() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let base = cmBase(&font)
+  let outlines = ColorOutlines.new(base, Maybe<VarcOutlines<'static>>.None)
+  let glyph = run cmMapped(&font, 0xf0e00)
+  let range = run cmSome(Colr.v0BaseGlyph(&sources.table, glyph))
+  let mut sink = ControlBounds.new(Matrix.identity<f32>())
+  let mut i = range.start
+  while i < range.end {
+    let layer = run cmSome(Colr.v0Layer(&sources.table, i))
+    drop run cmAlloc(
+      run Effect.result(
+        BaseOutlines.draw(&base, GlyphId.new(GlyphId16.toU32(layer.glyphId)), &coords, &mut sink),
+      ),
+    )
+    i = i + 1
+  }
+  let actual = run cmAlloc(run Effect.result(ColorInstance.measure(&instance, &outlines, glyph)))
+  run Testing.expect(
+    cmBoxEqual(actual, ControlBounds.finish(&sink)),
+    "layer bounds equal independently collected control points",
+  )
+}
+
+test effect fn extentsFollowATranslation() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmTranslation() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmTranslation() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  let base = run cmAlloc(
+    run Effect.result(ColorInstance.measure(&instance, &outlines, run cmMapped(&font, 0xf0900))),
+  )
+  let xs: [f32; 7] = [0.0, 0.0, 0.0, 100.0, -100.0, 200.0, -200.0]
+  let ys: [f32; 7] = [0.0, 100.0, -100.0, 0.0, 0.0, 200.0, -200.0]
+  let mut i: usize = 0
+  while i < 7 {
+    let actual = run cmAlloc(
+      run Effect.result(
+        ColorInstance.measure(&instance, &outlines, run cmMapped(&font, 0xf0900 + usize.toU32(i))),
+      ),
+    )
+    let expected = BoundingBox<f32> {
+      xMin: minNumber(base.xMin, base.xMin + xs[i]),
+      yMin: minNumber(base.yMin, base.yMin + ys[i]),
+      xMax: maxNumber(base.xMax, base.xMax + xs[i]),
+      yMax: maxNumber(base.yMax, base.yMax + ys[i]),
+    }
+    run Testing.expect(cmBoxEqual(actual, expected), "translation union")
+    i = i + 1
+  }
+}
+
+test effect fn version0GlyphsHaveExtents() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmV0Extents() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmV0Extents() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let base = cmBase(&font)
+  let glyph = run cmMapped(&font, 0xf0e00)
+  let actual = run ColorSources.extents(
+    &sources,
+    base,
+    Maybe<VarcOutlines<'static>>.None,
+    glyph,
+    &[],
+  )
+  run Testing.expect(
+    match move actual {
+      Option<GlyphExtents<F48Dot16>>.Some { value } => true
+      _ => false
+    },
+    "version0 extents",
+  )
+  let absent = run ColorSources.extents(
+    &sources,
+    base,
+    Maybe<VarcOutlines<'static>>.None,
+    GlyphId.new(0),
+    &[],
+  )
+  run Testing.expect(
+    match move absent {
+      Option<GlyphExtents<F48Dot16>>.None => true
+      _ => false
+    },
+    "unpainted glyph absent",
+  )
+}
+
+test effect fn paintFlagsRequiringIncreasedNodeBudget() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmComplexFlags() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmComplexFlags() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmRead(FontRef.new(ColorExpected.notoEmoji()))
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  let mut gid: u32 = 0
+  let mut checked: usize = 0
+  while gid < outlines.base.glyphCount {
+    let glyph = GlyphId.new(gid)
+    if let Option<PaintWithId<'static>>.Some { value } = Colr.v1BaseGlyph(&sources.table, glyph) {
+      drop run cmAlloc(run Effect.result(cmWalk(&instance, &outlines, glyph, 16384)))
+      checked = checked + 1
+    }
+    gid = gid + 1
+  }
+  run Testing.expect(checked > 0, "large paint graphs traversed")
+}
+
+test effect fn varDeltasImplicitMappingUsesOuterIndex() -> ()
+  ! AssertionError<'static> {
+  let bytes = b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x22\x00\x01\x00\x00\x00\x10\x00\x02\x00\x00\x00\x1a\x00\x00\x00\x24\x00\x01\x00\x01\x00\x00\x40\x00\x40\x00\x00\x01\x00\x01\x00\x01\x00\x00\x00\x64\x00\x01\x00\x01\x00\x01\x00\x00\x00\xc8"
+  let sources = cmSources(run cmRead(Colr.read(FontData.new(bytes))))
+  let coords = [F2Dot14.one()]
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let a = ColorInstance.deltas(&instance, 0, 1)
+  let b = ColorInstance.deltas(&instance, 65536, 1)
+  run Testing.expect(
+    F48Dot16.toF32(a[0]) == 100.0 && F48Dot16.toF32(b[0]) == 200.0,
+    "implicit outer index retained",
+  )
+}
+
+import tables.fvar { Fvar, UserCoordinate }
+import tables.avar { Avar }
+import font_types.lib { Tag }
+
+test effect fn clipboxTest() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmMovedClips() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmMovedClips() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let fvar = run cmRead(TableProvider.fvar(&font))
+  let glyph = run cmMapped(&font, 0xf0c00)
+  let clip = run cmSome(Colr.v1ClipBox(&sources.table, glyph))
+  let base = ColorInstance.clipBox(&ColorInstance { sources: sources, coords: &[] }, clip, false)
+  let tags: [u32; 4] = [0x434c5849, 0x434c5841, 0x434c5949, 0x434c5941]
+  let shifts: [f32; 4] = [200.0122, -200.0122, 200.0122, -200.0122]
+  let mut i: usize = 0
+  while i < 4 {
+    let mut coords = [F2Dot14.zero(); 64]
+    run Fvar.userToNormalized(
+      &fvar,
+      Option<Avar<'static>>.None,
+      &[UserCoordinate { tag: Tag.fromU32(tags[i]), value: Fixed.fromF64(f32.toF64(shifts[i])) }],
+      &mut coords,
+    )
+    let instance = ColorInstance { sources: sources, coords: &coords }
+    let actual = ColorInstance.clipBox(&instance, clip, false)
+    let mut expected = base
+    if i == 0 {
+      expected.xMin = expected.xMin + shifts[i]
+    } else if i == 1 {
+      expected.xMax = expected.xMax + shifts[i]
+    } else if i == 2 {
+      expected.yMin = expected.yMin + shifts[i]
+    } else {
+      expected.yMax = expected.yMax + shifts[i]
+    }
+    run Testing.expect(
+      cmBoxEqual(actual, expected),
+      "each clip coordinate applies fractional delta",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn noCliplistPaints() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmNoClip() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmNoClip() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmRead(FontRef.new(ColorFixtures.unclippedColrFont()))
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  let glyph = GlyphId.new(1)
+  run Testing.expect(
+    match move Colr.v1ClipBox(&sources.table, glyph) {
+      Option<ClipBox<'static>>.None => true
+      _ => false
+    },
+    "cliplist absent",
+  )
+  drop run cmAlloc(run Effect.result(cmWalk(&instance, &outlines, glyph, 16384)))
+}
+
+test effect fn colrv0GlyphHasNoClipBox() -> ()
+  ! AssertionError<'static> {
+  let font = run cmFont()
+  let colr = run cmRead(TableProvider.colr(&font))
+  let glyph = run cmMapped(&font, 0xf0e00)
+  drop run cmSome(Colr.v0BaseGlyph(&colr, glyph))
+  run Testing.expect(
+    match move Colr.v1ClipBox(&colr, glyph) {
+      Option<ClipBox<'static>>.None => true
+      _ => false
+    },
+    "version0 glyph has no clip",
+  )
+}
+
+test effect fn noPanicOnEmptyColorline() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cmEmptyLine() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cmEmptyLine() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let font = run cmRead(FontRef.new(ColorFixtures.colrEmptyColorLineFont()))
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let outlines = ColorOutlines.new(cmBase(&font), Maybe<VarcOutlines<'static>>.None)
+  drop run cmSome(Colr.v1BaseGlyph(&sources.table, GlyphId.new(8447)))
+  drop run Effect.result(cmWalk(&instance, &outlines, GlyphId.new(8447), 16384))
+}
+
+// Resolve 24-bit IDs without narrowing before the clip validates font coverage.
+test effect fn glyph2BoundsPreserveBoundaryIds() -> ()
+  ! AssertionError<'static> {
+  let font = run cmFont()
+  let sources = cmSources(run cmRead(TableProvider.colr(&font)))
+  let coords: [F2Dot14; 0] = []
+  let instance = ColorInstance { sources: sources, coords: &coords }
+  let ids: [u32; 3] = [65535, 65536, 16777215]
+  let mut i: usize = 0
+  while i < 3 {
+    let gid = ids[i]
+    let bytes: [u8; 12] = [
+      33,
+      0,
+      0,
+      7,
+      u32.toU8(u32.shiftRight(gid, 16)),
+      u32.toU8(u32.bitAnd(u32.shiftRight(gid, 8), 255)),
+      u32.toU8(u32.bitAnd(gid, 255)),
+      2,
+      0,
+      7,
+      64,
+      0,
+    ]
+    let paint = run cmRead(Paint.read(FontData.new(&bytes)))
+    let mut state = ColorWalk.new()
+    let result = run Effect.result(ColorInstance.resolve(&instance, paint, &mut state))
+    run Testing.expect(
+      match move result {
+        Result<ResolvedPaint, Error>.Success {
+          value: ResolvedPaint.Glyph { glyph, child }
+        } => GlyphId.toU32(glyph) == gid
+        _ => false
+      },
+      "wide glyph ID retained",
+    )
+    i = i + 1
+  }
+}

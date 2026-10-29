@@ -1,0 +1,1807 @@
+//! Resolve script, language, feature ranges and variation substitutions once per run.
+import view { View, read16, offset, valueSize }
+import set_digest { SetDigest, subtableCoverage }
+import buffer { Buffer, Glyph }
+import direction { Direction }
+import feature { Feature }
+import arabic
+import complex
+import script { ScriptTags }
+import font { ConfiguredShaper, FontFuncs, Shaper }
+import read_fonts.tables.layout { FeatureVariations, LookupVariations }
+import read_fonts.tables.variations { ItemVariationStore, DeltaSetIndex }
+import read_fonts.model.error { Error }
+import read_fonts.lib { ReadError, FontData }
+import silk.core.result { Result }
+import silk.num.usize
+import font_types.lib { Tag, F2Dot14, F48Dot16 }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+
+struct CachedLookup {
+  digest: SetDigest,
+  second: SetDigest,
+  lookupOffset: usize,
+}
+
+pub struct LookupStep {
+  pub digest: SetDigest,
+  /// The glyphs that may follow the first one in a match of any of the lookup's subtables; full
+  /// when a subtable can match a single glyph or its second glyphs are not collected.
+  pub second: SetDigest,
+  /// The lookup table's offset in the layout table; the table's length when the index is invalid.
+  pub lookupOffset: usize,
+  /// This step's lookup subtables in `OtPlan.subtables`.
+  pub firstSubtable: usize,
+  pub subtableCount: usize,
+  pub index: u16,
+  pub required: bool,
+  pub tag: u32,
+  pub value: u32,
+  pub stage: u32,
+  /// The per-glyph conditions `ot.enabled` checks for the step's feature, as `CHECK_` bits; 0
+  /// when it applies to every glyph by its value and the features' ranges alone.
+  pub checks: u8,
+  /// One past the last of the steps from this one on that share its lookup and stage, which
+  /// `ot.apply` runs together; set once the steps are sorted.
+  pub groupEnd: usize,
+  /// Whether the lookup has subtables and all of them adjust pairs (`LookupSubtable.kern`), so
+  /// `ot.applyPairs` applies it.
+  pub pairs: bool,
+  /// Whether the lookup has subtables and all of them are contextual, so `ot.applyContextStep`
+  /// applies it.
+  pub contextual: bool,
+  /// Whether the lookup has subtables and all of them are positioning subtables other than
+  /// contextual and kerning ones, so `ot.applyPositionStep` applies it.
+  pub positions: bool,
+  /// Whether the lookup has subtables and all of them are single, multiple, alternate or
+  /// ligature substitutions, so `ot.applySubstituteStep` applies it.
+  pub substitutes: bool,
+  /// `ZWJ_*` bits for the step's feature under the plan's shaper and script: whether matching
+  /// skips joiners automatically, and whether substitution stays within a syllable.
+  pub zwj: u8,
+  /// The lookup's type, flags and mark filtering set, read once from its header.
+  pub kind: u16,
+  pub lookupFlags: u16,
+  pub markSet: u16,
+  /// Whether some step from this one to `groupEnd` applies to every glyph when the buffer has
+  /// no user features: it is required, or its feature is on with no per-glyph checks.
+  pub everywhere: bool,
+}
+
+impl Copy for LookupStep {}
+
+pub const ZWJ_AUTO: u8 = 1
+
+pub const ZWNJ_AUTO: u8 = 2
+
+pub const ZWJ_PER_SYLLABLE: u8 = 4
+
+/// The `ZWJ_*` bits for feature `tag` under `shaper` and `script`.
+fn zwjBits(shaper: u32, script: u32, tag: u32) -> u8 {
+  let mut autoZwj = true
+  let mut autoZwnj = true
+  let common = tag == 0x63636d70 || tag == 0x6c6f636c
+  if shaper != 0 && !common && tag != 0x7276726e {
+    autoZwj = false
+    if shaper == 1 || shaper == 2 {
+      autoZwnj = false
+    }
+  }
+  if arabic.usesScript(script)
+    && (common || arabic.isFeature(tag) || tag == 0x726c6967 || tag == 0x63616c74
+      || tag == 0x6c696761
+      || tag == 0x636c6967
+      || tag == 0x6d736574) {
+    autoZwj = false
+  }
+  let mut bits: u8 = 0
+  if autoZwj {
+    bits = bits | ZWJ_AUTO
+  }
+  if autoZwnj {
+    bits = bits | ZWNJ_AUTO
+  }
+  if complex.perSyllable(shaper, tag) {
+    bits = bits | ZWJ_PER_SYLLABLE
+  }
+  return bits
+}
+
+/// A lookup subtable resolved through any extension, with the digest of the glyphs it can
+/// start at. A subtable whose digest rejects the current glyph is skipped without parsing it.
+/// The subtable is kept as its offset in the layout table rather than a view, because a plan
+/// holding a list of lifetime-carrying values cannot be stored in a list (silk-lang/silk#2425).
+pub struct LookupSubtable {
+  pub offset: usize,
+  pub kind: u16,
+  /// With `contextDigests` (below), the subtable's backtrack, input and lookahead glyph counts.
+  pub backCount: u16,
+  pub inputCount: u16,
+  pub aheadCount: u16,
+  pub digest: SetDigest,
+  /// This subtable's rule set digests in `OtPlan.ruleDigests`; `ruleSets` is 0 without them.
+  pub ruleDigests: usize,
+  pub ruleSets: usize,
+  /// This subtable's pair set digests in `OtPlan.pairDigests`; `pairSets` is 0 without them.
+  pub pairDigests: usize,
+  pub pairSets: usize,
+  /// The coverage of the glyph a match starts at, expanded into `OtPlan.coverageValues` from
+  /// glyph `coverageFirst`: one entry per glyph, the coverage index plus one, or 0 when the glyph
+  /// is not covered. `coverageCount` is 0 when the coverage is not expanded.
+  pub coverageFirst: u32,
+  pub coverageStart: usize,
+  pub coverageCount: usize,
+  /// The same expansion of a format 1 mark attachment subtable's base (or ligature or mark 2)
+  /// coverage; `baseCount` is 0 when it is not expanded.
+  pub baseFirst: u32,
+  pub baseStart: usize,
+  pub baseCount: usize,
+  /// Whether applying the subtable to an uncovered glyph spends a unit of budget, as a format 3
+  /// contextual subtable does.
+  pub missSpends: bool,
+  /// The expansions of the subtable's class definitions, in `classDefs` order, once
+  /// `addAllClasses` has resolved them; an unexpanded definition has a count of 0.
+  pub classes: [ClassTable; 3],
+  pub classesResolved: bool,
+  /// 1 or 2 for a 16-bit pair subtable of that format whose values only adjust the first
+  /// glyph's advance, which is how kerning is stored; 3 or 4 when the advance also has a
+  /// device or variation record; 0 otherwise.
+  pub kern: u8,
+  /// For a 16-bit format 3 contextual subtable, where its digests start in
+  /// `OtPlan.contextDigests`; `usize.MAX` otherwise.
+  pub contextDigests: usize,
+}
+
+impl Copy for LookupSubtable {}
+
+fn kernFormat(table: View, kind: u16, positioning: bool) -> u8 {
+  let format = View.u16(&table, 0)
+  let first = View.u16(&table, 4)
+  if !positioning || kind != 2 || (format != 1 && format != 2) || (first != 4 && first != 0x44)
+    || View.u16(&table, 6) != 0 {
+    return 0
+  }
+  if first == 0x44 {
+    return u16.toU8(format) + 2
+  }
+  return u16.toU8(format)
+}
+
+fn noClassTable() -> ClassTable {
+  return ClassTable { offset: 0, first: 0, start: 0, count: 0 }
+}
+
+/// The class definitions a class-based contextual or pair subtable reads per glyph: a
+/// contextual subtable's input classes, or a chained one's backtrack, input and lookahead
+/// classes; a pair subtable's first and second glyph classes. `count` is 0 for other subtables.
+pub struct ClassDefs<'a> {
+  pub count: usize,
+  pub views: [View<'a>; 3],
+}
+
+impl<'a> Copy for ClassDefs<'a> {}
+
+pub fn classDefs<'a>(table: View<'a>, kind: u16, positioning: bool) -> ClassDefs<'a> {
+  // An empty view with the table's lifetime; View.empty() would be inferred as 'static here.
+  let none = View.tail(&table, View.len(&table))
+  let mut defs = ClassDefs { count: 0, views: [none, none, none] }
+  let rawFormat = View.u16(&table, 0)
+  if (!positioning && (kind == 5 || kind == 6)) || (positioning && (kind == 7 || kind == 8)) {
+    let chained = kind == 6 || kind == 8
+    let mut header: usize = 4
+    let mut width: usize = 2
+    if rawFormat == 5 {
+      header = 6
+      width = 4
+    } else if rawFormat != 2 {
+      return defs
+    }
+    defs.views[0] = View.offset(&table, header, width)
+    defs.count = 1
+    if chained {
+      defs.views[1] = View.offset(&table, header + width, width)
+      defs.views[2] = View.offset(&table, header + width * 2, width)
+      defs.count = 3
+    }
+  } else if positioning && kind == 2 {
+    if rawFormat == 2 {
+      defs.views[0] = View.offset(&table, 8, 2)
+      defs.views[1] = View.offset(&table, 10, 2)
+      defs.count = 2
+    } else if rawFormat == 4 {
+      defs.views[0] = View.offset(&table, 10, 4)
+      defs.views[1] = View.offset(&table, 14, 4)
+      defs.count = 2
+    }
+  }
+  return defs
+}
+
+/// A class definition expanded to one class per glyph from `first`, kept in
+/// `OtPlan.classValues`. `offset` is the class definition's offset in the layout table.
+pub struct ClassTable {
+  pub offset: usize,
+  pub first: u32,
+  pub start: usize,
+  pub count: usize,
+}
+
+impl Copy for ClassTable {}
+
+/// Expanded class definitions, enough for every contextual and pair subtable of a large font.
+const MAX_CLASS_VALUES: usize = 4194304
+
+/// The most glyphs one expanded coverage spans; wider coverages are searched instead.
+const MAX_COVERAGE_SPAN: usize = 8192
+
+/// A `ruleSeconds` entry for a rule that no second input value lets the rule loop skip.
+pub const RULE_STOP: u32 = 0x10000
+
+/// The features Indic shaping probes with `ot.wouldSubstitute`, as `OtPlan.probeDigests` keeps them.
+pub const PROBE_TAGS: [u32; 5] = [0x626c7766, 0x76617475, 0x70737466, 0x70726566, 0x72706866]
+
+pub struct OtPlan<'a> {
+  pub table: View<'a>,
+  pub steps: List<LookupStep>,
+  pub subtables: List<LookupSubtable>,
+  /// Class definitions of the plan's class-based subtables, sorted by offset.
+  pub classTables: List<ClassTable>,
+  pub classValues: List<u16>,
+  /// For each rule set of a 16-bit format 1 or 2 contextual subtable, a bit per second input
+  /// value (mod 64) of its rules; all bits when a rule has no second value or is malformed.
+  /// Likewise for each ligature set of a 16-bit ligature subtable, by second component.
+  pub ruleDigests: List<u64>,
+  /// For each entry of `ruleDigests`, where its rules' second input values start in
+  /// `ruleSeconds`, or `u32.MAX` for ligature sets.
+  pub ruleSecondStarts: List<u32>,
+  /// The second input value of each rule, in rule order, for the rule sets that have them.
+  pub ruleSeconds: List<u32>,
+  /// The first backtrack value of each rule, alongside `ruleSeconds`, or `RULE_STOP` for a rule
+  /// that is not chained, has no backtrack, or is malformed.
+  pub ruleBacks: List<u32>,
+  /// The first lookahead value of each chained rule with a single input, alongside
+  /// `ruleSeconds`, or `RULE_STOP` for any other rule.
+  pub ruleAheads: List<u32>,
+  /// For each lookup index, its first subtable in `subtables` in the high 32 bits and its
+  /// subtable count in the low ones, or `u64.MAX` when the plan has not cached it. Nested
+  /// lookups use these.
+  pub lookupSubtables: List<u64>,
+  /// Each cached lookup's `LookupStep.lookupOffset`.
+  pub lookupOffsets: List<usize>,
+  /// Each cached lookup's `LookupStep.second`.
+  lookupSeconds: List<SetDigest>,
+  /// For each pair set of a 16-bit format 1 pair adjustment subtable, the digest of its second
+  /// glyphs; full when the set is malformed.
+  pub pairDigests: List<SetDigest>,
+  pub coverageValues: List<u16>,
+  /// Three digests per 16-bit format 3 contextual subtable: its second input coverage, its
+  /// first backtrack coverage and its first lookahead coverage, each full when there is none.
+  pub contextDigests: List<SetDigest>,
+  /// GDEF glyph classes and mark attachment classes, when expanded.
+  pub glyphClasses: ClassTable,
+  pub markAttachClasses: ClassTable,
+  /// Digests of the lookups of the features Indic consonant positions and reph forms probe:
+  /// `blwf`, `vatu`, `pstf`, `pref` and `rphf`, in `PROBE_TAGS` order.
+  pub probeDigests: [SetDigest; 5],
+  /// The GDEF glyph class and mark attachment class definitions, found once per plan.
+  pub glyphClassDef: View<'a>,
+  pub markAttachClassDef: View<'a>,
+  pub direction: Direction,
+  pub script: u32,
+  pub positioning: bool,
+  /// Whether mark attachment subtables expand their base coverage too. Only the Arabic and
+  /// complex shapers' scripts attach marks often enough to repay the expansion.
+  pub expandBases: bool,
+  pub chosenScript: u32,
+}
+
+impl<'a> OtPlan<'a> {
+  /// Appends a step for lookup `index`, caching its subtables and their digests.
+  pub effect fn addStep(
+    self: &mut Self,
+    index: u16,
+    required: bool,
+    tag: u32,
+    value: u32,
+    stage: u32,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut first = List<LookupSubtable>.length(&self.subtables)
+    let mut count: usize = 0
+    let mut digest = SetDigest.new()
+    let mut second = SetDigest.full()
+    let mut lookupOffset: usize = 0
+
+    // A lookup that several features use shares one cached copy of its subtables.
+    let slot = u16.toUsize(index)
+    if slot < List<u64>.length(&self.lookupSubtables)
+      && List<u64>.get(&self.lookupSubtables, slot) != u64.MAX {
+      let packed = List<u64>.get(&self.lookupSubtables, slot)
+      first = u64.toUsize(u64.shiftRight(packed, 32))
+      count = u64.toUsize(packed & 0xffffffff)
+      let mut i: usize = 0
+      while i < count {
+        SetDigest.include(
+          &mut digest,
+          &List<LookupSubtable>.asSlice(&self.subtables)[first + i].digest,
+        )
+        i = i + 1
+      }
+      lookupOffset = List<usize>.get(&self.lookupOffsets, slot)
+      second = List<SetDigest>.get(&self.lookupSeconds, slot)
+    } else {
+      let cached = run self.cacheLookup(index, true)
+      count = List<LookupSubtable>.length(&self.subtables) - first
+      digest = cached.digest
+      second = cached.second
+      lookupOffset = cached.lookupOffset
+    }
+    let groupEnd = List<LookupStep>.length(&self.steps) + 1
+    let mut pairs = count != 0
+    let mut k: usize = 0
+    while k < count && pairs {
+      pairs = List<LookupSubtable>.asSlice(&self.subtables)[first + k].kern != 0
+      k = k + 1
+    }
+    let mut contextual = count != 0
+    k = 0
+    while k < count && contextual {
+      contextual = contextualKind(
+        List<LookupSubtable>.asSlice(&self.subtables)[first + k].kind,
+        self.positioning,
+      )
+      k = k + 1
+    }
+    let mut positions = count != 0 && self.positioning
+    k = 0
+    while k < count && positions {
+      let sub = &List<LookupSubtable>.asSlice(&self.subtables)[first + k]
+      positions = sub.kind >= 1 && sub.kind <= 6 && sub.kern == 0
+      k = k + 1
+    }
+    let mut substitutes = count != 0 && !self.positioning
+    k = 0
+    while k < count && substitutes {
+      let kind = List<LookupSubtable>.asSlice(&self.subtables)[first + k].kind
+      substitutes = kind >= 1 && kind <= 4
+      k = k + 1
+    }
+    let header = View.tail(&self.table, lookupOffset)
+    run List<LookupStep>.append(
+      &mut self.steps,
+      LookupStep {
+        digest: digest,
+        second: second,
+        lookupOffset: lookupOffset,
+        firstSubtable: first,
+        subtableCount: count,
+        index: index,
+        required: required,
+        tag: tag,
+        value: value,
+        stage: stage,
+        checks: featureChecks(tag),
+        groupEnd: groupEnd,
+        pairs: pairs,
+        contextual: contextual,
+        positions: positions,
+        substitutes: substitutes,
+        zwj: 0,
+        kind: View.u16(&header, 0),
+        lookupFlags: View.u16(&header, 2),
+        markSet: View.u16(&header, 6 + u16.toUsize(View.u16(&header, 4)) * 2),
+        everywhere: false,
+      },
+    )
+  }
+
+  /// Appends lookup `index`'s subtables to `subtables` with their digests, and their coverage
+  /// expansions when `expand`, and records them in `lookupSubtables` if the lookup has none
+  /// recorded yet. Nested lookups skip the expansions, which cost more to build than they save
+  /// at the few positions a nested lookup is applied.
+  effect fn cacheLookup(self: &mut Self, index: u16, expand: bool) -> CachedLookup
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let first = List<LookupSubtable>.length(&self.subtables)
+    let mut digest = SetDigest.new()
+    let mut second = SetDigest.new()
+    let list = View.layoutList(&self.table, 2)
+    let mut width: usize = 2
+    if View.u16(&self.table, 0) == 1 && View.u16(&self.table, 2) >= 2
+      && View.u32(&self.table, 22) != 0 {
+      width = 4
+    }
+    let mut lookupOffset = View.len(&self.table)
+    if index < View.u16(&list, 0) {
+      let lookup = View.offset(&list, 2 + u16.toUsize(index) * width, width)
+      lookupOffset = View.len(&self.table) - View.len(&lookup)
+      let lookupKind = View.u16(&lookup, 0)
+      let count = u16.toUsize(View.u16(&lookup, 4))
+      let mut i: usize = 0
+      while i < count {
+        let mut table = View.offset16(&lookup, 6 + i * 2)
+        let mut kind = lookupKind
+        let mut subtableDigest = SetDigest.new()
+        if (!self.positioning && kind == 7) || (self.positioning && kind == 9) {
+          // An invalid extension keeps its slot, with an empty digest, so lookup work
+          // budgets count the same subtables as the table does.
+          if View.u16(&table, 0) == 1 {
+            kind = View.u16(&table, 2)
+            table = View.offset32(&table, 4)
+            SetDigest.addCoverage(
+              &mut subtableDigest,
+              subtableCoverage(table, kind, self.positioning),
+            )
+          }
+        } else {
+          SetDigest.addCoverage(
+            &mut subtableDigest,
+            subtableCoverage(table, kind, self.positioning),
+          )
+        }
+        SetDigest.include(&mut digest, &subtableDigest)
+        let ruleDigests = List<u64>.length(&self.ruleDigests)
+        run self.addRuleDigests(table, kind)
+        let pairDigests = List<SetDigest>.length(&self.pairDigests)
+        run self.addPairDigests(table, kind)
+        if !self.positioning && kind == 4 {
+          addLigatureSeconds(&mut second, table)
+        } else if contextualKind(kind, self.positioning) {
+          addContextSeconds(&mut second, table, kind == 6 || kind == 8)
+        } else if List<SetDigest>.length(&self.pairDigests) > pairDigests {
+          let mut n = pairDigests
+          while n < List<SetDigest>.length(&self.pairDigests) {
+            SetDigest.include(&mut second, &List<SetDigest>.asSlice(&self.pairDigests)[n])
+            n = n + 1
+          }
+        } else {
+          second = SetDigest.full()
+        }
+        let mut contextDigests = usize.MAX
+        let mut backCount: u16 = 0
+        let mut inputCount: u16 = 0
+        let mut aheadCount: u16 = 0
+        if contextualKind(kind, self.positioning) && View.u16(&table, 0) == 3 {
+          contextDigests = List<SetDigest>.length(&self.contextDigests)
+          let chained = kind == 6 || kind == 8
+          run self.addFormat3Digests(table, chained)
+          if chained {
+            backCount = View.u16(&table, 2)
+            inputCount = View.u16(&table, 4 + u16.toUsize(backCount) * 2)
+            aheadCount = View.u16(
+              &table,
+              6 + u16.toUsize(backCount) * 2 + u16.toUsize(inputCount) * 2,
+            )
+          } else {
+            inputCount = View.u16(&table, 2)
+          }
+        }
+        let coverageStart = List<u16>.length(&self.coverageValues)
+        let mut coverageFirst: u32 = 0
+        if expand {
+          coverageFirst = run self.expandCoverage(table, kind)
+        }
+        let coverageEnd = List<u16>.length(&self.coverageValues)
+        let mut baseFirst: u32 = 0
+        if expand && self.expandBases && kind >= 4 && kind <= 6 && View.u16(&table, 0) == 1
+          && View.u16(&table, 4) != 0 {
+          baseFirst = run self.expandCoverageView(View.offset16(&table, 4))
+        }
+        run List<LookupSubtable>.append(
+          &mut self.subtables,
+          // Every view derived by offsets runs to the end of the layout table.
+          LookupSubtable {
+            offset: View.len(&self.table) - View.len(&table),
+            kind: kind,
+            digest: subtableDigest,
+            ruleDigests: ruleDigests,
+            ruleSets: List<u64>.length(&self.ruleDigests) - ruleDigests,
+            pairDigests: pairDigests,
+            pairSets: List<SetDigest>.length(&self.pairDigests) - pairDigests,
+            coverageFirst: coverageFirst,
+            coverageStart: coverageStart,
+            coverageCount: coverageEnd - coverageStart,
+            baseFirst: baseFirst,
+            baseStart: coverageEnd,
+            baseCount: List<u16>.length(&self.coverageValues) - coverageEnd,
+            missSpends: contextualKind(kind, self.positioning) && View.u16(&table, 0) == 3,
+            classes: [noClassTable(); 3],
+            classesResolved: false,
+            kern: kernFormat(table, kind, self.positioning),
+            contextDigests: contextDigests,
+            backCount: backCount,
+            inputCount: inputCount,
+            aheadCount: aheadCount,
+          },
+        )
+        i = i + 1
+      }
+    }
+    let lookups = u16.toUsize(View.u16(&list, 0))
+    while List<u64>.length(&self.lookupSubtables) < lookups {
+      run List<u64>.append(&mut self.lookupSubtables, u64.MAX)
+      run List<usize>.append(&mut self.lookupOffsets, 0)
+      run List<SetDigest>.append(&mut self.lookupSeconds, SetDigest.full())
+    }
+    let slot = u16.toUsize(index)
+    if slot < lookups && List<u64>.get(&self.lookupSubtables, slot) == u64.MAX {
+      let count = List<LookupSubtable>.length(&self.subtables) - first
+      List<u64>.set(
+        &mut self.lookupSubtables,
+        slot,
+        u64.shiftLeft(usize.toU64(first), 32) | usize.toU64(count),
+      )
+      List<usize>.set(&mut self.lookupOffsets, slot, lookupOffset)
+      List<SetDigest>.set(&mut self.lookupSeconds, slot, second)
+    }
+    return CachedLookup { digest: digest, second: second, lookupOffset: lookupOffset }
+  }
+
+  /// Appends the `contextDigests` of a 16-bit format 3 contextual subtable. Coverages are found
+  /// the way `ot.matches` finds them, so a glyph a digest rules out is one matching rejects.
+  effect fn addFormat3Digests(self: &mut Self, table: View<'a>, chained: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut pos: usize = 2
+    let mut backCount: usize = 0
+    if chained {
+      backCount = u16.toUsize(View.u16(&table, 2))
+      pos = 4 + backCount * 2
+    }
+    let inputCount = u16.toUsize(View.u16(&table, pos))
+    pos = pos + 2
+    if !chained {
+      pos = pos + 2
+    }
+    let mut input = SetDigest.full()
+    if inputCount >= 2 {
+      input = SetDigest.new()
+      SetDigest.addCoverage(
+        &mut input,
+        View.tail(&table, u32.toUsize(View.uint(&table, pos + 2, 2))),
+      )
+    }
+    let mut back = SetDigest.full()
+    if backCount != 0 {
+      back = SetDigest.new()
+      SetDigest.addCoverage(&mut back, View.tail(&table, u32.toUsize(View.uint(&table, 4, 2))))
+    }
+    let mut ahead = SetDigest.full()
+    if chained {
+      let aheadAt = pos + inputCount * 2
+      if View.u16(&table, aheadAt) != 0 {
+        ahead = SetDigest.new()
+        SetDigest.addCoverage(
+          &mut ahead,
+          View.tail(&table, u32.toUsize(View.uint(&table, aheadAt + 2, 2))),
+        )
+      }
+    }
+    run List<SetDigest>.append(&mut self.contextDigests, input)
+    run List<SetDigest>.append(&mut self.contextDigests, back)
+    run List<SetDigest>.append(&mut self.contextDigests, ahead)
+  }
+
+  /// Caches the lookups that contextual subtables apply, so nested lookups skip uncovered
+  /// subtables the way steps do. Subtables cached here are scanned in turn, which covers
+  /// lookups nested more than one level deep.
+  effect fn cacheNestedLookups(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Each lookup index is listed once, however many rules apply it.
+    let lookups = List<u64>.length(&self.lookupSubtables)
+    let mut seen = List<u64>.make()
+    run List<u64>.appendRepeated(&mut seen, 0, lookups / 64 + 1)
+    let mut nested = List<u16>.make()
+    let mut s: usize = 0
+    while s < List<LookupSubtable>.length(&self.subtables) {
+      let sub = List<LookupSubtable>.get(&self.subtables, s)
+      if contextualKind(sub.kind, self.positioning) {
+        List<u16>.clear(&mut nested)
+        run nestedLookups(
+          View.tail(&self.table, sub.offset),
+          sub.kind,
+          List<u64>.asMutSlice(&mut seen),
+          &mut nested,
+        )
+        let mut n: usize = 0
+        while n < List<u16>.length(&nested) {
+          let index = List<u16>.get(&nested, n)
+          let slot = u16.toUsize(index)
+          if slot < List<u64>.length(&self.lookupSubtables)
+            && List<u64>.get(&self.lookupSubtables, slot) == u64.MAX {
+            drop run self.cacheLookup(index, false)
+          }
+          n = n + 1
+        }
+      }
+      s = s + 1
+    }
+  }
+
+  /// Appends a digest per rule set of a 16-bit format 1 or 2 contextual subtable, so
+  /// `contextual` can skip a rule set none of whose rules can match the next glyph.
+  effect fn addRuleDigests(self: &mut Self, table: View<'a>, kind: u16) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.positioning && kind == 4 {
+      if View.u16(&table, 0) != 1 {
+        return ()
+      }
+      let sets = u16.toUsize(View.u16(&table, 4))
+      let mut index: usize = 0
+      while index < sets {
+        run List<u64>.append(
+          &mut self.ruleDigests,
+          ligatureSetDigest(View.offset(&table, 6 + index * 2, 2)),
+        )
+        run List<u32>.append(&mut self.ruleSecondStarts, u32.MAX)
+        index = index + 1
+      }
+      return ()
+    }
+    let contextual = (!self.positioning && (kind == 5 || kind == 6))
+      || (self.positioning && (kind == 7 || kind == 8))
+    if !contextual {
+      return ()
+    }
+    let chained = kind == 6 || kind == 8
+    let format = View.u16(&table, 0)
+    let mut countPos: usize = 4
+    if format == 2 {
+      countPos = 6
+      if chained {
+        countPos = 10
+      }
+    } else if format != 1 {
+      return ()
+    }
+    let sets = u16.toUsize(View.u16(&table, countPos))
+    let mut index: usize = 0
+    while index < sets {
+      let ruleSet = View.offset(&table, countPos + 2 + index * 2, 2)
+      let digest = ruleSetDigest(ruleSet, chained)
+      run List<u64>.append(&mut self.ruleDigests, digest)
+      run List<u32>.append(
+        &mut self.ruleSecondStarts,
+        usize.toU32(List<u32>.length(&self.ruleSeconds)),
+      )
+      run self.addRuleSeconds(ruleSet, chained)
+      index = index + 1
+    }
+  }
+
+  /// Appends the second input value of each rule of a rule set, or `RULE_STOP` for a rule that
+  /// the rule loop must look at whatever the second glyph is: a malformed rule, or one with
+  /// fewer than two or more than 64 inputs. These are the rules `skipRules16` stops at.
+  effect fn addRuleSeconds(self: &mut Self, ruleSet: View, chained: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = FontData.asBytes(&ruleSet.data)
+    let count = read16(bytes, 0)
+    let mut index: usize = 0
+    while index < count {
+      let start = read16(bytes, 2 + index * 2)
+      let mut countPos = start
+      if chained {
+        countPos = countPos + 2 + read16(bytes, countPos) * 2
+      }
+      let inputCount = read16(bytes, countPos)
+      let mut pos = countPos + 2
+      if !chained {
+        pos = pos + 2
+      }
+      let mut value = RULE_STOP
+      if start != 0 && start <= bytes.length && inputCount >= 2 && inputCount <= 64 {
+        value = usize.toU32(read16(bytes, pos))
+      }
+      run List<u32>.append(&mut self.ruleSeconds, value)
+      let mut back = RULE_STOP
+      if chained && start != 0 && start + 4 <= bytes.length && read16(bytes, start) != 0 {
+        back = usize.toU32(read16(bytes, start + 2))
+      }
+      run List<u32>.append(&mut self.ruleBacks, back)
+
+      // A single input stores no input values, so the lookahead count follows the input count.
+      let mut ahead = RULE_STOP
+      if chained && start != 0 && inputCount == 1 && countPos + 6 <= bytes.length
+        && read16(bytes, countPos + 2) != 0 {
+        ahead = usize.toU32(read16(bytes, countPos + 4))
+      }
+      run List<u32>.append(&mut self.ruleAheads, ahead)
+      index = index + 1
+    }
+  }
+
+  /// Appends the digest of each pair set's second glyphs for a 16-bit format 1 pair adjustment
+  /// subtable, so `position` can reject most pairs without searching the set.
+  effect fn addPairDigests(self: &mut Self, table: View<'a>, kind: u16) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.positioning || kind != 2 || View.u16(&table, 0) != 1 {
+      return ()
+    }
+    let record = 2 + valueSize(View.u16(&table, 4)) + valueSize(View.u16(&table, 6))
+    let sets = u16.toUsize(View.u16(&table, 8))
+    let mut index: usize = 0
+    while index < sets {
+      let set = View.offset(&table, 10 + index * 2, 2)
+      let bytes = FontData.asBytes(&set.data)
+      let count = read16(bytes, 0)
+      let mut digest = SetDigest.new()
+      if bytes.length < 2 || count > (bytes.length - 2) / record {
+        digest = SetDigest.full()
+      } else {
+        let mut n: usize = 0
+        while n < count {
+          SetDigest.add(&mut digest, usize.toU32(read16(bytes, 2 + n * record)))
+          n = n + 1
+        }
+      }
+      run List<SetDigest>.append(&mut self.pairDigests, digest)
+      index = index + 1
+    }
+  }
+
+  /// Expands the starting coverage of a subtable whose functions reject an uncovered glyph
+  /// before anything else, so `applyLookup` can skip it without a call. Only 16-bit subtable and
+  /// coverage formats with a nonzero coverage offset are expanded, over at most
+  /// `MAX_COVERAGE_SPAN` glyphs. Each entry is what `View.coverage` returns for that glyph.
+  /// Returns the first glyph; nothing is appended when the coverage is not expanded.
+  effect fn expandCoverage(self: &mut Self, table: View<'a>, kind: u16) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let format = View.u16(&table, 0)
+    let mut plain = format == 1
+    if contextualKind(kind, self.positioning) {
+      plain = format >= 1 && format <= 3
+    } else if kind <= 2 {
+      plain = format == 1 || format == 2
+    } else if (self.positioning && kind > 6) || (!self.positioning && kind != 8 && kind > 4) {
+      plain = false
+    }
+    if !plain {
+      return 0
+    }
+    let coverageAt = offset16At(table, kind, self.positioning)
+    if View.u16(&table, coverageAt) == 0 {
+      return 0
+    }
+    return run self.expandCoverageView(View.offset16(&table, coverageAt))
+  }
+
+  /// Appends `coverage`'s expansion to `coverageValues` and returns its first glyph, or appends
+  /// nothing.
+  effect fn expandCoverageView(self: &mut Self, coverage: View<'a>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let coverageFormat = View.u16(&coverage, 0)
+    let count = u16.toUsize(View.u16(&coverage, 2))
+    let mut entrySize: usize = 2
+    if coverageFormat == 2 {
+      entrySize = 6
+    } else if coverageFormat != 1 {
+      return 0
+    }
+
+    // View.coverage rejects a count its table cannot hold; such a coverage is not expanded.
+    if count == 0 || View.len(&coverage) < 4 || count > (View.len(&coverage) - 4) / entrySize {
+      return 0
+    }
+
+    // Entries are filled straight from the table, which matches View.coverage's binary search
+    // only when the glyphs (or ranges) are sorted and disjoint; anything else is not expanded.
+    let first = u16.toU32(View.u16(&coverage, 4))
+    let mut last = first
+    let mut i: usize = 0
+    while i < count {
+      let start = u16.toU32(View.u16(&coverage, 4 + i * entrySize))
+      let mut end = start
+      if coverageFormat == 2 {
+        end = u16.toU32(View.u16(&coverage, 6 + i * entrySize))
+      }
+      if end < start || (i > 0 && start <= last) {
+        return 0
+      }
+
+      // Indexes are stored plus one in 16 bits.
+      if coverageFormat == 2
+        && u16.toU32(View.u16(&coverage, 8 + i * entrySize)) + (end - start) >= 65535 {
+        return 0
+      }
+      last = end
+      i = i + 1
+    }
+    let span = u32.toUsize(last - first) + 1
+    let base = List<u16>.length(&self.coverageValues)
+    if span > MAX_COVERAGE_SPAN || base > MAX_CLASS_VALUES || span > MAX_CLASS_VALUES - base {
+      return 0
+    }
+    run List<u16>.appendRepeated(&mut self.coverageValues, 0, span)
+    let values = List<u16>.asMutSlice(&mut self.coverageValues)
+    i = 0
+    while i < count {
+      let start = u16.toU32(View.u16(&coverage, 4 + i * entrySize))
+      let mut end = start
+      let mut index = i
+      if coverageFormat == 2 {
+        end = u16.toU32(View.u16(&coverage, 6 + i * entrySize))
+        index = u16.toUsize(View.u16(&coverage, 8 + i * entrySize))
+      }
+      let mut glyph = start
+      while glyph <= end {
+        values[base + u32.toUsize(glyph - first)] = usize.toU16(index + 1)
+        index = index + 1
+        glyph = glyph + 1
+      }
+      i = i + 1
+    }
+    return first
+  }
+
+  /// An empty plan over a GSUB or GPOS table; `addStep` adds lookups to it.
+  pub fn forTable(table: View<'a>, positioning: bool) -> Self {
+    return Self {
+      table: table,
+      steps: List<LookupStep>.make(),
+      subtables: List<LookupSubtable>.make(),
+      classTables: List<ClassTable>.make(),
+      classValues: List<u16>.make(),
+      ruleDigests: List<u64>.make(),
+      ruleSecondStarts: List<u32>.make(),
+      ruleSeconds: List<u32>.make(),
+      ruleBacks: List<u32>.make(),
+      ruleAheads: List<u32>.make(),
+      lookupSubtables: List<u64>.make(),
+      lookupOffsets: List<usize>.make(),
+      lookupSeconds: List<SetDigest>.make(),
+      pairDigests: List<SetDigest>.make(),
+      coverageValues: List<u16>.make(),
+      contextDigests: List<SetDigest>.make(),
+      glyphClasses: ClassTable { offset: 0, first: 0, start: 0, count: 0 },
+      markAttachClasses: ClassTable { offset: 0, first: 0, start: 0, count: 0 },
+      probeDigests: [SetDigest.new(); 5],
+      glyphClassDef: View.empty(),
+      markAttachClassDef: View.empty(),
+      direction: Direction.LeftToRight,
+      script: 0,
+      positioning: positioning,
+      expandBases: false,
+      chosenScript: 0,
+    }
+  }
+
+  /// Expands the class definitions of every lookup in the table, including those that
+  /// contextual rules reach without a feature.
+  pub effect fn addAllClasses(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = View.layoutList(&self.table, 2)
+    let mut width: usize = 2
+    if View.u16(&self.table, 0) == 1 && View.u16(&self.table, 2) >= 2
+      && View.u32(&self.table, 22) != 0 {
+      width = 4
+    }
+    let lookups = u16.toUsize(View.u16(&list, 0))
+    let mut index: usize = 0
+    while index < lookups {
+      let lookup = View.offset(&list, 2 + index * width, width)
+      let lookupKind = View.u16(&lookup, 0)
+      let count = u16.toUsize(View.u16(&lookup, 4))
+      let mut i: usize = 0
+      while i < count {
+        let mut table = View.offset16(&lookup, 6 + i * 2)
+        let mut kind = lookupKind
+        if (!self.positioning && kind == 7) || (self.positioning && kind == 9) {
+          if View.u16(&table, 0) != 1 {
+            i = i + 1
+            continue
+          }
+          kind = View.u16(&table, 2)
+          table = View.offset32(&table, 4)
+        }
+        run OtPlan.addSubtableClasses(&mut self, table, kind)
+        i = i + 1
+      }
+      index = index + 1
+    }
+
+    // Every expansion is in place now, so each cached subtable keeps its own and shaping does
+    // not search classTables per glyph.
+    let mut s: usize = 0
+    while s < List<LookupSubtable>.length(&self.subtables) {
+      let mut sub = List<LookupSubtable>.get(&self.subtables, s)
+      let defs = classDefs(View.tail(&self.table, sub.offset), sub.kind, self.positioning)
+      let mut n: usize = 0
+      while n < defs.count {
+        sub.classes[n] = OtPlan.findClasses(&self, defs.views[n])
+        n = n + 1
+      }
+      sub.classesResolved = true
+      List<LookupSubtable>.set(&mut self.subtables, s, sub)
+      s = s + 1
+    }
+  }
+
+  /// Expands the class definitions a class-based contextual or pair subtable reads per glyph.
+  effect fn addSubtableClasses(self: &mut Self, table: View<'a>, kind: u16) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let defs = classDefs(table, kind, self.positioning)
+    let mut n: usize = 0
+    while n < defs.count {
+      run OtPlan.addClasses(&mut self, defs.views[n])
+      n = n + 1
+    }
+  }
+
+  /// The expansion of the class definition at `classes`, or a count of 0 when it has none.
+  fn findClasses(self: &Self, classes: View<'a>) -> ClassTable {
+    let offset = View.len(&self.table) - View.len(&classes)
+    let tables = List<ClassTable>.asSlice(&self.classTables)
+    let mut lo: usize = 0
+    let mut hi = tables.length
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2
+      if tables[mid].offset < offset {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if lo < tables.length && tables[lo].offset == offset {
+      return tables[lo]
+    }
+    return noClassTable()
+  }
+
+  /// Expands the class definition at `classes`, a view into the layout table, unless it is
+  /// already expanded.
+  effect fn addClasses(self: &mut Self, classes: View<'a>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let offset = View.len(&self.table) - View.len(&classes)
+    let tables = List<ClassTable>.asSlice(&self.classTables)
+    let mut lo: usize = 0
+    let mut hi = tables.length
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2
+      if tables[mid].offset < offset {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if lo < tables.length && tables[lo].offset == offset {
+      return
+    }
+    if let Option<ClassTable>.Some { value } = run OtPlan.expandClasses(&mut self, classes) {
+      let mut table = value
+      table.offset = offset
+      run List<ClassTable>.insert(&mut self.classTables, lo, table)
+    }
+  }
+
+  /// Appends one class per glyph of `classes` to `classValues`. Class definitions that are
+  /// malformed, unsorted or too large are not expanded; callers search them in place.
+  effect fn expandClasses(self: &mut Self, classes: View<'a>) -> Option<ClassTable>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let format = View.u16(&classes, 0)
+    if format < 1 || format > 4 {
+      return Option<ClassTable>.None
+    }
+    let mut width: usize = 2
+    if format >= 3 {
+      width = 3
+    }
+    let start = List<u16>.length(&self.classValues)
+    let mut first: u32 = 0
+    let mut count: usize = 0
+    if format == 1 || format == 3 {
+      first = View.uint(&classes, 2, width)
+      count = u32.toUsize(View.uint(&classes, 2 + width, width))
+      let header = 2 + width * 2
+      if header > View.len(&classes) || count > (View.len(&classes) - header) / width
+        || count > MAX_CLASS_VALUES - start {
+        return Option<ClassTable>.None
+      }
+      run List<u16>.reserve(&mut self.classValues, count)
+      let mut i: usize = 0
+      while i < count {
+        let value = View.uint(&classes, header + i * width, width)
+        if value > 65535 {
+          List<u16>.truncate(&mut self.classValues, start)
+          return Option<ClassTable>.None
+        }
+        run List<u16>.append(&mut self.classValues, u32.toU16(value))
+        i = i + 1
+      }
+    } else {
+      let header = 2 + width
+      let stride = width * 2 + 2
+      let ranges = u32.toUsize(View.uint(&classes, 2, width))
+      if ranges == 0 || header > View.len(&classes)
+        || ranges > (View.len(&classes) - header) / stride {
+        return Option<ClassTable>.None
+      }
+
+      // Only sorted, disjoint ranges give the same answers as the binary search.
+      first = View.uint(&classes, header, width)
+      let mut previous: u32 = 0
+      let mut i: usize = 0
+      while i < ranges {
+        let at = header + i * stride
+        let rangeStart = View.uint(&classes, at, width)
+        let rangeEnd = View.uint(&classes, at + width, width)
+        if rangeEnd < rangeStart || (i > 0 && rangeStart <= previous) {
+          return Option<ClassTable>.None
+        }
+        previous = rangeEnd
+        i = i + 1
+      }
+      let span = u32.toUsize(previous - first) + 1
+      if span > MAX_CLASS_VALUES - start {
+        return Option<ClassTable>.None
+      }
+      count = span
+      let mut glyph = first
+      i = 0
+      while i < ranges {
+        let at = header + i * stride
+        let rangeStart = View.uint(&classes, at, width)
+        let rangeEnd = View.uint(&classes, at + width, width)
+        let value = View.u16(&classes, at + width * 2)
+        run List<u16>.appendRepeated(&mut self.classValues, 0, u32.toUsize(rangeStart - glyph))
+        run List<u16>.appendRepeated(
+          &mut self.classValues,
+          value,
+          u32.toUsize(rangeEnd - rangeStart) + 1,
+        )
+        glyph = rangeEnd + 1
+        i = i + 1
+      }
+    }
+    return Option<ClassTable>.some(
+      ClassTable { offset: 0, first: first, start: start, count: count },
+    )
+  }
+
+  pub effect fn new<'s, F: FontFuncs>(
+    font: &ConfiguredShaper<'a, 's, F>,
+    buffer: &Buffer,
+    features: &[Feature],
+    positioning: bool,
+  ) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut table = font.data.gsub
+    if positioning {
+      table = font.data.gpos
+    }
+    let mut plan = OtPlan.forTable(table, positioning)
+    plan.direction = buffer.direction
+    plan.script = buffer.script
+    plan.expandBases = buffer.shaper != 0 || arabic.usesScript(buffer.script)
+    let scriptList = View.layoutList(&table, 0)
+    let mut script = View.tail(&table, View.len(&table))
+    let candidates = ScriptTags.forLanguage(buffer.script, &buffer.languageValue)
+    let mut rank: usize = 0
+    while rank < candidates.length + 2 {
+      let mut tag: u32 = 0x6c61746e
+      if rank < candidates.length {
+        tag = candidates.values[rank]
+      } else if rank == candidates.length {
+        tag = 0x44464c54
+      }
+      let mut i: usize = 0
+      while i < u16.toUsize(View.u16(&scriptList, 0)) {
+        if View.u32(&scriptList, 2 + i * 6) == tag {
+          script = View.offset16(&scriptList, 6 + i * 6)
+          break
+        }
+        i = i + 1
+      }
+      if View.len(&script) != 0 {
+        plan.chosenScript = tag
+        break
+      }
+      rank = rank + 1
+    }
+    let mut lang = View.offset16(&script, 0)
+    let mut i: usize = 0
+    let mut languageIndex: usize = 0
+    let mut languageCount = buffer.languageTags.length
+    if languageCount == 0 {
+      languageCount = 1
+    }
+    let mut foundLanguage = false
+    while languageIndex < languageCount && !foundLanguage {
+      let mut tag = buffer.language
+      if buffer.languageTags.length != 0 {
+        tag = buffer.languageTags.values[languageIndex]
+      }
+      i = 0
+      while i < u16.toUsize(View.u16(&script, 2)) {
+        if View.u32(&script, 4 + i * 6) == tag {
+          lang = View.offset16(&script, 8 + i * 6)
+          foundLanguage = true
+          break
+        }
+        i = i + 1
+      }
+      languageIndex = languageIndex + 1
+    }
+    let required = View.u16(&lang, 2)
+    let list = View.layoutList(&table, 1)
+    let alternatives = selectVariations(&table, font)
+    let deltaStore = varStore(font)
+    let deltaCoords = List<F2Dot14>.asSlice(&font.coords)
+    i = 0
+    while i < u16.toUsize(View.u16(&list, 0)) {
+      let tag = View.u32(&list, 2 + i * 6)
+      let isRequired = i == u16.toUsize(required) && View.len(&lang) >= 6
+      let mut present = i == u16.toUsize(required) && View.len(&lang) >= 6
+      let mut j: usize = 0
+      while !present && j < u16.toUsize(View.u16(&lang, 4)) {
+        present = u16.toUsize(View.u16(&lang, 6 + j * 2)) == i
+        j = j + 1
+      }
+      if tag == 0x76657274 {
+        present = true
+      }
+      let mut initial = defaultValue(tag, buffer.targetDirection)
+      if !buffer.dumber && arabic.usesScript(buffer.script)
+        && (arabic.isFeature(tag) || tag == 0x6d736574 || tag == 0x73746368) {
+        initial = 1
+      }
+      if !positioning {
+        initial = complex.featureDefault(buffer.shaper, tag, initial)
+      }
+      if !buffer.dumber && buffer.script == 0x48616e67
+        && (tag == 0x6c6a6d6f || tag == 0x766a6d6f || tag == 0x746a6d6f) {
+        initial = 1
+      }
+      let mut value = initial
+      j = 0
+      while j < features.length {
+        if Tag.toU32(features[j].tag) == tag {
+          if Feature.isGlobal(&features[j]) {
+            value = features[j].value
+          } else if value == 0 {
+            value = 1
+          }
+        }
+        j = j + 1
+      }
+      let mut selectedStage = stage(tag, buffer.script, buffer.shaper, positioning)
+      if isRequired {
+        if value == 0 {
+          selectedStage = 0
+        }
+        value = 1
+        initial = 1
+      }
+      if present && value != 0 {
+        let mut feature = View.offset16(&list, 6 + i * 6)
+        j = 0
+        while j < u16.toUsize(View.u16(&alternatives, 4)) {
+          if u16.toUsize(View.u16(&alternatives, 6 + j * 6)) == i {
+            feature = View.offset32(&alternatives, 8 + j * 6)
+            break
+          }
+          j = j + 1
+        }
+        let mut indices = List<u16>.make()
+        j = 0
+        while j < u16.toUsize(View.u16(&feature, 2)) {
+          run List<u16>.append(&mut indices, View.u16(&feature, 4 + j * 2))
+          j = j + 1
+        }
+        if let Option<FeatureVariations>.Some { value: vars } = readVariations(&table) {
+          if let Option<LookupVariations>.Some {
+            value: lookups
+          } = FeatureVariations.lookupVariations(&vars) {
+            drop run LookupVariations<'a>.apply<Error>(
+              &lookups,
+              usize.toU16(i),
+              List<F2Dot14>.asSlice(&font.coords),
+              fn(index: u32) -> Result<f64, Error> {
+                return delta(&deltaStore, deltaCoords, index)
+              },
+              &mut indices,
+            )
+          }
+        }
+        j = 0
+        while j < List<u16>.length(&indices) {
+          if List<LookupStep>.length(&plan.steps) >= 65536 {
+            break
+          }
+          run OtPlan.addStep(
+            &mut plan,
+            List<u16>.get(&indices, j),
+            isRequired,
+            tag,
+            initial,
+            selectedStage,
+          )
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+
+    // Stable insertion sort: lookup lists are short and already mostly ordered.
+    i = 1
+    while i < List<LookupStep>.length(&plan.steps) {
+      let item = List<LookupStep>.get(&plan.steps, i)
+      let mut j = i
+      while j > 0 {
+        let prev = List<LookupStep>.get(&plan.steps, j - 1)
+        if prev.stage < item.stage || (prev.stage == item.stage && prev.index <= item.index) {
+          break
+        }
+        List<LookupStep>.set(&mut plan.steps, j, prev)
+        j = j - 1
+      }
+      List<LookupStep>.set(&mut plan.steps, j, item)
+      i = i + 1
+    }
+    let steps = List<LookupStep>.asMutSlice(&mut plan.steps)
+    i = steps.length
+    while i > 0 {
+      i = i - 1
+      steps[i].zwj = zwjBits(buffer.shaper, buffer.script, steps[i].tag)
+      steps[i].groupEnd = i + 1
+      steps[i].everywhere = steps[i].required || (steps[i].checks == 0 && steps[i].value != 0)
+      if i + 1 < steps.length && steps[i + 1].index == steps[i].index
+        && steps[i + 1].stage == steps[i].stage {
+        steps[i].groupEnd = steps[i + 1].groupEnd
+        steps[i].everywhere = steps[i].everywhere || steps[i + 1].everywhere
+      }
+    }
+    let mut probes: [SetDigest; 5] = [SetDigest.new(); 5]
+    let finished = List<LookupStep>.asSlice(&plan.steps)
+    let mut k: usize = 0
+    while k < finished.length {
+      let mut p: usize = 0
+      while p < PROBE_TAGS.length {
+        if finished[k].tag == PROBE_TAGS[p] {
+          SetDigest.include(&mut probes[p], &finished[k].digest)
+        }
+        p = p + 1
+      }
+      k = k + 1
+    }
+    plan.probeDigests = probes
+    run OtPlan.cacheNestedLookups(&mut plan)
+    run OtPlan.addAllClasses(&mut plan)
+    let glyphClassDef = View.gdefList(&font.data.gdef, 0)
+    let markAttachClassDef = View.gdefList(&font.data.gdef, 3)
+    plan.glyphClassDef = glyphClassDef
+    plan.markAttachClassDef = markAttachClassDef
+    if let Option<ClassTable>.Some { value } = run OtPlan.expandClasses(&mut plan, glyphClassDef) {
+      plan.glyphClasses = value
+    }
+    if let Option<ClassTable>.Some { value } = run OtPlan.expandClasses(
+      &mut plan,
+      markAttachClassDef,
+    ) {
+      plan.markAttachClasses = value
+    }
+    return move plan
+  }
+}
+
+/// An Arabic joining form, enabled on glyphs of that form outside the Arabic shaper.
+pub const CHECK_FORM: u8 = 1
+
+/// A complex shaper's per-glyph feature (`complex.featureEnabled`).
+pub const CHECK_COMPLEX: u8 = 2
+
+/// A Hangul jamo feature, enabled on glyphs of that form.
+pub const CHECK_JAMO: u8 = 4
+
+/// `calt`, off on Hangul jamo.
+pub const CHECK_CALT: u8 = 8
+
+/// A fraction feature, enabled on the glyphs `fraction` marks for it.
+pub const CHECK_FRACTION: u8 = 16
+
+/// `rtlm`, enabled on mirrored glyphs.
+pub const CHECK_RTLM: u8 = 32
+
+/// The per-glyph conditions `ot.enabled` checks for feature `tag`, besides its cluster.
+fn featureChecks(tag: u32) -> u8 {
+  let mut checks: u8 = 0
+  if arabic.isFeature(tag) {
+    checks = checks | CHECK_FORM
+  }
+  if complex.featureBit(tag) != 0 || tag == 0x72706866 {
+    checks = checks | CHECK_COMPLEX
+  }
+  if tag == 0x6c6a6d6f || tag == 0x766a6d6f || tag == 0x746a6d6f {
+    checks = checks | CHECK_JAMO
+  }
+  if tag == 0x63616c74 {
+    checks = checks | CHECK_CALT
+  }
+  if tag == 0x66726163 || tag == 0x6e756d72 || tag == 0x646e6f6d {
+    checks = checks | CHECK_FRACTION
+  }
+  if tag == 0x72746c6d {
+    checks = checks | CHECK_RTLM
+  }
+  return checks
+}
+
+pub fn featureValue(tag: u32, default: u32, cluster: u32, features: &[Feature]) -> u32 {
+  let mut value = default
+  let mut i: usize = 0
+  while i < features.length {
+    let f = features[i]
+    if Tag.toU32(f.tag) == tag && cluster >= f.start && cluster < f.end {
+      value = f.value
+    }
+    i = i + 1
+  }
+  return value
+}
+
+pub fn defaultValue(tag: u32, direction: Direction) -> u32 {
+  if tag == 0x72616e64 {
+    return 4294967295
+  }
+  if tag == 0x66726163 || tag == 0x6e756d72 || tag == 0x646e6f6d {
+    return 1
+  }
+  if tag == 0x7276726e || tag == 0x6162766d || tag == 0x626c776d || tag == 0x63636d70
+    || tag == 0x6c6f636c
+    || tag == 0x6d61726b
+    || tag == 0x6d6b6d6b
+    || tag == 0x726c6967
+    || tag == 0x72616e64
+    || tag == 0x7472616b
+    || tag == 0x48617266
+    || tag == 0x48415246
+    || tag == 0x42757a7a
+    || tag == 0x42555a5a {
+    return 1
+  }
+  if Direction.isHorizontal(direction) {
+    if tag == 0x63616c74 || tag == 0x636c6967 || tag == 0x63757273 || tag == 0x64697374
+      || tag == 0x6b65726e
+      || tag == 0x6c696761
+      || tag == 0x72636c74 {
+      return 1
+    }
+    if direction == Direction.LeftToRight && (tag == 0x6c747261 || tag == 0x6c74726d) {
+      return 1
+    }
+    if direction == Direction.RightToLeft && (tag == 0x72746c61 || tag == 0x72746c6d) {
+      return 1
+    }
+  } else if tag == 0x76657274 || tag == 0x766b726e {
+    return 1
+  }
+  return 0
+}
+
+fn stage(tag: u32, script: u32, shaper: u32, positioning: bool) -> u32 {
+  if positioning {
+    return 0
+  }
+  if tag == 0x6c747261 || tag == 0x6c74726d || tag == 0x72746c61 || tag == 0x72746c6d
+    || tag == 0x66726163
+    || tag == 0x6e756d72
+    || tag == 0x646e6f6d
+    || tag == 0x72616e64
+    || tag == 0x48617266
+    || tag == 0x48415246 {
+    return 1
+  }
+  if shaper != 0 {
+    return complex.stage(shaper, tag)
+  }
+  if arabic.usesScript(script) {
+    return arabic.stage(tag, script)
+  }
+  if tag == 0x7276726e {
+    return 0
+  }
+  return 1
+}
+
+fn varStore<'a, 's, F: FontFuncs>(font: &ConfiguredShaper<'a, 's, F>) -> Option<
+  ItemVariationStore<'a>
+> {
+  return match move ItemVariationStore.read(View.gdefVarStore(&font.data.gdef).data) {
+    Result<ItemVariationStore<'a>, ReadError>.Success { value } => Option<
+      ItemVariationStore<'a>
+    >.some(value)
+    _ => Option<ItemVariationStore<'a>>.None
+  }
+}
+
+fn readVariations<'a>(table: &View<'a>) -> Option<FeatureVariations<'a>> {
+  if View.u16(table, 2) < 1 {
+    return Option<FeatureVariations<'a>>.None
+  }
+  return match move FeatureVariations.read(View.offset32(table, 10).data) {
+    Result<FeatureVariations<'a>, ReadError>.Success { value } => Option<
+      FeatureVariations<'a>
+    >.some(value)
+    _ => Option<FeatureVariations<'a>>.None
+  }
+}
+
+fn selectVariations<'a, 's, F: FontFuncs>(
+  table: &View<'a>,
+  font: &ConfiguredShaper<'a, 's, F>,
+) -> View<'a> {
+  if let Option<FeatureVariations<'a>>.Some { value: vars } = readVariations(table) {
+    let deltaStore = varStore(font)
+    let deltaCoords = List<F2Dot14>.asSlice(&font.coords)
+    if let Option<u32>.Some { value: index } = FeatureVariations<'a>.indexForCoordsWithDelta<Error>(
+      &vars,
+      List<F2Dot14>.asSlice(&font.coords),
+      fn(index: u32) -> Result<f64, Error> {
+        return delta(&deltaStore, deltaCoords, index)
+      },
+    ) {
+      return View.offset32(&View.offset32(table, 10), offset(12, u32.toUsize(index), 8))
+    }
+  }
+  return View.empty()
+}
+
+fn delta(store: &Option<ItemVariationStore>, coords: &[F2Dot14], index: u32) -> Result<f64, Error> {
+  let mut value = F48Dot16.zero()
+  if let Option<ItemVariationStore>.Some { value: selected } = &store.* {
+    value = ItemVariationStore.computeDelta(&selected, DeltaSetIndex.fromU32(index), coords)
+      |> Option<F48Dot16>.unwrapOr(F48Dot16.zero())
+  }
+  return Result<f64, Error>.succeed(F48Dot16.toF64(value))
+}
+
+/// The second input values of a rule set's rules, one bit each mod 64. A rule without a second
+/// input value, or one `contextual` would not reject on it, fills every bit.
+fn ruleSetDigest(ruleSet: View, chained: bool) -> u64 {
+  let bytes = FontData.asBytes(&ruleSet.data)
+  let count = read16(bytes, 0)
+  let mut digest: u64 = 0
+  let mut index: usize = 0
+  while index < count {
+    let start = read16(bytes, 2 + index * 2)
+    let mut pos = start
+    if chained {
+      pos = pos + 2 + read16(bytes, pos) * 2
+    }
+    let inputCount = read16(bytes, pos)
+    pos = pos + 2
+    if !chained {
+      pos = pos + 2
+    }
+    if start == 0 || start > bytes.length || inputCount < 2 || inputCount > 64 {
+      return u64.MAX
+    }
+    digest = digest | u64.shiftLeft(1, usize.toU64(read16(bytes, pos) & 63))
+    index = index + 1
+  }
+  return digest
+}
+
+/// A digest of the second components of a 16-bit ligature set's ligatures, or `u64.MAX` when a
+/// ligature is malformed or has a single component, so the set must be walked.
+fn ligatureSetDigest(set: View) -> u64 {
+  let bytes = FontData.asBytes(&set.data)
+  let count = read16(bytes, 0)
+  let mut digest: u64 = 0
+  let mut index: usize = 0
+  while index < count {
+    let start = read16(bytes, 2 + index * 2)
+    if start == 0 || start > bytes.length {
+      return u64.MAX
+    }
+    let components = read16(bytes, start + 2)
+    if components < 2 || components > 64 {
+      return u64.MAX
+    }
+    digest = digest | u64.shiftLeft(1, usize.toU64(read16(bytes, start + 4) & 63))
+    index = index + 1
+  }
+  return digest
+}
+
+/// Adds the second components of a 16-bit ligature subtable's ligatures to `digest`, or fills it
+/// when a ligature is malformed or has a single component.
+fn addLigatureSeconds(digest: &mut SetDigest, table: View) -> () {
+  if View.u16(&table, 0) != 1 {
+    digest.* = SetDigest.full()
+    return ()
+  }
+  let sets = u16.toUsize(View.u16(&table, 4))
+  let mut index: usize = 0
+  while index < sets {
+    let set = View.offset(&table, 6 + index * 2, 2)
+    let bytes = FontData.asBytes(&set.data)
+    let count = read16(bytes, 0)
+    let mut n: usize = 0
+    while n < count {
+      let start = read16(bytes, 2 + n * 2)
+      if start == 0 || start + 6 > bytes.length || read16(bytes, start + 2) < 2 {
+        digest.* = SetDigest.full()
+        return ()
+      }
+      SetDigest.add(&mut digest, usize.toU32(read16(bytes, start + 4)))
+      n = n + 1
+    }
+    index = index + 1
+  }
+}
+
+/// Adds the glyphs a contextual subtable can match after its first input glyph: each rule's
+/// second input, or for a single input its first lookahead. Rules that match a single glyph, and
+/// anything malformed, fill `digest`.
+fn addContextSeconds(digest: &mut SetDigest, table: View, chained: bool) -> () {
+  let format = View.u16(&table, 0)
+  if format == 3 {
+    addFormat3Seconds(&mut digest, table, chained)
+    return ()
+  }
+  if format != 1 && format != 2 {
+    digest.* = SetDigest.full()
+    return ()
+  }
+  let mut countPos: usize = 4
+  if format == 2 {
+    countPos = 6
+    if chained {
+      countPos = 10
+    }
+  }
+
+  // Format 1 rules hold glyphs and format 2 rules hold classes, of the input class definition
+  // for a second input and of the lookahead one for a first lookahead.
+  let mut inputs = SetDigest.new()
+  let mut aheads = SetDigest.new()
+  let mut anyInput = false
+  let mut anyAhead = false
+  let sets = u16.toUsize(View.u16(&table, countPos))
+  let mut index: usize = 0
+  while index < sets {
+    let setAt = countPos + 2 + index * 2
+    if View.u16(&table, setAt) != 0 {
+      let ruleSet = View.offset16(&table, setAt)
+      let bytes = FontData.asBytes(&ruleSet.data)
+      let count = read16(bytes, 0)
+      let mut n: usize = 0
+      while n < count {
+        let start = read16(bytes, 2 + n * 2)
+        if start == 0 || start >= bytes.length {
+          digest.* = SetDigest.full()
+          return ()
+        }
+        let mut pos = start
+        if chained {
+          pos = pos + 2 + read16(bytes, pos) * 2
+        }
+        let inputCount = read16(bytes, pos)
+        if inputCount >= 2 {
+          let mut at = pos + 4
+          if chained {
+            at = pos + 2
+          }
+          if at + 2 > bytes.length {
+            digest.* = SetDigest.full()
+            return ()
+          }
+          SetDigest.add(&mut inputs, usize.toU32(read16(bytes, at)))
+          anyInput = true
+        } else if chained && inputCount == 1 {
+          let ahead = pos + 2
+          if read16(bytes, ahead) == 0 || ahead + 4 > bytes.length {
+            digest.* = SetDigest.full()
+            return ()
+          }
+          SetDigest.add(&mut aheads, usize.toU32(read16(bytes, ahead + 2)))
+          anyAhead = true
+        } else {
+          digest.* = SetDigest.full()
+          return ()
+        }
+        n = n + 1
+      }
+    }
+    index = index + 1
+  }
+  if format == 1 {
+    SetDigest.include(&mut digest, &inputs)
+    SetDigest.include(&mut digest, &aheads)
+    return ()
+  }
+  let mut inputAt: usize = 4
+  if chained {
+    inputAt = 6
+  }
+  if anyInput {
+    addClassGlyphs(&mut digest, table, inputAt, &inputs)
+  }
+  if anyAhead {
+    addClassGlyphs(&mut digest, table, 8, &aheads)
+  }
+}
+
+/// Adds the glyphs of the 16-bit class definition at offset `at` of `table` whose classes
+/// `classes` may hold, or fills `digest` when class 0, which holds every other glyph, may be one
+/// of them or the definition is not a 16-bit one.
+fn addClassGlyphs(digest: &mut SetDigest, table: View, at: usize, classes: &SetDigest) -> () {
+  if SetDigest.mayHave(classes, 0) || View.u16(&table, at) == 0 {
+    digest.* = SetDigest.full()
+    return ()
+  }
+  let classDef = View.offset16(&table, at)
+  let format = View.u16(&classDef, 0)
+  if format == 1 {
+    let first = u16.toU32(View.u16(&classDef, 2))
+    let count = u16.toUsize(View.u16(&classDef, 4))
+    let mut i: usize = 0
+    while i < count {
+      if SetDigest.mayHave(classes, u16.toU32(View.u16(&classDef, 6 + i * 2))) {
+        SetDigest.add(&mut digest, first + usize.toU32(i))
+      }
+      i = i + 1
+    }
+  } else if format == 2 {
+    let ranges = u16.toUsize(View.u16(&classDef, 2))
+    let mut i: usize = 0
+    while i < ranges {
+      let rangeAt = 4 + i * 6
+      if SetDigest.mayHave(classes, u16.toU32(View.u16(&classDef, rangeAt + 4))) {
+        let rangeStart = u16.toU32(View.u16(&classDef, rangeAt))
+        let rangeEnd = u16.toU32(View.u16(&classDef, rangeAt + 2))
+        if rangeStart <= rangeEnd {
+          SetDigest.addRange(&mut digest, rangeStart, rangeEnd)
+        }
+      }
+      i = i + 1
+    }
+  } else {
+    digest.* = SetDigest.full()
+  }
+}
+
+fn addFormat3Seconds(digest: &mut SetDigest, table: View, chained: bool) -> () {
+  let mut pos: usize = 2
+  if chained {
+    pos = 4 + u16.toUsize(View.u16(&table, 2)) * 2
+  }
+  let inputCount = u16.toUsize(View.u16(&table, pos))
+  let mut at: usize = 0
+  if inputCount >= 2 {
+    at = pos + 4
+    if !chained {
+      at = pos + 6
+    }
+  } else if chained && inputCount == 1 {
+    let lookahead = pos + 4
+    if View.u16(&table, lookahead) != 0 {
+      at = lookahead + 2
+    }
+  }
+  if at == 0 || View.u16(&table, at) == 0 {
+    digest.* = SetDigest.full()
+    return ()
+  }
+  SetDigest.addCoverage(&mut digest, View.offset16(&table, at))
+}
+
+fn contextualKind(kind: u16, positioning: bool) -> bool {
+  return (!positioning && (kind == 5 || kind == 6)) || (positioning && (kind == 7 || kind == 8))
+}
+
+/// Where a 16-bit subtable keeps the 16-bit offset of the coverage its match starts at: after
+/// the backtrack offsets of a chained format 3 subtable, at 6 for an unchained one, else at 2.
+fn offset16At(table: View, kind: u16, positioning: bool) -> usize {
+  if contextualKind(kind, positioning) && View.u16(&table, 0) == 3 {
+    if kind == 6 || kind == 8 {
+      return 6 + u16.toUsize(View.u16(&table, 2)) * 2
+    }
+    return 6
+  }
+  return 2
+}
+
+/// Appends the lookup indices of the actions of a 16-bit contextual subtable's rules that
+/// `seen`, a bit per lookup index, does not have yet, and adds them to it.
+effect fn nestedLookups(table: View, kind: u16, seen: &mut [u64], out: &mut List<u16>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let chained = kind == 6 || kind == 8
+  let format = View.u16(&table, 0)
+  if format == 3 {
+    let mut pos: usize = 2
+    let mut actionCount: usize = 0
+    if chained {
+      pos = pos + 2 + u16.toUsize(View.u16(&table, pos)) * 2
+      pos = pos + 2 + u16.toUsize(View.u16(&table, pos)) * 2
+      pos = pos + 2 + u16.toUsize(View.u16(&table, pos)) * 2
+      actionCount = u16.toUsize(View.u16(&table, pos))
+      pos = pos + 2
+    } else {
+      let inputCount = u16.toUsize(View.u16(&table, 2))
+      actionCount = u16.toUsize(View.u16(&table, 4))
+      pos = 6 + inputCount * 2
+    }
+    run appendActions(table, pos, actionCount, &mut seen, &mut out)
+    return ()
+  }
+  let mut countPos: usize = 4
+  if format == 2 {
+    countPos = 6
+    if chained {
+      countPos = 10
+    }
+  } else if format != 1 {
+    return ()
+  }
+  let sets = u16.toUsize(View.u16(&table, countPos))
+  let mut index: usize = 0
+  while index < sets {
+    let ruleSet = View.offset(&table, countPos + 2 + index * 2, 2)
+    let count = u16.toUsize(View.u16(&ruleSet, 0))
+    let mut r: usize = 0
+    while r < count {
+      let rule = View.offset(&ruleSet, 2 + r * 2, 2)
+      let mut pos: usize = 0
+      let mut actionCount: usize = 0
+      if chained {
+        pos = 2 + u16.toUsize(View.u16(&rule, 0)) * 2
+        let inputCount = u16.toUsize(View.u16(&rule, pos))
+        pos = pos + 2 + usize.saturatingSubtract(inputCount, 1) * 2
+        pos = pos + 2 + u16.toUsize(View.u16(&rule, pos)) * 2
+        actionCount = u16.toUsize(View.u16(&rule, pos))
+        pos = pos + 2
+      } else {
+        let inputCount = u16.toUsize(View.u16(&rule, 0))
+        actionCount = u16.toUsize(View.u16(&rule, 2))
+        pos = 4 + usize.saturatingSubtract(inputCount, 1) * 2
+      }
+      run appendActions(rule, pos, actionCount, &mut seen, &mut out)
+      r = r + 1
+    }
+    index = index + 1
+  }
+}
+
+effect fn appendActions(
+  table: View,
+  pos: usize,
+  count: usize,
+  seen: &mut [u64],
+  out: &mut List<u16>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut n: usize = 0
+  while n < count && pos + n * 4 + 4 <= View.len(&table) {
+    let index = View.u16(&table, pos + n * 4 + 2)
+    let word = u16.toUsize(index) / 64
+    let bit = u64.shiftLeft(1, u16.toU64(index) & 63)
+    if word >= seen.length {
+      // Out of the lookup list: the caller ignores it, as it would every repeat.
+    } else if (seen[word] & bit) == 0 {
+      seen[word] = seen[word] | bit
+      run List<u16>.append(&mut out, index)
+    }
+    n = n + 1
+  }
+}

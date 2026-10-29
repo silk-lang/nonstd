@@ -1,0 +1,2761 @@
+//! Resolve typed computed CSS and exact reference geometry into retained nodes.
+import scene {
+  RenderOptions,
+  RenderError,
+  RenderTree,
+  ResolvedNode,
+  ResolvedShape,
+  StrokeSpace,
+  Style,
+  Paint,
+  PaintInstance,
+  ResolvedPattern
+}
+import document_styles { StyledGraph }
+import structure { Graph, OccurrenceId }
+import used_viewports { Metadata, Clip, ElementKind }
+import used_viewports
+import used_geometry
+import used_style { DashCache }
+import used_style
+import used_path_length
+import used_path_length { Cache as PathLengthCache }
+import used_transforms
+import used_paints { Store as PaintStore }
+import used_paints
+import used_markers { Layout as MarkerLayout }
+import used_patterns
+import used_patterns { Layout as PatternLayout }
+import vector.projective { Homography }
+import used_markers
+import used_frames { Frame }
+import paint_metadata { Metadata as PaintMetadata, MarkerOrient, MarkerUnits }
+import svg_geometry.markers { MarkerPosition, MarkerKind, MarkerError }
+import svg_geometry.markers
+import reference_bounds { Cache as ReferenceBoundsCache }
+import mapping { Mapping, ProjectionClip }
+import vector.projective { HalfPlane }
+import vector.geometry_error { GeometryError }
+import svg_xml.xml { Document, NodeId }
+import svg_css.computed { Engine, StyleId, ComputedValue }
+import svg_css.properties { Property }
+import svg_css.tokens { Limits, CssError, equal }
+import svg_css.transform_values { ReferenceBox }
+import svg_css.transform_values
+import svg_css.values { Value, ValueId, PaintLayer, VectorReference }
+import svg_css.dimensions { Context }
+import view_fragment { SpatialView, SpatialUnit }
+import svg_geometry.geometry { Rect, Point, Path, Transform }
+import svg_geometry.transforms { Matrix, Facing }
+import svg_geometry.transforms
+import svg_geometry.svg
+import svg_geometry.svg { AspectRatio }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.num.u8
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+struct Viewport {
+  width: f64,
+  height: f64,
+  pixelsWidth: u32,
+  pixelsHeight: u32,
+  scale: Transform
+}
+
+fn positive(value: Option<f64>) -> Option<f64> {
+  return match &value {
+    Option<f64>.Some { value: found } => if found >= 0.0 {
+      Option<f64>.some(found)
+    } else {
+      Option<f64>.None
+    }
+    _ => Option<f64>.None
+  }
+}
+
+fn rootRatio(width: Option<f64>, height: Option<f64>, box: Option<Rect>) -> Option<f64> {
+  match &width {
+    Option<f64>.Some { value: w } => {
+      match &height {
+        Option<f64>.Some { value: h } => {
+          if w > 0.0 && h > 0.0 {
+            return Option<f64>.some(w / h)
+          }
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  match &box {
+    Option<Rect>.Some { value } => {
+      if value.width() > 0.0 && value.height() > 0.0 {
+        return Option<f64>.some(value.width() / value.height())
+      }
+    }
+    _ => {}
+  }
+  return Option<f64>.None
+}
+
+// CSS default object sizing. Host dimensions supply the embedding viewport;
+// output pixel overrides do not rewrite that document coordinate system.
+effect fn sizing(
+  engine: &Engine,
+  root: StyleId,
+  box: Option<Rect>,
+  options: &RenderOptions,
+  initialWidth: f64,
+  initialHeight: f64,
+) -> Viewport
+  ! RenderError {
+  if !f64.isFinite(options.zoom) || options.zoom <= 0.0 {
+    fail RenderError.InvalidSize
+  }
+  let width = positive(engine.number(root, Property.Width, initialWidth))
+  let height = positive(engine.number(root, Property.Height, initialHeight))
+  let ratio = rootRatio(width, height, box)
+  let mut w = initialWidth
+  let mut h = initialHeight
+  match &width {
+    Option<f64>.Some { value } => {
+      w = value
+      match &height {
+        Option<f64>.Some { value: foundHeight } => {
+          h = foundHeight
+        }
+        _ => {
+          match &ratio {
+            Option<f64>.Some { value: foundRatio } => {
+              h = w / foundRatio
+            }
+            _ => {}
+          }
+        }
+      }
+    }
+    _ => {
+      match &height {
+        Option<f64>.Some { value } => {
+          h = value
+          match &ratio {
+            Option<f64>.Some { value: foundRatio } => {
+              w = h * foundRatio
+            }
+            _ => {}
+          }
+        }
+        _ => {
+          match &ratio {
+            Option<f64>.Some { value } => {
+              if value >= initialWidth / initialHeight {
+                h = w / value
+              } else {
+                w = h * value
+              }
+            }
+            _ => {}
+          }
+        }
+      }
+    }
+  }
+  if !f64.isFinite(w) || !f64.isFinite(h) || w <= 0.0 || h <= 0.0 {
+    fail RenderError.InvalidSize
+  }
+  let mut outputWidth = w
+  let mut outputHeight = h
+  if options.width != 0 {
+    outputWidth = u32.toF64(options.width)
+    outputHeight = if options.height != 0 {
+      u32.toF64(options.height)
+    } else {
+      outputWidth * (h / w)
+    }
+  } else if options.height != 0 {
+    outputHeight = u32.toF64(options.height)
+    outputWidth = outputHeight * (w / h)
+  }
+  let scaledWidth = f64.ceil(outputWidth * options.zoom)
+  let scaledHeight = f64.ceil(outputHeight * options.zoom)
+  let pw = match &f64.checkedToU32(scaledWidth) {
+    Option<u32>.Some { value } => value
+    _ => {
+      fail RenderError.TooLarge
+    }
+  }
+  let ph = match &f64.checkedToU32(scaledHeight) {
+    Option<u32>.Some { value } => value
+    _ => {
+      fail RenderError.TooLarge
+    }
+  }
+  if pw == 0 || ph == 0 {
+    fail RenderError.InvalidSize
+  }
+  let widthPixels = u32.toUsize(pw)
+  let heightPixels = u32.toUsize(ph)
+
+  // The RGBA size must also fit vector's usize multiplication on wasm32.
+  if widthPixels > usize.MAX / 4 / heightPixels || widthPixels > options.maxPixels / heightPixels {
+    fail RenderError.TooLarge
+  }
+  let scale = Transform.scale(u32.toF64(pw) / w, u32.toF64(ph) / h)
+  if !Transform.isFinite(scale) {
+    fail RenderError.InvalidSize
+  }
+  return Viewport { width: w, height: h, pixelsWidth: pw, pixelsHeight: ph, scale: scale }
+}
+
+struct Plan {
+  occurrence: OccurrenceId,
+  firstChild: Option<usize>,
+  nextSibling: Option<usize>,
+  styleId: StyleId,
+  style: Style,
+  hasStroke: bool,
+  vectorFlags: u8,
+  vectorScreen: bool,
+  subtreeEffects: bool,
+  fixedPosition: Point,
+  path: Option<usize>,
+  pathLength: Option<f64>,
+  paintable: bool,
+  container: bool,
+  ownBounds: bool,
+  instance: bool,
+  foreign: bool,
+  viewport: usize,
+  childViewport: usize,
+  layout: Option<usize>,
+  local: Mapping,
+  transformed: bool,
+  perspective: bool,
+  hiddenBackface: bool,
+  suppressed: bool,
+  pending: Option<usize>,
+}
+
+impl Copy for Plan {}
+
+// Sparse viewport/use data: ordinary geometry retains only arena indices.
+struct Layout {
+  supplement: Transform,
+  clip: Option<Clip>,
+  clipMapping: Mapping,
+  referenceMapping: bool,
+  viewportHost: Option<Mapping>,
+}
+
+struct Pending {
+  matrix: Matrix,
+  clip: Option<Matrix>,
+  viewportHost: Option<Matrix>,
+}
+
+struct MetadataCache {
+  indices: List<List<usize>>,
+  values: List<Metadata>,
+}
+
+struct MarkerKey {
+  node: usize,
+  values: [f64; 5],
+  context: u8,
+}
+
+impl Copy for MarkerKey {}
+
+impl HashKey for MarkerKey {
+  fn equals(a: &Self, b: &Self) -> bool {
+    if a.node != b.node || a.context != b.context {
+      return false
+    }
+    let mut i: usize = 0
+    while i < 5 {
+      if a.values[i] != b.values[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    let mut result = Hash.combine(Hash.mix(seed, usize.toU64(value.node)), u8.toU64(value.context))
+    let mut i: usize = 0
+    while i < 5 {
+      let number = value.values[i]
+      result = Hash.combine(
+        result,
+        f64.toBits(
+          if number == 0.0 {
+            0.0
+          } else {
+            number
+          },
+        ),
+      )
+      i = i + 1
+    }
+    return result
+  }
+}
+
+struct MarkerDefinition {
+  root: usize,
+  placement: Transform,
+  orientation: u8,
+  userUnits: bool,
+}
+
+impl Copy for MarkerDefinition {}
+
+struct ReferenceKey {
+  parent: usize,
+  node: usize,
+}
+
+impl Copy for ReferenceKey {}
+
+impl HashKey for ReferenceKey {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return a.parent == b.parent && a.node == b.node
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    return Hash.combine(Hash.mix(seed, usize.toU64(value.parent)), usize.toU64(value.node))
+  }
+}
+
+struct PatternKey {
+  node: usize,
+  ancestry: usize,
+  fill: usize,
+  stroke: usize,
+  values: [f64; 27],
+}
+
+impl Copy for PatternKey {}
+
+impl HashKey for PatternKey {
+  fn equals(a: &Self, b: &Self) -> bool {
+    if a.node != b.node || a.ancestry != b.ancestry || a.fill != b.fill || a.stroke != b.stroke {
+      return false
+    }
+    let mut i: usize = 0
+    while i < 27 {
+      if a.values[i] != b.values[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    let mut result = Hash.mix(seed, usize.toU64(value.node))
+    result = Hash.combine(result, usize.toU64(value.ancestry))
+    result = Hash.combine(result, usize.toU64(value.fill))
+    result = Hash.combine(result, usize.toU64(value.stroke))
+    let mut i: usize = 0
+    while i < 27 {
+      let number = value.values[i]
+      result = Hash.combine(
+        result,
+        f64.toBits(
+          if number == 0.0 {
+            0.0
+          } else {
+            number
+          },
+        ),
+      )
+      i = i + 1
+    }
+    return result
+  }
+}
+
+fn paintIdentity(paint: &Paint) -> usize {
+  return match &paint.* {
+    Paint.None => 0
+    Paint.CurrentColor => 1
+    Paint.ContextFill => 2
+    Paint.ContextStroke => 3
+    Paint.Solid { color } => 4
+    Paint.Server { index } => index + 5
+  }
+}
+
+fn paintComponents(paint: &Paint) -> [f64; 4] {
+  return match &paint.* {
+    Paint.Solid { color } => [color.r, color.g, color.b, color.a]
+    _ => [0.0; 4]
+  }
+}
+
+// Prepared geometry is dense and independent of source occurrence numbering.
+// A referenced subtree gets one plan per renderable node, not an entire
+// document-sized array for every marker or pattern instance.
+struct Planning {
+  metadata: MetadataCache,
+  paths: List<Path>,
+  dashes: List<List<f64>>,
+  dashCache: DashCache,
+  pathLengthCache: PathLengthCache,
+  spaces: List<Rect>,
+  layouts: List<Layout>,
+  plans: List<Plan>,
+  pending: List<Pending>,
+  bounds: ReferenceBoundsCache,
+  visits: usize,
+  markerKeys: HashMap<MarkerKey, usize>,
+  markers: List<MarkerDefinition>,
+  positionKeys: HashMap<usize, usize>,
+  positions: List<List<MarkerPosition>>,
+  activeMarkers: List<usize>,
+  strokeSpaces: List<StrokeSpace>,
+  patternKeys: HashMap<PatternKey, usize>,
+  patterns: List<ResolvedPattern>,
+  patternDepths: List<usize>,
+  patternReferences: List<usize>,
+  depthPeak: usize,
+  referencePeak: usize,
+  activePatterns: List<usize>,
+  resourceAncestry: usize,
+  ancestryKeys: HashMap<ReferenceKey, usize>,
+  ancestryCount: usize,
+}
+
+effect fn resourceAncestry(state: &mut Planning, node: usize) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let key = ReferenceKey { parent: state.resourceAncestry, node: node }
+  let cached: Option<usize> = state.ancestryKeys.get(key)
+  if let Option<usize>.Some { value } = &cached {
+    return value
+  }
+  let index = state.ancestryCount
+  state.ancestryCount = index + 1
+  drop run state.ancestryKeys.insert(key, index)
+  return index
+}
+
+struct PreparationRoot {
+  occurrence: OccurrenceId,
+  viewport: usize,
+  childViewport: usize,
+  layout: usize,
+  definition: bool,
+  externalTransform: bool,
+}
+
+struct PaintContext {
+  root: usize,
+  fill: Paint,
+  stroke: Paint,
+}
+
+impl Copy for PaintContext {}
+
+fn contextual(paint: &Paint, context: &PaintContext) -> Paint {
+  return match &paint.* {
+    Paint.ContextFill => context.fill
+    Paint.ContextStroke => context.stroke
+    _ => paint.*
+  }
+}
+
+fn paintContext(style: &Style, root: usize) -> PaintContext {
+  return PaintContext {
+    root: root,
+    fill: match &style.fill {
+      Paint.CurrentColor => Paint.Solid { color: style.color }
+      _ => style.fill
+    },
+    stroke: match &style.stroke {
+      Paint.CurrentColor => Paint.Solid { color: style.color }
+      _ => style.stroke
+    },
+  }
+}
+
+fn present(paint: &Paint, context: u8) -> bool {
+  return match &paint.* {
+    Paint.None => false
+    Paint.ContextFill => (context & 1) != 0
+    Paint.ContextStroke => (context & 2) != 0
+    _ => true
+  }
+}
+
+fn contextPresence(context: &PaintContext) -> u8 {
+  let fill: u8 = if present(&context.fill, 0) {
+    1
+  } else {
+    0
+  }
+  let stroke: u8 = if present(&context.stroke, 0) {
+    2
+  } else {
+    0
+  }
+  return fill + stroke
+}
+
+effect fn metadata(graph: &Graph, engine: &mut Engine, limits: &Limits) -> MetadataCache
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = MetadataCache {
+    indices: List<List<usize>>.make(),
+    values: List<Metadata>.make(),
+  }
+  let mut documentIndex: usize = 0
+  while documentIndex < graph.documents.length() {
+    let document = &graph.documents.asSlice()[documentIndex].document
+    let mut indices = run List<usize>.makeWithCapacity(Document.nodes(document).length)
+    let mut i: usize = 0
+    while i < Document.nodes(document).length {
+      let node = NodeId { index: i }
+      let mut index = usize.MAX
+      if equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg") {
+        match &run used_viewports.parseMetadata(
+          document,
+          node,
+          &mut engine.values.numerics,
+          limits,
+        ) {
+          Option<Metadata>.Some { value } => {
+            index = result.values.length()
+            run result.values.append(value)
+          }
+          _ => {}
+        }
+      }
+      run indices.append(index)
+      i = i + 1
+    }
+    run result.indices.append(move indices)
+    documentIndex = documentIndex + 1
+  }
+  return move result
+}
+
+// Known non-container elements cannot become unknown generic containers merely
+// because their specialised painting stage is not involved in this traversal.
+fn containerName(name: &[u8]) -> bool {
+  if equal(name, b"g") || equal(name, b"a") || equal(name, b"svg") || equal(name, b"use")
+    || equal(name, b"symbol")
+    || equal(name, b"switch")
+    || equal(name, b"foreignObject") {
+    return true
+  }
+  return !(equal(name, b"defs") || equal(name, b"desc") || equal(name, b"title")
+    || equal(name, b"metadata")
+    || equal(name, b"view")
+    || equal(name, b"style")
+    || equal(name, b"script")
+    || equal(name, b"linearGradient")
+    || equal(name, b"radialGradient")
+    || equal(name, b"stop")
+    || equal(name, b"pattern")
+    || equal(name, b"marker")
+    || equal(name, b"clipPath")
+    || equal(name, b"mask")
+    || equal(name, b"filter")
+    || equal(name, b"text")
+    || equal(name, b"tspan")
+    || equal(name, b"textPath")
+    || equal(name, b"image")
+    || equal(name, b"animate")
+    || equal(name, b"animateMotion")
+    || equal(name, b"animateTransform")
+    || equal(name, b"animateColor")
+    || equal(name, b"set")
+    || equal(name, b"mpath")
+    || equal(name, b"discard")
+    || equal(name, b"tref")
+    || equal(name, b"altGlyph")
+    || equal(name, b"altGlyphDef")
+    || equal(name, b"altGlyphItem")
+    || equal(name, b"glyphRef")
+    || equal(name, b"font")
+    || equal(name, b"glyph")
+    || equal(name, b"missing-glyph")
+    || equal(name, b"hkern")
+    || equal(name, b"vkern")
+    || equal(name, b"font-face")
+    || equal(name, b"font-face-src")
+    || equal(name, b"font-face-uri")
+    || equal(name, b"font-face-name")
+    || equal(name, b"definition-src")
+    || equal(name, b"feBlend")
+    || equal(name, b"feColorMatrix")
+    || equal(name, b"feComponentTransfer")
+    || equal(name, b"feComposite")
+    || equal(name, b"feConvolveMatrix")
+    || equal(name, b"feDiffuseLighting")
+    || equal(name, b"feDisplacementMap")
+    || equal(name, b"feDistantLight")
+    || equal(name, b"feDropShadow")
+    || equal(name, b"feFlood")
+    || equal(name, b"feFuncA")
+    || equal(name, b"feFuncB")
+    || equal(name, b"feFuncG")
+    || equal(name, b"feFuncR")
+    || equal(name, b"feGaussianBlur")
+    || equal(name, b"feImage")
+    || equal(name, b"feMerge")
+    || equal(name, b"feMergeNode")
+    || equal(name, b"feMorphology")
+    || equal(name, b"feOffset")
+    || equal(name, b"fePointLight")
+    || equal(name, b"feSpecularLighting")
+    || equal(name, b"feSpotLight")
+    || equal(name, b"feTile")
+    || equal(name, b"feTurbulence"))
+}
+
+effect fn rectangle(x: f64, y: f64, width: f64, height: f64) -> Rect
+  ! RenderError {
+  return match &Rect.new(x, y, width, height) {
+    Option<Rect>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidGeometry
+    }
+  }
+}
+
+fn united(left: Option<Rect>, right: Option<Rect>) -> Option<Rect> {
+  return match &left {
+    Option<Rect>.Some { value: a } => match &right {
+      Option<Rect>.Some { value: b } => a.united(b)
+      _ => left
+    }
+    _ => right
+  }
+}
+
+effect fn prepare(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: OccurrenceId,
+  root: &PreparationRoot,
+  parent: Option<usize>,
+  context: u8,
+  state: &mut Planning,
+  limits: &Limits,
+) -> Option<usize>
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let occurrence = graph.occurrences.asSlice()[id.index]
+  if !occurrence.eligible {
+    return Option<usize>.None
+  }
+  let source = occurrence.source
+  let document = graph.sourceDocument(source)
+  let name = Document.localName(document, source.node)
+  let svgElement = equal(
+    Document.namespaceUri(document, source.node),
+    b"http://www.w3.org/2000/svg",
+  )
+  let isRoot = id.index == root.occurrence.index
+  let mut foreign = false
+  let mut viewportIndex = root.viewport
+  let mut host = Option<StyleId>.None
+  if let Option<usize>.Some { value } = &parent {
+    let enclosing = state.plans.asSlice()[value]
+    foreign = enclosing.foreign
+    viewportIndex = enclosing.childViewport
+    if enclosing.instance && occurrence.shadowRoot {
+      host = Option<StyleId>.some(enclosing.styleId)
+    }
+  }
+  if !svgElement && !foreign {
+    return Option<usize>.None
+  }
+  let drawable = svgElement && !foreign
+    && (equal(name, b"path") || equal(name, b"rect") || equal(name, b"circle")
+      || equal(name, b"ellipse")
+      || equal(name, b"line")
+      || equal(name, b"polyline")
+      || equal(name, b"polygon"))
+  let container = !svgElement || (!drawable && (containerName(name) || (isRoot && root.definition)))
+  if !container && !drawable {
+    return Option<usize>.None
+  }
+  let styleId = match &styles.nodeStyle(id) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let viewport = state.spaces.asSlice()[viewportIndex]
+  let style = run used_style.project(
+    &styles.catalog.engine,
+    styleId,
+    viewport.width(),
+    viewport.height(),
+    &mut state.dashCache,
+    &mut state.dashes,
+  )
+  let fillPresence: u8 = if present(&style.fill, context)
+    || styles.resource(id, Property.Fill).isSome() {
+    1
+  } else {
+    0
+  }
+  let strokePresence: u8 = if present(&style.stroke, context)
+    || styles.resource(id, Property.Stroke).isSome() {
+    2
+  } else {
+    0
+  }
+  let presence = fillPresence + strokePresence
+
+  // Never-rendered definitions remain referenceable despite their UA display:none.
+  if !style.displayed && !(isRoot && root.definition) {
+    return Option<usize>.None
+  }
+  let mut childViewport = viewportIndex
+  let mut layout = Option<usize>.None
+  let mut disabled = false
+  let mut path = Option<usize>.None
+  let mut paintable = false
+  let mut ownBounds = false
+  let instance = svgElement && equal(name, b"use")
+  if isRoot {
+    childViewport = root.childViewport
+    layout = Option<usize>.some(root.layout)
+  } else if svgElement {
+    let metadataIndex = state.metadata.indices.asSlice()[source.document.index].asSlice()[source.node.index]
+    if metadataIndex != usize.MAX && (!foreign || equal(name, b"svg")) {
+      let data = &state.metadata.values.asSlice()[metadataIndex]
+      let used = run used_viewports.nested(
+        data,
+        &mut styles.catalog.engine,
+        styleId,
+        viewport,
+        host,
+      )
+      disabled = used.disabled
+      foreign = !used.establishesSvgViewport
+      childViewport = state.spaces.length()
+      run state.spaces.append(used.user)
+      layout = Option<usize>.some(state.layouts.length())
+      run state.layouts.append(
+        Layout {
+          supplement: used.mapping,
+          clip: used.clip,
+          clipMapping: Mapping.identity(),
+          referenceMapping: true,
+          viewportHost: if used.establishesSvgViewport {
+            Option<Mapping>.some(
+              Mapping.Affine {
+                value: Transform.translation(used.physical.xMin, used.physical.yMin),
+              },
+            )
+          } else {
+            Option<Mapping>.None
+          },
+        },
+      )
+      if data.kind == ElementKind.ForeignObject && !disabled {
+        ownBounds = true
+        path = Option<usize>.some(state.paths.length())
+        run state.paths.append(
+          run svg.rectangle(0.0, 0.0, used.physical.width(), used.physical.height(), 0.0, 0.0),
+        )
+      }
+    } else if instance && !foreign {
+      layout = Option<usize>.some(state.layouts.length())
+      run state.layouts.append(
+        Layout {
+          supplement: run used_viewports.useTranslation(&styles.catalog.engine, styleId, viewport),
+          clip: Option<Clip>.None,
+          clipMapping: Mapping.identity(),
+          referenceMapping: false,
+          viewportHost: Option<Mapping>.None,
+        },
+      )
+    }
+  }
+  if disabled {
+    return Option<usize>.None
+  }
+  if drawable {
+    let geometry = run used_geometry.shape(
+      document,
+      source.node,
+      &mut styles.catalog.engine,
+      styleId,
+      viewport.width(),
+      viewport.height(),
+      &mut state.paths,
+      limits,
+    )
+    path = geometry.path
+    paintable = geometry.paintable
+  }
+  let index = state.plans.length()
+  if index >= graph.limits.maxOccurrences {
+    fail RenderError.TooLarge
+  }
+  let mut vectorFlags: u8 = 0
+  let mut vectorScreen = false
+  if let Option<ComputedValue>.Some { value } = &styles.catalog.engine.get(
+    styleId,
+    Property.VectorEffect,
+  ) {
+    match &styles.catalog.engine.values.get(value.value).* {
+      Value.VectorEffect { flags, reference } => {
+        vectorFlags = flags
+        vectorScreen = reference == VectorReference.Screen
+      }
+      _ => {
+        fail RenderError.InvalidGeometry
+      }
+    }
+  }
+
+  // vector-effect applies to graphics elements, not the resource root. Keep
+  // its computed value untouched so descendants' explicit inherit still works.
+  if isRoot && root.definition {
+    vectorFlags = 0
+    vectorScreen = false
+  }
+  run state.plans.append(
+    Plan {
+      occurrence: id,
+      firstChild: Option<usize>.None,
+      nextSibling: Option<usize>.None,
+      styleId: styleId,
+      style: style,
+      path: path,
+      pathLength: if drawable {
+        run used_path_length.attribute(
+          document,
+          source.node,
+          &mut styles.catalog.engine,
+          styleId,
+          limits,
+        )
+      } else {
+        Option<f64>.None
+      },
+      paintable: paintable,
+      hasStroke: (presence & 2) != 0,
+      vectorFlags: vectorFlags,
+      vectorScreen: vectorScreen,
+      subtreeEffects: vectorFlags != 0,
+      fixedPosition: Point.new(0.0, 0.0),
+      container: container,
+      ownBounds: ownBounds,
+      instance: instance,
+      foreign: foreign,
+      viewport: viewportIndex,
+      childViewport: childViewport,
+      layout: layout,
+      local: Mapping.identity(),
+      transformed: !(isRoot && root.externalTransform)
+        && used_transforms.transformed(&styles.catalog.engine, styleId),
+      perspective: used_transforms.hasPerspective(&styles.catalog.engine, styleId),
+      hiddenBackface: used_transforms.hiddenBackface(&styles.catalog.engine, styleId),
+      suppressed: false,
+      pending: Option<usize>.None,
+    },
+  )
+  if container {
+    let mut child = if instance || (isRoot && root.definition && occurrence.shadow.isSome()) {
+      occurrence.shadow
+    } else {
+      occurrence.firstChild
+    }
+    let mut previous = Option<usize>.None
+    while let Option<OccurrenceId>.Some { value: next } = &child {
+      let prepared = run prepare(
+        graph,
+        &mut styles.*,
+        next,
+        root,
+        Option<usize>.some(index),
+        if instance {
+          presence
+        } else {
+          context
+        },
+        &mut state.*,
+        limits,
+      )
+      if let Option<usize>.Some { value } = &prepared {
+        let mut entries = state.plans.asMutSlice()
+        entries[index].subtreeEffects = entries[index].subtreeEffects
+          || entries[value].subtreeEffects
+        match &previous {
+          Option<usize>.Some { value: last } => {
+            entries[last].nextSibling = Option<usize>.some(value)
+          }
+          _ => {
+            entries[index].firstChild = Option<usize>.some(value)
+          }
+        }
+        previous = Option<usize>.some(value)
+      }
+      child = graph.occurrences.asSlice()[next.index].nextSibling
+    }
+  }
+  return Option<usize>.some(index)
+}
+
+// Empty is not a rectangle at the origin. See the unresolved SVGWG clarification:
+// https://github.com/w3c/svgwg/issues/422
+// Positioned degenerate shapes remain finite boxes, unlike absent geometry.
+effect fn gather(
+  graph: &Graph,
+  id: usize,
+  plans: &[Plan],
+  layouts: &[Layout],
+  paths: &[Path],
+  target: &Mapping,
+  includeLocal: bool,
+  stroke: bool,
+  cache: &mut ReferenceBoundsCache,
+) -> Option<Rect>
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = &plans[id]
+  let matrix = if includeLocal {
+    run target.compose(&plan.local)
+  } else {
+    match &plan.layout {
+      Option<usize>.Some { value } => if layouts[value].referenceMapping {
+        run target.compose(&Mapping.Affine { value: layouts[value].supplement })
+      } else {
+        target.*
+      }
+      _ => target.*
+    }
+  }
+  let mut result = Option<Rect>.None
+  match &plan.path {
+    Option<usize>.Some { value: index } => {
+      result = run cache.fillBounds(paths, index, &matrix, 0.0000001)
+      if stroke && plan.paintable && plan.hasStroke && plan.style.strokeWidth > 0.0 {
+        // Reference geometry uses a much tighter tolerance than pixel coverage;
+        // inability to meet it is an explicit numeric error, never a hull fallback.
+        let stroked = run cache.strokeBounds(paths, index, &plan.style, &matrix, 0.0000001)
+        result = united(result, stroked)
+      }
+    }
+    _ => {}
+  }
+
+  // SVG2 embedded#Placement: an embedded element's positioning rectangle is
+  // its bounding box, independently of overflowing child content.
+  if plan.container && !plan.ownBounds {
+    let mut child = plan.firstChild
+    while true {
+      let next = match &child {
+        Option<usize>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      result = united(
+        result,
+        run gather(graph, next, plans, layouts, paths, &matrix, true, stroke, &mut cache.*),
+      )
+      child = plans[next].nextSibling
+    }
+  }
+  return result
+}
+
+effect fn mapped(plan: &mut Plan, matrix: &Matrix, deferFacing: bool) -> ()
+  ! RenderError | GeometryError {
+  plan.local = run Mapping.fromMatrix(matrix)
+  if deferFacing {
+    return
+  }
+  let facing = transforms.facing(matrix)
+  if facing == Facing.Invalid {
+    fail RenderError.InvalidGeometry
+  }
+  plan.suppressed = facing == Facing.Singular || facing == Facing.EdgeOn
+    || (plan.hiddenBackface && facing == Facing.Back)
+  match &plan.local {
+    Mapping.Projective { value } => {
+      if value.wx == 0.0 && value.wy == 0.0 && value.ww <= 0.0 {
+        plan.suppressed = true
+      }
+    }
+    _ => {}
+  }
+}
+
+// The hard composed-occurrence depth ceiling bounds this recursion.
+// Curved descendants are measured in the requested coordinate space, not by
+// transforming intermediate axis-aligned bounding boxes.
+effect fn place(
+  graph: &Graph,
+  id: usize,
+  engine: &Engine,
+  spaces: &[Rect],
+  viewTransform: &Matrix,
+  retain: bool,
+  plans: &mut List<Plan>,
+  layouts: &mut List<Layout>,
+  pending: &mut List<Pending>,
+  paths: &[Path],
+  cache: &mut ReferenceBoundsCache,
+) -> ()
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut plan = plans.asSlice()[id]
+  if plan.container {
+    let mut child = plan.firstChild
+    while true {
+      let next = match &child {
+        Option<usize>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      run place(
+        graph,
+        next,
+        engine,
+        spaces,
+        viewTransform,
+        plan.perspective,
+        &mut plans.*,
+        &mut layouts.*,
+        &mut pending.*,
+        paths,
+        &mut cache.*,
+      )
+      child = plans.asSlice()[next].nextSibling
+    }
+  }
+  let viewport = spaces[plan.viewport]
+  let mut reference = viewport
+  if (plan.transformed || plan.perspective) && plan.occurrence.index != graph.root.index {
+    let kind = match &used_transforms.referenceBox(engine, plan.styleId) {
+      Option<ReferenceBox>.Some { value } => value
+      _ => {
+        fail RenderError.InvalidGeometry
+      }
+    }
+    if kind != ReferenceBox.View {
+      let stroke = kind == ReferenceBox.Border || kind == ReferenceBox.Stroke
+      reference = match &run gather(
+        graph,
+        id,
+        plans.asSlice(),
+        layouts.asSlice(),
+        paths,
+        &Mapping.identity(),
+        false,
+        stroke,
+        &mut cache.*,
+      ) {
+        Option<Rect>.Some { value } => value
+        _ => run rectangle(0.0, 0.0, 0.0, 0.0)
+      }
+    }
+  }
+  if plan.container && plan.perspective {
+    let mut projection = match &used_transforms.perspective(
+      engine,
+      plan.styleId,
+      viewport,
+      reference,
+      reference,
+    ) {
+      Option<Matrix>.Some { value } => value
+      _ => {
+        fail RenderError.InvalidGeometry
+      }
+    }
+
+    // Viewport placement is outside its children's coordinate system. Express
+    // perspective in that child system before composing FULL child matrices.
+    match &plan.layout {
+      Option<usize>.Some { value } => {
+        let layout = &layouts.asSlice()[value]
+        if layout.referenceMapping {
+          let inverse = match &layout.supplement.inverse() {
+            Option<Transform>.Some { value: inverseValue } => inverseValue
+            _ => {
+              fail RenderError.InvalidGeometry
+            }
+          }
+          projection = transforms.multiply(
+            &transforms.fromAffine(inverse),
+            &transforms.multiply(&projection, &transforms.fromAffine(layout.supplement)),
+          )
+        }
+      }
+      _ => {}
+    }
+    let mut child = plan.firstChild
+    while true {
+      let next = match &child {
+        Option<usize>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      let mut placed = plans.asSlice()[next]
+      let index = match &placed.pending {
+        Option<usize>.Some { value: pendingIndex } => pendingIndex
+        _ => {
+          fail RenderError.InvalidGeometry
+        }
+      }
+      let retained = &pending.asSlice()[index]
+      let matrix = transforms.multiply(&projection, &retained.matrix)
+      run mapped(&mut placed, &matrix, false)
+      if let Option<usize>.Some { value: layoutIndex } = &placed.layout {
+        if let Option<Matrix>.Some { value: clipMatrix } = &retained.clip {
+          let mapping = run Mapping.fromMatrix(&transforms.multiply(&projection, &clipMatrix))
+          let mut layoutEntries = layouts.asMutSlice()
+          layoutEntries[layoutIndex].clipMapping = mapping
+        }
+        if let Option<Matrix>.Some { value: hostMatrix } = &retained.viewportHost {
+          let mapping = run Mapping.fromMatrix(&transforms.multiply(&projection, &hostMatrix))
+          let mut layoutEntries = layouts.asMutSlice()
+          layoutEntries[layoutIndex].viewportHost = Option<Mapping>.some(mapping)
+        }
+      }
+      placed.pending = Option<usize>.None
+      let mut entries = plans.asMutSlice()
+      entries[next] = placed
+      child = plans.asSlice()[next].nextSibling
+    }
+  }
+  let mut matrix = if plan.transformed {
+    match &used_transforms.element(engine, plan.styleId, viewport, reference, reference) {
+      Option<Matrix>.Some { value } => value
+      _ => {
+        fail RenderError.InvalidGeometry
+      }
+    }
+  } else {
+    transforms.identity()
+  }
+  if (plan.vectorFlags & 8) != 0 {
+    let values = transforms.coefficients(&matrix)
+    plan.fixedPosition = Point.new(values[3] / values[15], values[7] / values[15])
+  }
+  let clipMatrix = matrix
+  if plan.occurrence.index == graph.root.index {
+    matrix = transforms.multiply(&matrix, viewTransform)
+  }
+  let mut pendingClip = Option<Matrix>.None
+  let mut pendingHost = Option<Matrix>.None
+  match &plan.layout {
+    Option<usize>.Some { value } => {
+      if let Option<Mapping>.Some { value: host } = &layouts.asSlice()[value].viewportHost {
+        let placement = match &host {
+          Mapping.Affine { value: affine } => affine
+          _ => {
+            fail RenderError.InvalidGeometry
+          }
+        }
+        let hostMatrix = transforms.multiply(&clipMatrix, &transforms.fromAffine(placement))
+        let hostMapping = run Mapping.fromMatrix(&hostMatrix)
+        let mut entries = layouts.asMutSlice()
+        entries[value].viewportHost = Option<Mapping>.some(hostMapping)
+        if retain {
+          pendingHost = Option<Matrix>.some(hostMatrix)
+        }
+      }
+      let supplement = layouts.asSlice()[value].supplement
+      matrix = transforms.multiply(&matrix, &transforms.fromAffine(supplement))
+      match &layouts.asSlice()[value].clip {
+        Option<Clip>.Some { value: clip } => {
+          let mapping = run Mapping.fromMatrix(&clipMatrix)
+          let mut entries = layouts.asMutSlice()
+          entries[value].clipMapping = mapping
+          if retain {
+            pendingClip = Option<Matrix>.some(clipMatrix)
+          }
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  run mapped(&mut plan, &matrix, retain)
+  if retain {
+    plan.pending = Option<usize>.some(pending.length())
+    run pending.append(Pending { matrix: matrix, clip: pendingClip, viewportHost: pendingHost })
+  }
+  let mut entries = plans.asMutSlice()
+  entries[id] = plan
+}
+
+effect fn markerDefinition(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  node: OccurrenceId,
+  viewportIndex: usize,
+  strokeWidth: f64,
+  context: u8,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+) -> Option<usize>
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let metadata = match &(run used_paints.metadataIndex(
+    &mut paints.*,
+    graph,
+    &mut styles.*,
+    node,
+    limits,
+  )) {
+    Option<usize>.Some { value } => value
+    _ => {
+      return Option<usize>.None
+    }
+  }
+  let data = match &paints.metadata.asSlice()[metadata] {
+    PaintMetadata.Marker { value } => value
+    _ => {
+      return Option<usize>.None
+    }
+  }
+  let viewport = state.spaces.asSlice()[viewportIndex]
+  let userUnits = match &data.units {
+    Option<MarkerUnits>.Some { value } => value == MarkerUnits.UserSpaceOnUse
+    _ => false
+  }
+  let key = MarkerKey {
+    node: node.index,
+    context: context,
+    values: [
+      viewport.xMin,
+      viewport.yMin,
+      viewport.xMax,
+      viewport.yMax,
+      if userUnits {
+        1.0
+      } else {
+        strokeWidth
+      },
+    ],
+  }
+  let cached: Option<usize> = state.markerKeys.get(key)
+  if let Option<usize>.Some { value } = &cached {
+    return if value == usize.MAX {
+      Option<usize>.None
+    } else {
+      Option<usize>.some(value)
+    }
+  }
+  let style = match &styles.nodeStyle(node) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let base = run used_markers.resolve(
+    &data,
+    &mut styles.catalog.engine,
+    style,
+    viewport,
+    strokeWidth,
+    MarkerPosition { position: Point.new(0.0, 0.0), angle: 0.0, kind: MarkerKind.Mid },
+  )
+  let mut index = usize.MAX
+  if let Option<MarkerLayout>.Some { value: layout } = &base {
+    let layoutIndex = state.layouts.length()
+    run state.layouts.append(
+      Layout {
+        supplement: layout.content,
+        clip: run used_viewports.clipping(
+          &styles.catalog.engine,
+          style,
+          layout.physical,
+          layout.content,
+        ),
+        clipMapping: Mapping.identity(),
+        referenceMapping: true,
+        viewportHost: Option<Mapping>.None,
+      },
+    )
+
+    // A marker is a drawing surface, not a new SVG percentage viewport.
+    let root = PreparationRoot {
+      occurrence: node,
+      viewport: viewportIndex,
+      childViewport: viewportIndex,
+      layout: layoutIndex,
+      definition: true,
+      externalTransform: false,
+    }
+    let prepared = run prepare(
+      graph,
+      &mut styles.*,
+      node,
+      &root,
+      Option<usize>.None,
+      context,
+      &mut state.*,
+      limits,
+    )
+    if let Option<usize>.Some { value: rootPlan } = &prepared {
+      run place(
+        graph,
+        rootPlan,
+        &styles.catalog.engine,
+        state.spaces.asSlice(),
+        &transforms.identity(),
+        false,
+        &mut state.plans,
+        &mut state.layouts,
+        &mut state.pending,
+        state.paths.asSlice(),
+        &mut state.bounds,
+      )
+      state.pending.truncate(0)
+      let orientation: u8 = match &data.orient {
+        Option<MarkerOrient>.Some { value } => match &value {
+          MarkerOrient.Auto => 1
+          MarkerOrient.AutoStartReverse => 2
+          _ => 0
+        }
+        _ => 0
+      }
+      index = state.markers.length()
+      run state.markers.append(
+        MarkerDefinition {
+          root: rootPlan,
+          placement: layout.clipMapping,
+          orientation: orientation,
+          userUnits: userUnits,
+        },
+      )
+    }
+  }
+  drop run state.markerKeys.insert(key, index)
+  return if index == usize.MAX {
+    Option<usize>.None
+  } else {
+    Option<usize>.some(index)
+  }
+}
+
+effect fn markerLimit(error: MarkerError) -> ()
+  ! RenderError {
+  fail RenderError.InvalidGeometry
+}
+
+effect fn markerPositions(state: &mut Planning, path: usize) -> usize
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let cached: Option<usize> = state.positionKeys.get(path)
+  if let Option<usize>.Some { value } = &cached {
+    return value
+  }
+  let mut positions = List<MarkerPosition>.make()
+  run Effect.catch<MarkerError>(
+    markers.positions(&state.paths.asSlice()[path], &mut positions),
+    markerLimit,
+  )
+  let index = state.positions.length()
+  run state.positions.append(move positions)
+  drop run state.positionKeys.insert(path, index)
+  return index
+}
+
+effect fn mappedMarkerLimit(error: MarkerError) -> List<MarkerPosition>
+  ! RenderError {
+  fail RenderError.InvalidGeometry
+}
+
+effect fn paintMarkers(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  plan: &Plan,
+  path: usize,
+  used: &Style,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  transform: &Mapping,
+  strokeSpace: Option<usize>,
+  clip: Option<usize>,
+  outputBounds: Rect,
+  depth: usize,
+  references: usize,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+  clips: &mut List<ProjectionClip>,
+) -> ()
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let targets = [
+    styles.resource(plan.occurrence, Property.MarkerStart),
+    styles.resource(plan.occurrence, Property.MarkerMid),
+    styles.resource(plan.occurrence, Property.MarkerEnd),
+  ]
+  if targets[0].isNone() && targets[1].isNone() && targets[2].isNone() {
+    return
+  }
+  let context = paintContext(used, plan.occurrence.index)
+  let presence = contextPresence(&context)
+  let mut definitions = [Option<usize>.None; 3]
+  let mut k: usize = 0
+  while k < 3 {
+    if let Option<OccurrenceId>.Some { value: target } = &targets[k] {
+      let mut active = false
+      let mut i: usize = 0
+      while i < state.activeMarkers.length() {
+        active = active || state.activeMarkers.asSlice()[i] == target.index
+        i = i + 1
+      }
+      if !active {
+        if references >= graph.limits.maxReferenceDepth {
+          fail RenderError.TooLarge
+        }
+        definitions[k] = run markerDefinition(
+          graph,
+          &mut styles.*,
+          target,
+          plan.viewport,
+          used.strokeWidth,
+          presence,
+          &mut state.*,
+          &mut paints.*,
+          limits,
+        )
+      }
+    }
+    k = k + 1
+  }
+  if definitions[0].isNone() && definitions[1].isNone() && definitions[2].isNone() {
+    return
+  }
+  let mut needsHost = false
+  let mut needsUser = false
+  k = 0
+  while k < 3 {
+    if let Option<usize>.Some { value } = &definitions[k] {
+      if strokeSpace.isSome() && !state.markers.asSlice()[value].userUnits {
+        needsHost = true
+      } else {
+        needsUser = true
+      }
+    }
+    k = k + 1
+  }
+  let positions = if needsUser {
+    run markerPositions(&mut state.*, path)
+  } else {
+    usize.MAX
+  }
+  let mut mappedPositions = List<MarkerPosition>.make()
+  let mut hostToDevice = Mapping.identity()
+  if needsHost {
+    let spaceIndex = match &strokeSpace {
+      Option<usize>.Some { value } => value
+      _ => {
+        fail RenderError.InvalidGeometry
+      }
+    }
+    let space = &state.strokeSpaces.asSlice()[spaceIndex]
+    let matrix = match &space.pathToHost {
+      Mapping.Affine { value } => transforms.fromAffine(value)
+      Mapping.Projective { value: h } => transforms.fromColumnMajor(
+        &[h.xx, h.yx, 0.0, h.wx, h.xy, h.yy, 0.0, h.wy, 0.0, 0.0, 1.0, 0.0, h.xw, h.yw, 0.0, h.ww],
+      )
+    }
+    hostToDevice = space.hostToDevice
+    mappedPositions = run Effect.catch<MarkerError>(
+      markers.positionsMapped(&state.paths.asSlice()[path], &matrix),
+      mappedMarkerLimit,
+    )
+  }
+
+  // Roles are global: one start, all intermediate vertices, one end. Visiting
+  // those three ranges preserves paint order even when their markerUnits differ.
+  let mut slot: usize = 0
+  while slot < 3 {
+    if let Option<usize>.Some { value } = &definitions[slot] {
+      let definition = state.markers.asSlice()[value]
+      let hostUnits = strokeSpace.isSome() && !definition.userUnits
+      let count = if hostUnits {
+        mappedPositions.length()
+      } else {
+        state.positions.asSlice()[positions].length()
+      }
+      let mut i = if slot == 2 && count > 0 {
+        count - 1
+      } else {
+        0
+      }
+      let end = if slot == 0 && count > 0 {
+        1
+      } else {
+        count
+      }
+      while i < end {
+        let position = if hostUnits {
+          mappedPositions.asSlice()[i]
+        } else {
+          state.positions.asSlice()[positions].asSlice()[i]
+        }
+        let positionSlot: usize = match &position.kind {
+          MarkerKind.Start => 0
+          MarkerKind.Mid => 1
+          MarkerKind.End => 2
+        }
+        if positionSlot == slot {
+          let mut rotation = if definition.orientation == 0 {
+            Transform.identity()
+          } else {
+            Transform.rotation(position.angle)
+          }
+          if definition.orientation == 2 && position.kind == MarkerKind.Start {
+            rotation.a = -rotation.a
+            rotation.b = -rotation.b
+            rotation.c = -rotation.c
+            rotation.d = -rotation.d
+          }
+          rotation.e = position.position.x
+          rotation.f = position.position.y
+          let placement = run Mapping.Affine { value: rotation }.compose(
+            &Mapping.Affine { value: definition.placement },
+          )
+          let parent = if hostUnits {
+            run hostToDevice.compose(&placement)
+          } else {
+            run transform.compose(&placement)
+          }
+          let mut markerClip = clip
+          if let Mapping.Projective {
+            value: projection
+          } = &state.plans.asSlice()[definition.root].local {
+            if let Option<HalfPlane>.Some { value: plane } = &(run parent.flatteningClip()) {
+              markerClip = Option<usize>.some(clips.length())
+              run clips.append(ProjectionClip { parent: clip, plane: plane })
+            }
+          }
+          run state.activeMarkers.append(state.plans.asSlice()[definition.root].occurrence.index)
+          let markerContext = PaintContext {
+            fill: context.fill,
+            stroke: context.stroke,
+            root: state.plans.asSlice()[definition.root].occurrence.index,
+          }
+          let previousAncestry = state.resourceAncestry
+          state.resourceAncestry = run resourceAncestry(&mut state.*, markerContext.root)
+          run paint(
+            graph,
+            &mut styles.*,
+            definition.root,
+            &mut state.*,
+            &mut paints.*,
+            limits,
+            &parent,
+            &Frame.root(parent),
+            markerClip,
+            outputBounds,
+            &markerContext,
+            depth + 1,
+            references + 1,
+            &mut nodes.*,
+            &mut shapes.*,
+            &mut clips.*,
+          )
+          state.resourceAncestry = previousAncestry
+          drop state.activeMarkers.pop()
+        }
+        i = i + 1
+      }
+    }
+    slot = slot + 1
+  }
+}
+
+effect fn inverseMapping(input: &Mapping) -> Option<Mapping>
+  ! RenderError {
+  let result = match &input.* {
+    Mapping.Affine { value: affine } => match &affine.inverse() {
+      Option<Transform>.Some { value } => Option<Mapping>.some(Mapping.Affine { value: value })
+      _ => Option<Mapping>.None
+    }
+    Mapping.Projective { value: projective } => match &projective.inverse() {
+      Option<Homography>.Some { value } => Option<Mapping>.some(Mapping.Projective { value: value })
+      _ => Option<Mapping>.None
+    }
+  }
+  if result.isNone() {
+    let matrix = match &input.* {
+      Mapping.Affine { value } => transforms.fromAffine(value)
+      Mapping.Projective { value: h } => transforms.fromColumnMajor(
+        &[h.xx, h.yx, 0.0, h.wx, h.xy, h.yy, 0.0, h.wy, 0.0, 0.0, 1.0, 0.0, h.xw, h.yw, 0.0, h.ww],
+      )
+    }
+    let facing = transforms.facing(&matrix)
+    if facing != Facing.Singular && facing != Facing.EdgeOn {
+      fail RenderError.InvalidGeometry
+    }
+  }
+  return result
+}
+
+effect fn localContextPaint(value: Paint, inverse: &Mapping, paints: &mut PaintStore) -> Paint
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let source = match &value {
+    Paint.Server { index } => index
+    _ => {
+      return value
+    }
+  }
+  if source >= paints.paints.length() {
+    fail RenderError.InvalidGeometry
+  }
+  let instance = match &paints.paints.asSlice()[source] {
+    PaintInstance.Gradient { gradient, transform } => PaintInstance.Gradient {
+      gradient: gradient,
+      transform: run inverse.compose(&transform),
+    }
+    PaintInstance.Pattern { pattern, transform } => PaintInstance.Pattern {
+      pattern: pattern,
+      transform: run inverse.compose(&transform),
+    }
+  }
+  let index = paints.paints.length()
+  run paints.paints.append(move instance)
+  return Paint.Server { index: index }
+}
+
+fn resourceContext(graph: &Graph, node: OccurrenceId, context: &PaintContext) -> PaintContext {
+  // CR2018 painting.html#context-paint, pinned 7d6def..., lines 227-258:
+  // a reference to a pattern establishes NO context element. Only actual
+  // membership in an instantiated use subtree / rendered marker preserves it.
+  let mut current = Option<OccurrenceId>.some(node)
+  while let Option<OccurrenceId>.Some { value } = &current {
+    if value.index == context.root {
+      return context.*
+    }
+    current = graph.occurrences.asSlice()[value.index].parent
+  }
+  return PaintContext { fill: Paint.None, stroke: Paint.None, root: usize.MAX }
+}
+
+effect fn paintedUnion(left: Option<Rect>, right: Option<Rect>) -> Option<Rect>
+  ! RenderError {
+  let result = united(left, right)
+  if left.isSome() && right.isSome() && result.isNone() {
+    fail RenderError.InvalidGeometry
+  }
+  return result
+}
+
+effect fn pictureBounds(
+  state: &mut Planning,
+  shapes: &mut List<ResolvedShape>,
+  nodes: &mut List<ResolvedNode>,
+  clip: Option<Clip>,
+) -> Rect
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = Option<Rect>.None
+  let mut i: usize = 0
+  while i < shapes.length() {
+    let shape = &shapes.asSlice()[i]
+
+    // A finite physical clip is already a conservative content bound. Measuring
+    // the unclipped curve first would wrongly reject eye-plane crossings that
+    // the tile surface can render, and needlessly expand every hidden stroke.
+    if let Option<Clip>.Some { value } = &clip {
+      if value.x && value.y
+        && ((present(&shape.style.fill, 0) && shape.style.fillOpacity > 0.0)
+          || (present(&shape.style.stroke, 0) && shape.style.strokeOpacity > 0.0
+            && shape.style.strokeWidth > 0.0)) {
+        result = Option<Rect>.some(value.rectangle)
+        break
+      }
+    }
+    let mut bounds = Option<Rect>.None
+    if present(&shape.style.fill, 0) && shape.style.fillOpacity > 0.0 {
+      bounds = run state.bounds.fillBounds(
+        state.paths.asSlice(),
+        shape.path,
+        &shape.transform,
+        0.0000001,
+      )
+    }
+    if present(&shape.style.stroke, 0) && shape.style.strokeOpacity > 0.0
+      && shape.style.strokeWidth > 0.0 {
+      let space = match &shape.strokeSpace {
+        Option<usize>.Some { value } => Option<StrokeSpace>.some(
+          state.strokeSpaces.asSlice()[value],
+        )
+        _ => Option<StrokeSpace>.None
+      }
+      let stroke = run state.bounds.paintedStrokeBounds(
+        state.paths.asSlice(),
+        shape.path,
+        &shape.style,
+        &shape.transform,
+        space,
+        state.dashes.asSlice()[shape.style.dashIndex].asSlice(),
+      )
+      bounds = run paintedUnion(bounds, stroke)
+    }
+    result = run paintedUnion(result, bounds)
+    i = i + 1
+  }
+  let mut bounds = match &result {
+    Option<Rect>.Some { value } => value
+    _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+  }
+  if let Option<Clip>.Some { value } = &clip {
+    if value.x {
+      bounds.xMin = f64.max(bounds.xMin, value.rectangle.xMin)
+      bounds.xMax = f64.min(bounds.xMax, value.rectangle.xMax)
+    }
+    if value.y {
+      bounds.yMin = f64.max(bounds.yMin, value.rectangle.yMin)
+      bounds.yMax = f64.min(bounds.yMax, value.rectangle.yMax)
+    }
+    if bounds.xMax < bounds.xMin || bounds.yMax < bounds.yMin {
+      bounds = Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+    }
+  }
+  if !bounds.isValid() || !f64.isFinite(bounds.width()) || !f64.isFinite(bounds.height()) {
+    fail RenderError.InvalidGeometry
+  }
+
+  // Paint traversal has not rasterized anything yet. Replace the provisional
+  // tile bounds on opacity groups as well, so overflow is never cropped early.
+  i = 0
+  while i < shapes.length() {
+    let mut entries = shapes.asMutSlice()
+    entries[i].bounds = bounds
+    i = i + 1
+  }
+  i = 0
+  while i < nodes.length() {
+    let updated = match &nodes.asSlice()[i] {
+      ResolvedNode.BeginGroup { opacity, bounds: previous, linearRgb } => Option<ResolvedNode>.some(
+        ResolvedNode.BeginGroup { opacity: opacity, bounds: bounds, linearRgb: linearRgb },
+      )
+      _ => Option<ResolvedNode>.None
+    }
+    match move updated {
+      Option<ResolvedNode>.Some { value } => {
+        let mut entries = nodes.asMutSlice()
+        entries[i] = move value
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return bounds
+}
+
+effect fn resourcePaint(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  node: OccurrenceId,
+  viewport: Rect,
+  bounds: Rect,
+  transform: &Mapping,
+  context: &PaintContext,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  depth: usize,
+  references: usize,
+  clips: &mut List<ProjectionClip>,
+) -> Option<Paint>
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let merged = match &(run used_paints.mergedPattern(
+    &mut paints.*,
+    graph,
+    &mut styles.*,
+    node,
+    limits,
+  )) {
+    Option<usize>.Some { value } => value
+    _ => {
+      return run used_paints.gradient(
+        &mut paints.*,
+        graph,
+        &mut styles.*,
+        node,
+        viewport,
+        bounds,
+        transform,
+        limits,
+      )
+    }
+  }
+  let mut i: usize = 0
+  while i < state.activePatterns.length() {
+    if state.activePatterns.asSlice()[i] == node.index {
+      // Suppress the active reference edge, allowing the URL's fallback paint.
+      return Option<Paint>.None
+    }
+    i = i + 1
+  }
+  if references >= graph.limits.maxReferenceDepth {
+    fail RenderError.TooLarge
+  }
+  let style = match &styles.nodeStyle(node) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let data = paints.patterns.asSlice()[merged]
+  let layout = match &(run used_patterns.resolve(
+    &data,
+    &mut styles.catalog.engine,
+    style,
+    viewport,
+    bounds,
+  )) {
+    Option<PatternLayout>.Some { value } => value
+    _ => {
+      return Option<Paint>.some(Paint.None)
+    }
+  }
+  let placement = run transform.compose(&layout.mapping)
+  let inverse = match &(run inverseMapping(&placement)) {
+    Option<Mapping>.Some { value } => value
+    _ => {
+      return Option<Paint>.some(Paint.None)
+    }
+  }
+  let inherited = resourceContext(graph, node, context)
+  let fill = paintComponents(&inherited.fill)
+  let stroke = paintComponents(&inherited.stroke)
+  let contextServer = paintIdentity(&inherited.fill) >= 5 || paintIdentity(&inherited.stroke) >= 5
+  let coordinates = if contextServer {
+    match &inverse {
+      Mapping.Affine { value } => [
+        value.a,
+        value.c,
+        value.e,
+        value.b,
+        value.d,
+        value.f,
+        0.0,
+        0.0,
+        1.0,
+      ]
+      Mapping.Projective { value } => [
+        value.xx,
+        value.xy,
+        value.xw,
+        value.yx,
+        value.yy,
+        value.yw,
+        value.wx,
+        value.wy,
+        value.ww,
+      ]
+    }
+  } else {
+    [0.0; 9]
+  }
+
+  // The retained picture depends on its tile/content layout, not unused
+  // referring-box coordinates. Placement stays on each paint instance; only a
+  // rebased context server makes that mapping part of picture identity.
+  let key = PatternKey {
+    node: node.index,
+    ancestry: state.resourceAncestry,
+    fill: paintIdentity(&inherited.fill),
+    stroke: paintIdentity(&inherited.stroke),
+    values: [
+      viewport.xMin,
+      viewport.yMin,
+      viewport.xMax,
+      viewport.yMax,
+      layout.physical.width(),
+      layout.physical.height(),
+      layout.content.a,
+      layout.content.d,
+      layout.content.e,
+      layout.content.f,
+      fill[0],
+      fill[1],
+      fill[2],
+      fill[3],
+      stroke[0],
+      stroke[1],
+      stroke[2],
+      stroke[3],
+      coordinates[0],
+      coordinates[1],
+      coordinates[2],
+      coordinates[3],
+      coordinates[4],
+      coordinates[5],
+      coordinates[6],
+      coordinates[7],
+      coordinates[8],
+    ],
+  }
+  let cached: Option<usize> = state.patternKeys.get(key)
+  let definition = match &cached {
+    Option<usize>.Some { value } => {
+      let extraDepth = state.patternDepths.asSlice()[value]
+      let extraReferences = state.patternReferences.asSlice()[value]
+      if depth > graph.limits.maxOccurrenceDepth
+        || extraDepth > graph.limits.maxOccurrenceDepth - depth
+        || depth > 256
+        || extraDepth > 256 - depth
+        || extraReferences > graph.limits.maxReferenceDepth - references {
+        fail RenderError.TooLarge
+      }
+      if depth + extraDepth > state.depthPeak {
+        state.depthPeak = depth + extraDepth
+      }
+      if references + extraReferences > state.referencePeak {
+        state.referencePeak = references + extraReferences
+      }
+      value
+    }
+    _ => {
+      // #context-paint lines 247-253 requires the context element's paint space,
+      // not the resource child's bbox. Rebase once per actual definition key.
+      let localContext = PaintContext {
+        fill: run localContextPaint(inherited.fill, &inverse, &mut paints.*),
+        stroke: run localContextPaint(inherited.stroke, &inverse, &mut paints.*),
+        root: inherited.root,
+      }
+      let index = state.patterns.length()
+      if index >= graph.limits.maxOccurrences {
+        fail RenderError.TooLarge
+      }
+
+      // Reserve the handle before descendants. Nested resources keep global
+      // arena indices while their shape indices remain local to each picture.
+      run state.patterns.append(
+        ResolvedPattern {
+          tile: layout.physical,
+          contentBounds: Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 },
+          shapes: List<ResolvedShape>.make(),
+          nodes: List<ResolvedNode>.make(),
+        },
+      )
+      run state.patternDepths.append(0)
+      run state.patternReferences.append(0)
+      let previousDepth = state.depthPeak
+      let previousReferences = state.referencePeak
+      state.depthPeak = depth
+      state.referencePeak = references + 1
+      let viewportIndex = state.spaces.length()
+      run state.spaces.append(viewport)
+      let childViewport = state.spaces.length()
+      run state.spaces.append(layout.user)
+      let layoutIndex = state.layouts.length()
+      run state.layouts.append(
+        Layout {
+          supplement: layout.content,
+          clip: layout.clip,
+          clipMapping: Mapping.identity(),
+          referenceMapping: true,
+          viewportHost: Option<Mapping>.None,
+        },
+      )
+      let root = PreparationRoot {
+        occurrence: node,
+        viewport: viewportIndex,
+        childViewport: childViewport,
+        layout: layoutIndex,
+        definition: true,
+        externalTransform: true,
+      }
+      let prepared = run prepare(
+        graph,
+        &mut styles.*,
+        node,
+        &root,
+        Option<usize>.None,
+        contextPresence(&localContext),
+        &mut state.*,
+        limits,
+      )
+      let mut nodes = List<ResolvedNode>.make()
+      let mut shapes = List<ResolvedShape>.make()
+      if let Option<usize>.Some { value: rootPlan } = &prepared {
+        run place(
+          graph,
+          rootPlan,
+          &styles.catalog.engine,
+          state.spaces.asSlice(),
+          &transforms.identity(),
+          false,
+          &mut state.plans,
+          &mut state.layouts,
+          &mut state.pending,
+          state.paths.asSlice(),
+          &mut state.bounds,
+        )
+        state.pending.truncate(0)
+        run state.activePatterns.append(node.index)
+        let previous = state.resourceAncestry
+        state.resourceAncestry = run resourceAncestry(&mut state.*, node.index)
+        run paint(
+          graph,
+          &mut styles.*,
+          rootPlan,
+          &mut state.*,
+          &mut paints.*,
+          limits,
+          &Mapping.identity(),
+          &Frame.root(Mapping.identity()),
+          Option<usize>.None,
+          layout.physical,
+          &localContext,
+          depth + 1,
+          references + 1,
+          &mut nodes,
+          &mut shapes,
+          &mut clips.*,
+        )
+        state.resourceAncestry = previous
+        drop state.activePatterns.pop()
+      }
+      let contentBounds = run pictureBounds(&mut state.*, &mut shapes, &mut nodes, layout.clip)
+      let mut depths = state.patternDepths.asMutSlice()
+      depths[index] = state.depthPeak - depth
+      let mut referenceDepths = state.patternReferences.asMutSlice()
+      referenceDepths[index] = state.referencePeak - references
+      if previousDepth > state.depthPeak {
+        state.depthPeak = previousDepth
+      }
+      if previousReferences > state.referencePeak {
+        state.referencePeak = previousReferences
+      }
+      let mut entries = state.patterns.asMutSlice()
+      entries[index] = ResolvedPattern {
+        tile: layout.physical,
+        contentBounds: contentBounds,
+        shapes: move shapes,
+        nodes: move nodes,
+      }
+      drop run state.patternKeys.insert(key, index)
+      index
+    }
+  }
+  let content = state.patterns.asSlice()[definition].contentBounds
+  if content.width() == 0.0 || content.height() == 0.0 {
+    // A valid empty paint server paints nothing, without selecting its fallback
+    // or allocating a potentially enormous transparent tile.
+    return Option<Paint>.some(Paint.None)
+  }
+  let index = paints.paints.length()
+  run paints.paints.append(PaintInstance.Pattern { pattern: definition, transform: placement })
+  return Option<Paint>.some(Paint.Server { index: index })
+}
+
+effect fn nodePaints(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  state: &mut Planning,
+  transform: &Mapping,
+  context: &PaintContext,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  depth: usize,
+  references: usize,
+  clips: &mut List<ProjectionClip>,
+) -> Style
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = state.plans.asSlice()[id]
+  let mut used = plan.style
+  used.fill = contextual(&used.fill, context)
+  used.stroke = contextual(&used.stroke, context)
+  let fill = styles.resource(plan.occurrence, Property.Fill)
+  let stroke = styles.resource(plan.occurrence, Property.Stroke)
+  if fill.isNone() && stroke.isNone() {
+    return used
+  }
+  let viewport = state.spaces.asSlice()[plan.viewport]
+  let bounds = match &(run gather(
+    graph,
+    id,
+    state.plans.asSlice(),
+    state.layouts.asSlice(),
+    state.paths.asSlice(),
+    &Mapping.identity(),
+    false,
+    false,
+    &mut state.bounds,
+  )) {
+    Option<Rect>.Some { value } => value
+    _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+  }
+  let mut resolvedFill = false
+  if let Option<OccurrenceId>.Some { value } = &fill {
+    if let Option<Paint>.Some { value: paint } = &(run resourcePaint(
+      graph,
+      &mut styles.*,
+      value,
+      viewport,
+      bounds,
+      transform,
+      context,
+      &mut state.*,
+      &mut paints.*,
+      limits,
+      depth,
+      references,
+      &mut clips.*,
+    )) {
+      used.fill = paint
+      resolvedFill = true
+    }
+  }
+  if let Option<OccurrenceId>.Some { value } = &stroke {
+    let same = resolvedFill
+      && match &fill {
+        Option<OccurrenceId>.Some { value: filled } => filled.index == value.index
+        _ => false
+      }
+    if same {
+      used.stroke = used.fill
+    } else if let Option<Paint>.Some { value: paint } = &(run resourcePaint(
+      graph,
+      &mut styles.*,
+      value,
+      viewport,
+      bounds,
+      transform,
+      context,
+      &mut state.*,
+      &mut paints.*,
+      limits,
+      depth,
+      references,
+      &mut clips.*,
+    )) {
+      used.stroke = paint
+    }
+  }
+  return used
+}
+
+// Frames are only propagated through subtrees that use vector effects. Ordinary
+// drawing retains the single-map traversal without extra matrix compositions.
+effect fn paint(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  parent: &Mapping,
+  parentFrame: &Frame,
+  inheritedClip: Option<usize>,
+  outputBounds: Rect,
+  context: &PaintContext,
+  depth: usize,
+  references: usize,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+  clips: &mut List<ProjectionClip>,
+) -> ()
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth > graph.limits.maxOccurrenceDepth || depth > 256
+    || state.visits >= graph.limits.maxOccurrences {
+    fail RenderError.TooLarge
+  }
+  state.visits = state.visits + 1
+  if depth > state.depthPeak {
+    state.depthPeak = depth
+  }
+  if references > state.referencePeak {
+    state.referencePeak = references
+  }
+  let plan = state.plans.asSlice()[id]
+  if plan.style.opacity == 0.0 || plan.suppressed {
+    return
+  }
+  let matrix = run parent.compose(&plan.local)
+  if plan.subtreeEffects {
+    let host = match &plan.layout {
+      Option<usize>.Some { value } => state.layouts.asSlice()[value].viewportHost
+      _ => Option<Mapping>.None
+    }
+    let mut frame = run parentFrame.advance(&plan.local, host)
+    let space = if plan.vectorFlags != 0 {
+      run frame.apply(plan.vectorFlags, plan.vectorScreen, plan.fixedPosition)
+    } else {
+      Option<StrokeSpace>.None
+    }
+    let mut strokeSpace = Option<usize>.None
+    if plan.paintable && plan.style.visible {
+      if let Option<StrokeSpace>.Some { value } = &space {
+        strokeSpace = Option<usize>.some(state.strokeSpaces.length())
+        run state.strokeSpaces.append(value)
+      }
+    }
+    let geometry = if (plan.vectorFlags & 14) != 0 {
+      run frame.screenToDevice.compose(&frame.localToScreen)
+    } else {
+      matrix
+    }
+    run paintPrepared(
+      graph,
+      &mut styles.*,
+      id,
+      &plan,
+      &mut state.*,
+      &mut paints.*,
+      limits,
+      parent,
+      &frame,
+      &geometry,
+      strokeSpace,
+      inheritedClip,
+      outputBounds,
+      context,
+      depth,
+      references,
+      &mut nodes.*,
+      &mut shapes.*,
+      &mut clips.*,
+    )
+  } else {
+    run paintPrepared(
+      graph,
+      &mut styles.*,
+      id,
+      &plan,
+      &mut state.*,
+      &mut paints.*,
+      limits,
+      parent,
+      parentFrame,
+      &matrix,
+      Option<usize>.None,
+      inheritedClip,
+      outputBounds,
+      context,
+      depth,
+      references,
+      &mut nodes.*,
+      &mut shapes.*,
+      &mut clips.*,
+    )
+  }
+}
+
+effect fn paintPrepared(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  plan: &Plan,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  parent: &Mapping,
+  frame: &Frame,
+  matrix: &Mapping,
+  strokeSpace: Option<usize>,
+  inheritedClip: Option<usize>,
+  outputBounds: Rect,
+  context: &PaintContext,
+  depth: usize,
+  references: usize,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+  clips: &mut List<ProjectionClip>,
+) -> ()
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut clip = inheritedClip
+  match &plan.layout {
+    Option<usize>.Some { value } => {
+      let layout = &state.layouts.asSlice()[value]
+      match &layout.clip {
+        Option<Clip>.Some { value: boundary } => {
+          if (boundary.x && boundary.rectangle.width() == 0.0)
+            || (boundary.y && boundary.rectangle.height() == 0.0) {
+            return
+          }
+          let clipMapping = run parent.compose(&layout.clipMapping)
+          clip = run clipMapping.clipRectangle(
+            boundary.rectangle,
+            boundary.x,
+            boundary.y,
+            clip,
+            &mut clips.*,
+          )
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  let mut used = if (plan.paintable && plan.style.visible) || plan.instance {
+    run nodePaints(
+      graph,
+      &mut styles.*,
+      id,
+      &mut state.*,
+      matrix,
+      context,
+      &mut paints.*,
+      limits,
+      depth,
+      references,
+      &mut clips.*,
+    )
+  } else {
+    plan.style
+  }
+  if plan.paintable && plan.style.visible && present(&used.stroke, 0) && used.strokeWidth > 0.0
+    && used.strokeOpacity > 0.0 {
+    if let Option<f64>.Some { value: author } = &plan.pathLength {
+      if let Option<usize>.Some { value: path } = &plan.path {
+        let host = match &strokeSpace {
+          Option<usize>.Some { value } => Option<Mapping>.some(
+            state.strokeSpaces.asSlice()[value].pathToHost,
+          )
+          _ => Option<Mapping>.None
+        }
+        run used_path_length.apply(
+          &mut state.pathLengthCache,
+          &mut state.bounds,
+          &styles.catalog.engine,
+          plan.styleId,
+          &mut used,
+          state.paths.asSlice(),
+          path,
+          host,
+          state.spaces.asSlice()[plan.viewport],
+          author,
+          &mut state.dashes,
+        )
+      }
+    }
+  }
+  let childContext = if plan.instance {
+    paintContext(&used, plan.occurrence.index)
+  } else {
+    context.*
+  }
+  let layer = plan.style.opacity != 1.0
+  if layer {
+    run nodes.append(
+      ResolvedNode.BeginGroup {
+        opacity: plan.style.opacity,
+        bounds: outputBounds,
+        linearRgb: plan.style.linearRgb,
+      },
+    )
+  }
+  if plan.paintable && plan.style.visible {
+    match &plan.path {
+      Option<usize>.Some { value } => {
+        let shape = shapes.length()
+        run shapes.append(
+          ResolvedShape {
+            path: value,
+            transform: matrix.*,
+            strokeSpace: strokeSpace,
+            clip: clip,
+            bounds: outputBounds,
+            style: used,
+          },
+        )
+        let mut part: usize = 0
+        while part < 3 {
+          let layer = plan.style.paintOrder[part]
+          if layer == PaintLayer.Markers {
+            run paintMarkers(
+              graph,
+              &mut styles.*,
+              plan,
+              value,
+              &used,
+              &mut state.*,
+              &mut paints.*,
+              limits,
+              matrix,
+              strokeSpace,
+              clip,
+              outputBounds,
+              depth,
+              references,
+              &mut nodes.*,
+              &mut shapes.*,
+              &mut clips.*,
+            )
+          } else {
+            run nodes.append(ResolvedNode.Paint { shape: shape, layer: layer })
+          }
+          part = part + 1
+        }
+      }
+      _ => {}
+    }
+  }
+  if plan.container {
+    let mut child = plan.firstChild
+    let mut childClip = clip
+    let mut preparedClip = false
+    while true {
+      let next = match &child {
+        Option<usize>.Some { value } => value
+        _ => {
+          break
+        }
+      }
+      let childPlan = &state.plans.asSlice()[next]
+      let projected = !childPlan.suppressed && childPlan.style.opacity != 0.0
+        && match &childPlan.local {
+          Mapping.Projective { value: projection } => true
+          _ => false
+        }
+      if projected && !preparedClip {
+        match &(run matrix.flatteningClip()) {
+          Option<HalfPlane>.Some { value } => {
+            childClip = Option<usize>.some(clips.length())
+            run clips.append(ProjectionClip { parent: clip, plane: value })
+          }
+          _ => {}
+        }
+        preparedClip = true
+      }
+      let sourceScope = graph.scopes.asSlice()[graph.occurrences.asSlice()[plan.occurrence.index].scope].depth
+      let childScope = graph.scopes.asSlice()[graph.occurrences.asSlice()[state.plans.asSlice()[next].occurrence.index].scope].depth
+      let extra = if childScope > sourceScope {
+        childScope - sourceScope
+      } else {
+        0
+      }
+      if references > graph.limits.maxReferenceDepth
+        || extra > graph.limits.maxReferenceDepth - references {
+        fail RenderError.TooLarge
+      }
+      run paint(
+        graph,
+        &mut styles.*,
+        next,
+        &mut state.*,
+        &mut paints.*,
+        limits,
+        matrix,
+        frame,
+        if projected {
+          childClip
+        } else {
+          clip
+        },
+        outputBounds,
+        &childContext,
+        depth + 1,
+        references + extra,
+        &mut nodes.*,
+        &mut shapes.*,
+        &mut clips.*,
+      )
+      child = state.plans.asSlice()[next].nextSibling
+    }
+  }
+  if layer {
+    run nodes.append(ResolvedNode.EndGroup)
+  }
+}
+
+effect fn resolveStyled(
+  graph: Graph,
+  inputStyles: StyledGraph,
+  options: &RenderOptions,
+  limits: &Limits,
+  initialWidth: f64,
+  initialHeight: f64,
+) -> RenderTree
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let root = graph.root
+  let mut styles = move inputStyles
+  let rootStyle = match &styles.nodeStyle(root) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let sourceMetadata = run metadata(&graph, &mut styles.catalog.engine, limits)
+  let source = graph.occurrences.asSlice()[root.index].source
+  let metadataIndex = sourceMetadata.indices.asSlice()[source.document.index].asSlice()[source.node.index]
+  if metadataIndex == usize.MAX {
+    fail RenderError.InvalidRoot
+  }
+  let rootMetadata = &sourceMetadata.values.asSlice()[metadataIndex]
+  let mut box = match &styles.selection.viewBox {
+    Option<Rect>.Some { value } => Option<Rect>.some(value)
+    _ => rootMetadata.viewBox
+  }
+  let ratio = match &styles.selection.aspectRatio {
+    Option<AspectRatio>.Some { value } => value
+    _ => rootMetadata.aspectRatio
+  }
+  let viewport = run sizing(
+    &styles.catalog.engine,
+    rootStyle,
+    box,
+    options,
+    initialWidth,
+    initialHeight,
+  )
+  match &styles.selection.spatial {
+    Option<SpatialView>.Some { value } => {
+      let xScale = if value.unit == SpatialUnit.Percent {
+        viewport.width / 100.0
+      } else {
+        1.0
+      }
+      let yScale = if value.unit == SpatialUnit.Percent {
+        viewport.height / 100.0
+      } else {
+        1.0
+      }
+      box = Option<Rect>.some(
+        run rectangle(
+          u64.toF64(value.x) * xScale,
+          u64.toF64(value.y) * yScale,
+          u64.toF64(value.width) * xScale,
+          u64.toF64(value.height) * yScale,
+        ),
+      )
+    }
+    _ => {}
+  }
+  let outputBounds = run rectangle(
+    0.0,
+    0.0,
+    u32.toF64(viewport.pixelsWidth),
+    u32.toF64(viewport.pixelsHeight),
+  )
+  let physical = run rectangle(0.0, 0.0, viewport.width, viewport.height)
+  let userViewport = match &box {
+    Option<Rect>.Some { value } => value
+    _ => physical
+  }
+  let mut viewTransform = transforms.identity()
+  match &styles.selection.transform {
+    Option<ValueId>.Some { value } => {
+      let context = match &styles.catalog.engine.metrics(rootStyle) {
+        Option<Context>.Some { value: metrics } => metrics
+        _ => {
+          fail RenderError.InvalidStyleContext
+        }
+      }
+      let computed = match &styles.catalog.engine.values.values.asSlice()[value.index] {
+        Value.Transform { value: transform } => run transform_values.compute(
+          &transform,
+          &mut styles.catalog.engine.values.numerics,
+          &context,
+        )
+        _ => {
+          fail RenderError.InvalidGeometry
+        }
+      }
+      viewTransform = match &used_transforms.value(
+        &styles.catalog.engine.values,
+        &computed,
+        physical,
+      ) {
+        Option<Matrix>.Some { value: matrix } => matrix
+        _ => {
+          fail RenderError.InvalidGeometry
+        }
+      }
+    }
+    _ => {}
+  }
+
+  // Styling of all occurrences is complete before the one path-arena transfer.
+  let paths = move styles.catalog.engine.values.paths
+  styles.catalog.engine.values.paths = List<Path>.make()
+  let mut dashes = List<List<f64>>.make()
+  run dashes.append(List<f64>.make())
+  let mut state = Planning {
+    metadata: move sourceMetadata,
+    paths: move paths,
+    dashes: move dashes,
+    dashCache: DashCache.make(),
+    pathLengthCache: PathLengthCache.make(),
+    spaces: List<Rect>.make(),
+    layouts: List<Layout>.make(),
+    plans: List<Plan>.make(),
+    pending: List<Pending>.make(),
+    bounds: ReferenceBoundsCache.make(),
+    visits: 0,
+    markerKeys: HashMap<MarkerKey, usize>.make(Hash.seed(0)),
+    markers: List<MarkerDefinition>.make(),
+    positionKeys: HashMap<usize, usize>.make(Hash.seed(0)),
+    positions: List<List<MarkerPosition>>.make(),
+    activeMarkers: List<usize>.make(),
+    strokeSpaces: List<StrokeSpace>.make(),
+    patternKeys: HashMap<PatternKey, usize>.make(Hash.seed(0)),
+    patterns: List<ResolvedPattern>.make(),
+    patternDepths: List<usize>.make(),
+    patternReferences: List<usize>.make(),
+    depthPeak: 0,
+    referencePeak: 0,
+    activePatterns: List<usize>.make(),
+    resourceAncestry: usize.MAX,
+    ancestryKeys: HashMap<ReferenceKey, usize>.make(Hash.seed(0)),
+    ancestryCount: 0,
+  }
+  let mut nodes = List<ResolvedNode>.make()
+  let mut shapes = List<ResolvedShape>.make()
+  let mut paints = PaintStore.make()
+  let mut projectionClips = List<ProjectionClip>.make()
+  let rootMap = match &box {
+    Option<Rect>.Some { value } => svg.viewportWithAspectRatio(
+      value,
+      viewport.width,
+      viewport.height,
+      ratio,
+    )
+    _ => Option<Transform>.some(Transform.identity())
+  }
+  match &rootMap {
+    Option<Transform>.Some { value } => {
+      run state.spaces.append(physical)
+      run state.spaces.append(userViewport)
+      run state.layouts.append(
+        Layout {
+          supplement: value,
+          clip: Option<Clip>.None,
+          clipMapping: Mapping.identity(),
+          referenceMapping: true,
+          viewportHost: Option<Mapping>.some(Mapping.identity()),
+        },
+      )
+      let preparation = PreparationRoot {
+        occurrence: root,
+        viewport: 0,
+        childViewport: 1,
+        layout: 0,
+        definition: false,
+        externalTransform: false,
+      }
+      let prepared = run prepare(
+        &graph,
+        &mut styles,
+        root,
+        &preparation,
+        Option<usize>.None,
+        0,
+        &mut state,
+        limits,
+      )
+      if let Option<usize>.Some { value: rootPlan } = &prepared {
+        run place(
+          &graph,
+          rootPlan,
+          &styles.catalog.engine,
+          state.spaces.asSlice(),
+          &viewTransform,
+          false,
+          &mut state.plans,
+          &mut state.layouts,
+          &mut state.pending,
+          state.paths.asSlice(),
+          &mut state.bounds,
+        )
+        state.pending.truncate(0)
+        run paint(
+          &graph,
+          &mut styles,
+          rootPlan,
+          &mut state,
+          &mut paints,
+          limits,
+          &Mapping.Affine { value: viewport.scale },
+          &Frame.root(Mapping.Affine { value: viewport.scale }),
+          Option<usize>.None,
+          outputBounds,
+          &PaintContext { fill: Paint.None, stroke: Paint.None, root: usize.MAX },
+          0,
+          0,
+          &mut nodes,
+          &mut shapes,
+          &mut projectionClips,
+        )
+      }
+    }
+    _ => {}
+  }
+  return RenderTree {
+    width: viewport.pixelsWidth,
+    height: viewport.pixelsHeight,
+    maxPixels: options.maxPixels,
+    graph: move graph,
+    styles: move styles,
+    paths: move state.paths,
+    dashes: move state.dashes,
+    nodes: move nodes,
+    shapes: move shapes,
+    gradientStops: move paints.gradientStops,
+    gradients: move paints.gradients,
+    paints: move paints.paints,
+    patterns: move state.patterns,
+    strokeSpaces: move state.strokeSpaces,
+    projectionClips: move projectionClips,
+  }
+}
+
+effect fn cssLimit(error: CssError) -> RenderTree
+  ! RenderError {
+  drop error
+  fail RenderError.TooLarge
+}
+
+effect fn geometryLimit(error: GeometryError) -> RenderTree
+  ! RenderError {
+  drop error
+  fail RenderError.InvalidGeometry
+}
+
+pub effect fn resolve(
+  graph: Graph,
+  styles: StyledGraph,
+  options: &RenderOptions,
+  limits: &Limits,
+  initialWidth: f64,
+  initialHeight: f64,
+) -> RenderTree
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<GeometryError>(
+    Effect.catch<CssError>(
+      resolveStyled(move graph, move styles, options, limits, initialWidth, initialHeight),
+      cssLimit,
+    ),
+    geometryLimit,
+  )
+}

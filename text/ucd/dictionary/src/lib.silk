@@ -1,0 +1,356 @@
+//! Optional ICU 78.1 dictionary engines for Thai, Lao, Khmer and Myanmar.
+//! Port of PossibleWord and the four dictionary engines in dictbe.cpp at
+//! 049e0d6a420629ac7db77256987d083a563287b5. See ../LICENSE and the generator
+//! for source checksums. Native ICU is not a runtime dependency.
+import generated_thai as Thai
+import generated_lao as Lao
+import generated_khmer as Khmer
+import generated_myanmar as Myanmar
+import ucd.lib as Ucd
+import ucd.lib { LineBreak }
+import ucd.utf8 as Utf8
+import ucd.dictionary { DictionarySegmenter }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+pub struct IcuDictionary {}
+
+impl IcuDictionary {
+  pub fn make() -> Self {
+    return Self {}
+  }
+}
+
+struct Trie {
+  nodes: &'static [u8],
+  edges: &'static [u8],
+  root: usize,
+}
+
+fn dictionary(language: u32) -> Trie {
+  return match language {
+    1 => Trie { nodes: Thai.nodes(), edges: Thai.edges(), root: Thai.root() }
+    2 => Trie { nodes: Lao.nodes(), edges: Lao.edges(), root: Lao.root() }
+    3 => Trie { nodes: Khmer.nodes(), edges: Khmer.edges(), root: Khmer.root() }
+    _ => Trie { nodes: Myanmar.nodes(), edges: Myanmar.edges(), root: Myanmar.root() }
+  }
+}
+
+fn u16be(bytes: &[u8], at: usize) -> u32 {
+  return u32.shiftLeft(u8.toU32(bytes[at]), 8) | u8.toU32(bytes[at + 1])
+}
+
+fn u32be(bytes: &[u8], at: usize) -> usize {
+  return u32.toUsize(u32.shiftLeft(u16be(bytes, at), 16) | u16be(bytes, at + 2))
+}
+
+// Node records are (firstEdge:u32, edgeCount:u16, terminal:u8), edges are
+// (scalar:u16, child:u32), all big endian. Only generated trusted indices enter
+// these loads; text scalars are binary-searched, never used as array indices.
+fn child(trie: &Trie, node: usize, cp: u32) -> usize {
+  let record = node * 7
+  let first = u32be(trie.nodes, record)
+  let mut low: usize = 0
+  let mut high = u32.toUsize(u16be(trie.nodes, record + 4))
+  while low < high {
+    let mid = low + (high - low) / 2
+    let edge = (first + mid) * 6
+    let value = u16be(trie.edges, edge)
+    if value < cp {
+      low = mid + 1
+    } else if value > cp {
+      high = mid
+    } else {
+      return u32be(trie.edges, edge + 2)
+    }
+  }
+  return usize.MAX
+}
+
+// ICU's capacity is 20, not a heap vector. The generator verifies the maximum
+// number of nested dictionary terminals fits, so candidates are never dropped.
+struct PossibleWord {
+  offset: usize,
+  count: usize,
+  prefix: usize,
+  current: usize,
+  marked: usize,
+  ends: [usize; 20],
+  lengths: [usize; 20],
+}
+
+impl PossibleWord {
+  fn make() -> Self {
+    return Self {
+      offset: usize.MAX,
+      count: 0,
+      prefix: 0,
+      current: 0,
+      marked: 0,
+      ends: [0; 20],
+      lengths: [0; 20],
+    }
+  }
+
+  fn candidates(self: &mut Self, trie: &Trie, text: &[u8], start: usize, end: usize) -> usize {
+    if self.offset != start {
+      self.offset = start
+      self.count = 0
+      self.prefix = 0
+      let mut node = trie.root
+      let mut at = start
+      while at < end {
+        let decoded = Utf8.decode(text, at)
+        at = decoded.next
+
+        // ICU DictionaryMatcher includes the failed scalar in longestPrefix.
+        self.prefix = self.prefix + 1
+        let next = child(trie, node, decoded.cp)
+        if next == usize.MAX {
+          break
+        }
+        node = next
+        if trie.nodes[node * 7 + 6] != 0 {
+          self.ends[self.count] = at
+          self.lengths[self.count] = self.prefix
+          self.count = self.count + 1
+        }
+        if u16be(trie.nodes, node * 7 + 4) == 0 {
+          break
+        }
+      }
+    }
+    if self.count > 0 {
+      self.current = self.count - 1
+      self.marked = self.current
+    }
+    return self.count
+  }
+}
+
+// Preserve ICU's ordered three-word search. A shorter first word wins when it
+// admits a second and third word; two-word successes mark the first candidate
+// while the search continues. This is deliberately not longest-match-only.
+fn select(
+  first: &mut PossibleWord,
+  second: &mut PossibleWord,
+  third: &mut PossibleWord,
+  trie: &Trie,
+  text: &[u8],
+  end: usize,
+) {
+  if first.count <= 1 || first.ends[first.current] >= end {
+    return
+  }
+  while true {
+    let secondStart = first.ends[first.current]
+    if PossibleWord.candidates(&mut second, trie, text, secondStart, end) > 0 {
+      first.marked = first.current
+      if second.ends[second.current] >= end {
+        return
+      }
+      while true {
+        let thirdStart = second.ends[second.current]
+        if PossibleWord.candidates(&mut third, trie, text, thirdStart, end) > 0 {
+          first.marked = first.current
+          return
+        }
+        if second.current == 0 {
+          break
+        }
+        second.current = second.current - 1
+      }
+    }
+    if first.current == 0 {
+      return
+    }
+    first.current = first.current - 1
+  }
+}
+
+fn language(cp: u32) -> u32 {
+  let line = Ucd.lineBreak(cp)
+  let sa = match &line {
+    LineBreak.SA => true
+    _ => false
+  }
+  if !sa {
+    return 0
+  }
+  return match Ucd.script(cp).value {
+    0x54686169 => 1
+    0x4c616f6f => 2
+    0x4b686d72 => 3
+    0x4d796d72 => 4
+    _ => 0
+  }
+}
+
+fn beginWord(cp: u32, lang: u32) -> bool {
+  return match lang {
+    1 => (cp >= 0x0e01 && cp <= 0x0e2e) || (cp >= 0x0e40 && cp <= 0x0e44)
+    2 => (cp >= 0x0e81 && cp <= 0x0eae) || (cp >= 0x0edc && cp <= 0x0edd)
+      || (cp >= 0x0ec0 && cp <= 0x0ec4)
+    3 => cp >= 0x1780 && cp <= 0x17b3
+    _ => cp >= 0x1000 && cp <= 0x102a
+  }
+}
+
+fn endWord(cp: u32, lang: u32) -> bool {
+  if language(cp) != lang {
+    return false
+  }
+  return match lang {
+    1 => cp != 0x0e31 && !(cp >= 0x0e40 && cp <= 0x0e44)
+    2 => !(cp >= 0x0ec0 && cp <= 0x0ec4)
+    3 => cp != 0x17d2
+    _ => true
+  }
+}
+
+fn suffix(cp: u32) -> bool {
+  return cp == 0x0e2f || cp == 0x0e46
+}
+
+fn previous(text: &[u8], at: usize) -> u32 {
+  let mut start = at - 1
+  while start > 0 && (text[start] & 0xc0) == 0x80 {
+    start = start - 1
+  }
+  return Utf8.decode(text, start).cp
+}
+
+effect fn divide(text: &[u8], start: usize, end: usize, lang: u32, output: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // Native indexing is UTF-8. Preserve ICU's scalar guard for Thai and its
+  // native-unit guard for Lao, Khmer and Burmese (UText UTF-8 reference mode).
+  if lang == 1 {
+    let mut probe = start
+    let mut count: usize = 0
+    while probe < end && count < 4 {
+      probe = Utf8.decode(text, probe).next
+      count = count + 1
+    }
+    if probe >= end {
+      return
+    }
+  } else if end - start < 4 {
+    return
+  }
+  let trie = dictionary(lang)
+  let mut first = PossibleWord.make()
+  let mut second = PossibleWord.make()
+  let mut third = PossibleWord.make()
+  let mut at = start
+  while at < end {
+    let current = at
+    let mut cpLength: usize = 0
+    if PossibleWord.candidates(&mut first, &trie, text, current, end) > 0 {
+      select(&mut first, &mut second, &mut third, &trie, text, end)
+      at = first.ends[first.marked]
+      cpLength = first.lengths[first.marked]
+    }
+
+    // Unknown-word combination and resynchronization use both root length
+    // and dictionary-prefix thresholds, plus each language's begin/end sets.
+    if at < end && cpLength < 3 {
+      let count = PossibleWord.candidates(&mut second, &trie, text, at, end)
+      if count == 0 && (at == current || second.prefix < 3) {
+        while at < end {
+          let decoded = Utf8.decode(text, at)
+          at = decoded.next
+          if at >= end {
+            break
+          }
+          if endWord(decoded.cp, lang) && beginWord(Utf8.decode(text, at).cp, lang) {
+            if PossibleWord.candidates(&mut third, &trie, text, at, end) > 0 {
+              break
+            }
+          }
+        }
+      }
+    }
+
+    // A leading mark belongs to the word before it, even after fallback.
+    while at < end {
+      let decoded = Utf8.decode(text, at)
+      if !Ucd.isMark(decoded.cp) && decoded.cp != 0x20 {
+        break
+      }
+      at = decoded.next
+    }
+    if lang == 1 && at < end && at > current {
+      if PossibleWord.candidates(&mut second, &trie, text, at, end) == 0 {
+        let cp = Utf8.decode(text, at).cp
+        if cp == 0x0e2f && !suffix(previous(text, at)) {
+          at = Utf8.decode(text, at).next
+        }
+        if at < end && Utf8.decode(text, at).cp == 0x0e46 && previous(text, at) != 0x0e46 {
+          at = Utf8.decode(text, at).next
+        }
+      }
+    }
+
+    // A candidate or the unknown-word scanner always advances at least one
+    // scalar. Range end belongs to the enclosing segmenter, not this engine.
+    if at < end {
+      run List<usize>.append(&mut output, at)
+    }
+  }
+}
+
+// ICU dictbe.cpp removes the end of each dictionary range. Its enclosing
+// line.txt $ALPlus rule keeps SA and AL in one alphabetic run. In particular,
+// exiting the SA set is not itself a word boundary: same-script alphabetic
+// symbols can continue a word without belonging to the dictionary engine.
+fn alphabeticContinuation(left: u32, right: u32) -> bool {
+  if Ucd.script(left).value != Ucd.script(right).value {
+    return false
+  }
+  if language(left) != 0 {
+    let next = Ucd.lineBreak(right)
+    return match &next {
+      LineBreak.AL => true
+      _ => false
+    }
+  }
+  if language(right) != 0 {
+    let prior = Ucd.lineBreak(left)
+    return match &prior {
+      LineBreak.AL => true
+      _ => false
+    }
+  }
+  return false
+}
+
+impl DictionarySegmenter for IcuDictionary {
+  effect fn breaks(self: &Self, text: &[u8], output: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run List<usize>.append(&mut output, 0)
+    let mut at: usize = 0
+
+    // Non-dictionary spans are opaque; only edges outside same-script
+    // alphabetic continuations are emitted. Use ucd.segmentation for UAX29.
+    while at < text.length {
+      let start = at
+      let lang = language(Utf8.decode(text, at).cp)
+      at = Utf8.decode(text, at).next
+      while at < text.length && language(Utf8.decode(text, at).cp) == lang {
+        at = Utf8.decode(text, at).next
+      }
+      if lang != 0 {
+        run divide(text, start, at, lang, &mut output)
+      }
+      if at == text.length
+        || !alphabeticContinuation(previous(text, at), Utf8.decode(text, at).cp) {
+        run List<usize>.append(&mut output, at)
+      }
+    }
+  }
+}

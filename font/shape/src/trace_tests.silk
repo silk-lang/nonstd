@@ -1,0 +1,299 @@
+import test_fonts
+import silk.collections.bytes { Bytes }
+import silk.system.filesystem { FileError }
+import silk.system.host_input { HostInputError }
+//! Behavioral ports of upstream tests/tracing.rs.
+import buffer { Buffer, ContentType, GlyphInfos, GlyphPositions }
+import font { ShaperData, ConfiguredShaper, FontFuncs, DefaultFontFuncs }
+import shape { shapeWithFeatures }
+import serialize { serialize, serializeWithoutFont }
+import generated_fixtures as Fixtures
+import silk.concurrency.sync { Mutex, MutexGuard }
+import silk.text.string { String }
+import silk.collections.list { List }
+import silk.core.result { Result }
+import read_fonts.lib { FontRef, ReadError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+
+struct Message {
+  text: String,
+  snapshot: String,
+  content: ContentType,
+  positioned: bool,
+  validViews: bool,
+}
+
+struct Observer {
+  messages: Mutex<List<Message>>,
+  reject: string,
+  rejectSecond: string,
+}
+
+impl FontFuncs for Observer {
+  fn isDefault(self: &Self) -> bool {
+    return true
+  }
+
+  fn tracing(self: &Self) -> bool {
+    return true
+  }
+
+  effect fn message(
+    self: &Self,
+    font: &ConfiguredShaper<Self>,
+    buffer: &Buffer,
+    text: string,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let snapshot = run serialize(font, buffer, 0)
+    let positions = GlyphPositions.len(&Buffer.glyphPositions(buffer))
+    let record = Message {
+      text: run String.copy(text),
+      snapshot: move snapshot,
+      content: buffer.contentType,
+      positioned: positions != 0,
+      validViews: GlyphInfos.len(&Buffer.glyphInfos(buffer)) == Buffer.len(buffer)
+        && (positions == 0 || positions == Buffer.len(buffer)),
+    }
+    let mut guard = Mutex<List<Message>>.lock(&self.messages)
+    run List<Message>.append(MutexGuard.getMut(&mut guard), move record)
+    return (self.reject == "" || !String.startsWith(text, self.reject))
+      && (self.rejectSecond == "" || !String.startsWith(text, self.rejectSecond))
+  }
+}
+
+effect fn input(buffer: &mut Buffer, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  Buffer.clear(&mut buffer)
+  run Buffer.pushStr(&mut buffer, text)
+  Buffer.guessSegmentProperties(&mut buffer)
+}
+
+effect fn cases() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError
+  ? &mut Allocator {
+  let robotoFontBytes = run test_fonts.read("benches/fonts/Roboto-Regular.ttf")
+  let source = match move FontRef.new(Bytes.asSlice(&robotoFontBytes)) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      run Testing.expect(false, "Roboto font")
+      return
+    }
+  }
+  let data = ShaperData.new(&source)
+  let observer = Observer {
+    messages: run Mutex<List<Message>>.make(List<Message>.make()),
+    reject: "",
+    rejectSecond: "",
+  }
+  let mut font = ConfiguredShaper.withFontFuncs(ShaperData.shaper(&data), move observer)
+  let mut buffer = Buffer.new()
+  run input(&mut buffer, "o\u{0301}ffice AV")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  let mut count: usize = 0
+  if true {
+    let guard = Mutex<List<Message>>.lock(&font.funcs.messages)
+    let rows = List<Message>.asSlice(MutexGuard.get(&guard))
+    count = rows.length
+    run Testing.expect(
+      count > 10 && String.view(&rows[0].text) == "start decompose",
+      "first callback is normalization",
+    )
+    run Testing.expect(
+      String.view(&rows[0].snapshot)
+        == "<U+006F=0|U+0301=0|U+0066=3|U+0066=4|U+0069=5|U+0063=6|U+0065=7|U+0020=8|U+0041=9|U+0056=10>",
+      "trace observes clustered Unicode before mapping",
+    )
+    let expected = [
+      "start decompose",
+      "end decompose",
+      "start reorder",
+      "end reorder",
+      "start compose",
+      "end compose",
+    ]
+    let mut normalization: usize = 0
+    let mut gsub = false
+    let mut gpos = false
+    let mut i: usize = 0
+    while i < rows.length {
+      let message = String.view(&rows[i].text)
+      run Testing.expect(
+        rows[i].validViews && String.ownedByteLength(&rows[i].snapshot) != 0,
+        "callback gets coherent nonempty glyph views",
+      )
+      if String.endsWith(message, "decompose") || String.endsWith(message, "reorder")
+        || String.endsWith(message, "compose") {
+        run Testing.expect(
+          normalization < 6 && message == expected[normalization],
+          "normalization callbacks stay ordered",
+        )
+        normalization = normalization + 1
+      }
+      if String.startsWith(message, "start table GSUB") {
+        gsub = rows[i].content == ContentType.Glyphs && !rows[i].positioned
+      }
+      if String.startsWith(message, "end table GPOS") {
+        gpos = rows[i].positioned
+      }
+      i = i + 1
+    }
+    run Testing.expect(
+      normalization == 6 && gsub && gpos,
+      "tracing observes Unicode, glyph IDs, and positioned glyphs",
+    )
+  }
+  run input(&mut buffer, "o\u{0301}ffice AV")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  Buffer.reset(&mut buffer)
+  run input(&mut buffer, "o\u{0301}ffice AV")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  if true {
+    let guard = Mutex<List<Message>>.lock(&font.funcs.messages)
+    run Testing.expect(
+      List<Message>.length(MutexGuard.get(&guard)) == count * 3,
+      "observer survives clear and reset",
+    )
+  }
+  run input(&mut buffer, "ffi AV")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  let normal = run serialize(&font, &buffer, 0)
+  font.funcs.reject = "end"
+  run input(&mut buffer, "ffi AV")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  let endRejected = run serialize(&font, &buffer, 0)
+  run Testing.expect(
+    String.view(&normal) == String.view(&endRejected),
+    "end-message return values cannot suppress shaping",
+  )
+  font.funcs.reject = "start table GSUB"
+  run input(&mut buffer, "ffi")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  run Testing.expect(Buffer.len(&buffer) == 3, "rejecting GSUB skips ligatures")
+  font.funcs.reject = "start lookup"
+  if true {
+    let mut guard = Mutex<List<Message>>.lock(&font.funcs.messages)
+    List<Message>.clear(MutexGuard.getMut(&mut guard))
+  }
+  run input(&mut buffer, "ffi")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  run Testing.expect(Buffer.len(&buffer) == 3, "rejecting lookups skips their operations")
+  if true {
+    let guard = Mutex<List<Message>>.lock(&font.funcs.messages)
+    let rows = List<Message>.asSlice(MutexGuard.get(&guard))
+    let mut i: usize = 0
+    let mut found = false
+    while i < rows.length {
+      let text = String.view(&rows[i].text)
+      if String.startsWith(text, "start lookup") && String.contains(text, "feature 'liga'") {
+        found = true
+      }
+      run Testing.expect(
+        !String.startsWith(text, "end lookup") && !String.startsWith(text, "ligating"),
+        "skipped lookups have no operations or end message",
+      )
+      i = i + 1
+    }
+    run Testing.expect(found, "lookup messages identify the feature")
+  }
+  font.funcs.reject = "start compose"
+  font.funcs.rejectSecond = "start table GSUB"
+  run input(&mut buffer, "o\u{0301}")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  run Testing.expect(
+    Buffer.len(&buffer) == 2,
+    "composition can be suppressed independently of GSUB",
+  )
+  let withoutExtents = run serializeWithoutFont(&buffer, 0)
+  let requestedExtents = run serializeWithoutFont(&buffer, 8)
+  run Testing.expect(
+    String.view(&withoutExtents) == String.view(&requestedExtents),
+    "missing extents are omitted without a font",
+  )
+  Buffer.setTracing(&mut buffer, false)
+  run input(&mut buffer, "ffi")
+  drop run shapeWithFeatures(&font, &mut buffer, &[])
+  run Testing.expect(Buffer.len(&buffer) == 1, "disabling tracing also disables rejection")
+}
+
+test effect fn tracingCallbacksAndRejection() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cases() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct LimitObserver {
+  coherent: Mutex<bool>,
+}
+
+impl FontFuncs for LimitObserver {
+  fn isDefault(self: &Self) -> bool {
+    return true
+  }
+
+  fn tracing(self: &Self) -> bool {
+    return true
+  }
+
+  effect fn message(
+    self: &Self,
+    font: &ConfiguredShaper<Self>,
+    buffer: &Buffer,
+    text: string,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = Mutex<bool>.lock(&self.coherent)
+    let value = MutexGuard.getMut(&mut guard)
+    value.* = value.* && GlyphInfos.len(&Buffer.glyphInfos(buffer)) == Buffer.len(buffer)
+    return true
+  }
+}
+
+effect fn limitCase() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError
+  ? &mut Allocator {
+  let bytes = run test_fonts.read("tests/fonts/text-rendering-tests/TestGSUBThree.ttf")
+  let source = match move FontRef.new(Bytes.asSlice(&bytes)) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      run Testing.expect(false, "work-limit font")
+      return
+    }
+  }
+  let data = ShaperData.new(&source)
+  let font = ShaperData.shaper(&data)
+  let traced = ConfiguredShaper<LimitObserver>.withFuncs(
+    &data,
+    LimitObserver { coherent: run Mutex<bool>.make(true) },
+  )
+  let mut normal = Buffer.new()
+  let mut observed = Buffer.new()
+  run input(&mut normal, "lol")
+  run input(&mut observed, "lol")
+  drop run shapeWithFeatures(&font, &mut normal, &[])
+  drop run shapeWithFeatures(&traced, &mut observed, &[])
+  run Testing.expect(
+    Buffer.allocationSuccessful(&normal) == Buffer.allocationSuccessful(&observed)
+      && Buffer.len(&normal) == Buffer.len(&observed),
+    "tracing preserves failed-allocation state and length",
+  )
+  let expected = run serialize(&font, &normal, 0)
+  let actual = run serialize(&traced, &observed, 0)
+  run Testing.expect(
+    String.view(&expected) == String.view(&actual),
+    "tracing preserves every output byte at the shaping limit",
+  )
+  let guard = Mutex<bool>.lock(&traced.funcs.coherent)
+  run Testing.expect(MutexGuard.get(&guard).*, "all work-limit callbacks receive coherent views")
+}
+
+test effect fn tracingAtShapingLimit() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run limitCase() |> Effect.provideMut<Allocator>(&mut allocator)
+}

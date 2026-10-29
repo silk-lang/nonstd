@@ -1,0 +1,481 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Glyph names from post/CFF, with inline UTF-8 storage and synthesized fallbacks.
+import table_provider { TableProvider }
+import tables.post { Post, GlyphNames as PostGlyphNames, GlyphNameEntry as PostGlyphNameEntry }
+import tables.maxp { SelectedMaxp }
+import tables.head { Head }
+import tables.cff { Cff }
+import ps.cff.font { CffFontRef }
+import ps.cff.charset { Charset, Iter as CharsetIter, CharsetEntry }
+import ps.string { Sid }
+import font_data { FontData }
+import font_types.lib { GlyphId, GlyphId16 }
+import read { ReadError }
+import model.error { Error }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.slice { Slice }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Display, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.core.order { Order, Ordering }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+pub enum GlyphNameSource {
+  Post,
+  Cff,
+  Type1,
+  Synthesized,
+}
+
+pub struct GlyphName {
+  name: [u8; 63],
+  length: u8,
+  nameSource: GlyphNameSource,
+}
+
+impl Copy for GlyphName {}
+
+impl GlyphName {
+  pub fn asStr(self: &Self) -> string {
+    return String.fromUtf8(Slice.view(&self.name, 0, u8.toUsize(self.length)))
+      |> Result<string, InvalidUtf8>.unwrapOr("")
+  }
+
+  pub fn source(self: &Self) -> GlyphNameSource {
+    return self.nameSource
+  }
+
+  pub fn isSynthesized(self: &Self) -> bool {
+    return self.nameSource == GlyphNameSource.Synthesized
+  }
+
+  pub fn fromBytes(bytes: &[u8], source: GlyphNameSource) -> Option<Self> {
+    let value = match move String.fromUtf8(bytes) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      _ => {
+        return Option<Self>.None
+      }
+    }
+    if bytes.length == 0 {
+      return Option<Self>.None
+    }
+    let mut count = bytes.length
+    if count > 63 {
+      count = 63
+    }
+    while !String.isCharBoundary(value, count) {
+      count = count - 1
+    }
+    let mut name = GlyphName { name: [0; 63], length: usize.toU8(count), nameSource: source }
+    let mut i: usize = 0
+    while i < count {
+      name.name[i] = bytes[i]
+      i = i + 1
+    }
+    return Option<Self>.some(name)
+  }
+
+  pub fn synthesized(glyph: GlyphId) -> Self {
+    let mut name = GlyphName { name: [0; 63], length: 3, nameSource: GlyphNameSource.Synthesized }
+    name.name[0] = 103
+    name.name[1] = 105
+    name.name[2] = 100
+    let mut digits: [u8; 10] = [0; 10]
+    let mut count: usize = 0
+    let mut value = GlyphId.toU32(glyph)
+    while true {
+      digits[count] = u32.toU8(value % 10) + 48
+      count = count + 1
+      value = value / 10
+      if value == 0 {
+        break
+      }
+    }
+    let mut at: usize = 3
+    while count > 0 {
+      count = count - 1
+      name.name[at] = digits[count]
+      at = at + 1
+    }
+    name.length = usize.toU8(at)
+    return name
+  }
+}
+
+impl Display for GlyphName {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Writer.writeString(GlyphName.asStr(self))
+  }
+}
+
+union NameSource<'a> {
+  Post { post: Post<'a> },
+  SfntCff { cff: Cff<'a>, charset: Charset<'a> },
+  StandaloneCff { cff: CffFontRef<'a>, charset: Charset<'a> },
+  Synthesized,
+}
+
+pub struct GlyphNameMap<'a> {
+  nameSource: NameSource<'a>,
+  count: u32,
+}
+
+impl<'a> GlyphNameMap<'a> {
+  pub fn new<P: TableProvider<'a>>(provider: &P) -> Self {
+    let count = match move TableProvider.selectedMaxp(provider) {
+      Result<SelectedMaxp<'a>, ReadError>.Success { value } => SelectedMaxp.numGlyphs(&value)
+      _ => 0
+    }
+    if let Result<Post<'a>, ReadError>.Success { value } = TableProvider.post(provider) {
+      if Post.numNames(&value) != 0 {
+        return Self { nameSource: NameSource<'a>.Post { post: value }, count: count }
+      }
+    }
+    if let Result<Cff<'a>, ReadError>.Success { value } = TableProvider.cff(provider) {
+      let mut upem = match move TableProvider.head(provider) {
+        Result<Head<'a>, ReadError>.Success { value: head } => Head.unitsPerEm(&head)
+        _ => 0
+      }
+      if upem < 16 || upem > 16384 {
+        upem = 1000
+      }
+      if let Result<CffFontRef<'a>, Error>.Success { value: font } = CffFontRef.newCff(
+        FontData.asBytes(&Cff.offsetData(&value)),
+        0,
+        Option<i32>.some(u16.toI32(upem)),
+      ) {
+        if CffFontRef.isCid(&font) {
+          return Self { nameSource: NameSource<'a>.Synthesized, count: count }
+        }
+      }
+      if let Option<Charset<'a>>.Some { value: charset } = Cff.charset(&value, 0) {
+        return Self {
+          nameSource: NameSource<'a>.SfntCff { cff: value, charset: charset },
+          count: count,
+        }
+      }
+    }
+    return Self { nameSource: NameSource<'a>.Synthesized, count: count }
+  }
+
+  pub fn fromCff(cff: CffFontRef<'a>) -> Self {
+    let count = CffFontRef.numGlyphs(&cff)
+    if !CffFontRef.isCid(&cff) {
+      if let Option<Charset<'a>>.Some { value: charset } = CffFontRef.charset(&cff) {
+        return Self {
+          nameSource: NameSource<'a>.StandaloneCff { cff: move cff, charset: charset },
+          count: count,
+        }
+      }
+    }
+    return Self { nameSource: NameSource<'a>.Synthesized, count: count }
+  }
+
+  pub fn numGlyphs(self: &Self) -> u32 {
+    return self.count
+  }
+
+  pub fn glyphName(self: &Self, glyph: GlyphId) -> Option<GlyphName> {
+    if GlyphId.toU32(glyph) >= self.count {
+      return Option<GlyphName>.None
+    }
+    let mut name = Option<GlyphName>.None
+    match &self.nameSource {
+      NameSource<'a>.Post { post } => {
+        if GlyphId.toU32(glyph) <= 65535 {
+          if let Option<string<'a>>.Some { value } = Post.glyphName(
+            &post,
+            GlyphId16.new(u32.toU16(GlyphId.toU32(glyph))),
+          ) {
+            name = GlyphName.fromBytes(String.utf8Bytes(value), GlyphNameSource.Post)
+          }
+        }
+      }
+      NameSource<'a>.SfntCff { cff, charset } => {
+        if let Option<Sid>.Some { value: sid } = Charset.stringId(&charset, glyph) {
+          if let Option<&'a [u8]>.Some { value: bytes } = Cff.string(&cff, sid) {
+            name = GlyphName.fromBytes(bytes, GlyphNameSource.Cff)
+          }
+        }
+      }
+      NameSource<'a>.StandaloneCff { cff, charset } => {
+        if let Option<Sid>.Some { value: sid } = Charset.stringId(&charset, glyph) {
+          if let Option<&'a [u8]>.Some { value: bytes } = CffFontRef.string(&cff, sid) {
+            name = GlyphName.fromBytes(bytes, GlyphNameSource.Cff)
+          }
+        }
+      }
+      NameSource<'a>.Synthesized => {}
+    }
+    return Option<GlyphName>.some(
+      move name |> Option<GlyphName>.unwrapOr(GlyphName.synthesized(glyph)),
+    )
+  }
+
+  fn cffString(self: &Self, sid: Sid) -> Option<&'a [u8]> {
+    return match &self.nameSource {
+      NameSource<'a>.SfntCff { cff, charset } => Cff.string(&cff, sid)
+      NameSource<'a>.StandaloneCff { cff, charset } => CffFontRef.string(&cff, sid)
+      _ => Option<&'a [u8]>.None
+    }
+  }
+
+  pub fn glyphNames<'s>(self: &'s Self) -> GlyphNames<'s, 'a> {
+    let mut source = NameIterSource<'a>.Synthesized
+    match &self.nameSource {
+      NameSource<'a>.Post { post } => {
+        let mut names = Post.glyphNames(&post)
+        let first = PostGlyphNames.next(&mut names)
+        let mut pending = PostGlyphNameEntry<'a> { glyph: GlyphId.new(0), name: "" }
+        let mut present = false
+        if let Option<PostGlyphNameEntry<'a>>.Some { value } = move first {
+          pending = value
+          present = true
+        }
+        source = NameIterSource<'a>.Post { names: names, pending: pending, present: present }
+      }
+      NameSource<'a>.SfntCff { cff, charset } => {
+        source = NameIterSource<'a>.Cff { names: Charset.iter(&charset) }
+      }
+      NameSource<'a>.StandaloneCff { cff, charset } => {
+        source = NameIterSource<'a>.Cff { names: Charset.iter(&charset) }
+      }
+      NameSource<'a>.Synthesized => {}
+    }
+    return GlyphNames<'s, 'a> { map: self, source: source, nextGlyph: 0 }
+  }
+}
+
+union NameIterSource<'a> {
+  Post { names: PostGlyphNames<'a>, pending: PostGlyphNameEntry<'a>, present: bool },
+  Cff { names: CharsetIter<'a> },
+  Synthesized,
+}
+
+impl<'a> Copy for NameIterSource<'a> {}
+
+pub struct GlyphNameEntry {
+  pub glyph: GlyphId,
+  pub name: GlyphName,
+}
+
+impl Copy for GlyphNameEntry {}
+
+struct StoredName<'a> {
+  text: string<'a>,
+  source: GlyphNameSource,
+}
+
+impl<'a> Copy for StoredName<'a> {}
+
+struct StoredEntry<'a> {
+  glyph: GlyphId,
+  name: Option<StoredName<'a>>,
+}
+
+pub struct GlyphNames<'s, 'a> {
+  map: &'s GlyphNameMap<'a>,
+  source: NameIterSource<'a>,
+  nextGlyph: u32,
+}
+
+impl<'s, 'a> GlyphNames<'s, 'a> {
+  pub fn len(self: &Self) -> usize {
+    return u32.toUsize(self.map.count - self.nextGlyph)
+  }
+
+  fn nextStored(self: &mut Self) -> Option<StoredEntry<'a>> {
+    if self.nextGlyph >= self.map.count {
+      return Option<StoredEntry<'a>>.None
+    }
+    let glyph = GlyphId.new(self.nextGlyph)
+    self.nextGlyph = self.nextGlyph + 1
+    let mut name = Option<StoredName<'a>>.None
+    match self.source {
+      NameIterSource<'a>.Post { names, pending, present } => {
+        if present && GlyphId.toU32(pending.glyph) == GlyphId.toU32(glyph) {
+          if String.byteLength(pending.name) > 0 {
+            name = Option<StoredName<'a>>.some(
+              StoredName<'a> { text: pending.name, source: GlyphNameSource.Post },
+            )
+          }
+          let mut nextNames = names
+          let next = PostGlyphNames.next(&mut nextNames)
+          let mut nextPending = pending
+          let mut hasNext = false
+          if let Option<PostGlyphNameEntry<'a>>.Some { value } = move next {
+            nextPending = value
+            hasNext = true
+          }
+          self.source = NameIterSource<'a>.Post {
+            names: nextNames,
+            pending: nextPending,
+            present: hasNext
+          }
+        }
+      }
+      NameIterSource<'a>.Cff { names } => {
+        let mut nextNames = names
+        let next = CharsetIter.next(&mut nextNames)
+        self.source = NameIterSource<'a>.Cff { names: nextNames }
+        if let Option<CharsetEntry>.Some { value } = move next {
+          if GlyphId.toU32(value.glyph) == GlyphId.toU32(glyph) {
+            if let Option<&'a [u8]>.Some { value: bytes } = GlyphNameMap.cffString(
+              self.map,
+              value.sid,
+            ) {
+              if let Result<string<'a>, InvalidUtf8>.Success { value: text } = String.fromUtf8(
+                bytes,
+              ) {
+                if String.byteLength(text) > 0 {
+                  name = Option<StoredName<'a>>.some(
+                    StoredName<'a> { text: text, source: GlyphNameSource.Cff },
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+      NameIterSource<'a>.Synthesized => {}
+    }
+    return Option<StoredEntry<'a>>.some(StoredEntry<'a> { glyph: glyph, name: move name })
+  }
+
+  pub fn next(self: &mut Self) -> Option<GlyphNameEntry> {
+    let entry = match move GlyphNames.nextStored(&mut self) {
+      Option<StoredEntry<'a>>.Some { value } => move value
+      _ => {
+        return Option<GlyphNameEntry>.None
+      }
+    }
+    let mut name = GlyphName.synthesized(entry.glyph)
+    if let Option<StoredName<'a>>.Some { value } = move entry.name {
+      name = GlyphName.fromBytes(String.utf8Bytes(value.text), value.source)
+        |> Option<GlyphName>.unwrapOr(name)
+    }
+    return Option<GlyphNameEntry>.some(GlyphNameEntry { glyph: entry.glyph, name: name })
+  }
+}
+
+struct SortingName<'a> {
+  text: string<'a>,
+  glyph: u32,
+}
+
+impl<'a> Copy for SortingName<'a> {}
+
+fn compareBytes(a: &[u8], b: &[u8]) -> Ordering {
+  let mut i: usize = 0
+  while i < a.length && i < b.length {
+    if a[i] < b[i] {
+      return Ordering.Less
+    }
+    if a[i] > b[i] {
+      return Ordering.Greater
+    }
+    i = i + 1
+  }
+  if a.length < b.length {
+    return Ordering.Less
+  }
+  if a.length > b.length {
+    return Ordering.Greater
+  }
+  return Ordering.Equal
+}
+
+impl<'a> Order for SortingName<'a> {
+  fn compare(a: &Self, b: &Self) -> Ordering {
+    let order = compareBytes(String.utf8Bytes(a.text), String.utf8Bytes(b.text))
+    if order != Ordering.Equal {
+      return order
+    }
+    if a.glyph < b.glyph {
+      return Ordering.Less
+    }
+    if a.glyph > b.glyph {
+      return Ordering.Greater
+    }
+    return Ordering.Equal
+  }
+}
+
+struct NameRange {
+  start: usize,
+  end: usize,
+  glyph: u32,
+}
+
+impl Copy for NameRange {}
+
+pub struct GlyphNameIndex {
+  names: List<u8>,
+  entries: List<NameRange>,
+}
+
+impl GlyphNameIndex {
+  pub effect fn new<'a>(map: &GlyphNameMap<'a>) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut sorting = List<SortingName<'a>>.make()
+    let mut iter = GlyphNameMap.glyphNames(map)
+    while let Option<StoredEntry<'a>>.Some { value } = GlyphNames.nextStored(&mut iter) {
+      if let Option<StoredName<'a>>.Some { value: name } = move value.name {
+        run List<SortingName<'a>>.append(
+          &mut sorting,
+          SortingName<'a> { text: name.text, glyph: GlyphId.toU32(value.glyph) },
+        )
+      }
+    }
+    run List<SortingName<'a>>.sort(&mut sorting)
+    let mut names = List<u8>.make()
+    let mut entries = List<NameRange>.make()
+    let mut i: usize = 0
+    while i < List<SortingName<'a>>.length(&sorting) {
+      let entry = List<SortingName<'a>>.get(&sorting, i)
+      let start = List<u8>.length(&names)
+      run List<u8>.appendBytes(&mut names, String.utf8Bytes(entry.text))
+      run List<NameRange>.append(
+        &mut entries,
+        NameRange { start: start, end: List<u8>.length(&names), glyph: entry.glyph },
+      )
+      i = i + 1
+    }
+    return GlyphNameIndex { names: move names, entries: move entries }
+  }
+
+  pub fn get(self: &Self, name: string) -> Option<GlyphId> {
+    let key = String.utf8Bytes(name)
+    let names = List<u8>.asSlice(&self.names)
+    let mut low: usize = 0
+    let mut high = List<NameRange>.length(&self.entries)
+    while low < high {
+      let mid = low + (high - low) / 2
+      let entry = List<NameRange>.get(&self.entries, mid)
+      if compareBytes(Slice.view(names, entry.start, entry.end - entry.start), key)
+        == Ordering.Less {
+        low = mid + 1
+      } else {
+        high = mid
+      }
+    }
+    if low < List<NameRange>.length(&self.entries) {
+      let entry = List<NameRange>.get(&self.entries, low)
+      if compareBytes(Slice.view(names, entry.start, entry.end - entry.start), key)
+        == Ordering.Equal {
+        return Option<GlyphId>.some(GlyphId.new(entry.glyph))
+      }
+    }
+    return Option<GlyphId>.None
+  }
+}

@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Materialize WHATWG Encoding data as packed original Silk tables.
+
+Default: offline, verify every cached source against encodings.lock.json.
+--fetch: hydrate missing cache files from the lock's immutable URLs, verifying hashes.
+--update REVISION: explicitly select a 40-hex upstream commit and replace the lock.
+No host codecs, runtime dependencies, formatter, compiler, or test runner are used.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[3]
+LOCK = ROOT / "css/style/encodings.lock.json"
+CACHE = ROOT / "css/style/.cache/encodings"
+OUTPUT = ROOT / "css/style/src/encoding_data.silk"
+SPEC_SHA256 = "e1421f1791b202717883c452a6267129ce5fb3ca13652e5022a2b6d2a11fc262"
+# Explicit names avoid coupling the data's IDs to Silk enum discriminants.
+VARIANTS = {
+    "UTF-8": "Utf8", "IBM866": "Ibm866",
+    **{f"ISO-8859-{n}": f"Iso8859_{n}" for n in (2, 3, 4, 5, 6, 7, 8, 10, 13, 14, 15, 16)},
+    "ISO-8859-8-I": "Iso8859_8I", "KOI8-R": "Koi8R", "KOI8-U": "Koi8U",
+    "macintosh": "Macintosh", "windows-874": "Windows874",
+    **{f"windows-{n}": f"Windows{n}" for n in range(1250, 1259)},
+    "x-mac-cyrillic": "XMacCyrillic", "GBK": "Gbk", "gb18030": "Gb18030",
+    "Big5": "Big5", "EUC-JP": "EucJp", "ISO-2022-JP": "Iso2022Jp",
+    "Shift_JIS": "ShiftJis", "EUC-KR": "EucKr", "replacement": "Replacement",
+    "UTF-16BE": "Utf16Be", "UTF-16LE": "Utf16Le", "x-user-defined": "XUserDefined",
+}
+MULTI = {"gb18030": "gb18030", "big5": "big5", "jis0208": "jis0208",
+         "jis0212": "jis0212", "euc-kr": "eucKr"}
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def download(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "silk-svg-encoding-data/1"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def replace_if_changed(path: Path, data: bytes) -> None:
+    if not path.exists() or path.read_bytes() != data:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+
+def encodings(data: bytes) -> tuple[list[dict], list[dict]]:
+    groups = json.loads(data)
+    all_encodings = [entry for group in groups for entry in group["encodings"]]
+    if {entry["name"] for entry in all_encodings} != set(VARIANTS):
+        raise ValueError("upstream encoding names changed; review enum and algorithm support")
+    single = next(group["encodings"] for group in groups
+                  if group["heading"] == "Legacy single-byte encodings")
+    return all_encodings, single
+
+
+def source_names(labels: bytes) -> list[str]:
+    _, single = encodings(labels)
+    indexes = {entry["name"].lower() for entry in single if entry["name"] != "ISO-8859-8-I"}
+    indexes.update(MULTI)
+    indexes.add("gb18030-ranges")
+    return ["LICENSE", "encodings.json"] + [f"index-{name}.txt" for name in sorted(indexes)]
+
+
+def update(revision: str) -> tuple[dict, dict[str, bytes]]:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("--update requires an immutable lowercase 40-hex commit")
+    base = f"https://raw.githubusercontent.com/whatwg/encoding/{revision}/"
+    labels = download(base + "encodings.json")
+    sources = {"encodings.json": labels}
+    for name in source_names(labels):
+        if name not in sources:
+            sources[name] = download(base + name)
+    records = []
+    for name in sorted(sources):
+        data = sources[name]
+        record = {"name": name, "url": base + name, "sha256": digest(data), "bytes": len(data)}
+        for key in ("Identifier", "Date"):
+            match = re.search(r"^# " + key + r": (.+)$", data.decode("utf-8"), re.MULTILINE)
+            if match:
+                record[key.lower()] = match.group(1)
+        records.append(record)
+        replace_if_changed(CACHE / digest(data), data)
+    lock = {
+        "format": 1,
+        "repository": "https://github.com/whatwg/encoding",
+        "revision": revision,
+        "specification": {"url": "https://encoding.spec.whatwg.org/", "sha256": SPEC_SHA256},
+        "license": {
+            "source": base + "LICENSE", "sha256": digest(sources["LICENSE"]),
+            "copyright": "Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).",
+            "upstream": "CC-BY-4.0; portions incorporated into source code are BSD-3-Clause",
+            "generated_data": "BSD-3-Clause",
+        },
+        "sources": records,
+    }
+    return lock, sources
+
+
+def load(fetch: bool) -> tuple[dict, dict[str, bytes]]:
+    lock = json.loads(LOCK.read_bytes())
+    if lock["format"] != 1 or not re.fullmatch(r"[0-9a-f]{40}", lock["revision"]):
+        raise ValueError("invalid encoding lock format or revision")
+    base = f"https://raw.githubusercontent.com/whatwg/encoding/{lock['revision']}/"
+    sources = {}
+    for record in lock["sources"]:
+        if record["url"] != base + record["name"]:
+            raise ValueError("source URL is not pinned to the locked official revision")
+        if not re.fullmatch(r"[0-9a-f]{64}", record["sha256"]):
+            raise ValueError("invalid source hash")
+        path = CACHE / record["sha256"]
+        if not path.exists():
+            if not fetch:
+                raise ValueError(f"missing cached {record['name']}; use --fetch to hydrate the locked cache")
+            data = download(record["url"])
+        else:
+            data = path.read_bytes()
+        if digest(data) != record["sha256"] or len(data) != record["bytes"]:
+            raise ValueError(f"hash/length mismatch for {record['name']}")
+        replace_if_changed(path, data)
+        if record["name"] in sources:
+            raise ValueError("duplicate source record")
+        sources[record["name"]] = data
+    if set(sources) != set(source_names(sources["encodings.json"])):
+        raise ValueError("lock does not contain exactly the required index and license sources")
+    if lock["license"]["sha256"] != digest(sources["LICENSE"]):
+        raise ValueError("license provenance hash mismatch")
+    return lock, sources
+
+
+def index(data: bytes) -> dict[int, int]:
+    result = {}
+    # The standard specifies LF, not Unicode splitlines (index comments contain NEL).
+    for line in data.decode("utf-8").split("\n"):
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        pointer, cp = int(fields[0]), int(fields[1], 16)
+        if pointer < 0 or pointer in result or not (0 <= cp <= 0x10FFFF) or 0xD800 <= cp <= 0xDFFF:
+            raise ValueError("invalid index entry")
+        result[pointer] = cp
+    return result
+
+
+def packed_function(name: str, data: bytes) -> str:
+    literal = "".join(f"\\x{byte:02x}" for byte in data)
+    return f'fn {name}() -> &\'static [u8] {{\n  return b"{literal}"\n}}\n\n'
+
+
+def packed_index(values: dict[int, int], length: int) -> bytes:
+    if max(values) >= length:
+        raise ValueError("index exceeds its pointer space")
+    return b"".join(values.get(pointer, 0xFFFFFF).to_bytes(3, "big") for pointer in range(length))
+
+
+def render(lock: dict, sources: dict[str, bytes]) -> bytes:
+    all_encodings, single = encodings(sources["encodings.json"])
+    license_text = sources["LICENSE"].decode("utf-8")
+    bsd = license_text.split("BSD 3-Clause License\n", 1)[1].split("- - - -", 1)[0].strip()
+    out = "// Generated by images/svg/scripts/generate-encodings; DO NOT EDIT.\n"
+    out += f"// WHATWG Encoding revision {lock['revision']}; css/style/encodings.lock.json pins every input.\n"
+    out += f"// Encoding Standard snapshot SHA-256: {SPEC_SHA256}.\n"
+    out += "// Original table materialization: big-endian packed 24-bit scalars, FFFFFF = null.\n"
+    out += "// Labels are sorted packed records; no allocation or host codec is used.\n"
+    out += "// Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).\n"
+    out += f"// Source and license: {lock['license']['source']}\n"
+    out += "// Incorporated data is licensed under BSD-3-Clause:\n"
+    out += "\n".join("// " + line for line in bsd.splitlines()) + "\n\n"
+    out += "import encoding_types { Encoding }\nimport silk.core.option { Option }\nimport silk.num.u8\nimport silk.num.u32\nimport silk.num.usize\n\n"
+    out += '''// Callers establish the packed-record bounds before multiplying offsets.
+fn be24(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) * 65536 + u8.toU32(data[at + 1]) * 256 + u8.toU32(data[at + 2])
+}
+
+fn lookup(data: &[u8], pointer: usize) -> u32 {
+  if pointer >= data.length / 3 { return 0xFFFFFFFF }
+  let value = be24(data, pointer * 3)
+  return if value == 0xFFFFFF { 0xFFFFFFFF } else { value }
+}
+
+// https://encoding.spec.whatwg.org/#index-code-point
+pub fn single(encoding: Encoding, pointer: usize) -> u32 {
+  if pointer >= 128 { return 0xFFFFFFFF }
+  let data = match encoding {
+'''
+    for entry in single:
+        name = entry["name"]
+        table_variant = "Iso8859_8" if name == "ISO-8859-8-I" else VARIANTS[name]
+        out += f"    Encoding.{VARIANTS[name]} => table{table_variant}()\n"
+    out += "    _ => { return 0xFFFFFFFF }\n  }\n  return lookup(data, pointer)\n}\n\n"
+    for entry in single:
+        name = entry["name"]
+        if name == "ISO-8859-8-I":
+            continue
+        values = index(sources[f"index-{name.lower()}.txt"])
+        out += packed_function("table" + VARIANTS[name], packed_index(values, 128))
+    for name, api in MULTI.items():
+        values = index(sources[f"index-{name}.txt"])
+        out += f"// https://encoding.spec.whatwg.org/#index-{name}\npub fn {api}(pointer: usize) -> u32 {{\n  return lookup(table{api}(), pointer)\n}}\n\n"
+        out += packed_function("table" + api, packed_index(values, max(values) + 1))
+    ranges = sorted(index(sources["index-gb18030-ranges.txt"]).items())
+    if not ranges or ranges[0][0] != 0:
+        raise ValueError("gb18030 ranges must begin at zero")
+    range_bytes = b"".join(pointer.to_bytes(3, "big") + cp.to_bytes(3, "big") for pointer, cp in ranges)
+    out += packed_function("rangeData", range_bytes)
+    out += '''// https://encoding.spec.whatwg.org/#index-gb18030-ranges-code-point
+pub fn gb18030Range(pointer: usize) -> u32 {
+  if (pointer > 39419 && pointer < 189000) || pointer > 1237575 { return 0xFFFFFFFF }
+  if pointer == 7457 { return 0xE7C7 }
+  let data = rangeData()
+  let mut low: usize = 0
+  let mut high = data.length / 6
+  while low < high {
+    let middle = low + (high - low) / 2
+    if u32.toUsize(be24(data, middle * 6)) <= pointer { low = middle + 1 }
+    else { high = middle }
+  }
+  // The first range begins at zero, hence low is at least one.
+  let at = (low - 1) * 6
+  return be24(data, at + 3) + usize.toU32(pointer) - be24(data, at)
+}
+
+fn whitespace(byte: u8) -> bool {
+  return byte == 9 || byte == 10 || byte == 12 || byte == 13 || byte == 32
+}
+
+fn lowercase(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 { byte + 32 } else { byte }
+}
+
+// https://encoding.spec.whatwg.org/#concept-encoding-get
+pub fn label(input: &[u8]) -> Option<Encoding> {
+  let mut start: usize = 0
+  let mut end = input.length
+  while start < end && whitespace(input[start]) { start = start + 1 }
+  while end > start && whitespace(input[end - 1]) { end = end - 1 }
+  if start == end { return Option<Encoding>.None }
+  let text = labelText()
+  let records = labelRecords()
+  let mut low: usize = 0
+  let mut high = records.length / 5
+  while low < high {
+    let middle = low + (high - low) / 2
+    let at = middle * 5
+    let offset = u32.toUsize(be24(records, at))
+    let length = u32.toUsize(u8.toU32(records[at + 3]))
+    let mut i: usize = 0
+    while i < end - start && i < length && lowercase(input[start + i]) == text[offset + i] {
+      i = i + 1
+    }
+    if i == end - start && i == length { return encodingId(records[at + 4]) }
+    if i == end - start || (i < length && lowercase(input[start + i]) < text[offset + i]) {
+      high = middle
+    } else { low = middle + 1 }
+  }
+  return Option<Encoding>.None
+}
+
+fn encodingId(id: u8) -> Option<Encoding> {
+  return match id {
+'''
+    labels = []
+    for identifier, entry in enumerate(all_encodings):
+        out += f"    {identifier} => Option<Encoding>.Some {{ value: Encoding.{VARIANTS[entry['name']]} }}\n"
+        labels.extend((label, identifier) for label in entry["labels"])
+    out += "    _ => Option<Encoding>.None\n  }\n}\n\n"
+    labels.sort()
+    if len({label for label, _ in labels}) != len(labels):
+        raise ValueError("duplicate encoding label")
+    text, records = bytearray(), bytearray()
+    for label, identifier in labels:
+        label_bytes = label.encode("ascii")
+        if label != label.lower() or not label or len(label_bytes) > 255:
+            raise ValueError("invalid label")
+        records.extend(len(text).to_bytes(3, "big") + bytes((len(label_bytes), identifier)))
+        text.extend(label_bytes)
+    out += packed_function("labelText", bytes(text))
+    out += packed_function("labelRecords", bytes(records))
+    return out.encode("utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fetch", action="store_true", help="fetch missing locked sources without changing the pin")
+    mode.add_argument("--update", metavar="REVISION", help="explicitly update to an immutable upstream commit")
+    args = parser.parse_args()
+    lock, sources = update(args.update) if args.update else load(args.fetch)
+    output = render(lock, sources)
+    if args.update:
+        replace_if_changed(LOCK, (json.dumps(lock, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    replace_if_changed(OUTPUT, output)
+    print(f"Materialized {OUTPUT.relative_to(ROOT)} from {len(sources)} pinned sources ({len(output)} bytes)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError) as error:
+        raise SystemExit(f"generate-encodings: {error}") from error

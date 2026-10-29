@@ -1,0 +1,1046 @@
+//! XML stylesheet collection and parent-first computed styles over a borrowed document.
+//! Pinned SVG2ED styling.html #UAStyleSheet / #PresentationAttributes, CSSOM #add-a-css-style-sheet.
+import stylesheets { Catalog, RuleSetId }
+import style_tree
+import resources { Resolver, Policy, ProcessingMode, Limits as ResourceLimits }
+import url { Url, UrlError }
+import svg_xml.xml {
+  Document,
+  NodeId,
+  NodeKind,
+  Encoding as XmlEncoding,
+  PseudoAttributes,
+  XmlError,
+  XmlErrorKind,
+  Limits as XmlLimits,
+  parsePseudoAttributes
+}
+import svg_css.tokens { Limits, CssError, CssErrorKind, TokenRange, Span, equal, insensitive }
+import svg_css.encoding { Encoding }
+import svg_css.encoding
+import svg_css.properties { Property }
+import svg_css.properties
+import svg_css.computed { HostContext, StyleId, ComputedValue, ComputedError }
+import svg_css.cascade { Candidate, Priority, Origin }
+import svg_css.media_features { Environment }
+import svg_css.element { MatchContext, NO_ELEMENT }
+import silk.collections.bytes { Bytes }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.usize
+import structure { Graph, SourceId, OccurrenceId, Options, StructureError }
+import structure
+import svg_css.values { Value, Paint }
+import occurrence_tree
+import occurrence_tree { Cache as TreeCache }
+import view_selection { Selection }
+
+struct NodeDeclarations {
+  presentation: TokenRange,
+  inline: TokenRange,
+}
+
+impl Copy for NodeDeclarations {}
+
+struct SourceStyles {
+  rules: RuleSetId,
+  nodes: List<NodeDeclarations>,
+  templateTransforms: HashMap<usize, usize>,
+}
+
+pub struct StyledGraph {
+  pub catalog: Catalog,
+  pub selection: Selection,
+  styles: List<StyleId>,
+  resources: HashMap<ResourceKey, OccurrenceId>,
+  templates: HashMap<usize, OccurrenceId>,
+}
+
+struct ResourceKey {
+  node: usize,
+  property: usize,
+}
+
+impl Copy for ResourceKey {}
+
+impl HashKey for ResourceKey {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return a.node == b.node && a.property == b.property
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    return Hash.combine(Hash.mix(seed, usize.toU64(value.node)), usize.toU64(value.property))
+  }
+}
+
+impl StyledGraph {
+  pub fn resource(self: &Self, node: OccurrenceId, property: Property) -> Option<OccurrenceId> {
+    return self.resources.get(
+      ResourceKey { node: node.index, property: properties.index(property) },
+    )
+  }
+
+  pub fn template(self: &Self, node: OccurrenceId) -> Option<OccurrenceId> {
+    return self.templates.get(node.index)
+  }
+
+  pub fn nodeStyle(self: &Self, node: OccurrenceId) -> Option<StyleId> {
+    return if node.index < self.styles.length() {
+      Option<StyleId>.some(self.styles.asSlice()[node.index])
+    } else {
+      Option<StyleId>.None
+    }
+  }
+}
+
+pub struct StyledDocument {
+  pub catalog: Catalog,
+  nodeStyles: List<Option<StyleId>>,
+}
+
+impl StyledDocument {
+  pub fn nodeStyle(self: &Self, node: NodeId) -> Option<StyleId> {
+    return if node.index < self.nodeStyles.length() {
+      self.nodeStyles.asSlice()[node.index]
+    } else {
+      Option<StyleId>.None
+    }
+  }
+}
+
+// Exact stylesheet in pinned SVG2ED dbbc1f8bcb1a3b05777d1ec03dac8040738b02941142018e44e2e02dad691195.
+// https://svgwg.org/svg2-draft/styling.html#UAStyleSheet
+fn uaSheet() -> &'static [u8] {
+  return b"@namespace url(http://www.w3.org/2000/svg);\n@namespace xml url(http://www.w3.org/XML/1998/namespace);\n\nsvg:not(:root), image, marker, pattern, symbol { overflow: hidden; }\n\n*:not(svg),\n*:not(foreignObject) > svg {\n  transform-origin: 0 0;\n}\n\n*[xml|space=preserve] {\n  white-space-collapse: preserve-spaces;\n}\n\ndefs,\nclipPath, mask, marker,\ndesc, title, metadata,\npattern, linearGradient, radialGradient,\nscript, style,\nsymbol {\n  display: none !important;\n}\n:host(use) > symbol {\n  display: inline !important;\n}\n:link, :visited {\n  cursor: pointer;\n}\n"
+}
+
+fn svg(document: &Document, node: NodeId) -> bool {
+  return equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg")
+}
+
+fn attribute<'a>(document: &'a Document, node: NodeId, name: &[u8]) -> &'a [u8] {
+  return match &Document.attribute(document, node, b"", name) {
+    Option<&[u8]>.Some { value } => value
+    _ => b""
+  }
+}
+
+fn pseudo<'a>(attributes: &'a PseudoAttributes, name: &[u8]) -> &'a [u8] {
+  return match &attributes.get(name) {
+    Option<&[u8]>.Some { value } => value
+    _ => b""
+  }
+}
+
+// PI type is an advisory MIME type, unlike HTML/SVG style's type string.
+// https://www.w3.org/TR/xml-stylesheet/#PA-type
+fn cssMediaType(value: &[u8]) -> bool {
+  let mut start: usize = 0
+  while start < value.length && (value[start] == 32 || value[start] == 9) {
+    start = start + 1
+  }
+  let mut end = start
+  while end < value.length && value[end] != 59 {
+    end = end + 1
+  }
+  while end > start && (value[end - 1] == 32 || value[end - 1] == 9) {
+    end = end - 1
+  }
+  return insensitive(Slice.view<u8>(value, start, end - start), b"text/css")
+}
+
+fn documentEncoding(document: &Document) -> Encoding {
+  return match Document.encoding(document) {
+    XmlEncoding.Utf8 => Encoding.Utf8
+    XmlEncoding.Utf16Le => Encoding.Utf16Le
+    XmlEncoding.Utf16Be => Encoding.Utf16Be
+  }
+}
+
+union Sheet {
+  Embedded { node: NodeId },
+  External { attributes: PseudoAttributes },
+}
+
+fn title<'a>(document: &'a Document, sheet: &'a Sheet) -> &'a [u8] {
+  return match &sheet.* {
+    Sheet.Embedded { node } => attribute(document, node, b"title")
+    Sheet.External { attributes } => pseudo(&attributes, b"title")
+  }
+}
+
+fn alternate(sheet: &Sheet) -> bool {
+  return match &sheet.* {
+    Sheet.External { attributes } => equal(pseudo(&attributes, b"alternate"), b"yes")
+    _ => false
+  }
+}
+
+// PI pseudoattributes are decoded once and retained; embedded metadata stays borrowed in XML.
+// https://www.w3.org/TR/cssom/#requirements-on-user-agents-implementing-the-xml-stylesheet-processing-instruction
+// https://www.w3.org/TR/xml-stylesheet/#pseudo-attributes
+// Malformed instructions are ignored; exhaustion remains a hard error.
+effect fn sheets(document: &Document, limits: &Limits) -> List<Sheet>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<Sheet>.make()
+  let mut xmlLimits = XmlLimits.make()
+  xmlLimits.maxInputBytes = limits.maxInputBytes
+  xmlLimits.maxStorageBytes = limits.maxStorageBytes
+  xmlLimits.maxExpandedBytes = limits.maxStorageBytes
+  xmlLimits.maxAttributes = limits.maxDeclarations
+  let nodes = Document.nodes(document)
+  let mut metadataBytes: usize = 0
+  let mut i: usize = 0
+  while i < nodes.length {
+    let node = NodeId { index: i }
+    if nodes[i].kind == NodeKind.Element && svg(document, node)
+      && equal(Document.localName(document, node), b"style") {
+      let kind = attribute(document, node, b"type")
+      if kind.length == 0 || insensitive(kind, b"text/css") {
+        run result.append(Sheet.Embedded { node: node })
+      }
+    } else if i < Document.root(document).index && nodes[i].kind == NodeKind.ProcessingInstruction
+      && equal(Document.localName(document, node), b"xml-stylesheet") {
+      let bytes = Document.text(document, node)
+      if metadataBytes > limits.maxInputBytes
+        || bytes.length > limits.maxInputBytes - metadataBytes {
+        fail CssError { kind: CssErrorKind.InputLimit, offset: i }
+      }
+      metadataBytes = metadataBytes + bytes.length
+      let parsed = run Effect.result(parsePseudoAttributes(bytes, &xmlLimits))
+      match move parsed {
+        Result<PseudoAttributes, XmlError | OutOfMemoryError>.Success { value: attributes } => {
+          let supported = match &attributes.get(b"type") {
+            Option<&[u8]>.Some { value } => cssMediaType(value)
+            _ => true
+          }
+          let alt = equal(pseudo(&attributes, b"alternate"), b"yes")
+          if supported && (!alt || pseudo(&attributes, b"title").length != 0) {
+            let hasHref = match &attributes.get(b"href") {
+              Option<&[u8]>.Some { value } => true
+              _ => false
+            }
+            if hasHref {
+              run result.append(Sheet.External { attributes: move attributes })
+            }
+          }
+        }
+        Result<PseudoAttributes, XmlError | OutOfMemoryError>.Failure {
+          error
+        } => match move error {
+          XmlError invalid => {
+            if invalid.kind == XmlErrorKind.Limit {
+              fail CssError { kind: CssErrorKind.StorageLimit, offset: invalid.offset }
+            }
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+    }
+    if result.length() > limits.maxRules {
+      fail CssError { kind: CssErrorKind.RuleLimit, offset: i }
+    }
+    i = i + 1
+  }
+  return move result
+}
+
+// Preorder traversal of the style subtree without recursion or an arena copy.
+fn nextDescendant(document: &Document, root: NodeId, current: NodeId) -> Option<NodeId> {
+  match &Document.firstChild(document, current) {
+    Option<NodeId>.Some { value } => {
+      return Option<NodeId>.Some { value: value }
+    }
+    _ => {}
+  }
+  let mut at = current
+  while at.index != root.index {
+    match &Document.nextSibling(document, at) {
+      Option<NodeId>.Some { value } => {
+        return Option<NodeId>.Some { value: value }
+      }
+      _ => {}
+    }
+    at = match &Document.nodes(document)[at.index].parent {
+      Option<NodeId>.Some { value } => value
+      _ => {
+        return Option<NodeId>.None
+      }
+    }
+  }
+  return Option<NodeId>.None
+}
+
+effect fn embedded(
+  catalog: &mut Catalog,
+  rules: RuleSetId,
+  document: &Document,
+  node: NodeId,
+  base: usize,
+  environmentEncoding: Encoding,
+  environment: &Environment,
+  limits: &Limits,
+) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  // The common single text/CDATA node is passed directly to the tokenizer.
+  let first = Document.firstChild(document, node)
+  match &first {
+    Option<NodeId>.Some { value } => {
+      if Document.nodes(document)[value.index].kind == NodeKind.Text {
+        match &Document.nextSibling(document, value) {
+          Option<NodeId>.None => {
+            run catalog.addSheet(
+              rules,
+              Document.text(document, value),
+              base,
+              environmentEncoding,
+              Origin.Author,
+              environment,
+              limits,
+            )
+            return
+          }
+          _ => {}
+        }
+      }
+    }
+    _ => {
+      return
+    }
+  }
+  let mut text = Bytes.make()
+  let mut current = first
+  while true {
+    let id = match &current {
+      Option<NodeId>.Some { value } => value
+      _ => {
+        break
+      }
+    }
+    if Document.nodes(document)[id.index].kind == NodeKind.Text {
+      let bytes = Document.text(document, id)
+      if Bytes.length(&text) > limits.maxInputBytes
+        || bytes.length > limits.maxInputBytes - Bytes.length(&text) {
+        fail CssError { kind: CssErrorKind.InputLimit, offset: id.index }
+      }
+      run Bytes.append(&mut text, bytes)
+    }
+    current = nextDescendant(document, node, id)
+  }
+  run catalog.addSheet(
+    rules,
+    Bytes.asSlice(&text),
+    base,
+    environmentEncoding,
+    Origin.Author,
+    environment,
+    limits,
+  )
+}
+
+// https://svgwg.org/svg2-draft/styling.html#PresentationAttributes
+// SVG11 additions: https://www.w3.org/TR/2011/REC-SVG11-20110816/styling.html#UsingPresentationAttributes
+fn presentation(element: &[u8], name: &[u8]) -> Option<Property> {
+  let gradient = equal(element, b"linearGradient") || equal(element, b"radialGradient")
+  let pattern = equal(element, b"pattern")
+  if equal(name, b"gradientTransform") {
+    return if gradient {
+      Option<Property>.Some { value: Property.Transform }
+    } else {
+      Option<Property>.None
+    }
+  }
+  if equal(name, b"patternTransform") {
+    return if pattern {
+      Option<Property>.Some { value: Property.Transform }
+    } else {
+      Option<Property>.None
+    }
+  }
+  let property = match &properties.lookup(name) {
+    Option<Property>.Some { value } => value
+    _ => {
+      return Option<Property>.None
+    }
+  }
+  if !equal(name, properties.name(property)) {
+    return Option<Property>.None
+  }
+  let circle = equal(element, b"circle")
+  let ellipse = equal(element, b"ellipse")
+  let rect = equal(element, b"rect")
+  let positioned = rect || equal(element, b"foreignObject") || equal(element, b"image")
+    || equal(element, b"svg")
+    || equal(element, b"symbol")
+    || equal(element, b"use")
+  let allowed = match property {
+    Property.Cx => circle || ellipse
+    Property.Cy => circle || ellipse
+    Property.R => circle
+    Property.Rx => ellipse || rect
+    Property.Ry => ellipse || rect
+    Property.X => positioned
+    Property.Y => positioned
+    Property.Width => positioned
+    Property.Height => positioned
+    Property.D => equal(element, b"path")
+    Property.Fill => !equal(element, b"animate") && !equal(element, b"animateMotion")
+      && !equal(element, b"animateTransform")
+      && !equal(element, b"set")
+      && !equal(element, b"animateColor")
+    Property.Transform => !gradient && !pattern
+    Property.AlignmentBaseline => true
+    Property.BaselineShift => true
+    Property.ClipPath => true
+    Property.ClipRule => true
+    Property.Color => true
+    Property.ColorInterpolation => true
+    Property.ColorInterpolationFilters => true
+    Property.Cursor => true
+    Property.Direction => true
+    Property.Display => true
+    Property.DominantBaseline => true
+    Property.FillOpacity => true
+    Property.FillRule => true
+    Property.Filter => true
+    Property.FloodColor => true
+    Property.FloodOpacity => true
+    Property.FontFamily => true
+    Property.FontSize => true
+    Property.FontSizeAdjust => true
+    Property.FontStretch => true
+    Property.FontStyle => true
+    Property.FontVariant => true
+    Property.FontWeight => true
+    Property.GlyphOrientationVertical => true
+    Property.ImageRendering => true
+    Property.LetterSpacing => true
+    Property.LightingColor => true
+    Property.MarkerEnd => true
+    Property.MarkerMid => true
+    Property.MarkerStart => true
+    Property.Mask => true
+    Property.MaskType => true
+    Property.Opacity => true
+    Property.Overflow => true
+    Property.PaintOrder => true
+    Property.PointerEvents => true
+    Property.ShapeRendering => true
+    Property.StopColor => true
+    Property.StopOpacity => true
+    Property.Stroke => true
+    Property.StrokeDasharray => true
+    Property.StrokeDashoffset => true
+    Property.StrokeLinecap => true
+    Property.StrokeLinejoin => true
+    Property.StrokeMiterlimit => true
+    Property.StrokeOpacity => true
+    Property.StrokeWidth => true
+    Property.TextAnchor => true
+    Property.TextDecoration => true
+    Property.TextOverflow => true
+    Property.TextRendering => true
+    Property.TransformOrigin => true
+    Property.UnicodeBidi => true
+    Property.VectorEffect => true
+    Property.Visibility => true
+    Property.WhiteSpace => true
+    Property.WordSpacing => true
+    Property.WritingMode => true
+    Property.Clip => true
+    Property.ColorProfile => true
+    Property.ColorRendering => true
+    Property.EnableBackground => true
+    Property.GlyphOrientationHorizontal => true
+    Property.Kerning => true
+    Property.Marker => true
+    _ => false
+  }
+  return if allowed {
+    Option<Property>.Some { value: property }
+  } else {
+    Option<Property>.None
+  }
+}
+
+effect fn collectSheets(
+  document: &Document,
+  catalog: &mut Catalog,
+  rules: RuleSetId,
+  base: usize,
+  nodeBases: &[usize],
+  mediaEnvironment: &Environment,
+  limits: &Limits,
+) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let collected = run sheets(document, limits)
+  let sourceEncoding = documentEncoding(document)
+
+  // Resolve the preferred set before applying sheets, including earlier alternate sheets.
+  // Media does not participate in selection of the preferred title.
+  let mut preferred = Option<usize>.None
+  let mut i: usize = 0
+  while i < collected.length() {
+    let sheet = &collected.asSlice()[i]
+    if !preferred.isSome() && !alternate(sheet) && title(document, sheet).length != 0 {
+      preferred = Option<usize>.Some { value: i }
+    }
+    i = i + 1
+  }
+  let preferredTitle = match &preferred {
+    Option<usize>.Some { value } => title(document, &collected.asSlice()[value])
+    _ => b""
+  }
+  i = 0
+  while i < collected.length() {
+    let sheet = &collected.asSlice()[i]
+    let name = title(document, sheet)
+    if (name.length == 0 && !alternate(sheet)) || equal(name, preferredTitle) {
+      match &sheet.* {
+        Sheet.Embedded { node } => {
+          let sheetBase = if node.index < nodeBases.length {
+            nodeBases[node.index]
+          } else {
+            base
+          }
+          if run catalog.matchesMedia(
+            attribute(document, node, b"media"),
+            sheetBase,
+            mediaEnvironment,
+            limits,
+          ) {
+            run embedded(
+              &mut catalog.*,
+              rules,
+              document,
+              node,
+              sheetBase,
+              sourceEncoding,
+              mediaEnvironment,
+              limits,
+            )
+          }
+        }
+        Sheet.External { attributes } => {
+          if run catalog.matchesMedia(
+            pseudo(&attributes, b"media"),
+            base,
+            mediaEnvironment,
+            limits,
+          ) {
+            let encoding = match &encoding.label(pseudo(&attributes, b"charset")) {
+              Option<Encoding>.Some { value } => value
+              _ => sourceEncoding
+            }
+            let address = match &catalog.registeredBase(base) {
+              Option<&Url>.Some { value } => value
+              _ => {
+                fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+              }
+            }
+            let resolved = run Effect.result(Url.resolve(address, pseudo(&attributes, b"href")))
+            match move resolved {
+              Result<Url, UrlError | OutOfMemoryError>.Success { value } => {
+                run catalog.addExternal(
+                  rules,
+                  move value,
+                  encoding,
+                  Origin.Author,
+                  mediaEnvironment,
+                  limits,
+                )
+              }
+              Result<Url, UrlError | OutOfMemoryError>.Failure { error } => match move error {
+                UrlError invalid => {
+                  if invalid == UrlError.InputLimit {
+                    fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
+                  }
+                }
+                OutOfMemoryError exhausted => {
+                  fail move exhausted
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Compile source attributes once; each occurrence cascades these same declarations
+// against its own inherited style and tree-scope selector matches.
+effect fn compileNodes(
+  document: &Document,
+  catalog: &mut Catalog,
+  rules: RuleSetId,
+  base: usize,
+  nodeBases: &[usize],
+  limits: &Limits,
+) -> SourceStyles
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let nodes = Document.nodes(document)
+  let mut result = run List<NodeDeclarations>.makeWithCapacity(nodes.length)
+  let mut transforms = HashMap<usize, usize>.make(Hash.seed(0))
+  let mut i: usize = 0
+  while i < nodes.length {
+    let node = NodeId { index: i }
+    let nodeBase = if i < nodeBases.length {
+      nodeBases[i]
+    } else {
+      base
+    }
+    let start = catalog.declarations.length()
+    if nodes[i].kind == NodeKind.Element && svg(document, node) {
+      let attrs = Document.attributes(document, node)
+      let mut a: usize = 0
+      while a < attrs.length {
+        if Document.attributeNamespaceUri(document, attrs[a]).length == 0 {
+          let name = Document.attributeLocalName(document, attrs[a])
+          match &presentation(Document.localName(document, node), name) {
+            Option<Property>.Some { value } => {
+              let parsed = run catalog.addPresentation(
+                rules,
+                Document.attributeValue(document, attrs[a]),
+                nodeBase,
+                value,
+                limits,
+              )
+              if equal(name, b"gradientTransform") || equal(name, b"patternTransform") {
+                if let Option<usize>.Some { value: declaration } = parsed {
+                  drop run transforms.insert(i, declaration)
+                }
+              }
+            }
+            _ => {}
+          }
+        }
+        a = a + 1
+      }
+    }
+    let presentation = TokenRange { start: start, end: catalog.declarations.length() }
+    let mut inline = TokenRange { start: presentation.end, end: presentation.end }
+    if nodes[i].kind == NodeKind.Element && svg(document, node) {
+      match &Document.attribute(document, node, b"", b"style") {
+        Option<&[u8]>.Some { value } => {
+          inline = run catalog.addInline(rules, value, nodeBase, limits)
+        }
+        _ => {}
+      }
+    }
+    run result.append(NodeDeclarations { presentation: presentation, inline: inline })
+    i = i + 1
+  }
+  return SourceStyles { rules: rules, nodes: move result, templateTransforms: move transforms }
+}
+
+effect fn appendNodeCandidates(
+  node: &NodeDeclarations,
+  depth: usize,
+  candidates: &mut List<Candidate>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut declaration = node.presentation.start
+  while declaration < node.presentation.end {
+    let mut priority = Priority.make(Origin.Author, 0)
+    priority.encapsulationDepth = depth
+    run candidates.append(Candidate { declaration: declaration, priority: priority })
+    declaration = declaration + 1
+  }
+  declaration = node.inline.start
+  while declaration < node.inline.end {
+    let mut priority = Priority.make(Origin.Author, declaration + 1)
+    priority.encapsulationDepth = depth
+    priority.inline = true
+    run candidates.append(Candidate { declaration: declaration, priority: priority })
+    declaration = declaration + 1
+  }
+}
+
+// A template presentation attribute participates in the HOST cascade. Copying
+// its computed transform afterwards would incorrectly override transform:none,
+// initial, inherit, and author stylesheet declarations on the host.
+fn templateTransform(
+  graph: &Graph,
+  sources: &[SourceStyles],
+  templates: &HashMap<usize, OccurrenceId>,
+  node: usize,
+) -> Option<usize> {
+  let mut next: Option<OccurrenceId> = templates.get(node)
+  if next.isNone() {
+    return Option<usize>.None
+  }
+  let source = graph.occurrences.asSlice()[node].source
+  let document = graph.sourceDocument(source)
+  let name = if equal(Document.localName(document, source.node), b"pattern") {
+    b"patternTransform"
+  } else {
+    b"gradientTransform"
+  }
+  if Document.attribute(document, source.node, b"", name).isSome()
+    || Document.attribute(document, source.node, b"", b"transform").isSome() {
+    return Option<usize>.None
+  }
+  let mut remaining = graph.occurrences.length()
+  while let Option<OccurrenceId>.Some { value } = next {
+    if remaining == 0 {
+      return Option<usize>.None
+    }
+    remaining = remaining - 1
+    let target = graph.occurrences.asSlice()[value.index].source
+    if Document.attribute(graph.sourceDocument(target), target.node, b"", name).isSome() {
+      return sources[target.document.index].templateTransforms.get(target.node.index)
+    }
+    next = templates.get(value.index)
+  }
+  return Option<usize>.None
+}
+
+// Independent source-document styling remains useful without instantiation.
+pub effect fn build(
+  document: &Document,
+  catalog: Catalog,
+  host: &HostContext,
+  mediaEnvironment: &Environment,
+  documentBase: Url,
+  limits: &Limits,
+) -> StyledDocument
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut catalog = move catalog
+  let base = run catalog.registerBase(move documentBase)
+  let rules = run catalog.createRuleSet(
+    base,
+    Policy { mode: ProcessingMode.Static, limits: ResourceLimits.defaults() },
+  )
+  run catalog.addSheet(
+    RuleSetId { index: 0 },
+    uaSheet(),
+    base,
+    Encoding.Utf8,
+    Origin.UserAgent,
+    mediaEnvironment,
+    limits,
+  )
+  run collectSheets(document, &mut catalog, rules, base, &[], mediaEnvironment, limits)
+  let declarations = run compileNodes(document, &mut catalog, rules, base, &[], limits)
+  let tree = run style_tree.make(document)
+  let nodes = Document.nodes(document)
+  let mut nodeStyles = run List<Option<StyleId>>.makeWithCapacity(nodes.length)
+  let mut context = MatchContext.make(Document.root(document).index, NO_ELEMENT)
+  let mut i: usize = 0
+  while i < nodes.length {
+    let node = NodeId { index: i }
+    if nodes[i].kind != NodeKind.Element {
+      run nodeStyles.append(Option<StyleId>.None)
+    } else {
+      let mut candidates = run catalog.matching(rules, &tree, i, &mut context)
+      run appendNodeCandidates(&declarations.nodes.asSlice()[i], 0, &mut candidates)
+      let parent = match &nodes[i].parent {
+        Option<NodeId>.Some { value } => nodeStyles.asSlice()[value.index]
+        _ => Option<StyleId>.None
+      }
+      let style = run catalog.engine.build(
+        catalog.buffers.asSlice(),
+        catalog.declarations.asSlice(),
+        candidates.asSlice(),
+        parent,
+        host,
+        limits,
+      )
+      run nodeStyles.append(Option<StyleId>.Some { value: style })
+    }
+    i = i + 1
+  }
+  return StyledDocument { catalog: move catalog, nodeStyles: move nodeStyles }
+}
+
+effect fn sourceBase(
+  graph: &Graph,
+  index: usize,
+  mapped: &mut List<usize>,
+  catalog: &mut Catalog,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let existing = mapped.asSlice()[index]
+  if existing != usize.MAX {
+    return existing
+  }
+  let base = run graph.urls.asSlice()[index].clone()
+  let registered = run catalog.registerBase(move base)
+  let mut entries = mapped.asMutSlice()
+  entries[index] = registered
+  return registered
+}
+
+pub effect fn buildGraph(
+  graph: &mut Graph,
+  catalog: Catalog,
+  host: &HostContext,
+  mediaEnvironment: &Environment,
+  selection: Selection,
+  limits: &Limits,
+  options: &Options,
+) -> StyledGraph
+  ! CssError | ComputedError | StructureError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut catalog = move catalog
+  let mut mapped = run List<usize>.makeWithCapacity(graph.urls.length())
+  let mut i: usize = 0
+  while i < graph.urls.length() {
+    run mapped.append(usize.MAX)
+    i = i + 1
+  }
+  let rootSource = graph.occurrences.asSlice()[graph.root.index].source
+  let rootBase = run sourceBase(
+    &graph.*,
+    graph.documents.asSlice()[rootSource.document.index].base,
+    &mut mapped,
+    &mut catalog,
+  )
+  run catalog.addSheet(
+    RuleSetId { index: 0 },
+    uaSheet(),
+    rootBase,
+    Encoding.Utf8,
+    Origin.UserAgent,
+    mediaEnvironment,
+    limits,
+  )
+  let mut sources = run List<SourceStyles>.makeWithCapacity(graph.documents.length())
+  let mut metadata = TreeCache.make()
+  let mut styles = run List<StyleId>.makeWithCapacity(graph.occurrences.length())
+  let mut resources = HashMap<ResourceKey, OccurrenceId>.make(Hash.seed(0))
+  let mut templates = HashMap<usize, OccurrenceId>.make(Hash.seed(0))
+  let mut referenceCursor: usize = 0
+  let mut templateCursor: usize = 0
+  let mut targetNode = NO_ELEMENT
+  if let Option<SourceId>.Some { value } = &selection.target {
+    i = 0
+    while i < graph.occurrences.length() {
+      let occurrence = &graph.occurrences.asSlice()[i]
+      if occurrence.scope == 0 && occurrence.source.document.index == value.document.index
+        && occurrence.source.node.index == value.node.index {
+        targetNode = i
+        break
+      }
+      i = i + 1
+    }
+  }
+  let mut context = MatchContext.make(graph.root.index, targetNode)
+  while true {
+    run structure.expand(&mut graph.*, options)
+    while mapped.length() < graph.urls.length() {
+      run mapped.append(usize.MAX)
+    }
+    i = sources.length()
+    while i < graph.documents.length() {
+      let source = &graph.documents.asSlice()[i]
+      let base = run sourceBase(&graph.*, source.base, &mut mapped, &mut catalog)
+      let rules = run catalog.createRuleSet(base, source.policy)
+      let mut bases = run List<usize>.makeWithCapacity(source.nodeBases.length())
+      let mut node: usize = 0
+      while node < source.nodeBases.length() {
+        run bases.append(
+          run sourceBase(&graph.*, source.nodeBases.asSlice()[node], &mut mapped, &mut catalog),
+        )
+        node = node + 1
+      }
+      run collectSheets(
+        &source.document,
+        &mut catalog,
+        rules,
+        base,
+        bases.asSlice(),
+        mediaEnvironment,
+        limits,
+      )
+      let declarations = run compileNodes(
+        &source.document,
+        &mut catalog,
+        rules,
+        base,
+        bases.asSlice(),
+        limits,
+      )
+      run sources.append(move declarations)
+      i = i + 1
+    }
+    while templateCursor < graph.occurrences.length() {
+      let node = OccurrenceId { index: templateCursor }
+      if let Option<SourceId>.Some { value } = graph.templateSource(node) {
+        if let Option<OccurrenceId>.Some { value: target } = run graph.occurrence(node, value) {
+          drop run templates.insert(node.index, target)
+        }
+      }
+      templateCursor = templateCursor + 1
+    }
+    run metadata.extend(&graph.*)
+    let tree = occurrence_tree.make(&graph.*, &metadata)
+    i = styles.length()
+    while i < graph.occurrences.length() {
+      let occurrence = &graph.occurrences.asSlice()[i]
+      let scope = &graph.scopes.asSlice()[occurrence.scope]
+      context.scope = scope.root.index
+      context.shadowHost = match &scope.host {
+        Option<OccurrenceId>.Some { value } => value.index
+        _ => NO_ELEMENT
+      }
+      let source = &sources.asSlice()[occurrence.source.document.index]
+      let mut candidates = run catalog.matching(source.rules, &tree, i, &mut context)
+      let mut priorities = candidates.asMutSlice()
+      let mut c: usize = 0
+      while c < priorities.length {
+        priorities[c].priority.encapsulationDepth = scope.depth
+        c = c + 1
+      }
+      drop priorities
+      if let Option<usize>.Some { value } = templateTransform(
+        &graph.*,
+        sources.asSlice(),
+        &templates,
+        i,
+      ) {
+        let mut priority = Priority.make(Origin.Author, 0)
+        priority.encapsulationDepth = scope.depth
+        run candidates.append(Candidate { declaration: value, priority: priority })
+      }
+      run appendNodeCandidates(
+        &source.nodes.asSlice()[occurrence.source.node.index],
+        scope.depth,
+        &mut candidates,
+      )
+
+      // The inner scope's :host rules participate before inheritance into children.
+      match &occurrence.shadow {
+        Option<OccurrenceId>.Some { value } => {
+          let inner = &graph.scopes.asSlice()[graph.occurrences.asSlice()[value.index].scope]
+          context.shadowHost = i
+          let innerCandidates = run catalog.matching(
+            sources.asSlice()[inner.document.index].rules,
+            &tree,
+            i,
+            &mut context,
+          )
+          c = 0
+          while c < innerCandidates.length() {
+            let mut candidate = innerCandidates.asSlice()[c]
+            candidate.priority.encapsulationDepth = inner.depth
+            run candidates.append(candidate)
+            c = c + 1
+          }
+        }
+        _ => {}
+      }
+      let parent = match &occurrence.parent {
+        Option<OccurrenceId>.Some { value } => Option<StyleId>.some(styles.asSlice()[value.index])
+        _ => Option<StyleId>.None
+      }
+      let style = run catalog.engine.build(
+        catalog.buffers.asSlice(),
+        catalog.declarations.asSlice(),
+        candidates.asSlice(),
+        parent,
+        host,
+        limits,
+      )
+      run styles.append(style)
+      i = i + 1
+    }
+    drop tree
+
+    // Only newly computed occurrences are inspected. Their URLs may append source
+    // documents, raw shadow forests and declarations for the next incremental pass.
+    let end = styles.length()
+    while referenceCursor < end {
+      let node = OccurrenceId { index: referenceCursor }
+      let referenceProperties = [
+        Property.Fill,
+        Property.Stroke,
+        Property.MarkerStart,
+        Property.MarkerMid,
+        Property.MarkerEnd,
+      ]
+      let mut p: usize = 0
+      while p < referenceProperties.length {
+        let property = referenceProperties[p]
+        if let Option<ComputedValue>.Some { value: entry } = catalog.engine.get(
+          styles.asSlice()[node.index],
+          property,
+        ) {
+          let reference = match &catalog.engine.values.get(entry.value).* {
+            Value.Paint { paint } => match &paint {
+              Paint.Server { url, fallback } => Option<Span>.some(url)
+              _ => Option<Span>.None
+            }
+            Value.Resource { url } => Option<Span>.some(url)
+            _ => Option<Span>.None
+          }
+          if let Option<Span>.Some { value: span } = reference {
+            let declarationBase = match &entry.sourceBuffer {
+              Option<usize>.Some { value: buffer } => catalog.base(buffer)
+              _ => Option<&'static Url>.None
+            }
+            let declarationDocument = match &entry.sourceBuffer {
+              Option<usize>.Some { value: buffer } => catalog.sourceDocument(buffer)
+              _ => Option<&'static Url>.None
+            }
+            let target = run structure.resolveResource(
+              &mut graph.*,
+              node,
+              declarationDocument,
+              declarationBase,
+              catalog.engine.values.text(span),
+              options,
+            )
+            if let Option<OccurrenceId>.Some { value } = target {
+              let targetSource = graph.occurrences.asSlice()[value.index].source
+              let targetDocument = graph.sourceDocument(targetSource)
+              let name = Document.localName(targetDocument, targetSource.node)
+              let paint = property == Property.Fill || property == Property.Stroke
+              if svg(targetDocument, targetSource.node)
+                && ((paint
+                  && (equal(name, b"linearGradient") || equal(name, b"radialGradient")
+                    || equal(name, b"pattern")))
+                  || (!paint && equal(name, b"marker"))) {
+                let ignored = run resources.insert(
+                  ResourceKey { node: node.index, property: properties.index(property) },
+                  value,
+                )
+                drop ignored
+              }
+            }
+          }
+        }
+        p = p + 1
+      }
+      referenceCursor = referenceCursor + 1
+    }
+    if styles.length() == graph.occurrences.length() {
+      break
+    }
+  }
+  return StyledGraph {
+    catalog: move catalog,
+    styles: move styles,
+    selection: move selection,
+    resources: move resources,
+    templates: move templates,
+  }
+}

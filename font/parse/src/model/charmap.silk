@@ -1,0 +1,1048 @@
+// Copyright 2026 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+//! Selected Unicode mappings and individually selectable encoding records.
+import table_provider { TableProvider }
+import tables.cmap {
+  Cmap,
+  Dmap,
+  CmapSubtable,
+  CmapSubtableIter,
+  CmapIterLimits,
+  CmapMapping,
+  EncodingRecord,
+  PlatformId,
+  BestCmapSubtable,
+  SelectedUvsSubtable,
+  UvsSubtable,
+  UvsSubtableIter,
+  UvsMappingEntry,
+  MapVariant,
+  Cmap4,
+  Cmap4Segment,
+  Cmap12,
+  Cmap12Group,
+  GroupMap,
+  SegmentMap
+}
+import tables.name { MacRomanMapping }
+import tables.maxp { SelectedMaxp }
+import ps.cff.font { CffFontRef, Encoding as CffEncoding }
+import ps.encoding { PredefinedEncoding }
+import array { ComputedArray }
+import font_types.lib { GlyphId, Tag }
+import read { ReadError }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.core.equal { Equal }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.text.char
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+pub enum(u32) EncodingKind {
+  None = 0,
+  MsSymbol = 1937337698,
+  Unicode = 1970170211,
+  Sjis = 1936353651,
+  Prc = 1734484000,
+  Big5 = 1651074869,
+  Wansung = 2002873971,
+  Johab = 1785686113,
+  AdobeStandard = 1094995778,
+  AdobeExpert = 1094992453,
+  AdobeCustom = 1094992451,
+  AdobeLatin1 = 1818326065,
+  AppleRoman = 1634889070,
+}
+
+pub struct Encoding {
+  encodingKind: EncodingKind,
+  index: u32,
+  platformId: u16,
+  encodingId: u16,
+}
+
+impl Copy for Encoding {}
+
+impl Equal for Encoding {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return a.encodingKind == b.encodingKind && a.index == b.index && a.platformId == b.platformId
+      && a.encodingId == b.encodingId
+  }
+}
+
+impl HashKey for Encoding {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return &a.* == &b.*
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    let mut result = Hash.mix(seed, u32.toU64(EncodingKind.value(value.encodingKind)))
+    result = Hash.combine(result, u32.toU64(value.index))
+    result = Hash.combine(result, u16.toU64(value.platformId))
+    return Hash.combine(result, u16.toU64(value.encodingId))
+  }
+}
+
+pub struct SfntIndex {
+  pub tag: Tag,
+  pub index: u32,
+}
+
+impl Copy for SfntIndex {}
+
+pub struct SfntIds {
+  pub platformId: u16,
+  pub encodingId: u16,
+}
+
+impl Copy for SfntIds {}
+
+impl Encoding {
+  pub fn kind(self: Self) -> EncodingKind {
+    return self.encodingKind
+  }
+
+  pub fn sfntIndex(self: Self) -> Option<SfntIndex> {
+    if self.index >= 4294967292 {
+      return Option<SfntIndex>.None
+    }
+    let mut tag = Tag.new(&[99, 109, 97, 112])
+    if (self.index & 0x80000000) != 0 {
+      tag = Tag.new(&[68, 77, 65, 80])
+    }
+    return Option<SfntIndex>.some(SfntIndex { tag: tag, index: self.index & 0x7fffffff })
+  }
+
+  pub fn sfntIds(self: Self) -> Option<SfntIds> {
+    if self.index >= 4294967292 {
+      return Option<SfntIds>.None
+    }
+    return Option<SfntIds>.some(
+      SfntIds { platformId: self.platformId, encodingId: self.encodingId },
+    )
+  }
+
+  pub fn standaloneCffNative(predefined: Option<PredefinedEncoding>) -> Self {
+    let kind = match move predefined {
+      Option<PredefinedEncoding>.Some {
+        value: PredefinedEncoding.Standard
+      } => EncodingKind.AdobeStandard
+      Option<PredefinedEncoding>.Some {
+        value: PredefinedEncoding.Expert
+      } => EncodingKind.AdobeExpert
+      Option<PredefinedEncoding>.Some {
+        value: PredefinedEncoding.IsoLatin1
+      } => EncodingKind.AdobeLatin1
+      _ => EncodingKind.AdobeCustom
+    }
+    return Self { encodingKind: kind, index: 4294967293, platformId: 0, encodingId: 0 }
+  }
+}
+
+union MaybeCmap<'a> {
+  None,
+  Some { table: Cmap<'a> },
+}
+
+impl<'a> Copy for MaybeCmap<'a> {}
+
+union MaybeSubtable<'a> {
+  None,
+  Some { table: CmapSubtable<'a> },
+}
+
+impl<'a> Copy for MaybeSubtable<'a> {}
+
+union MaybeUvs<'a> {
+  None,
+  Some { table: UvsSubtable<'a> },
+}
+
+impl<'a> Copy for MaybeUvs<'a> {}
+
+union MaybeCff<'a> {
+  None,
+  Some { table: CffEncoding<'a> },
+}
+
+impl<'a> Copy for MaybeCff<'a> {}
+
+fn nonzero(input: Option<GlyphId>) -> Option<GlyphId> {
+  if let Option<GlyphId>.Some { value } = move input {
+    if GlyphId.toU32(value) != 0 {
+      return Option<GlyphId>.some(value)
+    }
+  }
+  return Option<GlyphId>.None
+}
+
+impl<'a> MaybeSubtable<'a> {
+  fn map(self: &Self, code: u32) -> Option<GlyphId> {
+    return match &self.* {
+      MaybeSubtable<'a>.Some { table } => CmapSubtable.mapCodepoint(&table, code)
+      _ => Option<GlyphId>.None
+    }
+  }
+
+  fn present(self: &Self) -> bool {
+    return match &self.* {
+      MaybeSubtable<'a>.Some { table } => true
+      _ => false
+    }
+  }
+
+  fn iter(self: &Self, limits: CmapIterLimits) -> CmapSubtableIter<'a> {
+    return match &self.* {
+      MaybeSubtable<'a>.Some { table } => CmapSubtable.iterWithLimits(&table, limits)
+      _ => CmapSubtableIter<'a>.None
+    }
+  }
+}
+
+impl<'a> MaybeUvs<'a> {
+  fn map(self: &Self, code: u32, selector: u32) -> Option<MapVariant> {
+    return match &self.* {
+      MaybeUvs<'a>.Some { table } => UvsSubtable.mapVariant(&table, code, selector)
+      _ => Option<MapVariant>.None
+    }
+  }
+
+  fn iter(self: &Self, limits: CmapIterLimits) -> Option<UvsSubtableIter<'a>> {
+    return match &self.* {
+      MaybeUvs<'a>.Some { table } => Option<UvsSubtableIter<'a>>.some(
+        UvsSubtable.iterWithLimits(&table, limits),
+      )
+      _ => Option<UvsSubtableIter<'a>>.None
+    }
+  }
+}
+
+struct UnicodeSubtables<'a> {
+  subtable: MaybeSubtable<'a>,
+  variants: MaybeUvs<'a>,
+  isSymbol: bool,
+  isMacRoman: bool,
+  // A format 12/13 subtable with no symbol or Mac Roman remapping maps straight
+  // through `groups`.
+  direct: bool,
+  groups: GroupMap<'a>,
+  // The same for a format 4 subtable, through `segments`.
+  direct4: bool,
+  segments: SegmentMap<'a>,
+}
+
+impl<'a> Copy for UnicodeSubtables<'a> {}
+
+impl<'a> UnicodeSubtables<'a> {
+  fn read(cmap: MaybeCmap<'a>) -> Self {
+    let mut result = Self {
+      subtable: MaybeSubtable<'a>.None,
+      variants: MaybeUvs<'a>.None,
+      isSymbol: false,
+      isMacRoman: false,
+      direct: false,
+      groups: GroupMap<'a>.empty(),
+      direct4: false,
+      segments: SegmentMap<'a>.empty(),
+    }
+    if let MaybeCmap<'a>.Some { table } = cmap {
+      if let Option<BestCmapSubtable<'a>>.Some { value } = Cmap.bestSubtable(&table) {
+        result.subtable = MaybeSubtable<'a>.Some { table: value.subtable }
+        result.isSymbol = EncodingRecord.isSymbol(&value.record)
+        result.isMacRoman = EncodingRecord.isMacRoman(&value.record)
+        if let Option<GroupMap<'a>>.Some { value: groups } = CmapSubtable.groupMap(
+          &value.subtable,
+        ) {
+          result.groups = groups
+          result.direct = !result.isSymbol && !result.isMacRoman
+        }
+        if let Option<SegmentMap<'a>>.Some { value: segments } = CmapSubtable.segmentMap(
+          &value.subtable,
+        ) {
+          result.segments = segments
+          result.direct4 = !result.isSymbol && !result.isMacRoman
+        }
+      }
+      if let Option<SelectedUvsSubtable<'a>>.Some { value } = Cmap.uvsSubtable(&table) {
+        result.variants = MaybeUvs<'a>.Some { table: value.subtable }
+      }
+    }
+    return result
+  }
+
+  fn code(self: &Self, codepoint: u32) -> Option<u32> {
+    if self.isMacRoman && codepoint > 127 {
+      let value = match move char.fromU32(codepoint) {
+        Option<char>.Some { value } => value
+        _ => {
+          return Option<u32>.None
+        }
+      }
+      return match move MacRomanMapping.encode(value) {
+        Option<u8>.Some { value: encoded } => Option<u32>.some(u8.toU32(encoded))
+        _ => Option<u32>.None
+      }
+    }
+    return Option<u32>.some(codepoint)
+  }
+
+  fn map(self: &Self, codepoint: u32) -> Option<GlyphId> with Intrinsic.inlineAlways() {
+    if self.direct {
+      return nonzero(GroupMap.map(&self.groups, codepoint))
+    }
+    if self.direct4 {
+      return nonzero(SegmentMap.map(&self.segments, codepoint))
+    }
+    if !MaybeSubtable.present(&self.subtable) {
+      return Option<GlyphId>.None
+    }
+    return UnicodeSubtables.mapSlow(self, codepoint)
+  }
+
+  fn mapSlow(self: &Self, codepoint: u32) -> Option<GlyphId> {
+    let code = match move UnicodeSubtables.code(self, codepoint) {
+      Option<u32>.Some { value } => value
+      _ => {
+        return Option<GlyphId>.None
+      }
+    }
+    if let Option<GlyphId>.Some { value } = nonzero(MaybeSubtable.map(&self.subtable, code)) {
+      return Option<GlyphId>.some(value)
+    }
+    if self.isSymbol && code <= 255 {
+      return nonzero(MaybeSubtable.map(&self.subtable, 0xf000 + code))
+    }
+    return Option<GlyphId>.None
+  }
+
+  fn cachedMap(
+    self: &Self,
+    codepoint: u32,
+    cached4: &mut Option<Cmap4Segment>,
+    cached12: &mut Option<Cmap12Group>,
+  ) -> Option<GlyphId> {
+    let code = match move UnicodeSubtables.code(self, codepoint) {
+      Option<u32>.Some { value } => value
+      _ => {
+        return Option<GlyphId>.None
+      }
+    }
+    if let Option<GlyphId>.Some { value } = nonzero(
+      cachedLookup(self.subtable, code, &mut cached4, &mut cached12),
+    ) {
+      return Option<GlyphId>.some(value)
+    }
+    if self.isSymbol && code <= 255 {
+      return nonzero(cachedLookup(self.subtable, 0xf000 + code, &mut cached4, &mut cached12))
+    }
+    return Option<GlyphId>.None
+  }
+}
+
+fn cachedLookup<'a>(
+  subtable: MaybeSubtable<'a>,
+  code: u32,
+  cached4: &mut Option<Cmap4Segment>,
+  cached12: &mut Option<Cmap12Group>,
+) -> Option<GlyphId> {
+  if let MaybeSubtable<'a>.Some { table } = subtable {
+    return match table {
+      CmapSubtable<'a>.Format4 { value } => Cmap4.mapCodepointCached(&value, code, &mut cached4)
+      CmapSubtable<'a>.Format12 { value } => Cmap12.mapCodepointCached(&value, code, &mut cached12)
+      _ => CmapSubtable.mapCodepoint(&table, code)
+    }
+  }
+  return Option<GlyphId>.None
+}
+
+pub struct Charmap<'a> {
+  cmap: MaybeCmap<'a>,
+  dmap: MaybeCmap<'a>,
+  base: UnicodeSubtables<'a>,
+  delta: UnicodeSubtables<'a>,
+  native: MaybeCff<'a>,
+  glyphCount: u32,
+}
+
+impl<'a> Copy for Charmap<'a> {}
+
+impl<'a> Charmap<'a> {
+  pub fn new<P: TableProvider<'a>>(provider: &P) -> Self {
+    let cmap = match move TableProvider.cmap(provider) {
+      Result<Cmap<'a>, ReadError>.Success { value } => MaybeCmap<'a>.Some { table: value }
+      _ => MaybeCmap<'a>.None
+    }
+    let dmap = match move TableProvider.dmap(provider) {
+      Result<Dmap<'a>, ReadError>.Success { value } => MaybeCmap<'a>.Some {
+        table: Dmap.asCmap(&value)
+      }
+      _ => MaybeCmap<'a>.None
+    }
+    let count = match move TableProvider.selectedMaxp(provider) {
+      Result<SelectedMaxp<'a>, ReadError>.Success { value } => SelectedMaxp.numGlyphs(&value)
+      _ => 0
+    }
+    return Self {
+      cmap: cmap,
+      dmap: dmap,
+      base: UnicodeSubtables.read(cmap),
+      delta: UnicodeSubtables.read(dmap),
+      native: MaybeCff<'a>.None,
+      glyphCount: count,
+    }
+  }
+
+  pub fn fromCff(font: &CffFontRef<'a>) -> Self {
+    let mut native = MaybeCff<'a>.None
+    if !CffFontRef.isCid(font) {
+      if let Option<CffEncoding<'a>>.Some { value } = CffFontRef.encoding(font) {
+        native = MaybeCff<'a>.Some { table: value }
+      }
+    }
+    return Self {
+      cmap: MaybeCmap<'a>.None,
+      dmap: MaybeCmap<'a>.None,
+      base: UnicodeSubtables.read(MaybeCmap<'a>.None),
+      delta: UnicodeSubtables.read(MaybeCmap<'a>.None),
+      native: native,
+      glyphCount: CffFontRef.numGlyphs(font),
+    }
+  }
+
+  pub fn hasUnicode(self: &Self) -> bool {
+    return MaybeSubtable.present(&self.base.subtable) || MaybeSubtable.present(&self.delta.subtable)
+  }
+
+  pub fn unicodeIsSymbol(self: &Self) -> bool {
+    return self.base.isSymbol || self.delta.isSymbol
+  }
+
+  pub fn unicodeIsMacRoman(self: &Self) -> bool {
+    return self.base.isMacRoman || self.delta.isMacRoman
+  }
+
+  /// Writes `mapUnicode`'s glyph for each code point below `out.length` into `out`, as 0 when
+  /// unmapped and 0xFFFF when the glyph does not fit in 16 bits, for a single format 4, 12 or
+  /// 13 Unicode subtable whose ranges are sorted and disjoint. Returns false, leaving `out`
+  /// unchanged, for any other mapping.
+  pub fn fillUnicode(self: &Self, out: &mut [u16]) -> bool {
+    if self.delta.direct || self.delta.direct4 || MaybeSubtable.present(&self.delta.subtable) {
+      return false
+    }
+    if self.base.direct {
+      return GroupMap.fill(&self.base.groups, move out)
+    }
+    if self.base.direct4 {
+      return SegmentMap.fill(&self.base.segments, move out)
+    }
+    return false
+  }
+
+  pub fn mapUnicode(self: &Self, codepoint: u32) -> Option<GlyphId> with Intrinsic.inlineAlways() {
+    if let Option<GlyphId>.Some { value } = UnicodeSubtables.map(&self.delta, codepoint) {
+      return Option<GlyphId>.some(value)
+    }
+    return UnicodeSubtables.map(&self.base, codepoint)
+  }
+
+  /// Maps the shorter input/output length, as Rust's zipped input iterator does.
+  pub fn mapUnicodeBatched(self: &Self, codepoints: &[u32], outputs: &mut [GlyphId]) -> usize {
+    let mut count = codepoints.length
+    if outputs.length < count {
+      count = outputs.length
+    }
+    let mut cached4 = Option<Cmap4Segment>.None
+    let mut cached12 = Option<Cmap12Group>.None
+    let mut mapped: usize = 0
+    let mut initial = true
+    let mut i: usize = 0
+    while i < count {
+      let mut result = Option<GlyphId>.None
+      if MaybeSubtable.present(&self.delta.subtable) {
+        result = Charmap.mapUnicode(self, codepoints[i])
+      } else {
+        result = UnicodeSubtables.cachedMap(&self.base, codepoints[i], &mut cached4, &mut cached12)
+      }
+      let glyph = move result |> Option<GlyphId>.unwrapOr(GlyphId.new(0))
+      outputs[i] = glyph
+      initial = initial && GlyphId.toU32(glyph) != 0
+      if initial {
+        mapped = mapped + 1
+      }
+      i = i + 1
+    }
+    return mapped
+  }
+
+  pub fn unicodes(self: &Self) -> Unicodes<'a> {
+    let limits = CmapIterLimits { maxChar: 1114111, glyphCount: self.glyphCount }
+    return Unicodes<'a> {
+      map: self.*,
+      base: UnicodeIter.new(self.base, limits),
+      delta: UnicodeIter.new(self.delta, limits),
+      inDelta: true,
+    }
+  }
+
+  pub fn hasUnicodeVariants(self: &Self) -> bool {
+    return match self.delta.variants {
+      MaybeUvs<'a>.Some { table } => true
+      _ => match self.base.variants {
+        MaybeUvs<'a>.Some { table } => true
+        _ => false
+      }
+    }
+  }
+
+  pub fn mapUnicodeVariant(self: &Self, codepoint: u32, selector: u32) -> Option<GlyphId> {
+    let mut mapping = MaybeUvs.map(&self.delta.variants, codepoint, selector)
+    if let Option<MapVariant>.None = &mapping {
+      mapping = MaybeUvs.map(&self.base.variants, codepoint, selector)
+    }
+    return match move mapping {
+      Option<MapVariant>.Some { value } => Charmap.resolve(self, value, codepoint)
+      _ => Option<GlyphId>.None
+    }
+  }
+
+  fn resolve(self: &Self, mapping: MapVariant, codepoint: u32) -> Option<GlyphId> {
+    return match mapping {
+      MapVariant.UseDefault => Charmap.mapUnicode(self, codepoint)
+      MapVariant.Variant { glyph } => nonzero(Option<GlyphId>.some(glyph))
+    }
+  }
+
+  pub fn unicodeVariants(self: &Self) -> UnicodeVariants<'a> {
+    let limits = CmapIterLimits { maxChar: 1114111, glyphCount: self.glyphCount }
+    return UnicodeVariants<'a> {
+      map: self.*,
+      base: MaybeUvs.iter(&self.base.variants, limits),
+      delta: MaybeUvs.iter(&self.delta.variants, limits),
+      inDelta: true,
+    }
+  }
+
+  pub fn encodings(self: &Self) -> Encodings<'a> {
+    return Encodings<'a> { map: self.*, index: 0, phase: 0 }
+  }
+
+  /// Maps one code. To map many codes in the same encoding, use [`Charmap.encodingMapper`], which
+  /// looks the subtable up once.
+  pub fn mapCode(self: &Self, encoding: Encoding, code: u32) -> Option<GlyphId> {
+    return EncodingMapper.map(&Charmap.encodingMapper(self, encoding), code)
+  }
+
+  /// Returns a mapper for `encoding` that gives the same results as [`Charmap.mapCode`].
+  pub fn encodingMapper(self: &Self, encoding: Encoding) -> EncodingMapper<'a> {
+    if let MaybeCff<'a>.Some { table } = self.native {
+      return EncodingMapper<'a> {
+        table: MaybeEncodingTable<'a>.None,
+        native: self.native,
+        nativeMatches: &encoding == &Encoding.standaloneCffNative(CffEncoding.predefined(&table)),
+      }
+    }
+    let mut table = MaybeEncodingTable<'a>.None
+    if let Option<EncodingTable<'a>>.Some { value } = Charmap.table(self, encoding) {
+      table = MaybeEncodingTable<'a>.Some { table: value }
+    }
+    return EncodingMapper<'a> { table: table, native: MaybeCff<'a>.None, nativeMatches: false }
+  }
+
+  pub fn codes(self: &Self, encoding: Encoding) -> Codes<'a> {
+    let limits = CmapIterLimits { maxChar: 4294967295, glyphCount: self.glyphCount }
+    let mut result = Codes<'a> {
+      delta: RawCodeIter.empty(),
+      base: RawCodeIter.empty(),
+      deltaTable: MaybeSubtable<'a>.None,
+      native: MaybeCff<'a>.None,
+      nativeCode: 0,
+      inDelta: true,
+    }
+    if let MaybeCff<'a>.Some { table } = self.native {
+      if &encoding == &Encoding.standaloneCffNative(CffEncoding.predefined(&table)) {
+        result.native = self.native
+      }
+      return move result
+    }
+    if let Option<EncodingTable<'a>>.Some { value } = Charmap.table(self, encoding) {
+      result.deltaTable = value.delta
+      result.delta = RawCodeIter.new(value.delta, limits)
+      result.base = RawCodeIter.new(MaybeSubtable<'a>.Some { table: value.subtable }, limits)
+    }
+    return move result
+  }
+
+  fn table(self: &Self, encoding: Encoding) -> Option<EncodingTable<'a>> {
+    let source = match move Encoding.sfntIndex(encoding) {
+      Option<SfntIndex>.Some { value } => value
+      _ => {
+        return Option<EncodingTable<'a>>.None
+      }
+    }
+    let isDelta = (encoding.index & 0x80000000) != 0
+    let mut cmap = self.cmap
+    if isDelta {
+      cmap = self.dmap
+    }
+    let mut table = match move readEncoding(cmap, source.index, isDelta) {
+      Option<EncodingTable<'a>>.Some { value } => value
+      _ => {
+        return Option<EncodingTable<'a>>.None
+      }
+    }
+    if &table.encoding != &encoding {
+      return Option<EncodingTable<'a>>.None
+    }
+    if !isDelta {
+      table.delta = Charmap.encodingDelta(self, encoding)
+    }
+    return Option<EncodingTable<'a>>.some(table)
+  }
+
+  fn encodingDelta(self: &Self, base: Encoding) -> MaybeSubtable<'a> {
+    if base.encodingKind == EncodingKind.Unicode {
+      if let MaybeCmap<'a>.Some { table } = self.dmap {
+        if let Option<BestCmapSubtable<'a>>.Some { value } = Cmap.bestSubtable(&table) {
+          if let Option<EncodingTable<'a>>.Some { value: entry } = readEncoding(
+            self.dmap,
+            u16.toU32(value.index),
+            true,
+          ) {
+            if entry.encoding.encodingKind == EncodingKind.Unicode {
+              return MaybeSubtable<'a>.Some { table: entry.subtable }
+            }
+          }
+        }
+      }
+    }
+    let count = encodingCount(self.dmap)
+    let mut index: u32 = 0
+    while index < count {
+      if let Option<EncodingTable<'a>>.Some { value } = readEncoding(self.dmap, index, true) {
+        if sameIds(value.encoding, base) {
+          return MaybeSubtable<'a>.Some { table: value.subtable }
+        }
+      }
+      index = index + 1
+    }
+    index = 0
+    while index < count {
+      if let Option<EncodingTable<'a>>.Some { value } = readEncoding(self.dmap, index, true) {
+        if sameKind(value.encoding, base) {
+          return MaybeSubtable<'a>.Some { table: value.subtable }
+        }
+      }
+      index = index + 1
+    }
+    return MaybeSubtable<'a>.None
+  }
+}
+
+struct UnicodeIter<'a> {
+  map: UnicodeSubtables<'a>,
+  normal: CmapSubtableIter<'a>,
+  romanCode: u32,
+}
+
+impl<'a> UnicodeIter<'a> {
+  fn new(map: UnicodeSubtables<'a>, limits: CmapIterLimits) -> Self {
+    return Self { map: map, normal: MaybeSubtable.iter(&map.subtable, limits), romanCode: 0 }
+  }
+
+  fn next(self: &mut Self) -> Option<CmapMapping> {
+    if !self.map.isMacRoman {
+      return CmapSubtableIter.next(&mut self.normal)
+    }
+    while self.romanCode < 256 {
+      let code = char.toU32(MacRomanMapping.decode(u32.toU8(self.romanCode)))
+      self.romanCode = self.romanCode + 1
+      if let Option<GlyphId>.Some { value } = UnicodeSubtables.map(&self.map, code) {
+        return Option<CmapMapping>.some(CmapMapping { codepoint: code, glyph: value })
+      }
+    }
+    return Option<CmapMapping>.None
+  }
+}
+
+pub struct Unicodes<'a> {
+  map: Charmap<'a>,
+  base: UnicodeIter<'a>,
+  delta: UnicodeIter<'a>,
+  inDelta: bool,
+}
+
+impl<'a> Unicodes<'a> {
+  pub fn next(self: &mut Self) -> Option<CmapMapping> {
+    while self.inDelta {
+      if let Option<CmapMapping>.Some { value } = UnicodeIter.next(&mut self.delta) {
+        if GlyphId.toU32(value.glyph) != 0 {
+          return Option<CmapMapping>.some(value)
+        }
+      } else {
+        self.inDelta = false
+      }
+    }
+    while true {
+      let value = match move UnicodeIter.next(&mut self.base) {
+        Option<CmapMapping>.Some { value } => value
+        _ => {
+          return Option<CmapMapping>.None
+        }
+      }
+      if GlyphId.toU32(value.glyph) == 0 {
+        continue
+      }
+      if let Option<GlyphId>.Some { value: glyph } = UnicodeSubtables.map(
+        &self.map.delta,
+        value.codepoint,
+      ) {
+        continue
+      }
+      return Option<CmapMapping>.some(value)
+    }
+  }
+}
+
+pub struct UnicodeVariant {
+  pub codepoint: u32,
+  pub selector: u32,
+  pub glyph: GlyphId,
+}
+
+impl Copy for UnicodeVariant {}
+
+pub struct UnicodeVariants<'a> {
+  map: Charmap<'a>,
+  base: Option<UvsSubtableIter<'a>>,
+  delta: Option<UvsSubtableIter<'a>>,
+  inDelta: bool,
+}
+
+fn nextVariant<'a>(iter: &mut Option<UvsSubtableIter<'a>>) -> Option<UvsMappingEntry> {
+  if let Option<UvsSubtableIter<'a>>.Some { value } = &mut iter.* {
+    return UvsSubtableIter.next(&mut value)
+  }
+  return Option<UvsMappingEntry>.None
+}
+
+impl<'a> UnicodeVariants<'a> {
+  pub fn next(self: &mut Self) -> Option<UnicodeVariant> {
+    while true {
+      let mut entry = Option<UvsMappingEntry>.None
+      if self.inDelta {
+        entry = nextVariant(&mut self.delta)
+        if let Option<UvsMappingEntry>.None = &entry {
+          self.inDelta = false
+        }
+      }
+      if !self.inDelta {
+        entry = nextVariant(&mut self.base)
+        if let Option<UvsMappingEntry>.Some { value } = &entry {
+          if let Option<MapVariant>.Some { value: found } = MaybeUvs.map(
+            &self.map.delta.variants,
+            value.codepoint,
+            value.selector,
+          ) {
+            continue
+          }
+        }
+      }
+      let value = match move entry {
+        Option<UvsMappingEntry>.Some { value } => value
+        _ => {
+          return Option<UnicodeVariant>.None
+        }
+      }
+      if let Option<GlyphId>.Some { value: glyph } = Charmap.resolve(
+        &self.map,
+        value.mapping,
+        value.codepoint,
+      ) {
+        return Option<UnicodeVariant>.some(
+          UnicodeVariant { codepoint: value.codepoint, selector: value.selector, glyph: glyph },
+        )
+      }
+    }
+  }
+}
+
+/// Maps codes in one encoding, with its subtables looked up once. Made by
+/// [`Charmap.encodingMapper`].
+pub struct EncodingMapper<'a> {
+  table: MaybeEncodingTable<'a>,
+  native: MaybeCff<'a>,
+  nativeMatches: bool,
+}
+
+impl<'a> Copy for EncodingMapper<'a> {}
+
+impl<'a> EncodingMapper<'a> {
+  pub fn map(self: &Self, code: u32) -> Option<GlyphId> {
+    if let MaybeCff<'a>.Some { table } = self.native {
+      if !self.nativeMatches || code > 255 {
+        return Option<GlyphId>.None
+      }
+      return nonzero(CffEncoding.map(&table, u32.toU8(code)))
+    }
+    if let MaybeEncodingTable<'a>.Some { table } = self.table {
+      if let Option<GlyphId>.Some { value: glyph } = nonzero(
+        MaybeSubtable.map(&table.delta, code),
+      ) {
+        return Option<GlyphId>.some(glyph)
+      }
+      return nonzero(CmapSubtable.mapCodepoint(&table.subtable, code))
+    }
+    return Option<GlyphId>.None
+  }
+}
+
+union MaybeEncodingTable<'a> {
+  None,
+  Some { table: EncodingTable<'a> },
+}
+
+impl<'a> Copy for MaybeEncodingTable<'a> {}
+
+struct EncodingTable<'a> {
+  encoding: Encoding,
+  subtable: CmapSubtable<'a>,
+  delta: MaybeSubtable<'a>,
+}
+
+impl<'a> Copy for EncodingTable<'a> {}
+
+fn encodingCount<'a>(cmap: MaybeCmap<'a>) -> u32 {
+  return match cmap {
+    MaybeCmap<'a>.Some { table } => u16.toU32(Cmap.numTables(&table))
+    _ => 0
+  }
+}
+
+fn sameIds(a: Encoding, b: Encoding) -> bool {
+  return a.platformId == b.platformId && a.encodingId == b.encodingId
+}
+
+fn sameKind(a: Encoding, b: Encoding) -> bool {
+  return a.encodingKind == b.encodingKind && (a.encodingKind != EncodingKind.None || sameIds(a, b))
+}
+
+fn readEncoding<'a>(cmap: MaybeCmap<'a>, index: u32, isDelta: bool) -> Option<EncodingTable<'a>> {
+  let table = match cmap {
+    MaybeCmap<'a>.Some { table } => table
+    _ => {
+      return Option<EncodingTable<'a>>.None
+    }
+  }
+  let records = Cmap.encodingRecords(&table)
+  let record = match move ComputedArray<'a, (), EncodingRecord<'a>>.get(
+    &records,
+    u32.toUsize(index),
+  ) {
+    Result<EncodingRecord<'a>, ReadError>.Success { value } => value
+    _ => {
+      return Option<EncodingTable<'a>>.None
+    }
+  }
+  let subtable = match move EncodingRecord.subtable(&record, Cmap.offsetData(&table)) {
+    Result<CmapSubtable<'a>, ReadError>.Success { value } => value
+    _ => {
+      return Option<EncodingTable<'a>>.None
+    }
+  }
+  let supported = match subtable {
+    CmapSubtable<'a>.Format0 { value } => true
+    CmapSubtable<'a>.Format4 { value } => true
+    CmapSubtable<'a>.Format6 { value } => true
+    CmapSubtable<'a>.Format10 { value } => true
+    CmapSubtable<'a>.Format12 { value } => true
+    CmapSubtable<'a>.Format13 { value } => true
+    _ => false
+  }
+  if !supported {
+    return Option<EncodingTable<'a>>.None
+  }
+  let platform = EncodingRecord.platformId(&record)
+  let id = EncodingRecord.encodingId(&record)
+  let mut kind = EncodingKind.None
+  if platform == PlatformId.Unicode || platform == PlatformId.ISO {
+    kind = EncodingKind.Unicode
+  } else if platform == PlatformId.Macintosh && id == 0 {
+    kind = EncodingKind.AppleRoman
+  } else if platform == PlatformId.Windows {
+    kind = match id {
+      0 => EncodingKind.MsSymbol
+      1 => EncodingKind.Unicode
+      10 => EncodingKind.Unicode
+      2 => EncodingKind.Sjis
+      3 => EncodingKind.Prc
+      4 => EncodingKind.Big5
+      5 => EncodingKind.Wansung
+      6 => EncodingKind.Johab
+      _ => EncodingKind.None
+    }
+  }
+  let mut key = index
+  if isDelta {
+    key = key | 0x80000000
+  }
+  return Option<EncodingTable<'a>>.some(
+    EncodingTable<'a> {
+      encoding: Encoding {
+        encodingKind: kind,
+        index: key,
+        platformId: PlatformId.value(platform),
+        encodingId: id,
+      },
+      subtable: subtable,
+      delta: MaybeSubtable<'a>.None,
+    },
+  )
+}
+
+pub struct Encodings<'a> {
+  map: Charmap<'a>,
+  index: u32,
+  phase: u8,
+}
+
+impl<'a> Encodings<'a> {
+  pub fn next(self: &mut Self) -> Option<Encoding> {
+    while self.phase < 2 {
+      let mut table = self.map.cmap
+      if self.phase == 1 {
+        table = self.map.dmap
+      }
+      while self.index < encodingCount(table) {
+        let index = self.index
+        self.index = self.index + 1
+        if let Option<EncodingTable<'a>>.Some { value } = readEncoding(
+          table,
+          index,
+          self.phase == 1,
+        ) {
+          if self.phase == 1 {
+            let mut hidden = false
+            let mut i: u32 = 0
+            while i < encodingCount(self.map.cmap) {
+              if let Option<EncodingTable<'a>>.Some { value: base } = readEncoding(
+                self.map.cmap,
+                i,
+                false,
+              ) {
+                if sameKind(base.encoding, value.encoding) {
+                  hidden = true
+                  break
+                }
+              }
+              i = i + 1
+            }
+            if hidden {
+              continue
+            }
+          }
+          return Option<Encoding>.some(value.encoding)
+        }
+      }
+      self.phase = self.phase + 1
+      self.index = 0
+    }
+    if self.phase == 2 {
+      self.phase = 3
+      if let MaybeCff<'a>.Some { table } = self.map.native {
+        return Option<Encoding>.some(Encoding.standaloneCffNative(CffEncoding.predefined(&table)))
+      }
+    }
+    return Option<Encoding>.None
+  }
+}
+
+// Upstream iter_subtable appends a format-0 scan after the generic cursor.
+// Keep this ordering (including repeated format-0 codes) for individual encodings.
+struct RawCodeIter<'a> {
+  normal: CmapSubtableIter<'a>,
+  extra: MaybeSubtable<'a>,
+  code: u32,
+}
+
+impl<'a> RawCodeIter<'a> {
+  fn empty() -> Self {
+    return Self { normal: CmapSubtableIter<'a>.None, extra: MaybeSubtable<'a>.None, code: 0 }
+  }
+
+  fn new(table: MaybeSubtable<'a>, limits: CmapIterLimits) -> Self {
+    let mut extra = MaybeSubtable<'a>.None
+    if let MaybeSubtable<'a>.Some { table: subtable } = table {
+      if let CmapSubtable<'a>.Format0 { value } = subtable {
+        extra = table
+      }
+    }
+    return Self { normal: MaybeSubtable.iter(&table, limits), extra: extra, code: 0 }
+  }
+
+  fn next(self: &mut Self) -> Option<CmapMapping> {
+    if let Option<CmapMapping>.Some { value } = CmapSubtableIter.next(&mut self.normal) {
+      return Option<CmapMapping>.some(value)
+    }
+    while self.code < 256 {
+      let code = self.code
+      self.code = self.code + 1
+      if let Option<GlyphId>.Some { value } = MaybeSubtable.map(&self.extra, code) {
+        return Option<CmapMapping>.some(CmapMapping { codepoint: code, glyph: value })
+      }
+    }
+    return Option<CmapMapping>.None
+  }
+}
+
+pub struct Codes<'a> {
+  delta: RawCodeIter<'a>,
+  base: RawCodeIter<'a>,
+  deltaTable: MaybeSubtable<'a>,
+  native: MaybeCff<'a>,
+  nativeCode: u32,
+  inDelta: bool,
+}
+
+impl<'a> Codes<'a> {
+  pub fn next(self: &mut Self) -> Option<CmapMapping> {
+    if let MaybeCff<'a>.Some { table } = self.native {
+      while self.nativeCode < 256 {
+        let code = self.nativeCode
+        self.nativeCode = self.nativeCode + 1
+        if let Option<GlyphId>.Some { value } = nonzero(CffEncoding.map(&table, u32.toU8(code))) {
+          return Option<CmapMapping>.some(CmapMapping { codepoint: code, glyph: value })
+        }
+      }
+      return Option<CmapMapping>.None
+    }
+    while self.inDelta {
+      if let Option<CmapMapping>.Some { value } = RawCodeIter.next(&mut self.delta) {
+        if GlyphId.toU32(value.glyph) != 0 {
+          return Option<CmapMapping>.some(value)
+        }
+      } else {
+        self.inDelta = false
+      }
+    }
+    while true {
+      let value = match move RawCodeIter.next(&mut self.base) {
+        Option<CmapMapping>.Some { value } => value
+        _ => {
+          return Option<CmapMapping>.None
+        }
+      }
+      if GlyphId.toU32(value.glyph) == 0 {
+        continue
+      }
+      if let Option<GlyphId>.Some { value: glyph } = nonzero(
+        MaybeSubtable.map(&self.deltaTable, value.codepoint),
+      ) {
+        continue
+      }
+      return Option<CmapMapping>.some(value)
+    }
+  }
+}

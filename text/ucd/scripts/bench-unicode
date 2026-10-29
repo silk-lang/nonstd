@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Compare Unicode algorithms with pinned Rust/ICU4X implementations.
+
+Checksums compare byte boundaries (or whole-paragraph L1 bidi levels). References
+are performance baselines, not Unicode 18 correctness oracles. A mismatch needs
+investigation against conformance; no speed ratio is reported for differing work.
+"""
+import argparse
+import json
+from pathlib import Path
+import re
+import statistics
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parents[3]
+WORKLOADS = {
+    "latin": "The quick brown fox jumps over 13 lazy dogs. Next sentence! ",
+    "bidi": "English עברית العربية 123 (456) — mixed text. ",
+    "indic": "नमस्ते दुनिया। বাংলা ভাষা। தமிழ் மொழி. ",
+    "cjk": "漢字とかな、カタカナ。中文排版测试。 ",
+    "emoji": "A 👩🏽‍🚀 family 👨‍👩‍👧‍👦 flags 🇺🇳🇯🇵. ",
+}
+REFERENCES = (
+    ("bidi", "bidi", "unicode-bidi"),
+    ("line", "line", "unicode-linebreak"),
+    ("line", "icu-line", "ICU4X"),
+    ("grapheme", "grapheme", "ICU4X"),
+    ("word", "word", "unicode-segmentation"),
+    ("sentence", "sentence", "ICU4X"),
+)
+
+
+def measure(command, args, destination):
+    if args.callgrind:
+        subprocess.run(["valgrind", "--tool=callgrind", "--quiet",
+                        f"--callgrind-out-file={destination}", *command],
+                       cwd=ROOT, check=True, stdout=subprocess.DEVNULL, timeout=600)
+        match = re.search(rb"^summary: (\d+)$", destination.read_bytes(), re.M)
+        if not match:
+            raise RuntimeError(f"missing instruction count in {destination}")
+        return int(match[1])
+    samples = []
+    for _ in range(args.samples):
+        start = time.perf_counter()
+        subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE, timeout=300)
+        samples.append(time.perf_counter() - start)
+    return statistics.median(samples)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--silk", type=Path, default=ROOT / "build/llvm/x86_64-unknown-linux-gnu/release/ucd_bench")
+    parser.add_argument("--rust", type=Path, default=ROOT / "build/ucd-rust/release/rust-ucd-bench")
+    parser.add_argument("--baseline-only", action="store_true")
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--samples", type=int, default=3)
+    parser.add_argument("--filter", default="")
+    parser.add_argument("--algorithm", choices=sorted({row[0] for row in REFERENCES}), action="append")
+    parser.add_argument("--callgrind", action="store_true")
+    parser.add_argument("--report", type=Path, default=ROOT / "build/ucd-bench/report.json")
+    args = parser.parse_args()
+    if not 1 <= args.iterations <= 100000 or not 1 <= args.samples <= 100:
+        parser.error("iterations and samples must be positive and bounded")
+    directory = ROOT / "build/ucd-bench"
+    directory.mkdir(parents=True, exist_ok=True)
+    versions = subprocess.check_output([str(args.rust), "--version"], cwd=ROOT, text=True).strip()
+    unit = "Ir" if args.callgrind else "seconds"
+    print(versions, flush=True)
+    print(f"| Algorithm / workload | Reference | Silk {unit} | Reference {unit} | Ratio | Result |", flush=True)
+    print("|---|---|---:|---:|---:|---|", flush=True)
+    rows = []
+    failed = False
+    for algorithm, reference_algorithm, reference in REFERENCES:
+        if args.algorithm and algorithm not in args.algorithm:
+            continue
+        for name, seed in WORKLOADS.items():
+            label = f"{algorithm}/{name}"
+            if args.filter not in label:
+                continue
+            text = directory / f"{name}.txt"
+            text.write_text(seed * 256, encoding="utf-8")
+            commands = [("reference", [str(args.rust), reference_algorithm, str(text), str(args.iterations)])]
+            if not args.baseline_only:
+                commands.insert(0, ("silk", [str(args.silk), algorithm, str(text), str(args.iterations)]))
+            outputs = {}
+            values = {}
+            for twin, command in commands:
+                outputs[twin] = subprocess.check_output(command, cwd=ROOT, timeout=300).decode().strip()
+                values[twin] = measure(command, args, directory / f"{algorithm}-{reference_algorithm}-{name}-{twin}.callgrind")
+            matches = args.baseline_only or outputs["silk"] == outputs["reference"]
+            failed |= not matches
+            ratio = values["silk"] / values["reference"] if matches and not args.baseline_only else None
+            row = {"algorithm": algorithm, "workload": name, "bytes": text.stat().st_size,
+                   "reference": reference, "reference_algorithm": reference_algorithm,
+                   "measurements": values, "outputs": outputs, "matches": matches,
+                   "ratio": ratio}
+            rows.append(row)
+            silk = "—" if args.baseline_only else f"{values['silk']:.6g}"
+            comparison = "—" if ratio is None else f"{ratio:.2f}x"
+            status = "baseline" if args.baseline_only else ("match" if matches else "different boundaries/levels")
+            print(f"| {label} | {reference} | {silk} | {values['reference']:.6g} | {comparison} | {status} |", flush=True)
+    if not rows:
+        parser.error("filter selects no workloads")
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(json.dumps({"references": versions, "unit": unit,
+                                      "iterations": args.iterations, "samples": args.samples,
+                                      "baseline_only": args.baseline_only, "rows": rows}, indent=2) + "\n")
+    return int(failed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

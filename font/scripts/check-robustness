@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Every corpus font and a seeded sample of corrupted fonts must dump cleanly.
+
+This checks the Silk dumper on its own: it must exit 0 within the timeout and
+emit a structurally complete dump. Parse errors are fine; traps, crashes,
+hangs and truncated output are not. Comparison against the Rust reference
+lives in the baseline workflow (font/scripts/check-malformed, font/scripts/compare).
+"""
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ProcessPoolExecutor
+import json
+from pathlib import Path
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import harness
+import malformed
+
+
+def check(silk: Path, name: str, data: bytes, timeout: float, failures: Path) -> dict | None:
+    with tempfile.TemporaryDirectory(prefix="read-fonts-robustness-") as temporary:
+        font = Path(temporary) / "input.font"
+        font.write_bytes(data)
+        with (Path(temporary) / "silk.dump").open("w+b") as output:
+            try:
+                result = harness.run_dump_file(silk, font, timeout, output)
+                if result.returncode != 0:
+                    error = f"exit {result.returncode}: " + result.stderr.decode("utf-8", "backslashreplace")[-2000:]
+                else:
+                    harness.inspect_dump_file(output)
+                    return None
+            except subprocess.TimeoutExpired:
+                error = f"timed out after {timeout}s"
+            except ValueError as problem:
+                error = str(problem)
+        destination = failures / malformed.sha(data)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(font, destination / "input.font")
+        return {"case": name, "error": error, "artifact": harness.display(destination / "input.font")}
+
+
+def cases(fonts: list[Path], per_font: int, seed: int):
+    for font in fonts:
+        data = font.read_bytes()
+        name = harness.display(font)
+        yield name, data
+        if per_font:
+            variants = list(malformed.mutations(data, seed))
+            for recipe, changed in random.Random(f"{seed}:{name}").sample(variants, min(per_font, len(variants))):
+                yield f"{name} {json.dumps(recipe, sort_keys=True)}", changed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--fonts", type=Path)
+    parser.add_argument("--silk-dumper", type=Path)
+    parser.add_argument("--mutations-per-font", type=int, default=4,
+                        help="corrupted variants per corpus font (0 for clean fonts only)")
+    parser.add_argument("--seed", type=int, default=20261026)
+    parser.add_argument("--timeout", type=float, default=60, help="seconds per dump")
+    parser.add_argument("--jobs", type=int, default=harness.JOBS)
+    parser.add_argument("--failures", type=Path, default=harness.ROOT / "build/robustness-failures")
+    args = parser.parse_args()
+    try:
+        fonts, _ = harness.font_list(args.fonts)
+        silk = (args.silk_dumper or harness.silk_binary()).resolve()
+    except (OSError, ValueError) as error:
+        print(f"check-robustness: {error}", file=sys.stderr)
+        return 2
+    failed = total = 0
+    with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+        tasks = [pool.submit(check, silk, name, data, args.timeout, args.failures)
+                 for name, data in cases(fonts, args.mutations_per_font, args.seed)]
+        for task in tasks:
+            total += 1
+            if (failure := task.result()) is not None:
+                failed += 1
+                print("FAIL", json.dumps(failure), flush=True)
+    print(f"{'FAIL' if failed else 'OK'}: {total - failed}/{total} dumps clean "
+          f"({len(fonts)} fonts, {args.mutations_per_font} corrupted variants each)")
+    return int(bool(failed))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

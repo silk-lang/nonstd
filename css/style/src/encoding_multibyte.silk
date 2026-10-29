@@ -1,0 +1,411 @@
+//! Legacy multibyte decoders from the pinned WHATWG Encoding Standard.
+//! The input slice is the I/O queue: bounded lookahead or cursor restoration implements reconsume.
+import encoding_types { Encoding }
+import encoding_output { Output, scalar }
+import encoding_data
+import tokens { CssError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.usize
+
+const NULL: u32 = 0xffffffff
+
+const REPLACEMENT: u32 = 0xfffd
+
+fn mapped(cp: u32) -> u32 {
+  return if cp == NULL {
+    REPLACEMENT
+  } else {
+    cp
+  }
+}
+
+fn between(byte: u8, first: u8, last: u8) -> bool {
+  return byte >= first && byte <= last
+}
+
+pub effect fn decode(data: &[u8], encoding: Encoding, output: &mut Output) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  match encoding {
+    Encoding.Gbk => {
+      run gb(data, &mut output.*)
+    }
+    Encoding.Gb18030 => {
+      run gb(data, &mut output.*)
+    }
+    Encoding.EucJp => {
+      run eucJp(data, &mut output.*)
+    }
+    Encoding.Iso2022Jp => {
+      run iso2022Jp(data, &mut output.*)
+    }
+
+    // The caller dispatches only the seven multibyte encodings here.
+    _ => {
+      run pairs(data, encoding, &mut output.*)
+    }
+  }
+}
+
+// https://encoding.spec.whatwg.org/#gbk-decoder
+// https://encoding.spec.whatwg.org/#gb18030-decoder
+// GBK deliberately uses the full gb18030 decoder, including four-byte sequences.
+effect fn gb(data: &[u8], output: &mut Output) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < data.length {
+    let start = at
+    let first = data[at]
+    at = at + 1
+    if first < 0x80 {
+      run scalar(&mut output.*, u8.toU32(first), start)
+      continue
+    }
+    if first == 0x80 {
+      run scalar(&mut output.*, 0x20ac, start)
+      continue
+    }
+    if !between(first, 0x81, 0xfe) || at == data.length {
+      run scalar(&mut output.*, REPLACEMENT, start)
+      continue
+    }
+    let second = data[at]
+    if between(second, 0x30, 0x39) {
+      // EOF consumes the complete pending sequence, including its ASCII second byte.
+      if data.length - at == 1 {
+        at = data.length
+        run scalar(&mut output.*, REPLACEMENT, start)
+        continue
+      }
+      let third = data[at + 1]
+      if !between(third, 0x81, 0xfe) {
+        // Restore second and third: only the first byte has been consumed.
+        run scalar(&mut output.*, REPLACEMENT, start)
+        continue
+      }
+      if data.length - at == 2 {
+        at = data.length
+        run scalar(&mut output.*, REPLACEMENT, start)
+        continue
+      }
+      let fourth = data[at + 2]
+      if !between(fourth, 0x30, 0x39) {
+        // Restore second, third and fourth in their original order.
+        run scalar(&mut output.*, REPLACEMENT, start)
+        continue
+      }
+
+      // Each operand was range checked; the pointer is at most 1,587,599.
+      let pointer = u8.toUsize(first - 0x81) * 12600 + u8.toUsize(second - 0x30) * 1260
+        + u8.toUsize(third - 0x81) * 10
+        + u8.toUsize(fourth - 0x30)
+      at = at + 3
+      run scalar(&mut output.*, mapped(encoding_data.gb18030Range(pointer)), start)
+      continue
+    }
+    let mut cp = NULL
+    if between(second, 0x40, 0x7e) || between(second, 0x80, 0xfe) {
+      let offset: u8 = if second < 0x7f {
+        0x40
+      } else {
+        0x41
+      }
+      cp = encoding_data.gb18030(u8.toUsize(first - 0x81) * 190 + u8.toUsize(second - offset))
+    }
+    if cp != NULL || second >= 0x80 {
+      at = at + 1
+    }
+    run scalar(&mut output.*, mapped(cp), start)
+  }
+}
+
+// https://encoding.spec.whatwg.org/#big5-decoder
+// https://encoding.spec.whatwg.org/#shift_jis-decoder
+// https://encoding.spec.whatwg.org/#euc-kr-decoder
+// These three handlers share only their one-lead queue and ASCII restoration rules.
+effect fn pairs(data: &[u8], encoding: Encoding, output: &mut Output) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < data.length {
+    let start = at
+    let first = data[at]
+    at = at + 1
+    if first < 0x80 || (encoding == Encoding.ShiftJis && first == 0x80) {
+      run scalar(&mut output.*, u8.toU32(first), start)
+      continue
+    }
+    if encoding == Encoding.ShiftJis && between(first, 0xa1, 0xdf) {
+      run scalar(&mut output.*, 0xff61 + u8.toU32(first - 0xa1), start)
+      continue
+    }
+    let leading = if encoding == Encoding.ShiftJis {
+      between(first, 0x81, 0x9f) || between(first, 0xe0, 0xfc)
+    } else {
+      between(first, 0x81, 0xfe)
+    }
+    if !leading || at == data.length {
+      run scalar(&mut output.*, REPLACEMENT, start)
+      continue
+    }
+    let second = data[at]
+    let mut cp = NULL
+    if encoding == Encoding.Big5 {
+      if between(second, 0x40, 0x7e) || between(second, 0xa1, 0xfe) {
+        let offset: u8 = if second < 0x7f {
+          0x40
+        } else {
+          0x62
+        }
+        let pointer = u8.toUsize(first - 0x81) * 157 + u8.toUsize(second - offset)
+        if pointer == 1133 || pointer == 1135 || pointer == 1164 || pointer == 1166 {
+          at = at + 1
+          run scalar(
+            &mut output.*,
+            if pointer < 1164 {
+              0x00ca
+            } else {
+              0x00ea
+            },
+            start,
+          )
+          run scalar(
+            &mut output.*,
+            if pointer == 1133 || pointer == 1164 {
+              0x0304
+            } else {
+              0x030c
+            },
+            start,
+          )
+          continue
+        }
+        cp = encoding_data.big5(pointer)
+      }
+    } else if encoding == Encoding.ShiftJis {
+      if between(second, 0x40, 0x7e) || between(second, 0x80, 0xfc) {
+        let offset: u8 = if second < 0x7f {
+          0x40
+        } else {
+          0x41
+        }
+        let leadingOffset: u8 = if first < 0xa0 {
+          0x81
+        } else {
+          0xc1
+        }
+        let pointer = u8.toUsize(first - leadingOffset) * 188 + u8.toUsize(second - offset)
+        cp = if pointer >= 8836 && pointer <= 10715 {
+          0xe000 + usize.toU32(pointer - 8836)
+        } else {
+          encoding_data.jis0208(pointer)
+        }
+      }
+    } else {
+      if between(second, 0x41, 0xfe) {
+        cp = encoding_data.eucKr(u8.toUsize(first - 0x81) * 190 + u8.toUsize(second - 0x41))
+      }
+    }
+
+    // Undefined index entries restore ASCII too, not just syntactically invalid trails.
+    if cp != NULL || second >= 0x80 {
+      at = at + 1
+    }
+    run scalar(&mut output.*, mapped(cp), start)
+  }
+}
+
+// https://encoding.spec.whatwg.org/#euc-jp-decoder
+effect fn eucJp(data: &[u8], output: &mut Output) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  let mut lead: u8 = 0
+  let mut jis0212 = false
+  let mut start: usize = 0
+  while at < data.length {
+    let byte = data[at]
+    at = at + 1
+    if lead == 0x8e && between(byte, 0xa1, 0xdf) {
+      lead = 0
+      run scalar(&mut output.*, 0xff61 + u8.toU32(byte - 0xa1), start)
+      continue
+    }
+    if lead == 0x8f && between(byte, 0xa1, 0xfe) {
+      jis0212 = true
+      lead = byte
+      continue
+    }
+    if lead != 0 {
+      let mut cp = NULL
+      if between(lead, 0xa1, 0xfe) && between(byte, 0xa1, 0xfe) {
+        let pointer = u8.toUsize(lead - 0xa1) * 94 + u8.toUsize(byte - 0xa1)
+        cp = if jis0212 {
+          encoding_data.jis0212(pointer)
+        } else {
+          encoding_data.jis0208(pointer)
+        }
+      }
+      lead = 0
+      jis0212 = false
+      if cp == NULL && byte < 0x80 {
+        at = at - 1
+      }
+      run scalar(&mut output.*, mapped(cp), start)
+      continue
+    }
+    start = at - 1
+    if byte < 0x80 {
+      run scalar(&mut output.*, u8.toU32(byte), start)
+    } else if byte == 0x8e || byte == 0x8f || between(byte, 0xa1, 0xfe) {
+      lead = byte
+    } else {
+      run scalar(&mut output.*, REPLACEMENT, start)
+    }
+  }
+  if lead != 0 {
+    run scalar(&mut output.*, REPLACEMENT, start)
+  }
+}
+
+enum JpState {
+  Ascii,
+  Roman,
+  Katakana,
+  Leading,
+  Trailing,
+  EscapeStart,
+  Escape
+}
+
+// https://encoding.spec.whatwg.org/#iso-2022-jp-decoder
+// EOF is processed by the state machine: a truncated escape can restore a byte that
+// itself starts a pending JIS pair, so a single unconditional EOF replacement is wrong.
+effect fn iso2022Jp(data: &[u8], output: &mut Output) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut state = JpState.Ascii
+  let mut outputState = JpState.Ascii
+  let mut outputFlag = false
+  let mut lead: u8 = 0
+  let mut at: usize = 0
+  while true {
+    let offset = at
+    let eof = at == data.length
+    let byte: u8 = if eof {
+      0
+    } else {
+      data[at]
+    }
+    if !eof {
+      at = at + 1
+    }
+    match state {
+      JpState.EscapeStart => {
+        if !eof && (byte == 0x24 || byte == 0x28) {
+          lead = byte
+          state = JpState.Escape
+          continue
+        }
+        if !eof {
+          at = at - 1
+        }
+        outputFlag = false
+        state = outputState
+        run scalar(&mut output.*, REPLACEMENT, offset)
+      }
+      JpState.Escape => {
+        let leading = lead
+        lead = 0
+        let mut next = JpState.Escape
+        if !eof {
+          if leading == 0x28 {
+            if byte == 0x42 {
+              next = JpState.Ascii
+            } else if byte == 0x4a {
+              next = JpState.Roman
+            } else if byte == 0x49 {
+              next = JpState.Katakana
+            }
+          } else if byte == 0x40 || byte == 0x42 {
+            next = JpState.Leading
+          }
+        }
+        if next != JpState.Escape {
+          state = next
+          outputState = next
+          let repeated = outputFlag
+          outputFlag = true
+          if repeated {
+            run scalar(&mut output.*, REPLACEMENT, offset)
+          }
+        } else {
+          // leading is immediately before this byte (or EOF) in the original slice.
+          let restored: usize = if eof {
+            1
+          } else {
+            2
+          }
+          at = at - restored
+          outputFlag = false
+          state = outputState
+          run scalar(&mut output.*, REPLACEMENT, offset)
+        }
+      }
+      JpState.Trailing => {
+        if !eof && byte == 0x1b {
+          state = JpState.EscapeStart
+          run scalar(&mut output.*, REPLACEMENT, offset)
+        } else {
+          state = JpState.Leading
+          let mut cp = NULL
+          if !eof && between(byte, 0x21, 0x7e) {
+            cp = encoding_data.jis0208(u8.toUsize(lead - 0x21) * 94 + u8.toUsize(byte - 0x21))
+          }
+          run scalar(&mut output.*, mapped(cp), offset)
+        }
+      }
+      _ => {
+        if eof {
+          return
+        }
+        if byte == 0x1b {
+          state = JpState.EscapeStart
+          continue
+        }
+        outputFlag = false
+        if state == JpState.Leading {
+          if between(byte, 0x21, 0x7e) {
+            lead = byte
+            state = JpState.Trailing
+          } else {
+            run scalar(&mut output.*, REPLACEMENT, offset)
+          }
+        } else if state == JpState.Katakana {
+          run scalar(
+            &mut output.*,
+            if between(byte, 0x21, 0x5f) {
+              0xff61 + u8.toU32(byte - 0x21)
+            } else {
+              REPLACEMENT
+            },
+            offset,
+          )
+        } else if byte <= 0x7f && byte != 0x0e && byte != 0x0f {
+          let cp = if state == JpState.Roman && byte == 0x5c {
+            0x00a5
+          } else if state == JpState.Roman && byte == 0x7e {
+            0x203e
+          } else {
+            u8.toU32(byte)
+          }
+          run scalar(&mut output.*, cp, offset)
+        } else {
+          run scalar(&mut output.*, REPLACEMENT, offset)
+        }
+      }
+    }
+  }
+}

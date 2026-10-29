@@ -1,0 +1,4544 @@
+//! Bounded OpenType lookup execution. Subtables borrow checked font views.
+import silk.collections.slice { Slice }
+import trace
+import view { View, read16, offset, valueSize }
+import set_digest { SetDigest }
+import buffer { Buffer, Glyph, GlyphPosition }
+import font { ConfiguredShaper, FontFuncs, Shaper }
+import plan {
+  OtPlan,
+  LookupStep,
+  LookupSubtable,
+  ClassTable,
+  featureValue,
+  RULE_STOP,
+  CHECK_FORM,
+  CHECK_COMPLEX,
+  CHECK_JAMO,
+  CHECK_CALT,
+  CHECK_FRACTION,
+  CHECK_RTLM,
+  ZWJ_AUTO,
+  ZWNJ_AUTO,
+  ZWJ_PER_SYLLABLE,
+}
+import feature { Feature }
+import arabic
+import complex
+import preprocess
+import scale { Scale, add, sub, clamp }
+import direction { Direction }
+import font_types.lib { F2Dot14, F48Dot16 }
+import read_fonts.lib { ReadError, FontData }
+import read_fonts.tables.variations { ItemVariationStore, DeltaSetIndex }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u16
+import silk.num.u32
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.num.u8
+import silk.num.u64
+
+struct Context<'a, 's> {
+  /// Whether `Buffer.savedInput` holds this lookup's input.
+  haveSavedInput: bool,
+  table: View<'a>,
+  gdef: View<'a>,
+  scale: Scale,
+  coords: &'s [F2Dot14],
+  features: &'s [Feature],
+  steps: &'s [LookupStep],
+  positioning: bool,
+  autoZwj: bool,
+  autoZwnj: bool,
+  randomState: u32,
+  budget: usize,
+  maxLength: usize,
+  ligatureId: u32,
+  shaper: u32,
+  restrictSyllable: bool,
+  /// Whether multiple and ligature substitutions may start an output pass at their first edit.
+  outputPass: bool,
+  /// Whether the current step group enables its lookup for every glyph (`enabledEverywhere`),
+  /// so matching skips the per-glyph check.
+  everywhere: bool,
+  classTables: &'s [ClassTable],
+  classValues: &'s [u16],
+  /// Per rule set digests of contextual subtables' second input values (`OtPlan.ruleDigests`).
+  ruleDigests: &'s [u64],
+  /// Where each rule set's second input values start in `ruleSeconds` (`OtPlan.ruleSecondStarts`).
+  ruleSecondStarts: &'s [u32],
+  ruleSeconds: &'s [u32],
+  ruleBacks: &'s [u32],
+  ruleAheads: &'s [u32],
+  contextDigests: &'s [SetDigest],
+  /// The plan's cached subtables, and where each lookup's start (`OtPlan.lookupSubtables`).
+  subtables: &'s [LookupSubtable],
+  lookupSubtables: &'s [u64],
+  /// Where each cached lookup starts in the table (`OtPlan.lookupOffsets`).
+  lookupOffsets: &'s [usize],
+  /// Expanded starting coverages of the plan's subtables (`OtPlan.coverageValues`).
+  coverageValues: &'s [u16],
+  /// Second glyph digests of pair sets (`OtPlan.pairDigests`).
+  pairDigests: &'s [SetDigest],
+  glyphClasses: Classes<'a, 's>,
+  markAttachClasses: Classes<'a, 's>,
+  /// GDEF's variation store, read once; None without variation coordinates, as in harfrust.
+  varStore: Option<ItemVariationStore<'a>>,
+  /// Whether variation coordinates are set; without them every device delta is zero.
+  variable: bool,
+}
+
+/// A class definition, expanded to one class per glyph when the plan holds it.
+struct Classes<'a, 's> {
+  view: View<'a>,
+  first: u32,
+  values: &'s [u16],
+}
+
+impl<'a, 's> Copy for Classes<'a, 's> {}
+
+fn noClasses<'a, 's>(context: &Context<'a, 's>) -> Classes<'a, 's> {
+  return Classes { view: View.empty(), first: 0, values: Slice.view(context.classValues, 0, 0) }
+}
+
+/// Finds the plan's expansion of the class definition `view`, which must lie in the layout table.
+fn classesFor<'a, 's>(context: &Context<'a, 's>, view: View<'a>) -> Classes<'a, 's> {
+  let offset = View.len(&context.table) - View.len(&view)
+  let tables = context.classTables
+  let mut lo: usize = 0
+  let mut hi = tables.length
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if tables[mid].offset < offset {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if lo < tables.length && tables[lo].offset == offset {
+    let table = tables[lo]
+    return Classes {
+      view: view,
+      first: table.first,
+      values: Slice.view(context.classValues, table.start, table.count),
+    }
+  }
+  return Classes { view: view, first: 0, values: Slice.view(context.classValues, 0, 0) }
+}
+
+/// The `n`th class definition, `view`, of the cached subtable `index` of `subtables`, from the
+/// plan's resolution when it has one. Uncached subtables pass an empty list.
+fn subtableClasses<'a, 's>(
+  context: &Context<'a, 's>,
+  subtables: &[LookupSubtable],
+  index: usize,
+  n: usize,
+  view: View<'a>,
+) -> Classes<'a, 's> {
+  if index < subtables.length && subtables[index].classesResolved {
+    let table = subtables[index].classes[n]
+    return Classes {
+      view: view,
+      first: table.first,
+      values: Slice.view(context.classValues, table.start, table.count),
+    }
+  }
+  return classesFor(context, view)
+}
+
+fn gdefClasses<'a, 's>(plan: &'s OtPlan<'a>, view: View<'a>, table: ClassTable) -> Classes<
+  'a,
+  's,
+> {
+  return Classes {
+    view: view,
+    first: table.first,
+    values: Slice.view(List<u16>.asSlice(&plan.classValues), table.start, table.count),
+  }
+}
+
+/// Sets each glyph's GDEF glyph class, using the plan's expansion when it has one.
+pub fn setGdefGlyphClasses<'a>(plan: &OtPlan<'a>, glyphs: &mut [Glyph]) -> () {
+  let classes = gdefClasses(plan, plan.glyphClassDef, plan.glyphClasses)
+  let mut i: usize = 0
+  while i < glyphs.length {
+    glyphs[i].glyphClass = u32.wrappingToU8(classOf(&classes, glyphs[i].info.glyphId))
+    i = i + 1
+  }
+}
+
+fn classOf(classes: &Classes, glyph: u32) -> u32 with Intrinsic.inlineAlways() {
+  if classes.values.length == 0 {
+    return View.class(&classes.view, glyph)
+  }
+  if glyph < classes.first {
+    return 0
+  }
+  let index = u32.toUsize(glyph - classes.first)
+  if index >= classes.values.length {
+    return 0
+  }
+  return u16.toU32(classes.values[index])
+}
+
+struct Lookup<'a> {
+  table: View<'a>,
+  kind: u16,
+  flags: u16,
+  markSet: u16,
+}
+
+impl<'a> Copy for Lookup<'a> {}
+
+struct Applied {
+  yes: bool,
+  next: usize,
+}
+
+impl Copy for Applied {}
+
+fn no() -> Applied {
+  return Applied { yes: false, next: 0 }
+}
+
+fn yes(next: usize) -> Applied {
+  return Applied { yes: true, next: next }
+}
+
+pub effect fn apply<'a, 's, F: FontFuncs>(
+  font: &ConfiguredShaper<'a, 's, F>,
+  buffer: &mut Buffer,
+  plan: &OtPlan<'a>,
+  features: &[Feature],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut tableStart = "start table GSUB"
+  let mut tableEnd = "end table GSUB"
+  if plan.positioning {
+    tableStart = "start table GPOS"
+    tableEnd = "end table GPOS"
+  }
+  if !run trace.table(font, &buffer.*, tableStart, plan.chosenScript) {
+    return
+  }
+  let steps = List<LookupStep>.asSlice(&plan.steps)
+
+  // A digest of the buffer's glyphs lets a lookup that cannot apply to any of them skip the
+  // glyph walk. Substitutions add their glyphs to it, so only a pause, which can change glyphs
+  // in other ways, refreshes it, as in harfrust.
+  if !plan.positioning || !buffer.digestFresh {
+    buffer.digest = bufferDigest(&buffer.*)
+  }
+  buffer.digestFresh = false
+  let mut digestStale = false
+  let tracing = trace.enabled(font, &buffer.*)
+  let paused = complex.pausedStages(buffer.shaper, buffer.script)
+
+  // Without pauses or tracing, a table none of whose lookups may apply to the glyphs does
+  // nothing, so it returns before the context is set up.
+  if !tracing && (plan.positioning || paused == 0) && buffer.successful
+    && usize.saturatingMultiply(buffer.maxOperations, 64) != 0 {
+    let mut any = false
+    let mut i: usize = 0
+    while i < steps.length {
+      if stepMayApply(&steps[i], &buffer.digest, &buffer.*) {
+        any = true
+        break
+      }
+      i = i + 1
+    }
+    if !any {
+      buffer.digestFresh = !plan.positioning
+      drop run trace.table(font, &buffer.*, tableEnd, plan.chosenScript)
+      return
+    }
+  }
+  let length = Buffer.len(&buffer.*)
+  let maxLength = buffer.maxLength
+  let mut context = Context {
+    haveSavedInput: false,
+    table: plan.table,
+    gdef: font.data.gdef,
+    scale: font.scale,
+    coords: List<F2Dot14>.asSlice(&font.coords),
+    features: features,
+    steps: steps,
+    positioning: plan.positioning,
+    autoZwj: true,
+    autoZwnj: true,
+    randomState: 1,
+    budget: usize.saturatingMultiply(buffer.maxOperations, 64),
+    maxLength: maxLength,
+    ligatureId: 0,
+    shaper: buffer.shaper,
+    restrictSyllable: false,
+    outputPass: false,
+    everywhere: false,
+    classTables: List<ClassTable>.asSlice(&plan.classTables),
+    classValues: List<u16>.asSlice(&plan.classValues),
+    ruleDigests: List<u64>.asSlice(&plan.ruleDigests),
+    ruleSecondStarts: List<u32>.asSlice(&plan.ruleSecondStarts),
+    ruleSeconds: List<u32>.asSlice(&plan.ruleSeconds),
+    ruleBacks: List<u32>.asSlice(&plan.ruleBacks),
+    ruleAheads: List<u32>.asSlice(&plan.ruleAheads),
+    contextDigests: List<SetDigest>.asSlice(&plan.contextDigests),
+    subtables: List<LookupSubtable>.asSlice(&plan.subtables),
+    lookupSubtables: List<u64>.asSlice(&plan.lookupSubtables),
+    lookupOffsets: List<usize>.asSlice(&plan.lookupOffsets),
+    coverageValues: List<u16>.asSlice(&plan.coverageValues),
+    pairDigests: List<SetDigest>.asSlice(&plan.pairDigests),
+    glyphClasses: gdefClasses(plan, plan.glyphClassDef, plan.glyphClasses),
+    markAttachClasses: gdefClasses(plan, plan.markAttachClassDef, plan.markAttachClasses),
+    varStore: readVarStore(font.data.gdef, List<F2Dot14>.length(&font.coords)),
+    variable: List<F2Dot14>.length(&font.coords) != 0,
+  }
+  let mut step: usize = 0
+  let mut stage: u32 = 0
+  let mut stageLimit: u32 = 1
+  if buffer.shaper != 0 {
+    stageLimit = 15
+  }
+  if arabic.usesScript(buffer.script) && stageLimit < 13 {
+    stageLimit = 13
+  }
+  if steps.length > 0 && steps[steps.length - 1].stage + 1 > stageLimit {
+    stageLimit = steps[steps.length - 1].stage + 1
+  }
+
+  while stage < stageLimit && context.budget != 0 && buffer.successful {
+    if !plan.positioning && stage < 64 && (u64.shiftRight(paused, u32.toU64(stage)) & 1) != 0 {
+      if run complex.pause(font, &mut buffer, plan, stage, features) {
+        digestStale = true
+      }
+    }
+    context.restrictSyllable = !plan.positioning && buffer.shaper != 0
+    while step < steps.length && steps[step].stage == stage && context.budget != 0
+      && buffer.successful {
+      let end = steps[step].groupEnd
+      if digestStale {
+        buffer.digest = bufferDigest(&buffer.*)
+        digestStale = false
+      }
+
+      // A lookup that cannot match the buffer's glyphs does nothing; without tracing, it is
+      // skipped before any setup.
+      let mayApply = stepMayApply(&steps[step], &buffer.digest, &buffer.*)
+      if !mayApply && !tracing {
+        step = end
+        continue
+      }
+      context.haveSavedInput = false
+      List<Glyph>.clear(&mut buffer.savedInput)
+      let tag = steps[step].tag
+      let mut messageTag = tag
+      if steps[step].required {
+        messageTag = 0
+      }
+      if !run trace.lookup(
+        font,
+        &buffer.*,
+        "start lookup ",
+        u16.toUsize(steps[step].index),
+        messageTag,
+        "",
+      ) {
+        step = end
+        continue
+      }
+      let zwj = steps[step].zwj
+      context.restrictSyllable = !plan.positioning && (zwj & ZWJ_PER_SYLLABLE) != 0
+      context.autoZwj = (zwj & ZWJ_AUTO) != 0
+      context.autoZwnj = (zwj & ZWNJ_AUTO) != 0
+      let lookup = stepLookup(&context, &steps[step])
+      let subtables = Slice.view(
+        List<LookupSubtable>.asSlice(&plan.subtables),
+        steps[step].firstSubtable,
+        steps[step].subtableCount,
+      )
+      let everywhere = enabledEverywhere(&context, step)
+      context.everywhere = everywhere
+      let pairs = steps[step].pairs && context.positioning
+      if !mayApply {
+        // Nothing in the buffer is covered.
+      } else if lookup.kind == 8 && !context.positioning {
+        digestStale = Buffer.len(&buffer.*) <= 32
+        let mut i = Buffer.len(&buffer.*)
+        while i > 0 && context.budget != 0 && buffer.successful {
+          i = i - 1
+          let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+          if SetDigest.mayHave(&steps[step].digest, glyph.info.glyphId)
+            && (everywhere || enabled(&context, glyph, step, end) > 0) {
+            drop run applyLookup(
+              font,
+              &mut context,
+              &mut buffer,
+              &lookup,
+              subtables,
+              i,
+              step,
+              end,
+              0,
+            )
+          }
+        }
+      } else if !context.positioning && !tracing && Buffer.len(&buffer.*) > 48
+        && multipliesOrLigates(subtables) {
+        // Multiple and ligature substitutions start an output pass at their first edit, instead
+        // of moving the rest of the buffer at every edit. The pass reads from `buffer.idx`. Short
+        // buffers, such as single words, move less in place than a pass costs to set up.
+        context.outputPass = true
+        buffer.idx = 0
+        while buffer.idx < Buffer.len(&buffer.*) && context.budget != 0 && buffer.successful {
+          let from = buffer.idx
+          let i = nextCandidate(List<Glyph>.asSlice(&buffer.glyphs), from, &steps[step].digest)
+          if !buffer.haveOutput {
+            buffer.idx = i
+          } else if buffer.outLen == from && !buffer.separateOutput {
+            // Until the output outgrows the input, it is the input read so far.
+            buffer.outLen = i
+            buffer.idx = i
+          } else {
+            run Buffer.nextGlyphs(&mut buffer, i - from)
+          }
+          if i >= Buffer.len(&buffer.*) {
+            break
+          }
+          let mut result = no()
+          let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+          if everywhere || enabled(&context, glyph, step, end) > 0 {
+            result = run applyLookup(
+              font,
+              &mut context,
+              &mut buffer,
+              &lookup,
+              subtables,
+              i,
+              step,
+              end,
+              0,
+            )
+          }
+          if result.yes {
+            if !buffer.haveOutput {
+              buffer.idx = result.next
+            }
+          } else if !buffer.haveOutput {
+            buffer.idx = i + 1
+          } else if buffer.successful {
+            run Buffer.nextGlyph(&mut buffer)
+          }
+        }
+        context.outputPass = false
+        if buffer.haveOutput {
+          // A failed pass still leaves the buffer as matching saw it, as edits in place do.
+          let successful = buffer.successful
+          let hadPositions = buffer.havePositions
+          buffer.successful = true
+          drop run Buffer.syncOutput(&mut buffer)
+          buffer.successful = successful
+          buffer.havePositions = hadPositions
+        }
+        buffer.idx = 0
+      } else if pairs {
+        run applyPairsStep(font, &mut context, &mut buffer, &lookup, subtables, step, end)
+      } else if steps[step].substitutes && !tracing {
+        // A short buffer's digest is cheap to refresh, and an exact one skips more lookups.
+        let applied = run applySubstituteStep(
+          font,
+          &mut context,
+          &mut buffer,
+          &lookup,
+          subtables,
+          step,
+          end,
+        )
+        if applied && Buffer.len(&buffer.*) <= 32 {
+          digestStale = true
+        }
+      } else if steps[step].positions && !tracing {
+        run applyPositionStep(font, &mut context, &mut buffer, &lookup, subtables, step, end)
+      } else if steps[step].contextual && !tracing {
+        // A short buffer's digest is cheap to refresh, and an exact one skips more lookups.
+        let applied = run applyContextStep(
+          font,
+          &mut context,
+          &mut buffer,
+          &lookup,
+          subtables,
+          step,
+          end,
+        )
+        if applied && !context.positioning && Buffer.len(&buffer.*) <= 32 {
+          digestStale = true
+        }
+      } else {
+        let mut i: usize = 0
+        while i < Buffer.len(&buffer.*) && context.budget != 0 && buffer.successful {
+          i = nextCandidate(List<Glyph>.asSlice(&buffer.glyphs), i, &steps[step].digest)
+          if i >= Buffer.len(&buffer.*) {
+            break
+          }
+          let mut result = no()
+          let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+          if !everywhere && enabled(&context, glyph, step, end) == 0 {
+            // The glyph's features leave the step off.
+          } else {
+            result = run applyLookup(
+              font,
+              &mut context,
+              &mut buffer,
+              &lookup,
+              subtables,
+              i,
+              step,
+              end,
+              0,
+            )
+          }
+          if result.yes {
+            // A short buffer's digest is cheap to refresh, and an exact one skips more lookups.
+            if !context.positioning && Buffer.len(&buffer.*) <= 32 {
+              digestStale = true
+            }
+            i = result.next
+          } else {
+            i = i + 1
+          }
+        }
+      }
+      if !buffer.successful && context.haveSavedInput {
+        digestStale = true
+
+        // The failed lookup's glyphs become the next saved input's storage.
+        let saved = Intrinsic.replace(buffer.savedInput, List<Glyph>.make())
+        let failed = Intrinsic.replace(buffer.glyphs, move saved)
+        buffer.savedInput = move failed
+        context.haveSavedInput = false
+      }
+      drop run trace.lookup(
+        font,
+        &buffer.*,
+        "end lookup ",
+        u16.toUsize(steps[step].index),
+        messageTag,
+        "",
+      )
+      step = end
+    }
+    stage = stage + 1
+  }
+  if context.budget == 0 {
+    buffer.successful = false
+  }
+  buffer.digestFresh = !plan.positioning && !digestStale
+  drop run trace.table(font, &buffer.*, tableEnd, plan.chosenScript)
+}
+
+/// Whether a lookup's subtables are all multiple or ligature substitutions, which an output
+/// pass applies.
+fn multipliesOrLigates(subtables: &[LookupSubtable]) -> bool {
+  if subtables.length == 0 {
+    return false
+  }
+  let mut i: usize = 0
+  while i < subtables.length {
+    if subtables[i].kind != 2 && subtables[i].kind != 4 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Whether a step's lookup may apply to the glyphs of `digest`: one of them must start a match,
+/// and unless the buffer records unsafe-to-concat flags, which a rejected pair or ligature sets,
+/// one must be able to follow it.
+fn stepMayApply(step: &LookupStep, digest: &SetDigest, buffer: &Buffer) -> bool {
+  return SetDigest.mayIntersect(&step.digest, digest)
+    && ((buffer.flags & 64) != 0 || SetDigest.mayIntersect(&step.second, digest))
+}
+
+/// The first glyph from `from` that `digest` may hold, or the buffer's length. Kept apart from
+/// `apply` so the scan over glyphs a lookup cannot start at stays a tight loop.
+fn nextCandidate(glyphs: &[Glyph], from: usize, digest: &SetDigest) -> usize {
+  let set = digest.*
+  let mut i = from
+  while i < glyphs.length && !SetDigest.mayHave(&set, glyphs[i].info.glyphId) {
+    i = i + 1
+  }
+  return i
+}
+
+fn bufferDigest(buffer: &Buffer) -> SetDigest {
+  let mut digest = SetDigest.new()
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let mut i: usize = 0
+  while i < glyphs.length {
+    SetDigest.add(&mut digest, glyphs[i].info.glyphId)
+    i = i + 1
+  }
+  return digest
+}
+
+/// A plan step's lookup, from the header fields the plan read.
+fn stepLookup<'a, 's>(context: &Context<'a, 's>, step: &LookupStep) -> Lookup<'a> {
+  return Lookup {
+    table: View.tail(&context.table, step.lookupOffset),
+    kind: step.kind,
+    flags: step.lookupFlags,
+    markSet: step.markSet,
+  }
+}
+
+/// The lookup at a plan step's cached offset.
+fn lookupAt<'a, 's>(context: &Context<'a, 's>, offset: usize) -> Lookup<
+  'a
+> with Intrinsic.inlineAlways() {
+  let table = View.tail(&context.table, offset)
+  return Lookup {
+    table: table,
+    kind: View.u16(&table, 0),
+    flags: View.u16(&table, 2),
+    markSet: View.u16(&table, 6 + u16.toUsize(View.u16(&table, 4)) * 2),
+  }
+}
+
+fn getLookup<'a, 's>(context: &Context<'a, 's>, index: u16) -> Lookup<'a> {
+  let list = View.layoutList(&context.table, 2)
+  let mut width: usize = 2
+  if View.u16(&context.table, 0) == 1 && View.u16(&context.table, 2) >= 2
+    && View.u32(&context.table, 22) != 0 {
+    width = 4
+  }
+  let mut table = View.tail(&context.table, View.len(&context.table))
+  if index < View.u16(&list, 0) {
+    table = View.offset(&list, 2 + u16.toUsize(index) * width, width)
+  }
+  return Lookup {
+    table: table,
+    kind: View.u16(&table, 0),
+    flags: View.u16(&table, 2),
+    markSet: View.u16(&table, 6 + u16.toUsize(View.u16(&table, 4)) * 2),
+  }
+}
+
+pub effect fn wouldSubstitute<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  plan: &OtPlan,
+  tag: u32,
+  glyphs: &[u32],
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let steps = List<LookupStep>.asSlice(&plan.steps)
+
+  // Shapers probe many glyph pairs per run; most fail every step's digest.
+  let mut candidate = false
+  let mut k: usize = 0
+  while k < steps.length && !candidate {
+    candidate = steps[k].tag == tag && glyphs.length != 0
+      && SetDigest.mayHave(&steps[k].digest, glyphs[0])
+    k = k + 1
+  }
+  if !candidate {
+    return false
+  }
+  let mut context = Context {
+    haveSavedInput: false,
+    table: plan.table,
+    gdef: font.data.gdef,
+    scale: font.scale,
+    coords: List<F2Dot14>.asSlice(&font.coords),
+    features: &[],
+    steps: steps,
+    positioning: false,
+    autoZwj: true,
+    autoZwnj: true,
+    randomState: 1,
+    budget: 2048,
+    maxLength: 64,
+    ligatureId: 0,
+    shaper: 0,
+    restrictSyllable: false,
+    outputPass: false,
+    everywhere: false,
+    classTables: List<ClassTable>.asSlice(&plan.classTables),
+    classValues: List<u16>.asSlice(&plan.classValues),
+    ruleDigests: List<u64>.asSlice(&plan.ruleDigests),
+    ruleSecondStarts: List<u32>.asSlice(&plan.ruleSecondStarts),
+    ruleSeconds: List<u32>.asSlice(&plan.ruleSeconds),
+    ruleBacks: List<u32>.asSlice(&plan.ruleBacks),
+    ruleAheads: List<u32>.asSlice(&plan.ruleAheads),
+    contextDigests: List<SetDigest>.asSlice(&plan.contextDigests),
+    subtables: List<LookupSubtable>.asSlice(&plan.subtables),
+    lookupSubtables: List<u64>.asSlice(&plan.lookupSubtables),
+    lookupOffsets: List<usize>.asSlice(&plan.lookupOffsets),
+    coverageValues: List<u16>.asSlice(&plan.coverageValues),
+    pairDigests: List<SetDigest>.asSlice(&plan.pairDigests),
+    glyphClasses: gdefClasses(plan, plan.glyphClassDef, plan.glyphClasses),
+    markAttachClasses: gdefClasses(plan, plan.markAttachClassDef, plan.markAttachClasses),
+    varStore: readVarStore(font.data.gdef, List<F2Dot14>.length(&font.coords)),
+    variable: List<F2Dot14>.length(&font.coords) != 0,
+  }
+
+  // One buffer serves every probed lookup; a lookup that applies ends the probe, and one that
+  // does not leaves only its glyphs to replace.
+  let mut buffer = Buffer.new()
+  let mut i: usize = 0
+  while i < steps.length {
+    if steps[i].tag == tag && SetDigest.mayHave(&steps[i].digest, glyphs[0]) {
+      let lookup = stepLookup(&context, &steps[i])
+      if glyphs.length > 1 && lookup.kind <= 3 {
+        i = i + 1
+        continue
+      }
+      List<Glyph>.clear(&mut buffer.glyphs)
+      let mut j: usize = 0
+      while j < glyphs.length {
+        let mut item = Glyph.new(0, 0)
+        item.info.glyphId = glyphs[j]
+        item.form = tag
+        item.featureMask = 4294967295
+        run List<Glyph>.append(&mut buffer.glyphs, item)
+        j = j + 1
+      }
+      let subtables = Slice.view(
+        List<LookupSubtable>.asSlice(&plan.subtables),
+        steps[i].firstSubtable,
+        steps[i].subtableCount,
+      )
+      let result = run applyLookup(
+        font,
+        &mut context,
+        &mut buffer,
+        &lookup,
+        subtables,
+        0,
+        i,
+        i + 1,
+        0,
+      )
+      if result.yes {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn enabled(
+  context: &Context,
+  glyph: &Glyph,
+  first: usize,
+  last: usize,
+) -> u32 with Intrinsic.inlineAlways() {
+  let mut result: u32 = 0
+  let mut i = first
+  while i < last {
+    let step = &context.steps[i]
+    if step.required {
+      return 1
+    }
+    let checks = step.checks
+    let mut initial = step.value
+    if checks != 0 {
+      if (checks & CHECK_FORM) != 0 && context.shaper != 1 && glyph.form != step.tag {
+        initial = 0
+      }
+      if (checks & CHECK_COMPLEX) != 0 && !context.positioning
+        && !complex.featureEnabled(context.shaper, glyph, step.tag) {
+        initial = 0
+      }
+      if (checks & CHECK_JAMO) != 0 && glyph.form != step.tag {
+        initial = 0
+      }
+
+      // Jamo start at U+1100, so most scripts' glyphs pass on the first compare.
+      if (checks & CHECK_CALT) != 0 && glyph.codepoint >= 0x1100
+        && preprocess.isJamo(glyph.codepoint) {
+        initial = 0
+      }
+      if (checks & CHECK_FRACTION) != 0 {
+        initial = 0
+        if (step.tag == 0x66726163 && glyph.fraction != 0)
+          || (step.tag == 0x6e756d72 && glyph.fraction == 1)
+          || (step.tag == 0x646e6f6d && glyph.fraction == 2) {
+          initial = 1
+        }
+      }
+      if (checks & CHECK_RTLM) != 0 && !glyph.mirrored {
+        initial = 0
+      }
+    }
+    let mut value = initial
+    if context.features.length != 0 {
+      value = featureValue(step.tag, initial, glyph.info.cluster, context.features)
+    }
+    if value > result {
+      result = value
+    }
+    i = i + 1
+  }
+  return result
+}
+
+/// Whether `enabled` is nonzero for every glyph: without user features, a required step or a
+/// plain step with a nonzero value enables the lookup whatever the glyph.
+fn enabledEverywhere(context: &Context, first: usize) -> bool {
+  return context.features.length == 0 && context.steps[first].everywhere
+}
+
+/// Whether `lookup` skips `glyph` by its GDEF class. The class checks are inlined into every
+/// glyph walk; marks filtered by a set or attachment class take `markIgnored`.
+fn ignored(context: &Context, lookup: Lookup, glyph: &Glyph) -> bool with Intrinsic.inlineAlways() {
+  if glyph.glyphClass == 1 {
+    return (lookup.flags & 2) != 0
+  }
+  if glyph.glyphClass == 2 {
+    return (lookup.flags & 4) != 0
+  }
+  if glyph.glyphClass == 3 && (lookup.flags & 0xff18) != 0 {
+    return markIgnored(context, lookup, glyph)
+  }
+  return false
+}
+
+fn markIgnored(context: &Context, lookup: Lookup, glyph: &Glyph) -> bool {
+  if glyph.glyphClass == 3 {
+    if (lookup.flags & 8) != 0 {
+      return true
+    }
+    if (lookup.flags & 16) != 0 {
+      let sets = View.gdefList(&context.gdef, 4)
+      if lookup.markSet >= View.u16(&sets, 2) {
+        return true
+      }
+      let coverage = View.offset32(&sets, 4 + u16.toUsize(lookup.markSet) * 4)
+      return !hasCoverage(coverage, glyph.info.glyphId)
+    }
+    if (lookup.flags & 0xff00) != 0 {
+      return classOf(&context.markAttachClasses, glyph.info.glyphId)
+        != u16.toU32(lookup.flags / 256)
+    }
+  }
+  return false
+}
+
+fn next(context: &Context, buffer: &Buffer, lookup: Lookup, start: usize, backward: bool) -> Option<
+  usize
+> {
+  let mut i = start
+  while true {
+    if backward {
+      if i == 0 {
+        return Option<usize>.None
+      }
+      i = i - 1
+    } else {
+      if i >= Buffer.len(buffer) {
+        return Option<usize>.None
+      }
+      i = i + 1
+      if i >= Buffer.len(buffer) {
+        return Option<usize>.None
+      }
+    }
+    let item = List<Glyph>.get(&buffer.glyphs, i)
+    if context.restrictSyllable
+      && item.syllable != List<Glyph>.get(&buffer.glyphs, start).syllable {
+      return Option<usize>.None
+    }
+    if ignored(context, lookup, &item) {
+      continue
+    }
+    if item.ignorable && !item.substituted && (!item.hidden || context.positioning) {
+      if (item.codepoint == 0x200c || (context.shaper != 0 && item.codepoint == 0x200d))
+        && !context.positioning {
+        return Option<usize>.some(i)
+      }
+      continue
+    }
+    return Option<usize>.some(i)
+  }
+}
+
+/// `next` forward from `start` while positioning, where every ignorable glyph is skipped:
+/// the following glyph `lookup` does not skip, or `SECOND_NONE`.
+fn nextPositioned(
+  context: &Context,
+  glyphs: &[Glyph],
+  lookup: Lookup,
+  start: usize,
+) -> usize with Intrinsic.inlineAlways() {
+  let syllable = glyphs[start].syllable
+  let mut i = start + 1
+  while i < glyphs.length {
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != syllable {
+      return SECOND_NONE
+    }
+    if !ignored(context, lookup, item) && !(item.ignorable && !item.substituted) {
+      return i
+    }
+    i = i + 1
+  }
+  return SECOND_NONE
+}
+
+/// `nextPositioned` backward from `start`.
+fn previousPositioned(
+  context: &Context,
+  glyphs: &[Glyph],
+  lookup: Lookup,
+  start: usize,
+) -> usize with Intrinsic.inlineAlways() {
+  let syllable = glyphs[start].syllable
+  let mut i = start
+  while i != 0 {
+    i = i - 1
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != syllable {
+      return SECOND_NONE
+    }
+    if !ignored(context, lookup, item) && !(item.ignorable && !item.substituted) {
+      return i
+    }
+  }
+  return SECOND_NONE
+}
+
+/// Applies the first subtable of `lookup` that matches at `at`. `subtables` is the plan's
+/// cached subtable list for this lookup; when it is empty the subtables are read from the table.
+effect fn applyLookup<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  at: usize,
+  first: usize,
+  last: usize,
+  depth: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if depth > 64 {
+    buffer.successful = false
+    return no()
+  }
+  if !buffer.successful || context.budget == 0 || at >= Buffer.len(&buffer.*)
+    || ignored(&context.*, lookup.*, &List<Glyph>.asSlice(&buffer.glyphs)[at]) {
+    return no()
+  }
+  context.budget = context.budget - 1
+  let cached = subtables.length != 0
+  let mut count = u16.toUsize(View.u16(&lookup.table, 4))
+  let mut glyph: u32 = 0
+  if cached {
+    count = subtables.length
+    glyph = List<Glyph>.get(&buffer.glyphs, at).info.glyphId
+  }
+
+  let mut second = SECOND_UNKNOWN
+
+  // The glyphs format 3 rules' digests are checked against, found once for all the subtables.
+  let mut ahead = BACK_UNKNOWN
+  let mut back = BACK_UNKNOWN
+  let mut i: usize = 0
+  while i < count && context.budget != 0 && buffer.successful {
+    let mut table = View.empty()
+    let mut kind = lookup.kind
+    let mut known: u32 = 0
+    if cached {
+      // Subtables the glyph cannot start a match in are skipped in a loop of their own, which
+      // keeps the budget in a local; nothing they skip changes `buffer.successful`.
+      let mut budget = context.budget
+      let mut found = false
+      while i < subtables.length && budget != 0 {
+        budget = budget - 1
+        let sub = &subtables[i]
+        if SetDigest.mayHave(&sub.digest, glyph) {
+          // An expanded coverage rejects an uncovered glyph without calling the subtable,
+          // which would reject it first thing. A covered glyph's index is passed on so the
+          // subtable does not search for it again.
+          if sub.coverageCount == 0 {
+            found = true
+            break
+          }
+          if glyph >= sub.coverageFirst
+            && u32.toUsize(glyph - sub.coverageFirst) < sub.coverageCount {
+            known = u16.toU32(
+              context.coverageValues[sub.coverageStart + u32.toUsize(glyph - sub.coverageFirst)],
+            )
+          }
+          if known != 0 {
+            found = true
+            break
+          }
+          if sub.missSpends && budget != 0 {
+            budget = budget - 1
+          }
+        }
+        i = i + 1
+      }
+      context.budget = budget
+      if !found {
+        return no()
+      }
+      table = View.tail(&context.table, subtables[i].offset)
+      kind = subtables[i].kind
+    } else {
+      context.budget = context.budget - 1
+      table = View.offset16(&lookup.table, 6 + i * 2)
+      let extension = (!context.positioning && kind == 7) || (context.positioning && kind == 9)
+      if extension {
+        if View.u16(&table, 0) != 1 {
+          i = i + 1
+          continue
+        }
+        kind = View.u16(&table, 2)
+        table = View.offset32(&table, 4)
+      }
+    }
+    let mut result = no()
+    if (!context.positioning && (kind == 5 || kind == 6))
+      || (context.positioning && (kind == 7 || kind == 8)) {
+      // A covered 16-bit format 3 rule that fails is rejected here, spending the budget unit
+      // `contextual` would, without the call and its setup.
+      if known != 0 && View.u16(&table, 0) == 3 && (buffer.flags & 64) == 0 && context.budget != 0
+        && buffer.successful {
+        // The plan's digests rule out most failing rules from the glyphs next to the first one,
+        // before the rest of the rule is read: the second input, or the first lookahead of a
+        // single input, and the first backtrack.
+        let chained = kind == 6 || kind == 8
+        let digestsAt = subtables[i].contextDigests
+        let mut rejected = false
+        if digestsAt != usize.MAX {
+          let backCount = subtables[i].backCount
+          let inputCount = subtables[i].inputCount
+          let digests = Slice.view(context.contextDigests, digestsAt, 3)
+          let mut aheadDigest = &digests[0]
+          if inputCount == 1 {
+            aheadDigest = &digests[2]
+          }
+          if ahead == BACK_UNKNOWN {
+            ahead = outsideGlyph(&context.*, &buffer.*, lookup, at, false)
+          }
+          if ahead == BACK_NONE {
+            rejected = inputCount > 1 || subtables[i].aheadCount != 0
+          } else if ahead < BACK_SKIPPABLE {
+            rejected = !SetDigest.mayHave(aheadDigest, u64.wrappingToU32(ahead))
+          }
+          if !rejected && backCount != 0 {
+            if back == BACK_UNKNOWN {
+              back = outsideGlyph(&context.*, &buffer.*, lookup, at, true)
+            }
+            rejected = back == BACK_NONE
+              || (back < BACK_SKIPPABLE && !SetDigest.mayHave(&digests[1], u64.wrappingToU32(back)))
+          }
+        }
+        if rejected
+          || format3Fails(
+            &context.*,
+            &buffer.*,
+            lookup,
+            table,
+            at,
+            first,
+            last,
+            chained,
+            usize.MAX,
+          ) {
+          context.budget = context.budget - 1
+          i = i + 1
+          continue
+        }
+      }
+      let mut digests = Slice.view(context.ruleDigests, 0, 0)
+      let mut starts = Slice.view(context.ruleSecondStarts, 0, 0)
+      if cached {
+        digests = Slice.view(context.ruleDigests, subtables[i].ruleDigests, subtables[i].ruleSets)
+        starts = Slice.view(
+          context.ruleSecondStarts,
+          subtables[i].ruleDigests,
+          subtables[i].ruleSets,
+        )
+      }
+      result = run contextual(
+        font,
+        &mut context,
+        &mut buffer,
+        lookup.*,
+        table,
+        subtables,
+        i,
+        digests,
+        starts,
+        known,
+        at,
+        first,
+        last,
+        depth,
+        kind == 6 || kind == 8,
+        false,
+      )
+    } else if context.positioning && known != 0 && subtables[i].kern != 0
+      && (subtables[i].kern <= 2 || !context.variable) {
+      // A format 1 pair set whose digest lacks the second glyph is rejected here, without
+      // the call; `kern` would reject it the same way.
+      if second == SECOND_UNKNOWN {
+        second = match move next(&context.*, &buffer.*, lookup.*, at, false) {
+          Option<usize>.Some { value } => value
+          _ => SECOND_NONE
+        }
+      }
+      if second == SECOND_NONE {
+        i = i + 1
+        continue
+      }
+      let sub = &subtables[i]
+      let coverage = u32.toUsize(known - 1)
+      if (sub.kern == 1 || sub.kern == 3) && coverage < sub.pairSets
+        && !SetDigest.mayHave(
+          &context.pairDigests[sub.pairDigests + coverage],
+          List<Glyph>.asSlice(&buffer.glyphs)[second].info.glyphId,
+        ) {
+        Buffer.unsafeToConcat(&mut buffer, at, second + 1)
+        i = i + 1
+        continue
+      }
+      result = run kern(font, &context.*, &mut buffer, table, sub, known, at, second)
+    } else if context.positioning {
+      result = run position(
+        font,
+        &context.*,
+        &mut buffer,
+        lookup.*,
+        table,
+        subtables,
+        i,
+        kind,
+        known,
+        at,
+      )
+    } else {
+      let mut digests = Slice.view(context.ruleDigests, 0, 0)
+      if cached {
+        digests = Slice.view(context.ruleDigests, subtables[i].ruleDigests, subtables[i].ruleSets)
+      }
+      result = run substitute(
+        font,
+        &mut context,
+        &mut buffer,
+        lookup.*,
+        table,
+        kind,
+        digests,
+        known,
+        at,
+        first,
+        last,
+        depth,
+      )
+    }
+    if result.yes {
+      return result
+    }
+    i = i + 1
+  }
+  return no()
+}
+
+/// Applies a step whose subtables are all contextual ones at each glyph in turn, as
+/// `applyLookup` would, with the digest checks and their per-subtable setup in the glyph loop.
+/// Returns whether the lookup applied anywhere.
+effect fn applyContextStep<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  step: usize,
+  end: usize,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let everywhere = context.everywhere
+  let mut applied = false
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) && context.budget != 0 && buffer.successful {
+    i = nextCandidate(List<Glyph>.asSlice(&buffer.glyphs), i, &context.steps[step].digest)
+    if i >= Buffer.len(&buffer.*) {
+      break
+    }
+    let mut result = no()
+    let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+    if everywhere || enabled(&context.*, glyph, step, end) != 0 {
+      result = run applyContextual(font, &mut context, &mut buffer, lookup, subtables, i, step, end)
+    }
+    if result.yes {
+      applied = true
+      i = result.next
+    } else {
+      i = i + 1
+    }
+  }
+  return applied
+}
+
+/// `applyLookup` at depth 0 for a lookup whose cached subtables are all contextual ones: the
+/// same budget charges, digest and `format3Fails` rejections, and calls of `contextual`, inlined
+/// into `applyContextStep`.
+effect fn applyContextual<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  at: usize,
+  first: usize,
+  last: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  if !buffer.successful || context.budget == 0 || at >= Buffer.len(&buffer.*)
+    || ignored(&context.*, lookup.*, &List<Glyph>.asSlice(&buffer.glyphs)[at]) {
+    return no()
+  }
+  context.budget = context.budget - 1
+  let glyph = List<Glyph>.asSlice(&buffer.glyphs)[at].info.glyphId
+  let mut ahead = BACK_UNKNOWN
+  let mut back = BACK_UNKNOWN
+  let mut i: usize = 0
+  while i < subtables.length && context.budget != 0 && buffer.successful {
+    let mut known: u32 = 0
+    let mut budget = context.budget
+    let mut found = false
+    while i < subtables.length && budget != 0 {
+      budget = budget - 1
+      let sub = &subtables[i]
+      if SetDigest.mayHave(&sub.digest, glyph) {
+        if sub.coverageCount == 0 {
+          found = true
+          break
+        }
+        if glyph >= sub.coverageFirst
+          && u32.toUsize(glyph - sub.coverageFirst) < sub.coverageCount {
+          known = u16.toU32(
+            context.coverageValues[sub.coverageStart + u32.toUsize(glyph - sub.coverageFirst)],
+          )
+        }
+        if known != 0 {
+          found = true
+          break
+        }
+        if sub.missSpends && budget != 0 {
+          budget = budget - 1
+        }
+      }
+      i = i + 1
+    }
+    context.budget = budget
+    if !found {
+      return no()
+    }
+    let table = View.tail(&context.table, subtables[i].offset)
+    let kind = subtables[i].kind
+    let chained = kind == 6 || kind == 8
+    let mut checked = false
+    if known != 0 && View.u16(&table, 0) == 3 && (buffer.flags & 64) == 0 && context.budget != 0
+      && buffer.successful
+      && subtables[i].contextDigests != usize.MAX {
+      let digests = Slice.view(context.contextDigests, subtables[i].contextDigests, 3)
+      let inputCount = subtables[i].inputCount
+      let mut aheadDigest = &digests[0]
+      if inputCount == 1 {
+        aheadDigest = &digests[2]
+      }
+      if ahead == BACK_UNKNOWN {
+        ahead = outsideGlyph(&context.*, &buffer.*, lookup, at, false)
+      }
+      let mut rejected = false
+      if ahead == BACK_NONE {
+        rejected = inputCount > 1 || subtables[i].aheadCount != 0
+      } else if ahead < BACK_SKIPPABLE {
+        rejected = !SetDigest.mayHave(aheadDigest, u64.wrappingToU32(ahead))
+      }
+      if !rejected && subtables[i].backCount != 0 {
+        if back == BACK_UNKNOWN {
+          back = outsideGlyph(&context.*, &buffer.*, lookup, at, true)
+        }
+        rejected = back == BACK_NONE
+          || (back < BACK_SKIPPABLE && !SetDigest.mayHave(&digests[1], u64.wrappingToU32(back)))
+      }
+      if rejected
+        || format3Fails(&context.*, &buffer.*, lookup, table, at, first, last, chained, usize.MAX) {
+        context.budget = context.budget - 1
+        i = i + 1
+        continue
+      }
+      checked = true
+    }
+    let digests = Slice.view(context.ruleDigests, subtables[i].ruleDigests, subtables[i].ruleSets)
+    let starts = Slice.view(
+      context.ruleSecondStarts,
+      subtables[i].ruleDigests,
+      subtables[i].ruleSets,
+    )
+    let result = run contextual(
+      font,
+      &mut context,
+      &mut buffer,
+      lookup.*,
+      table,
+      subtables,
+      i,
+      digests,
+      starts,
+      known,
+      at,
+      first,
+      last,
+      0,
+      chained,
+      checked,
+    )
+    if result.yes {
+      return result
+    }
+    i = i + 1
+  }
+  return no()
+}
+
+/// Applies a step whose subtables are all single, multiple, alternate or ligature substitutions
+/// at each glyph in turn, as `applyLookup` would. Returns whether the lookup applied anywhere.
+effect fn applySubstituteStep<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  step: usize,
+  end: usize,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let everywhere = context.everywhere
+  let mut applied = false
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) && context.budget != 0 && buffer.successful {
+    i = nextCandidate(List<Glyph>.asSlice(&buffer.glyphs), i, &context.steps[step].digest)
+    if i >= Buffer.len(&buffer.*) {
+      break
+    }
+    let mut result = no()
+    let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+    if everywhere || enabled(&context.*, glyph, step, end) != 0 {
+      result = run applySubstitution(
+        font,
+        &mut context,
+        &mut buffer,
+        lookup,
+        subtables,
+        i,
+        step,
+        end,
+      )
+    }
+    if result.yes {
+      applied = true
+      i = result.next
+    } else {
+      i = i + 1
+    }
+  }
+  return applied
+}
+
+/// `applyLookup` at depth 0 for a lookup whose cached subtables are all single, multiple,
+/// alternate or ligature substitutions: the same budget charges, subtable skips and calls of
+/// `substitute`.
+effect fn applySubstitution<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  at: usize,
+  first: usize,
+  last: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  if !buffer.successful || context.budget == 0 || at >= Buffer.len(&buffer.*)
+    || ignored(&context.*, lookup.*, &List<Glyph>.asSlice(&buffer.glyphs)[at]) {
+    return no()
+  }
+  context.budget = context.budget - 1
+  let glyph = List<Glyph>.asSlice(&buffer.glyphs)[at].info.glyphId
+  let mut i: usize = 0
+  while i < subtables.length && context.budget != 0 && buffer.successful {
+    let mut known: u32 = 0
+    let mut budget = context.budget
+    let mut found = false
+    while i < subtables.length && budget != 0 {
+      budget = budget - 1
+      let sub = &subtables[i]
+      if SetDigest.mayHave(&sub.digest, glyph) {
+        if sub.coverageCount == 0 {
+          found = true
+          break
+        }
+        if glyph >= sub.coverageFirst
+          && u32.toUsize(glyph - sub.coverageFirst) < sub.coverageCount {
+          known = u16.toU32(
+            context.coverageValues[sub.coverageStart + u32.toUsize(glyph - sub.coverageFirst)],
+          )
+        }
+        if known != 0 {
+          found = true
+          break
+        }
+        if sub.missSpends && budget != 0 {
+          budget = budget - 1
+        }
+      }
+      i = i + 1
+    }
+    context.budget = budget
+    if !found {
+      return no()
+    }
+    let table = View.tail(&context.table, subtables[i].offset)
+    let digests = Slice.view(context.ruleDigests, subtables[i].ruleDigests, subtables[i].ruleSets)
+    let result = run substitute(
+      font,
+      &mut context,
+      &mut buffer,
+      lookup.*,
+      table,
+      subtables[i].kind,
+      digests,
+      known,
+      at,
+      first,
+      last,
+      0,
+    )
+    if result.yes {
+      return result
+    }
+    i = i + 1
+  }
+  return no()
+}
+
+/// Applies a step whose subtables all position glyphs, other than contextually or by kerning,
+/// at each glyph in turn, as `applyLookup` would.
+effect fn applyPositionStep<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  step: usize,
+  end: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let everywhere = context.everywhere
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) && context.budget != 0 && buffer.successful {
+    i = nextCandidate(List<Glyph>.asSlice(&buffer.glyphs), i, &context.steps[step].digest)
+    if i >= Buffer.len(&buffer.*) {
+      break
+    }
+    let mut result = no()
+    let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+    if everywhere || enabled(&context.*, glyph, step, end) != 0 {
+      result = run applyPosition(font, &mut context, &mut buffer, lookup, subtables, i)
+    }
+    if result.yes {
+      i = result.next
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+/// `applyLookup` at depth 0 for a lookup whose cached subtables all position glyphs other than
+/// contextually or by kerning: the same budget charges, subtable skips and calls of `position`.
+effect fn applyPosition<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  at: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  if !buffer.successful || context.budget == 0 || at >= Buffer.len(&buffer.*)
+    || ignored(&context.*, lookup.*, &List<Glyph>.asSlice(&buffer.glyphs)[at]) {
+    return no()
+  }
+  context.budget = context.budget - 1
+  let glyph = List<Glyph>.asSlice(&buffer.glyphs)[at].info.glyphId
+  let mut i: usize = 0
+  while i < subtables.length && context.budget != 0 && buffer.successful {
+    let mut known: u32 = 0
+    let mut budget = context.budget
+    let mut found = false
+    while i < subtables.length && budget != 0 {
+      budget = budget - 1
+      let sub = &subtables[i]
+      if SetDigest.mayHave(&sub.digest, glyph) {
+        if sub.coverageCount == 0 {
+          found = true
+          break
+        }
+        if glyph >= sub.coverageFirst
+          && u32.toUsize(glyph - sub.coverageFirst) < sub.coverageCount {
+          known = u16.toU32(
+            context.coverageValues[sub.coverageStart + u32.toUsize(glyph - sub.coverageFirst)],
+          )
+        }
+        if known != 0 {
+          found = true
+          break
+        }
+        if sub.missSpends && budget != 0 {
+          budget = budget - 1
+        }
+      }
+      i = i + 1
+    }
+    context.budget = budget
+    if !found {
+      return no()
+    }
+    let table = View.tail(&context.table, subtables[i].offset)
+    let result = run position(
+      font,
+      &context.*,
+      &mut buffer,
+      lookup.*,
+      table,
+      subtables,
+      i,
+      subtables[i].kind,
+      known,
+      at,
+    )
+    if result.yes {
+      return result
+    }
+    i = i + 1
+  }
+  return no()
+}
+
+/// Applies a pair adjustment step, whose subtables all adjust pairs, at each glyph in turn; its
+/// own loop keeps `applyPairs` inlined.
+effect fn applyPairsStep<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  step: usize,
+  end: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let everywhere = context.everywhere
+  let mut i: usize = 0
+  while i < Buffer.len(&buffer.*) && context.budget != 0 && buffer.successful {
+    i = nextCandidate(List<Glyph>.asSlice(&buffer.glyphs), i, &context.steps[step].digest)
+    if i >= Buffer.len(&buffer.*) {
+      break
+    }
+    let mut result = no()
+    let glyph = &List<Glyph>.asSlice(&buffer.glyphs)[i]
+    if everywhere || enabled(&context.*, glyph, step, end) != 0 {
+      result = run applyPairs(font, &mut context, &mut buffer, lookup, subtables, i)
+    }
+    if result.yes {
+      i = result.next
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+/// `applyLookup` for a top-level lookup whose subtables all adjust pairs (`kern != 0`): the same
+/// subtable skips, budget charges and results, without the branches for other kinds. A pair
+/// subtable's digest holds every glyph of its coverage, so an expanded coverage is checked
+/// without it, and no pair subtable spends budget on a miss.
+effect fn applyPairs<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: &Lookup,
+  subtables: &[LookupSubtable],
+  at: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  if !buffer.successful || context.budget == 0 || at >= Buffer.len(&buffer.*)
+    || ignored(&context.*, lookup.*, &List<Glyph>.asSlice(&buffer.glyphs)[at]) {
+    return no()
+  }
+  let glyph = List<Glyph>.asSlice(&buffer.glyphs)[at].info.glyphId
+  let mut budget = context.budget - 1
+  let mut second = SECOND_UNKNOWN
+  let mut i: usize = 0
+  while i < subtables.length && budget != 0 && buffer.successful {
+    let mut known: u32 = 0
+    let mut found = false
+    while i < subtables.length && budget != 0 {
+      budget = budget - 1
+      let sub = &subtables[i]
+      if sub.coverageCount != 0 {
+        if glyph >= sub.coverageFirst
+          && u32.toUsize(glyph - sub.coverageFirst) < sub.coverageCount {
+          known = u16.toU32(
+            context.coverageValues[sub.coverageStart + u32.toUsize(glyph - sub.coverageFirst)],
+          )
+        }
+        if known != 0 {
+          found = true
+          break
+        }
+      } else if SetDigest.mayHave(&sub.digest, glyph) {
+        found = true
+        break
+      }
+      i = i + 1
+    }
+    context.budget = budget
+    if !found {
+      return no()
+    }
+    let sub = &subtables[i]
+    let mut result = no()
+    if known != 0 && (sub.kern <= 2 || !context.variable) {
+      if second == SECOND_UNKNOWN {
+        if context.positioning {
+          second = nextPositioned(&context.*, List<Glyph>.asSlice(&buffer.glyphs), lookup.*, at)
+        } else {
+          second = match move next(&context.*, &buffer.*, lookup.*, at, false) {
+            Option<usize>.Some { value } => value
+            _ => SECOND_NONE
+          }
+        }
+      }
+      if second == SECOND_NONE {
+        i = i + 1
+        continue
+      }
+      let coverage = u32.toUsize(known - 1)
+      if (sub.kern == 1 || sub.kern == 3) && coverage < sub.pairSets
+        && !SetDigest.mayHave(
+          &context.pairDigests[sub.pairDigests + coverage],
+          List<Glyph>.asSlice(&buffer.glyphs)[second].info.glyphId,
+        ) {
+        Buffer.unsafeToConcat(&mut buffer, at, second + 1)
+        i = i + 1
+        continue
+      }
+      result = run kern(
+        font,
+        &context.*,
+        &mut buffer,
+        View.tail(&context.table, sub.offset),
+        sub,
+        known,
+        at,
+        second,
+      )
+    } else {
+      result = run position(
+        font,
+        &context.*,
+        &mut buffer,
+        lookup.*,
+        View.tail(&context.table, sub.offset),
+        subtables,
+        i,
+        sub.kind,
+        known,
+        at,
+      )
+    }
+    if result.yes {
+      return result
+    }
+    budget = context.budget
+    i = i + 1
+  }
+  context.budget = budget
+  return no()
+}
+
+fn setGlyph(
+  context: &Context,
+  buffer: &mut Buffer,
+  at: usize,
+  glyphId: u32,
+  ligature: bool,
+  multiplied: bool,
+) -> () {
+  // In place, rather than copying the whole glyph out and back.
+  let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  substituteGlyph(context, &mut glyphs[at], &mut buffer.digest, glyphId, ligature, multiplied)
+}
+
+fn substituteGlyph(
+  context: &Context,
+  item: &mut Glyph,
+  digest: &mut SetDigest,
+  glyphId: u32,
+  ligature: bool,
+  multiplied: bool,
+) -> () {
+  SetDigest.add(&mut digest, glyphId)
+  item.info.glyphId = glyphId
+  item.substituted = true
+  if ligature {
+    item.ligated = true
+    item.multiplied = false
+  }
+  if multiplied {
+    item.multiplied = true
+  }
+  if View.len(&context.glyphClasses.view) > 0 {
+    item.glyphClass = u32.wrappingToU8(classOf(&context.glyphClasses, glyphId))
+  }
+}
+
+/// Starts the output pass of `ot.apply` at glyph `at`, the first edit: the glyphs before it are
+/// the output so far, in place.
+fn beginOutput(buffer: &mut Buffer, at: usize) -> () {
+  if !buffer.haveOutput {
+    buffer.haveOutput = true
+    buffer.separateOutput = false
+    List<Glyph>.truncate(&mut buffer.out, 0)
+    buffer.idx = at
+    buffer.outLen = at
+  }
+}
+
+/// The buffer's length as matching sees it: during an output pass, the output so far and the
+/// unread input.
+fn glyphCount(buffer: &Buffer) -> usize {
+  if buffer.haveOutput {
+    return buffer.outLen + (Buffer.len(buffer) - buffer.idx)
+  }
+  return Buffer.len(buffer)
+}
+
+effect fn substitute<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: Lookup,
+  table: View,
+  kind: u16,
+  digests: &[u64],
+  known: u32,
+  at: usize,
+  first: usize,
+  last: usize,
+  depth: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let glyph = List<Glyph>.get(&buffer.glyphs, at)
+  let rawFormat = View.u16(&table, 0)
+  let wide = (kind == 1 && (rawFormat == 3 || rawFormat == 4)) || (kind != 1 && rawFormat == 2)
+  let mut width: usize = 2
+  let mut header: usize = 4
+  let mut coverageWidth: usize = 2
+  if wide {
+    width = 3
+    header = 6
+    coverageWidth = 4
+  }
+  let mut coverage = usize.wrappingSubtract(u32.toUsize(known), 1)
+  if known == 0 {
+    coverage = match move View.coverage(
+      &View.offset(&table, 2, coverageWidth),
+      glyph.info.glyphId,
+    ) {
+      Option<u32>.Some { value } => u32.toUsize(value)
+      _ => {
+        return no()
+      }
+    }
+  }
+  let mut format = rawFormat
+  if wide {
+    if kind == 1 {
+      format = format - 2
+    } else {
+      format = 1
+    }
+  }
+  if kind == 1 {
+    let mut substitute: u32 = 0
+    if format == 1 {
+      substitute = u32.wrappingAdd(glyph.info.glyphId, View.uint(&table, header, width)) & 0xffffff
+      if !wide {
+        substitute = substitute & 65535
+      }
+    } else if format == 2 && coverage < u32.toUsize(View.uint(&table, header, width)) {
+      substitute = View.uint(&table, offset(header + width, coverage, width), width)
+    } else {
+      return no()
+    }
+    drop run trace.indexed(font, &buffer.*, "replacing glyph at ", at, " (single substitution)")
+    setGlyph(&context.*, &mut buffer, at, substitute, false, false)
+    drop run trace.indexed(font, &buffer.*, "replaced glyph at ", at, " (single substitution)")
+    return yes(at + 1)
+  }
+  if (kind == 2 || kind == 3 || kind == 4) && format == 1 {
+    if coverage >= u32.toUsize(View.uint(&table, header, width)) {
+      return no()
+    }
+    let set = View.offset(&table, offset(header + width, coverage, width), width)
+    let count = u16.toUsize(View.u16(&set, 0))
+    if kind == 2 {
+      if count > (usize.saturatingSubtract(View.len(&set), 2) / width) {
+        return no()
+      }
+      if glyphCount(&buffer.*) + count - 1 > context.maxLength {
+        buffer.successful = false
+        return no()
+      }
+      if context.outputPass && count != 1 {
+        beginOutput(&mut buffer, at)
+      }
+      if buffer.haveOutput {
+        // An output pass writes the glyph's replacements to the output instead of moving the
+        // rest of the buffer.
+        if count == 0 {
+          Buffer.deleteCurrent(&mut buffer)
+          return yes(at)
+        }
+        if count == 1 {
+          setGlyph(&context.*, &mut buffer, at, View.uint(&set, 2, width), false, false)
+          run Buffer.nextGlyph(&mut buffer)
+          return yes(at + 1)
+        }
+        run saveInput(&mut context, &mut buffer)
+        let mut i: usize = 0
+        while i < count {
+          let mut item = glyph
+          if item.ligatureId == 0 {
+            item.component = usize.wrappingToU8(i & 15)
+            item.numComponents = 1
+          }
+          if View.len(&context.glyphClasses.view) == 0 && glyph.glyphClass == 2 {
+            item.glyphClass = 1
+          }
+          substituteGlyph(
+            &context.*,
+            &mut item,
+            &mut buffer.digest,
+            View.uint(&set, 2 + i * width, width),
+            false,
+            true,
+          )
+          run Buffer.outputItem(&mut buffer, item)
+          i = i + 1
+        }
+        Buffer.skipGlyph(&mut buffer)
+        return yes(at + count)
+      }
+      if count == 0 {
+        drop run trace.indexed(
+          font,
+          &buffer.*,
+          "deleting glyph at ",
+          at,
+          " (multiple substitution)",
+        )
+        Buffer.deleteGlyph(&mut buffer, at)
+        drop run trace.indexed(font, &buffer.*, "deleted glyph at ", at, " (multiple substitution)")
+        return yes(at)
+      }
+      if count == 1 {
+        drop run trace.indexed(
+          font,
+          &buffer.*,
+          "replacing glyph at ",
+          at,
+          " (multiple substitution)",
+        )
+        setGlyph(&context.*, &mut buffer, at, View.uint(&set, 2, width), false, false)
+        drop run trace.indexed(
+          font,
+          &buffer.*,
+          "replaced glyph at ",
+          at,
+          " (multiple substitution)",
+        )
+        return yes(at + 1)
+      }
+      run saveInput(&mut context, &mut buffer)
+      drop run trace.indexed(font, &buffer.*, "multiplying glyph at ", at, "")
+      run Buffer.insertCopies(&mut buffer, at + 1, count - 1, glyph)
+      let mut i: usize = 0
+      while i < count {
+        let mut item = glyph
+        if item.ligatureId == 0 {
+          item.component = usize.wrappingToU8(i & 15)
+          item.numComponents = 1
+        }
+        if View.len(&context.glyphClasses.view) == 0 && glyph.glyphClass == 2 {
+          item.glyphClass = 1
+        }
+        List<Glyph>.set(&mut buffer.glyphs, at + i, item)
+        setGlyph(
+          &context.*,
+          &mut buffer,
+          at + i,
+          View.uint(&set, 2 + i * width, width),
+          false,
+          true,
+        )
+        i = i + 1
+      }
+      if trace.enabled(font, &buffer.*) {
+        let mut indices = List<usize>.make()
+        let mut n: usize = 0
+        while n < count {
+          run List<usize>.append(&mut indices, n)
+          n = n + 1
+        }
+        drop run trace.indices(
+          font,
+          &buffer.*,
+          "multiplied glyphs at ",
+          List<usize>.asSlice(&indices),
+          at,
+        )
+      }
+      return yes(at + count)
+    }
+    if kind == 3 {
+      let mut selection = u32.toUsize(enabled(&context.*, &glyph, first, last))
+      if selection == 4294967295 && count != 0 {
+        context.randomState = u32.wrappingMultiply(context.randomState, 48271) % 2147483647
+        selection = u32.toUsize(context.randomState) % count + 1
+        let length = Buffer.len(&buffer.*)
+        Buffer.unsafeToBreak(&mut buffer, 0, length)
+      }
+      if selection == 0 || selection > count {
+        return no()
+      }
+      drop run trace.indexed(
+        font,
+        &buffer.*,
+        "replacing glyph at ",
+        at,
+        " (alternate substitution)",
+      )
+      setGlyph(
+        &context.*,
+        &mut buffer,
+        at,
+        View.uint(&set, 2 + (selection - 1) * width, width),
+        false,
+        false,
+      )
+      drop run trace.indexed(font, &buffer.*, "replaced glyph at ", at, " (alternate substitution)")
+      return yes(at + 1)
+    }
+
+    // With several candidates, find the glyph after this one once and reject ligatures whose
+    // second component differs without matching them, as harfrust does.
+    let mut second: u32 = 0
+    let mut secondAt: usize = 0
+    let mut haveSecond = false
+    let mut skippedAny = false
+    let mut nothingAfter = false
+    if count > 1 {
+      let found = ligatureSecond(&context.*, &buffer.*, lookup, at)
+      if found == NOTHING_AFTER {
+        nothingAfter = true
+      } else if found != NO_SECOND {
+        second = List<Glyph>.asSlice(&buffer.glyphs)[found].info.glyphId
+        secondAt = found
+        haveSecond = true
+      }
+    }
+
+    // The plan's digest of the set's second components rejects every ligature at once, as
+    // walking them would.
+    if haveSecond && width == 2 && coverage < digests.length && digests[coverage] != u64.MAX
+      && (digests[coverage] & u64.shiftLeft(1, u32.toU64(second & 63))) == 0 {
+      if context.budget != 0 && buffer.successful {
+        Buffer.unsafeToConcat(&mut buffer, at, secondAt + 1)
+        context.budget = usize.saturatingSubtract(context.budget, count)
+      }
+      return no()
+    }
+
+    // Component positions live in this nesting depth's slot of the buffer's position stack,
+    // which a contextual lookup at this depth would use and none is applying.
+    let base = depth * 64
+    let stackLength = List<usize>.length(&buffer.positionStack)
+    if stackLength < base + 64 {
+      run List<usize>.appendRepeated(&mut buffer.positionStack, 0, base + 64 - stackLength)
+    }
+    let mut i: usize = 0
+    while i < count && context.budget != 0 && buffer.successful {
+      if haveSecond && width == 2 {
+        let skipped = skipLigatures16(&mut context, set, i, count, second)
+        if skipped.marked && !skippedAny {
+          Buffer.unsafeToConcat(&mut buffer, at, secondAt + 1)
+          skippedAny = true
+        }
+        i = skipped.index
+        if i >= count || context.budget == 0 {
+          break
+        }
+      }
+      context.budget = context.budget - 1
+      let ligature = View.offset(&set, 2 + i * width, width)
+      let components = u16.toUsize(View.u16(&ligature, width))
+      if components == 0 || components > 64 {
+        i = i + 1
+        continue
+      }
+      if nothingAfter && components > 1 {
+        // Matching would find no second glyph and mark only this one.
+        Buffer.unsafeToConcat(&mut buffer, at, at + 1)
+        i = i + 1
+        continue
+      }
+      if haveSecond && components > 1 && View.uint(&ligature, 2 + width, width) != second {
+        // A full match would have failed at the second glyph and marked the same span.
+        if !skippedAny {
+          Buffer.unsafeToConcat(&mut buffer, at, secondAt + 1)
+          skippedAny = true
+        }
+        i = i + 1
+        continue
+      }
+      let mut matchKind: u32 = 0
+      if wide {
+        matchKind = 4
+      }
+
+      let mut matched: usize = 1
+      let mut cursor = at
+      while matched < components {
+        let found = nextExpected(
+          &context.*,
+          &buffer.*,
+          lookup,
+          cursor,
+          false,
+          ligature,
+          2 + matched * width,
+          matchKind,
+          noClasses(&context.*),
+          false,
+        )
+        if found == NOT_FOUND {
+          break
+        }
+        cursor = found & (MISMATCH - 1)
+        if (found & MISMATCH) != 0
+          || (!context.everywhere
+            && enabled(&context.*, &List<Glyph>.asSlice(&buffer.glyphs)[cursor], first, last) == 0)
+          || !compatibleComponents(
+            &context.*,
+            &buffer.*,
+            lookup,
+            at,
+            &List<Glyph>.asSlice(&buffer.glyphs)[cursor],
+          ) {
+          break
+        }
+        List<usize>.set(&mut buffer.positionStack, base + matched, cursor)
+        matched = matched + 1
+      }
+      if matched == components {
+        List<usize>.set(&mut buffer.positionStack, base, at)
+        drop run trace.indices(
+          font,
+          &buffer.*,
+          "ligating glyphs at ",
+          Slice.view(List<usize>.asSlice(&buffer.positionStack), base, components),
+          0,
+        )
+        Buffer.mergeInputClusters(&mut buffer, at, cursor + 1)
+        Buffer.unsafeToBreak(&mut buffer, at, cursor + 1)
+        let original = List<Glyph>.get(&buffer.glyphs, at)
+        let mut baseLigature = original.glyphClass == 1
+        let mut markLigature = original.glyphClass == 3
+        let mut total = Glyph.ligNumComps(&original)
+        let mut n: usize = 1
+        while n < components {
+          let part = List<Glyph>.get(
+            &buffer.glyphs,
+            List<usize>.get(&buffer.positionStack, base + n),
+          )
+          if part.glyphClass != 3 {
+            baseLigature = false
+            markLigature = false
+          }
+          total = total + Glyph.ligContribution(&part)
+          n = n + 1
+        }
+        let isLigature = !baseLigature && !markLigature
+        let mut id: u8 = 0
+        let mut lastId = original.ligatureId
+        let mut lastNum = Glyph.ligNumComps(&original)
+        let mut soFar = lastNum
+        let mut item = original
+        if isLigature {
+          context.ligatureId = context.ligatureId % 7 + 1
+          id = u32.wrappingToU8(context.ligatureId)
+          item.ligatureId = id
+          item.component = 0
+          item.numComponents = u32.wrappingToU8(total & 15)
+          if View.len(&context.glyphClasses.view) == 0 {
+            item.glyphClass = 2
+          }
+        }
+        List<Glyph>.set(&mut buffer.glyphs, at, item)
+        setGlyph(&context.*, &mut buffer, at, View.uint(&ligature, 0, width), true, false)
+        let mut p = at + 1
+        n = 1
+        while p <= cursor {
+          let mut part = List<Glyph>.get(&buffer.glyphs, p)
+          if n < components && p == List<usize>.get(&buffer.positionStack, base + n) {
+            n = n + 1
+            lastId = part.ligatureId
+            lastNum = Glyph.ligContribution(&part)
+            soFar = soFar + lastNum
+          } else if isLigature {
+            let mut comp = u8.toU32(part.component)
+            if comp == 0 || comp > lastNum {
+              comp = lastNum
+            }
+            part.ligatureId = id
+            part.component = u32.wrappingToU8((soFar - lastNum + comp) & 15)
+            part.numComponents = 1
+            List<Glyph>.set(&mut buffer.glyphs, p, part)
+          }
+          p = p + 1
+        }
+        if !markLigature && lastId != 0 {
+          while p < Buffer.len(&buffer.*) {
+            let mut part = List<Glyph>.get(&buffer.glyphs, p)
+            if part.ligatureId != lastId || part.component == 0 {
+              break
+            }
+            let mut comp = u8.toU32(part.component)
+            if comp > lastNum {
+              comp = lastNum
+            }
+            part.ligatureId = id
+            part.component = u32.wrappingToU8((soFar - lastNum + comp) & 15)
+            part.numComponents = 1
+            List<Glyph>.set(&mut buffer.glyphs, p, part)
+            p = p + 1
+          }
+        }
+        if context.outputPass {
+          beginOutput(&mut buffer, at)
+        }
+        if buffer.haveOutput {
+          // The ligature goes to the output; the glyphs between its components move up to
+          // the components' end and stay unread, as they follow the ligature.
+          run Buffer.nextGlyph(&mut buffer)
+          let positions = Slice.view(List<usize>.asSlice(&buffer.positionStack), base, components)
+          let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+          let mut write = cursor + 1
+          let mut read = cursor
+          let mut m = components - 1
+          while read > at {
+            if m != 0 && read == positions[m] {
+              m = m - 1
+            } else {
+              write = write - 1
+              glyphs[write] = glyphs[read]
+            }
+            read = read - 1
+          }
+          buffer.idx = write
+          return yes(at + 1)
+        }
+        let stack = Intrinsic.replace(buffer.positionStack, List<usize>.make())
+        Buffer.removeSorted(
+          &mut buffer,
+          Slice.view(List<usize>.asSlice(&stack), base + 1, components - 1),
+        )
+        buffer.positionStack = move stack
+        drop run trace.indexed(font, &buffer.*, "ligated glyph at ", at, "")
+        return yes(at + 1)
+      }
+      Buffer.unsafeToConcat(&mut buffer, at, cursor + 1)
+      i = i + 1
+    }
+  }
+  if kind == 8 && format == 1 {
+    let backCount = u16.toUsize(View.u16(&table, header))
+    let aheadPos = header + 2 + backCount * width
+    let mut matchKind: u32 = 2
+    if wide {
+      matchKind = 6
+    }
+    let aheadCount = u16.toUsize(View.u16(&table, aheadPos))
+    if !matchOutside(
+      &context.*,
+      &buffer.*,
+      lookup,
+      table,
+      header + 2,
+      backCount,
+      at,
+      true,
+      matchKind,
+      noClasses(&context.*),
+    )
+      || !matchOutside(
+        &context.*,
+        &buffer.*,
+        lookup,
+        table,
+        aheadPos + 2,
+        aheadCount,
+        at,
+        false,
+        matchKind,
+        noClasses(&context.*),
+      ) {
+      return no()
+    }
+    let substitutes = aheadPos + 2 + aheadCount * width
+    if coverage >= u32.toUsize(View.uint(&table, substitutes, width)) {
+      return no()
+    }
+    drop run trace.indexed(
+      font,
+      &buffer.*,
+      "replacing glyph at ",
+      at,
+      " (reverse chaining substitution)",
+    )
+    setGlyph(
+      &context.*,
+      &mut buffer,
+      at,
+      View.uint(&table, substitutes + width + coverage * width, width),
+      false,
+      false,
+    )
+    drop run trace.indexed(
+      font,
+      &buffer.*,
+      "replaced glyph at ",
+      at,
+      " (reverse chaining substitution)",
+    )
+    return yes(at + 1)
+  }
+  return no()
+}
+
+// Contextual matches obey the same component boundaries as ligatures.
+fn compatibleComponents(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  at: usize,
+  item: &Glyph,
+) -> bool with Intrinsic.inlineAlways() {
+  // Most first glyphs are no ligature component, which needs only the matched glyph.
+  let first = &List<Glyph>.asSlice(&buffer.glyphs)[at]
+  if first.ligatureId == 0 || first.component == 0 {
+    return item.ligatureId == 0 || item.component == 0 || item.ligatureId == first.ligatureId
+  }
+  return componentOfSameLigature(context, buffer, lookup, at, item)
+}
+
+fn componentOfSameLigature(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  at: usize,
+  item: &Glyph,
+) -> bool {
+  let first = List<Glyph>.get(&buffer.glyphs, at)
+  if first.ligatureId != 0 && first.component != 0 {
+    if first.ligatureId == item.ligatureId && first.component == item.component {
+      return true
+    }
+
+    // During an output pass the glyphs before the current one are the output.
+    let mut floor: usize = 0
+    if buffer.haveOutput && at >= buffer.idx {
+      floor = buffer.idx
+    }
+    let mut p = at
+    while p > floor {
+      p = p - 1
+      let base = List<Glyph>.get(&buffer.glyphs, p)
+      if base.ligatureId != first.ligatureId {
+        return false
+      }
+      if base.component == 0 {
+        return ignored(context, lookup, &base)
+      }
+    }
+    if buffer.haveOutput && at >= buffer.idx {
+      let out = Buffer.outGlyphs(buffer)
+      let mut k = out.length
+      while k != 0 {
+        k = k - 1
+        if out[k].ligatureId != first.ligatureId {
+          break
+        }
+        if out[k].component == 0 {
+          return ignored(context, lookup, &out[k])
+        }
+      }
+    }
+    return false
+  }
+  return item.ligatureId == 0 || item.component == 0 || item.ligatureId == first.ligatureId
+}
+
+/// The glyph a ligature's second component must match: the next glyph the lookup does not
+/// ignore. None when that glyph may be skipped as default-ignorable, or the syllable ends,
+/// since then each ligature must be matched in full.
+/// `ligatureSecond` results besides a glyph index: a glyph that stops matching, and the end of
+/// the buffer (or only ignored glyphs) after the first component.
+const NO_SECOND: usize = usize.MAX
+
+const NOTHING_AFTER: usize = usize.MAX - 1
+
+fn ligatureSecond(context: &Context, buffer: &Buffer, lookup: Lookup, at: usize) -> usize {
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let mut i = at + 1
+  while i < glyphs.length {
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != glyphs[at].syllable {
+      return NO_SECOND
+    }
+    if !ignored(context, lookup, item) {
+      if item.ignorable && !item.substituted && (!item.hidden || context.positioning) {
+        return NO_SECOND
+      }
+      return i
+    }
+    i = i + 1
+  }
+  return NOTHING_AFTER
+}
+
+fn matchWidth(kind: u32) -> usize {
+  if kind >= 4 {
+    return 3
+  }
+  return 2
+}
+
+fn matches(table: View, pos: usize, kind: u32, classes: Classes, glyph: u32) -> bool {
+  let expected = View.uint(&table, pos, matchWidth(kind))
+  if (kind & 3) == 2 {
+    return hasCoverage(View.tail(&table, u32.toUsize(expected)), glyph)
+  }
+  if (kind & 3) == 1 {
+    return classOf(&classes, glyph) == expected
+  }
+  return glyph == expected
+}
+
+/// `nextExpected` results: no glyph to compare, or this bit on the index of a glyph that does
+/// not match.
+const NOT_FOUND: usize = usize.MAX
+
+const MISMATCH: usize = usize.MAX / 2 + 1
+
+fn nextExpected(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  start: usize,
+  backward: bool,
+  table: View,
+  pos: usize,
+  kind: u32,
+  classes: Classes,
+  contextual: bool,
+) -> usize {
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let syllable = glyphs[start].syllable
+  let mut i = start
+  while true {
+    if backward {
+      if i == 0 {
+        return NOT_FOUND
+      }
+      i = i - 1
+    } else {
+      i = i + 1
+      if i >= glyphs.length {
+        return NOT_FOUND
+      }
+    }
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != syllable {
+      return NOT_FOUND
+    }
+    if ignored(context, lookup, item) {
+      continue
+    }
+    if matches(table, pos, kind, classes, item.info.glyphId) {
+      return i
+    }
+    if item.ignorable && !item.substituted && (!item.hidden || context.positioning)
+      && (item.codepoint != 0x200c || context.positioning || (contextual && context.autoZwnj))
+      && (item.codepoint != 0x200d || contextual || context.autoZwj) {
+      continue
+    }
+    return i | MISMATCH
+  }
+  return NOT_FOUND
+}
+
+/// Where a rule's lookahead and actions sit, and whether its action records fit in the rule.
+struct RuleTail {
+  aheadPos: usize,
+  aheadCount: usize,
+  actionPos: usize,
+  actionCount: usize,
+  valid: bool,
+}
+
+/// Reads the rest of a rule from `pos`, just past its input values. Unchained rules store the
+/// action count before the input, so the caller passes it in.
+fn ruleTail(
+  rule: View,
+  pos: usize,
+  chained: bool,
+  actionCount: usize,
+  width: usize,
+) -> RuleTail with Intrinsic.inline() {
+  let mut at = pos
+  let mut aheadPos: usize = 0
+  let mut aheadCount: usize = 0
+  let mut actions = actionCount
+  if chained {
+    aheadCount = u16.toUsize(View.u16(&rule, at))
+    aheadPos = at + 2
+    at = at + 2 + aheadCount * width
+    actions = u16.toUsize(View.u16(&rule, at))
+    at = at + 2
+  }
+  return RuleTail {
+    aheadPos: aheadPos,
+    aheadCount: aheadCount,
+    actionPos: at,
+    actionCount: actions,
+    valid: actions <= 64 && offset(at, actions, 4) <= View.len(&rule),
+  }
+}
+
+/// Skips the rules of a format 1 or 2 rule set whose second input value cannot match, exactly as
+/// the full loop in `contextual` would reject them, and returns the first rule that needs the
+/// full match. Positions are read from the rule set directly, without a view per rule.
+fn skipRules(
+  context: &mut Context,
+  buffer: &mut Buffer,
+  ruleSet: View,
+  from: usize,
+  count: usize,
+  offsetWidth: usize,
+  chained: bool,
+  width: usize,
+  found: bool,
+  secondValue: u32,
+  at: usize,
+  secondEnd: usize,
+) -> usize {
+  if offsetWidth == 2 && width == 2 {
+    return skipRules16(
+      &mut context,
+      &mut buffer,
+      ruleSet,
+      from,
+      count,
+      chained,
+      found,
+      secondValue,
+      at,
+      secondEnd,
+    )
+  }
+  let length = View.len(&ruleSet)
+  let mut index = from
+  while index < count && context.budget != 0 {
+    let start = u32.toUsize(
+      View.uint(
+        &ruleSet,
+        usize.wrappingAdd(2, usize.wrappingMultiply(index, offsetWidth)),
+        offsetWidth,
+      ),
+    )
+    let mut pos = start
+    if chained {
+      let backCount = u16.toUsize(View.u16(&ruleSet, pos))
+      pos = usize.wrappingAdd(pos, usize.wrappingAdd(2, usize.wrappingMultiply(backCount, width)))
+    }
+    let inputCount = u16.toUsize(View.u16(&ruleSet, pos))
+    pos = usize.wrappingAdd(pos, 2)
+    let mut actionCount: usize = 0
+    if !chained {
+      actionCount = u16.toUsize(View.u16(&ruleSet, pos))
+      pos = usize.wrappingAdd(pos, 2)
+    }
+
+    // A missing rule reads as zero inputs, which the full loop skips without marking.
+    if start == 0 || start > length || inputCount < 2 || inputCount > 64
+      || (found && View.uint(&ruleSet, pos, width) == secondValue) {
+      return index
+    }
+    context.budget = context.budget - 1
+    if (buffer.flags & 64) != 0 {
+      let rule = View.tail(&ruleSet, start)
+      let end = usize.wrappingAdd(pos - start, usize.wrappingMultiply(inputCount - 1, width))
+      if ruleTail(rule, end, chained, actionCount, width).valid {
+        Buffer.unsafeToConcat(&mut buffer, at, secondEnd)
+      }
+    }
+    index = index + 1
+  }
+  return index
+}
+
+/// `skipRules` for the common 16-bit rule sets, reading the bytes without width dispatch.
+fn skipRules16(
+  context: &mut Context,
+  buffer: &mut Buffer,
+  ruleSet: View,
+  from: usize,
+  count: usize,
+  chained: bool,
+  found: bool,
+  secondValue: u32,
+  at: usize,
+  secondEnd: usize,
+) -> usize {
+  let bytes = FontData.asBytes(&ruleSet.data)
+
+  // The budget and flags stay in locals so the loop does not reload them through the references.
+  let marks = (buffer.flags & 64) != 0
+  let mut budget = context.budget
+  let mut index = from
+  while index < count && budget != 0 {
+    // Offsets and counts are at most 65535, so the wrapping arithmetic below cannot wrap.
+    let start = read16(bytes, usize.wrappingAdd(2, usize.wrappingMultiply(index, 2)))
+    if start == 0 || start > bytes.length {
+      break
+    }
+    let mut countPos = start
+    if chained {
+      countPos = usize.wrappingAdd(
+        countPos,
+        usize.wrappingAdd(2, usize.wrappingMultiply(read16(bytes, countPos), 2)),
+      )
+    }
+    let inputCount = read16(bytes, countPos)
+    if inputCount < 2 || inputCount > 64 {
+      break
+    }
+
+    // Unchained rules keep their action count between the input count and the input values.
+    let mut pos = usize.wrappingAdd(countPos, 2)
+    if !chained {
+      pos = usize.wrappingAdd(pos, 2)
+    }
+    if found && usize.toU32(read16(bytes, pos)) == secondValue {
+      break
+    }
+    budget = budget - 1
+    if marks {
+      let mut actionCount: usize = 0
+      if !chained {
+        actionCount = read16(bytes, countPos + 2)
+      }
+      let end = pos - start + (inputCount - 1) * 2
+      if ruleTail(View.tail(&ruleSet, start), end, chained, actionCount, 2).valid {
+        Buffer.unsafeToConcat(&mut buffer, at, secondEnd)
+      }
+    }
+    index = index + 1
+  }
+  context.budget = budget
+  return index
+}
+
+struct SkippedLigatures {
+  index: usize,
+  marked: bool,
+}
+
+/// Skips the ligatures of a 16-bit ligature set that the full loop in `substitute` would reject
+/// without matching: malformed ones, and ones whose second component is not `second`. Returns
+/// the first ligature that needs matching and whether a skipped one would have marked the span.
+fn skipLigatures16(
+  context: &mut Context,
+  set: View,
+  from: usize,
+  count: usize,
+  second: u32,
+) -> SkippedLigatures {
+  let bytes = FontData.asBytes(&set.data)
+  let mut budget = context.budget
+  let mut marked = false
+  let mut index = from
+  while index < count && budget != 0 {
+    let start = read16(bytes, 2 + index * 2)
+    let mut components: usize = 0
+    if start != 0 && start <= bytes.length {
+      components = read16(bytes, start + 2)
+    }
+    if components != 0 && components <= 64 {
+      if components == 1 || usize.toU32(read16(bytes, start + 4)) == second {
+        break
+      }
+      marked = true
+    }
+    budget = budget - 1
+    index = index + 1
+  }
+  context.budget = budget
+  return SkippedLigatures { index: index, marked: marked }
+}
+
+/// The first glyph after `at` that input matching compares with a rule's second value.
+struct InputSecond {
+  found: bool,
+  index: usize,
+  glyph: u32,
+  skippable: bool,
+}
+
+fn inputSecond(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  at: usize,
+) -> InputSecond with Intrinsic.inlineAlways() {
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let mut i = at + 1
+  while i < glyphs.length {
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != glyphs[at].syllable {
+      break
+    }
+    if !ignored(context, lookup, item) {
+      return InputSecond {
+        found: true,
+        index: i,
+        glyph: item.info.glyphId,
+        skippable: item.ignorable && !item.substituted && (!item.hidden || context.positioning)
+          && (item.codepoint != 0x200c || context.positioning)
+          && (item.codepoint != 0x200d || context.autoZwj),
+      }
+    }
+    i = i + 1
+  }
+  return InputSecond { found: false, index: at, glyph: 0, skippable: false }
+}
+
+/// `outsideFirst` results besides a value: not looked for yet, no glyph, or a glyph that
+/// matching may skip when it does not match, which leaves each rule to the full check.
+const BACK_UNKNOWN: u64 = 0x300000000
+
+const BACK_NONE: u64 = 0x200000000
+
+const BACK_SKIPPABLE: u64 = 0x100000000
+
+/// `outsideFirst` for glyph values, with the lookup borrowed and no class definitions.
+fn outsideGlyph(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: &Lookup,
+  at: usize,
+  backward: bool,
+) -> u64 {
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let syllable = glyphs[at].syllable
+  let mut i = at
+  while true {
+    if backward {
+      if i == 0 {
+        return BACK_NONE
+      }
+      i = i - 1
+    } else {
+      i = i + 1
+      if i >= glyphs.length {
+        return BACK_NONE
+      }
+    }
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != syllable {
+      break
+    }
+    if ignored(context, lookup.*, item) {
+      continue
+    }
+    if item.ignorable && !item.substituted && (!item.hidden || context.positioning)
+      && (item.codepoint != 0x200c || context.positioning || context.autoZwnj) {
+      return BACK_SKIPPABLE
+    }
+    return u32.toU64(item.info.glyphId)
+  }
+  return BACK_NONE
+}
+
+/// The value for `kind` of the glyph a rule's first backtrack value (or, forward, a single-input
+/// rule's first lookahead value) is compared with: the first one before (or after) `at` that
+/// matching does not ignore.
+fn outsideFirst(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  at: usize,
+  backward: bool,
+  kind: u32,
+  classes: Classes,
+) -> u64 {
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let syllable = glyphs[at].syllable
+  let mut i = at
+  while true {
+    if backward {
+      if i == 0 {
+        return BACK_NONE
+      }
+      i = i - 1
+    } else {
+      i = i + 1
+      if i >= glyphs.length {
+        return BACK_NONE
+      }
+    }
+    let item = &glyphs[i]
+    if context.restrictSyllable && item.syllable != syllable {
+      break
+    }
+    if ignored(context, lookup, item) {
+      continue
+    }
+    if item.ignorable && !item.substituted && (!item.hidden || context.positioning)
+      && (item.codepoint != 0x200c || context.positioning || context.autoZwnj) {
+      return BACK_SKIPPABLE
+    }
+    let mut value = item.info.glyphId
+    if kind == 1 {
+      value = classOf(&classes, value)
+    }
+    return u32.toU64(value)
+  }
+  return BACK_NONE
+}
+
+/// A cached 16-bit format 3 contextual subtable's `contextDigests`, or none.
+fn format3DigestsAt(subtables: &[LookupSubtable], index: usize) -> usize {
+  if index < subtables.length {
+    return subtables[index].contextDigests
+  }
+  return usize.MAX
+}
+
+/// Whether the rule loop in `contextual` would reject the 16-bit format 3 rule at `at`, whose
+/// first input glyph is known to match. It makes the same checks in the same order.
+fn format3Fails(
+  context: &Context,
+  buffer: &Buffer,
+  lookupRef: &Lookup,
+  table: View,
+  at: usize,
+  first: usize,
+  last: usize,
+  chained: bool,
+  digestsAt: usize,
+) -> bool {
+  let mut pos: usize = 2
+  let mut backPos: usize = 0
+  let mut backCount: usize = 0
+  if chained {
+    backCount = u16.toUsize(View.u16(&table, 2))
+    backPos = 4
+    pos = 4 + backCount * 2
+  }
+  let inputCount = u16.toUsize(View.u16(&table, pos))
+  pos = pos + 2
+  let mut actionCount: usize = 0
+  if !chained {
+    actionCount = u16.toUsize(View.u16(&table, pos))
+    pos = pos + 2
+  }
+  let inputPos = pos
+
+  // The plan's digests rule out most failing rules from the glyphs next to the first one,
+  // before the rest of the rule is read or any coverage is searched: the second input, or the
+  // first lookahead of a single input, and the first backtrack.
+  if digestsAt != usize.MAX {
+    let digests = Slice.view(context.contextDigests, digestsAt, 3)
+    let next = outsideGlyph(context, buffer, lookupRef, at, false)
+    let mut nextDigest = &digests[0]
+    if inputCount == 1 {
+      nextDigest = &digests[2]
+    }
+    if next == BACK_NONE
+      && (inputCount > 1 || (chained && View.u16(&table, pos + inputCount * 2) != 0)) {
+      return true
+    }
+    if next < BACK_SKIPPABLE && !SetDigest.mayHave(nextDigest, u64.wrappingToU32(next)) {
+      return true
+    }
+    if backCount != 0 {
+      let back = outsideGlyph(context, buffer, lookupRef, at, true)
+      if back == BACK_NONE
+        || (back < BACK_SKIPPABLE && !SetDigest.mayHave(&digests[1], u64.wrappingToU32(back))) {
+        return true
+      }
+    }
+  }
+  let tail = ruleTail(table, pos + inputCount * 2, chained, actionCount, 2)
+  if inputCount == 0 || inputCount > 64 || !tail.valid {
+    return true
+  }
+  let lookup = lookupRef.*
+  let classes = noClasses(context)
+  let mut cursor = at
+  let mut n: usize = 1
+  while n < inputCount {
+    let found = nextExpected(
+      context,
+      buffer,
+      lookup,
+      cursor,
+      false,
+      table,
+      inputPos + n * 2,
+      2,
+      classes,
+      false,
+    )
+    if found == NOT_FOUND || (found & MISMATCH) != 0 {
+      return true
+    }
+    cursor = found
+    let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+    if (!context.everywhere && enabled(context, &glyphs[cursor], first, last) == 0)
+      || !compatibleComponents(context, buffer, lookup, at, &glyphs[cursor]) {
+      return true
+    }
+    n = n + 1
+  }
+  return !matchOutside(context, buffer, lookup, table, backPos, backCount, at, true, 2, classes)
+    || !matchOutside(
+      context,
+      buffer,
+      lookup,
+      table,
+      tail.aheadPos,
+      tail.aheadCount,
+      cursor,
+      false,
+      2,
+      classes,
+    )
+}
+
+fn matchOutside(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  table: View,
+  pos: usize,
+  count: usize,
+  at: usize,
+  backward: bool,
+  kind: u32,
+  classes: Classes,
+) -> bool {
+  if count > 64 || offset(pos, count, matchWidth(kind)) > View.len(&table) {
+    return false
+  }
+  let mut cursor = at
+  let mut i: usize = 0
+  while i < count {
+    let found = nextExpected(
+      context,
+      buffer,
+      lookup,
+      cursor,
+      backward,
+      table,
+      pos + i * matchWidth(kind),
+      kind,
+      classes,
+      true,
+    )
+    if found == NOT_FOUND || (found & MISMATCH) != 0 {
+      return false
+    }
+    cursor = found
+    i = i + 1
+  }
+  return true
+}
+
+fn outsideEdge(
+  context: &Context,
+  buffer: &Buffer,
+  lookup: Lookup,
+  table: View,
+  pos: usize,
+  count: usize,
+  at: usize,
+  backward: bool,
+  kind: u32,
+  classes: Classes,
+) -> usize {
+  let mut cursor = at
+  let mut i: usize = 0
+  while i < count && i < 64 {
+    let found = nextExpected(
+      context,
+      buffer,
+      lookup,
+      cursor,
+      backward,
+      table,
+      pos + i * matchWidth(kind),
+      kind,
+      classes,
+      true,
+    )
+    if found == NOT_FOUND {
+      break
+    }
+    cursor = found & (MISMATCH - 1)
+    i = i + 1
+  }
+  return cursor
+}
+
+effect fn contextual<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &mut Context,
+  buffer: &mut Buffer,
+  lookup: Lookup,
+  table: View,
+  subtables: &[LookupSubtable],
+  subtableIndex: usize,
+  digests: &[u64],
+  starts: &[u32],
+  known: u32,
+  at: usize,
+  first: usize,
+  last: usize,
+  depth: usize,
+  chained: bool,
+  checked: bool,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let rawFormat = View.u16(&table, 0)
+  let wide = rawFormat >= 4 && rawFormat <= 6
+  if chained && rawFormat == 6 {
+    return no()
+  }
+
+  // Format 3 has a single rule, which most glyphs fail on its first input coverage. Check that
+  // before the general setup, spending the same budget the rule loop would.
+  let mut firstMatched = false
+  if rawFormat == 3 && known != 0 {
+    firstMatched = true
+  } else if rawFormat == 3 && context.budget != 0 && buffer.successful {
+    let mut inputPos: usize = 6
+    if chained {
+      inputPos = 6 + u16.toUsize(View.u16(&table, 2)) * 2
+    }
+    let first = List<Glyph>.asSlice(&buffer.glyphs)[at].info.glyphId
+    if !matches(table, inputPos, 2, noClasses(&context.*), first) {
+      context.budget = context.budget - 1
+      return no()
+    }
+    firstMatched = true
+  }
+
+  // Most format 3 rules whose first input matches still fail. Without unsafe-to-concat tracking
+  // a failed rule only spends its budget unit, so check the rule before the general setup,
+  // unless the caller just did.
+  if rawFormat == 3 && !checked && (buffer.flags & 64) == 0 && context.budget != 0
+    && buffer.successful
+    && format3Fails(
+      &context.*,
+      &buffer.*,
+      &lookup,
+      table,
+      at,
+      first,
+      last,
+      chained,
+      format3DigestsAt(subtables, subtableIndex),
+    ) {
+    context.budget = context.budget - 1
+    return no()
+  }
+  let mut format = rawFormat
+  let mut offsetWidth: usize = 2
+  let mut header: usize = 4
+  let mut countWidth: usize = 2
+  let mut coverageWidth: usize = 2
+  if wide {
+    format = format - 3
+    offsetWidth = 3
+    header = 6
+    countWidth = 3
+    coverageWidth = 4
+  }
+  let glyph = List<Glyph>.get(&buffer.glyphs, at).info.glyphId
+  let mut ruleSet = View.tail(&table, View.len(&table))
+  let mut classes = noClasses(&context.*)
+  let mut backClasses = noClasses(&context.*)
+  let mut aheadClasses = noClasses(&context.*)
+  let mut kind: u32 = 0
+  let mut ruleSetIndex: usize = 0
+  if format == 1 || format == 2 {
+    let mut coverage = usize.wrappingSubtract(u32.toUsize(known), 1)
+    if known == 0 {
+      coverage = match move View.coverage(&View.offset(&table, 2, coverageWidth), glyph) {
+        Option<u32>.Some { value } => u32.toUsize(value)
+        _ => {
+          return no()
+        }
+      }
+    }
+    let mut index = coverage
+    let mut countPos = header
+    if format == 2 {
+      kind = 1
+      classes = subtableClasses(
+        &context.*,
+        subtables,
+        subtableIndex,
+        0,
+        View.offset(&table, header, coverageWidth),
+      )
+      countPos = header + coverageWidth
+      if chained {
+        backClasses = classes
+        classes = subtableClasses(
+          &context.*,
+          subtables,
+          subtableIndex,
+          1,
+          View.offset(&table, header + coverageWidth, coverageWidth),
+        )
+        aheadClasses = subtableClasses(
+          &context.*,
+          subtables,
+          subtableIndex,
+          2,
+          View.offset(&table, header + coverageWidth * 2, coverageWidth),
+        )
+        countPos = header + coverageWidth * 3
+        countWidth = 2
+      }
+      index = u32.toUsize(classOf(&classes, glyph))
+    }
+    if index >= u32.toUsize(View.uint(&table, countPos, countWidth)) {
+      return no()
+    }
+    ruleSetIndex = index
+    ruleSet = View.offset(&table, countPos + countWidth + index * offsetWidth, offsetWidth)
+  } else if format == 3 {
+    kind = 2
+  } else {
+    return no()
+  }
+  if wide && kind != 1 {
+    kind = kind + 4
+  }
+  let width = matchWidth(kind)
+  let mut ruleOffsetWidth = offsetWidth
+  if format == 1 && !chained {
+    ruleOffsetWidth = 2
+  }
+  let mut count: usize = 1
+  if format != 3 {
+    count = u16.toUsize(View.u16(&ruleSet, 0))
+  }
+
+  // Rules in formats 1 and 2 mostly fail on their second input value. The glyph that value is
+  // compared with does not depend on the rule unless it is a default ignorable that matching may
+  // skip, so find it once and reject such rules without walking the buffer.
+  let mut second = InputSecond { found: false, index: at, glyph: 0, skippable: true }
+  if format != 3 {
+    second = inputSecond(&context.*, &buffer.*, lookup, at)
+  }
+  let mut secondValue = second.glyph
+  if kind == 1 {
+    secondValue = classOf(&classes, second.glyph)
+  }
+  let quickReject = format != 3 && !second.skippable
+  let mut secondEnd = at + 1
+  if second.found {
+    secondEnd = second.index + 1
+  }
+
+  // The plan's digest of the rule set's second input values can rule out every rule at once.
+  // The rule loop would reject each one, spending one budget unit per rule; buffers that track
+  // unsafe-to-concat take the loop, which marks the span.
+  if quickReject && (buffer.flags & 64) == 0 && ruleSetIndex < digests.length
+    && digests[ruleSetIndex] != u64.MAX
+    && (!second.found
+      || (digests[ruleSetIndex] & u64.shiftLeft(1, u32.toU64(secondValue & 63))) == 0) {
+    if context.budget != 0 && buffer.successful {
+      context.budget = usize.saturatingSubtract(context.budget, count)
+    }
+    return no()
+  }
+
+  // Matched input positions live in this nesting depth's slot of the context's scratch list, so
+  // each application neither zeroes nor copies a 64-entry array.
+  let base = depth * 64
+  let stackLength = List<usize>.length(&buffer.positionStack)
+  if stackLength < base + 64 {
+    run List<usize>.appendRepeated(&mut buffer.positionStack, 0, base + 64 - stackLength)
+  }
+
+  // The plan keeps each rule's second input value, so rules are skipped by reading those
+  // instead of the rules, stopping where `skipRules` would: at a rule whose second value matches
+  // or one the plan marks `RULE_STOP`. Buffers that track unsafe-to-concat take
+  // `skipRules`, which marks the span.
+  let mut seconds = Slice.view(context.ruleSeconds, 0, 0)
+  if quickReject && (buffer.flags & 64) == 0 && ruleSetIndex < starts.length
+    && starts[ruleSetIndex] != u32.MAX {
+    seconds = Slice.view(context.ruleSeconds, u32.toUsize(starts[ruleSetIndex]), count)
+  }
+  let mut target = secondValue
+  if !second.found {
+    target = u32.MAX
+  }
+
+  // Likewise the plan keeps each chained rule's first backtrack value, which is compared with
+  // the glyph before the first one; that glyph is found when a rule first needs it.
+  // Single-input rules' first lookahead values are compared with the glyph after the first.
+  let mut backs = Slice.view(context.ruleBacks, 0, 0)
+  let mut aheads = Slice.view(context.ruleAheads, 0, 0)
+  if chained && seconds.length != 0 {
+    backs = Slice.view(context.ruleBacks, u32.toUsize(starts[ruleSetIndex]), count)
+    aheads = Slice.view(context.ruleAheads, u32.toUsize(starts[ruleSetIndex]), count)
+  }
+  let mut back: u64 = BACK_UNKNOWN
+  let mut ahead: u64 = BACK_UNKNOWN
+  let mut ruleIndex: usize = 0
+  while ruleIndex < count && context.budget != 0 && buffer.successful {
+    if seconds.length != 0 {
+      // A rule the loop below would look at is skipped here too when its first backtrack value
+      // rules it out, which the check below would do after reading the rule for the same budget.
+      let mut budget = context.budget
+      while ruleIndex < seconds.length && budget != 0 {
+        let value = seconds[ruleIndex]
+        if value == target || value == RULE_STOP {
+          if backs.length == 0 {
+            break
+          }
+          let mut rejected = false
+          if backs[ruleIndex] != RULE_STOP {
+            if back == BACK_UNKNOWN {
+              back = outsideFirst(&context.*, &buffer.*, lookup, at, true, kind, backClasses)
+            }
+            rejected = back == BACK_NONE
+              || (back < BACK_SKIPPABLE && back != u32.toU64(backs[ruleIndex]))
+          }
+          if !rejected && aheads[ruleIndex] != RULE_STOP {
+            if ahead == BACK_UNKNOWN {
+              ahead = outsideFirst(&context.*, &buffer.*, lookup, at, false, kind, aheadClasses)
+            }
+            rejected = ahead == BACK_NONE
+              || (ahead < BACK_SKIPPABLE && ahead != u32.toU64(aheads[ruleIndex]))
+          }
+          if !rejected {
+            break
+          }
+        }
+        budget = budget - 1
+        ruleIndex = ruleIndex + 1
+      }
+      context.budget = budget
+      if ruleIndex >= count || budget == 0 {
+        break
+      }
+    } else if quickReject {
+      ruleIndex = skipRules(
+        &mut context,
+        &mut buffer,
+        ruleSet,
+        ruleIndex,
+        count,
+        ruleOffsetWidth,
+        chained,
+        width,
+        second.found,
+        secondValue,
+        at,
+        secondEnd,
+      )
+      if ruleIndex >= count || context.budget == 0 {
+        break
+      }
+    }
+    context.budget = context.budget - 1
+    let mut rule = table
+    let mut pos: usize = 2
+    if format != 3 {
+      rule = View.offset(&ruleSet, 2 + ruleIndex * ruleOffsetWidth, ruleOffsetWidth)
+      pos = 0
+    }
+    let mut backPos: usize = 0
+    let mut backCount: usize = 0
+    if chained {
+      backCount = u16.toUsize(View.u16(&rule, pos))
+      backPos = pos + 2
+      pos = pos + 2 + backCount * width
+    }
+    let inputCount = u16.toUsize(View.u16(&rule, pos))
+    pos = pos + 2
+    let mut actionCount: usize = 0
+    if !chained {
+      actionCount = u16.toUsize(View.u16(&rule, pos))
+      pos = pos + 2
+    }
+    let inputPos = pos
+    let mut stored = inputCount
+    if format != 3 && stored > 0 {
+      stored = stored - 1
+    }
+    pos = pos + stored * width
+    if quickReject && inputCount > 1 && inputCount <= 64
+      && (!second.found || View.uint(&rule, inputPos, width) != secondValue) {
+      // Only buffers that track unsafe-to-concat need the rest of the rule, to skip marking
+      // for rules the full path would reject as malformed.
+      if (buffer.flags & 64) != 0 && ruleTail(rule, pos, chained, actionCount, width).valid {
+        Buffer.unsafeToConcat(&mut buffer, at, secondEnd)
+      }
+      ruleIndex = ruleIndex + 1
+      continue
+    }
+    if backs.length != 0 && backs[ruleIndex] != RULE_STOP {
+      if back == BACK_UNKNOWN {
+        back = outsideFirst(&context.*, &buffer.*, lookup, at, true, kind, backClasses)
+      }
+      if back == BACK_NONE || (back < BACK_SKIPPABLE && back != u32.toU64(backs[ruleIndex])) {
+        ruleIndex = ruleIndex + 1
+        continue
+      }
+    }
+    let tail = ruleTail(rule, pos, chained, actionCount, width)
+    let aheadPos = tail.aheadPos
+    let aheadCount = tail.aheadCount
+    let actionPos = tail.actionPos
+    actionCount = tail.actionCount
+    if inputCount == 0 || inputCount > 64 || !tail.valid {
+      ruleIndex = ruleIndex + 1
+      continue
+    }
+    if format == 3 && !firstMatched && !matches(rule, inputPos, kind, classes, glyph) {
+      ruleIndex = ruleIndex + 1
+      continue
+    }
+    List<usize>.set(&mut buffer.positionStack, base + 0, at)
+    let mut n: usize = 1
+    let mut cursor = at
+    while n < inputCount {
+      let mut index = n - 1
+      if format == 3 {
+        index = n
+      }
+
+      // A rule that got past the quick reject stores the second glyph's value, so the walk
+      // would stop at the glyph `inputSecond` already found.
+      let mut found = second.index
+      if n != 1 || !quickReject || !second.found {
+        found = nextExpected(
+          &context.*,
+          &buffer.*,
+          lookup,
+          cursor,
+          false,
+          rule,
+          inputPos + index * width,
+          kind,
+          classes,
+          false,
+        )
+      }
+      if found == NOT_FOUND {
+        break
+      }
+      cursor = found & (MISMATCH - 1)
+      if (found & MISMATCH) != 0
+        || (!context.everywhere
+          && enabled(&context.*, &List<Glyph>.asSlice(&buffer.glyphs)[cursor], first, last) == 0)
+        || !compatibleComponents(
+          &context.*,
+          &buffer.*,
+          lookup,
+          at,
+          &List<Glyph>.asSlice(&buffer.glyphs)[cursor],
+        ) {
+        break
+      }
+      List<usize>.set(&mut buffer.positionStack, base + n, cursor)
+      n = n + 1
+    }
+    if n != inputCount
+      || !matchOutside(
+        &context.*,
+        &buffer.*,
+        lookup,
+        rule,
+        backPos,
+        backCount,
+        at,
+        true,
+        kind,
+        backClasses,
+      )
+      || !matchOutside(
+        &context.*,
+        &buffer.*,
+        lookup,
+        rule,
+        aheadPos,
+        aheadCount,
+        cursor,
+        false,
+        kind,
+        aheadClasses,
+      ) {
+      Buffer.unsafeToConcat(&mut buffer, at, cursor + 1)
+      ruleIndex = ruleIndex + 1
+      continue
+    }
+    let backEdge = outsideEdge(
+      &context.*,
+      &buffer.*,
+      lookup,
+      rule,
+      backPos,
+      backCount,
+      at,
+      true,
+      kind,
+      backClasses,
+    )
+    let aheadEdge = outsideEdge(
+      &context.*,
+      &buffer.*,
+      lookup,
+      rule,
+      aheadPos,
+      aheadCount,
+      cursor,
+      false,
+      kind,
+      aheadClasses,
+    )
+    Buffer.unsafeToBreak(&mut buffer, backEdge, aheadEdge + 1)
+    let mut end = cursor + 1
+    let mut matchedCount = inputCount
+    let mut action: usize = 0
+    let mut outputCursor = at
+    while action < actionCount && buffer.successful {
+      let sequence = u16.toUsize(View.u16(&rule, actionPos + action * 4))
+      if sequence < matchedCount
+        && List<usize>.get(&buffer.positionStack, base + sequence) < Buffer.len(&buffer.*) {
+        let atAction = List<usize>.get(&buffer.positionStack, base + sequence)
+        let mut moveCost = usize.saturatingSubtract(atAction, outputCursor)
+        if outputCursor > atAction {
+          moveCost = outputCursor - atAction
+        }
+        if !Buffer.spendOperations(&mut buffer, moveCost)
+          || !Buffer.spendOperations(&mut buffer, 1) {
+          break
+        }
+        let oldLength = Buffer.len(&buffer.*)
+        let nestedIndex = u16.toUsize(View.u16(&rule, actionPos + action * 4 + 2))
+
+        // The plan caches the lookups contextual rules apply, with where each starts.
+        let mut nested = Lookup { table: View.empty(), kind: 0, flags: 0, markSet: 0 }
+        if nestedIndex < context.lookupSubtables.length
+          && context.lookupSubtables[nestedIndex] != u64.MAX
+          && nestedIndex < context.lookupOffsets.length {
+          nested = lookupAt(&context.*, context.lookupOffsets[nestedIndex])
+        } else {
+          nested = getLookup(&context.*, View.u16(&rule, actionPos + action * 4 + 2))
+        }
+        drop run trace.pair(
+          font,
+          &buffer.*,
+          "start recursing to lookup ",
+          nestedIndex,
+          " at ",
+          atAction,
+          "",
+        )
+
+        // The plan caches the lookups contextual rules apply; any others parse their subtables
+        // in place.
+        let mut nestedSubtables = Slice.view(context.subtables, 0, 0)
+        if nestedIndex < context.lookupSubtables.length
+          && context.lookupSubtables[nestedIndex] != u64.MAX {
+          let packed = context.lookupSubtables[nestedIndex]
+          nestedSubtables = Slice.view(
+            context.subtables,
+            u64.toUsize(u64.shiftRight(packed, 32)),
+            u64.toUsize(packed & 0xffffffff),
+          )
+        }
+        let applied = run applyLookup(
+          font,
+          &mut context,
+          &mut buffer,
+          &nested,
+          nestedSubtables,
+          atAction,
+          first,
+          last,
+          depth + 1,
+        )
+        drop run trace.indexed(font, &buffer.*, "end recursing to lookup ", nestedIndex, "")
+        outputCursor = atAction
+        if applied.yes {
+          outputCursor = applied.next
+          let newLength = Buffer.len(&buffer.*)
+          if newLength > oldLength {
+            let delta = newLength - oldLength
+            if matchedCount + delta > 64 {
+              break
+            }
+            let mut j = matchedCount
+            while j > sequence + 1 {
+              j = j - 1
+              let moved = List<usize>.get(&buffer.positionStack, base + j) + delta
+              List<usize>.set(&mut buffer.positionStack, base + j + delta, moved)
+            }
+            j = sequence + 1
+            while j <= sequence + delta {
+              let moved = List<usize>.get(&buffer.positionStack, base + j - 1) + 1
+              List<usize>.set(&mut buffer.positionStack, base + j, moved)
+              j = j + 1
+            }
+            matchedCount = matchedCount + delta
+          } else if oldLength > newLength {
+            let mut delta = oldLength - newLength
+            if delta > matchedCount - sequence - 1 {
+              delta = matchedCount - sequence - 1
+            }
+            let mut j = sequence + 1
+            while j + delta < matchedCount {
+              let moved = usize.saturatingSubtract(
+                List<usize>.get(&buffer.positionStack, base + j + delta),
+                delta,
+              )
+              List<usize>.set(&mut buffer.positionStack, base + j, moved)
+              j = j + 1
+            }
+            matchedCount = matchedCount - delta
+          }
+          if newLength >= oldLength {
+            end = end + newLength - oldLength
+          } else {
+            end = usize.saturatingSubtract(end, oldLength - newLength)
+          }
+        }
+      }
+      action = action + 1
+    }
+    let mut moveCost = usize.saturatingSubtract(end, outputCursor)
+    if outputCursor > end {
+      moveCost = outputCursor - end
+    }
+    drop Buffer.spendOperations(&mut buffer, moveCost)
+    return yes(end)
+  }
+  return no()
+}
+
+fn readVarStore<'a>(gdef: View<'a>, coordCount: usize) -> Option<ItemVariationStore<'a>> {
+  if coordCount == 0 {
+    return Option<ItemVariationStore<'a>>.None
+  }
+  return match move ItemVariationStore.read(View.gdefVarStore(&gdef).data) {
+    Result<ItemVariationStore<'a>, ReadError>.Success { value } => Option<
+      ItemVariationStore<'a>
+    >.some(value)
+    _ => Option<ItemVariationStore<'a>>.None
+  }
+}
+
+fn deviceDelta(context: &Context, device: View) -> f32 {
+  if View.u16(&device, 4) != 0x8000 {
+    return 0.0
+  }
+  if let Option<ItemVariationStore>.Some { value: store } = &context.varStore {
+    let index = DeltaSetIndex { outer: View.u16(&device, 0), inner: View.u16(&device, 2) }
+    if let Option<F48Dot16>.Some { value } = ItemVariationStore.computeDelta(
+      &store,
+      index,
+      context.coords,
+    ) {
+      return F48Dot16.toF32(value)
+    }
+  }
+  return 0.0
+}
+
+fn adjustValue(
+  context: &Context,
+  buffer: &mut Buffer,
+  at: usize,
+  table: View,
+  pos: usize,
+  format: u16,
+) -> () {
+  if offset(pos, 1, valueSize(format)) > View.len(&table) || at >= Buffer.len(&buffer.*) {
+    return
+  }
+  let horizontal = Direction.isHorizontal(buffer.direction)
+  let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  let mut cursor = pos
+  if (format & 1) != 0 {
+    let value = i16.toI32(View.i16(&table, cursor))
+    glyphs[at].position.xOffset = add(glyphs[at].position.xOffset, Scale.x(&context.scale, value))
+    cursor = cursor + 2
+  }
+  if (format & 2) != 0 {
+    let value = i16.toI32(View.i16(&table, cursor))
+    glyphs[at].position.yOffset = add(glyphs[at].position.yOffset, Scale.y(&context.scale, value))
+    cursor = cursor + 2
+  }
+  if (format & 4) != 0 {
+    if horizontal {
+      let value = i16.toI32(View.i16(&table, cursor))
+      glyphs[at].position.xAdvance = add(
+        glyphs[at].position.xAdvance,
+        Scale.x(&context.scale, value),
+      )
+    }
+    cursor = cursor + 2
+  }
+  if (format & 8) != 0 {
+    if !horizontal {
+      let value = i16.toI32(View.i16(&table, cursor))
+      glyphs[at].position.yAdvance = sub(
+        glyphs[at].position.yAdvance,
+        Scale.y(&context.scale, value),
+      )
+    }
+    cursor = cursor + 2
+  }
+  if (format & 240) == 0 || !context.variable {
+    return
+  }
+  if (format & 16) != 0 {
+    let delta = deviceDelta(context, View.offset16(&table, cursor))
+    glyphs[at].position.xOffset = add(glyphs[at].position.xOffset, Scale.xf(&context.scale, delta))
+    cursor = cursor + 2
+  }
+  if (format & 32) != 0 {
+    let delta = deviceDelta(context, View.offset16(&table, cursor))
+    glyphs[at].position.yOffset = add(glyphs[at].position.yOffset, Scale.yf(&context.scale, delta))
+    cursor = cursor + 2
+  }
+  if (format & 64) != 0 {
+    if horizontal {
+      let delta = deviceDelta(context, View.offset16(&table, cursor))
+      glyphs[at].position.xAdvance = add(
+        glyphs[at].position.xAdvance,
+        Scale.xf(&context.scale, delta),
+      )
+    }
+    cursor = cursor + 2
+  }
+  if (format & 128) != 0 && !horizontal {
+    let delta = deviceDelta(context, View.offset16(&table, cursor))
+    glyphs[at].position.yAdvance = sub(
+      glyphs[at].position.yAdvance,
+      Scale.yf(&context.scale, delta),
+    )
+  }
+}
+
+struct Anchor {
+  x: i32,
+  y: i32,
+  valid: bool,
+}
+
+impl Copy for Anchor {}
+
+fn anchor(context: &Context, table: View) -> Anchor {
+  if View.len(&table) < 6 {
+    return Anchor { x: 0, y: 0, valid: false }
+  }
+  let format = View.u16(&table, 0)
+  if format == 0 || format > 3 {
+    return Anchor { x: 0, y: 0, valid: false }
+  }
+
+  // At unit scale a design-unit anchor without device deltas is already the result.
+  if format != 3 && Scale.isUnit(&context.scale) {
+    return Anchor {
+      x: i16.toI32(View.i16(&table, 2)),
+      y: i16.toI32(View.i16(&table, 4)),
+      valid: true,
+    }
+  }
+  let mut x = i16.toF32(View.i16(&table, 2))
+  let mut y = i16.toF32(View.i16(&table, 4))
+  if format == 3 {
+    x = x + deviceDelta(context, View.offset16(&table, 6))
+    y = y + deviceDelta(context, View.offset16(&table, 8))
+  }
+  return Anchor { x: Scale.xf(&context.scale, x), y: Scale.yf(&context.scale, y), valid: true }
+}
+
+/// `applyLookup`'s shared second glyph for `kern` before it is looked for, and when there is none.
+const SECOND_UNKNOWN: usize = usize.MAX
+
+const SECOND_NONE: usize = usize.MAX - 1
+
+/// Applies a 16-bit kerning-only pair subtable `sub` (`LookupSubtable.kern`) whose first glyph's
+/// coverage index is `known - 1` and whose second glyph is at `secondAt`. An advance device adds
+/// nothing without variation coordinates, so callers pass subtables with one only then. Results
+/// and buffer flags match `position`.
+effect fn kern<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &Context,
+  buffer: &mut Buffer,
+  table: View,
+  sub: &LookupSubtable,
+  known: u32,
+  at: usize,
+  secondAt: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  let left = glyphs[at].info.glyphId
+  let right = glyphs[secondAt].info.glyphId
+  let coverage = u32.toUsize(known - 1)
+  let mut value: i16 = 0
+  let kind = sub.kern
+  let mut size: usize = 2
+  if kind >= 3 {
+    size = 4
+  }
+  if kind == 1 || kind == 3 {
+    // `applyLookup` has already rejected pairs missing from the set's digest.
+    if coverage >= u16.toUsize(View.u16(&table, 8)) {
+      return no()
+    }
+
+    // Each record is a second glyph and the first glyph's advance, with its device offset.
+    let values = View.offset16(&table, 10 + coverage * 2)
+    let records = u16.toUsize(View.u16(&values, 0))
+    let stride = 2 + size
+    let mut lo: usize = 0
+    let mut hi = records
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2
+      if u16.toU32(View.u16(&values, 2 + mid * stride)) < right {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if lo >= records || u16.toU32(View.u16(&values, 2 + lo * stride)) != right {
+      Buffer.unsafeToConcat(&mut buffer, at, secondAt + 1)
+      return no()
+    }
+    if 4 + lo * stride + size > View.len(&values) {
+      return no()
+    }
+    value = View.i16(&values, 4 + lo * stride)
+  } else {
+    let c1 = u32.toUsize(pairClass(context, sub, 0, &table, 8, left))
+    let c2 = u32.toUsize(pairClass(context, sub, 1, &table, 10, right))
+    let count2 = u16.toUsize(View.u16(&table, 14))
+    if c1 >= u16.toUsize(View.u16(&table, 12)) || c2 >= count2 {
+      return no()
+    }
+    let pos = 16 + (c1 * count2 + c2) * size
+    if pos + size > View.len(&table) {
+      return no()
+    }
+    value = View.i16(&table, pos)
+  }
+  drop run trace.pair(font, &buffer.*, "try kerning glyphs at ", at, ",", secondAt, "")
+  let kerned = value != 0 && Direction.isHorizontal(buffer.direction)
+  if kerned {
+    let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+    slots[at].position.xAdvance = add(
+      slots[at].position.xAdvance,
+      Scale.x(&context.scale, i16.toI32(value)),
+    )
+    Buffer.unsafeToBreak(&mut buffer, at, secondAt + 1)
+  }
+  Buffer.unsafeToConcat(&mut buffer, at, secondAt + 1)
+  if kerned {
+    drop run trace.pair(font, &buffer.*, "kerned glyphs at ", at, ",", secondAt, "")
+  }
+  drop run trace.pair(font, &buffer.*, "tried kerning glyphs at ", at, ",", secondAt, "")
+  return yes(secondAt)
+}
+
+/// The class of `glyph` in the class definition at offset `at` of a pair subtable, read from
+/// the plan's expansion when there is one.
+fn pairClass(
+  context: &Context,
+  sub: &LookupSubtable,
+  n: usize,
+  table: &View,
+  at: usize,
+  glyph: u32,
+) -> u32 with Intrinsic.inlineAlways() {
+  if !sub.classesResolved {
+    return classOf(&classesFor(context, View.offset16(&table, at)), glyph)
+  }
+  let expanded = &sub.classes[n]
+  if expanded.count == 0 {
+    return View.class(&View.offset16(&table, at), glyph)
+  }
+  if glyph < expanded.first {
+    return 0
+  }
+  let index = u32.toUsize(glyph - expanded.first)
+  if index >= expanded.count {
+    return 0
+  }
+  return u16.toU32(context.classValues[expanded.start + index])
+}
+
+effect fn position<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &Context,
+  buffer: &mut Buffer,
+  lookup: Lookup,
+  table: View,
+  subtables: &[LookupSubtable],
+  subtableIndex: usize,
+  kind: u16,
+  known: u32,
+  at: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let glyphId = List<Glyph>.asSlice(&buffer.glyphs)[at].info.glyphId
+  let rawFormat = View.u16(&table, 0)
+  let wide = ((kind == 1 || kind == 2) && (rawFormat == 3 || rawFormat == 4))
+    || (kind >= 3 && rawFormat == 2)
+  let mut width: usize = 2
+  let mut header: usize = 4
+  let mut coverageWidth: usize = 2
+  let mut format = rawFormat
+  if wide {
+    width = 3
+    header = 6
+    coverageWidth = 4
+    if kind <= 2 {
+      format = format - 2
+    } else {
+      format = 1
+    }
+  }
+  let mut coverage = usize.wrappingSubtract(u32.toUsize(known), 1)
+  if known == 0 {
+    coverage = match move View.coverage(&View.offset(&table, 2, coverageWidth), glyphId) {
+      Option<u32>.Some { value } => u32.toUsize(value)
+      _ => {
+        return no()
+      }
+    }
+  }
+  if kind == 1 {
+    let valueFormat = View.u16(&table, header)
+    let mut pos = header + 2
+    if format == 2 {
+      if coverage >= u32.toUsize(View.uint(&table, header + 2, width)) {
+        return no()
+      }
+      pos = offset(header + 2 + width, coverage, valueSize(valueFormat))
+    } else if format != 1 {
+      return no()
+    }
+    drop run trace.indexed(font, &buffer.*, "positioning glyph at ", at, "")
+    adjustValue(context, &mut buffer, at, table, pos, valueFormat)
+    drop run trace.indexed(font, &buffer.*, "positioned glyph at ", at, "")
+    return yes(at + 1)
+  }
+  if kind == 2 {
+    let second = nextPositioned(context, List<Glyph>.asSlice(&buffer.glyphs), lookup, at)
+    if second == SECOND_NONE {
+      return no()
+    }
+    let right = List<Glyph>.get(&buffer.glyphs, second).info.glyphId
+    let vf1 = View.u16(&table, header)
+    let vf2 = View.u16(&table, header + 2)
+    let size1 = valueSize(vf1)
+    let size2 = valueSize(vf2)
+    let mut values = table
+    let mut pos: usize = 0
+    if format == 1 {
+      if coverage >= u32.toUsize(View.uint(&table, header + 4, width)) {
+        return no()
+      }
+
+      // The plan's digest of the pair set's second glyphs rejects most pairs without a search.
+      if subtableIndex < subtables.length && coverage < subtables[subtableIndex].pairSets
+        && !SetDigest.mayHave(
+          &context.pairDigests[subtables[subtableIndex].pairDigests + coverage],
+          right,
+        ) {
+        Buffer.unsafeToConcat(&mut buffer, at, second + 1)
+        return no()
+      }
+      values = View.offset(&table, header + 4 + width + coverage * width, width)
+      let mut lo: usize = 0
+      let mut hi = u32.toUsize(View.uint(&values, 0, width))
+      while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if View.uint(&values, offset(width, mid, width + size1 + size2), width) < right {
+          lo = mid + 1
+        } else {
+          hi = mid
+        }
+      }
+      pos = offset(width, lo, width + size1 + size2)
+      if lo >= u32.toUsize(View.uint(&values, 0, width))
+        || View.uint(&values, pos, width) != right {
+        Buffer.unsafeToConcat(&mut buffer, at, second + 1)
+        return no()
+      }
+      pos = pos + width
+    } else if format == 2 {
+      let c1 = u32.toUsize(
+        classOf(
+          &subtableClasses(
+            context,
+            subtables,
+            subtableIndex,
+            0,
+            View.offset(&table, header + 4, coverageWidth),
+          ),
+          glyphId,
+        ),
+      )
+      let c2 = u32.toUsize(
+        classOf(
+          &subtableClasses(
+            context,
+            subtables,
+            subtableIndex,
+            1,
+            View.offset(&table, header + 4 + coverageWidth, coverageWidth),
+          ),
+          right,
+        ),
+      )
+      let count2 = u16.toUsize(View.u16(&table, header + 6 + coverageWidth * 2))
+      if c1 >= u16.toUsize(View.u16(&table, header + 4 + coverageWidth * 2)) || c2 >= count2 {
+        return no()
+      }
+      pos = offset(header + 8 + coverageWidth * 2, offset(c2, c1, count2), size1 + size2)
+    } else {
+      return no()
+    }
+    if offset(pos, 1, size1 + size2) > View.len(&values) {
+      return no()
+    }
+    drop run trace.pair(font, &buffer.*, "try kerning glyphs at ", at, ",", second, "")
+    let mut kerned = false
+    if vf2 == 0 && (vf1 == 4 || (vf1 == 0x44 && !context.variable)) {
+      // Kerning only adjusts the first glyph's advance; an advance device adds nothing without
+      // variation coordinates.
+      let value = View.i16(&values, pos)
+      if value != 0 && Direction.isHorizontal(buffer.direction) {
+        let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+        glyphs[at].position.xAdvance = add(
+          glyphs[at].position.xAdvance,
+          Scale.x(&context.scale, i16.toI32(value)),
+        )
+        kerned = true
+      }
+    } else {
+      adjustValue(context, &mut buffer, at, values, pos, vf1)
+      adjustValue(context, &mut buffer, second, values, pos + size1, vf2)
+      kerned = hasValue(context, values, pos, vf1, buffer.direction)
+        || hasValue(context, values, pos + size1, vf2, buffer.direction)
+    }
+    if kerned {
+      Buffer.unsafeToBreak(&mut buffer, at, second + 1)
+    }
+    Buffer.unsafeToConcat(&mut buffer, at, second + 1)
+    if kerned {
+      drop run trace.pair(font, &buffer.*, "kerned glyphs at ", at, ",", second, "")
+    }
+    drop run trace.pair(font, &buffer.*, "tried kerning glyphs at ", at, ",", second, "")
+    if vf2 != 0 {
+      return yes(second + 1)
+    }
+    return yes(second)
+  }
+  if kind == 3 && format == 1 {
+    if wide {
+      return run cursive(
+        font,
+        context,
+        &mut buffer,
+        lookup,
+        table,
+        subtables,
+        subtableIndex,
+        coverage,
+        at,
+        3,
+        6,
+        4,
+      )
+    }
+    return run cursive(
+      font,
+      context,
+      &mut buffer,
+      lookup,
+      table,
+      subtables,
+      subtableIndex,
+      coverage,
+      at,
+      2,
+      4,
+      2,
+    )
+  }
+  if kind >= 4 && kind <= 6 && format == 1 {
+    if wide {
+      return run attachMark(
+        font,
+        context,
+        &mut buffer,
+        lookup,
+        table,
+        subtables,
+        subtableIndex,
+        kind,
+        coverage,
+        at,
+        3,
+        6,
+        4,
+      )
+    }
+    return run attachMark(
+      font,
+      context,
+      &mut buffer,
+      lookup,
+      table,
+      subtables,
+      subtableIndex,
+      kind,
+      coverage,
+      at,
+      2,
+      4,
+      2,
+    )
+  }
+  return no()
+}
+
+/// The coverage index of `glyph` in the subtable's first coverage, read from the plan's
+/// expansion when there is one.
+fn subtableCoverage(
+  context: &Context,
+  subtables: &[LookupSubtable],
+  subtableIndex: usize,
+  table: &View,
+  coverageWidth: usize,
+  glyph: u32,
+) -> Option<u32> with Intrinsic.inlineAlways() {
+  if subtableIndex < subtables.length && subtables[subtableIndex].coverageCount != 0 {
+    let sub = &subtables[subtableIndex]
+    if glyph >= sub.coverageFirst && u32.toUsize(glyph - sub.coverageFirst) < sub.coverageCount {
+      let value = context.coverageValues[sub.coverageStart + u32.toUsize(glyph - sub.coverageFirst)]
+      if value != 0 {
+        return Option<u32>.some(u16.toU32(value) - 1)
+      }
+    }
+    return Option<u32>.None
+  }
+  return View.coverage(&View.offset(&table, 2, coverageWidth), glyph)
+}
+
+/// The coverage index of `glyph` in a mark attachment subtable's base coverage, read from
+/// the plan's expansion when there is one.
+fn baseCoverage(
+  context: &Context,
+  subtables: &[LookupSubtable],
+  subtableIndex: usize,
+  table: &View,
+  header: usize,
+  coverageWidth: usize,
+  glyph: u32,
+) -> Option<u32> with Intrinsic.inlineAlways() {
+  if subtableIndex < subtables.length && subtables[subtableIndex].baseCount != 0 {
+    let sub = &subtables[subtableIndex]
+    if glyph >= sub.baseFirst && u32.toUsize(glyph - sub.baseFirst) < sub.baseCount {
+      let value = context.coverageValues[sub.baseStart + u32.toUsize(glyph - sub.baseFirst)]
+      if value != 0 {
+        return Option<u32>.some(u16.toU32(value) - 1)
+      }
+    }
+    return Option<u32>.None
+  }
+  return View.coverage(&View.offset(&table, header, coverageWidth), glyph)
+}
+
+/// `position` for a cursive attachment subtable whose offsets are `width` bytes, after a
+/// `header`-byte header, with `coverageWidth`-byte coverage offsets. Called with constant
+/// widths so that each read compiles to one load.
+effect fn cursive<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &Context,
+  buffer: &mut Buffer,
+  lookup: Lookup,
+  table: View,
+  subtables: &[LookupSubtable],
+  subtableIndex: usize,
+  coverage: usize,
+  at: usize,
+  width: usize,
+  header: usize,
+  coverageWidth: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  if coverage >= u32.toUsize(View.uint(&table, header, width)) {
+    return no()
+  }
+  let entry = anchor(context, View.offset(&table, header + width + coverage * width * 2, width))
+  if !entry.valid {
+    return no()
+  }
+  let previous = previousPositioned(context, List<Glyph>.asSlice(&buffer.glyphs), lookup, at)
+  if previous == SECOND_NONE {
+    Buffer.unsafeToConcat(&mut buffer, 0, at + 1)
+    return no()
+  }
+  let index = match move subtableCoverage(
+    context,
+    subtables,
+    subtableIndex,
+    &table,
+    coverageWidth,
+    List<Glyph>.asSlice(&buffer.glyphs)[previous].info.glyphId,
+  ) {
+    Option<u32>.Some { value } => u32.toUsize(value)
+    _ => {
+      return no()
+    }
+  }
+  let exit = anchor(context, View.offset(&table, header + width * 2 + index * width * 2, width))
+  if !exit.valid {
+    Buffer.unsafeToConcat(&mut buffer, previous, at + 1)
+    return no()
+  }
+  drop run trace.pair(
+    font,
+    &buffer.*,
+    "cursive attaching glyph at ",
+    previous,
+    " to glyph at ",
+    at,
+    "",
+  )
+  let direction = buffer.direction
+  let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  let left = &mut glyphs[previous].position
+  if direction == Direction.LeftToRight {
+    left.xAdvance = add(exit.x, left.xOffset)
+  } else if direction == Direction.RightToLeft {
+    let d = add(exit.x, left.xOffset)
+    left.xAdvance = sub(left.xAdvance, d)
+    left.xOffset = sub(left.xOffset, d)
+  } else if direction == Direction.TopToBottom {
+    left.yAdvance = add(exit.y, left.yOffset)
+  } else {
+    let d = add(exit.y, left.yOffset)
+    left.yAdvance = sub(left.yAdvance, d)
+    left.yOffset = sub(left.yOffset, d)
+  }
+  let right = &mut glyphs[at].position
+  if direction == Direction.LeftToRight {
+    let d = add(entry.x, right.xOffset)
+    right.xAdvance = sub(right.xAdvance, d)
+    right.xOffset = sub(right.xOffset, d)
+  } else if direction == Direction.RightToLeft {
+    right.xAdvance = add(entry.x, right.xOffset)
+  } else if direction == Direction.TopToBottom {
+    let d = add(entry.y, right.yOffset)
+    right.yAdvance = sub(right.yAdvance, d)
+    right.yOffset = sub(right.yOffset, d)
+  } else {
+    right.yAdvance = entry.y
+  }
+  let mut child = previous
+  let mut parent = at
+  let mut x = sub(entry.x, exit.x)
+  let mut y = sub(entry.y, exit.y)
+  if (lookup.flags & 1) == 0 {
+    child = at
+    parent = previous
+    x = sub(0, x)
+    y = sub(0, y)
+  }
+  reverseCursive(&mut buffer, child, parent, 0)
+  buffer.haveAttachments = true
+  let horizontal = Direction.isHorizontal(buffer.direction)
+  let attached = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  let chain = usize.toI64(parent) - usize.toI64(child)
+  let changed = &mut attached[child]
+  changed.attach = 0
+  if chain >= -32768 && chain <= 32767 {
+    changed.attach = i64.toI32(chain)
+  }
+  changed.attachType = 2
+  if horizontal {
+    changed.position.yOffset = y
+  } else {
+    changed.position.xOffset = x
+  }
+  let link = changed.attach
+  let ancestor = &mut attached[parent]
+  if ancestor.attach == -link {
+    ancestor.attach = 0
+    if horizontal {
+      ancestor.position.yOffset = 0
+    } else {
+      ancestor.position.xOffset = 0
+    }
+  }
+  drop run trace.pair(
+    font,
+    &buffer.*,
+    "cursive attached glyph at ",
+    previous,
+    " to glyph at ",
+    at,
+    "",
+  )
+  Buffer.unsafeToBreak(&mut buffer, previous, at + 1)
+  return yes(at + 1)
+}
+
+/// `position` for a mark-to-base, mark-to-ligature or mark-to-mark subtable (`kind` 4 to 6),
+/// with widths as for `cursive`.
+effect fn attachMark<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  context: &Context,
+  buffer: &mut Buffer,
+  lookup: Lookup,
+  table: View,
+  subtables: &[LookupSubtable],
+  subtableIndex: usize,
+  kind: u16,
+  coverage: usize,
+  at: usize,
+  width: usize,
+  header: usize,
+  coverageWidth: usize,
+) -> Applied
+  ! OutOfMemoryError
+  ? &mut Allocator with Intrinsic.inlineAlways() {
+  let mut base = at
+  let mut props = lookup
+  if kind == 6 {
+    props.flags = props.flags & 65521
+  } else {
+    props.flags = 8
+  }
+  let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+  while true {
+    if base == 0 {
+      return no()
+    }
+    base = base - 1
+    let candidate = &glyphs[base]
+    if ignored(context, props, candidate) || (candidate.ignorable && !candidate.ligated) {
+      continue
+    }
+    if kind != 6 && candidate.glyphClass == 3 {
+      continue
+    }
+    if kind == 6 && candidate.glyphClass != 3 {
+      return no()
+    }
+    if kind != 6 && candidate.multiplied && candidate.component != 0 {
+      let mut accept = false
+      if kind == 4 && base > 0 {
+        let prev = &glyphs[base - 1]
+        accept = prev.glyphClass == 3 || !prev.multiplied || candidate.ligatureId != prev.ligatureId
+          || candidate.component != prev.component + 1
+      }
+      if !accept
+        && !hasCoverage(View.offset(&table, header, coverageWidth), candidate.info.glyphId) {
+        continue
+      }
+    }
+    break
+  }
+  let item = &glyphs[at]
+  let baseGlyph = &glyphs[base]
+  if kind == 6 {
+    if item.ligatureId == baseGlyph.ligatureId {
+      if item.ligatureId != 0 && item.component != baseGlyph.component {
+        return no()
+      }
+    } else if !(item.ligatureId > 0 && item.component == 0)
+      && !(baseGlyph.ligatureId > 0 && baseGlyph.component == 0) {
+      return no()
+    }
+  }
+  let baseIndex = match move baseCoverage(
+    context,
+    subtables,
+    subtableIndex,
+    &table,
+    header,
+    coverageWidth,
+    baseGlyph.info.glyphId,
+  ) {
+    Option<u32>.Some { value } => u32.toUsize(value)
+    _ => {
+      return no()
+    }
+  }
+  let marks = View.offset(&table, header + coverageWidth + 2, coverageWidth)
+  if coverage >= u32.toUsize(View.uint(&marks, 0, width)) {
+    return no()
+  }
+  let markClass = u16.toUsize(View.u16(&marks, width + coverage * (2 + width)))
+  let classCount = u16.toUsize(View.u16(&table, header + coverageWidth))
+  if markClass >= classCount {
+    return no()
+  }
+  let mark = anchor(context, View.offset(&marks, width + 2 + coverage * (2 + width), width))
+  let mut bases = View.offset(&table, header + coverageWidth * 2 + 2, coverageWidth)
+  let mut baseHeader = width
+  if kind == 6 {
+    baseHeader = 2
+  }
+  if baseIndex >= u32.toUsize(View.uint(&bases, 0, baseHeader)) {
+    return no()
+  }
+  let mut row = baseIndex
+  if kind == 5 {
+    bases = View.offset(&bases, width + baseIndex * width, width)
+    baseHeader = 2
+    let components = u16.toUsize(View.u16(&bases, 0))
+    if components == 0 {
+      return no()
+    }
+    row = components - 1
+    if item.ligatureId != 0 && item.ligatureId == baseGlyph.ligatureId && item.component > 0
+      && u8.toUsize(item.component) <= components {
+      row = u8.toUsize(item.component) - 1
+    }
+  }
+  let target = anchor(
+    context,
+    View.offset(&bases, offset(baseHeader, offset(markClass, row, classCount), width), width),
+  )
+  if !mark.valid || !target.valid || at - base > 32768 {
+    return no()
+  }
+  drop run trace.pair(font, &buffer.*, "attaching mark glyph at ", at, " to glyph at ", base, "")
+  let cross = crossOffset(&buffer.*, base)
+  buffer.haveAttachments = true
+  let horizontal = Direction.isHorizontal(buffer.direction)
+  let changed = &mut List<Glyph>.asMutSlice(&mut buffer.glyphs)[at]
+  changed.position.xOffset = sub(target.x, mark.x)
+  changed.position.yOffset = sub(target.y, mark.y)
+  if horizontal {
+    changed.position.yOffset = add(changed.position.yOffset, cross)
+  } else {
+    changed.position.xOffset = add(changed.position.xOffset, cross)
+  }
+  changed.attach = -usize.toI32(at - base)
+  changed.attachType = 1
+  drop run trace.pair(font, &buffer.*, "attached mark glyph at ", at, " to glyph at ", base, "")
+  Buffer.unsafeToBreak(&mut buffer, base, at + 1)
+  return yes(at + 1)
+}
+
+fn reverseCursive(buffer: &mut Buffer, at: usize, parent: usize, depth: usize) -> () {
+  if depth > 64 {
+    return
+  }
+  let mut item = List<Glyph>.get(&buffer.glyphs, at)
+  if item.attach == 0 || item.attachType != 2 {
+    return
+  }
+  let chain = item.attach
+  item.attach = 0
+  List<Glyph>.set(&mut buffer.glyphs, at, item)
+  let target = usize.toI64(at) + i32.toI64(chain)
+  if target < 0 || target >= usize.toI64(Buffer.len(&buffer.*)) {
+    return
+  }
+  let other = i64.toUsize(target)
+  if other == parent {
+    return
+  }
+  reverseCursive(&mut buffer, other, parent, depth + 1)
+  item = List<Glyph>.get(&buffer.glyphs, at)
+  let mut next = List<Glyph>.get(&buffer.glyphs, other)
+  if Direction.isHorizontal(buffer.direction) {
+    next.position.yOffset = sub(0, item.position.yOffset)
+  } else {
+    next.position.xOffset = sub(0, item.position.xOffset)
+  }
+  next.attach = -chain
+  next.attachType = 2
+  List<Glyph>.set(&mut buffer.glyphs, other, next)
+}
+
+fn crossOffset(buffer: &Buffer, at: usize) -> i32 {
+  let mut index = at
+  let mut result: i32 = 0
+  let mut budget: usize = 100
+  while index < Buffer.len(buffer) && budget > 0 {
+    budget = budget - 1
+    let item = &List<Glyph>.asSlice(&buffer.glyphs)[index]
+    if Direction.isHorizontal(buffer.direction) {
+      result = add(result, item.position.yOffset)
+    } else {
+      result = add(result, item.position.xOffset)
+    }
+    if item.attachType != 2 || item.attach == 0 {
+      break
+    }
+    let target = usize.toI64(index) + i32.toI64(item.attach)
+    if target < 0 || target >= usize.toI64(Buffer.len(buffer)) {
+      break
+    }
+    index = i64.toUsize(target)
+  }
+  return result
+}
+
+fn hasValue(context: &Context, table: View, pos: usize, format: u16, direction: Direction) -> bool {
+  let horizontal = Direction.isHorizontal(direction)
+  let mut at = pos
+  if (format & 1) != 0 {
+    if View.i16(&table, at) != 0 {
+      return true
+    }
+    at = at + 2
+  }
+  if (format & 2) != 0 {
+    if View.i16(&table, at) != 0 {
+      return true
+    }
+    at = at + 2
+  }
+  if (format & 4) != 0 {
+    if horizontal && View.i16(&table, at) != 0 {
+      return true
+    }
+    at = at + 2
+  }
+  if (format & 8) != 0 {
+    if !horizontal && View.i16(&table, at) != 0 {
+      return true
+    }
+    at = at + 2
+  }
+  let mut bit: u16 = 16
+  while bit <= 128 && (format & 240) != 0 && context.variable {
+    if (format & bit) != 0 {
+      let applies = (bit != 64 || horizontal) && (bit != 128 || !horizontal)
+      if applies && deviceDelta(context, View.offset16(&table, at)) != 0.0 {
+        return true
+      }
+      at = at + 2
+    }
+    bit = bit * 2
+  }
+  return false
+}
+
+pub effect fn finishOffsets(buffer: &mut Buffer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !buffer.haveAttachments {
+    return
+  }
+  let horizontal = Direction.isHorizontal(buffer.direction)
+  let forward = Direction.isForward(buffer.direction)
+  let glyphs = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+  let mut i: usize = 0
+  while i < glyphs.length {
+    if glyphs[i].attach != 0 {
+      resolveOffset(&mut glyphs, i, horizontal, forward, 0)
+    }
+    i = i + 1
+  }
+}
+
+// The advances of glyphs `from..to`, in 64 bits so long runs cannot overflow.
+fn advanceSum(glyphs: &mut [Glyph], from: usize, to: usize) -> [i64; 2] {
+  let mut x: i64 = 0
+  let mut y: i64 = 0
+  let mut k = from
+  while k < to {
+    x = x + i32.toI64(glyphs[k].position.xAdvance)
+    y = y + i32.toI64(glyphs[k].position.yAdvance)
+    k = k + 1
+  }
+  return [x, y]
+}
+
+fn resolveOffset(
+  glyphs: &mut [Glyph],
+  at: usize,
+  horizontal: bool,
+  forward: bool,
+  depth: usize,
+) -> () {
+  if depth >= 100 {
+    return
+  }
+  let attach = glyphs[at].attach
+  if attach == 0 {
+    return
+  }
+  glyphs[at].attach = 0
+  let target = usize.toI64(at) + i32.toI64(attach)
+  if target < 0 || target >= usize.toI64(glyphs.length) {
+    return
+  }
+  let base = i64.toUsize(target)
+  resolveOffset(&mut glyphs, base, horizontal, forward, depth + 1)
+  let parentX = glyphs[base].position.xOffset
+  let parentY = glyphs[base].position.yOffset
+  if glyphs[at].attachType == 2 {
+    if horizontal {
+      glyphs[at].position.yOffset = add(glyphs[at].position.yOffset, parentY)
+    } else {
+      glyphs[at].position.xOffset = add(glyphs[at].position.xOffset, parentX)
+    }
+    return
+  }
+  if horizontal {
+    glyphs[at].position.xOffset = add(glyphs[at].position.xOffset, parentX)
+  } else {
+    glyphs[at].position.yOffset = add(glyphs[at].position.yOffset, parentY)
+  }
+
+  // Move the glyph back over the advances between it and its base.
+  let mut shift: [i64; 2] = [0, 0]
+  if forward {
+    if base < at {
+      let sum = advanceSum(&mut glyphs, base, at)
+      shift = [0 - sum[0], 0 - sum[1]]
+    } else {
+      shift = advanceSum(&mut glyphs, at, base)
+    }
+  } else if base < at {
+    shift = advanceSum(&mut glyphs, base + 1, at + 1)
+  } else {
+    let sum = advanceSum(&mut glyphs, at + 1, base + 1)
+    shift = [0 - sum[0], 0 - sum[1]]
+  }
+  glyphs[at].position.xOffset = clamp(i32.toI64(glyphs[at].position.xOffset) + shift[0])
+  glyphs[at].position.yOffset = clamp(i32.toI64(glyphs[at].position.yOffset) + shift[1])
+}
+
+fn hasCoverage(table: View, glyph: u32) -> bool {
+  return match move View.coverage(&table, glyph) {
+    Option<u32>.Some { value } => true
+    _ => false
+  }
+}
+
+// A failed lookup discards its separate output, as upstream Buffer.sync does.
+// Save lazily on its first expansion, so ordinary substitutions allocate nothing.
+effect fn saveInput(context: &mut Context, buffer: &mut Buffer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if context.haveSavedInput {
+    return
+  }
+  context.haveSavedInput = true
+  let mut saved = Intrinsic.replace(buffer.savedInput, List<Glyph>.make())
+  run List<Glyph>.reserve(&mut saved, glyphCount(&buffer.*))
+  let mut from: usize = 0
+  if buffer.haveOutput {
+    // The buffer as matching sees it: the output so far, then the unread input.
+    run appendGlyphs(&mut saved, Buffer.outGlyphs(&buffer.*))
+    from = buffer.idx
+  }
+  let input = List<Glyph>.asSlice(&buffer.glyphs)
+  run appendGlyphs(&mut saved, Slice.view(input, from, input.length - from))
+  buffer.savedInput = move saved
+}
+
+/// Appends `glyphs` in runs short enough that each copy stays a vector loop.
+effect fn appendGlyphs(list: &mut List<Glyph>, glyphs: &[Glyph]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < glyphs.length {
+    let mut chunk = glyphs.length - at
+    if chunk > 24 {
+      chunk = 24
+    }
+    run List<Glyph>.appendSlice(&mut list, Slice.view(glyphs, at, chunk))
+    at = at + chunk
+  }
+}

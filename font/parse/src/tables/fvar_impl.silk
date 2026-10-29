@@ -1,0 +1,370 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import generated_avar { Avar, SegmentMaps }
+import generated_variations { ItemVariationStore, DeltaSetIndexMap, DeltaSetIndex }
+import font_types.lib { F48Dot16 }
+import array { VarLenIter }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+
+pub struct UserCoordinate {
+  pub tag: Tag,
+  pub value: Fixed,
+}
+
+impl Copy for UserCoordinate {}
+
+impl<'a> Fvar<'a> {
+  pub fn axes(self: &Self) -> Result<ComputedArray<'a, (), VariationAxisRecord<'a>>, ReadError> {
+    return match move Fvar.axisInstanceArrays(self) {
+      Result<AxisInstanceArrays<'a>, ReadError>.Success { value } => Result<
+        ComputedArray<'a, (), VariationAxisRecord<'a>>,
+        ReadError
+      >.succeed(AxisInstanceArrays.axes(&value))
+      Result<AxisInstanceArrays<'a>, ReadError>.Failure { error } => Result<
+        ComputedArray<'a, (), VariationAxisRecord<'a>>,
+        ReadError
+      >.failResult(error)
+    }
+  }
+
+  pub fn instances(self: &Self) -> Result<
+    ComputedArray<'a, ReadArgs2<u16, u16>, InstanceRecord<'a>>,
+    ReadError
+  > {
+    return match move Fvar.axisInstanceArrays(self) {
+      Result<AxisInstanceArrays<'a>, ReadError>.Success { value } => Result<
+        ComputedArray<'a, ReadArgs2<u16, u16>, InstanceRecord<'a>>,
+        ReadError
+      >.succeed(AxisInstanceArrays.instances(&value))
+      Result<AxisInstanceArrays<'a>, ReadError>.Failure { error } => Result<
+        ComputedArray<'a, ReadArgs2<u16, u16>, InstanceRecord<'a>>,
+        ReadError
+      >.failResult(error)
+    }
+  }
+
+  pub effect fn userToNormalized<'b>(
+    self: &Self,
+    avar: Option<Avar<'b>>,
+    userCoords: &[UserCoordinate],
+    normalizedCoords: &mut [F2Dot14],
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < normalizedCoords.length {
+      normalizedCoords[i] = F2Dot14.zero()
+      i = i + 1
+    }
+    let axes = Fvar.axes(self)
+      |> Result<ComputedArray<'a, (), VariationAxisRecord<'a>>, ReadError>.unwrapOr(
+        ComputedArray<'a, (), VariationAxisRecord<'a>>.empty(()),
+      )
+    let mut count = ComputedArray<'a, (), VariationAxisRecord<'a>>.len(&axes)
+    if count > normalizedCoords.length {
+      count = normalizedCoords.length
+    }
+    if count <= 64 {
+      let mut fixed = [Fixed.zero(); 64]
+      run normalizeWithStorage(
+        &axes,
+        move avar,
+        userCoords,
+        &mut normalizedCoords,
+        &mut fixed,
+        count,
+      )
+    } else {
+      let mut fixed = List<Fixed>.make()
+      i = 0
+      while i < count {
+        run List<Fixed>.append(&mut fixed, Fixed.zero())
+        i = i + 1
+      }
+      run normalizeWithStorage(
+        &axes,
+        move avar,
+        userCoords,
+        &mut normalizedCoords,
+        List<Fixed>.asMutSlice(&mut fixed),
+        count,
+      )
+    }
+  }
+}
+
+fn axisAt<'a>(
+  axes: &ComputedArray<'a, (), VariationAxisRecord<'a>>,
+  index: usize,
+) -> VariationAxisRecord<'a> {
+  return ComputedArray<'a, (), VariationAxisRecord<'a>>.get(axes, index)
+    |> Result<VariationAxisRecord<'a>, ReadError>.unwrapOr(VariationAxisRecord<'a>.default())
+}
+
+fn axisTagAt<'a>(axes: &ComputedArray<'a, (), VariationAxisRecord<'a>>, index: usize) -> u32 {
+  return Tag.toU32(VariationAxisRecord.axisTag(&axisAt(axes, index)))
+}
+
+fn siftAxisOrder<'a>(
+  axes: &ComputedArray<'a, (), VariationAxisRecord<'a>>,
+  order: &mut [u16],
+  start: usize,
+  end: usize,
+) -> () {
+  let mut root = start
+  while root * 2 + 1 < end {
+    let mut child = root * 2 + 1
+    if child + 1 < end
+      && axisTagAt(axes, u16.toUsize(order[child]))
+        < axisTagAt(axes, u16.toUsize(order[child + 1])) {
+      child = child + 1
+    }
+    if axisTagAt(axes, u16.toUsize(order[root])) >= axisTagAt(axes, u16.toUsize(order[child])) {
+      return
+    }
+    let saved = order[root]
+    order[root] = order[child]
+    order[child] = saved
+    root = child
+  }
+}
+
+fn normalizeIndexed<'a>(
+  axes: &ComputedArray<'a, (), VariationAxisRecord<'a>>,
+  userCoords: &[UserCoordinate],
+  coords: &mut [Fixed],
+  order: &mut [u16],
+  count: usize,
+) -> () {
+  let mut i: usize = 0
+  while i < count {
+    order[i] = usize.toU16(i)
+    i = i + 1
+  }
+  i = count / 2
+  while i > 0 {
+    i = i - 1
+    siftAxisOrder(axes, &mut order, i, count)
+  }
+  i = count
+  while i > 1 {
+    i = i - 1
+    let saved = order[0]
+    order[0] = order[i]
+    order[i] = saved
+    siftAxisOrder(axes, &mut order, 0, i)
+  }
+  i = 0
+  while i < userCoords.length {
+    let tag = Tag.toU32(userCoords[i].tag)
+    let mut low: usize = 0
+    let mut high = count
+    while low < high {
+      let mid = low + (high - low) / 2
+      if axisTagAt(axes, u16.toUsize(order[mid])) < tag {
+        low = mid + 1
+      } else {
+        high = mid
+      }
+    }
+    while low < count && axisTagAt(axes, u16.toUsize(order[low])) == tag {
+      let index = u16.toUsize(order[low])
+      coords[index] = VariationAxisRecord.normalize(&axisAt(axes, index), userCoords[i].value)
+      low = low + 1
+    }
+    i = i + 1
+  }
+}
+
+effect fn normalizeUserCoords<'a>(
+  axes: &ComputedArray<'a, (), VariationAxisRecord<'a>>,
+  userCoords: &[UserCoordinate],
+  coords: &mut [Fixed],
+  count: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if count <= 64 {
+    let mut user: usize = 0
+    while user < userCoords.length {
+      let mut axis: usize = 0
+      while axis < count {
+        if axisTagAt(axes, axis) == Tag.toU32(userCoords[user].tag) {
+          coords[axis] = VariationAxisRecord.normalize(&axisAt(axes, axis), userCoords[user].value)
+        }
+        axis = axis + 1
+      }
+      user = user + 1
+    }
+  } else if count <= 128 {
+    let mut order: [u16; 128] = [0; 128]
+    normalizeIndexed(axes, userCoords, &mut coords, &mut order, count)
+  } else {
+    let mut order = List<u16>.make()
+    let mut i: usize = 0
+    while i < count {
+      run List<u16>.append(&mut order, 0)
+      i = i + 1
+    }
+    normalizeIndexed(axes, userCoords, &mut coords, List<u16>.asMutSlice(&mut order), count)
+  }
+}
+
+fn roundedDelta(value: f64) -> i32 {
+  let mut rounded = value - 0.5
+  if value >= 0.0 {
+    rounded = value + 0.5
+  }
+  if f64.isNaN(rounded) {
+    return 0
+  }
+  if rounded >= 2147483647.0 {
+    return i32.MAX
+  }
+  if rounded <= -2147483648.0 {
+    return i32.MIN
+  }
+  return f64.toI32(rounded)
+}
+
+import silk.testing.testing { Testing, AssertionError }
+
+test effect fn avar2Preserves16dot16PrecisionUntilFinalRounding() -> ()
+  ! AssertionError<'static> {
+  let result = Fixed.fromBits(i32.wrappingAdd(3, roundedDelta(0.5 * 4.0)))
+  run Testing.expect(
+    F2Dot14.toBits(Fixed.toF2dot14(result)) == 1,
+    "keep precision until final rounding",
+  )
+}
+
+effect fn normalizeWithStorage<'a, 'b>(
+  axes: &ComputedArray<'a, (), VariationAxisRecord<'a>>,
+  avar: Option<Avar<'b>>,
+  userCoords: &[UserCoordinate],
+  normalized: &mut [F2Dot14],
+  fixed: &mut [Fixed],
+  count: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run normalizeUserCoords(axes, userCoords, &mut fixed, count)
+  let mut i: usize = 0
+  match move avar {
+    Option<Avar<'b>>.Some { value: table } => {
+      let mut maps = VarLenArray<'b, SegmentMaps<'b>>.iter(&Avar.axisSegmentMaps(&table))
+      while i < count {
+        match move VarLenIter<'b, SegmentMaps<'b>>.next(&mut maps) {
+          Option<Result<SegmentMaps<'b>, ReadError>>.Some {
+            value: Result<SegmentMaps<'b>, ReadError>.Success { value }
+          } => {
+            fixed[i] = SegmentMaps.apply(&value, fixed[i])
+          }
+          Option<Result<SegmentMaps<'b>, ReadError>>.None => {
+            break
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+      i = 0
+      while i < count {
+        normalized[i] = Fixed.toF2dot14(fixed[i])
+        i = i + 1
+      }
+      let version = Avar.version(&table)
+      if version.major != 1 || version.minor != 0 {
+        match move Avar.varStore(&table) {
+          Option<Result<ItemVariationStore<'b>, ReadError>>.Some {
+            value: Result<ItemVariationStore<'b>, ReadError>.Success { value: store }
+          } => {
+            let mapping = Avar.axisIndexMap(&table)
+            i = 0
+            while i < count {
+              let mut index = DeltaSetIndex { outer: 0, inner: usize.toU16(i) }
+              match &mapping {
+                Option<Result<DeltaSetIndexMap<'b>, ReadError>>.Some {
+                  value: Result<DeltaSetIndexMap<'b>, ReadError>.Success { value: map }
+                } => {
+                  match move DeltaSetIndexMap.get(&map, usize.toU32(i)) {
+                    Result<DeltaSetIndex, ReadError>.Success { value } => {
+                      index = value
+                    }
+                    _ => {
+                      i = i + 1
+                      continue
+                    }
+                  }
+                }
+                _ => {}
+              }
+              match move ItemVariationStore.computeDelta(
+                &store,
+                index,
+                Slice.view(&normalized, 0, count),
+              ) {
+                Option<F48Dot16>.Some { value } => {
+                  let mut bits = i32.wrappingAdd(
+                    Fixed.toBits(fixed[i]),
+                    roundedDelta(F48Dot16.toF64(value) * 4.0),
+                  )
+                  if bits < -65536 {
+                    bits = -65536
+                  }
+                  if bits > 65536 {
+                    bits = 65536
+                  }
+                  fixed[i] = Fixed.fromBits(bits)
+                }
+                _ => {}
+              }
+              i = i + 1
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    _ => {}
+  }
+  i = 0
+  while i < count {
+    normalized[i] = Fixed.toF2dot14(fixed[i])
+    i = i + 1
+  }
+}
+
+impl<'a> VariationAxisRecord<'a> {
+  pub fn normalize(self: &Self, value: Fixed) -> Fixed {
+    let minimum = VariationAxisRecord.minValue(self)
+    let defaultValue = VariationAxisRecord.defaultValue(self)
+    let mut maximum = VariationAxisRecord.maxValue(self)
+    if Fixed.toBits(maximum) < Fixed.toBits(minimum) {
+      maximum = minimum
+    }
+    let mut clamped = value
+    if Fixed.toBits(clamped) < Fixed.toBits(minimum) {
+      clamped = minimum
+    }
+    if Fixed.toBits(clamped) > Fixed.toBits(maximum) {
+      clamped = maximum
+    }
+    let mut normalized = Fixed.zero()
+    if Fixed.toBits(clamped) < Fixed.toBits(defaultValue) {
+      normalized = -(Fixed.saturatingSub(defaultValue, clamped)
+        / Fixed.saturatingSub(defaultValue, minimum))
+    } else if Fixed.toBits(clamped) > Fixed.toBits(defaultValue) {
+      normalized = Fixed.saturatingSub(clamped, defaultValue)
+        / Fixed.saturatingSub(maximum, defaultValue)
+    }
+    if Fixed.toBits(normalized) < -65536 {
+      return Fixed.negOne()
+    }
+    if Fixed.toBits(normalized) > 65536 {
+      return Fixed.one()
+    }
+    return normalized
+  }
+}

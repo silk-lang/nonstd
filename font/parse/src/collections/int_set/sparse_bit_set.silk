@@ -1,0 +1,322 @@
+// Copyright 2024 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+// Compact sparse-set serialization, preserving the upstream breadth-first format.
+pub import collections.int_set.branch_factor { BranchFactor }
+import collections.int_set { IntSet, IntSetIter, U32Set }
+import collections.int_set.input_bit_stream { InputBitStream, StreamHeader }
+import collections.int_set.output_bit_stream { OutputBitStream }
+import collections.int_set.bitpage { trailingZeros }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.core.equal { Equal }
+import silk.text.format { Display, Formatter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+pub struct DecodingError {}
+
+impl Copy for DecodingError {}
+
+impl Equal for DecodingError {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return true
+  }
+}
+
+impl Display for DecodingError {
+  effect fn display(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Writer.writeString("The input data stream was too short to be a valid sparse bit set.")
+  }
+}
+
+pub struct DecodedSparseSet<'a> {
+  pub set: IntSet<u32>,
+  pub remaining: &'a [u8],
+}
+
+struct NextNode {
+  start: u64,
+  depth: u32,
+}
+
+impl Copy for NextNode {}
+
+pub effect fn decode<'a>(data: &'a [u8], bias: u32, maxValue: u32, maxSetSize: u32) -> Result<
+  DecodedSparseSet<'a>,
+  DecodingError
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let header = match move InputBitStream.decodeHeader(data) {
+    Option<StreamHeader>.Some { value } => value
+    _ => {
+      return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+    }
+  }
+  if header.height > BranchFactor.maxHeight(&header.branchFactor) {
+    return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+  }
+  let mut out = U32Set.empty()
+  if header.height == 0 {
+    return Result<DecodedSparseSet<'a>, DecodingError>.succeed(
+      DecodedSparseSet<'a> {
+        set: IntSet<u32>.fromBitset(move out),
+        remaining: Slice.view(data, 1, data.length - 1),
+      },
+    )
+  }
+  let mut stream = InputBitStream.from(data, header.branchFactor)
+  let mut queue = List<NextNode>.make()
+  run List<NextNode>.append(&mut queue, NextNode { start: 0, depth: 1 })
+  let mut front: usize = 0
+  let mut stopped = false
+  let height = u8.toU32(header.height)
+  let log2 = BranchFactor.nodeSizeLog2(&header.branchFactor)
+  while front < List<NextNode>.length(&queue) && !stopped {
+    let node = List<NextNode>.get(&queue, front)
+    front = front + 1
+    let mut bits = match move InputBitStream.next(&mut stream) {
+      Option<u32>.Some { value } => value
+      _ => {
+        return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+      }
+    }
+    if bits == 0 {
+      // The maximum supported tree is 35 bits, so all intermediate math fits u64.
+      let size = u64.shiftLeft(1, u32.toU64(log2 * (height - node.depth + 1)))
+      let start = node.start + u32.toU64(bias)
+      if start > u32.toU64(maxValue) {
+        continue
+      }
+      let mut end = node.start + size - 1 + u32.toU64(bias)
+      if end > u32.toU64(maxValue) {
+        end = u32.toU64(maxValue)
+      }
+      let count = end - start + 1
+      if U32Set.len(&out) + count > u32.toU64(maxSetSize) {
+        return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+      }
+      run U32Set.insertRange(&mut out, u64.toU32(start), u64.toU32(end))
+      continue
+    }
+    let size = u64.shiftLeft(1, u32.toU64(log2 * (height - node.depth)))
+    while bits != 0 {
+      let bitIndex = trailingZeros(u32.toU64(bits))
+      if node.depth == height {
+        let start = node.start + u32.toU64(bitIndex) + u32.toU64(bias)
+        if start > u32.toU64(maxValue) {
+          stopped = true
+          break
+        }
+        if U32Set.len(&out) >= u32.toU64(maxSetSize) {
+          return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+        }
+        drop run U32Set.insert(&mut out, u64.toU32(start))
+      } else {
+        run List<NextNode>.append(
+          &mut queue,
+          NextNode { start: node.start + u32.toU64(bitIndex) * size, depth: node.depth + 1 },
+        )
+      }
+      bits = bits & u32.bitNot(u32.shiftLeft(1, bitIndex))
+    }
+
+    // Clear the queue once all enqueued nodes have been consumed.
+    if front == List<NextNode>.length(&queue) {
+      List<NextNode>.clear(&mut queue)
+      front = 0
+    }
+  }
+  let remaining = List<NextNode>.length(&queue) - front
+  let skip = match move usize.checkedToU32(remaining) {
+    Option<u32>.Some { value } => value
+    _ => {
+      return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+    }
+  }
+  if !InputBitStream.skipNodes(&mut stream, skip) {
+    return Result<DecodedSparseSet<'a>, DecodingError>.failResult(DecodingError {})
+  }
+  let used = InputBitStream.bytesConsumed(&stream)
+  return Result<DecodedSparseSet<'a>, DecodingError>.succeed(
+    DecodedSparseSet<'a> {
+      set: IntSet<u32>.fromBitset(move out),
+      remaining: Slice.view(data, used, data.length - used),
+    },
+  )
+}
+
+enum NodeType {
+  Standard,
+  Filled,
+  Skip,
+}
+
+struct Node {
+  bits: u32,
+  parentIndex: u32,
+  nodeType: NodeType,
+}
+
+impl Copy for Node {}
+
+struct LayerState {
+  upper: IntSet<u32>,
+  filled: IntSet<u32>,
+  current: Node,
+  hasCurrent: bool,
+  filledBits: u32,
+  childCount: u64,
+  initialLength: usize,
+  bf: BranchFactor,
+}
+
+impl LayerState {
+  effect fn commit(self: &mut Self, nodes: &mut List<Node>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.hasCurrent {
+      return
+    }
+    let mut node = self.current
+    self.hasCurrent = false
+    drop run IntSet<u32>.insert(&mut self.upper, node.parentIndex)
+    if self.filledBits == BranchFactor.u32Mask(&self.bf) {
+      drop run IntSet<u32>.insert(&mut self.filled, node.parentIndex)
+      node.nodeType = NodeType.Filled
+      if usize.toU64(self.initialLength) >= self.childCount {
+        let mut at = self.initialLength - u64.toUsize(self.childCount)
+        let low = u32.toU64(node.parentIndex) * u32.toU64(BranchFactor.arity(&self.bf))
+        let high = low + u32.toU64(BranchFactor.arity(&self.bf))
+        while at < self.initialLength {
+          let mut child = List<Node>.get(&nodes, at)
+          if u32.toU64(child.parentIndex) >= low && u32.toU64(child.parentIndex) < high {
+            child.nodeType = NodeType.Skip
+            List<Node>.set(&mut nodes, at, child)
+          }
+          at = at + 1
+        }
+      }
+    }
+    run List<Node>.append(&mut nodes, node)
+    self.filledBits = 0
+  }
+}
+
+struct Layer {
+  indices: IntSet<u32>,
+  filled: IntSet<u32>,
+}
+
+effect fn createLayer(
+  bf: BranchFactor,
+  values: &IntSet<u32>,
+  filledValues: &IntSet<u32>,
+  nodes: &mut List<Node>,
+) -> Layer
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut state = LayerState {
+    upper: IntSet<u32>.empty(),
+    filled: IntSet<u32>.empty(),
+    current: Node { bits: 0, parentIndex: 0, nodeType: NodeType.Standard },
+    hasCurrent: false,
+    filledBits: 0,
+    childCount: IntSet<u32>.len(values),
+    initialLength: List<Node>.length(&nodes),
+    bf: bf,
+  }
+  let mut iter = IntSet<u32>.iter(values)
+  while let Option<u32>.Some { value } = IntSetIter<u32>.nextBack(&mut iter) {
+    let parent = value / BranchFactor.arity(&bf)
+    if state.hasCurrent && state.current.parentIndex != parent {
+      run LayerState.commit(&mut state, &mut nodes)
+    }
+    if !state.hasCurrent {
+      state.current = Node { bits: 0, parentIndex: parent, nodeType: NodeType.Standard }
+      state.hasCurrent = true
+    }
+    let mask = u32.shiftLeft(1, value % BranchFactor.arity(&bf))
+    state.current.bits = state.current.bits | mask
+    if IntSet<u32>.contains(filledValues, value) {
+      state.filledBits = state.filledBits | mask
+    }
+  }
+  run LayerState.commit(&mut state, &mut nodes)
+  return Layer { indices: move state.upper, filled: move state.filled }
+}
+
+pub effect fn toSparseBitSetWithBf(set: &IntSet<u32>, requested: BranchFactor) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let maximum = match move IntSet<u32>.last(set) {
+    Option<u32>.Some { value } => value
+    _ => {
+      return OutputBitStream.intoBytes(run OutputBitStream.new(requested, 0))
+    }
+  }
+  let mut bf = requested
+  let mut height = BranchFactor.treeHeightFor(&bf, maximum)
+  if height > BranchFactor.maxHeight(&bf) {
+    bf = BranchFactor.Four
+    height = BranchFactor.treeHeightFor(&bf, maximum)
+  }
+  let mut stream = run OutputBitStream.new(bf, height)
+  let mut nodes = List<Node>.make()
+  let mut indices = run IntSet<u32>.clone(set)
+  let mut filled = IntSet<u32>.all()
+  while height > 0 {
+    let layer = run createLayer(bf, &indices, &filled, &mut nodes)
+    indices = move layer.indices
+    filled = move layer.filled
+    height = height - 1
+  }
+  let mut at = List<Node>.length(&nodes)
+  while at > 0 {
+    at = at - 1
+    let node = List<Node>.get(&nodes, at)
+    match node.nodeType {
+      NodeType.Standard => {
+        run OutputBitStream.writeNode(&mut stream, node.bits)
+      }
+      NodeType.Filled => {
+        run OutputBitStream.writeNode(&mut stream, 0)
+      }
+      NodeType.Skip => {}
+    }
+  }
+  return OutputBitStream.intoBytes(move stream)
+}
+
+pub effect fn encode(set: &IntSet<u32>) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let maximum = match move IntSet<u32>.last(set) {
+    Option<u32>.Some { value } => value
+    _ => {
+      return OutputBitStream.intoBytes(run OutputBitStream.new(BranchFactor.Two, 0))
+    }
+  }
+  let factors = [BranchFactor.Two, BranchFactor.Four, BranchFactor.Eight, BranchFactor.ThirtyTwo]
+  let mut best = List<u8>.make()
+  let mut at: usize = 0
+  while at < factors.length {
+    let bf = factors[at]
+    if BranchFactor.treeHeightFor(&bf, maximum) <= BranchFactor.maxHeight(&bf) {
+      let candidate = run toSparseBitSetWithBf(set, bf)
+      if List<u8>.length(&best) == 0 || List<u8>.length(&candidate) < List<u8>.length(&best) {
+        best = move candidate
+      }
+    }
+    at = at + 1
+  }
+  return move best
+}

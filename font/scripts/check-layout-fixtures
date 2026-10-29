@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Compare original layout specimens, every prefix, extensions and graph aliases."""
+import argparse
+from pathlib import Path
+import re
+import struct
+import tempfile
+import harness
+
+ROOT = Path(__file__).resolve().parents[2]
+
+def sfnt(tag, payload):
+    return struct.pack('>IHHHH4sIII', 0x10000, 1, 0, 0, 0, tag, 0, 28, len(payload)) + payload
+
+def lookup_table(payload, kind, extension=False, gsub=False):
+    if extension:
+        payload = struct.pack('>HHI', 1, kind, 8) + payload
+        kind = 7 if gsub else 9
+    # Header, LookupList, one Lookup, then the subtable.
+    return struct.pack('>HHHHHHHHHHH', 1, 0, 0, 0, 10, 1, 4, kind, 0, 1, 8) + payload
+
+def upstream_bytes(module):
+    text = re.sub(r'//[^\n]*', '', (ROOT / f'font/parse/upstream/font-test-data/src/{module}.rs').read_text())
+    return {name: bytes(int(n.strip(), 0) for n in body.split(',') if n.strip())
+            for name, body in re.findall(r'pub (?:static|const) (\w+): &\[u8\] = &\[([^]]*)\];', text)}
+
+def fixtures():
+    for module, prefixes in (
+        ('gsub', {'SINGLE': 1, 'MULTIPLE': 2, 'ALTERNATE': 3, 'LIGATURE': 4, 'CONTEXTUAL': 5, 'REVERSECHAIN': 8}),
+        ('gpos', {'SINGLE': 1, 'PAIR': 2, 'CURSIVE': 3, 'MARKBASE': 4, 'MARKLIG': 5, 'MARKMARK': 6, 'CONTEXTUAL': 7, 'VALUEFORMATTABLE': 1}),
+    ):
+        for name, data in upstream_bytes(module).items():
+            kind = next((kind for prefix, kind in prefixes.items() if name.startswith(prefix)), None)
+            if kind is None:
+                continue
+            for length in range(len(data) + 1):
+                yield f'{module}-{name}-{length}', sfnt(module.upper().encode(), lookup_table(data[:length], kind))
+            yield f'{module}-{name}-extension', sfnt(module.upper().encode(), lookup_table(data, kind, True, module == 'gsub'))
+    for name, data in upstream_bytes('layout').items():
+        script, feature = (0, 10) if name.startswith('FEATURE') else (10, 0)
+        for length in range(len(data) + 1):
+            yield f'layout-{name}-{length}', sfnt(b'GSUB', struct.pack('>5H', 1, 0, script, feature, 0) + data[:length])
+    for name, data in upstream_bytes('gdef').items():
+        if name == 'GDEF_HEADER':
+            payload = data
+        else:
+            offsets = [0, 0, 0, 0]
+            index = {'GLYPHCLASSDEF_TABLE': 0, 'ATTACHLIST_TABLE': 1, 'LIGCARETLIST_TABLE': 2, 'MARKATTACHCLASSDEF_TABLE': 3}.get(name)
+            if index is None:
+                continue
+            offsets[index] = 12
+            payload = struct.pack('>6H', 1, 0, *offsets) + data
+        for length in range(len(payload) + 1):
+            yield f'gdef-{name}-{length}', sfnt(b'GDEF', payload[:length])
+    for tag in (b'GSUB', b'GPOS'):
+        # Original and extended headers, null/non-null precedence and truncation.
+        for minor in (0, 1, 2, 65535):
+            for offset in (0, 10, 26, 0xffffffff):
+                payload = struct.pack('>5H4I', 1, minor, 26, 26, 26, 0, offset, offset, offset) + bytes(4)
+                for length in range(len(payload) + 1):
+                    yield f'header-{tag.decode()}-{minor}-{offset}-{length}', sfnt(tag, payload[:length])
+    # Shared Feature data parsed with distinct tags must retain distinct params.
+    records = b''.join(struct.pack('>4sH', tag, 20) for tag in (b'ss01', b'ss02', b'size'))
+    feature_list = struct.pack('>H', 3) + records + struct.pack('>HH', 4, 0) + bytes(10)
+    yield 'feature-params-alias-different-tags', sfnt(b'GSUB', struct.pack('>5H', 1, 0, 0, 10, 0) + feature_list)
+    # Every prefix of original lookup-variation tables used in upstream tests.
+    tests = (ROOT / 'font/parse/src/lookup_variation_tests.silk').read_text()
+    for name, literal in re.findall(r"fn (\w+Bytes)\(\) -> &'static \[u8\] \{\s*return b\"([^\"]*)\"\s*\}", tests):
+        data = bytes.fromhex(literal.replace('\\x', ''))
+        for length in range(len(data) + 1):
+            yield f'lookup-variations-{name}-{length}', sfnt(b'GSUB', struct.pack('>5HI', 1, 1, 0, 0, 0, 14) + data[:length])
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--reference', type=Path, default=harness.REFERENCE)
+parser.add_argument('--silk-dumper', type=Path)
+parser.add_argument('--report', type=Path)
+args = parser.parse_args()
+with tempfile.TemporaryDirectory(prefix='font-layout-fixtures-') as temporary:
+    paths = []
+    for name, data in fixtures():
+        path = Path(temporary) / f'{name}.ttf'
+        path.write_bytes(data)
+        paths.append(path)
+    raise SystemExit(harness.compare(paths, args.reference, args.silk_dumper or harness.silk_binary(), 10, args.report))

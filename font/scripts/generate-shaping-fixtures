@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Build small independent ISO/IEC 14496-22:2026 lookup fixtures.
+
+These deliberately use glyph IDs above 65535, and mixed 16/24/32-bit fields,
+which the pinned real-font corpus does not exercise.
+"""
+from pathlib import Path
+import runpy
+
+ROOT = Path(__file__).resolve().parents[2]
+byte_function = runpy.run_path(str(ROOT / 'font/scripts/generate-shaping-unicode'))['byte_function']
+
+
+def integer(value, width=2):
+    return (value & ((1 << (8 * width)) - 1)).to_bytes(width, 'big')
+
+
+def words(*values):
+    return b''.join(integer(v) for v in values)
+
+
+class Table:
+    def __init__(self):
+        self.data = bytearray()
+        self.labels = {'start': 0}
+        self.fixups = []
+
+    def add(self, data):
+        self.data.extend(data)
+        return self
+
+    def label(self, name):
+        self.labels[name] = len(self.data)
+        return self
+
+    def ref(self, name, width, base='start'):
+        self.fixups.append((len(self.data), name, width, base))
+        return self.add(bytes(width))
+
+    def finish(self):
+        for at, name, width, base in self.fixups:
+            self.data[at:at + width] = integer(self.labels[name] - self.labels[base], width)
+        return bytes(self.data)
+
+
+A, B, C = 0x10001, 0x10002, 0x10003
+
+
+def coverage(*glyphs):
+    return words(3) + integer(len(glyphs), 3) + b''.join(integer(g, 3) for g in glyphs)
+
+
+def classes(glyph, value):
+    return words(3) + integer(glyph, 3) + integer(1, 3) + integer(value, 3)
+
+
+def single(format, glyph=A, target=C):
+    t = Table().add(words(format)).ref('coverage', 4)
+    if format == 3:
+        t.add(integer(target - glyph, 3))
+    else:
+        t.add(integer(1, 3)).add(integer(target, 3))
+    return t.label('coverage').add(coverage(glyph)).finish()
+
+
+def layout(lookups):
+    # Version 1.2, with the original lookup list deliberately null.
+    t = Table().add(words(1, 2, 0, 0, 0)).add(bytes(12)).ref('lookups', 4)
+    t.label('lookups').add(words(len(lookups)))
+    for n in range(len(lookups)):
+        t.ref(f'lookup{n}', 4, 'lookups')
+    for n, (kind, body) in enumerate(lookups):
+        t.label(f'lookup{n}').add(words(kind, 0, 1, 8)).add(body)
+    return t.finish()
+
+
+def sfnt(tables):
+    t = Table().add(integer(65536, 4)).add(words(len(tables), 0, 0, 0))
+    for tag, data in sorted(tables.items()):
+        t.add(tag.encode()).add(integer(0, 4)).ref(tag, 4).add(integer(len(data), 4))
+    for tag, data in sorted(tables.items()):
+        t.label(tag).add(data)
+    return t.finish()
+
+
+def shaping_layout(lookups):
+    data = bytearray(layout(lookups))
+    script_offset = len(data)
+    # latn script, default LangSys, one feature index.
+    data += words(1) + b'latn' + words(8, 4, 0, 0, 0xffff, 1, 0)
+    feature_offset = len(data)
+    data += words(1) + b'test' + words(8, 0, 1, 0)
+    data[14:18] = integer(script_offset, 4)
+    data[18:22] = integer(feature_offset, 4)
+    return bytes(data)
+
+
+def fixtures():
+    feat = integer(65536, 4) + words(4, 0, 0, 0)
+    for kind, flags in [(1, 0), (17, 0x8000), (35, 0), (37, 0x8000)]:
+        feat += words(kind, 2, 0, 0, flags, 0)
+    ltag = integer(1, 4) + integer(0, 4) + integer(1, 4) + words(16, 2) + b'tr'
+    yield 'aatFeatureFont', sfnt({'feat': feat, 'ltag': ltag})
+    chain = integer(1, 4) + bytes(12)
+    for kind, setting, enable, disable in [(1, 3, 0, ~1), (1, 2, 1, ~0), (3, 3, 2, ~0), (35, 2, 4, ~0), (35, 3, 0, ~4), (17, 7, 8, ~0), (39, 1, 16, ~0)]:
+        chain += words(kind, setting) + integer(enable, 4) + integer(disable, 4)
+    yield 'aatFeatureChain', chain
+    # One variation region, active by half at coordinate 0.5; delta 3 => 1.5.
+    store = words(1) + integer(12, 4) + words(1) + integer(22, 4)
+    store += words(1, 1, 0, 16384, 16384) + words(1, 1, 1, 0, 3)
+    yield 'fractionalGdef', words(1, 3, 0, 0, 0, 0, 0) + integer(18, 4) + store
+    t = Table().add(words(3)).ref('coverage', 4).add(words(64)).ref('device', 2)
+    t.label('device').add(words(0, 0, 0x8000)).label('coverage').add(coverage(A))
+    yield 'fractionalPosition', layout([(1, t.finish())])
+    yield 'singleDelta', layout([(1, single(3))])
+    yield 'singleNegativeDelta', layout([(1, single(3, C, A))])
+    yield 'singleArray', layout([(1, single(4))])
+    for name, kind in [('multiple', 2), ('alternate', 3), ('ligature', 4)]:
+        t = Table().add(words(2)).ref('coverage', 4).add(integer(1, 3)).ref('set', 3)
+        t.label('coverage').add(coverage(A)).label('set')
+        if kind == 4:
+            t.add(words(1)).ref('ligature', 3, 'set').label('ligature')
+            t.add(integer(C, 3)).add(words(2)).add(integer(B, 3))
+        else:
+            t.add(words(2)).add(integer(B, 3)).add(integer(C, 3))
+        yield name, layout([(kind, t.finish())])
+        if kind == 4:
+            cmap_sub = words(12, 0) + integer(28, 4) + integer(0, 4) + integer(1, 4) + integer(65, 4) + integer(66, 4) + integer(A, 4)
+            cmap = words(0, 1, 3, 10) + integer(12, 4) + cmap_sub
+            gsub = shaping_layout([(4, t.finish())])
+            yield 'plannedFont', sfnt({'GSUB': gsub, 'cmap': cmap})
+            gsub = bytearray(gsub)
+            script_list = int.from_bytes(gsub[14:18], 'big')
+            # LangSys requiredFeatureIndex is zero, before its optional feature list.
+            gsub[script_list + 14:script_list + 16] = words(0)
+            yield 'requiredFont', sfnt({'GSUB': gsub, 'cmap': cmap})
+    t = Table().add(words(2)).ref('coverage', 4).add(words(1)).ref('back', 3)
+    t.add(words(1)).ref('ahead', 3).add(integer(1, 3)).add(integer(C, 3))
+    t.label('coverage').add(coverage(A)).label('back').add(coverage(B)).label('ahead').add(coverage(B))
+    yield 'reverse', layout([(8, t.finish())])
+    for chained in (False, True):
+        for format in (4, 5, 6):
+            if chained and format == 6:
+                continue  # The wide chained coverage form is not defined.
+            t = Table().add(words(format))
+            if format == 6:
+                t.add(words(2, 1)).ref('coverage', 3).ref('second', 3).add(words(0, 1))
+            else:
+                t.ref('coverage', 4)
+                if format == 5:
+                    if chained:
+                        t.ref('emptyClasses', 4)
+                    t.ref('classes', 4)
+                    if chained:
+                        t.ref('emptyClasses', 4)
+                count_width = 2 if chained and format == 5 else 3
+                t.add(integer(1, count_width)).ref('set', 3).label('set')
+                t.add(words(1)).ref('rule', 2 if not chained and format == 4 else 3, 'set')
+                t.label('rule')
+                if chained:
+                    t.add(words(0, 2))
+                else:
+                    t.add(words(2, 1))
+                t.add(integer(B if format == 4 else 1, 3 if format == 4 else 2))
+                if chained:
+                    t.add(words(0, 1))
+                t.add(words(0, 1))
+            t.label('coverage').add(coverage(A)).label('second').add(coverage(B))
+            t.label('classes').add(classes(B, 1)).label('emptyClasses').add(words(1, 0, 0))
+            yield ('chain' if chained else 'context') + str(format), layout([(6 if chained else 5, t.finish()), (1, single(4))])
+    for format in (3, 4):
+        t = Table().add(words(format)).ref('coverage', 4).add(words(4))
+        if format == 4:
+            t.add(integer(1, 3))
+        t.add(words(-37)).label('coverage').add(coverage(A))
+        yield f'position{format}', layout([(1, t.finish())])
+    t = Table().add(words(3)).ref('coverage', 4).add(words(4, 1)).add(integer(1, 3)).ref('pairs', 3)
+    t.label('pairs').add(integer(1, 3)).add(integer(B, 3)).add(words(-37, 19))
+    t.label('coverage').add(coverage(A))
+    yield 'pair3', layout([(2, t.finish())])
+    t = Table().add(words(4)).ref('coverage', 4).add(words(4, 1)).ref('left', 4).ref('right', 4)
+    t.add(words(1, 1, -37, 19)).label('coverage').add(coverage(A))
+    t.label('left').add(classes(A, 0)).label('right').add(classes(B, 0))
+    yield 'pair4', layout([(2, t.finish())])
+    t = Table().add(words(2)).ref('coverage', 4).add(integer(2, 3))
+    t.add(integer(0, 3)).ref('exit', 3).ref('entry', 3).add(integer(0, 3))
+    t.label('coverage').add(coverage(A, B)).label('entry').add(words(1, 10, 20)).label('exit').add(words(1, 100, 200))
+    yield 'cursive2', layout([(3, t.finish())])
+    for name, kind in [('markBase2', 4), ('markLigature2', 5), ('markMark2', 6)]:
+        t = Table().add(words(2)).ref('markCoverage', 4).ref('baseCoverage', 4).add(words(1)).ref('marks', 4).ref('bases', 4)
+        t.label('markCoverage').add(coverage(B)).label('baseCoverage').add(coverage(A))
+        t.label('marks').add(integer(1, 3)).add(words(0)).ref('markAnchor', 3, 'marks')
+        t.label('markAnchor').add(words(1, 10, 20)).label('bases')
+        if kind == 5:
+            t.add(integer(1, 3)).ref('components', 3, 'bases').label('components').add(words(1)).ref('baseAnchor', 3, 'components')
+        else:
+            t.add(integer(1, 2 if kind == 6 else 3)).ref('baseAnchor', 3, 'bases')
+        t.label('baseAnchor').add(words(1, 100, 200))
+        yield name, layout([(kind, t.finish())])
+
+
+if __name__ == '__main__':
+    text = '// THIS FILE IS AUTOGENERATED by font/scripts/generate-shaping-fixtures. DO NOT EDIT.\n'
+    text += ''.join(byte_function(name, data) for name, data in fixtures())
+    (ROOT / 'font/shape/src/generated_fixtures.silk').write_text(text)

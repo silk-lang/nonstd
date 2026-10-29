@@ -1,0 +1,296 @@
+// Copyright 2022 the Fontations Authors. Licensed under Apache-2.0 or MIT.
+import read_fonts.lib { FontRef, FontData, ReadError, ScalarArray }
+import read_fonts.tables.glyf { Glyf, Glyph }
+import read_fonts.tables.loca { Loca, LocaGlyph }
+import read_fonts.tables.gvar {
+  Gvar,
+  GvarExtended,
+  SelectedGvar,
+  GlyphVariationData,
+  GlyphVariationDataHeader,
+  GlyphVariationDataHeaderExtended,
+  GlyphDelta
+}
+import read_fonts.tables.variations {
+  Tuple,
+  TupleVariationData,
+  TupleVariation,
+  TupleVariationIter,
+  TupleDeltaIter
+}
+import font_types.lib { GlyphId, F2Dot14, Fixed, Point }
+import dump_support { DumpPath, scalar, absent, readError }
+import generated_dump_glyf
+import generated_dump_gvar
+import generated_dump_variations
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.collections.slice { Slice }
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+pub effect fn dump<'a>(path: &mut DumpPath, font: &FontRef<'a>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, "glyfLoca")
+  match move FontRef.loca(font, Option<bool>.None) {
+    Result<Loca<'a>, ReadError>.Success { value } => run dumpLoca(
+      &mut path,
+      value,
+      FontRef.glyf(font),
+    )
+    Result<Loca<'a>, ReadError>.Failure { error } => run readError(&path, error)
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "GLYFLOCA")
+  match move FontRef.locaExtended(font, Option<bool>.None) {
+    Result<Loca<'a>, ReadError>.Success { value } => run dumpLoca(
+      &mut path,
+      value,
+      FontRef.glyfExtended(font),
+    )
+    Result<Loca<'a>, ReadError>.Failure { error } => run readError(&path, error)
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "gvarGlyphs")
+  match move FontRef.gvar(font) {
+    Result<Gvar<'a>, ReadError>.Success { value } => run dumpGvar(
+      &mut path,
+      SelectedGvar.Original { table: value },
+    )
+    Result<Gvar<'a>, ReadError>.Failure { error } => run readError(&path, error)
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "GVARGlyphs")
+  match move FontRef.gvarExtended(font) {
+    Result<GvarExtended<'a>, ReadError>.Success { value } => run dumpGvar(
+      &mut path,
+      SelectedGvar.Extended { table: value },
+    )
+    Result<GvarExtended<'a>, ReadError>.Failure { error } => run readError(&path, error)
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn dumpLoca<'a>(
+  path: &mut DumpPath,
+  table: Loca<'a>,
+  glyf: Result<Glyf<'a>, ReadError>,
+) -> ()
+  ! WriterError
+  ? &mut Writer {
+  DumpPath.push(&mut path, "kind")
+  run scalar(
+    &path,
+    match table {
+      Loca<'a>.Short { data } => "Short"
+      Loca<'a>.Long { data } => "Long"
+    },
+  )
+  DumpPath.pop(&mut path)
+  let count = match table {
+    Loca<'a>.Short { data } => ScalarArray<u16>.len(&data)
+    Loca<'a>.Long { data } => ScalarArray<u32>.len(&data)
+  }
+  DumpPath.push(&mut path, "offsets")
+  DumpPath.push(&mut path, "length")
+  run scalar(&path, count)
+  DumpPath.pop(&mut path)
+  let mut index: usize = 0
+  while index < count {
+    DumpPath.setIndex(&mut path, index)
+    match move Loca.getRaw(&table, index) {
+      Option<u32>.Some { value } => run scalar(&path, value)
+      _ => run absent(&path)
+    }
+    index = index + 1
+  }
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "ascending")
+  run scalar(&path, Loca.allOffsetsAreAscending(&table))
+  DumpPath.pop(&mut path)
+  DumpPath.push(&mut path, "glyphs")
+  match move glyf {
+    Result<Glyf<'a>, ReadError>.Failure { error } => run readError(&path, error)
+    Result<Glyf<'a>, ReadError>.Success { value } => {
+      let mut glyph: usize = 0
+      while glyph < Loca.len(&table) {
+        DumpPath.setIndex(&mut path, glyph)
+        DumpPath.beginTable(&mut path)
+        match move Loca.get(&table, GlyphId.new(usize.toU32(glyph)), &value) {
+          Option<LocaGlyph<'a>>.None => run absent(&path)
+          Option<LocaGlyph<'a>>.Some { value: LocaGlyph<'a>.Empty } => run scalar(&path, "empty")
+          Option<LocaGlyph<'a>>.Some {
+            value: LocaGlyph<'a>.Glyph { value: outline }
+          } => run generated_dump_glyf.dumpGlyph(&mut path, outline)
+        }
+        glyph = glyph + 1
+      }
+    }
+  }
+  DumpPath.pop(&mut path)
+}
+
+effect fn dumpTuple<'a>(path: &mut DumpPath, variation: Option<Tuple<'a>>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  match move variation {
+    Option<Tuple<'a>>.Some { value } => run generated_dump_variations.dumpTuple(
+      &mut path,
+      value,
+      FontData.new(&[]),
+    )
+    Option<Tuple<'a>>.None => run absent(&path)
+  }
+}
+
+effect fn dumpGvar<'a>(path: &mut DumpPath, table: SelectedGvar<'a>) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let locations: [i16; 4] = [0, -8192, 8192, 16384]
+  let mut coordinates = [F2Dot14.zero(); 65535]
+  let axisCount = u16.toUsize(SelectedGvar.axisCount(&table))
+  let mut glyph: u32 = 0
+  while glyph < SelectedGvar.glyphCount(&table) {
+    DumpPath.setIndex(&mut path, u32.toUsize(glyph))
+    DumpPath.beginTable(&mut path)
+    let gid = GlyphId.new(glyph)
+    DumpPath.push(&mut path, "raw")
+    match move SelectedGvar.dataForGid(&table, gid) {
+      Result<Option<FontData<'a>>, ReadError>.Failure { error } => run readError(&path, error)
+      Result<Option<FontData<'a>>, ReadError>.Success {
+        value: Option<FontData<'a>>.None
+      } => run absent(&path)
+      Result<Option<FontData<'a>>, ReadError>.Success {
+        value: Option<FontData<'a>>.Some { value }
+      } => {
+        if SelectedGvar.isExtended(&table) {
+          match move GlyphVariationDataHeaderExtended.read(value) {
+            Result<GlyphVariationDataHeaderExtended<'a>, ReadError>.Success {
+              value: header
+            } => run generated_dump_gvar.dumpGlyphVariationDataHeaderExtended(&mut path, header)
+            Result<GlyphVariationDataHeaderExtended<'a>, ReadError>.Failure {
+              error
+            } => run readError(&path, error)
+          }
+        } else {
+          match move GlyphVariationDataHeader.read(value) {
+            Result<GlyphVariationDataHeader<'a>, ReadError>.Success {
+              value: header
+            } => run generated_dump_gvar.dumpGlyphVariationDataHeader(&mut path, header)
+            Result<GlyphVariationDataHeader<'a>, ReadError>.Failure { error } => run readError(
+              &path,
+              error,
+            )
+          }
+        }
+      }
+    }
+    DumpPath.pop(&mut path)
+    DumpPath.push(&mut path, "tuples")
+    match move SelectedGvar.glyphVariationData(&table, gid) {
+      Result<Option<GlyphVariationData<'a>>, ReadError>.Failure { error } => run readError(
+        &path,
+        error,
+      )
+      Result<Option<GlyphVariationData<'a>>, ReadError>.Success {
+        value: Option<GlyphVariationData<'a>>.None
+      } => run absent(&path)
+      Result<Option<GlyphVariationData<'a>>, ReadError>.Success {
+        value: Option<GlyphVariationData<'a>>.Some { value }
+      } => {
+        let mut iter = TupleVariationData<'a, GlyphDelta>.tuples(&value)
+        let mut tupleIndex: usize = 0
+        while let Option<TupleVariation<'a, GlyphDelta>>.Some {
+          value: variation
+        } = move TupleVariationIter<'a, GlyphDelta>.next(&mut iter) {
+          DumpPath.setIndex(&mut path, tupleIndex)
+          DumpPath.push(&mut path, "allPoints")
+          run scalar(&path, TupleVariation<'a, GlyphDelta>.hasDeltasForAllPoints(&variation))
+          DumpPath.pop(&mut path)
+          DumpPath.push(&mut path, "peak")
+          run dumpTuple(
+            &mut path,
+            Option<Tuple<'a>>.some(TupleVariation<'a, GlyphDelta>.peak(&variation)),
+          )
+          DumpPath.pop(&mut path)
+          DumpPath.push(&mut path, "start")
+          run dumpTuple(&mut path, TupleVariation<'a, GlyphDelta>.intermediateStart(&variation))
+          DumpPath.pop(&mut path)
+          DumpPath.push(&mut path, "end")
+          run dumpTuple(&mut path, TupleVariation<'a, GlyphDelta>.intermediateEnd(&variation))
+          DumpPath.pop(&mut path)
+          DumpPath.push(&mut path, "deltas")
+          let mut deltas = TupleVariation<'a, GlyphDelta>.deltas(&variation)
+          let mut deltaIndex: usize = 0
+          while let Option<GlyphDelta>.Some { value: delta } = move TupleDeltaIter<
+            'a,
+            GlyphDelta
+          >.next(&mut deltas) {
+            DumpPath.setIndex(&mut path, deltaIndex)
+            DumpPath.push(&mut path, "position")
+            run scalar(&path, delta.position)
+            DumpPath.pop(&mut path)
+            DumpPath.push(&mut path, "x")
+            run scalar(&path, delta.xDelta)
+            DumpPath.pop(&mut path)
+            DumpPath.push(&mut path, "y")
+            run scalar(&path, delta.yDelta)
+            DumpPath.pop(&mut path)
+            deltaIndex = deltaIndex + 1
+          }
+          DumpPath.pop(&mut path)
+          DumpPath.push(&mut path, "evaluated")
+          let mut location: usize = 0
+          while location < 4 {
+            DumpPath.setIndex(&mut path, location)
+            let mut axis: usize = 0
+            while axis < axisCount {
+              coordinates[axis] = F2Dot14.fromBits(locations[location])
+              axis = axis + 1
+            }
+            let coords = Slice.view<F2Dot14>(&coordinates, 0, axisCount)
+            match move TupleVariation<'a, GlyphDelta>.computeScalar(&variation, coords) {
+              Option<Fixed>.None => run absent(&path)
+              Option<Fixed>.Some { value: scale } => {
+                DumpPath.push(&mut path, "scalar")
+                run scalar(&path, Fixed.toBits(scale))
+                DumpPath.pop(&mut path)
+                let mut scaled = TupleVariation<'a, GlyphDelta>.deltas(&variation)
+                let mut scaledIndex: usize = 0
+                DumpPath.push(&mut path, "deltas")
+                while let Option<GlyphDelta>.Some { value: delta } = move TupleDeltaIter<
+                  'a,
+                  GlyphDelta
+                >.next(&mut scaled) {
+                  DumpPath.setIndex(&mut path, scaledIndex)
+                  let point = GlyphDelta.applyScalar<Fixed>(delta, scale)
+                  DumpPath.push(&mut path, "x")
+                  run scalar(&path, Fixed.toBits(point.x))
+                  DumpPath.pop(&mut path)
+                  DumpPath.push(&mut path, "y")
+                  run scalar(&path, Fixed.toBits(point.y))
+                  DumpPath.pop(&mut path)
+                  scaledIndex = scaledIndex + 1
+                }
+                DumpPath.pop(&mut path)
+              }
+            }
+            location = location + 1
+          }
+          DumpPath.pop(&mut path)
+          tupleIndex = tupleIndex + 1
+        }
+        DumpPath.clearIndex(&mut path)
+        DumpPath.push(&mut path, "length")
+        run scalar(&path, tupleIndex)
+        DumpPath.pop(&mut path)
+      }
+    }
+    DumpPath.pop(&mut path)
+    glyph = glyph + 1
+  }
+  DumpPath.clearIndex(&mut path)
+}

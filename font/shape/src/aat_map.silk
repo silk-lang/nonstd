@@ -1,0 +1,224 @@
+//! Resolve OpenType feature ranges into Apple's per-chain feature flags.
+import generated_unicode as Data
+import feature { Feature }
+import font { ConfiguredShaper, FontFuncs, Shaper, table }
+import language { Language }
+import view { View, offset }
+import font_types.lib { Tag }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+
+struct Setting {
+  kind: u16,
+  value: u16,
+  exclusive: bool,
+  start: u32,
+  end: u32,
+}
+
+impl Copy for Setting {}
+
+pub struct Range {
+  pub first: u32,
+  pub flags: u32,
+}
+
+impl Copy for Range {}
+
+fn descriptor<'a>(feat: View<'a>, kind: u16) -> View<'a> {
+  let mut i: usize = 0
+  while i < u16.toUsize(View.u16(&feat, 4)) {
+    let at = offset(12, i, 12)
+    if offset(at, 1, 12) > View.len(&feat) {
+      break
+    }
+    if View.u16(&feat, at) == kind && View.u16(&feat, at + 2) != 0 {
+      return View.tail(&feat, at)
+    }
+    i = i + 1
+  }
+  return View.empty()
+}
+
+pub effect fn compile<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  chain: View,
+  header: usize,
+  count: usize,
+  features: &[Feature],
+  language: &Language,
+) -> List<Range>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let feat = table(&font.data.font, 0x66656174)
+  let ltag = table(&font.data.font, 0x6c746167)
+  let mappings = View.bytes(Data.aatFeatures())
+  let mut settings = List<Setting>.make()
+  let mut boundaries = List<u32>.make()
+  run List<u32>.append(&mut boundaries, 0)
+  let mut i: usize = 0
+  while i < features.length {
+    let feature = features[i]
+    i = i + 1
+    if feature.start >= feature.end {
+      continue
+    }
+    let tag = Tag.toU32(feature.tag)
+    let mut kind: u16 = 65535
+    let mut setting: u16 = 0
+    if tag == 0x61616c74 && feature.value <= 65535 {
+      kind = 17
+      setting = u32.toU16(feature.value)
+    }
+    let mut j: usize = 0
+    while j < View.len(&mappings) / 7 {
+      if View.u32(&mappings, j * 7) == tag {
+        kind = u8.toU16(View.u8(&mappings, j * 7 + 4))
+        let mut column: usize = 5
+        if feature.value == 0 {
+          column = 6
+        }
+        setting = u8.toU16(View.u8(&mappings, j * 7 + column))
+        break
+      }
+      j = j + 1
+    }
+    if kind == 65535 {
+      continue
+    }
+    let mut description = descriptor(feat, kind)
+    if View.len(&description) == 0 && kind == 37 && setting == 1 {
+      description = descriptor(feat, 3)
+    }
+    if View.len(&description) == 0 {
+      continue
+    }
+    let item = Setting {
+      kind: kind,
+      value: setting,
+      exclusive: (View.u16(&description, 8) & 0x8000) != 0 || kind == 17,
+      start: feature.start,
+      end: feature.end,
+    }
+
+    // Activation order is stable: earlier range starts precede later ones.
+    let mut at = List<Setting>.length(&settings)
+    while at > 0 && List<Setting>.get(&settings, at - 1).start > item.start {
+      at = at - 1
+    }
+    run List<Setting>.insert(&mut settings, at, item)
+    run boundary(&mut boundaries, feature.start)
+    run boundary(&mut boundaries, feature.end)
+  }
+  let mut result = List<Range>.make()
+  i = 0
+  while i < List<u32>.length(&boundaries) {
+    let first = List<u32>.get(&boundaries, i)
+
+    // The final range is inclusive of u32::MAX, as in upstream's map.
+    if first == 4294967295 {
+      break
+    }
+    let mut flags = View.u32(&chain, 0)
+    let mut f: usize = 0
+    while f < count && offset(header, f + 1, 12) <= View.len(&chain) {
+      let at = offset(header, f, 12)
+      let kind = View.u16(&chain, at)
+      let setting = View.u16(&chain, at + 2)
+      let requested = contains(List<Setting>.asSlice(&settings), first, kind, setting)
+        || (kind == 3 && setting == 3 && contains(List<Setting>.asSlice(&settings), first, 37, 1))
+        || (kind == 39 && languageMatches(ltag, setting, Language.asBytes(language)))
+      if requested {
+        flags = (flags & View.u32(&chain, at + 8)) | View.u32(&chain, at + 4)
+      }
+      f = f + 1
+    }
+    run List<Range>.append(&mut result, Range { first: first, flags: flags })
+    i = i + 1
+  }
+  return move result
+}
+
+effect fn boundary(boundaries: &mut List<u32>, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < List<u32>.length(&boundaries.*) && List<u32>.get(&boundaries.*, i) < value {
+    i = i + 1
+  }
+  if i < List<u32>.length(&boundaries.*) && List<u32>.get(&boundaries.*, i) == value {
+    return
+  }
+  run List<u32>.insert(&mut boundaries, i, value)
+}
+
+fn contains(settings: &[Setting], cluster: u32, kind: u16, value: u16) -> bool {
+  let mut i: usize = 0
+  while i < settings.length {
+    let item = settings[i]
+    if item.kind == kind && item.start <= cluster && cluster < item.end
+      && (item.exclusive || (item.value & 65534) == (value & 65534)) {
+      return item.value == value
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn languageMatches(ltag: View, setting: u16, requested: &[u8]) -> bool {
+  if setting == 0 || requested.length == 0 || u16.toU32(setting) > View.u32(&ltag, 8) {
+    return false
+  }
+  let record = 12 + (u16.toUsize(setting) - 1) * 4
+  let start = u16.toUsize(View.u16(&ltag, record))
+  let length = u16.toUsize(View.u16(&ltag, record + 2))
+  if length == 0 || length > requested.length || offset(start, 1, length) > View.len(&ltag) {
+    return false
+  }
+  let mut i: usize = 0
+  while i < length {
+    let mut b = View.u8(&ltag, start + i)
+    if b >= 65 && b <= 90 {
+      b = b + 32
+    } else if b == 95 {
+      b = 45
+    }
+    if b != requested[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return length == requested.length || requested[length] == 45
+}
+
+pub fn flags(ranges: &[Range], cluster: u32) -> u32 {
+  let mut lo: usize = 0
+  let mut hi = ranges.length
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if ranges[mid].first <= cluster {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if lo == 0 {
+    return 0
+  }
+  return ranges[lo - 1].flags
+}
+
+pub fn any(ranges: &[Range], mask: u32) -> bool {
+  let mut i: usize = 0
+  while i < ranges.length {
+    if (ranges[i].flags & mask) != 0 {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}

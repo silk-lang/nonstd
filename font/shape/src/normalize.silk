@@ -1,0 +1,725 @@
+//! Font-aware canonical decomposition, mark ordering and recomposition.
+import trace
+import buffer { Buffer, Glyph, ClusterLevel, reverseRange }
+import font { ConfiguredShaper, FontFuncs, NominalGlyphs, ShaperData }
+import direction { Direction }
+import unicode
+import arabic
+import font_types.lib { GlyphId }
+import silk.core.option { Option }
+import silk.num.u32
+import silk.num.u8
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub effect fn normalize<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &mut Buffer,
+  hasGposMark: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut allSimple = true
+
+  // Whether no glyph is a mark, so every run maps without stopping.
+  let mut markFree = true
+  if true {
+    let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+    let mut scan: usize = 1
+    while scan < glyphs.length {
+      if isMark(glyphs[scan].codepoint) {
+        markFree = false
+        allSimple = false
+        break
+      }
+      scan = scan + 1
+    }
+    if markFree && glyphs.length != 0 && isMark(glyphs[0].codepoint) {
+      markFree = false
+    }
+  }
+  let decomposeEnabled = run trace.message(font, &buffer.*, "start decompose")
+  if decomposeEnabled {
+    if !buffer.dumber && buffer.script == 0x48616e67 {
+      let mut j: usize = 0
+      while j < Buffer.len(&buffer.*) {
+        let mut item = List<Glyph>.get(&buffer.glyphs, j)
+        item.info.glyphId = ConfiguredShaper.glyphOrNotdef(font, item.codepoint)
+        List<Glyph>.set(&mut buffer.glyphs, j, item)
+        j = j + 1
+      }
+      drop run trace.message(font, &buffer.*, "end decompose")
+      return
+    }
+
+    // Glyphs mapped in place stay in the buffer until the first glyph that needs more work;
+    // only then is the output list started, with everything before it.
+    let mut output = List<Glyph>.make()
+    let mut materialized = false
+    let mut i: usize = 0
+    while i < Buffer.len(&buffer.*) {
+      if buffer.shaper == 0 {
+        let mut end = i
+        if markFree {
+          end = Buffer.len(&buffer.*)
+        }
+        if end < Buffer.len(&buffer.*) {
+          // A run stops before a mark and before the glyph a mark follows; each glyph's
+          // mark test is carried over to the next step.
+          let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+          let mut mark = isMark(glyphs[end].codepoint)
+          while !mark {
+            if end + 1 >= glyphs.length {
+              end = glyphs.length
+              break
+            }
+            mark = isMark(glyphs[end + 1].codepoint)
+            if !mark {
+              end = end + 1
+            }
+          }
+        }
+        if end > i {
+          let mut mapped: usize = 0
+          if true {
+            let mut batch = NominalGlyphs.new(List<Glyph>.asMutSlice(&mut buffer.glyphs), i, end)
+            mapped = ConfiguredShaper.nominalGlyphs(font, &mut batch)
+          }
+          if mapped > end - i {
+            mapped = end - i
+          }
+          let last = i + mapped
+          if !materialized {
+            i = last
+          }
+          while i < last {
+            run List<Glyph>.append(&mut output, List<Glyph>.get(&buffer.glyphs, i))
+            i = i + 1
+          }
+          if mapped != 0 {
+            continue
+          }
+        }
+      }
+
+      // A glyph that stays one glyph is mapped in place until the output list is needed.
+      let length = Buffer.len(&buffer.*)
+      if i + 1 >= length
+        || !unicode.isVariationSelector(List<Glyph>.asSlice(&buffer.glyphs)[i + 1].codepoint) {
+        let cp = List<Glyph>.asSlice(&buffer.glyphs)[i].codepoint
+        let shortest = buffer.shaper == 0 && !isMark(cp)
+          && !(i + 1 < length && isMark(List<Glyph>.asSlice(&buffer.glyphs)[i + 1].codepoint))
+        if let Option<Mapped>.Some { value: single } = singleGlyph(font, &buffer.*, cp, shortest) {
+          if materialized {
+            let mut mapped = List<Glyph>.get(&buffer.glyphs, i)
+            Mapped.apply(&single, &mut mapped)
+            run List<Glyph>.append(&mut output, mapped)
+          } else {
+            let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+            Mapped.apply(&single, &mut slots[i])
+          }
+          i = i + 1
+          continue
+        }
+      }
+      if !materialized {
+        let mut kept: usize = 0
+        while kept < i {
+          run List<Glyph>.append(&mut output, List<Glyph>.get(&buffer.glyphs, kept))
+          kept = kept + 1
+        }
+        materialized = true
+      }
+      let item = List<Glyph>.get(&buffer.glyphs, i)
+      if i + 1 < Buffer.len(&buffer.*) {
+        let next = List<Glyph>.get(&buffer.glyphs, i + 1)
+        if unicode.isVariationSelector(next.codepoint) {
+          if let Option<GlyphId>.Some { value: glyph } = ConfiguredShaper.variationGlyph(
+            font,
+            item.codepoint,
+            next.codepoint,
+          ) {
+            let mut combined = item
+            combined.info.glyphId = GlyphId.toU32(glyph)
+            run List<Glyph>.append(&mut output, combined)
+            i = i + 2
+            continue
+          }
+          let mut base = item
+          base.info.glyphId = ConfiguredShaper.glyphOrNotdef(font, item.codepoint)
+          let mut selector = next
+          selector.info.glyphId = ConfiguredShaper.glyphOrNotdef(font, next.codepoint)
+          selector.selectorFallback = true
+          if let Option<u32>.Some { value } = &buffer.notFoundVariationSelectorGlyph {
+            selector.ignorable = false
+          }
+          run List<Glyph>.append(&mut output, base)
+          run List<Glyph>.append(&mut output, selector)
+          i = i + 2
+          continue
+        }
+      }
+      let mut shortest = true
+      if isMark(item.codepoint)
+        || (i + 1 < Buffer.len(&buffer.*)
+          && isMark(List<Glyph>.asSlice(&buffer.glyphs)[i + 1].codepoint)) {
+        shortest = false
+      }
+      if buffer.shaper != 0 {
+        shortest = false
+      }
+      let before = List<Glyph>.length(&output)
+      if !run decompose(font, &mut output, item, shortest, 0, buffer.shaper) {
+        run List<Glyph>.append(&mut output, fallbackGlyph(font, &buffer.*, item))
+      }
+      if before == List<Glyph>.length(&output) {
+        run List<Glyph>.append(&mut output, item)
+      }
+      i = i + 1
+    }
+    if materialized {
+      buffer.glyphs = move output
+    }
+    drop run trace.message(font, &buffer.*, "end decompose")
+  } else {
+    let mut n: usize = 0
+    while n < Buffer.len(&buffer.*) {
+      let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+      slots[n].info.glyphId = 0
+      n = n + 1
+    }
+    allSimple = true
+  }
+  let mut i: usize = 0
+  if !allSimple && (run trace.message(font, &buffer.*, "start reorder")) {
+    // Sorting is bounded like Harfrust's MAX_COMBINING_MARKS (32).
+    i = 0
+    while i < Buffer.len(&buffer.*) {
+      if List<Glyph>.asSlice(&buffer.glyphs)[i].combiningClass == 0 {
+        i = i + 1
+        continue
+      }
+      let mut end = i + 1
+      while end < Buffer.len(&buffer.*)
+        && List<Glyph>.asSlice(&buffer.glyphs)[end].combiningClass != 0 {
+        end = end + 1
+      }
+      if end - i <= 32 {
+        let mut j = i + 1
+        while j < end {
+          let item = List<Glyph>.get(&buffer.glyphs, j)
+          let mut pos = j
+          while pos > i
+            && List<Glyph>.asSlice(&buffer.glyphs)[pos - 1].combiningClass > item.combiningClass {
+            pos = pos - 1
+          }
+          if pos != j {
+            Buffer.mergeClusters(&mut buffer, pos, j + 1)
+            let sorted = List<Glyph>.remove(&mut buffer.glyphs, j)
+            run List<Glyph>.insert(&mut buffer.glyphs, pos, sorted)
+          }
+          j = j + 1
+        }
+      }
+      if !buffer.dumber && end - i <= 32 {
+        run reorderMarks(&mut buffer, i, end)
+      }
+      i = end
+    }
+    drop run trace.message(font, &buffer.*, "end reorder")
+  }
+  let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+
+  // Decomposition never produces a CGJ, and a CGJ is a mark, so mark-free text has none.
+  i = 1
+  if markFree {
+    i = slots.length
+  }
+  while i + 1 < slots.length {
+    if slots[i].codepoint == 0x34f {
+      let next = slots[i + 1].combiningClass
+      if next == 0 || slots[i - 1].combiningClass <= next {
+        slots[i].hidden = false
+      }
+    }
+    i = i + 1
+  }
+  if allSimple || !run trace.message(font, &buffer.*, "start compose") {
+    return
+  }
+  let mut starter: usize = 0
+
+  // Only a mark that is the second half of some composition can compose, besides the
+  // Hebrew fallback and the Bengali nukta special case below.
+  let hebrew = !buffer.dumber && buffer.script == 0x48656272 && !hasGposMark
+  i = 1
+  while i < Buffer.len(&buffer.*) {
+    let glyphs = List<Glyph>.asSlice(&buffer.glyphs)
+    if !hebrew {
+      // Glyphs that cannot be the second half of a composition only move the starter.
+      while i < glyphs.length && glyphs[i].codepoint != 0x09bc
+        && !unicode.composesAsSecond(glyphs[i].codepoint) {
+        if glyphs[i].combiningClass == 0 {
+          starter = i
+        }
+        i = i + 1
+      }
+      if i == glyphs.length {
+        break
+      }
+    }
+    let cp = glyphs[i].codepoint
+    let combiningClass = glyphs[i].combiningClass
+    if (hebrew || cp == 0x09bc || unicode.composesAsSecond(cp)) && isMark(cp)
+      && (glyphs[i - 1].combiningClass < combiningClass || i == starter + 1) {
+      let baseCp = glyphs[starter].codepoint
+      let mut composed: u32 = 0
+
+      // Indic, Khmer and Myanmar shapers never compose onto a mark base.
+      if !((buffer.shaper == 1 || buffer.shaper == 2 || buffer.shaper == 4) && isMark(baseCp)) {
+        composed = unicode.composeRaw(baseCp, cp)
+        if composed == 0 && !buffer.dumber && buffer.script == 0x48656272 && !hasGposMark {
+          composed = hebrewCompose(baseCp, cp)
+        }
+      }
+      if buffer.shaper == 1 && baseCp == 0x09af && cp == 0x09bc {
+        composed = 0x09df
+      }
+      if composed != 0 {
+        let glyph = ConfiguredShaper.glyphFor(font, composed)
+        if ConfiguredShaper.mappedGlyphExists(font, composed, glyph) {
+          Buffer.mergeClusters(&mut buffer, starter, i + 1)
+          let mut changed = List<Glyph>.get(&buffer.glyphs, starter)
+          changed.codepoint = composed
+          changed.info.glyphId = glyph
+          List<Glyph>.set(&mut buffer.glyphs, starter, changed)
+          drop List<Glyph>.remove(&mut buffer.glyphs, i)
+          continue
+        }
+      }
+    }
+    if combiningClass == 0 {
+      starter = i
+    }
+    i = i + 1
+  }
+  drop run trace.message(font, &buffer.*, "end compose")
+}
+
+effect fn decompose<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  output: &mut List<Glyph>,
+  item: Glyph,
+  shortest: bool,
+  depth: usize,
+  shaper: u32,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let glyph = ConfiguredShaper.glyphFor(font, item.codepoint)
+  if shortest && ConfiguredShaper.mappedGlyphExists(font, item.codepoint, glyph) {
+    let mut mapped = item
+    mapped.info.glyphId = glyph
+    run List<Glyph>.append(&mut output, mapped)
+    return true
+  }
+  let parts = decompositionFor(item.codepoint, shaper)
+  if parts.first != 0 && depth < 32
+    && (parts.second == 0 || ConfiguredShaper.hasGlyph(font, parts.second)) {
+    let mut first = item
+    first.codepoint = parts.first
+    first.combiningClass = unicode.modifiedCombiningClass(parts.first)
+    if run decompose(font, &mut output, first, shortest, depth + 1, shaper) {
+      if parts.second != 0 {
+        let mut second = item
+        second.codepoint = parts.second
+        second.info.glyphId = ConfiguredShaper.glyphFor(font, parts.second)
+        second.combiningClass = unicode.modifiedCombiningClass(parts.second)
+        run List<Glyph>.append(&mut output, second)
+      }
+      return true
+    }
+  }
+  if ConfiguredShaper.mappedGlyphExists(font, item.codepoint, glyph) {
+    let mut mapped = item
+    mapped.info.glyphId = glyph
+    run List<Glyph>.append(&mut output, mapped)
+    return true
+  }
+  return false
+}
+
+fn decompositionFor(cp: u32, shaper: u32) -> unicode.Decomposition {
+  let mut parts = unicode.decomposeRaw(cp)
+  if shaper == 1 && (cp == 0x0931 || cp == 0x09dc || cp == 0x09dd || cp == 0x0b94) {
+    parts.first = 0
+  }
+  if shaper == 2 && (cp == 0x17be || cp == 0x17bf || cp == 0x17c0 || cp == 0x17c4 || cp == 0x17c5) {
+    parts.first = 0x17c1
+    parts.second = cp
+  }
+  return parts
+}
+
+// The glyph a code point maps to when decompose finds no decomposition: the 0x2011 to
+// 0x2010 and space fallbacks, else the not-found glyph.
+// A glyph id for a code point, and the space fallback to record when it is not 0.
+struct Mapped {
+  glyphId: u32,
+  space: u8,
+}
+
+impl Copy for Mapped {}
+
+impl Mapped {
+  fn apply(self: &Self, item: &mut Glyph) -> () with Intrinsic.inlineAlways() {
+    item.info.glyphId = self.glyphId
+    if self.space != 0 {
+      item.spaceFallback = self.space
+    }
+  }
+}
+
+fn fallbackGlyph<F: FontFuncs>(font: &ConfiguredShaper<F>, buffer: &Buffer, item: Glyph) -> Glyph {
+  let mut mapped = item
+  Mapped.apply(&fallbackMapping(font, buffer, item.codepoint), &mut mapped)
+  return mapped
+}
+
+fn fallbackMapping<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &Buffer,
+  codepoint: u32,
+) -> Mapped {
+  let mut cp = codepoint
+  if cp == 0x2011 && !ConfiguredShaper.hasGlyph(font, cp) {
+    cp = 0x2010
+  }
+  let mut result = Mapped { glyphId: ConfiguredShaper.glyphFor(font, cp), space: 0 }
+  if !ConfiguredShaper.mappedGlyphExists(font, cp, result.glyphId) {
+    let space = spaceType(codepoint)
+    result.glyphId = buffer.notFoundGlyph
+    if space != 0 {
+      result.glyphId = ConfiguredShaper.glyphFor(font, 32)
+      if !ConfiguredShaper.mappedGlyphExists(font, 32, result.glyphId) {
+        result.glyphId = GlyphId.toU32(
+          Buffer.getInvisibleGlyph(buffer) |> Option<GlyphId>.unwrapOr(GlyphId.new(0)),
+        )
+      }
+      if result.glyphId != 0 {
+        result.space = space
+      }
+    }
+  }
+  return result
+}
+
+// The glyph that the decompose step maps `cp` to when it stays one glyph, or `None` when it
+// might decompose into several glyphs. It matches decompose followed by fallbackGlyph.
+fn singleGlyph<F: FontFuncs>(
+  font: &ConfiguredShaper<F>,
+  buffer: &Buffer,
+  cp: u32,
+  shortest: bool,
+) -> Option<Mapped> {
+  let glyph = ConfiguredShaper.glyphFor(font, cp)
+  let exists = ConfiguredShaper.mappedGlyphExists(font, cp, glyph)
+  if !(shortest && exists) {
+    let parts = decompositionFor(cp, buffer.shaper)
+    if parts.first != 0 && (parts.second == 0 || ConfiguredShaper.hasGlyph(font, parts.second)) {
+      return Option<Mapped>.None
+    }
+  }
+  if exists {
+    return Option<Mapped>.some(Mapped { glyphId: glyph, space: 0 })
+  }
+  return Option<Mapped>.some(fallbackMapping(font, buffer, cp))
+}
+
+// No code point below U+0300 is a mark, so Latin text skips the category table.
+fn isMark(cp: u32) -> bool with Intrinsic.inlineAlways() {
+  return cp >= 0x300 && unicode.isMark(cp)
+}
+
+pub fn formClusters(buffer: &mut Buffer) -> () {
+  let count = Buffer.len(&buffer.*)
+  if count == 0 {
+    return
+  }
+  let mut start: usize = 0
+  let mut previousContinuation = false
+  let mut prev = List<Glyph>.asSlice(&buffer.glyphs)[0].codepoint
+  let mut i: usize = 1
+  while i < count {
+    let slots = List<Glyph>.asMutSlice(&mut buffer.glyphs)
+
+    // Glyphs below U+0300, and non-marks below U+200D, that do not follow a ZWJ
+    // each start their own cluster. When the open cluster has at most one glyph,
+    // closing it needs no merge, so such a run is marked without the general checks.
+    if i - start < 2 {
+      let first = i
+      while i < slots.length && prev != 0x200d {
+        let next = slots[i].codepoint
+        if next >= 0x300 && (next >= 0x200d || unicode.isMark(next)) {
+          break
+        }
+        prev = next
+        slots[i].continuation = false
+        i = i + 1
+      }
+      if i > first {
+        start = i - 1
+        previousContinuation = false
+        if i == count {
+          break
+        }
+      }
+    }
+    let cp = slots[i].codepoint
+    let mut continuation = prev == 0x200d && unicode.isExtendedPictographic(cp)
+
+    // Every other continuation is at or above U+0300.
+    if cp >= 0x300 && !continuation {
+      continuation = isMark(cp)
+        || (cp >= 0x200d
+          && (cp == 0x200d || (cp >= 0x1f3fb && cp <= 0x1f3ff) || (cp >= 0xe0020 && cp <= 0xe007f)
+            || (cp >= 0xff9e && cp <= 0xff9f)
+            || (cp >= 0x1f1e6 && cp <= 0x1f1ff && prev >= 0x1f1e6 && prev <= 0x1f1ff
+              && !previousContinuation)))
+    }
+    slots[i].continuation = continuation
+    if !continuation {
+      // A single glyph is already its own cluster.
+      if i - start >= 2 {
+        Buffer.mergeGraphemeClusters(&mut buffer, start, i)
+      }
+      start = i
+    }
+    previousContinuation = continuation
+    prev = cp
+    i = i + 1
+  }
+  if count - start >= 2 {
+    Buffer.mergeGraphemeClusters(&mut buffer, start, count)
+  }
+}
+
+pub fn nativeDirection(buffer: &mut Buffer) -> () with Intrinsic.inlineAlways() {
+  let mut rtl = unicode.isRtl(buffer.script)
+  if rtl && buffer.direction == Direction.LeftToRight {
+    let mut number = false
+    let mut letter = false
+    let mut i: usize = 0
+    while i < Buffer.len(&buffer.*) {
+      let cp = List<Glyph>.asSlice(&buffer.glyphs)[i].codepoint
+      let gc = unicode.generalCategory(cp)
+      number = number || gc == 13 || (cp >= 0x1f1e6 && cp <= 0x1f1ff)
+      letter = letter || (gc >= 5 && gc <= 9)
+      i = i + 1
+    }
+    if number && !letter {
+      rtl = false
+    }
+  }
+  let directionless = buffer.script == 0x48756e67 || buffer.script == 0x4974616c
+    || buffer.script == 0x52756e72
+    || buffer.script == 0x54666e67
+  let reverse = (Direction.isHorizontal(buffer.direction) && !directionless
+    && (buffer.direction == Direction.RightToLeft) != rtl)
+    || buffer.direction == Direction.BottomToTop
+  if reverse {
+    let length = Buffer.len(&buffer.*)
+    let mut start: usize = 0
+    let mut i: usize = 1
+    while i <= length {
+      if i == length || !List<Glyph>.asSlice(&buffer.glyphs)[i].continuation {
+        reverseRange(&mut buffer.glyphs, start, i)
+        start = i
+      }
+      i = i + 1
+    }
+    Buffer.reverse(&mut buffer)
+    buffer.direction = Direction.reverse(buffer.direction)
+  }
+}
+
+pub fn spaceType(cp: u32) -> u8 {
+  return match cp {
+    0x20 => 32
+    0xa0 => 32
+    0x2000 => 2
+    0x2001 => 1
+    0x2002 => 2
+    0x2003 => 1
+    0x2004 => 3
+    0x2005 => 4
+    0x2006 => 6
+    0x2007 => 33
+    0x2008 => 34
+    0x2009 => 5
+    0x200a => 16
+    0x202f => 35
+    0x205f => 36
+    0x3000 => 1
+    _ => 0
+  }
+}
+
+effect fn reorderMarks(buffer: &mut Buffer, start: usize, end: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if arabic.usesScript(buffer.script) {
+    let mut from = start
+    let mut i = start
+    let mut cc: u8 = 220
+    while cc <= 230 {
+      while i < end && List<Glyph>.asSlice(&buffer.glyphs)[i].combiningClass < cc {
+        i = i + 1
+      }
+      let mut j = i
+      while j < end {
+        let item = List<Glyph>.get(&buffer.glyphs, j)
+        if item.combiningClass != cc || !modifierMark(item.codepoint) {
+          break
+        }
+        j = j + 1
+      }
+      if i != j {
+        Buffer.mergeClusters(&mut buffer, from, j)
+        let count = j - i
+        let mut n: usize = 0
+        while n < count {
+          let mut item = List<Glyph>.remove(&mut buffer.glyphs, i + n)
+          item.combiningClass = 22
+          if cc == 230 {
+            item.combiningClass = 26
+          }
+          run List<Glyph>.insert(&mut buffer.glyphs, from + n, item)
+          n = n + 1
+        }
+        from = from + count
+        i = j
+      }
+      cc = cc + 10
+    }
+  } else if buffer.script == 0x48656272 {
+    let mut i = start
+    while i + 2 < end {
+      let a = List<Glyph>.asSlice(&buffer.glyphs)[i].combiningClass
+      let b = List<Glyph>.asSlice(&buffer.glyphs)[i + 1].combiningClass
+      let c = List<Glyph>.asSlice(&buffer.glyphs)[i + 2].combiningClass
+      if (a == unicode.modifiedCombiningClass(0x5b7) || a == unicode.modifiedCombiningClass(0x5b8))
+        && (b == unicode.modifiedCombiningClass(0x5b0)
+          || b == unicode.modifiedCombiningClass(0x5b4))
+        && (c == 22 || c == 220) {
+        Buffer.mergeClusters(&mut buffer, i + 1, i + 3)
+        reverseRange(&mut buffer.glyphs, i + 1, i + 3)
+        break
+      }
+      i = i + 1
+    }
+  }
+}
+
+fn modifierMark(cp: u32) -> bool {
+  return cp == 0x654 || cp == 0x655 || cp == 0x658 || cp == 0x6dc || cp == 0x6e3 || cp == 0x6e7
+    || cp == 0x6e8
+    || cp == 0x8ca
+    || cp == 0x8cb
+    || cp == 0x8cd
+    || cp == 0x8ce
+    || cp == 0x8cf
+    || cp == 0x8d3
+    || cp == 0x8f3
+}
+
+// Presentation forms deliberately excluded from Unicode NFC, needed by older
+// Hebrew fonts without OpenType mark positioning.
+pub fn hebrewCompose(a: u32, b: u32) -> u32 {
+  if b == 0x05b4 && a == 0x05d9 {
+    return 0xfb1d
+  }
+  if b == 0x05b7 {
+    if a == 0x05d9 {
+      return 0xfb1f
+    }
+    if a == 0x05d0 {
+      return 0xfb2e
+    }
+  }
+  if b == 0x05b8 && a == 0x05d0 {
+    return 0xfb2f
+  }
+  if b == 0x05b9 && a == 0x05d5 {
+    return 0xfb4b
+  }
+  if b == 0x05bc {
+    if a >= 0x05d0 && a <= 0x05ea {
+      let forms: [u32; 27] = [
+        0xfb30,
+        0xfb31,
+        0xfb32,
+        0xfb33,
+        0xfb34,
+        0xfb35,
+        0xfb36,
+        0,
+        0xfb38,
+        0xfb39,
+        0xfb3a,
+        0xfb3b,
+        0xfb3c,
+        0,
+        0xfb3e,
+        0,
+        0xfb40,
+        0xfb41,
+        0,
+        0xfb43,
+        0xfb44,
+        0,
+        0xfb46,
+        0xfb47,
+        0xfb48,
+        0xfb49,
+        0xfb4a,
+      ]
+      return forms[u32.toUsize(a - 0x05d0)]
+    }
+    if a == 0xfb2a {
+      return 0xfb2c
+    }
+    if a == 0xfb2b {
+      return 0xfb2d
+    }
+  }
+  if b == 0x05bf {
+    if a == 0x05d1 {
+      return 0xfb4c
+    }
+    if a == 0x05db {
+      return 0xfb4d
+    }
+    if a == 0x05e4 {
+      return 0xfb4e
+    }
+  }
+  if b == 0x05c1 {
+    if a == 0x05e9 {
+      return 0xfb2a
+    }
+    if a == 0xfb49 {
+      return 0xfb2c
+    }
+  }
+  if b == 0x05c2 {
+    if a == 0x05e9 {
+      return 0xfb2b
+    }
+    if a == 0xfb49 {
+      return 0xfb2d
+    }
+  }
+  return 0
+}

@@ -1,0 +1,179 @@
+//! Reusable-output Unicode workloads matching text/ucd/scripts/rust-ucd-bench.
+import ucd.bidi { BidiAnalysis, ParagraphDirection }
+import ucd.segmentation as Segmentation
+import ucd.line_break as LineBreak
+import ucd.line_break { LineOptions, BreakOpportunity }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.text.format { Format, ParseError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+enum Algorithm {
+  Bidi,
+  Line,
+  Grapheme,
+  Word,
+  Sentence
+}
+
+fn mix(hash: u64, value: u64) -> u64 with Intrinsic.inlineAlways() {
+  return u64.wrappingMultiply(hash ^ value, 1099511628211)
+}
+
+effect fn process() -> i32
+  ! OutOfMemoryError | HostInputError | FileError | WriterError
+  ? &mut Allocator | &mut HostInput | &mut FileSystem | &mut Writer {
+  let mut args = List<String>.make()
+  let count = run HostInput.argumentCount()
+  let mut i: usize = 1
+  while i < count {
+    if let Option<Bytes>.Some { value: raw } = run HostInput.argument(i) {
+      if let Result<String, InvalidUtf8>.Success { value: text } = move String.fromBytes(move raw) {
+        run args.append(move text)
+      } else {
+        return 2
+      }
+    }
+    i = i + 1
+  }
+  let values = args.asSlice()
+  if values.length == 1 && String.view(&values[0]) == "--version" {
+    run Writer.writeString("ucd_bench Unicode 18.0.0\n")
+    return 0
+  }
+  if values.length != 3 {
+    run Writer.writeString("Usage: ucd_bench bidi|line|grapheme|word|sentence FILE ITERATIONS\n")
+    return 2
+  }
+  let name = String.view(&values[0])
+  let mut algorithm = Algorithm.Bidi
+  if name == "bidi" {
+    algorithm = Algorithm.Bidi
+  } else if name == "line" {
+    algorithm = Algorithm.Line
+  } else if name == "grapheme" {
+    algorithm = Algorithm.Grapheme
+  } else if name == "word" {
+    algorithm = Algorithm.Word
+  } else if name == "sentence" {
+    algorithm = Algorithm.Sentence
+  } else {
+    return 2
+  }
+  let iterations = u32.parse(String.view(&values[2])) |> Result<u32, ParseError>.unwrapOr(0)
+  if iterations == 0 || iterations > 100000 {
+    return 2
+  }
+  let cwd = run HostInput.workingDirectory()
+  let base = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let file = String.view(&values[1])
+  let path = if String.startsWith(file, "/") {
+    run Path.fromBytes(String.utf8Bytes(file))
+  } else {
+    run Path.resolve(&base, file)
+  }
+  let input = run FileSystem.readFile(&path)
+  let text = Bytes.asSlice(&input)
+  if let Result<string, InvalidUtf8>.Failure { error: _ } = move String.fromUtf8(text) {
+    return 2
+  }
+  let mut positions = List<usize>.make()
+  let mut breaks = List<BreakOpportunity>.make()
+  let mut analysis = BidiAnalysis.make()
+  let mut checksum: u64 = 0
+  let mut boundaries: u64 = 0
+  let mut iteration: u32 = 0
+  while iteration < iterations {
+    let mut hash: u64 = 14695981039346656037
+    let mut amount: u64 = 0
+    match algorithm {
+      Algorithm.Bidi => {
+        run analysis.analyze(text, ParagraphDirection.Auto)
+        let runs = analysis.runs()
+        let mut runIndex: usize = 0
+        let mut at: usize = 0
+        while at < text.length {
+          if (text[at] & 0xc0) != 0x80 {
+            while runs[runIndex].end <= at {
+              runIndex = runIndex + 1
+            }
+            hash = mix(mix(hash, usize.toU64(at)), u8.toU64(runs[runIndex].unwrappedLevel))
+            amount = amount + 1
+          }
+          at = at + 1
+        }
+      }
+      Algorithm.Line => {
+        breaks.clear()
+        run LineBreak.breaks(text, LineOptions.make(), &mut breaks)
+        let result = breaks.asSlice()
+        let mut at: usize = 0
+        while at < result.length {
+          hash = mix(hash, usize.toU64(result[at].offset))
+          amount = amount + 1
+          at = at + 1
+        }
+      }
+      _ => {
+        positions.clear()
+        if algorithm == Algorithm.Grapheme {
+          run Segmentation.graphemes(text, &mut positions)
+        } else if algorithm == Algorithm.Word {
+          run Segmentation.words(text, &mut positions)
+        } else {
+          run Segmentation.sentences(text, &mut positions)
+        }
+        let result = positions.asSlice()
+        let mut at: usize = 0
+        while at < result.length {
+          hash = mix(hash, usize.toU64(result[at]))
+          amount = amount + 1
+          at = at + 1
+        }
+      }
+    }
+    checksum = u64.wrappingAdd(checksum, hash)
+    boundaries = u64.wrappingAdd(boundaries, amount)
+    iteration = iteration + 1
+  }
+  run Format.format("{checksum} {boundaries}\n", &.{ checksum: checksum, boundaries: boundaries })
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32
+  ! WriterError {
+  drop error
+  let mut writer = StderrWriter.make()
+  run Writer.writeString("ucd_bench: unable to process input\n")
+    |> Effect.provideMut<Writer>(&mut writer)
+  return 2
+}
+
+effect fn provided() -> i32
+  ! OutOfMemoryError | HostInputError | FileError | WriterError
+  ? &mut Allocator | &mut HostInput {
+  let mut files = run OsFileSystem.make("/")
+  let mut writer = StdoutWriter.make()
+  return run process() |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Writer>(&mut writer)
+}
+
+pub effect fn main() -> i32
+  ! WriterError
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(provided(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Run the SVG rendering gate; never builds GPU packages or reference renderers."""
+import argparse
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+# The SVG packages, with the XML and CSS packages they were written with.
+SVG_PACKAGES = ("text/xml", "css/style", "images/svg/geometry", "images/svg/image", "images/svg",
+                "images/svg/raster", "images/svg/filters", "images/svg/render", "images/svg/cli",
+                "images/svg/tests", "images/svg/bench")
+
+
+def run(*command):
+    print("+ " + " ".join(map(str, command)), flush=True)
+    subprocess.run(list(map(str, command)), cwd=ROOT, check=True)
+
+
+def native_target():
+    machine = {"arm64": "aarch64", "AMD64": "x86_64"}.get(platform.machine(), platform.machine())
+    suffix = {"Darwin": "apple-darwin", "Linux": "unknown-linux-gnu"}.get(platform.system())
+    if suffix is None or machine not in ("aarch64", "x86_64"):
+        raise ValueError(f"unsupported native gate host: {platform.system()} {machine}")
+    return f"{machine}-{suffix}"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--offline", action="store_true", help="verify existing caches without network access")
+    parser.add_argument("--skip-fetch", action="store_true", help="skip spec/suite cache checks for local source-only work")
+    args = parser.parse_args()
+    silk = os.environ.get("SILK", "silk")
+    python = sys.executable
+    packages = SVG_PACKAGES
+    vector = ROOT / "images/svg/vector/silk.toml"
+    clang = os.environ.get("SILK_CLANG", "")
+    if not Path(clang).is_absolute() or not Path(clang).is_file():
+        parser.error("SILK_CLANG must be the absolute path to Clang 22 or newer (see README)")
+    # Check only SVG tables here, not the font/UCD generators in font/scripts/generate.
+    generated = ("css/style/src/encoding_data.silk", "images/svg/src/url_idna_data.silk")
+    for generator in ("encodings", "idna"):
+        run(python, f"images/svg/scripts/generate-{generator}")
+    run(silk, "format", *generated)
+    changed = subprocess.check_output(
+        ["git", "status", "--porcelain", "--", *generated], cwd=ROOT, text=True)
+    if changed:
+        parser.exit(1, "Generated SVG output differs from the committed files:\n" + changed)
+    # Keep compiles serial: the font/shaping dependency closure can be memory-heavy.
+    for package in packages:
+        run(silk, "check", "--manifest-path", f"{package}/silk.toml")
+    run(silk, "build", "--manifest-path", vector)
+    for package in packages:
+        run(silk, "format", "--check", "--manifest-path", f"{package}/silk.toml")
+    for package in packages:
+        if (ROOT / package / "src/tests.silk").is_file():
+            run(silk, "test", "--manifest-path", f"{package}/silk.toml", "--root", "src/tests.silk")
+    run(silk, "test", "--manifest-path", vector, "--root", "src/tests.silk")
+    run(python, "-m", "unittest", "discover", "-s", "images/svg/bench", "-p", "test_*.py")
+    run(python, "-m", "unittest", "discover", "-s", "images/svg/scripts/tests", "-p", "test_*.py")
+    target = native_target()
+    run(silk, "build", "--release", "--manifest-path", "images/svg/cli/silk.toml", "--target", target)
+    binary = ROOT / "build/llvm" / target / "release/svg_cli"
+    renderer = [str(binary), "{input}", "-o", "{output}"]
+    reports = ROOT / "build/svg"
+    reports.mkdir(parents=True, exist_ok=True)
+    run(binary, "--help")
+    run(binary, "--version")
+    run(python, "images/svg/scripts/reftests", "--suite", "own", "--renderer", json.dumps(renderer),
+        "--report", reports / "own.json", "--diff-dir", reports / "own-diffs")
+    run(python, "images/svg/scripts/reftests", "--suite", "own",
+        "--manifest", "images/svg/tests/fixtures/css/manifest.json", "--renderer", json.dumps(renderer),
+        "--report", reports / "css.json", "--diff-dir", reports / "css-diffs")
+    run(python, "images/svg/scripts/reftests", "--suite", "own",
+        "--manifest", "images/svg/tests/fixtures/structure/manifest.json", "--renderer", json.dumps(renderer),
+        "--report", reports / "structure.json", "--diff-dir", reports / "structure-diffs")
+    run(python, "images/svg/scripts/reftests", "--suite", "own",
+        "--manifest", "images/svg/tests/fixtures/painting/manifest.json", "--renderer", json.dumps(renderer),
+        "--report", reports / "painting.json", "--diff-dir", reports / "painting-diffs")
+    run(python, "images/svg/scripts/reftests", "--suite", "own", "--malformed", "--renderer", json.dumps(renderer),
+        "--report", reports / "malformed.json", "--diff-dir", reports / "malformed-diffs")
+    if not args.skip_fetch:
+        offline = ["--offline"] if args.offline else []
+        run(python, "images/svg/scripts/fetch-specs.py", "--only", "svg2-coords", "svg2-paths", "svg2-conform", *offline)
+        run(python, "images/svg/scripts/fetch-suites", *offline)
+        run(python, "images/svg/scripts/reftests", "--renderer", json.dumps(renderer + ["--width", "300"]),
+            "--report", reports / "resvg-curated.json", "--diff-dir", reports / "resvg-curated-diffs")
+    print("SVG rendering gate passed." + (" External references skipped by request." if args.skip_fetch else ""))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(error.returncode)
