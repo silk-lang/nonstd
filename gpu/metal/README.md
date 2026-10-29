@@ -1,4 +1,6 @@
-# Metal for Silk
+# gpu-metal
+
+Metal for Silk, for programs that talk to Apple GPUs directly.
 
 A low-level Silk port of [gfx-rs/metal-rs](https://github.com/gfx-rs/metal-rs), pinned to [`e47bc888d3837f85ea8b01c9e66ccf73236293b9`](https://github.com/gfx-rs/metal-rs/tree/e47bc888d3837f85ea8b01c9e66ccf73236293b9).
 
@@ -6,14 +8,14 @@ The port maps all 1,216 explicitly declared upstream public methods, including h
 
 Silk calls a compiled Objective-C bridge. There is **no Rust dependency**. The bridge handles Objective-C messaging and blocks; C-layout records now cross Silk's C ABI directly by value. The public interface is deliberately unsafe: object types, pointer extents, API availability, encoder state, resource synchronization, and callback lifetimes remain caller obligations.
 
-## Build
+## Build and test
 
-Requirements:
+From `gpu/metal`, with:
 
 - Apple Silicon macOS with a Metal device.
 - Xcode/macOS SDK 15.4 or newer for the complete declaration surface.
-- Silk `0.1.0-dev.29+94cf9559bf47`, pinned by the nonstd workspace (`scripts/install-silk` at the repository root installs it).
-- LLVM 22 clang for Silk's LLVM output (`SILK_CLANG`; `scripts/install-llvm` at the repository root finds or installs one); `xcrun clang` compiles the Objective-C bridge.
+- Silk `0.1.0-dev.29+94cf9559bf47`, as pinned by the workspace.
+- LLVM 22 clang for Silk's LLVM output (`SILK_CLANG`); `xcrun clang` compiles the Objective-C bridge.
 - `make`; Python 3.9+ only for inventory checks or regeneration.
 
 ```sh
@@ -36,33 +38,7 @@ Verified on Apple M1 Max with macOS SDK 15.4 and the pinned Silk toolchain: all 
 
 The dev.17 migration also passed a temporary debug/release ABI smoke harness: direct SDK queries matched `MTLSize`, `MTLSizeAndAlign`, and `MTLResourceID` results; `CGSize` passed and returned both double fields; an `NSRange` GPU fill changed exactly the requested bytes without consuming the input value.
 
-## Use from another Silk package
-
-Silk currently **does not propagate native link inputs from dependencies** ([silk-lang/silk#2595](https://github.com/silk-lang/silk/issues/2595)). Build the bridge and copy the archive beneath the consuming manifest, since native input paths cannot contain `..`:
-
-```sh
-make native
-mkdir -p /path/to/app/native
-cp native/build/libsilkmetal.a /path/to/app/native/
-```
-
-In the consuming `silk.toml`:
-
-```toml
-[dependencies]
-metal = { path = "../nonstd/gpu/metal", package = "gpu-metal" }
-
-[native]
-link = [
-  { static-archive = "native/libsilkmetal.a" },
-  { framework = "Foundation" },
-  { framework = "Metal" },
-  { framework = "QuartzCore" },
-  { framework = "MetalPerformanceShaders" },
-]
-```
-
-The example Makefile targets perform this copy automatically. Recopy the archive after changing or rebuilding the bridge. The root `silk build` creates a static archive containing the declared native objects; ordinary Silk consumers compile the exported `.silk` modules from source.
+## Example
 
 ```silk
 import metal.device { Device }
@@ -84,6 +60,12 @@ pub fn main() -> i32 {
   return 0
 }
 ```
+
+Silk does not yet pass native link inputs on from dependencies
+([silk-lang/silk#2595](https://github.com/silk-lang/silk/issues/2595)). A program using this
+package must therefore link `libsilkmetal.a` (built by `make native`) and the Foundation, Metal,
+QuartzCore and MetalPerformanceShaders frameworks in its own `[native]` section. The manifests
+in `examples/` show the exact list.
 
 ## Modules
 
@@ -125,23 +107,7 @@ String getters expose NSString's UTF-8 storage without the upstream UTF-16-lengt
 
 Callback context must remain valid until Metal finishes using it, including asynchronous notification and buffer deallocation. Callbacks can run on Metal/dispatch threads. Do not suspend, unwind, or perform unsynchronized access to shared storage. An unretained-reference command buffer additionally requires every referenced resource to outlive GPU execution.
 
-### Migrating from the dev.14 port
-
-The dev.17 update changes 47 binding methods to use record values rather than single-record pointers or output parameters. For example:
-
-```silk
-ComputeCommandEncoder.dispatch_threads(encoder, grid, group)
-RenderPassColorAttachmentDescriptor.set_clear_color(attachment, clear)
-let stored_clear = unsafe RenderPassColorAttachmentDescriptor.clear_color(attachment)
-let dimensions = unsafe Device.max_threads_per_threadgroup(device)
-```
-
-Invoke the first two unsafe calls inside an `unsafe` block, or prefix each with `unsafe`. Records implement `Copy`, so passing one does not consume it. Arrays of records, raw byte buffers, NSError/reflection outputs, and optional scalar outputs still use pointers.
-
-Update manifests from `package.root`/`source-root` to `package.source` and `package.main` (relative to `source`), from `build.artifact` to `package.kind`, and from `build.native-link-inputs` to `[native].link`. Multi-field struct declarations now require comma separators.
-
-Rebuild the native archive and every consuming executable together: the old pointer-based C signatures are not ABI-compatible with the new value signatures. No legacy adapters are retained.
-
+[Migrating from the dev.14 port](docs/migrating-from-dev14.md) covers the record-by-value ABI change.
 
 ## Deliberate corrections and adaptations
 

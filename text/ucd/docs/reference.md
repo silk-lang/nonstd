@@ -1,4 +1,7 @@
-# ucd
+# text-ucd reference
+
+The full reference for [text-ucd](../README.md) (imported as `ucd`): data generation, every
+property query, the text algorithms, shaping policies, conformance and benchmarks.
 
 `ucd` is the font-independent Unicode data package, imported as `ucd.lib`.
 It exposes typed character properties and raw canonical composition queries.

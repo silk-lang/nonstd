@@ -1,48 +1,45 @@
 # nonstd
 
-Experimental Silk packages that live outside the standard library. Each one tests how far the
-language goes for a kind of API. Nothing here is stable.
+Silk libraries that live outside the standard library: fonts, text, CSS, images and GPUs. They
+are grouped by area, and every package is a member of one workspace that pins Silk
+`0.1.0-dev.29+94cf9559bf47` (`toolchains.lock.json`). Nothing here is stable yet.
 
-| Package | What it is |
-| --- | --- |
-| [`packages/cli`](packages/cli) | Declarative command-line parsing, planned during compilation |
+## Libraries
 
-Examples that use the packages are in [`examples`](examples).
+| Path | Package | What it is |
+| --- | --- | --- |
+| [`font/types`](font/types) | `font-types` | The scalar types OpenType tables are built from |
+| [`font/parse`](font/parse) | `font-parse` | Font file parsing and a font model (outlines, metrics, charmaps); a port of read-fonts and skrifa |
+| [`font/shape`](font/shape) | `font-shape` | Text shaping; a port of harfrust |
+| [`text/ucd`](text/ucd) | `text-ucd` | Unicode 18 properties, bidi, line breaking and segmentation |
+| [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser |
+| [`css/style`](css/style) | `css-style` | CSS parsing, selectors and the cascade |
+| [`css/layout`](css/layout) | `css-layout` | Block, inline, flex and grid layout |
+| [`images/svg`](images/svg) | `images-svg` | An SVG renderer written from the specifications |
+| [`images/svg/vector`](images/svg/vector) | `images-svg-vector` | A pure-Silk 2D rasterizer |
+| [`images/svg/gpu_scene`](images/svg/gpu_scene) | `images-svg-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU output |
+| [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
+| [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
+| [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
 
-## Layout
+Each library's README lists its helper packages (command-line tools, benchmarks, test runners).
+Package names follow their paths, with hyphens. `text/ucd`, `text/xml` and `packages/cli` are
+headed for the standard library.
 
-Packages are grouped by area. Each leaf folder is one Silk package, and every package is a member
-of the root workspace.
-
-| Area | Packages |
-| --- | --- |
-| `font/` | font parsing (`font/parse`) and text shaping (`font/shape`) |
-| `gpu/` | WebGPU (`gpu/webgpu`) and Metal (`gpu/metal`) bindings |
-| `images/` | SVG (`images/svg`) |
-| `css/` | CSS layout (`css/layout`) and other CSS building blocks |
-| `packages/` | packages headed for the standard library (`cli`) |
-
-These areas are being filled by moving the code from julia-script/read-fonts,
-julia-script/silk-gpu and silk-lang/silk-layout.
+Programs that use `cli` are in [`examples`](examples).
 
 ## Working in the workspace
 
-The workspace and every member pin Silk `0.1.0-dev.29+94cf9559bf47` (`toolchains.lock.json`).
-`scripts/install-silk` downloads it, checks it against the published checksums and prints its
-`bin` directory. Silk also needs an LLVM 22 `clang`: set `SILK_CLANG` to it, or run
-`scripts/install-llvm` to find or download one.
+The workspace builds into `build/` at the root. Commands run from the root unless a README says
+otherwise:
 
 ```sh
-export PATH="$(scripts/install-silk):$PATH"
-export SILK_CLANG="$(scripts/install-llvm)"
+silk test --manifest-path packages/cli/silk.toml --root src/tests.silk
+silk run --manifest-path examples/greet/silk.toml -- --name Julia --times 2
 ```
 
-Project commands run inside a member directory:
+Each area has its own gate script and CI workflow, for example
+`images/svg/scripts/check`, `gpu/webgpu/scripts/check` and `css/layout/scripts/check`.
 
-```sh
-cd packages/cli && silk test --root src/tests.silk
-cd examples/greet && silk run -- --name Julia --times 2
-```
-
-To add a package, run `silk init <area>/<name> --lib` from the workspace root. It is added to
-`members` in `silk.toml`.
+To add a package, run `silk init <area>/<name> --lib` from the root. It is added to `members` in
+`silk.toml`.
