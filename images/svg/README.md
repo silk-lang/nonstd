@@ -17,7 +17,8 @@ coverage.
   viewport boundaries.
 - **Paint:** solid colours, linear and radial gradients, patterns, markers, context paint,
   `paint-order`, `vector-effect`, opacity groups, linear-RGB compositing and `pathLength`
-  dashes.
+  dashes. All separable and non-separable `mix-blend-mode` values and explicit
+  `isolation` are consumed by the CPU layer executor.
 
 General clipping and masking, filters, image decoding, text, animation and ICC colour are planned
 later phases. [Status](docs/status.md) describes what each phase delivered.

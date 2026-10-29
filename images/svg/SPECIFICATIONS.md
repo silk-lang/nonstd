@@ -395,6 +395,20 @@ merely because an element references a paint server. Rendering-hint parsing
 remains separate from image/text consumers in their later implementation phases.
 
 
+### Compositing groups
+
+The [SVG compositing rules](https://www.w3.org/TR/compositing-1/#svgcompositing)
+and [isolation property](https://www.w3.org/TR/compositing-1/#isolation) govern
+backdrop boundaries. Explicit isolation, opacity below one, non-normal blending,
+and specified 3D transforms create transparent intermediate surfaces. A specified
+3D identity retains this boundary even when its flattened matrix is affine;
+ordinary 2D transforms do not create a boundary. The retained `BlendMode` enum
+maps to the shared vector compositor only at execution. Group opacity applies
+once when the surface is composited into its parent.
+
+Clipping, masking, filters and their additional isolation behavior remain under
+implementation; these tests do not complete the combined coverage item below.
+
 ## Section-level coverage checklist
 
 Use this as the coverage map. Each line becomes tests before code. ✓ means done in a merged PR. Keep it updated in `SPECIFICATIONS.md`, not in a separate progress file. Section numbers are SVG 2 unless marked 1.1.
