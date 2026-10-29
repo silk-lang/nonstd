@@ -1,0 +1,1587 @@
+//! Paints: solid colors, linear and radial gradients, and image patterns.
+//!
+//! A paint is a [`Shader`]: it returns the premultiplied color at a device pixel center. Gradient
+//! and image paints carry the transform from their own space to device space (the caller folds in
+//! `gradientTransform`, `patternTransform`, `objectBoundingBox` units and the CTM) and sample at
+//! `(x + 0.5, y + 0.5)` mapped back through its inverse.
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.i64
+import silk.num.i32
+import silk.core.option { Option }
+import strips { Coverage, BAND, minU32 }
+import geometry { Affine, Point }
+import projective { Homography }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT }
+import color_space as colorSpace
+import pixmap {
+  Pixmap,
+  Rgba8,
+  div255,
+  over,
+  overPacked,
+  overSpan,
+  overMaskedFour,
+  pack,
+  unpack,
+  scalePacked,
+  storePacked,
+}
+import silk.simd.u8x16
+import silk.simd.u16x16
+import silk.simd.u32x4
+import silk.simd.f32x4
+import silk.simd.i32x4
+
+pub interface Shader {
+  /// The premultiplied color at the center of device pixel `(x, y)`.
+  fn shade(self: &Self, x: u32, y: u32) -> Rgba8
+
+  /// Packed premultiplied colors (see [`pack`]) of pixels `x .. x + count` on row `y` into
+  /// `out[0 .. count]`.
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> ()
+
+  /// Whether every pixel has the same color, so [`fill`] can composite `shade(0, 0)` without
+  /// shading spans.
+  fn isUniform(self: &Self) -> bool
+}
+
+/// One premultiplied color everywhere.
+pub struct Solid {
+  pub color: Rgba8,
+}
+
+impl Copy for Solid {}
+
+impl Solid {
+  /// A solid paint from a straight-alpha color.
+  pub fn make(color: Rgba8) -> Solid {
+    return Solid { color: color.premultiply() }
+  }
+}
+
+impl Shader for Solid {
+  fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
+    return self.color
+  }
+
+  fn isUniform(self: &Self) -> bool {
+    return true
+  }
+
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    let word = pack(self.color)
+    let mut i: usize = 0
+    while i < count {
+      out[i] = word
+      i = i + 1
+    }
+  }
+}
+
+pub const SPREAD_PAD: u8 = 0
+
+pub const SPREAD_REFLECT: u8 = 1
+
+pub const SPREAD_REPEAT: u8 = 2
+
+const LINEAR: u8 = 0
+
+const RADIAL: u8 = 1
+
+/// Gradient colors are tabulated at this many evenly spaced offsets.
+pub const RAMP_SIZE: usize = 1024
+
+/// A gradient stop with a straight-alpha color (stop-color with stop-opacity folded in).
+pub struct Stop {
+  pub offset: f64,
+  pub color: Rgba8,
+}
+
+impl Copy for Stop {}
+
+/// A linear or two-point conical radial gradient (SVG 2 §14.3).
+pub struct Gradient {
+  kind: u8,
+  x0: f64,
+  y0: f64,
+  r0: f64,
+  x1: f64,
+  y1: f64,
+  r1: f64,
+  spread: u8,
+  inverse: Affine,
+  projective: bool,
+  homography: Homography,
+  valid: bool,
+  /// True for one stop or a degenerate linear vector, never merely a zero radial radius.
+  single: bool,
+  tangent: bool,
+  premultipliedInterpolation: bool,
+  linearRgbInterpolation: bool,
+  ramp: List<u8>,
+}
+
+// Distinguish a singular map (SVG paint-none) from an unrepresentable inverse.
+effect fn paintInverse(h: &Homography) -> Option<Homography>
+  ! GeometryError {
+  if !h.isFinite() {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  if let Option<Homography>.Some { value: inverse } = h.inverse() {
+    return Option<Homography>.some(inverse)
+  }
+  let sx = f64.max(f64.abs(h.xx), f64.max(f64.abs(h.xy), f64.abs(h.xw)))
+  let sy = f64.max(f64.abs(h.yx), f64.max(f64.abs(h.yy), f64.abs(h.yw)))
+  let sw = f64.max(f64.abs(h.wx), f64.max(f64.abs(h.wy), f64.abs(h.ww)))
+  if sx == 0.0 || sy == 0.0 || sw == 0.0 {
+    return Option<Homography>.none()
+  }
+
+  // Only this failure path needs an exact determinant: cancellation in a
+  // floating determinant must not misclassify a nonsingular map as paint-none.
+  let scales = [rowPower(sx), rowPower(sy), rowPower(sw)]
+  let original = [h.xx, h.xy, h.xw, h.yx, h.yy, h.yw, h.wx, h.wy, h.ww]
+  let mut m: [f64; 9] = [0.0; 9]
+  let mut i: usize = 0
+  while i < 9 {
+    m[i] = original[i] / scales[i / 3]
+    if m[i] * scales[i / 3] != original[i] {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    i = i + 1
+  }
+  let permutations: [usize; 18] = [0, 4, 8, 1, 5, 6, 2, 3, 7, 2, 4, 6, 1, 3, 8, 0, 5, 7]
+  let mut expansion: [f64; 24] = [0.0; 24]
+  let mut length: usize = 0
+  i = 0
+  while i < 6 {
+    let a = m[permutations[i * 3]]
+    let b = m[permutations[i * 3 + 1]]
+    let c = m[permutations[i * 3 + 2]]
+      * if i < 3 {
+        1.0
+      } else {
+        -1.0
+      }
+    let ab = run exactPaintProduct(a, b)
+    let high = run exactPaintProduct(ab[0], c)
+    let low = run exactPaintProduct(ab[1], c)
+    length = addPaintExpansion(&mut expansion, length, low[1])
+    length = addPaintExpansion(&mut expansion, length, low[0])
+    length = addPaintExpansion(&mut expansion, length, high[1])
+    length = addPaintExpansion(&mut expansion, length, high[0])
+    i = i + 1
+  }
+  if length == 0 {
+    return Option<Homography>.none()
+  }
+  fail GeometryError { code: NUMERIC_LIMIT }
+}
+
+fn rowPower(maximum: f64) -> f64 {
+  let bits = f64.toBits(maximum) & 0x7ff0000000000000
+  return f64.fromBits(
+    if bits == 0 {
+      0x0010000000000000
+    } else {
+      bits
+    },
+  )
+}
+
+// Dekker's error-free product. The normalized operands are bounded by two;
+// refuse tiny intermediate products rather than losing their residual bits.
+effect fn exactPaintProduct(a: f64, b: f64) -> [f64; 2]
+  ! GeometryError {
+  if a == 0.0 || b == 0.0 {
+    return [0.0, 0.0]
+  }
+  let product = a * b
+  if f64.abs(product) < 1.0e-250 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let sa = 134217729.0 * a
+  let sb = 134217729.0 * b
+  let ah = sa - (sa - a)
+  let bh = sb - (sb - b)
+  let al = a - ah
+  let bl = b - bh
+  let error = ((ah * bh - product) + ah * bl + al * bh) + al * bl
+  return [product, error]
+}
+
+// Grow an exact nonoverlapping expansion, eliminating zero components.
+fn addPaintExpansion(e: &mut [f64; 24], length: usize, value: f64) -> usize {
+  let mut sum = value
+  let mut out: usize = 0
+  let mut i: usize = 0
+  while i < length {
+    let next = sum + e[i]
+    let virtual = next - sum
+    let error = (sum - (next - virtual)) + (e[i] - virtual)
+    if error != 0.0 {
+      e[out] = error
+      out = out + 1
+    }
+    sum = next
+    i = i + 1
+  }
+  if sum != 0.0 {
+    e[out] = sum
+    out = out + 1
+  }
+  return out
+}
+
+/// Canonical f32 inverse for native scene sampling: a b c d e f wx wy ww.
+/// Rejects lost nonzero coefficients, subnormals (WGSL may flush them), and
+/// singular rounded matrices. Common positive scaling preserves the mapping.
+/// This is an f32 sampling contract, not a browser byte-parity guarantee.
+pub effect fn packInverseHomography(h: &Homography) -> [f32; 9]
+  ! GeometryError {
+  if !h.isFinite() {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let values = [h.xx, h.yx, h.xy, h.yy, h.xw, h.yw, h.wx, h.wy, h.ww]
+  let mut scale = 0.0
+  let mut i: usize = 0
+  while i < 9 {
+    scale = f64.max(scale, f64.abs(values[i]))
+    i = i + 1
+  }
+  if scale == 0.0 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let mut packed: [f32; 9] = [0.0; 9]
+  let mut rounded: [f64; 9] = [0.0; 9]
+  i = 0
+  while i < 9 {
+    let value = values[i] / scale
+    let narrow = f64.toF32(value)
+    if !f32.isFinite(narrow) || (values[i] != 0.0 && f32.abs(narrow) < 1.17549435e-38) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    packed[i] = narrow
+    rounded[i] = f32.toF64(narrow)
+    i = i + 1
+  }
+  let a = rounded[0] * (rounded[3] * rounded[8] - rounded[5] * rounded[7])
+  let b = rounded[2] * (rounded[5] * rounded[6] - rounded[1] * rounded[8])
+  let c = rounded[4] * (rounded[1] * rounded[7] - rounded[3] * rounded[6])
+  if f64.abs(a + b + c) <= 7.105427357601002e-15 * (f64.abs(a) + f64.abs(b) + f64.abs(c)) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  return packed
+}
+
+fn clamp01(value: f64) -> f64 {
+  return f64.min(f64.max(value, 0.0), 1.0)
+}
+
+impl Gradient {
+  fn make(
+    kind: u8,
+    x0: f64,
+    y0: f64,
+    r0: f64,
+    x1: f64,
+    y1: f64,
+    r1: f64,
+    spread: u8,
+    transform: &Affine,
+  ) -> Gradient {
+    let mut inverse = Affine.identity()
+    let mut valid = false
+    if let Option<Affine>.Some { value: found } = transform.invert() {
+      inverse = found
+      valid = true
+    }
+    return Gradient {
+      kind: kind,
+      x0: x0,
+      y0: y0,
+      r0: r0,
+      x1: x1,
+      y1: y1,
+      r1: r1,
+      spread: spread,
+      inverse: inverse,
+      projective: false,
+      homography: Homography.fromAffine(&inverse),
+      valid: valid,
+      single: false,
+      premultipliedInterpolation: false,
+      tangent: kind == RADIAL && r0 != r1
+        && (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) == (r1 - r0) * (r1 - r0),
+      linearRgbInterpolation: false,
+      ramp: List<u8>.make(),
+    }
+  }
+
+  /// A linear gradient from `(x1, y1)` to `(x2, y2)` in gradient space; `transform` maps gradient
+  /// space to device space.
+  pub fn linear(x1: f64, y1: f64, x2: f64, y2: f64, spread: u8, transform: &Affine) -> Gradient {
+    let mut g = Gradient.make(LINEAR, x1, y1, 0.0, x2, y2, 0.0, spread, transform)
+    g.single = x1 == x2 && y1 == y2
+    return move g
+  }
+
+  /// A radial gradient from the focal circle `(fx, fy, fr)` to the end circle `(cx, cy, r)`, the
+  /// SVG 2 two-point conical form: a focal circle outside the end circle makes a cone, and points
+  /// outside it stay transparent. SVG 1.1's focal-point clamping is the caller's choice.
+  pub fn radial(
+    cx: f64,
+    cy: f64,
+    r: f64,
+    fx: f64,
+    fy: f64,
+    fr: f64,
+    spread: u8,
+    transform: &Affine,
+  ) -> Gradient {
+    return Gradient.make(RADIAL, fx, fy, fr, cx, cy, r, spread, transform)
+  }
+
+  /// A linear gradient with true inverse homogeneous pixel-center mapping.
+  /// Singular transforms paint nothing; nonfinite or unrepresentable inverses fail explicitly.
+  pub effect fn linearProjective(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    spread: u8,
+    transform: &Homography,
+  ) -> Gradient
+    ! GeometryError {
+    let mut g = Gradient.linear(x1, y1, x2, y2, spread, &Affine.identity())
+    run g.setProjective(transform)
+    return move g
+  }
+
+  /// The SVG 2 two-circle radial gradient under a projective transform.
+  pub effect fn radialProjective(
+    cx: f64,
+    cy: f64,
+    r: f64,
+    fx: f64,
+    fy: f64,
+    fr: f64,
+    spread: u8,
+    transform: &Homography,
+  ) -> Gradient
+    ! GeometryError {
+    let mut g = Gradient.radial(cx, cy, r, fx, fy, fr, spread, &Affine.identity())
+    run g.setProjective(transform)
+    return move g
+  }
+
+  /// Changes the paint-to-device map without allocating or rebuilding the ramp.
+  /// A singular map paints transparently; a later invertible map restores painting.
+  pub fn setTransform(self: &mut Self, transform: &Affine) -> () {
+    self.projective = false
+    self.valid = false
+    self.inverse = Affine.identity()
+    if let Option<Affine>.Some { value: inverse } = transform.invert() {
+      self.inverse = inverse
+      self.valid = true
+    }
+    self.homography = Homography.fromAffine(&self.inverse)
+  }
+
+  /// Projective counterpart of `setTransform`. A failed numeric check leaves the
+  /// paint invalid; the ramp is retained and either setter can restore validity.
+  pub effect fn setProjective(self: &mut Self, transform: &Homography) -> ()
+    ! GeometryError {
+    self.projective = true
+    self.valid = false
+    if let Option<Homography>.Some { value: inverse } = run paintInverse(transform) {
+      self.homography = inverse
+      self.valid = true
+    }
+  }
+
+  pub fn isProjective(self: &Self) -> bool {
+    return self.projective
+  }
+
+  /// Device-to-paint homogeneous map; also valid for affine paints.
+  pub fn inverseHomography(self: &Self) -> Homography {
+    return self.homography
+  }
+
+  /// Interpolate premultiplied colors (CSS Images 3) instead of straight colors (resvg, Skia's
+  /// SVG default). Call before [`setStops`].
+  pub fn setPremultipliedInterpolation(self: &mut Self, premultiplied: bool) -> () {
+    self.premultipliedInterpolation = premultiplied
+  }
+
+  /// Decode sRGB stops to linear light for interpolation, then encode the shared ramp back
+  /// to premultiplied sRGB RGBA8. Independent of alpha interpolation; call before `setStops`.
+  pub fn setLinearRgbInterpolation(self: &mut Self, linearRgb: bool) -> () {
+    self.linearRgbInterpolation = linearRgb
+  }
+
+  pub fn isRadial(self: &Self) -> bool {
+    return self.kind == RADIAL
+  }
+
+  /// True when the gradient paints its last stop everywhere.
+  pub fn isSingle(self: &Self) -> bool {
+    return self.single
+  }
+
+  /// Whether the ramp appends an exact tangent-cone limiting color at `RAMP_SIZE`.
+  pub fn hasTangentLimit(self: &Self) -> bool {
+    return self.tangent && !self.single
+  }
+
+  pub fn spreadMode(self: &Self) -> u8 {
+    return self.spread
+  }
+
+  /// Device-to-gradient transform for affine paints (`!isProjective()`).
+  /// Projective consumers must use [`inverseHomography`], including its denominator.
+  pub fn inverseTransform(self: &Self) -> Affine {
+    return self.inverse
+  }
+
+  /// Linear: `x1 y1 0 x2 y2 0`. Radial: `fx fy fr cx cy r`.
+  pub fn geometry(self: &Self) -> [f64; 6] {
+    return [self.x0, self.y0, self.r0, self.x1, self.y1, self.r1]
+  }
+
+  /// The premultiplied RGBA8 ramp: `RAMP_SIZE` entries, plus one if `hasTangentLimit`.
+  pub fn rampBytes(self: &Self) -> &[u8] {
+    return self.ramp.asSlice()
+  }
+
+  /// True once stops are set and the transform is invertible.
+  pub fn isPaintable(self: &Self) -> bool {
+    return self.valid && self.ramp.length() > 0
+  }
+
+  /// Tabulates `stops`. Offsets are clamped to `0..=1` and made non-decreasing (SVG 2 §14.4);
+  /// equal offsets make a hard edge. No stops leaves the gradient unpaintable (paint `none`); one
+  /// stop paints its color everywhere.
+  pub effect fn setStops(self: &mut Self, stops: &[Stop]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.ramp.clear()
+    self.single = stops.length == 1
+      || (self.kind == LINEAR && self.x0 == self.x1 && self.y0 == self.y1)
+    if stops.length == 0
+      || (!self.single && self.kind == RADIAL && self.x0 == self.x1 && self.y0 == self.y1
+        && self.r0 == self.r1) {
+      return
+    }
+    let tangent = self.hasTangentLimit()
+    let entries = if tangent {
+      RAMP_SIZE + 1
+    } else {
+      RAMP_SIZE
+    }
+    run self.ramp.appendRepeated(0, entries * 4)
+    let ramp = self.ramp.asMutSlice()
+    let first = pack(stops[0].color.premultiply())
+    let last = pack(stops[stops.length - 1].color.premultiply())
+    let step = 1.0 / usize.toF64(RAMP_SIZE - 1)
+
+    // `segment` is the first stop whose fixed-up offset `hi` exceeds t; `lo` is the one before it.
+    let mut segment: usize = 0
+    let mut lo = clamp01(stops[0].offset)
+    let mut hi = lo
+    let mut i: usize = 0
+    while i < RAMP_SIZE {
+      let t = usize.toF64(i) * step
+      while segment < stops.length && hi <= t {
+        segment = segment + 1
+        lo = hi
+        if segment < stops.length {
+          hi = f64.max(hi, clamp01(stops[segment].offset))
+        }
+      }
+      if self.single || segment == stops.length {
+        storePacked(&mut ramp, i * 4, last)
+        i = i + 1
+      } else if segment == 0 {
+        storePacked(&mut ramp, i * 4, first)
+        i = i + 1
+      } else {
+        // Entries up to `hi` interpolate this segment; step the weight in 32-bit fixed point.
+        // Here lo <= t < hi, so the span is positive.
+        let left = stops[segment - 1].color
+        let right = stops[segment].color
+        let span = hi - lo
+        if self.linearRgbInterpolation {
+          let a = linearStop(left, self.premultipliedInterpolation)
+          let b = linearStop(right, self.premultipliedInterpolation)
+          while i < RAMP_SIZE && usize.toF64(i) * step < hi {
+            let weight = (usize.toF64(i) * step - lo) / span
+            storePacked(
+              &mut ramp,
+              i * 4,
+              pack(mixLinear(&a, &b, weight, self.premultipliedInterpolation)),
+            )
+            i = i + 1
+          }
+          continue
+        }
+        let mut w = Intrinsic.f64ToU64((t - lo) / span * 4294967296.0)
+        let dw = Intrinsic.f64ToU64(step / span * 4294967296.0)
+        while i < RAMP_SIZE && usize.toF64(i) * step < hi {
+          let rounded = u64.shiftRight(w + 32768, 16)
+          let wb = if rounded < 65536 {
+            u64.wrappingToU32(rounded)
+          } else {
+            65536
+          }
+          storePacked(&mut ramp, i * 4, pack(mix(left, right, wb, self.premultipliedInterpolation)))
+          w = w + dw
+          i = i + 1
+        }
+      }
+    }
+    if tangent {
+      // CR2018 #RadialGradientNotes: the internally tangent exterior has the
+      // limiting terminal color (pad), or the offset-weighted period average.
+      // Reflect has the same mean as repeat. Integrate stops before tabulation
+      // so thin segments and alpha are not lost to ramp quantization.
+      let limit = if self.spread == SPREAD_PAD {
+        if self.r1 > self.r0 {
+          last
+        } else {
+          first
+        }
+      } else {
+        pack(averageStops(stops, self.premultipliedInterpolation, self.linearRgbInterpolation))
+      }
+      storePacked(&mut ramp, RAMP_SIZE * 4, limit)
+    }
+  }
+
+  /// The gradient parameter at gradient-space point `p`, or [`NOTHING`] where nothing is painted.
+  fn parameter(self: &Self, p: Point) -> f64 with Intrinsic.inlineAlways() {
+    if self.kind == LINEAR {
+      let dx = self.x1 - self.x0
+      let dy = self.y1 - self.y0
+      return ((p.x - self.x0) * dx + (p.y - self.y0) * dy) / (dx * dx + dy * dy)
+    }
+
+    // Largest t with |p - c(t)| = r(t) and r(t) >= 0, where c and r interpolate the focal circle
+    // (t = 0) to the end circle (t = 1): a t^2 - 2 b t + c = 0.
+    let cdx = self.x1 - self.x0
+    let cdy = self.y1 - self.y0
+    let dr = self.r1 - self.r0
+    let pdx = p.x - self.x0
+    let pdy = p.y - self.y0
+    let a = cdx * cdx + cdy * cdy - dr * dr
+    let b = pdx * cdx + pdy * cdy + self.r0 * dr
+    let c = pdx * pdx + pdy * pdy - self.r0 * self.r0
+    if self.tangent {
+      if b == 0.0 || (b < 0.0) == (dr > 0.0) {
+        return LIMIT_COLOR
+      }
+      return c / (2.0 * b)
+    }
+    let disc = b * b - a * c
+    if disc < 0.0 {
+      return NOTHING
+    }
+    let root = f64.sqrt(disc)
+    let t1 = f64.max((b + root) / a, (b - root) / a)
+    let t2 = f64.min((b + root) / a, (b - root) / a)
+    if self.r0 + t1 * dr >= 0.0 {
+      return t1
+    }
+    if self.r0 + t2 * dr >= 0.0 {
+      return t2
+    }
+    return NOTHING
+  }
+}
+
+/// Encodes "nothing painted here" apart from every real parameter.
+const NOTHING: f64 = -1.0e300
+
+const LIMIT_COLOR: f64 = -2.0e300
+
+fn averageStop(color: Rgba8, premultiplied: bool, linearRgb: bool) -> [f64; 4] {
+  if linearRgb {
+    return linearStop(color, premultiplied)
+  }
+  let alpha = u8.toF64(color.a) / 255.0
+  let factor = if premultiplied {
+    alpha / 255.0
+  } else {
+    1.0 / 255.0
+  }
+  return [u8.toF64(color.r) * factor, u8.toF64(color.g) * factor, u8.toF64(color.b) * factor, alpha]
+}
+
+fn integrateStops(
+  sum: &mut [f64; 4],
+  a: &[f64; 4],
+  b: &[f64; 4],
+  width: f64,
+  premultiplied: bool,
+) -> () {
+  let mut channel: usize = 0
+  while channel < 3 {
+    let mean = if premultiplied {
+      (a[channel] + b[channel]) * 0.5
+    } else {
+      // Integral of two linear functions' product: color(t) * alpha(t).
+      (2.0 * a[channel] * a[3] + a[channel] * b[3] + b[channel] * a[3] + 2.0 * b[channel] * b[3])
+        / 6.0
+    }
+    sum[channel] = sum[channel] + width * mean
+    channel = channel + 1
+  }
+  sum[3] = sum[3] + width * (a[3] + b[3]) * 0.5
+}
+
+fn averageStops(stops: &[Stop], premultiplied: bool, linearRgb: bool) -> Rgba8 {
+  let mut sum = [0.0; 4]
+  let mut previous = clamp01(stops[0].offset)
+  let mut left = averageStop(stops[0].color, premultiplied, linearRgb)
+  integrateStops(&mut sum, &left, &left, previous, premultiplied)
+  let mut i: usize = 1
+  while i < stops.length {
+    let offset = f64.max(previous, clamp01(stops[i].offset))
+    let right = averageStop(stops[i].color, premultiplied, linearRgb)
+    integrateStops(&mut sum, &left, &right, offset - previous, premultiplied)
+    previous = offset
+    left = right
+    i = i + 1
+  }
+  integrateStops(&mut sum, &left, &left, 1.0 - previous, premultiplied)
+  return Rgba8 {
+    r: if linearRgb {
+      colorSpace.encode(sum[0], sum[3])
+    } else {
+      colorSpace.byte(sum[0])
+    },
+    g: if linearRgb {
+      colorSpace.encode(sum[1], sum[3])
+    } else {
+      colorSpace.byte(sum[1])
+    },
+    b: if linearRgb {
+      colorSpace.encode(sum[2], sum[3])
+    } else {
+      colorSpace.byte(sum[2])
+    },
+    a: colorSpace.byte(sum[3]),
+  }
+}
+
+/// Interpolates stop colors `a` and `b` with weight `wb / 65536` on `b`, straight (then
+/// premultiplied) or premultiplied.
+fn mix(a: Rgba8, b: Rgba8, wb: u32, premultiplied: bool) -> Rgba8 with Intrinsic.inlineAlways() {
+  let wa = 65536 - wb
+  if premultiplied {
+    let pa = a.premultiply()
+    let pb = b.premultiply()
+    return Rgba8 {
+      r: lerpByte(pa.r, pb.r, wa, wb),
+      g: lerpByte(pa.g, pb.g, wa, wb),
+      b: lerpByte(pa.b, pb.b, wa, wb),
+      a: lerpByte(pa.a, pb.a, wa, wb),
+    }
+  }
+  let alpha = lerpByte(a.a, b.a, wa, wb)
+  return Rgba8.make(
+    lerpByte(a.r, b.r, wa, wb),
+    lerpByte(a.g, b.g, wa, wb),
+    lerpByte(a.b, b.b, wa, wb),
+    alpha,
+  ).premultiply()
+}
+
+fn lerpByte(a: u8, b: u8, wa: u32, wb: u32) -> u8 with Intrinsic.inlineAlways() {
+  return u32.wrappingToU8(u32.shiftRight(u8.toU32(a) * wa + u8.toU32(b) * wb + 32768, 16))
+}
+
+fn spreadParameter(t: f64, spread: u8) -> f64 with Intrinsic.inlineAlways() {
+  if spread == SPREAD_REPEAT {
+    return t - f64.floor(t)
+  }
+  if spread == SPREAD_REFLECT {
+    let m = t - 2.0 * f64.floor(t * 0.5)
+    return if m > 1.0 {
+      2.0 - m
+    } else {
+      m
+    }
+  }
+  return if t < 0.0 {
+    0.0
+  } else if t > 1.0 {
+    1.0
+  } else {
+    t
+  }
+}
+
+impl Shader for Gradient {
+  fn isUniform(self: &Self) -> bool {
+    return !self.isPaintable() || (self.single && !self.projective)
+  }
+
+  fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
+    if !self.isPaintable() {
+      return Rgba8.make(0, 0, 0, 0)
+    }
+    let ramp = self.ramp.asSlice()
+    let mut index = RAMP_SIZE - 1
+    let device = Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5)
+    let mut p = Point.make(0.0, 0.0)
+    if self.projective {
+      if let Option<Point>.Some { value: mapped } = self.homography.project(device) {
+        p = mapped
+      } else {
+        return Rgba8.make(0, 0, 0, 0)
+      }
+    } else if !self.single {
+      p = self.inverse.apply(device)
+    }
+    if !self.single {
+      let t = self.parameter(p)
+      if t == LIMIT_COLOR {
+        return unpack(rampWord(ramp, RAMP_SIZE))
+      }
+      if t == NOTHING || !f64.isFinite(t) {
+        return Rgba8.make(0, 0, 0, 0)
+      }
+      let s = spreadParameter(t, self.spread)
+      index = f64.toUsize(f64.floor(s * usize.toF64(RAMP_SIZE - 1) + 0.5))
+    }
+    return Rgba8 {
+      r: ramp[index * 4],
+      g: ramp[index * 4 + 1],
+      b: ramp[index * 4 + 2],
+      a: ramp[index * 4 + 3],
+    }
+  }
+
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    if self.projective {
+      let mut i: usize = 0
+      while i < count {
+        out[i] = pack(self.shade(x + usize.toU32(i), y))
+        i = i + 1
+      }
+      return
+    }
+    if !self.isPaintable() || self.single {
+      let word = pack(self.shade(x, y))
+      let mut i: usize = 0
+      while i < count {
+        out[i] = word
+        i = i + 1
+      }
+      return
+    }
+    let ramp = self.ramp.asSlice()
+    let scale = usize.toF64(RAMP_SIZE - 1)
+
+    // Gradient-space position of the first pixel center and the step to the next one.
+    let start = self.inverse.apply(Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5))
+    let mut i: usize = 0
+    if self.kind == LINEAR {
+      // The linear parameter is affine in device space: step it along the row.
+      let t0 = self.parameter(start)
+      let dt = self.parameter(Point.make(start.x + self.inverse.a, start.y + self.inverse.b)) - t0
+      let finite = f64.isFinite(t0) && f64.isFinite(dt)
+      while i < count {
+        if finite {
+          let index = Intrinsic.f64ToUsize(
+            spreadParameter(t0 + usize.toF64(i) * dt, self.spread) * scale + 0.5,
+          )
+          out[i] = rampWord(ramp, index)
+        } else {
+          out[i] = 0
+        }
+        i = i + 1
+      }
+      return
+    }
+    if self.r0 == 0.0 && self.x0 == self.x1 && self.y0 == self.y1 {
+      // Focal point at the center: t is the distance to it over the radius.
+      let inverseRadius = 1.0 / self.r1
+      while i < count {
+        let k = usize.toF64(i)
+        let dx = start.x + k * self.inverse.a - self.x1
+        let dy = start.y + k * self.inverse.b - self.y1
+        let t = f64.sqrt(dx * dx + dy * dy) * inverseRadius
+        out[i] = if f64.isFinite(t) {
+          rampWord(ramp, Intrinsic.f64ToUsize(spreadParameter(t, self.spread) * scale + 0.5))
+        } else {
+          0
+        }
+        i = i + 1
+      }
+      return
+    }
+    while i < count {
+      let k = usize.toF64(i)
+      let t = self.parameter(Point.make(start.x + k * self.inverse.a, start.y + k * self.inverse.b))
+      if t == LIMIT_COLOR {
+        out[i] = rampWord(ramp, RAMP_SIZE)
+        i = i + 1
+        continue
+      }
+      if t == NOTHING || !f64.isFinite(t) {
+        out[i] = 0
+      } else {
+        out[i] = rampWord(ramp, Intrinsic.f64ToUsize(spreadParameter(t, self.spread) * scale + 0.5))
+      }
+      i = i + 1
+    }
+  }
+}
+
+fn rampWord(ramp: &[u8], index: usize) -> u32 with Intrinsic.inlineAlways() {
+  let entry = Slice.view(ramp, index * 4, 4)
+  return u8.toU32(entry[0]) | u32.shiftLeft(u8.toU32(entry[1]), 8)
+    | u32.shiftLeft(u8.toU32(entry[2]), 16)
+    | u32.shiftLeft(u8.toU32(entry[3]), 24)
+}
+
+pub const SAMPLE_NEAREST: u8 = 0
+
+pub const SAMPLE_BILINEAR: u8 = 1
+
+pub const EXTEND_CLAMP: u8 = 0
+
+pub const EXTEND_REPEAT: u8 = 1
+
+/// A premultiplied image placed by `transform` (image pixel space to device space). `EXTEND_CLAMP`
+/// suits `image` (clip with its rectangle); `EXTEND_REPEAT` suits pattern tiles.
+///
+/// Sampling runs in f32 with the same operations, in the same order, as the GPU scene shader
+/// (`gpu_scene/shaders/scene.wgsl`, `shadeImage`), on the inverse rounded to f32 as the GPU
+/// receives it. Projective rows use explicit nested fused multiply-adds, so native
+/// backends cannot choose different contraction points. Native scene rendering
+/// also requires strict shader math; browser WGSL does not guarantee byte parity.
+pub struct ImagePattern<'a> {
+  image: &'a Pixmap,
+  inverse: Affine,
+  projective: bool,
+  homography: Homography,
+  denominator: [f32; 3],
+  /// `inverse` in f32: a b c d e f.
+  m: [f32; 6],
+  valid: bool,
+  sampling: u8,
+  extend: u8,
+}
+
+impl<'a> ImagePattern<'a> {
+  pub fn make(image: &'a Pixmap, transform: &Affine, sampling: u8, extend: u8) -> ImagePattern<'a> {
+    let mut inverse = Affine.identity()
+    let mut valid = image.width() > 0 && image.height() > 0
+    if let Option<Affine>.Some { value: found } = transform.invert() {
+      inverse = found
+    } else {
+      valid = false
+    }
+    let m = [
+      f64.toF32(inverse.a),
+      f64.toF32(inverse.b),
+      f64.toF32(inverse.c),
+      f64.toF32(inverse.d),
+      f64.toF32(inverse.e),
+      f64.toF32(inverse.f),
+    ]
+    return ImagePattern {
+      image: image,
+      inverse: inverse,
+      m: m,
+      valid: valid,
+      sampling: sampling,
+      extend: extend,
+      projective: false,
+      homography: Homography.fromAffine(&inverse),
+      denominator: [0.0, 0.0, 1.0],
+    }
+  }
+
+  /// Borrows the original pixels, sampling through the inverse homogeneous map.
+  /// Uses the same checked f32 matrix and operation order as native strict-math WGSL.
+  /// Browser shader arithmetic does not promise byte parity.
+  pub effect fn makeProjective(
+    image: &'a Pixmap,
+    transform: &Homography,
+    sampling: u8,
+    extend: u8,
+  ) -> ImagePattern<'a>
+    ! GeometryError {
+    let mut pattern = ImagePattern.make(image, &Affine.identity(), sampling, extend)
+    pattern.projective = true
+    pattern.valid = false
+    if let Option<Homography>.Some { value: inverse } = run paintInverse(transform) {
+      let m = run packInverseHomography(&inverse)
+      pattern.homography = inverse
+      pattern.m = [m[0], m[1], m[2], m[3], m[4], m[5]]
+      pattern.denominator = [m[6], m[7], m[8]]
+      pattern.valid = image.width() > 0 && image.height() > 0
+    }
+    return move pattern
+  }
+
+  pub fn isProjective(self: &Self) -> bool {
+    return self.projective
+  }
+
+  pub fn inverseHomography(self: &Self) -> Homography {
+    return self.homography
+  }
+
+  /// The premultiplied image being placed.
+  pub fn pixmap(self: &Self) -> &'a Pixmap {
+    return self.image
+  }
+
+  /// Device-to-image transform for affine paints (`!isProjective()`).
+  /// Projective consumers must use [`inverseHomography`], including its denominator.
+  pub fn inverseTransform(self: &Self) -> Affine {
+    return self.inverse
+  }
+
+  pub fn samplingMode(self: &Self) -> u8 {
+    return self.sampling
+  }
+
+  pub fn extendMode(self: &Self) -> u8 {
+    return self.extend
+  }
+
+  /// False for an empty image or a non-invertible transform: the pattern paints nothing.
+  pub fn isPaintable(self: &Self) -> bool {
+    return self.valid
+  }
+
+  /// The column (or row, with `size` the height) for the integer-valued image coordinate `v`,
+  /// repeated or clamped into the image as the shader's `texel` does.
+  fn wrap(self: &Self, v: f32, size: f32) -> usize with Intrinsic.inlineAlways() {
+    // Rounding can land exactly on the size; keep the index inside the image.
+    let t = if self.extend == EXTEND_REPEAT {
+      minF32(v - size * f32.floor(v / size), size - 1.0)
+    } else {
+      minF32(maxF32(v, 0.0), size - 1.0)
+    }
+
+    // WGSL's float-to-u32 conversion saturates: a remainder rounded below zero reads index 0.
+    return u32.toUsize(saturateToU32(t))
+  }
+
+  /// The packed texel at column `x`, row `y`.
+  fn word(self: &Self, x: usize, y: usize) -> u32 with Intrinsic.inlineAlways() {
+    let texel = Slice.view(self.image.data(), (y * u32.toUsize(self.image.width()) + x) * 4, 4)
+    return u8.toU32(texel[0]) | u32.shiftLeft(u8.toU32(texel[1]), 8)
+      | u32.shiftLeft(u8.toU32(texel[2]), 16)
+      | u32.shiftLeft(u8.toU32(texel[3]), 24)
+  }
+
+  /// The packed color at the center of device pixel `(px, py)`.
+  fn sample(self: &Self, px: u32, py: u32) -> u32 with Intrinsic.inlineAlways() {
+    let fx = u32.toF32(px) + 0.5
+    let fy = u32.toF32(py) + 0.5
+    let mut x: f32 = 0.0
+    let mut y: f32 = 0.0
+    if self.projective {
+      // Three rows in SIMD lanes: fma(yCoefficient, fy, fma(xCoefficient, fx, offset)).
+      // Explicit one-rounding operations match WGSL even on Metal, where a plain
+      // multiply/add expression can contract despite the module's strictMath flag.
+      let first = f32x4.mulAdd(
+        f32x4.fromArray([self.m[0], self.m[1], self.denominator[0], 0.0]),
+        f32x4.splat(fx),
+        f32x4.fromArray([self.m[4], self.m[5], self.denominator[2], 0.0]),
+      )
+      let mapped = f32x4.mulAdd(
+        f32x4.fromArray([self.m[2], self.m[3], self.denominator[1], 0.0]),
+        f32x4.splat(fy),
+        first,
+      )
+      let w = f32x4.extract(mapped, 2)
+      if w == 0.0 || !f32.isFinite(w) {
+        return 0
+      }
+      x = f32x4.extract(mapped, 0) / w
+      y = f32x4.extract(mapped, 1) / w
+    } else {
+      x = self.m[0] * fx + self.m[2] * fy + self.m[4]
+      y = self.m[1] * fx + self.m[3] * fy + self.m[5]
+    }
+    if !(f32.abs(x) <= 1.0e15) || !(f32.abs(y) <= 1.0e15) {
+      return 0
+    }
+    let w = u32.toF32(self.image.width())
+    let h = u32.toF32(self.image.height())
+    if self.sampling == SAMPLE_NEAREST {
+      return self.word(self.wrap(f32.floor(x), w), self.wrap(f32.floor(y), h))
+    }
+    let x0 = f32.floor(x - 0.5)
+    let y0 = f32.floor(y - 0.5)
+    let wx = x - 0.5 - x0
+    let wy = y - 0.5 - y0
+
+    // The shader wraps each of the four texels' coordinates; the four distinct ones suffice.
+    let left = self.wrap(x0, w)
+    let right = self.wrap(x0 + 1.0, w)
+    let top = self.wrap(y0, h)
+    let bottom = self.wrap(y0 + 1.0, h)
+    let a = self.word(left, top)
+    let b = self.word(right, top)
+    let c = self.word(left, bottom)
+    let d = self.word(right, bottom)
+    return bilerpWords(a, b, c, d, wx, wy)
+  }
+}
+
+impl<'a> ImagePattern<'a> {
+  /// [`sample`] of pixels `px .. px + 4` on row `py` into `out[at .. at + 4]`, one pixel per lane
+  /// with the same operations per lane. Returns false, writing nothing, when a pixel maps outside
+  /// the 1e15 range (the scalar path then handles it).
+  fn sampleFour(
+    self: &Self,
+    px: u32,
+    py: u32,
+    out: &mut [u32],
+    at: usize,
+  ) -> bool with Intrinsic.inlineAlways() {
+    let column = u32.toI32(px)
+    let half = f32x4.splat(0.5)
+    let fx = i32x4.toF32x4(i32x4.fromArray([column, column + 1, column + 2, column + 3])) + half
+    let fy = u32.toF32(py) + 0.5
+    let x = f32x4.splat(self.m[0]) * fx + f32x4.splat(self.m[2] * fy) + f32x4.splat(self.m[4])
+    let y = f32x4.splat(self.m[1]) * fx + f32x4.splat(self.m[3] * fy) + f32x4.splat(self.m[5])
+    let range = f32x4.splat(1.0e15)
+    let inside = u32x4.reduceBitAnd(
+      u32x4.select(f32x4.lanesLessOrEqual(absLanes(x), range), u32x4.splat(1), u32x4.splat(0)),
+    )
+      & u32x4.reduceBitAnd(
+        u32x4.select(f32x4.lanesLessOrEqual(absLanes(y), range), u32x4.splat(1), u32x4.splat(0)),
+      )
+    if inside == 0 {
+      return false
+    }
+    let x0 = floorLanes(x - half)
+    let y0 = floorLanes(y - half)
+    let wx = x - half - x0
+    let wy = y - half - y0
+    let one = f32x4.splat(1.0)
+    let w = f32x4.splat(u32.toF32(self.image.width()))
+    let h = f32x4.splat(u32.toF32(self.image.height()))
+    let stride = u32x4.splat(self.image.width())
+    let left = self.wrapLanes(x0, w)
+    let right = self.wrapLanes(x0 + one, w)
+    let top = u32x4.wrappingMultiply(self.wrapLanes(y0, h), stride)
+    let bottom = u32x4.wrappingMultiply(self.wrapLanes(y0 + one, h), stride)
+
+    // Texel indices of the four corners of each pixel (inside the image, so no wrap-around).
+    let a = u32x4.wrappingAdd(top, left)
+    let b = u32x4.wrappingAdd(top, right)
+    let c = u32x4.wrappingAdd(bottom, left)
+    let d = u32x4.wrappingAdd(bottom, right)
+    let data = self.image.data()
+    out[at] = bilerpWords(
+      texelAt(data, a, 0),
+      texelAt(data, b, 0),
+      texelAt(data, c, 0),
+      texelAt(data, d, 0),
+      f32x4.extract(wx, 0),
+      f32x4.extract(wy, 0),
+    )
+    out[at + 1] = bilerpWords(
+      texelAt(data, a, 1),
+      texelAt(data, b, 1),
+      texelAt(data, c, 1),
+      texelAt(data, d, 1),
+      f32x4.extract(wx, 1),
+      f32x4.extract(wy, 1),
+    )
+    out[at + 2] = bilerpWords(
+      texelAt(data, a, 2),
+      texelAt(data, b, 2),
+      texelAt(data, c, 2),
+      texelAt(data, d, 2),
+      f32x4.extract(wx, 2),
+      f32x4.extract(wy, 2),
+    )
+    out[at + 3] = bilerpWords(
+      texelAt(data, a, 3),
+      texelAt(data, b, 3),
+      texelAt(data, c, 3),
+      texelAt(data, d, 3),
+      f32x4.extract(wx, 3),
+      f32x4.extract(wy, 3),
+    )
+    return true
+  }
+
+  /// [`wrap`] per lane.
+  fn wrapLanes(self: &Self, v: simd<f32, 4>, size: simd<f32, 4>) -> simd<u32,
+    4> with Intrinsic.inlineAlways() {
+    let zero = f32x4.splat(0.0)
+    let limit = size - f32x4.splat(1.0)
+    let t = if self.extend == EXTEND_REPEAT {
+      minLanes(v - size * floorLanes(v / size), limit)
+    } else {
+      minLanes(maxLanes(v, zero), limit)
+    }
+    return i32x4.bitcastToU32x4(f32x4.toI32x4(maxLanes(t, zero)))
+  }
+}
+
+impl<'a> Shader for ImagePattern<'a> {
+  fn isUniform(self: &Self) -> bool {
+    return !self.valid
+  }
+
+  fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
+    if !self.valid {
+      return Rgba8.make(0, 0, 0, 0)
+    }
+    return unpack(self.sample(x, y))
+  }
+
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    let mut i: usize = 0
+    if self.valid && !self.projective && self.sampling == SAMPLE_BILINEAR {
+      while i + 4 <= count {
+        if !self.sampleFour(x + usize.toU32(i), y, &mut out, i) {
+          break
+        }
+        i = i + 4
+      }
+    }
+    while i < count {
+      out[i] = if self.valid {
+        self.sample(x + usize.toU32(i), y)
+      } else {
+        0
+      }
+      i = i + 1
+    }
+  }
+}
+
+/// The shader's `bilerp` of four packed texels, the four channels in the lanes of one vector
+/// (the same f32 operations per channel).
+fn bilerpWords(
+  a: u32,
+  b: u32,
+  c: u32,
+  d: u32,
+  wx: f32,
+  wy: f32,
+) -> u32 with Intrinsic.inlineAlways() {
+  let ca = channels(a)
+  let cb = channels(b)
+  let cc = channels(c)
+  let cd = channels(d)
+  let x = f32x4.splat(wx)
+  let top = ca + (cb - ca) * x
+  let bottom = cc + (cd - cc) * x
+
+  // floor(v + 0.5) for v in 0 ..= 255: never negative, so truncating is the floor.
+  let rounded = f32x4.toI32x4(top + (bottom - top) * f32x4.splat(wy) + f32x4.splat(0.5))
+  let bytes = i32x4.bitcastToU8x16(rounded)
+  let packed = u8x16.shuffle(bytes, bytes, [0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12])
+  return u32x4.extract(u8x16.bitcastToU32x4(packed), 0)
+}
+
+/// The packed texel at index lane `lane` of `indices`.
+fn texelAt(data: &[u8], indices: simd<u32, 4>, lane: usize) -> u32 with Intrinsic.inlineAlways() {
+  let texel = Slice.view(data, u32.toUsize(u32x4.extract(indices, lane)) * 4, 4)
+  return u8.toU32(texel[0]) | u32.shiftLeft(u8.toU32(texel[1]), 8)
+    | u32.shiftLeft(u8.toU32(texel[2]), 16)
+    | u32.shiftLeft(u8.toU32(texel[3]), 24)
+}
+
+/// The four channels of a packed color as f32 lanes.
+fn channels(word: u32) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  let bytes = u32x4.bitcastToU8x16(u32x4.splat(word))
+  let wide = u8x16.shuffle(
+    bytes,
+    u8x16.splat(0),
+    [0, 16, 16, 16, 1, 16, 16, 16, 2, 16, 16, 16, 3, 16, 16, 16],
+  )
+  return i32x4.toF32x4(u8x16.bitcastToI32x4(wide))
+}
+
+// LIMITATION-7 (silk-lang/silk#2566): plain selects; NaN never reaches them here.
+fn minF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+fn maxF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn minLanes(a: simd<f32, 4>, b: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  return f32x4.select(f32x4.lanesLess(a, b), a, b)
+}
+
+fn maxLanes(a: simd<f32, 4>, b: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  return f32x4.select(f32x4.lanesGreater(a, b), a, b)
+}
+
+fn absLanes(v: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  return f32x4.select(f32x4.lanesLess(v, f32x4.splat(0.0)), f32x4.splat(0.0) - v, v)
+}
+
+/// `f32.floor` per lane.
+fn floorLanes(v: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  let small = f32x4.lanesLess(absLanes(v), f32x4.splat(8388608.0))
+  let t = i32x4.toF32x4(f32x4.toI32x4(f32x4.select(small, v, f32x4.splat(0.0))))
+  let floored = f32x4.select(f32x4.lanesGreater(t, v), t - f32x4.splat(1.0), t)
+  return f32x4.select(small, floored, v)
+}
+
+/// WGSL `u32(v)`: truncates, with negative values giving 0 (callers keep `v` below 2^32).
+fn saturateToU32(v: f32) -> u32 with Intrinsic.inlineAlways() {
+  return if v > 0.0 {
+    Intrinsic.f32ToU32(v)
+  } else {
+    0
+  }
+}
+
+/// Composites `shader` source-over into `target` through `coverage`, scaled by `opacity`
+/// (0..=255, for `fill-opacity` and `stroke-opacity`).
+pub fn fill<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opacity: u8) -> () {
+  if opacity == 0 {
+    return
+  }
+  if shader.isUniform() {
+    fillUniform(&mut target, coverage, pack(shader.shade(0, 0)), opacity)
+    return
+  }
+  let width = minU32(target.width(), coverage.width())
+  let height = minU32(target.height(), coverage.height())
+  let stride = u32.toUsize(target.width()) * 4
+  let fullMask = u8.toU32(opacity)
+  let d = target.dataMut()
+  let mut colors: [u32; SPAN] = [0; SPAN]
+  let fills = coverage.fills()
+  let mut f: usize = 0
+  while f < fills.length {
+    let span = fills[f]
+    let right = minU32(span.x + span.width, width)
+    let mut y = span.y
+    while y < span.y + BAND && y < height {
+      let row = u32.toUsize(y) * stride
+      let mut x = span.x
+      while x < right {
+        let count = u32.toUsize(minU32(right - x, SPAN_U32))
+        shader.shadeSpan(x, y, count, &mut colors)
+        if fullMask != 255 {
+          let mut i: usize = 0
+          while i < count {
+            colors[i] = scalePacked(colors[i], fullMask)
+            i = i + 1
+          }
+        }
+        overSpan(&mut d, row + u32.toUsize(x) * 4, &colors, count)
+        x = x + usize.toU32(count)
+      }
+      y = y + 1
+    }
+    f = f + 1
+  }
+
+  // Strips hold column-major alphas; shade each strip row as a span.
+  let alphas = coverage.alphas()
+  let strips = coverage.strips()
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let right = minU32(strip.x + strip.width, width)
+    let mut row: u32 = 0
+    while row < BAND && strip.y + row < height {
+      let y = strip.y + row
+      let line = u32.toUsize(y) * stride
+      let mut x = strip.x
+      while x < right {
+        let count = u32.toUsize(minU32(right - x, SPAN_U32))
+        shader.shadeSpan(x, y, count, &mut colors)
+        let mut base = u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND + row)
+        let mut i: usize = 0
+        while i < count {
+          let alpha = u8.toU32(alphas[base])
+          let mask = if fullMask == 255 {
+            alpha
+          } else {
+            div255(alpha * fullMask)
+          }
+          if mask != 255 {
+            colors[i] = if mask == 0 {
+              0
+            } else {
+              scalePacked(colors[i], mask)
+            }
+          }
+          base = base + u32.toUsize(BAND)
+          i = i + 1
+        }
+        overSpan(&mut d, line + u32.toUsize(x) * 4, &colors, count)
+        x = x + usize.toU32(count)
+      }
+      row = row + 1
+    }
+    s = s + 1
+  }
+}
+
+/// [`fill`] with one packed premultiplied color: the same bytes, without shading spans.
+fn fillUniform(target: &mut Pixmap, coverage: &Coverage, word: u32, opacity: u8) -> () {
+  let width = minU32(target.width(), coverage.width())
+  let height = minU32(target.height(), coverage.height())
+  let stride = u32.toUsize(target.width()) * 4
+  let fullMask = u8.toU32(opacity)
+  let d = target.dataMut()
+  let color = if fullMask == 255 {
+    word
+  } else {
+    scalePacked(word, fullMask)
+  }
+  let fills = coverage.fills()
+  if color != 0 {
+    let mut colors: [u32; SPAN] = [0; SPAN]
+    let mut i: usize = 0
+    while i < SPAN {
+      colors[i] = color
+      i = i + 1
+    }
+    let mut f: usize = 0
+    while f < fills.length {
+      let span = fills[f]
+      let right = minU32(span.x + span.width, width)
+      let mut y = span.y
+      while y < span.y + BAND && y < height {
+        let row = u32.toUsize(y) * stride
+        let mut x = span.x
+        while x < right {
+          let count = u32.toUsize(minU32(right - x, SPAN_U32))
+          overSpan(&mut d, row + u32.toUsize(x) * 4, &colors, count)
+          x = x + usize.toU32(count)
+        }
+        y = y + 1
+      }
+      f = f + 1
+    }
+  }
+  if word == 0 {
+    return
+  }
+
+  // Each strip column's four alphas are adjacent. Blocks of four columns load their 16 alphas at
+  // once and composite each row's four pixels as one vector; the rest go column by column.
+  let alphas = coverage.alphas()
+  let strips = coverage.strips()
+  let rows = u32.toUsize(BAND)
+  let lanes = u8x16.toU16x16(u32x4.bitcastToU8x16(u32x4.splat(word)))
+  let opacityLanes = u16x16.splat(u8.toU16(opacity))
+  let half = u16x16.splat(128)
+  let eight = u16x16.splat(8)
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let right = minU32(strip.x + strip.width, width)
+    let visible = u32.toUsize(minU32(BAND, height - minU32(strip.y, height)))
+    let mut x = strip.x
+    while visible == rows && x + 4 <= right {
+      let block = u8x16.load(alphas, u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND))
+      let mut masks = u8x16.toU16x16(block)
+      if fullMask != 255 {
+        let m = u16x16.wrappingAdd(u16x16.wrappingMultiply(masks, opacityLanes), half)
+        masks = u16x16.shiftRight(u16x16.wrappingAdd(m, u16x16.shiftRight(m, eight)), eight)
+      }
+      let at = u32.toUsize(strip.y) * stride + u32.toUsize(x) * 4
+      overMaskedFour(
+        &mut d,
+        at,
+        lanes,
+        u16x16.shuffle(masks, masks, [0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12]),
+      )
+      overMaskedFour(
+        &mut d,
+        at + stride,
+        lanes,
+        u16x16.shuffle(masks, masks, [1, 1, 1, 1, 5, 5, 5, 5, 9, 9, 9, 9, 13, 13, 13, 13]),
+      )
+      overMaskedFour(
+        &mut d,
+        at + 2 * stride,
+        lanes,
+        u16x16.shuffle(masks, masks, [2, 2, 2, 2, 6, 6, 6, 6, 10, 10, 10, 10, 14, 14, 14, 14]),
+      )
+      overMaskedFour(
+        &mut d,
+        at + 3 * stride,
+        lanes,
+        u16x16.shuffle(masks, masks, [3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15]),
+      )
+      x = x + 4
+    }
+    while x < right {
+      let column = Slice.view(alphas, u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND), rows)
+      let mut at = u32.toUsize(strip.y) * stride + u32.toUsize(x) * 4
+      let mut row: usize = 0
+      while row < visible {
+        let alpha = u8.toU32(column[row])
+        let mask = if fullMask == 255 {
+          alpha
+        } else {
+          div255(alpha * fullMask)
+        }
+        if mask == 255 {
+          overPacked(&mut d, at, word)
+        } else if mask != 0 {
+          overPacked(&mut d, at, scalePacked(word, mask))
+        }
+        at = at + stride
+        row = row + 1
+      }
+      x = x + 1
+    }
+    s = s + 1
+  }
+}
+
+const SPAN: usize = 128
+
+const SPAN_U32: u32 = 128
+
+fn masked(color: Rgba8, mask: u32) -> Rgba8 {
+  if mask == 255 {
+    return color
+  }
+  return Rgba8 {
+    r: u32.toU8(div255(u8.toU32(color.r) * mask)),
+    g: u32.toU8(div255(u8.toU32(color.g) * mask)),
+    b: u32.toU8(div255(u8.toU32(color.b) * mask)),
+    a: u32.toU8(div255(u8.toU32(color.a) * mask)),
+  }
+}
+
+fn linearStop(color: Rgba8, premultiplied: bool) -> [f64; 4] {
+  let alpha = u8.toF64(color.a) / 255.0
+  let factor = if premultiplied {
+    alpha
+  } else {
+    1.0
+  }
+  return [
+    colorSpace.srgbToLinear(u8.toF64(color.r) / 255.0) * factor,
+    colorSpace.srgbToLinear(u8.toF64(color.g) / 255.0) * factor,
+    colorSpace.srgbToLinear(u8.toF64(color.b) / 255.0) * factor,
+    alpha,
+  ]
+}
+
+fn mixLinear(a: &[f64; 4], b: &[f64; 4], weight: f64, premultiplied: bool) -> Rgba8 {
+  let alpha = a[3] + (b[3] - a[3]) * weight
+  let factor = if premultiplied {
+    1.0
+  } else {
+    alpha
+  }
+  return Rgba8 {
+    r: colorSpace.encode((a[0] + (b[0] - a[0]) * weight) * factor, alpha),
+    g: colorSpace.encode((a[1] + (b[1] - a[1]) * weight) * factor, alpha),
+    b: colorSpace.encode((a[2] + (b[2] - a[2]) * weight) * factor, alpha),
+    a: colorSpace.byte(alpha),
+  }
+}
+
+/// Like `fill`, but source-over arithmetic uses linear light. Shader and target pixels stay
+/// premultiplied sRGB RGBA8; opacity does not quantize an intermediate linear color.
+pub fn fillLinearRgb<S: Shader>(
+  target: &mut Pixmap,
+  coverage: &Coverage,
+  shader: &S,
+  opacity: u8,
+) -> () {
+  if opacity == 0 {
+    return
+  }
+  let width = minU32(target.width(), coverage.width())
+  let height = minU32(target.height(), coverage.height())
+  let stride = u32.toUsize(target.width()) * 4
+  let level = u8.toU32(opacity)
+  let uniform = shader.isUniform()
+  let solid = if uniform {
+    shader.shade(0, 0)
+  } else {
+    Rgba8.make(0, 0, 0, 0)
+  }
+  let d = target.dataMut()
+  let fills = coverage.fills()
+  let mut f: usize = 0
+  while f < fills.length {
+    let span = fills[f]
+    let mut y = span.y
+    while y < span.y + BAND && y < height {
+      let mut x = span.x
+      while x < span.x + span.width && x < width {
+        let source = if uniform {
+          solid
+        } else {
+          shader.shade(x, y)
+        }
+        colorSpace.over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, source, level)
+        x = x + 1
+      }
+      y = y + 1
+    }
+    f = f + 1
+  }
+  let alphas = coverage.alphas()
+  let strips = coverage.strips()
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let mut column: u32 = 0
+    while column < strip.width && strip.x + column < width {
+      let base = u32.toUsize(strip.alphaOffset + column * BAND)
+      let mut row: u32 = 0
+      while row < BAND && strip.y + row < height {
+        let mask = div255(u8.toU32(alphas[base + u32.toUsize(row)]) * level)
+        if mask != 0 {
+          let x = strip.x + column
+          let y = strip.y + row
+          let source = if uniform {
+            solid
+          } else {
+            shader.shade(x, y)
+          }
+          colorSpace.over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, source, mask)
+        }
+        row = row + 1
+      }
+      column = column + 1
+    }
+    s = s + 1
+  }
+}
