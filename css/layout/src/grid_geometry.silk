@@ -1,0 +1,404 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import grid_absolute { GridGeometry }
+import grid_lines { LineNames }
+import grid_tracks { TrackState }
+import tree { NO_NODE }
+import geometry { Rect, max }
+import grid_fragment_scratch { GridFragmentScratch, logicalRow }
+import grid_subgrid { SubgridPool }
+
+struct Slot {
+  geometry: GridGeometry,
+  id: usize,
+  previous: usize,
+  previousFragment: usize,
+  nextFree: usize,
+}
+
+// Positioned grids and effective subgrids publish accepted records. The box
+// index is lazy; geometry and name buffers stay pooled after versions are freed.
+pub struct GridGeometryStore {
+  heads: List<usize>,
+  fragments: List<usize>,
+  slots: List<Slot>,
+  journal: List<usize>,
+  free: usize,
+}
+
+impl GridGeometryStore {
+  pub fn make() -> GridGeometryStore {
+    return GridGeometryStore {
+      heads: List<usize>.make(),
+      fragments: List<usize>.make(),
+      slots: List<Slot>.make(),
+      journal: List<usize>.make(),
+      free: NO_NODE,
+    }
+  }
+
+  pub fn find(self: &Self, id: usize) -> usize {
+    if id >= self.heads.length() {
+      return NO_NODE
+    }
+    return self.heads.get(id)
+  }
+
+  pub fn get(self: &Self, slot: usize) -> &GridGeometry {
+    return &self.slots.asSlice()[slot].geometry
+  }
+
+  // Written only on the new capture version before it is observed. The journal
+  // restores the previous version, including its inherited context identity.
+  pub fn setContext(self: &mut Self, id: usize, context: usize) {
+    let slot = self.find(id)
+    let geometry = &mut self.slots.asMutSlice()[slot].geometry
+    geometry.gridContext = context
+  }
+
+  pub fn context(self: &Self, id: usize) -> usize {
+    let slot = self.find(id)
+    if slot == NO_NODE { return 0 }
+    return self.slots.asSlice()[slot].geometry.gridContext
+  }
+
+  pub fn markContexts(self: &Self, pool: &mut SubgridPool) {
+    let mut at: usize = 0
+    while at < self.slots.length() {
+      let slot = &self.slots.asSlice()[at]
+      if slot.id != NO_NODE { pool.mark(slot.geometry.gridContext) }
+      at = at + 1
+    }
+  }
+
+  pub fn findFragment(self: &Self, id: usize, fragment: usize) -> usize {
+    if fragment >= self.fragments.length() {
+      return NO_NODE
+    }
+    let index = self.fragments.get(fragment)
+    if index == NO_NODE || self.slots.asSlice()[index].id != id {
+      return NO_NODE
+    }
+    return index
+  }
+
+  pub effect fn setFragment(
+    self: &mut Self,
+    id: usize,
+    fragment: usize,
+    content: Rect,
+    padding: Rect,
+  )
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Continuous layout never grows the fragment index. Reserve before changing
+    // either head so allocation failure leaves the previous publication intact.
+    if fragment != NO_NODE && fragment >= self.fragments.length() {
+      let additional = fragment + 1 - self.fragments.length()
+      run self.fragments.appendRepeated(NO_NODE, additional)
+    }
+    let index = self.find(id)
+    if self.slots.asSlice()[index].geometry.fragment != fragment {
+      self.detachFragment(index)
+      if fragment != NO_NODE {
+        let previous = self.fragments.get(fragment)
+        let slot = &mut self.slots.asMutSlice()[index]
+        slot.previousFragment = previous
+        slot.geometry.fragment = fragment
+        self.fragments.set(fragment, index)
+      }
+    }
+    let geometry = &mut self.slots.asMutSlice()[index].geometry
+    geometry.content = content
+    geometry.padding = padding
+  }
+
+  fn detachFragment(self: &mut Self, index: usize) {
+    let slot = &mut self.slots.asMutSlice()[index]
+    let fragment = slot.geometry.fragment
+    if fragment < self.fragments.length() && self.fragments.get(fragment) == index {
+      self.fragments.set(fragment, slot.previousFragment)
+    }
+    slot.geometry.fragment = NO_NODE
+    slot.previousFragment = NO_NODE
+  }
+
+  // Copy only accepted row edges into a new version. Earlier fragment columns
+  // and rows stay immutable, including while a later page is being retried.
+  pub fn inheritRows(self: &mut Self, id: usize) {
+    let index = self.find(id)
+    let previous = self.slots.asSlice()[index].previous
+    if previous == NO_NODE {
+      return
+    }
+    let count = self.slots.asSlice()[index].geometry.rows.tracks.length()
+    if self.slots.asSlice()[previous].geometry.fragment == NO_NODE
+      || self.slots.asSlice()[previous].geometry.rows.tracks.length() != count {
+      return
+    }
+    let reversed = self.slots.asSlice()[previous].geometry.rows.reversed
+    let extent = self.slots.asSlice()[previous].geometry.rows.extent
+    let mut at: usize = 0
+    while at < count {
+      let edges = self.slots.asSlice()[previous].geometry.rows.tracks.get(at)
+      self.slots.asMutSlice()[index].geometry.rows.tracks.set(at, edges)
+      at = at + 1
+    }
+    let rows = &mut self.slots.asMutSlice()[index].geometry.rows
+    rows.reversed = reversed
+    rows.extent = extent
+  }
+
+  pub fn captureRows(self: &mut Self, id: usize, scratch: &GridFragmentScratch) {
+    self.inheritRows(id)
+    let index = self.find(id)
+    let rows = &mut self.slots.asMutSlice()[index].geometry.rows
+    rows.reversed = scratch.reversed
+    let mut ordinal: usize = 0
+    while ordinal < scratch.rows.length() {
+      let row = &scratch.rows.asSlice()[ordinal]
+      if row.accepted {
+        let logical = logicalRow(ordinal, scratch.rows.length(), scratch.reversed)
+        let edge = &mut rows.tracks.asMutSlice()[logical]
+        if scratch.reversed {
+          if row.starts {
+            edge.end = row.consumedStart
+          }
+          edge.start = row.consumedEnd
+        } else {
+          if row.starts {
+            edge.start = row.consumedStart
+          }
+          edge.end = row.consumedEnd
+        }
+        rows.extent = max(rows.extent, row.consumedEnd)
+      }
+      ordinal = ordinal + 1
+    }
+  }
+
+  // A shell's checkpointed sizing pass owns a fresh pooled slot. Detach that
+  // slot, restore all probe state, then publish it in the enclosing journal.
+  // Tombstones keep outstanding checkpoint markers stable without copying
+  // either the track buffers or a full Layout.
+  pub fn retain(self: &mut Self, id: usize) -> usize {
+    let index = self.find(id)
+    let mut at = self.journal.length()
+    while at > 0 {
+      at = at - 1
+      if self.journal.get(at) == index {
+        self.journal.set(at, NO_NODE)
+        break
+      }
+    }
+    self.heads.set(id, self.slots.asSlice()[index].previous)
+    self.detachFragment(index)
+    let slot = &mut self.slots.asMutSlice()[index]
+    slot.previous = NO_NODE
+    return index
+  }
+
+  pub effect fn publish(self: &mut Self, id: usize, index: usize)
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.journal.append(index)
+    let previous = self.find(id)
+    let slot = &mut self.slots.asMutSlice()[index]
+    slot.previous = previous
+    slot.id = id
+    self.heads.set(id, index)
+  }
+
+  // Finalization follows track capture, before any positioned descendant can
+  // observe this version. Preserve the engine's per-source overflow clipping.
+  pub fn finish(self: &mut Self, id: usize, content: Rect, padding: Rect, normalPadding: Rect) {
+    let index = self.find(id)
+    let geometry = &mut self.slots.asMutSlice()[index].geometry
+    geometry.content = content
+    geometry.padding = padding
+    geometry.normalPadding = normalPadding
+  }
+
+  pub fn checkpoint(self: &Self) -> usize {
+    return self.journal.length()
+  }
+
+  pub effect fn capture(
+    self: &mut Self,
+    id: usize,
+    columns: &[TrackState],
+    columnOrigin: i32,
+    columnExplicit: usize,
+    columnNames: &LineNames,
+    rows: &[TrackState],
+    rowOrigin: i32,
+    rowExplicit: usize,
+    rowNames: &LineNames,
+  )
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if id >= self.heads.length() {
+      let additional = id + 1 - self.heads.length()
+      run self.heads.appendRepeated(NO_NODE, additional)
+    }
+    if self.free == NO_NODE {
+      let slot = self.slots.length()
+      run self.slots.append(
+        Slot {
+          geometry: GridGeometry.make(),
+          id: NO_NODE,
+          previous: NO_NODE,
+          previousFragment: NO_NODE,
+          nextFree: NO_NODE,
+        },
+      )
+      self.free = slot
+    }
+    let index = self.free
+
+    // Keep the candidate on the free chain until both axes have been copied.
+    // An allocation failure cannot publish half a geometry or lose its slot.
+    let slot = &mut self.slots.asMutSlice()[index]
+    run slot.geometry.columns.capture(columns, columnOrigin, columnExplicit, columnNames)
+    run slot.geometry.rows.capture(rows, rowOrigin, rowExplicit, rowNames)
+    slot.geometry.fragment = NO_NODE
+    slot.geometry.content = Rect.zero()
+    slot.geometry.padding = Rect.zero()
+    slot.geometry.normalPadding = Rect.zero()
+    slot.geometry.gridContext = 0
+    run self.journal.append(index)
+    self.free = slot.nextFree
+    slot.nextFree = NO_NODE
+    slot.id = id
+    slot.previous = self.heads.get(id)
+    self.heads.set(id, index)
+  }
+
+  fn release(self: &mut Self, index: usize) {
+    let slot = &mut self.slots.asMutSlice()[index]
+    let fragment = slot.geometry.fragment
+    if fragment < self.fragments.length() && self.fragments.get(fragment) == index {
+      self.fragments.set(fragment, NO_NODE)
+    }
+    slot.geometry.fragment = NO_NODE
+    slot.geometry.gridContext = 0
+    slot.previousFragment = NO_NODE
+    slot.id = NO_NODE
+    slot.previous = NO_NODE
+    slot.nextFree = self.free
+    self.free = index
+  }
+
+  // Reverse publication order also handles repeated writes to the same box
+  // and new writes made after restoring an inner checkpoint.
+  pub fn restore(self: &mut Self, marker: usize) {
+    let mut count = self.journal.length()
+    while count > marker {
+      count = count - 1
+      let index = self.journal.get(count)
+      if index == NO_NODE {
+        continue
+      }
+      let slot = &self.slots.asSlice()[index]
+      self.heads.set(slot.id, slot.previous)
+      self.detachFragment(index)
+      self.release(index)
+    }
+    self.journal.truncate(count)
+  }
+
+  // Forward order ensures a journal entry is consumed before a later entry
+  // releases it as its predecessor. No free-index list needs to grow here.
+  pub fn commit(self: &mut Self) {
+    let mut at: usize = 0
+    while at < self.journal.length() {
+      let index = self.journal.get(at)
+      if index == NO_NODE {
+        at = at + 1
+        continue
+      }
+      let previous = self.slots.asSlice()[index].previous
+      if previous != NO_NODE {
+        self.release(previous)
+      }
+      let slots = self.slots.asMutSlice()
+      slots[index].previous = NO_NODE
+      slots[index].previousFragment = NO_NODE
+      at = at + 1
+    }
+    self.journal.clear()
+  }
+
+  pub fn clear(self: &mut Self) {
+    self.heads.clear()
+    self.fragments.clear()
+    self.journal.clear()
+    self.free = NO_NODE
+    let mut at = self.slots.length()
+    while at > 0 {
+      at = at - 1
+      self.release(at)
+    }
+  }
+
+  // Invalidation and renumbering occur outside active layout checkpoints.
+  pub fn dropBox(self: &mut Self, id: usize) {
+    if self.heads.length() == 0 {
+      return
+    }
+    self.commit()
+    let index = self.find(id)
+    if index == NO_NODE {
+      return
+    }
+    self.heads.set(id, NO_NODE)
+    self.release(index)
+  }
+
+  pub effect fn remap(self: &mut Self, toOld: &[usize], toNew: &[usize])
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.heads.length() == 0 {
+      return
+    }
+
+    // Do not allocate a full box index for an unused store, or for new boxes
+    // beyond the last surviving geometry. Reserve before changing any heads.
+    let mut needed: usize = 0
+    let mut id: usize = 0
+    while id < toOld.length {
+      let old = toOld[id]
+      if old != NO_NODE && self.find(old) != NO_NODE {
+        needed = id + 1
+      }
+      id = id + 1
+    }
+    if needed > self.heads.length() {
+      let additional = needed - self.heads.length()
+      run self.heads.reserve(additional)
+    }
+    self.commit()
+    self.heads.clear()
+    while self.heads.length() < needed {
+      run self.heads.append(NO_NODE)
+    }
+    let mut at: usize = 0
+    while at < self.slots.length() {
+      let old = self.slots.asSlice()[at].id
+      if old != NO_NODE {
+        let mut next = NO_NODE
+        if old < toNew.length {
+          next = toNew[old]
+        }
+        if next == NO_NODE {
+          self.release(at)
+        } else {
+          let slots = self.slots.asMutSlice()
+          slots[at].id = next
+          self.heads.set(next, at)
+        }
+      }
+      at = at + 1
+    }
+  }
+}

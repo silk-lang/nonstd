@@ -1,0 +1,518 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.num.i32
+import silk.num.usize
+import box_tree { BoxTree, BoxKind }
+import context { outOfFlow, isGrid }
+import style { WritingMode }
+import grid_style { GridAutoFlow, GridAxis, GridLine, GridLineKind, MAX_GRID_TRACKS }
+import grid_lines { GridSpan, LineNames, resolveSpan }
+import grid_occupancy { Occupancy }
+import tree { NO_NODE, Measurement }
+
+pub struct GridItem {
+  pub id: usize,
+  pub row: GridSpan,
+  pub column: GridSpan,
+}
+
+impl Copy for GridItem {}
+
+impl GridItem {
+  pub fn make(id: usize) -> GridItem {
+    return GridItem {
+      id: id,
+      row: GridSpan { start: 0, end: 1, definite: false },
+      column: GridSpan { start: 0, end: 1, definite: false },
+    }
+  }
+}
+
+pub struct GridBounds {
+  pub rowOrigin: i32,
+  pub columnOrigin: i32,
+  pub rows: usize,
+  pub columns: usize,
+}
+
+impl Copy for GridBounds {}
+
+impl GridBounds {
+  pub fn empty() -> GridBounds {
+    return GridBounds { rowOrigin: 0, columnOrigin: 0, rows: 0, columns: 0 }
+  }
+}
+
+fn boundedTracks(count: usize) -> i32 {
+  if count > MAX_GRID_TRACKS {
+    return usize.toI32(MAX_GRID_TRACKS)
+  }
+  return usize.toI32(count)
+}
+
+// Preserve the explicit grid when the combined implicit extent exceeds the
+// allocation limit. Excess tracks on either side are clipped during normalization.
+fn limitedOrigin(first: i32, explicitEnd: i32) -> i32 {
+  let earliest = explicitEnd - usize.toI32(MAX_GRID_TRACKS)
+  if first < earliest {
+    return earliest
+  }
+  return first
+}
+
+fn limitedEnd(last: i32, origin: i32) -> i32 {
+  let latest = origin + usize.toI32(MAX_GRID_TRACKS)
+  if last > latest {
+    return latest
+  }
+  return last
+}
+
+fn normalize(span: GridSpan, origin: i32, end: i32) -> GridSpan {
+  let mut first = span.start
+  let mut last = span.end
+
+  // Grid §5.4: wholly excluded areas occupy the nearest boundary track;
+  // partially excluded areas retain the intersection with the limited grid.
+  if first < origin {
+    first = origin
+  }
+  if first >= end {
+    first = end - 1
+  }
+  if last > end {
+    last = end
+  }
+  if last <= first {
+    last = first + 1
+  }
+  return GridSpan { start: first - origin, end: last - origin, definite: span.definite }
+}
+
+pub struct PlacementScratch {
+  occupancy: Occupancy,
+}
+
+impl PlacementScratch {
+  pub fn make() -> PlacementScratch {
+    return PlacementScratch { occupancy: Occupancy.make() }
+  }
+}
+
+// Match flex's stable insertion sort, including its already-ordered fast path.
+fn sort(items: &mut [GridItem], nodes: &BoxTree) {
+  let mut index: usize = 1
+  while index < items.length {
+    if nodes.style(items[index - 1].id).order <= nodes.style(items[index].id).order {
+      index = index + 1
+      continue
+    }
+    let item = items[index]
+    let mut at = index
+    while at > 0 && nodes.style(items[at - 1].id).order > nodes.style(item.id).order {
+      items[at] = items[at - 1]
+      at = at - 1
+    }
+    items[at] = item
+    index = index + 1
+  }
+}
+
+fn smaller(a: i32, b: i32) -> i32 {
+  if a < b {
+    return a
+  }
+  return b
+}
+
+effect fn reserve(item: GridItem, work: &mut PlacementScratch)
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run work.occupancy.reserve(
+    i32.toUsize(item.row.start),
+    i32.toUsize(item.row.end),
+    i32.toUsize(item.column.start),
+    i32.toUsize(item.column.end),
+  )
+}
+
+fn finish(
+  items: &mut [GridItem],
+  majorOrigin: i32,
+  minorOrigin: i32,
+  majorEnd: i32,
+  minorEnd: i32,
+  transpose: bool,
+) -> GridBounds {
+  // Every span was clamped when resolved, and final bounds include all spans.
+  // Row flow is already normalized; only column flow needs an axis swap.
+  if transpose {
+    let mut index: usize = 0
+    while index < items.length {
+      let major = items[index].row
+      items[index].row = items[index].column
+      items[index].column = major
+      index = index + 1
+    }
+    return GridBounds {
+      rowOrigin: minorOrigin,
+      columnOrigin: majorOrigin,
+      rows: i32.toUsize(minorEnd),
+      columns: i32.toUsize(majorEnd),
+    }
+  }
+  return GridBounds {
+    rowOrigin: majorOrigin,
+    columnOrigin: minorOrigin,
+    rows: i32.toUsize(majorEnd),
+    columns: i32.toUsize(minorEnd),
+  }
+}
+
+// Only an automatic span takes its size from the child's subgrid line list.
+// Definite endpoints and authored spans retain ordinary placement semantics.
+fn itemSpan(
+  start: &GridLine,
+  end: &GridLine,
+  explicitTracks: usize,
+  names: &LineNames,
+  axis: &GridAxis,
+  eligible: bool,
+) -> GridSpan {
+  if !eligible || !axis.subgrid || start.kind == GridLineKind.Span
+    || end.kind == GridLineKind.Span {
+    return resolveSpan(start, end, explicitTracks, names)
+  }
+  let hasStart = start.kind == GridLineKind.Line && (start.name != 0 || start.number != 0)
+  let mut hasEnd = end.kind == GridLineKind.Line && (end.name != 0 || end.number != 0)
+  if hasStart && hasEnd {
+    let resolved = resolveSpan(start, end, explicitTracks, names)
+    if resolved.end - resolved.start != 1 { return resolved }
+    // Equal resolved endpoints discard the end before determining the span.
+    // Distinct adjacent endpoints still specify an implicit one-track span.
+    let automatic = GridLine.auto()
+    let first = resolveSpan(start, &automatic, explicitTracks, names)
+    let last = resolveSpan(&automatic, end, explicitTracks, names)
+    if first.start != last.end { return resolved }
+    hasEnd = false
+  }
+  let span = GridLine {
+    kind: GridLineKind.Span,
+    number: boundedTracks(axis.subgridSpan()),
+    name: 0,
+  }
+  if hasEnd {
+    return resolveSpan(&span, end, explicitTracks, names)
+  }
+  return resolveSpan(start, &span, explicitTracks, names)
+}
+
+// Grid 2 §8.5. Internally row/column mean logical major/minor; column flow
+// transposes at the boundary rather than maintaining a second algorithm.
+pub effect fn collectItems<'source>(
+  nodes: &BoxTree<'source>,
+  id: usize,
+  explicitRows: usize,
+  explicitColumns: usize,
+  rowNames: &LineNames,
+  columnNames: &LineNames,
+  items: &mut List<GridItem>,
+  work: &mut PlacementScratch,
+) -> GridBounds
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run collectSubgridItems(
+    nodes, id, explicitRows, explicitColumns, rowNames, columnNames,
+    false, false, &mut items, &mut work,
+  )
+}
+
+// Inherited axes cannot create implicit tracks. Bounds refer to the parent's
+// logical rows/columns, independently of its auto-flow direction.
+pub effect fn collectSubgridItems<'source>(
+  nodes: &BoxTree<'source>,
+  id: usize,
+  explicitRows: usize,
+  explicitColumns: usize,
+  rowNames: &LineNames,
+  columnNames: &LineNames,
+  boundedRows: bool,
+  boundedColumns: bool,
+  items: &mut List<GridItem>,
+  work: &mut PlacementScratch,
+) -> GridBounds
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  items.clear()
+  work.occupancy.clear()
+  let template = &nodes.grids[nodes.style(id).grid]
+  let transpose = template.flow == GridAutoFlow.Column
+  let dense = template.dense
+  let mut explicitMajor = boundedTracks(explicitRows)
+  let mut explicitMinor = boundedTracks(explicitColumns)
+  let mut boundedMajor = boundedRows
+  let mut boundedMinor = boundedColumns
+  if transpose {
+    explicitMajor = boundedTracks(explicitColumns)
+    explicitMinor = boundedTracks(explicitRows)
+    boundedMajor = boundedColumns
+    boundedMinor = boundedRows
+  }
+  // A used subgrid span always contains at least one track.
+  if boundedMajor && explicitMajor == 0 { explicitMajor = 1 }
+  if boundedMinor && explicitMinor == 0 { explicitMinor = 1 }
+  let mut majorLimit = usize.toI32(MAX_GRID_TRACKS)
+  let mut minorLimit = usize.toI32(MAX_GRID_TRACKS)
+  if boundedMajor { majorLimit = explicitMajor }
+  if boundedMinor { minorLimit = explicitMinor }
+  let mut majorOrigin: i32 = 0
+  let mut minorOrigin: i32 = 0
+  let mut majorEnd = explicitMajor
+  let mut minorEnd = explicitMinor
+  let parentHorizontal = nodes.style(id).writingMode == WritingMode.HorizontalTb
+
+  let mut count: usize = 0
+  let mut child = nodes.node(id).firstChild
+  while child != NO_NODE {
+    if !outOfFlow(nodes.style(child)) {
+      count = count + 1
+    }
+    child = nodes.node(child).nextSibling
+  }
+  run items.reserveExact(count)
+  let mut ordered = false
+  let mut automatic = false
+  child = nodes.node(id).firstChild
+  while child != NO_NODE {
+    let style = nodes.style(child)
+    if !outOfFlow(style) {
+      let childTemplate = &nodes.grids[style.grid]
+      let placement = &childTemplate.placement
+      let eligible = isGrid(style) && nodes.node(child).kind == BoxKind.Grid
+        && nodes.node(child).measurement != Measurement.Content && !style.replaced
+      let orthogonal = (style.writingMode == WritingMode.HorizontalTb) != parentHorizontal
+      let mut rowAxis = &childTemplate.rows
+      let mut columnAxis = &childTemplate.columns
+      if orthogonal {
+        rowAxis = &childTemplate.columns
+        columnAxis = &childTemplate.rows
+      }
+      let row = itemSpan(
+        &placement.rowStart, &placement.rowEnd, explicitRows, rowNames, rowAxis, eligible,
+      )
+      let column = itemSpan(
+        &placement.columnStart, &placement.columnEnd,
+        explicitColumns, columnNames, columnAxis, eligible,
+      )
+      let mut item = GridItem { id: child, row: row, column: column }
+      if transpose {
+        item.row = column
+        item.column = row
+      }
+      // Clamp before collecting extents or reserving cells, so excluded
+      // definite placements still block their nearest inherited track.
+      if boundedMajor {
+        item.row = normalize(item.row, 0, majorLimit)
+      }
+      if boundedMinor {
+        item.column = normalize(item.column, 0, minorLimit)
+      }
+      if item.row.definite {
+        if item.row.start < majorOrigin {
+          majorOrigin = item.row.start
+        }
+        if item.row.end > majorEnd {
+          majorEnd = item.row.end
+        }
+      }
+      if item.column.definite {
+        if item.column.start < minorOrigin {
+          minorOrigin = item.column.start
+        }
+        if item.column.end > minorEnd {
+          minorEnd = item.column.end
+        }
+      }
+      automatic = automatic || !item.row.definite || !item.column.definite
+      ordered = ordered || style.order != 0
+      run items.append(item)
+    }
+    child = nodes.node(child).nextSibling
+  }
+  let values = items.asMutSlice()
+  if ordered {
+    sort(&mut values, nodes)
+  }
+  majorOrigin = limitedOrigin(majorOrigin, explicitMajor)
+  minorOrigin = limitedOrigin(minorOrigin, explicitMinor)
+  majorEnd = limitedEnd(majorEnd, majorOrigin) - majorOrigin
+  minorEnd = limitedEnd(minorEnd, minorOrigin) - minorOrigin
+
+  // No cells are invented for an empty grid. Nonempty axes have at least one
+  // track even when every specified area lies beyond the supported boundary.
+  if count != 0 {
+    if majorEnd == 0 {
+      majorEnd = 1
+    }
+    if minorEnd == 0 {
+      minorEnd = 1
+    }
+  }
+  let mut index: usize = 0
+  while index < count {
+    if values[index].row.definite {
+      values[index].row = normalize(values[index].row, majorOrigin, majorOrigin + majorLimit)
+    }
+    if values[index].column.definite {
+      values[index].column = normalize(values[index].column, minorOrigin, minorOrigin + minorLimit)
+    }
+    index = index + 1
+  }
+
+  // Fully definite grids allow overlap and need neither bitmap nor row history.
+  if !automatic {
+    return finish(&mut values, majorOrigin, minorOrigin, majorEnd, minorEnd, transpose)
+  }
+
+  // Step 1 reserves ALL fully definite items before any automatic placement.
+  index = 0
+  while index < count {
+    if values[index].row.definite && values[index].column.definite {
+      run reserve(values[index], &mut work)
+    }
+    index = index + 1
+  }
+
+  // Step 2 searches earliest columns of the implicit grid. Its positive
+  // algorithm indices are not authored numeric lines relative to explicit 1.
+  // Only this step advances sparse history, keyed by definite row start.
+  index = 0
+  while index < count {
+    let mut item = values[index]
+    if item.row.definite && !item.column.definite {
+      let length = item.column.end - item.column.start
+      let firstRow = i32.toUsize(item.row.start)
+      let lastRow = i32.toUsize(item.row.end)
+      let mut column: i32 = 0
+      if !dense {
+        column = usize.toI32(work.occupancy.past(firstRow))
+      }
+      while column < minorLimit {
+        let next = usize.toI32(
+          work.occupancy.blockedEnd(
+            firstRow,
+            lastRow,
+            i32.toUsize(column),
+            i32.toUsize(smaller(column + length, minorLimit)),
+          ),
+        )
+        if next == column {
+          break
+        }
+        column = next
+      }
+      item.column = normalize(
+        GridSpan { start: column, end: column + length, definite: false },
+        0,
+        minorLimit,
+      )
+      if item.column.end > minorEnd {
+        minorEnd = item.column.end
+      }
+      run reserve(item, &mut work)
+      work.occupancy.remember(firstRow, i32.toUsize(item.column.end))
+      values[index] = item
+    }
+    index = index + 1
+  }
+
+  // Step 3 already includes every definite minor position, including those
+  // whose major position is still auto. Only unresolved minor spans widen it.
+  index = 0
+  while index < count {
+    let item = values[index]
+    if !item.row.definite && !item.column.definite {
+      let length = item.column.end - item.column.start
+      if length > minorEnd {
+        minorEnd = length
+      }
+    }
+    index = index + 1
+  }
+
+  // Step 4: sparse retains the cursor; dense restarts, except for a provably
+  // unusable prefix of completely occupied rows. Both searches are bounded.
+  let mut cursorRow: i32 = 0
+  let mut cursorColumn: i32 = 0
+  index = 0
+  while index < count {
+    let mut item = values[index]
+    if !item.row.definite {
+      let rowLength = item.row.end - item.row.start
+      let columnLength = item.column.end - item.column.start
+      if dense {
+        cursorRow = usize.toI32(work.occupancy.denseStart(i32.toUsize(minorEnd)))
+        cursorColumn = 0
+      }
+      if item.column.definite {
+        if !dense && item.column.start < cursorColumn && cursorRow < majorLimit {
+          cursorRow = cursorRow + 1
+        }
+        cursorColumn = item.column.start
+        while cursorRow < majorLimit {
+          let next = work.occupancy.blockedEnd(
+            i32.toUsize(cursorRow),
+            i32.toUsize(smaller(cursorRow + rowLength, majorLimit)),
+            i32.toUsize(cursorColumn),
+            i32.toUsize(item.column.end),
+          )
+          if next == i32.toUsize(cursorColumn) {
+            break
+          }
+          cursorRow = cursorRow + 1
+        }
+      } else {
+        while cursorRow < majorLimit {
+          if cursorColumn + columnLength > minorEnd {
+            cursorRow = cursorRow + 1
+            cursorColumn = 0
+            continue
+          }
+          let next = usize.toI32(
+            work.occupancy.blockedEnd(
+              i32.toUsize(cursorRow),
+              i32.toUsize(smaller(cursorRow + rowLength, majorLimit)),
+              i32.toUsize(cursorColumn),
+              i32.toUsize(cursorColumn + columnLength),
+            ),
+          )
+          if next == cursorColumn {
+            break
+          }
+          cursorColumn = next
+        }
+        if boundedMajor && boundedMinor && cursorRow >= majorLimit {
+          cursorColumn = minorEnd - 1
+        }
+        item.column = normalize(
+          GridSpan { start: cursorColumn, end: cursorColumn + columnLength, definite: false },
+          0,
+          minorEnd,
+        )
+      }
+      item.row = normalize(
+        GridSpan { start: cursorRow, end: cursorRow + rowLength, definite: false },
+        0,
+        majorLimit,
+      )
+      if item.row.end > majorEnd {
+        majorEnd = item.row.end
+      }
+      run reserve(item, &mut work)
+      values[index] = item
+    }
+    index = index + 1
+  }
+  return finish(&mut values, majorOrigin, minorOrigin, majorEnd, minorEnd, transpose)
+}

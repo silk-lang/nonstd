@@ -1,0 +1,176 @@
+import style { Style, Align, OverflowAlignment, WritingMode }
+import box_tree { BoxTree, BoxKind }
+import context { scrollable, usedOverflowForAxis }
+import geometry { Rect, Point, max }
+import grid_absolute { containingArea }
+import layout_pass { LayoutPass }
+import tree { Measurement, NO_NODE }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import geometry { Measure }
+import text { TextMeasure, TextError }
+import fragmentation { FragmentInput, FragmentationError }
+import context { Input }
+import engine { layoutInBfc }
+import bfc { BfcState }
+
+pub fn isContainer(nodes: &BoxTree, id: usize) -> bool {
+  return nodes.node(id).kind == BoxKind.Grid && nodes.node(id).measurement != Measurement.Content
+    && !nodes.style(id).replaced
+}
+
+// Fresh inline allocation for a positioning-only continuation. Keep only the
+// pooled Grid geometry; the checkpoint owns every speculative layout/publication.
+pub effect fn captureShell<'pass, 'source, M: Measure + TextMeasure>(
+  nodes: &BoxTree<'source>,
+  output: &mut LayoutPass<'pass, 'source>,
+  measurer: &mut M,
+  id: usize,
+  fragment: usize,
+  input: &Input,
+)
+  ! OutOfMemoryError | TextError | FragmentationError
+  ? &mut Allocator {
+  let checkpoint = output.checkpoint()
+  let mut request = input.*
+  request.performLayout = true
+  request.fragmentation = FragmentInput.continuous()
+  let mut bfc = BfcState.make()
+  drop run layoutInBfc(nodes, &mut output, &mut measurer, id, &request, &mut bfc)
+  let retained = output.cache.gridGeometry.retain(id)
+  output.restoreCheckpoint(checkpoint)
+  output.closeCheckpoint(checkpoint)
+  run output.cache.gridGeometry.publish(id, retained)
+  output.cache.gridGeometry.inheritRows(id)
+  let content = output.cache.gridGeometry.get(retained).content
+  let padding = output.cache.gridGeometry.get(retained).padding
+  run output.cache.gridGeometry.setFragment(id, fragment, content, padding)
+}
+
+// The supplied padding rectangle selects the physical containing-block instance.
+// Track geometry remains content-relative, including for repeated fixed grids.
+pub fn containingRect(
+  nodes: &BoxTree,
+  output: &LayoutPass,
+  container: usize,
+  child: usize,
+  padding: Rect,
+  fragment: usize,
+  joined: bool,
+) -> Rect {
+  let style = nodes.style(container)
+  let latest = output.cache.gridGeometry.find(container)
+  let mut slot = latest
+  if fragment != NO_NODE {
+    let found = output.cache.gridGeometry.findFragment(container, fragment)
+    if found != NO_NODE {
+      slot = found
+    }
+  }
+  let geometry = output.cache.gridGeometry.get(slot)
+  let mut localPadding = geometry.padding
+  let mut localContent = geometry.content
+  if geometry.fragment == NO_NODE {
+    localPadding = output.boxes[container].paddingRect()
+    localContent = output.boxes[container].contentRect()
+  }
+  let origin = Point { x: padding.x - localPadding.x, y: padding.y - localPadding.y }
+  let mut content = localContent.translated(origin)
+
+  // Joined normal-flow padding supplies the continuous block extent, while
+  // the selected fragment supplies its own inline track allocation.
+  if style.writingMode == WritingMode.HorizontalTb {
+    content.height = padding.height - localPadding.height + localContent.height
+  } else {
+    content.width = padding.width - localPadding.width + localContent.width
+  }
+  if joined && geometry.fragment != NO_NODE {
+    // A joined box keeps its first frame-start decoration and final frame-end
+    // decoration. The first fragment alone cannot supply a sliced ending edge.
+    let mut last = output.fragments.last(container)
+    while last != NO_NODE {
+      let value = &output.fragments.values.asSlice()[last]
+      if !value.positioningShell && !value.overflowOnly {
+        break
+      }
+      last = value.previousForBox
+    }
+    if last != NO_NODE {
+      let value = &output.fragments.values.asSlice()[last]
+      if output.frames.writingMode == WritingMode.HorizontalTb {
+        let top = localContent.y - localPadding.y
+        let bottom = value.paddingRect.y + value.paddingRect.height - value.contentRect.y
+          - value.contentRect.height
+        content.y = padding.y + top
+        content.height = max(0.0, padding.height - top - bottom)
+      } else {
+        let mut left = localContent.x - localPadding.x
+        let mut right = value.paddingRect.x + value.paddingRect.width - value.contentRect.x
+          - value.contentRect.width
+        if output.frames.writingMode == WritingMode.VerticalRl
+          || output.frames.writingMode == WritingMode.SidewaysRl {
+          left = value.contentRect.x - value.paddingRect.x
+          right = localPadding.x + localPadding.width - localContent.x - localContent.width
+        }
+        content.x = padding.x + left
+        content.width = max(0.0, padding.width - left - right)
+      }
+    }
+  }
+  let mut boundary = padding
+  let scrollX = scrollable(usedOverflowForAxis(style, true))
+  let scrollY = scrollable(usedOverflowForAxis(style, false))
+  if scrollX || scrollY {
+    // Position 4 §2 excludes absolute descendants, descendant overflow and
+    // relative offsets. Keep the engine's clipped normal-flow padding area,
+    // including when fragmented layout does not record reusable finals.
+    let overflow = geometry.normalPadding
+    if scrollX {
+      boundary.x = origin.x + overflow.x
+      boundary.width = overflow.width
+    }
+    if scrollY {
+      boundary.y = origin.y + overflow.y
+      boundary.height = overflow.height
+    }
+  }
+  return containingArea(
+    style,
+    &nodes.grids[nodes.style(child).grid].placement,
+    &geometry.columns,
+    &output.cache.gridGeometry.get(latest).rows,
+    content,
+    boundary,
+  )
+}
+
+pub struct StaticAlignment {
+  pub value: Align,
+  pub safety: OverflowAlignment,
+}
+
+pub fn staticAlignment(style: &Style, parent: &Style, inline: bool) -> StaticAlignment {
+  let mut value = style.alignSelf
+  let mut safety = style.alignSelfSafety
+  if inline {
+    value = style.justifySelf
+    safety = style.justifySelfSafety
+    if value == Align.Auto {
+      value = parent.justifyItems
+      safety = parent.justifyItemsSafety
+    }
+  } else if value == Align.Auto {
+    value = parent.alignItems
+    safety = parent.alignItemsSafety
+  }
+
+  // A hypothetical sole item has no baseline-sharing peer.
+  if value == Align.Baseline {
+    value = Align.SelfStart
+    safety = OverflowAlignment.Safe
+  }
+  if value == Align.LastBaseline {
+    value = Align.SelfEnd
+    safety = OverflowAlignment.Safe
+  }
+  return StaticAlignment { value: value, safety: safety }
+}
