@@ -1,7 +1,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.usize
 import silk.core.effect { Effect }
-import geometry { Layout, Size, Point, Rect, ResolvedEdges, OptionalSize, AvailableSpace, AvailableKind, Measure, MeasureRequest, NaturalDimensions, ScrollbarRequest, BaselineSet, MarginStrut, max, min, clamp, sameOverflow, EMPTY_EXTENT }
+import geometry { Layout, Size, Point, Rect, ResolvedEdges, OptionalSize, AvailableSpace, AvailableKind, Measure, MeasureRequest, NaturalDimensions, ScrollbarRequest, BaselineSet, MarginStrut, max, min, clamp, sameOverflow, sameSize, EMPTY_EXTENT }
 import style { Style, Display, Dimension, Edges, DimensionKind, DisplayOutside, DisplayInside, Float, Position, WritingMode, Direction, FlexDirection, FlexWrap, Align, Overflow, ScrollbarWidth, ScrollbarGutter, BoxDecorationBreak, BaselineSource }
 import tree { Tree, LayoutTree, LayoutStats, CutoffMiss, Measurement, NO_NODE }
 import context { Input, ResolvedBox, resolveBox, resolveBoxEdges, resolves, withGutter, scrollbarGutter, edges, isFlex, isGrid, outOfFlow, establishesContext, selfCollapsingSize, scrollable, overflowForAxis, usedOverflowForAxis, blockContentOffset, effectiveDisplay, blockJustification, UNBOUNDED }
@@ -1985,18 +1985,67 @@ fn baselinesMatter(nodes: &BoxTree, fragments: &FragmentArena, id: usize, fragme
 // it is the same as before, or, for an unmoved or absolutely positioned box
 // of a block or flex parent, both lie inside the parent's padding box,
 // which the parent's overflow covers anyway (see overflowGeometry).
-fn overflowStays(nodes: &BoxTree, output: &LayoutTree, id: usize, overflow: Rect, previous: Rect) -> bool {
+fn overflowStays(nodes: &BoxTree, output: &LayoutTree, id: usize, overflow: Rect, previous: Rect, moved: Point, size: Size) -> bool {
   let layout = &output.boxes.asSlice()[id]
-  if sameOverflow(overflow, previous, layout.size) { return true }
+  if moved.x == 0.0 && moved.y == 0.0 && sameSize(size, layout.size) && sameOverflow(overflow, previous, layout.size) { return true }
   let parent = nodes.node(id).parent
-  if parent == NO_NODE || !unmoved(nodes.style(id)) && !placedAlone(nodes, id) { return false }
+  if parent == NO_NODE { return false }
   let kind = nodes.node(parent).kind
   if kind != BoxKind.Block && kind != BoxKind.Flex { return false }
   let padding = output.boxes.asSlice()[parent].paddingRect()
-  return within(overflow.translated(layout.location), padding) && within(previous.translated(layout.location), padding)
+  let location = Point { x: layout.location.x + moved.x, y: layout.location.y + moved.y }
+  if unmoved(nodes.style(id)) {
+    return within(overflow.translated(location), padding) && within(previous.translated(layout.location), padding)
+  }
+  // The parent's union takes the box's rectangles unclipped.
+  let parentStyle = nodes.style(parent)
+  if !placedAlone(nodes, id) || parent == 0 || scrollable(usedOverflowForAxis(parentStyle, true)) || scrollable(usedOverflowForAxis(parentStyle, false)) { return false }
+  // An absolutely positioned box adds its border box and overflow to its
+  // parent's final overflow, which stays when the new ones lie inside it
+  // and the old ones drew none of its edges (see treeOverflow).
+  let area = output.boxes.asSlice()[parent].scrollableOverflow
+  return edgesStay(overflow.translated(location), previous.translated(layout.location), padding, area)
+    && edgesStay(Rect { x: location.x, y: location.y, width: size.width, height: size.height }, Rect { x: layout.location.x, y: layout.location.y, width: layout.size.width, height: layout.size.height }, padding, area)
 }
 fn within(rect: Rect, area: Rect) -> bool {
   return rect.x >= area.x && rect.y >= area.y && rect.x + rect.width <= area.x + area.width && rect.y + rect.height <= area.y + area.height
+}
+// Whether a rectangle that `area`, a union holding `padding`, took in as
+// `before` leaves it as it was as `now`: each side of `now` lies inside
+// `area`'s, and that side of `before` is the same or drew none of `area`'s.
+// A rectangle without area is no part of the union (see addOverflow).
+fn edgesStay(now: Rect, before: Rect, padding: Rect, area: Rect) -> bool {
+  let counted = now.width >= EMPTY_EXTENT && now.height >= EMPTY_EXTENT
+  let was = before.width >= EMPTY_EXTENT && before.height >= EMPTY_EXTENT
+  if !counted && !was { return true }
+  return sideStays(now.x, before.x, padding.x, area.x, counted, was) && sideStays(now.y, before.y, padding.y, area.y, counted, was)
+    && sideStays(-(now.x + now.width), -(before.x + before.width), -(padding.x + padding.width), -(area.x + area.width), counted, was)
+    && sideStays(-(now.y + now.height), -(before.y + before.height), -(padding.y + padding.height), -(area.y + area.height), counted, was)
+}
+// edgesStay for one low side (high sides negated).
+fn sideStays(now: f32, before: f32, padding: f32, area: f32, counted: bool, was: bool) -> bool {
+  if !was { return now >= area }
+  let drewNone = before > area || before >= padding
+  if !counted { return drewNone }
+  return now >= area && (now == before || drewNone)
+}
+
+// How far an absolutely positioned box placed alone moves when its size
+// changes from `old` to `new`, or false when that takes more than its
+// size. An axis of unchanged size keeps its position; on another, exactly
+// one inset must apply, so the box keeps that side (Position 3 §4.1) and
+// its alignment and static position play no part.
+fn relocation(nodes: &BoxTree, id: usize, old: Size, new: Size, moved: &mut Point) -> bool {
+  if !placedAlone(nodes, id) { return false }
+  let inset = nodes.style(id).inset
+  let right = inset.right.kind != DimensionKind.Auto
+  let bottom = inset.bottom.kind != DimensionKind.Auto
+  if old.width != new.width && (inset.left.kind != DimensionKind.Auto) == right { return false }
+  if old.height != new.height && (inset.top.kind != DimensionKind.Auto) == bottom { return false }
+  moved.* = Point { x: 0.0, y: 0.0 }
+  if right { moved.x = old.width - new.width }
+  if bottom { moved.y = old.height - new.height }
+  return true
 }
 
 // Gives each box of the subtree its layout from `scratch` and makes its
@@ -2045,6 +2094,8 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
   pass.keyShapes = Intrinsic.replace(facts.keyShapes, List<u16>.make())
   pass.itemFlags = Intrinsic.replace(facts.itemFlags, List<u8>.make())
   let baselines = baselinesMatter(nodes, &output.fragments, id, range.start)
+  let mut moved = Point { x: 0.0, y: 0.0 }
+  let mut resized = false
   let mut at = first
   while at < end && same {
     run probeNode(nodes, &mut pass, &mut measurer, id, &probes[at].input)
@@ -2064,10 +2115,28 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
       && recorded.valid && recorded.start == 0 && recorded.end == length && recorded.floatCount == 0
       && pass.fragments.values.length() == length
       && pass.fragments.texts.length() == output.fragments.textsBefore(range.end) - output.fragments.textsBefore(range.start)
+    let newSize = pass.boxes[id].size
+    if same && !sameSize(pass.boxes[id].size, output.boxes.asSlice()[id].size) {
+      // A box placed alone only moves with its size; its parent reads
+      // nothing else of it.
+      let size = output.boxes.asSlice()[id].size
+      if relocation(nodes, id, size, pass.boxes[id].size, &mut moved) {
+        pass.boxes[id].size = size
+        let values = pass.fragments.values.asMutSlice()
+        values[0].size = size
+        resized = true
+      }
+    }
+    same = same
       && Layout.sameBesideOverflow(&pass.boxes[id], &output.boxes.asSlice()[id], baselines)
-      && Fragment.sameBesideOverflow(&pass.fragments.values.asSlice()[0], &output.fragments.values.asSlice()[range.start], baselines)
-      && overflowStays(nodes, &output, id, pass.boxes[id].scrollableOverflow, output.boxes.asSlice()[id].scrollableOverflow)
-      && overflowStays(nodes, &output, id, pass.fragments.values.asSlice()[0].scrollableOverflow, output.fragments.values.asSlice()[range.start].scrollableOverflow)
+      && (resized || Fragment.sameBesideOverflow(&pass.fragments.values.asSlice()[0], &output.fragments.values.asSlice()[range.start], baselines))
+      && overflowStays(nodes, &output, id, pass.boxes[id].scrollableOverflow, output.boxes.asSlice()[id].scrollableOverflow, moved, newSize)
+      && overflowStays(nodes, &output, id, pass.fragments.values.asSlice()[0].scrollableOverflow, output.fragments.values.asSlice()[range.start].scrollableOverflow, moved, newSize)
+    if resized {
+      pass.boxes[id].size = newSize
+      let values = pass.fragments.values.asMutSlice()
+      values[0].size = newSize
+    }
   }
   if same { run pass.keepTexts() }
   output.cache = Intrinsic.replace(pass.cache, LayoutCache.make())
@@ -2078,8 +2147,12 @@ effect fn cutoffBox<'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>,
   facts.itemFlags = Intrinsic.replace(pass.itemFlags, List<u8>.make())
   drop pass
   if same {
+    let root = &mut output.fragments.values.asMutSlice()[range.start]
+    root.location = Point { x: root.location.x + moved.x, y: root.location.y + moved.y }
     output.fragments.spliceFrom(range.start, range.end, &scratchFragments)
     adoptSubtree(nodes, &mut output, scratchBoxes.asSlice(), id, id, range.start)
+    let layout = &mut output.boxes.asMutSlice()[id]
+    layout.location = Point { x: layout.location.x + moved.x, y: layout.location.y + moved.y }
   }
   unsetSubtree(nodes, &mut scratchFragments, id)
   output.scratchBoxes = move scratchBoxes
