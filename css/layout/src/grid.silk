@@ -29,7 +29,7 @@ import grid_fragment { FragmentGrid }
 import axes { Axes }
 import grid_placement { GridItem, collectItems }
 import grid_style { GridTrack, GridBreadthKind }
-import grid_scratch { GridAxisScratch, ContributionMemo }
+import grid_scratch { GridAxisScratch, ContributionMemo, ContributionMemos }
 import layout_cache { LayoutCache }
 import grid_lines { LineNames }
 import grid_template { expandedTracks, expandedLines }
@@ -247,42 +247,47 @@ fn cyclicTracks(tracks: &[GridTrack]) -> bool {
 // This also lets §12.1 compare the new min-content contributions in one walk.
 // Checks need only minimum/min-content; a triggered sizing pass collects maxima.
 // Baseline groups retain all three contribution kinds during either pass.
-// measureContribution, or what it returned for the same item and request
-// when the cache has cleared nothing of the item since: `memos[slot]`.
+// measureContribution, or what it returned for the same item, area and
+// policy when the cache has cleared nothing of the item since: memos' `slot`.
 effect fn memoContribution<'pass, 'source, M: Measure + TextMeasure>(
   nodes: &BoxTree<'source>,
   output: &mut LayoutPass<'pass, 'source>,
   measurer: &mut M,
-  memos: &mut List<ContributionMemo>,
+  memos: &mut ContributionMemos,
   slot: usize,
-  id: usize,
+  key: &ContributionMemo,
   request: &Input,
-  horizontal: bool,
-  automatic: bool,
-  cap: f32,
-  crossCap: f32,
-  needMin: bool,
-  needMax: bool,
 ) -> ItemContribution
   ! OutOfMemoryError | TextError | FragmentationError
   ? &mut Allocator {
   let kept = request.gridContext == 0 && output.frame == NO_NODE
-  if kept && slot < memos.length() {
-    let memo = &memos.asSlice()[slot]
-    if memo.id == id && output.cache.clearedAt(id) <= memo.clock
-      && memo.horizontal == horizontal && memo.automatic == automatic && memo.cap == cap && memo.crossCap == crossCap
-      && memo.needMin == needMin && memo.needMax == needMax && LayoutCache.sameRequest(&memo.request, request) {
-      return memo.result
+  if kept {
+    match memos.lookup(slot, key, output.cache.clearedAt(key.id)) {
+      Option<ItemContribution>.Some { value } => { return value }
+      Option<ItemContribution>.None => {}
     }
   }
   let clock = output.cache.clearClock()
-  let measured = run measureContribution(nodes, &mut output, &mut measurer, id, request, horizontal, automatic, cap, crossCap, needMin, needMax)
+  let measured = run measureContribution(nodes, &mut output, &mut measurer, key.id, request,
+    key.horizontal, key.automatic, key.cap, key.crossCap, key.needMin, key.needMax)
   if kept {
-    let value = ContributionMemo { id: id, clock: clock, request: request.*, horizontal: horizontal, automatic: automatic, cap: cap, crossCap: crossCap, needMin: needMin, needMax: needMax, result: measured }
-    while memos.length() <= slot { run memos.append(value) }
-    memos.set(slot, value)
+    let mut value = key.*
+    value.clock = clock
+    value.result = measured
+    run memos.store(slot, value)
   }
   return measured
+}
+
+fn contributionKey(
+  id: usize, area: OptionalSize, minimum: Size, horizontal: bool, automatic: bool,
+  cap: f32, crossCap: f32, needMin: bool, needMax: bool,
+) -> ContributionMemo {
+  return ContributionMemo {
+    id: id, clock: 0, area: area, minimum: minimum, horizontal: horizontal, automatic: automatic,
+    cap: cap, crossCap: crossCap, needMin: needMin, needMax: needMax,
+    result: ItemContribution { minimum: 0.0, minContent: 0.0, maxContent: 0.0, usedMinimum: 0.0 },
+  }
 }
 
 effect fn collectContributions<'pass, 'source, M: Measure + TextMeasure>(
@@ -344,6 +349,7 @@ effect fn collectContributions<'pass, 'source, M: Measure + TextMeasure>(
     && parent.writingMode == WritingMode.HorizontalTb
   Baselines.truncateMembers(&mut baselines, sizing.columns, items.length)
   Baselines.reset(&mut baselines, sizing.columns, own.contributions.asSlice())
+  own.memos.begin(base)
   let mut changed = false
   index = 0
   while index < items.length {
@@ -397,65 +403,70 @@ effect fn collectContributions<'pass, 'source, M: Measure + TextMeasure>(
           area.widthDefinite = true
         }
       }
-      let mut request = itemInput(&output, item.id, base, nodes.style(item.id), parent, axis, area)
-      if source.subgridChildren && Subgrid.eligible(nodes, item.id) {
-        let mut inherited = output.cache.subgrids.takeBuilder()
-        if sizing.columns {
-          run Subgrid.makeContext(nodes, item, parent, source, tracks, crossTracks,
-            sizing.usedGap, crossSizing.usedGap, &mut inherited)
-        } else {
-          run Subgrid.makeContext(nodes, item, parent, source, crossTracks, tracks,
-            crossSizing.usedGap, sizing.usedGap, &mut inherited)
+      let subgridItem = source.subgridChildren && Subgrid.eligible(nodes, item.id)
+      let mut slot = 2 * index
+      if checkOnly { slot = slot + 1 }
+      let key = contributionKey(
+        item.id, area, Size.zero(), sizing.columns != axis.vertical, policy.automatic,
+        policy.cap, crossPolicy.cap, policy.needMin, policy.needMax && (!checkOnly || aligned),
+      )
+      // A remembered contribution needs no request, unless baselines read it.
+      let mut remembered = Option<ItemContribution>.None
+      if policy.intrinsic && !aligned && !subgridItem && output.frame == NO_NODE {
+        remembered = own.memos.lookup(slot, &key, output.cache.clearedAt(item.id))
+      }
+      match remembered {
+        Option<ItemContribution>.Some { value } => {
+          contribution.minimum = value.minimum
+          contribution.minContent = value.minContent
+          contribution.maxContent = value.maxContent
         }
-        inherited.stage = 1
-        if sizing.columns { inherited.stage = inherited.stage + 1 }
-        if crossFinal { inherited.stage = inherited.stage + 2 }
-        if checkOnly { inherited.stage = inherited.stage + 4 }
-        request.gridContext = run output.cache.subgrids.intern(item.id, move inherited)
-      }
-      let mut measured = ItemContribution {
-        minimum: 0.0,
-        minContent: 0.0,
-        maxContent: 0.0,
-        usedMinimum: 0.0,
-      }
-      if policy.intrinsic {
-        let mut slot = 2 * index
-        if checkOnly { slot = slot + 1 }
-        measured = run memoContribution(
-          nodes,
-          &mut output,
-          &mut measurer,
-          &mut own.memos,
-          slot,
-          item.id,
-          &request,
-          sizing.columns != axis.vertical,
-          policy.automatic,
-          policy.cap,
-          crossPolicy.cap,
-          policy.needMin,
-          policy.needMax && (!checkOnly || aligned),
-        )
-        contribution.minimum = measured.minimum
-        contribution.minContent = measured.minContent
-        contribution.maxContent = measured.maxContent
-      }
-      if aligned {
-        // Members without track contributions still establish the group's
-        // baseline for members whose spans include intrinsically sized tracks.
-        run Baselines.captureContribution(
-          nodes,
-          &mut output,
-          &mut measurer,
-          &mut baselines,
-          index,
-          sizing.columns,
-          item.id,
-          &request,
-          &measured,
-          parent,
-        )
+        Option<ItemContribution>.None => {
+          let mut request = itemInput(&output, item.id, base, nodes.style(item.id), parent, axis, area)
+          if subgridItem {
+            let mut inherited = output.cache.subgrids.takeBuilder()
+            if sizing.columns {
+              run Subgrid.makeContext(nodes, item, parent, source, tracks, crossTracks,
+                sizing.usedGap, crossSizing.usedGap, &mut inherited)
+            } else {
+              run Subgrid.makeContext(nodes, item, parent, source, crossTracks, tracks,
+                crossSizing.usedGap, sizing.usedGap, &mut inherited)
+            }
+            inherited.stage = 1
+            if sizing.columns { inherited.stage = inherited.stage + 1 }
+            if crossFinal { inherited.stage = inherited.stage + 2 }
+            if checkOnly { inherited.stage = inherited.stage + 4 }
+            request.gridContext = run output.cache.subgrids.intern(item.id, move inherited)
+          }
+          let mut measured = ItemContribution {
+            minimum: 0.0,
+            minContent: 0.0,
+            maxContent: 0.0,
+            usedMinimum: 0.0,
+          }
+          if policy.intrinsic {
+            measured = run memoContribution(nodes, &mut output, &mut measurer, &mut own.memos, slot, &key, &request)
+            contribution.minimum = measured.minimum
+            contribution.minContent = measured.minContent
+            contribution.maxContent = measured.maxContent
+          }
+          if aligned {
+            // Members without track contributions still establish the group's
+            // baseline for members whose spans include intrinsically sized tracks.
+            run Baselines.captureContribution(
+              nodes,
+              &mut output,
+              &mut measurer,
+              &mut baselines,
+              index,
+              sizing.columns,
+              item.id,
+              &request,
+              &measured,
+              parent,
+            )
+          }
+        }
       }
     }
     if index < own.contributions.length() && !aligned {
@@ -698,7 +709,7 @@ pub effect fn requestItem<'pass, 'source, M: Measure + TextMeasure>(
   columnGap: f32,
   rowGap: f32,
   area: OptionalSize,
-  memos: &mut List<ContributionMemo>,
+  memos: &mut ContributionMemos,
   index: usize,
 ) -> Input
   ! OutOfMemoryError | TextError | FragmentationError
@@ -740,39 +751,13 @@ pub effect fn requestItem<'pass, 'source, M: Measure + TextMeasure>(
     blockMinimum = style.minWidth
   }
   if !inheritColumns && columnPolicy.automatic && inlineMinimum.kind == DimensionKind.Auto {
-    let measured = run memoContribution(
-      nodes,
-      &mut output,
-      &mut measurer,
-      &mut memos,
-      2 * index,
-      item.id,
-      &request,
-      !axis.vertical,
-      true,
-      columnPolicy.cap,
-      rowPolicy.cap,
-      false,
-      false,
-    )
+    let key = contributionKey(item.id, area, request.minimum, !axis.vertical, true, columnPolicy.cap, rowPolicy.cap, false, false)
+    let measured = run memoContribution(nodes, &mut output, &mut measurer, &mut memos, 2 * index, &key, &request)
     applyMinimum(&mut request, !axis.vertical, measured.usedMinimum)
   }
   if !inheritRows && rowPolicy.automatic && blockMinimum.kind == DimensionKind.Auto {
-    let measured = run memoContribution(
-      nodes,
-      &mut output,
-      &mut measurer,
-      &mut memos,
-      2 * index + 1,
-      item.id,
-      &request,
-      axis.vertical,
-      true,
-      rowPolicy.cap,
-      columnPolicy.cap,
-      false,
-      false,
-    )
+    let key = contributionKey(item.id, area, request.minimum, axis.vertical, true, rowPolicy.cap, columnPolicy.cap, false, false)
+    let measured = run memoContribution(nodes, &mut output, &mut measurer, &mut memos, 2 * index + 1, &key, &request)
     applyMinimum(&mut request, axis.vertical, measured.usedMinimum)
   }
   return request
@@ -1248,6 +1233,7 @@ pub effect fn layoutGrid<'pass, 'source, M: Measure + TextMeasure>(
       }
     }
   }
+  scratch.finalMemos.begin(&base)
   let mut pass: usize = 0
   while pass < passes {
     let mut index: usize = 0
