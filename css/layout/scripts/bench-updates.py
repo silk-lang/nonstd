@@ -6,7 +6,7 @@ one compute. The first, untimed compute lays out the initial document. After
 the run, the adapter's final geometry must equal a fresh layout of the same
 final document, so caches cannot change results unnoticed.
 
-Build the release adapter first: silk build --package silk_layout_cli --release
+Build the release adapter first: silk build --package css-layout-cli --release
 """
 import argparse
 import copy

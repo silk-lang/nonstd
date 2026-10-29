@@ -1,4 +1,4 @@
-"""Behavior tests; run explicitly with python -m unittest discover -s svg_bench."""
+"""Behavior tests; run explicitly with python -m unittest discover -s images/svg/bench."""
 import importlib.util
 import tempfile
 from pathlib import Path

@@ -196,9 +196,9 @@ def show_line(line: bytes | None) -> str:
 
 
 def silk_binary() -> Path:
-    candidates = sorted((ROOT / "build/llvm").glob(f"*/{PROFILE}/font_dump"))
+    candidates = sorted((ROOT / "build/llvm").glob(f"*/{PROFILE}/font-parse-dump"))
     if len(candidates) != 1:
-        raise ValueError("build font_dump first with font/scripts/build, or pass --silk-dumper PATH")
+        raise ValueError("build font-parse-dump first with font/scripts/build, or pass --silk-dumper PATH")
     return candidates[0]
 
 

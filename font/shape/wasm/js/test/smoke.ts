@@ -1,4 +1,4 @@
-// Shapes a few strings with the wasm build and compares them with the native hr_shape output.
+// Shapes a few strings with the wasm build and compares them with the native font-shape-cli output.
 // Run `font/scripts/build-wasm` first; fonts come from the font/shape/test-data/harfrust submodule.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -72,4 +72,4 @@ assert.equal(roboto.shape('office', { features: ['-liga'] }).glyphs.length, 6)
 assert.throws(() => harfrust.font(new Uint8Array([1, 2, 3])), /InvalidFont/)
 const serif = harfrust.font(readFileSync(new URL('SourceSerifVariable-Roman.ttf', fonts)))
 assert.deepEqual(serif.info.axes.map(axis => [axis.tag, axis.min, axis.max]), [['wght', 200, 900]])
-console.log(`ok: ${cases.length} shaping cases match hr_shape`)
+console.log(`ok: ${cases.length} shaping cases match font-shape-cli`)

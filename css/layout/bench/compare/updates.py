@@ -9,7 +9,7 @@ of a scenario's cycle and lays out again. Scenarios, for every workload:
   fluid-resize  the same with the root's width removed, so the resize reaches the boxes
 Geometry after the last step is compared on border boxes in absolute coordinates.
 
-  python3 bench/compare/updates.py --silk build/.../release/silk_layout_cli \\
+  python3 bench/compare/updates.py --silk build/.../release/css-layout-cli \\
       --taffy bench/compare/taffy/target/release/taffy-harness \\
       --yoga bench/compare/yoga/build/yoga-harness [--iterations 40] [--only NAME,...]
 """
