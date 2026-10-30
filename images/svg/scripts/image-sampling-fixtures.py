@@ -63,4 +63,33 @@ for name, hint, width, height, mx, my in cases:
         status='pass', tolerance={},
         spec='https://www.w3.org/TR/css-images-3/#the-image-rendering',
         reason='Original four-color PNG; reference explicitly duplicates samples to the nearest positive integer size on each axis, then uses the selected smooth algorithm.'))
+def add(name, actual, reference, reason):
+    filename = 'sampling-' + name + '.svg'
+    (ROOT / 'inputs' / filename).write_text(svg(actual))
+    (ROOT / 'references' / filename).write_text(svg(reference))
+    manifest['cases'].append(dict(
+        id='image-sampling-' + name, input='inputs/' + filename,
+        references=[dict(path='references/' + filename, relation='==')],
+        status='pass', tolerance={},
+        spec='https://www.w3.org/TR/css-images-3/#the-image-rendering',
+        reason=reason))
+
+
+for name, transform in [('scaled', 'scale(1.8)'),
+                        ('rotated-scaled', 'translate(12 0) rotate(90) scale(1.8)')]:
+    # 2.8/2 * 1.8 = 2.52 on each axis, so the device transform changes
+    # the first-stage integer multiple from one to three.
+    wrap = lambda body: f'<g transform="{transform}">{body}</g>'
+    add(name, wrap(image(source(), 2.8, 2.8, 'pixelated')),
+        wrap(image(source(3, 3), 2.8, 2.8, 'smooth')),
+        'Complete device mapping determines the nearest integer expansion; the independent reference expands threefold before the same scale and rotation.')
+
+actual = image(source(), 5.2, 3.2, 'pixelated')
+reference = image(source(3, 2), 5.2, 3.2, 'smooth')
+for shift, width, height, mx, my in [(4, 3.2, 5.2, 2, 3), (8, 5.2, 3.2, 3, 2)]:
+    actual += f'<g transform="translate(0 {shift})">' + image(source(), width, height, 'pixelated') + '</g>'
+    reference += f'<g transform="translate(0 {shift})">' + image(source(mx, my), width, height, 'smooth') + '</g>'
+add('shared-resource-scales', actual, reference,
+    'One decoded resource is used at two anisotropic integer expansions and then reuses the first expansion; independent references have duplicated samples for each scale.')
+
 manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
