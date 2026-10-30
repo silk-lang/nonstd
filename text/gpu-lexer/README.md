@@ -101,6 +101,11 @@ The native part needs Dawn and a Vulkan driver (lavapipe in CI); see `gpu/webgpu
 `node text/gpu-lexer/scripts/expected.mjs <gpu-lexer checkout>` regenerates `tests/expected`
 from the original (Node, plus Playwright's Chromium for the spans).
 
+## Command line
+
+`cli/` prints a file's spans, one `class start end` line each:
+`text-gpu-lexer-cli FILE [lite]`.
+
 ## Benchmarks
 
 `python3 text/gpu-lexer/scripts/bench` times the port (`bench/`) and
