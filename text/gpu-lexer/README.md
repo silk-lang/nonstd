@@ -136,7 +136,20 @@ emulates the GPU on the CPU, so the GPU dominates end to end; on lavapipe the po
 checkout>` adds the Silk TextMate grammar from
 [silk-vscode](https://github.com/silk-lang/silk-vscode) (`syntaxes/silk.tmLanguage.json`, MIT)
 as Shiki's `silk` language, maps `.silk` files to it, and adds Silk repositories to the pinned
-corpus. Then follow gpu-lexer's own training steps (`corpus:prepare`, `train`).
+corpus. Then, in `packages/training`:
+
+```sh
+mkdir -p runs   # train-tree.js saves into runs/ but does not create it
+node --max-old-space-size=11000 src/fetch-corpus.js
+for split in train verification mining; do node --max-old-space-size=11000 src/build-corpus.js --split $split; done
+node src/train-tree.js --epochs 12 --lr 0.0002 --final-lr 0.00001 --agreement-epochs 0 \
+  --fine-tune-epochs 0 --calibration-epochs 0 --distillation-weight 0 --replay-fraction 0 --seed 1337
+```
+
+Warm-started from gpu-lexer's model, the default schedule only polishes (learning rate 1e-6);
+the flags above run the full schedule. With 93 Silk files (4.7% of training parts), Silk part
+accuracy on silk-layout went from 88.5% to about 89.0%: the 41K-weight model is near capacity,
+and types (59% F1) remain the weakest class.
 
 ## License
 

@@ -21,7 +21,7 @@ if (head !== UPSTREAM_COMMIT) throw new Error(`expected gpu-lexer ${UPSTREAM_COM
 const here = new URL(".", import.meta.url).pathname;
 const training = join(checkout, "packages/training");
 
-// corpus.js maps `.silk`, label.js loads the grammar, fetch-corpus.js fetches with git (the archive
+// corpus.js maps `.silk`, label.js loads the grammar, language-objective.js weighs Silk, fetch-corpus.js fetches with git (the archive
 // endpoint is not reachable from every network).
 execFileSync("git", ["-C", checkout, "apply", join(here, "silk.patch")], { stdio: "inherit" });
 copyFileSync(join(here, "silk.tmLanguage.json"), join(training, "data/silk.tmLanguage.json"));
@@ -34,4 +34,13 @@ corpus.policy.minimumLanguageTokens.verification.silk = 2000;
 corpus.train.git.push(...SILK_TRAIN);
 corpus.verification.git.push(...SILK_VERIFICATION);
 writeFileSync(corpusPath, `${JSON.stringify(corpus, null, 2)}\n`);
+
+// The language objective needs every trained family: Silk joins as a supplemental language with
+// the same weight as the other supplemental formats.
+const popularityPath = join(training, "data/language-popularity.json");
+const popularity = readFileSync(popularityPath, "utf8");
+const diff = '    { "github": "Diff", "shiki": ["diff"], "family": "diff", "pushers": 0, "percent": 0, "supplemental": true }';
+if (!popularity.includes(diff)) throw new Error("unexpected language-popularity.json");
+writeFileSync(popularityPath, popularity.replace(diff, `${diff},
+    { "github": "Silk", "shiki": ["silk"], "family": "silk", "pushers": 0, "percent": 0, "supplemental": true }`));
 console.log("Silk training overlay applied");
