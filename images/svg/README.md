@@ -20,7 +20,11 @@ coverage.
   dashes. All separable and non-separable `mix-blend-mode` values and explicit
   `isolation` are consumed by the CPU layer executor.
 
-General clipping and masking, filters, image decoding, text, animation and ICC colour are planned
+Clipping now includes referenced `clipPath` geometry, nested intersections, child unions,
+`use`, basic CSS shapes and geometry boxes. Geometric unions are evaluated before
+antialias rasterization. Text clipping and projective clip edge cases remain in progress.
+
+Masking, filters, image decoding, text, animation and ICC colour are planned
 later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example

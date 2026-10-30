@@ -189,6 +189,27 @@ def generate_compositing(config):
     return {"compositing.svg": svg(size, shapes)}
 
 
+def generate_clipping(config):
+    """Repeated transformed unions/intersections plus CSS basic-shape clipping."""
+    size, grid = config["size"], config["grid"]
+    step = size // grid
+    shapes = ['<defs><clipPath id="outer" clipPathUnits="objectBoundingBox">'
+              '<rect x=".1" y=".1" width=".8" height=".8"/></clipPath>'
+              '<clipPath id="union" clipPathUnits="objectBoundingBox" clip-path="url(#outer)">'
+              '<circle cx=".35" cy=".5" r=".35"/>'
+              '<circle cx=".65" cy=".5" r=".35"/></clipPath></defs>',
+              f'<rect width="{size}" height="{size}" fill="#315579"/>']
+    for row in range(grid):
+        for column in range(grid):
+            left, top = column * step, row * step
+            shapes.append(
+                f'<g transform="translate({left} {top})" clip-path="url(#union)">'
+                f'<rect width="{step}" height="{step}" fill="#cc6633"/>'
+                f'<rect width="{step}" height="{step}" fill="#3399cc" '
+                'style="clip-path:polygon(0 0,100% 25%,75% 100%,25% 75%)"/></g>')
+    return {"clipping.svg": svg(size, shapes)}
+
+
 def verify_asset(data, spec):
     if hashlib.sha256(data).hexdigest() != spec["sha256"]:
         raise ValueError("Tiger SHA-256 mismatch; refusing unpinned content")
@@ -210,7 +231,7 @@ def normalize_tiger(data, config):
 def prepare(manifest, cache, fetch_tiger=False, selected=None):
     cache = Path(cache)
     result = {}
-    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing}
+    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing, "clipping": generate_clipping}
     for name, spec in manifest["workloads"].items():
         if selected is not None and name not in selected:
             continue

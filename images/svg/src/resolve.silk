@@ -1,5 +1,7 @@
 //! Resolve typed computed CSS and exact reference geometry into retained nodes.
 import scene {
+  ClipNode,
+  FillRule,
   BlendMode,
   RenderOptions,
   RenderError,
@@ -16,6 +18,10 @@ import document_styles { StyledGraph }
 import structure { Graph, OccurrenceId }
 import used_viewports { Metadata, Clip, ElementKind }
 import used_viewports
+import used_clip_shapes
+import svg_css.effect_values { EffectValue, ClipSource, GeometryBox }
+import used_clips
+import svg_css.value_keywords { Keyword }
 import used_geometry
 import used_style { DashCache }
 import used_style
@@ -433,6 +439,8 @@ struct Planning {
   depthPeak: usize,
   referencePeak: usize,
   activePatterns: List<usize>,
+  clipNodes: List<ClipNode>,
+  activeClips: List<usize>,
   resourceAncestry: usize,
   ancestryKeys: HashMap<ReferenceKey, usize>,
   ancestryCount: usize,
@@ -2276,6 +2284,273 @@ effect fn paint(
   }
 }
 
+// https://www.w3.org/TR/css-masking-1/#ClippingPaths
+// Clip children contribute geometry independently of all paint properties.
+effect fn clipGeometry(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  state: &mut Planning,
+  parent: &Mapping,
+  root: bool,
+  limits: &Limits,
+  depth: usize,
+) -> usize
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth > 256 || depth > graph.limits.maxOccurrenceDepth
+    || state.clipNodes.length() >= graph.limits.maxOccurrences {
+    fail RenderError.TooLarge
+  }
+  let plan = state.plans.asSlice()[id]
+  let matrix = run parent.compose(&plan.local)
+  let mut result = state.clipNodes.length()
+  run state.clipNodes.append(ClipNode.Empty)
+  if plan.suppressed {
+    return result
+  }
+  if plan.paintable && plan.style.visible {
+    if let Option<usize>.Some { value: path } = &plan.path {
+      let computed = match &styles.catalog.engine.get(plan.styleId, Property.ClipRule) {
+        Option<ComputedValue>.Some { value } => value.value
+        _ => {
+          fail RenderError.InvalidStyleContext
+        }
+      }
+      let rule = match &styles.catalog.engine.values.get(computed).* {
+        Value.Keyword { keyword: value } => if value == Keyword.Evenodd {
+          FillRule.EvenOdd
+        } else {
+          FillRule.Nonzero
+        }
+        _ => {
+          fail RenderError.InvalidStyleContext
+        }
+      }
+      result = state.clipNodes.length()
+      run state.clipNodes.append(ClipNode.Shape { path: path, transform: matrix, rule: rule })
+    }
+  }
+
+  // Only the resource root and use instances may contain contributing children.
+  // A group directly inside clipPath is not an allowed clipping shape.
+  if root || plan.instance {
+    let mut child = plan.firstChild
+    while let Option<usize>.Some { value: next } = &child {
+      let contribution = run clipGeometry(
+        graph,
+        &mut styles.*,
+        next,
+        &mut state.*,
+        &matrix,
+        false,
+        limits,
+        depth + 1,
+      )
+      let combined = state.clipNodes.length()
+      run state.clipNodes.append(ClipNode.Union { left: result, right: contribution })
+      result = combined
+      child = state.plans.asSlice()[next].nextSibling
+    }
+  }
+  if let Option<usize>.Some { value: nested } = &(run referencedClip(
+    graph,
+    &mut styles.*,
+    id,
+    &mut state.*,
+    &matrix,
+    limits,
+    depth + 1,
+  )) {
+    let combined = state.clipNodes.length()
+    run state.clipNodes.append(ClipNode.Intersect { left: result, right: nested })
+    result = combined
+  }
+  return result
+}
+
+effect fn referencedClip(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  state: &mut Planning,
+  matrix: &Mapping,
+  limits: &Limits,
+  depth: usize,
+) -> Option<usize>
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = state.plans.asSlice()[id]
+  if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
+    plan.styleId,
+    Property.ClipPath,
+  ) {
+    if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+      if let EffectValue.ClipPath { source } = &value {
+        let reference = match &source {
+          ClipSource.Shape { shape, reference } => reference
+          ClipSource.Box { reference } => reference
+          _ => GeometryBox.View
+        }
+        let box = if reference == GeometryBox.View {
+          state.spaces.asSlice()[plan.viewport]
+        } else {
+          match &(run gather(
+            graph,
+            id,
+            state.plans.asSlice(),
+            state.layouts.asSlice(),
+            state.paths.asSlice(),
+            &Mapping.identity(),
+            false,
+            reference == GeometryBox.Stroke || reference == GeometryBox.Border
+              || reference == GeometryBox.Margin,
+            &mut state.bounds,
+          )) {
+            Option<Rect>.Some { value: bounds } => bounds
+            _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+          }
+        }
+        if let ClipSource.Box { reference: ignored } = &source {
+          let path = state.paths.length()
+          run state.paths.append(
+            run svg.rectangle(box.xMin, box.yMin, box.width(), box.height(), 0.0, 0.0),
+          )
+          let index = state.clipNodes.length()
+          run state.clipNodes.append(
+            ClipNode.Shape { path: path, transform: matrix.*, rule: FillRule.Nonzero },
+          )
+          return Option<usize>.some(index)
+        }
+        if let ClipSource.Shape { shape, reference: ignored } = &source {
+          let built = run used_clip_shapes.build(&styles.catalog.engine, &shape, box)
+          if let Option<used_clip_shapes.Geometry>.Some { value: geometry } = move built {
+            let path = state.paths.length()
+            let rule = geometry.rule
+            run state.paths.append(move geometry.path)
+            let transform = run matrix.compose(
+              &Mapping.Affine { value: Transform.new(1.0, 0.0, 0.0, 1.0, box.xMin, box.yMin) },
+            )
+            let index = state.clipNodes.length()
+            run state.clipNodes.append(
+              ClipNode.Shape { path: path, transform: transform, rule: rule },
+            )
+            return Option<usize>.some(index)
+          }
+        }
+      }
+    }
+  }
+  let node = match &styles.resource(plan.occurrence, Property.ClipPath) {
+    Option<OccurrenceId>.Some { value } => value
+    _ => {
+      return Option<usize>.None
+    }
+  }
+  let source = graph.occurrences.asSlice()[node.index].source
+  let document = graph.sourceDocument(source)
+  if !equal(Document.localName(document, source.node), b"clipPath") {
+    return Option<usize>.None
+  }
+  let mut i: usize = 0
+  while i < state.activeClips.length() {
+    if state.activeClips.asSlice()[i] == node.index {
+      return Option<usize>.None
+    }
+    i = i + 1
+  }
+  if depth > 256 || state.activeClips.length() >= graph.limits.maxReferenceDepth {
+    fail RenderError.TooLarge
+  }
+  let bounds = match &(run gather(
+    graph,
+    id,
+    state.plans.asSlice(),
+    state.layouts.asSlice(),
+    state.paths.asSlice(),
+    &Mapping.identity(),
+    false,
+    false,
+    &mut state.bounds,
+  )) {
+    Option<Rect>.Some { value } => value
+    _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+  }
+  let coordinates = match &(run used_clips.coordinates(
+    document,
+    source.node,
+    state.spaces.asSlice()[plan.viewport],
+    bounds,
+  )) {
+    Option<used_clips.Coordinates>.Some { value } => value
+    _ => {
+      return Option<usize>.None
+    }
+  }
+  let viewport = state.spaces.length()
+  run state.spaces.append(coordinates.user)
+  let layout = state.layouts.length()
+  run state.layouts.append(
+    Layout {
+      supplement: Transform.identity(),
+      clip: Option<Clip>.None,
+      clipMapping: Mapping.identity(),
+      referenceMapping: true,
+      viewportHost: Option<Mapping>.None,
+    },
+  )
+  let root = PreparationRoot {
+    occurrence: node,
+    viewport: viewport,
+    childViewport: viewport,
+    layout: layout,
+    definition: true,
+    externalTransform: false,
+  }
+  let prepared = run prepare(
+    graph,
+    &mut styles.*,
+    node,
+    &root,
+    Option<usize>.None,
+    0,
+    &mut state.*,
+    limits,
+  )
+  let mut result = state.clipNodes.length()
+  run state.clipNodes.append(ClipNode.Empty)
+  if let Option<usize>.Some { value } = &prepared {
+    run place(
+      graph,
+      value,
+      &styles.catalog.engine,
+      state.spaces.asSlice(),
+      &transforms.identity(),
+      false,
+      &mut state.plans,
+      &mut state.layouts,
+      &mut state.pending,
+      state.paths.asSlice(),
+      &mut state.bounds,
+    )
+    state.pending.truncate(0)
+    let placement = run matrix.compose(&Mapping.Affine { value: coordinates.mapping })
+    run state.activeClips.append(node.index)
+    result = run clipGeometry(
+      graph,
+      &mut styles.*,
+      value,
+      &mut state.*,
+      &placement,
+      true,
+      limits,
+      depth + 1,
+    )
+    drop state.activeClips.pop()
+  }
+  return Option<usize>.some(result)
+}
+
 effect fn paintPrepared(
   graph: &Graph,
   styles: &mut StyledGraph,
@@ -2371,7 +2646,8 @@ effect fn paintPrepared(
   } else {
     context.*
   }
-  let layer = plan.style.opacity != 1.0 || plan.style.isolated
+  let clipping = run referencedClip(graph, &mut styles.*, id, &mut state.*, matrix, limits, depth)
+  let layer = clipping.isSome() || plan.style.opacity != 1.0 || plan.style.isolated
     || plan.style.blendMode != BlendMode.Normal
   if layer {
     run nodes.append(
@@ -2491,6 +2767,9 @@ effect fn paintPrepared(
       )
       child = state.plans.asSlice()[next].nextSibling
     }
+  }
+  if let Option<usize>.Some { value } = &clipping {
+    run nodes.append(ResolvedNode.ApplyClip { index: value })
   }
   if layer {
     run nodes.append(ResolvedNode.EndGroup)
@@ -2635,6 +2914,8 @@ effect fn resolveStyled(
     depthPeak: 0,
     referencePeak: 0,
     activePatterns: List<usize>.make(),
+    clipNodes: List<ClipNode>.make(),
+    activeClips: List<usize>.make(),
     resourceAncestry: usize.MAX,
     ancestryKeys: HashMap<ReferenceKey, usize>.make(Hash.seed(0)),
     ancestryCount: 0,
@@ -2736,6 +3017,7 @@ effect fn resolveStyled(
     patterns: move state.patterns,
     strokeSpaces: move state.strokeSpaces,
     projectionClips: move projectionClips,
+    clipNodes: move state.clipNodes,
   }
 }
 

@@ -53,7 +53,14 @@ isolated surfaces. The compositing manifest checks all 16 blend functions agains
 literal colors calculated from the normative equations, plus group opacity,
 non-inheritance and 2D/3D isolation. No comparison tolerance is used.
 
-General clipping/masking, image decoding, filters, text, animation and ICC remain
+Clipping is in progress: retained boolean geometry handles sibling unions and nested
+intersections before antialiasing. Own fixtures cover resource units, transforms,
+`use`, invalid children, paint-independent geometry, duplicate and shared edges,
+CSS basic shapes and geometry boxes. Unresolved clip URLs retain their required
+stacking context. Text clipping, broader projective cases, legacy `clip`, external
+conformance cases and performance validation are still pending.
+
+Masking, image decoding, filters, text, animation and ICC remain
 required later work, not exclusions from scope. `shape-rendering` controls current
 shape rasterization; computed image/text hints gain consumers in their own phases.
 Parsing those properties does not implement their rendering.

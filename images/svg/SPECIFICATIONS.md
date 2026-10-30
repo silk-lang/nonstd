@@ -406,7 +406,13 @@ ordinary 2D transforms do not create a boundary. The retained `BlendMode` enum
 maps to the shared vector compositor only at execution. Group opacity applies
 once when the surface is composited into its parent.
 
-Clipping, masking, filters and their additional isolation behavior remain under
+Clip-path resource geometry and CSS basic shapes now feed retained boolean clip
+nodes. CSS Masking 1 #the-clip-path requires isolation even for an unresolved URL;
+#ClippingPaths requires child unions and nested intersections independent of paint.
+These are checked with literal-geometry reftests, including antialiased shared edges.
+The phase checklist remains open pending the remaining clipping cases and gates.
+
+Masking, filters and their additional isolation behavior remain under
 implementation; these tests do not complete the combined coverage item below.
 
 ## Section-level coverage checklist
