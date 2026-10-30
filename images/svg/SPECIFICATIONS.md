@@ -627,3 +627,20 @@ The projective nearest-sampling fixture uses a continuous blue field, a binary r
 band and one antialiased outer clip as its reference. Two separately antialiased
 adjoining rectangles create a partial-alpha seam that an opaque sampled image
 does not have; they are not an equivalent reference for that test.
+
+### Base64 data payload correction
+
+SVG2 resource fetching delegates data URLs to Fetch's `#data-url-processor`,
+which invokes Infra `#forgiving-base64-decode`. The newly pinned Fetch and Infra
+texts require removal of ASCII whitespace, acceptance of omitted terminal padding,
+and discarding unused low bits. The previous RFC-2397-only strict decoder rejected
+these valid payloads, including whitespace-bearing embedded PNGs in the pinned
+resvg suite. Payload decoding now follows Infra while preserving exact preflight
+size limits and allocation-failure propagation. Invalid alphabet characters,
+impossible lengths, partial padding and non-whitespace after padding still fail.
+
+Four former rejection cases (`YQ`, `YR==`, `YWF=`, `YQ%20==`) are now explicit
+acceptance assertions under that normative algorithm. The allocator preflight test
+now uses an invalid alphabet character instead of nonzero discarded bits. This is
+a correction of expected behavior, not a pixel-tolerance change. Existing
+percent-escape and metadata parsing policies are unchanged by this payload fix.

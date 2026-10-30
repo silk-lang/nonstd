@@ -32,6 +32,8 @@ CSS21_CHAPTERS = (
     "generate page colors fonts text tables ui grammar sample changes"
 ).split()
 URLS = {
+    "fetch": "https://fetch.spec.whatwg.org/",
+    "infra": "https://infra.spec.whatwg.org/",
     "svg11": SVG11,
     "svg11-errata": "https://www.w3.org/2011/08/REC-SVG11-20110816-errata",
     "svg2": SVG2,

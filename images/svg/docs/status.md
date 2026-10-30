@@ -113,3 +113,11 @@ nearest (`optimizeSpeed`) or bilinear (`auto`/`optimizeQuality`) sampling. Exact
 fixtures cover sizing, meet/slice/none, opacity, use instances and projective
 placement. Nested SVG images, CSS image masks, CSS Images 3 sampling keywords and
 the CSS orientation override still need integration; phase 7 is not complete.
+
+The curated resvg set includes eight image cases with strict non-pass expectations.
+Six retain sampling/sample-conversion or transformed-edge differences; two reference
+JPEG files outside the CLI's input-directory resource root. All remain visible in
+the conformance ledger. The exact own image fixtures independently cover natural
+sizing, source alpha, JPEG orientation, image masks/patterns and projective mapping.
+Base64 payloads now follow Fetch/Infra forgiving decoding, including whitespace,
+missing padding and discarded trailing bits, with bounded preflight validation.
