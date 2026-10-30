@@ -40,6 +40,9 @@ import used_images { NaturalSize }
 import used_geometry
 import used_style { DashCache }
 import used_style
+import used_text
+import used_text { TextPiece }
+import svg_fonts.database { FontDatabase }
 import used_path_length
 import used_path_length { Cache as PathLengthCache }
 import used_transforms
@@ -291,6 +294,10 @@ struct Plan {
   subtreeEffects: bool,
   fixedPosition: Point,
   path: Option<usize>,
+  /// Glyph cells that replace `path` in the fill bounding box (SVG 2 #TextBoundingBox).
+  cells: Option<usize>,
+  /// A text content element: `text` or an element rendering its characters.
+  text: bool,
   pathLength: Option<f64>,
   paintable: bool,
   container: bool,
@@ -470,7 +477,10 @@ fn paintComponents(paint: &Paint) -> [f64; 4] {
 // Prepared geometry is dense and independent of source occurrence numbering.
 // A referenced subtree gets one plan per renderable node, not an entire
 // document-sized array for every marker or pattern instance.
-struct Planning {
+struct Planning<'f> {
+  fonts: &'f FontDatabase,
+  /// Per text content occurrence, the arena index of its glyph outlines; cells follow.
+  textPaths: HashMap<usize, usize>,
   embedded: List<EmbeddedImage>,
   images: ImageStore,
   metadata: MetadataCache,
@@ -746,9 +756,11 @@ effect fn prepare(
   let mut foreign = false
   let mut viewportIndex = root.viewport
   let mut host = Option<StyleId>.None
+  let mut parentText = false
   if let Option<usize>.Some { value } = &parent {
     let enclosing = state.plans.asSlice()[value]
     foreign = enclosing.foreign
+    parentText = enclosing.text
     viewportIndex = enclosing.childViewport
     if enclosing.instance && occurrence.shadowRoot {
       host = Option<StyleId>.some(enclosing.styleId)
@@ -757,15 +769,23 @@ effect fn prepare(
   if !svgElement && !foreign {
     return Option<usize>.None
   }
+
+  // SVG 2 #TextElement: only text content child elements render inside text.
+  let textElement = svgElement && !foreign && !parentText && equal(name, b"text")
+  let textChild = parentText && svgElement && used_text.contentChild(document, source.node)
+  if parentText && !textChild {
+    return Option<usize>.None
+  }
   let imageElement = svgElement && !foreign && equal(name, b"image")
-  let drawable = svgElement && !foreign
+  let drawable = svgElement && !foreign && !parentText
     && (equal(name, b"path") || equal(name, b"rect") || equal(name, b"circle")
       || equal(name, b"ellipse")
       || equal(name, b"line")
       || equal(name, b"polyline")
       || equal(name, b"polygon")
       || imageElement)
-  let container = !svgElement || (!drawable && (containerName(name) || (isRoot && root.definition)))
+  let container = textElement || textChild || !svgElement
+    || (!drawable && (containerName(name) || (isRoot && root.definition)))
   if !container && !drawable {
     return Option<usize>.None
   }
@@ -1006,6 +1026,32 @@ effect fn prepare(
     path = geometry.path
     paintable = geometry.paintable
   }
+  let mut cells = Option<usize>.None
+  if textElement {
+    let mut pieces = run used_text.resolve(
+      graph,
+      &mut styles.*,
+      id,
+      state.fonts,
+      viewport.width(),
+      viewport.height(),
+      limits,
+    )
+    while let Option<TextPiece>.Some { value: piece } = pieces.pop() {
+      let at = state.paths.length()
+      run state.paths.append(move piece.outline)
+      run state.paths.append(move piece.cells)
+      drop run state.textPaths.insert(piece.occurrence, at)
+    }
+  }
+  if textElement || textChild {
+    let found: Option<usize> = state.textPaths.get(id.index)
+    if let Option<usize>.Some { value: at } = found {
+      path = Option<usize>.some(at)
+      cells = Option<usize>.some(at + 1)
+      paintable = !state.paths.asSlice()[at].isEmpty()
+    }
+  }
   let index = state.plans.length()
   if index >= graph.limits.maxOccurrences {
     fail RenderError.TooLarge
@@ -1046,6 +1092,8 @@ effect fn prepare(
       styleId: styleId,
       style: style,
       path: path,
+      cells: cells,
+      text: textElement || textChild,
       pathLength: if drawable && !imageElement {
         run used_path_length.attribute(
           document,
@@ -1153,7 +1201,11 @@ effect fn gather(
   let mut result = Option<Rect>.None
   match &plan.path {
     Option<usize>.Some { value: index } => {
-      result = run cache.fillBounds(paths, index, &matrix, 0.0000001)
+      let filled = match &plan.cells {
+        Option<usize>.Some { value: cells } => cells
+        _ => index
+      }
+      result = run cache.fillBounds(paths, filled, &matrix, 0.0000001)
       if stroke && plan.paintable && plan.hasStroke && plan.style.strokeWidth > 0.0 {
         // Reference geometry uses a much tighter tolerance than pixel coverage;
         // inability to meet it is an explicit numeric error, never a hull fallback.
@@ -4173,7 +4225,7 @@ effect fn paintPrepared(
         let mut part: usize = 0
         while part < 3 {
           let layer = plan.style.paintOrder[part]
-          if layer == PaintLayer.Markers && plan.image.isNone() {
+          if layer == PaintLayer.Markers && plan.image.isNone() && !plan.text {
             run paintMarkers(
               graph,
               &mut styles.*,
@@ -4314,6 +4366,7 @@ effect fn resolveStyled(
   inputStyles: StyledGraph,
   options: &RenderOptions,
   limits: &Limits,
+  fonts: &FontDatabase,
   initialWidth: f64,
   initialHeight: f64,
   embedded: Option<Size>,
@@ -4424,6 +4477,8 @@ effect fn resolveStyled(
   let mut dashes = List<List<f64>>.make()
   run dashes.append(List<f64>.make())
   let mut state = Planning {
+    fonts: fonts,
+    textPaths: HashMap<usize, usize>.make(Hash.seed(0)),
     embedded: List<EmbeddedImage>.make(),
     images: move images,
     metadata: move sourceMetadata,
@@ -4587,6 +4642,7 @@ effect fn resolveWithViewport(
   styles: StyledGraph,
   options: &RenderOptions,
   limits: &Limits,
+  fonts: &FontDatabase,
   initialWidth: f64,
   initialHeight: f64,
   embedded: Option<Size>,
@@ -4601,6 +4657,7 @@ effect fn resolveWithViewport(
         move styles,
         options,
         limits,
+        fonts,
         initialWidth,
         initialHeight,
         embedded,
@@ -4617,6 +4674,7 @@ pub effect fn resolveWithImages(
   styles: StyledGraph,
   options: &RenderOptions,
   limits: &Limits,
+  fonts: &FontDatabase,
   initialWidth: f64,
   initialHeight: f64,
 ) -> RenderTree
@@ -4628,6 +4686,7 @@ pub effect fn resolveWithImages(
     move styles,
     options,
     limits,
+    fonts,
     initialWidth,
     initialHeight,
     Option<Size>.None,
@@ -4643,6 +4702,7 @@ pub effect fn resolveEmbedded(
   styles: StyledGraph,
   options: &RenderOptions,
   limits: &Limits,
+  fonts: &FontDatabase,
   viewport: Size,
 ) -> RenderTree
   ! RenderError | OutOfMemoryError
@@ -4653,6 +4713,7 @@ pub effect fn resolveEmbedded(
     move styles,
     options,
     limits,
+    fonts,
     viewport.width,
     viewport.height,
     Option<Size>.some(viewport),
@@ -4671,12 +4732,14 @@ pub effect fn resolve(
 ) -> RenderTree
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
+  let fonts = FontDatabase.make()
   return run resolveWithImages(
     ImageStore.empty(),
     move graph,
     move styles,
     options,
     limits,
+    &fonts,
     initialWidth,
     initialHeight,
   )

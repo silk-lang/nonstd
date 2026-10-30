@@ -74,6 +74,8 @@ pub struct Instance {
   /// Ascent and descent in user units, positive above and below the baseline.
   pub ascent: f64,
   pub descent: f64,
+  pub glyphCount: u32,
+  pub unitsPerEm: u16,
   span: usize,
   choice: usize,
 }
@@ -111,7 +113,7 @@ const TAG_ITAL: u32 = 0x6974616c
 
 const TAG_SLNT: u32 = 0x736c6e74
 
-fn fontOf<'a>(database: &'a FontDatabase, face: usize) -> Option<FontRef<'a>> {
+pub fn fontOf<'a>(database: &'a FontDatabase, face: usize) -> Option<FontRef<'a>> {
   let index = database.face(face).index
   return match move FontRef.fromIndex(database.data(face), index) {
     Result<FontRef<'a>, ReadError>.Success { value } => Option<FontRef<'a>>.Some { value: value }
@@ -170,7 +172,27 @@ fn lineMetric(value: F48Dot16) -> f64 {
   return F48Dot16.toF64(value)
 }
 
-/// The instance for a span's face choice, created on first use.
+fn optional(left: Option<f64>, right: Option<f64>) -> bool {
+  return match left {
+    Option<f64>.Some { value: a } => match right {
+      Option<f64>.Some { value: b } => a == b
+      Option<f64>.None => false
+    }
+    Option<f64>.None => right.isNone()
+  }
+}
+
+/// Whether two selections render glyphs identically.
+fn same(left: &Selection, right: &Selection) -> bool {
+  return left.face == right.face && left.weight == right.weight && left.width == right.width
+    && optional(left.italic, right.italic)
+    && optional(left.oblique, right.oblique)
+    && left.syntheticOblique == right.syntheticOblique
+    && left.syntheticBold == right.syntheticBold
+}
+
+/// The instance for a span's face choice, created on first use and shared by spans whose
+/// choice renders the same.
 effect fn instance(
   database: &FontDatabase,
   spans: &[Span],
@@ -183,7 +205,9 @@ effect fn instance(
   let mut index: usize = 0
   while index < List<Instance>.length(&instances.*) {
     let existing = &List<Instance>.asSlice(&instances.*)[index]
-    if existing.span == span && existing.choice == choice {
+    if (existing.span == span && existing.choice == choice)
+      || same(&existing.selection, &List<Selection>.asSlice(&spans[span].faces)[choice])
+        && spans[existing.span].size == spans[span].size {
       return index
     }
     index = index + 1
@@ -194,6 +218,8 @@ effect fn instance(
   let mut scale = 0.0
   let mut ascent = 0.0
   let mut descent = 0.0
+  let mut glyphCount: u32 = 0
+  let mut unitsPerEm: u16 = 0
   if let Option<FontRef>.Some { value: font } = fontOf(database, selection.face) {
     let data = ShaperData.new(&font)
     let mut shaper = Shaper.withFuncs(&data, DefaultFontFuncs {})
@@ -203,6 +229,8 @@ effect fn instance(
     run List<F2Dot14>.appendSlice(&mut coords, List<F2Dot14>.asSlice(&shaper.coords))
     let metrics = Metrics.fromSfnt(&font, List<F2Dot14>.asSlice(&coords))
     scale = spans[span].size / u16.toF64(metrics.unitsPerEm)
+    glyphCount = metrics.numGlyphs
+    unitsPerEm = metrics.unitsPerEm
     if let Option<LineBox<F48Dot16>>.Some { value: line } = metrics.hLine() {
       ascent = lineMetric(line.ascender) * scale
       descent = -lineMetric(line.descender) * scale
@@ -217,6 +245,8 @@ effect fn instance(
       scale: scale,
       ascent: ascent,
       descent: descent,
+      glyphCount: glyphCount,
+      unitsPerEm: unitsPerEm,
       span: span,
       choice: choice,
     },
@@ -358,18 +388,31 @@ pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Char
     index = index + 1
   }
 
-  // Step "CSS layout" along one line. Runs end where the span or the face changes.
+  // Per character, the font instance that renders it, or usize.MAX without a face.
+  let mut used = List<usize>.make()
+  index = 0
+  while index < count {
+    let span = characters[index].span
+    let chosen = if List<Selection>.length(&spans[span].faces) > 0 {
+      run instance(database, spans, span, List<usize>.get(&choices, index), &mut result.instances)
+    } else {
+      usize.MAX
+    }
+    run List<usize>.append(&mut used, chosen)
+    index = index + 1
+  }
+
+  // Step "CSS layout" along one line. Runs end where the font instance changes: CSS Text 3
+  // #boundary-shaping keeps shaping across element boundaries that do not change formatting.
   let mut pen = 0.0
   let mut start: usize = 0
   while start < count {
-    let span = characters[start].span
-    let choice = List<usize>.get(&choices, start)
+    let instanceIndex = List<usize>.get(&used, start)
     let mut end = start + 1
-    while end < count && characters[end].span == span && List<usize>.get(&choices, end) == choice {
+    while end < count && List<usize>.get(&used, end) == instanceIndex {
       end = end + 1
     }
-    if List<Selection>.length(&spans[span].faces) > 0 {
-      let instanceIndex = run instance(database, spans, span, choice, &mut result.instances)
+    if instanceIndex != usize.MAX {
       pen = run shapeRun(
         database,
         &mut result,

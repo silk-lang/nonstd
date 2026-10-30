@@ -1,0 +1,718 @@
+//! SVG 2 `text` content (https://www.w3.org/TR/SVG2/text.html): gathers the addressable
+//! characters of a `text` element and its text content children, resolves their fonts and
+//! positioning attributes, and lays them out with `images/svg/text`. Each element gets its
+//! glyph outlines and glyph cells as user-space paths.
+import structure { Graph, OccurrenceId }
+import document_styles { StyledGraph }
+import scene { RenderError }
+import used_style
+import svg_xml.xml { Document, NodeId, NodeKind }
+import svg_css.computed { Engine, StyleId, ComputedValue }
+import svg_css.dimensions { Context, Dimension, ExprId }
+import svg_css.dimensions
+import svg_css.values { Value }
+import svg_css.properties { Property }
+import svg_css.value_keywords { Keyword }
+import svg_css.text_values { TextValue, Atom, GenericFamily, Keyword as TextKeyword }
+import svg_css.tokens { Limits, CssError }
+import svg_css.lexer
+import svg_css.input { Input }
+import svg_css.value_cursor { Cursor }
+import svg_fonts.database { FontDatabase, Generic }
+import svg_fonts.matching { Request, Selection, Style as FontStyle }
+import svg_fonts.matching
+import svg_fonts.names
+import svg_text.layout { Anchor, Span, Character, Layout, layout }
+import svg_text.paths { spanGeometry }
+import svg_geometry.geometry { Path }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// The glyphs one element of a `text` subtree renders itself.
+pub struct TextPiece {
+  pub occurrence: usize,
+  pub outline: Path,
+  pub cells: Path,
+}
+
+/// An element of the subtree, in document order, with its addressable characters.
+struct Entry {
+  occurrence: OccurrenceId,
+  node: NodeId,
+  style: StyleId,
+  span: usize,
+  start: usize,
+  end: usize,
+}
+
+impl Copy for Entry {}
+
+/// Per addressable character: its UTF-16 length, which positioning lists count in.
+struct Gather {
+  entries: List<Entry>,
+  spans: List<Span>,
+  characters: List<Character>,
+  units: List<u8>,
+  /// The last character is a collapsible space (CSS Text 4 #white-space-phase-1).
+  collapsible: bool,
+}
+
+fn equal(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+/// Text content child elements. Unknown elements render as unpositioned spans (SVG 2
+/// changes: "Unknown elements within text render as unpositioned spans").
+pub fn contentChild(document: &Document, node: NodeId) -> bool {
+  let name = Document.localName(document, node)
+  if !equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg") {
+    return false
+  }
+  if equal(name, b"tspan") || equal(name, b"a") || equal(name, b"textPath") {
+    return true
+  }
+  return !known(name)
+}
+
+fn known(name: &[u8]) -> bool {
+  let names: &[&[u8]] = &[
+    b"svg",
+    b"g",
+    b"defs",
+    b"desc",
+    b"title",
+    b"metadata",
+    b"symbol",
+    b"use",
+    b"switch",
+    b"image",
+    b"path",
+    b"rect",
+    b"circle",
+    b"ellipse",
+    b"line",
+    b"polyline",
+    b"polygon",
+    b"text",
+    b"tspan",
+    b"textPath",
+    b"a",
+    b"view",
+    b"style",
+    b"script",
+    b"linearGradient",
+    b"radialGradient",
+    b"stop",
+    b"pattern",
+    b"marker",
+    b"clipPath",
+    b"mask",
+    b"filter",
+    b"foreignObject",
+    b"animate",
+    b"animateMotion",
+    b"animateTransform",
+    b"set",
+    b"mpath",
+    b"discard",
+    b"tref",
+    b"altGlyph",
+    b"altGlyphDef",
+    b"altGlyphItem",
+    b"glyphRef",
+    b"font",
+    b"glyph",
+    b"missing-glyph",
+    b"hkern",
+    b"vkern",
+    b"font-face",
+    b"cursor",
+    b"color-profile",
+  ]
+  let mut index: usize = 0
+  while index < names.length {
+    if equal(name, names[index]) {
+      return true
+    }
+    index = index + 1
+  }
+  return name.length > 2 && name[0] == 102 && name[1] == 101
+}
+
+// --- Computed font properties -------------------------------------------------------------
+
+fn textValue(engine: &Engine, style: StyleId, property: Property) -> Option<&TextValue> {
+  return match &engine.get(style, property) {
+    Option<ComputedValue>.Some { value } => match &engine.values.get(value.value).* {
+      Value.Text { value: text } => Option<&TextValue>.Some { value: &text }
+      _ => Option<&TextValue>.None
+    }
+    _ => Option<&TextValue>.None
+  }
+}
+
+fn weight(engine: &Engine, style: StyleId) -> f64 {
+  if let Option<&TextValue>.Some { value: text } = textValue(engine, style, Property.FontWeight) {
+    let items = text.items.asSlice()
+    if items.length > 0 {
+      return match &items[0].atom {
+        Atom.Numeric { value } => dimensions.evaluate(&engine.values.numerics, value, 0.0)
+        Atom.Keyword { value } => if value == TextKeyword.Bold {
+          700.0
+        } else {
+          400.0
+        }
+        _ => 400.0
+      }
+    }
+  }
+  return 400.0
+}
+
+fn width(engine: &Engine, style: StyleId) -> f64 {
+  if let Option<&TextValue>.Some { value: text } = textValue(engine, style, Property.FontWidth) {
+    let items = text.items.asSlice()
+    if items.length > 0 {
+      return match &items[0].atom {
+        Atom.Numeric { value } => dimensions.evaluate(&engine.values.numerics, value, 100.0)
+        Atom.Keyword { value } => match value {
+          TextKeyword.UltraCondensed => 50.0
+          TextKeyword.ExtraCondensed => 62.5
+          TextKeyword.Condensed => 75.0
+          TextKeyword.SemiCondensed => 87.5
+          TextKeyword.SemiExpanded => 112.5
+          TextKeyword.Expanded => 125.0
+          TextKeyword.ExtraExpanded => 150.0
+          TextKeyword.UltraExpanded => 200.0
+          _ => 100.0
+        }
+        _ => 100.0
+      }
+    }
+  }
+  return 100.0
+}
+
+// CSS Fonts 4 #font-style-prop: `oblique` without an angle is 14deg.
+fn fontStyle(engine: &Engine, style: StyleId) -> FontStyle {
+  let mut result = FontStyle.Normal
+  if let Option<&TextValue>.Some { value: text } = textValue(engine, style, Property.FontStyle) {
+    let items = text.items.asSlice()
+    let mut index: usize = 0
+    while index < items.length {
+      match &items[index].atom {
+        Atom.Keyword { value } => {
+          if value == TextKeyword.Italic {
+            result = FontStyle.Italic
+          } else if value == TextKeyword.Oblique {
+            result = FontStyle.Oblique { degrees: 14.0 }
+          }
+        }
+        Atom.Numeric { value } => {
+          result = FontStyle.Oblique {
+            degrees: dimensions.evaluate(&engine.values.numerics, value, 0.0),
+          }
+        }
+        _ => {}
+      }
+      index = index + 1
+    }
+  }
+  return result
+}
+
+fn generic(family: GenericFamily) -> Option<Generic> {
+  return match family {
+    GenericFamily.Serif => Option<Generic>.Some { value: Generic.Serif }
+    GenericFamily.SansSerif => Option<Generic>.Some { value: Generic.SansSerif }
+    GenericFamily.Cursive => Option<Generic>.Some { value: Generic.Cursive }
+    GenericFamily.Fantasy => Option<Generic>.Some { value: Generic.Fantasy }
+    GenericFamily.Monospace => Option<Generic>.Some { value: Generic.Monospace }
+    GenericFamily.SystemUi => Option<Generic>.Some { value: Generic.SystemUi }
+    GenericFamily.UiSerif => Option<Generic>.Some { value: Generic.UiSerif }
+    GenericFamily.UiSansSerif => Option<Generic>.Some { value: Generic.UiSansSerif }
+    GenericFamily.UiMonospace => Option<Generic>.Some { value: Generic.UiMonospace }
+    GenericFamily.UiRounded => Option<Generic>.Some { value: Generic.UiRounded }
+    GenericFamily.Math => Option<Generic>.Some { value: Generic.Math }
+    GenericFamily.Fangsong => Option<Generic>.Some { value: Generic.Fangsong }
+    _ => Option<Generic>.None
+  }
+}
+
+effect fn choose(
+  fonts: &FontDatabase,
+  faces: &List<usize>,
+  request: Request,
+  out: &mut List<Selection>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<Selection>.Some { value } = run matching.select(fonts, faces.asSlice(), request) {
+    run out.append(value)
+  }
+}
+
+/// The installed families in database order, each as its faces, for last-resort fallback.
+effect fn families(fonts: &FontDatabase) -> List<List<usize>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = List<List<usize>>.make()
+  let mut face: usize = 0
+  while face < fonts.faceCount() {
+    let labels = fonts.face(face).families.asSlice()
+    if labels.length > 0 {
+      let name = Bytes.asSlice(&labels[0])
+      let mut seen = false
+      let mut index: usize = 0
+      while index < result.length() && !seen {
+        let first = result.asSlice()[index].asSlice()[0]
+        let other = fonts.face(first).families.asSlice()
+        seen = other.length > 0 && names.same(Bytes.asSlice(&other[0]), name)
+        index = index + 1
+      }
+      if !seen {
+        let mut members = List<usize>.make()
+        run fonts.family(name, &mut members)
+        run result.append(move members)
+      }
+    }
+    face = face + 1
+  }
+  return move result
+}
+
+effect fn span(
+  fonts: &FontDatabase,
+  installed: &List<List<usize>>,
+  engine: &Engine,
+  style: StyleId,
+) -> Span
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let size = match &engine.metrics(style) {
+    Option<Context>.Some { value } => value.fontSize
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let request = Request {
+    weight: weight(engine, style),
+    width: width(engine, style),
+    style: fontStyle(engine, style),
+  }
+  let mut faces = List<Selection>.make()
+  let mut candidates = List<usize>.make()
+  if let Option<&TextValue>.Some { value: text } = textValue(engine, style, Property.FontFamily) {
+    let items = text.items.asSlice()
+    let mut index: usize = 0
+    while index < items.length {
+      if let Atom.Family { generic: kind, name } = items[index].atom {
+        candidates.clear()
+        if kind == GenericFamily.Named {
+          run fonts.family(text.text(name), &mut candidates)
+        } else if let Option<Generic>.Some { value } = generic(kind) {
+          run fonts.generic(value, &mut candidates)
+        }
+        run choose(fonts, &candidates, request, &mut faces)
+      }
+      index = index + 1
+    }
+  }
+
+  // CSS Fonts 4 #cluster-matching ends with system fallback; ours is every installed family.
+  let mut family: usize = 0
+  while family < installed.length() {
+    run choose(fonts, &installed.asSlice()[family], request, &mut faces)
+    family = family + 1
+  }
+  let anchor = match &(run used_style.keyword(engine, style, Property.TextAnchor)) {
+    Keyword.Middle => Anchor.Middle
+    Keyword.End => Anchor.End
+    _ => Anchor.Start
+  }
+  return Span { faces: move faces, size: size, anchor: anchor }
+}
+
+// --- White space and characters ------------------------------------------------------------
+
+enum Collapse {
+  Collapse,
+  Preserve,
+  PreserveSpaces,
+  PreserveBreaks,
+  Discard,
+}
+
+fn collapse(engine: &Engine, style: StyleId) -> Collapse {
+  if let Option<&TextValue>.Some { value: text } = textValue(
+    engine,
+    style,
+    Property.WhiteSpaceCollapse,
+  ) {
+    let items = text.items.asSlice()
+    if items.length > 0 {
+      if let Atom.Keyword { value } = items[0].atom {
+        return match value {
+          TextKeyword.Preserve => Collapse.Preserve
+          TextKeyword.PreserveSpaces => Collapse.PreserveSpaces
+          TextKeyword.PreserveBreaks => Collapse.PreserveBreaks
+          TextKeyword.BreakSpaces => Collapse.Preserve
+          TextKeyword.Discard => Collapse.Discard
+          _ => Collapse.Collapse
+        }
+      }
+    }
+  }
+  return Collapse.Collapse
+}
+
+/// Decodes one UTF-8 scalar at `at`, returning it and its byte length.
+fn decode(bytes: &[u8], at: usize) -> [u32; 2] {
+  let lead = u8.toU32(bytes[at])
+  if lead < 0x80 {
+    return [lead, 1]
+  }
+  let count: usize = if lead >= 0xF0 {
+    4
+  } else if lead >= 0xE0 {
+    3
+  } else {
+    2
+  }
+  if at + count > bytes.length {
+    return [0xFFFD, 1]
+  }
+  let mask: u32 = if count == 4 {
+    0x07
+  } else if count == 3 {
+    0x0F
+  } else {
+    0x1F
+  }
+  let mut value = lead & mask
+  let mut index: usize = 1
+  while index < count {
+    value = value * 64 + (u8.toU32(bytes[at + index]) & 0x3F)
+    index = index + 1
+  }
+  return [value, usize.toU32(count)]
+}
+
+effect fn push(gather: &mut Gather, cp: u32, span: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run gather.characters.append(
+    Character {
+      cp: cp,
+      span: span,
+      x: Option<f64>.None,
+      y: Option<f64>.None,
+      dx: 0.0,
+      dy: 0.0,
+      rotate: 0.0,
+    },
+  )
+  run gather.units.append(
+    if cp >= 0x10000 {
+      2
+    } else {
+      1
+    },
+  )
+}
+
+// CSS Text 4 #white-space-processing on one line: with `collapse`, segment breaks and tabs
+// become spaces and a space after a collapsible space or at the line start is removed;
+// the preserving values keep spaces and, with no line breaking in SVG text, render tabs and
+// segment breaks as spaces.
+effect fn characters(gather: &mut Gather, bytes: &[u8], span: usize, mode: Collapse) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < bytes.length {
+    let decoded = decode(bytes, at)
+    at = at + u32.toUsize(decoded[1])
+    let cp = decoded[0]
+    let space = cp == 0x20 || cp == 0x09 || cp == 0x0A || cp == 0x0D
+    if !space {
+      run push(&mut gather, cp, span)
+      gather.collapsible = false
+    } else if mode == Collapse.Discard {} else if mode == Collapse.Collapse
+      || (mode == Collapse.PreserveBreaks && cp != 0x0A) {
+      if !gather.collapsible && gather.characters.length() > 0 {
+        run push(&mut gather, 0x20, span)
+        gather.collapsible = true
+      }
+    } else {
+      run push(&mut gather, 0x20, span)
+      gather.collapsible = false
+    }
+  }
+}
+
+effect fn walk(
+  graph: &Graph,
+  styles: &StyledGraph,
+  fonts: &FontDatabase,
+  installed: &List<List<usize>>,
+  occurrence: OccurrenceId,
+  gather: &mut Gather,
+) -> ()
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let entry = graph.occurrences.asSlice()[occurrence.index]
+  let source = entry.source
+  let document = graph.sourceDocument(source)
+  let style = match &styles.nodeStyle(occurrence) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let engine = &styles.catalog.engine
+  if (run used_style.keyword(engine, style, Property.Display)) == Keyword.None {
+    return
+  }
+  let spanIndex = gather.spans.length()
+  run gather.spans.append(run span(fonts, installed, engine, style))
+  let position = gather.entries.length()
+  run gather.entries.append(
+    Entry {
+      occurrence: occurrence,
+      node: source.node,
+      style: style,
+      span: spanIndex,
+      start: gather.characters.length(),
+      end: 0,
+    },
+  )
+  let mode = collapse(engine, style)
+  let mut child = Document.firstChild(document, source.node)
+  let mut element = entry.firstChild
+  while let Option<NodeId>.Some { value: node } = child {
+    let kind = Document.nodes(document)[node.index].kind
+    if kind == NodeKind.Text {
+      run characters(&mut gather, Document.text(document, node), spanIndex, mode)
+    } else if kind == NodeKind.Element {
+      if let Option<OccurrenceId>.Some { value: nested } = element {
+        if graph.occurrences.asSlice()[nested.index].eligible && contentChild(document, node) {
+          run walk(graph, styles, fonts, installed, nested, &mut gather)
+        }
+        element = graph.occurrences.asSlice()[nested.index].nextSibling
+      }
+    }
+    child = Document.nextSibling(document, node)
+  }
+  let entries = gather.entries.asMutSlice()
+  entries[position].end = gather.characters.length()
+}
+
+// --- Positioning attributes ----------------------------------------------------------------
+
+/// A whitespace- or comma-separated list of lengths or numbers; invalid lists are ignored.
+effect fn list(
+  bytes: &[u8],
+  dimension: Dimension,
+  engine: &mut Engine,
+  style: StyleId,
+  basis: f64,
+  limits: &Limits,
+  out: &mut List<f64>,
+) -> ()
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  if bytes.length == 0 {
+    return
+  }
+  let context = match &engine.metrics(style) {
+    Option<Context>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let tokens = run lexer.tokenize(bytes, limits)
+  let input = Input.Contiguous { buffer: &tokens, range: tokens.all() }
+  let mut cursor = Cursor.make(&input)
+  while !cursor.done(&input) {
+    let parsed = run dimensions.parse(
+      &mut engine.values.numerics,
+      &input,
+      &mut cursor,
+      dimension,
+      true,
+    )
+    let id = match &parsed {
+      Option<ExprId>.Some { value } => value
+      _ => {
+        out.clear()
+        return
+      }
+    }
+    let computed = run dimensions.compute(&mut engine.values.numerics, id, &context)
+    let value = dimensions.evaluate(&engine.values.numerics, computed, basis)
+    if !f64.isFinite(value) {
+      out.clear()
+      return
+    }
+    run out.append(value)
+    drop cursor.comma(&input)
+  }
+}
+
+fn attribute<'d>(document: &'d Document, node: NodeId, name: &[u8]) -> &'d [u8] {
+  return match &Document.attribute(document, node, b"", name) {
+    Option<&[u8]>.Some { value } => value
+    _ => b""
+  }
+}
+
+// #TextLayoutAlgorithm "Resolve character positioning": elements in document order, so a
+// descendant's values replace its ancestors' for its own characters. Lists count UTF-16
+// code units; the second unit of a surrogate pair takes no value.
+effect fn position(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  gather: &mut Gather,
+  width: f64,
+  height: f64,
+  limits: &Limits,
+) -> ()
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = List<f64>.make()
+  let mut index: usize = 0
+  while index < gather.entries.length() {
+    let entry = gather.entries.asSlice()[index]
+    let document = graph.sourceDocument(graph.occurrences.asSlice()[entry.occurrence.index].source)
+    let engine = &mut styles.catalog.engine
+    let mut which: usize = 0
+    while which < 5 {
+      let name: &[u8] = match which {
+        0 => b"x"
+        1 => b"y"
+        2 => b"dx"
+        3 => b"dy"
+        _ => b"rotate"
+      }
+      let basis = if which == 0 || which == 2 {
+        width
+      } else {
+        height
+      }
+      let dimension = if which == 4 {
+        Dimension.Number
+      } else {
+        Dimension.LengthPercentage
+      }
+      run list(
+        attribute(document, entry.node, name),
+        dimension,
+        &mut engine.*,
+        entry.style,
+        basis,
+        limits,
+        &mut values,
+      )
+      let count = values.length()
+      if count > 0 {
+        let characters = gather.characters.asMutSlice()
+        let units = gather.units.asSlice()
+        let mut unit: usize = 0
+        let mut at = entry.start
+        while at < entry.end && at < characters.length {
+          if unit < count || which == 4 {
+            let value = values.asSlice()[if unit < count {
+              unit
+            } else {
+              count - 1
+            }]
+            match which {
+              0 => {
+                characters[at].x = Option<f64>.Some { value: value }
+              }
+              1 => {
+                characters[at].y = Option<f64>.Some { value: value }
+              }
+              2 => {
+                characters[at].dx = value
+              }
+              3 => {
+                characters[at].dy = value
+              }
+              _ => {
+                characters[at].rotate = value
+              }
+            }
+          }
+          unit = unit + u8.toUsize(units[at])
+          at = at + 1
+        }
+      }
+      which = which + 1
+    }
+    index = index + 1
+  }
+}
+
+/// Lays out the `text` element `text` and returns the glyph geometry of each element in its
+/// subtree that renders characters of its own.
+pub effect fn resolve(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  text: OccurrenceId,
+  fonts: &FontDatabase,
+  width: f64,
+  height: f64,
+  limits: &Limits,
+) -> List<TextPiece>
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let installed = run families(fonts)
+  let mut gather = Gather {
+    entries: List<Entry>.make(),
+    spans: List<Span>.make(),
+    characters: List<Character>.make(),
+    units: List<u8>.make(),
+    collapsible: false,
+  }
+  run walk(graph, &styles.*, fonts, &installed, text, &mut gather)
+
+  // A collapsible space at the end of the line is removed.
+  if gather.collapsible {
+    drop gather.characters.pop()
+    drop gather.units.pop()
+  }
+  run position(graph, &mut styles.*, &mut gather, width, height, limits)
+  let result = run layout(fonts, gather.spans.asSlice(), gather.characters.asSlice())
+  let mut pieces = List<TextPiece>.make()
+  let mut index: usize = 0
+  while index < gather.entries.length() {
+    let entry = gather.entries.asSlice()[index]
+    let mut outline = Path.make()
+    let mut cells = Path.make()
+    run spanGeometry(fonts, &result, entry.span, &mut outline, &mut cells)
+    run pieces.append(
+      TextPiece { occurrence: entry.occurrence.index, outline: move outline, cells: move cells },
+    )
+    index = index + 1
+  }
+  return move pieces
+}
