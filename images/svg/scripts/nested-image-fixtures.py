@@ -99,6 +99,33 @@ add('recursive-data', f'<image x="1" y="1" width="8" height="4" href="{nested}"/
 add('group-opacity', f'<image x="1" y="1" width="8" height="4" opacity=".5" href="{url}"/>',
     '<g opacity=".5">' + rect(1, 1, 4, 4, 'red') + rect(5, 1, 4, 4, 'blue') + '</g>',
     'Image opacity is applied once to the isolated embedded document output.')
+deferred = data(source.replace('viewBox="0 0 2 1"',
+                               'viewBox="0 0 2 1" preserveAspectRatio="xMaxYMax meet"'))
+add('defer', f'<image x="1" y="1" width="8" height="8" preserveAspectRatio="defer xMinYMin meet" href="{deferred}"/>',
+    rect(1, 5, 4, 4, 'red') + rect(5, 5, 4, 4, 'blue'),
+    'SVG 1.1 defer uses the explicitly supplied child aspect-ratio alignment before SVG2 viewport layout.')
+add('ignore-root-par', f'<image x="1" y="1" width="8" height="8" preserveAspectRatio="xMinYMin meet" href="{deferred}"/>',
+    rect(1, 1, 4, 4, 'red') + rect(5, 1, 4, 4, 'blue'),
+    'Without defer, image alignment wins over the child root aspect-ratio attribute.')
+pattern = '<defs><pattern id="p" patternUnits="userSpaceOnUse" width="4" height="2">{}</pattern></defs><rect width="12" height="12" fill="url(#p)"/>'
+add('in-pattern', pattern.format(f'<image width="4" height="2" href="{url}"/>'),
+    pattern.format(rect(0, 0, 2, 2, 'red') + rect(2, 0, 2, 2, 'blue')),
+    'Embedded commands also execute in retained pattern pictures at tile resolution.')
+mask = '<defs><mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="12" height="12" style="mask-type:alpha">{}</mask></defs><rect width="12" height="12" fill="lime" mask="url(#m)"/>'
+add('in-mask', mask.format(f'<image x="1" y="2" width="8" height="4" href="{url}"/>'),
+    mask.format(rect(1, 2, 8, 4, 'white')),
+    'An embedded image supplies alpha coverage as content of an SVG mask.')
+gradient_content = '<defs><linearGradient id="g"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><rect width="8" height="4" fill="url(#g)"/>'
+gradient = data(document(gradient_content, 'width="8" height="4"'))
+add('gradient-projective', f'<image width="8" height="4" style="{projective}" href="{gradient}"/>',
+    f'<g style="{projective}">{gradient_content}</g>',
+    'Child gradient sampling composes the image placement instead of retaining source-device coordinates.')
+overflow_pattern = pattern.replace('id="p"', 'id="p" overflow="visible"')
+overflow_source = data(document('<rect x="-2" width="6" height="2" fill="red" opacity=".5"/>',
+                                'width="2" height="2" overflow="visible"'))
+add('in-overflow-pattern', overflow_pattern.format(f'<image x="3" width="2" height="2" overflow="visible" href="{overflow_source}"/>'),
+    overflow_pattern.format('<rect x="1" width="6" height="2" fill="red" opacity=".5"/>'),
+    'Pattern overflow enumeration includes child document painting beyond the image positioning rectangle, including overlapping alpha.')
 # Resource files are also direct-render controls, so every tracked SVG has an
 # explicit manifest entry and the secure test cannot pass because its payload broke.
 for filename in ('nested-external.svg', 'nested-secure-source.svg'):
