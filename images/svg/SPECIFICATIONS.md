@@ -502,7 +502,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
 - [ ] Inputs: `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
 - [ ] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
-- [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color`
+- [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color` (all but `lighting-color` done)
 - [ ] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
 
 ### 5.11 Linking (§16, 1.1 ch. 17)
@@ -566,6 +566,43 @@ not a decodable image, are transparent black layers.
 
 `mask-border` is not implemented: nine-slice border images are not trivial, and the
 checklist admits `mask-border` only if trivial.
+
+### Filter graph
+
+A `filter` element resolves to a program (`images/svg/filters`): its
+[filter region](https://www.w3.org/TR/filter-effects-1/#filter-region), primitives with
+[subregions](https://www.w3.org/TR/filter-effects-1/#FilterPrimitiveSubRegion) already
+defaulted, named inputs and parameters, all in the filtered element's user space. The
+executor runs it on premultiplied RGBA8 surfaces over `vector.filter`. Interpretation
+decisions:
+
+- Filter space. When user space maps to the device by a positive scale and translation the
+  filter runs on device pixels. Otherwise it runs on a surface scaled by the lengths of the
+  user axes (so the region keeps its axes parallel to user space), and the result is drawn
+  through the remaining transform with bilinear sampling, as the
+  [region note](https://www.w3.org/TR/filter-effects-1/#element-attrdef-filter-x) suggests.
+  Lengths are scaled into that space; offsets and morphology radii round to whole pixels.
+- Region pixels. The region and subregions cover every pixel they touch (rounded outward,
+  after snapping edges within 1e-6 of a pixel boundary). The working surface is limited to
+  the canvas grown by its own size on each side.
+- Empty regions. The pinned text of
+  [#element-attrdef-filter-width](https://www.w3.org/TR/filter-effects-1/#element-attrdef-filter-width)
+  is cut off ("…ng of the element which referenced the filter"); we read it as
+  "negative or zero values disable rendering of the element which referenced the filter",
+  matching browsers. Bounding-box units on an empty box, and a filter with no primitives
+  ([#FilterPrimitiveTree](https://www.w3.org/TR/filter-effects-1/#FilterPrimitiveTree)),
+  also leave the element unrendered.
+- `color-interpolation-filters: auto` uses linearRGB. Flood colors are converted with the
+  same byte conversion as images, after premultiplying.
+- A primitive whose subregion has zero or negative width or height is disabled: its result
+  is transparent black. Blur and morphology read their input across the whole filter region
+  and are clipped to their subregion afterwards.
+- `feDropShadow` is its spec expansion; a negative `stdDeviation` there means no blur.
+- In this first step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint`
+  read as transparent black, the primitives `feImage`, `feTurbulence`, `feConvolveMatrix`,
+  `feDisplacementMap` and the lighting primitives produce transparent black, filter
+  functions in a `filter` list are skipped, and `filter` `href` templates and `filterRes`
+  are ignored. Each is still to be implemented in phase 8.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),
