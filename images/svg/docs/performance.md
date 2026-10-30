@@ -647,3 +647,55 @@ The raw A/B reports are ignored `build/svg/nested-ab.json` and
 all samples, stage checksums and full-process instruction counts. The new SVG
 image workloads have no equivalent old-renderer timing: the old renderer drops
 SVG image sources, so timing that blank output would not measure the same work.
+
+## Phase 7 SVG image orientation
+
+Implementation `769618a` extends the computed orientation path to SVG sources.
+`bench/svg_orientation.py` supplies 512×384 workloads with one or sixteen
+placements: unrotated sources, quarter-turned sources, and independent SVGs
+whose colored cells are already encoded in the rotated order. The quarter-turn
+and pre-oriented control checksums agree in every stage in Silk. Pinned resvg
+does not produce the rotated control output for the explicit `90deg` inputs;
+its unrotated and control checksums agree with Silk. Consequently, rotated-input
+engine ratios do not compare identical output.
+
+Measurements use the same Ubuntu 24.04 arm64 VM, Silk dev.33, LLVM 22.1.8,
+Rust 1.90.0 and resvg revision as the retained-SVG section above. Three alternating
+native samples use one iteration and no warmup. Separate Callgrind passes count
+the full process, including untimed parsing/rendering and checksum work.
+
+| Input, end-to-end | Silk ms | resvg ms | Time ratio | Full-process Ir ratio | Same checksum |
+|---|---:|---:|---:|---:|---|
+| control-1.svg | 1.1533 | 1.0547 | 1.093 | 1.343 | yes |
+| control-16.svg | 6.1574 | 12.8470 | 0.479 | 0.556 | yes |
+| none-1.svg | 1.2232 | 1.0855 | 1.127 | 1.342 | yes |
+| none-16.svg | 6.1650 | 12.8417 | 0.480 | 0.556 | yes |
+| rotate-1.svg | 1.2974 | 1.1388 | 1.139 | 1.348 | no |
+| rotate-16.svg | 6.1455 | 12.6796 | 0.485 | 0.559 | no |
+
+The shared-image cases are faster in these samples, while single-image
+end-to-end work still exceeds resvg. This is not phase-14 parity. Raw samples,
+input/binary hashes, stage checksums and instructions are recorded in ignored
+`build/svg/svg-orientation-reference.json`. Generate the workloads with
+`python3 images/svg/bench/svg_orientation.py build/svg/svg-orientation-inputs`
+and measure them with `bench/images.py` using the same flags as the previous section.
+
+A/B uses `ff5ac1b` (the retained-image implementation) as the baseline. All ten
+broad workload checksums agree. Parse-stage native medians and full-process
+instruction counts are reported below; the latter include rendering the recorded
+display list outside the parse timer. Small wall differences are noisy.
+
+| Workload, parse | New/old time | Old process Ir | New process Ir | Ir ratio |
+|---|---:|---:|---:|---:|
+| clipping/parse | 1.0296 | 1,864,522,159 | 1,864,522,166 | 1.000000 |
+| compositing/parse | 1.0199 | 545,588,851 | 545,588,827 | 1.000000 |
+| iconset/parse | 1.0008 | 654,511,544 | 654,514,744 | 1.000005 |
+| instances/parse | 0.9930 | 1,166,465,659 | 1,166,465,641 | 1.000000 |
+| largemap/parse | 1.0110 | 1,009,381,977 | 1,009,381,984 | 1.000000 |
+| masking/parse | 1.0104 | 4,967,891,181 | 4,967,891,187 | 1.000000 |
+| mixedcurves/parse | 1.0280 | 477,535,348 | 477,535,324 | 1.000000 |
+| paintservers/parse | 0.9817 | 339,661,006 | 339,660,994 | 1.000000 |
+| stylesheets/parse | 1.0007 | 1,043,405,902 | 1,043,405,878 | 1.000000 |
+| tiger/parse | 1.0181 | 445,150,358 | 445,150,365 | 1.000000 |
+
+The complete alternating A/B report is ignored `build/svg/svg-orientation-ab.json`.
