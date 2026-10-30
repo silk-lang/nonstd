@@ -291,25 +291,7 @@ pub fn srgbDecode(value: f64) -> f64 {
 }
 
 fn srgbEncode(value: f64) -> u8 {
-  let v = clamp(value)
-  let encoded = if v <= 0.0031308 {
-    v * 12.92
-  } else {
-    1.055 * f64.pow(v, 1.0 / 2.4) - 0.055
-  }
-  return f64.toU8(f64.floor(clamp(encoded) * 255.0 + 0.5))
-}
-
-effect fn srgbTable() -> List<f64>
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut values = run List<f64>.makeWithCapacity(256)
-  let mut index: u32 = 0
-  while index < 256 {
-    run values.append(srgbDecode(u32.toF64(index) / 255.0))
-    index = index + 1
-  }
-  return move values
+  return f64.toU8(f64.floor(encode(value) * 255.0 + 0.5))
 }
 
 fn multiply(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
@@ -361,22 +343,28 @@ fn fromPcs() -> [f64; 9] {
   return inverse(&colorants)
 }
 
-/// Builds the conversion for an embedded ICC profile, or None when the profile is
-/// malformed or not a matrix/TRC (RGB) or TRC (gray) profile with an XYZ PCS.
-pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
-  ! OutOfMemoryError
-  ? &mut Allocator {
+/// A parsed matrix/TRC or gray TRC profile: per-channel curves and the map from
+/// linear device values to linear sRGB. Gray profiles repeat the gray curve.
+struct Model {
+  curves: [Curve; 3],
+  matrix: [f64; 9],
+  channels: usize,
+}
+
+impl Copy for Model {}
+
+fn model(data: &[u8]) -> Option<Model> {
   if data.length < 132 || u32.toUsize(read32(data, 0)) > data.length
     || !signature(data, 36, b"acsp")
     || !signature(data, 20, b"XYZ ") {
-    return Option<Transform>.None
+    return Option<Model>.None
   }
   let pcs = fromPcs()
   if signature(data, 16, b"GRAY") {
     let gray = match curve(data, b"kTRC") {
       Option<Curve>.Some { value } => value
       Option<Curve>.None => {
-        return Option<Transform>.None
+        return Option<Model>.None
       }
     }
 
@@ -384,41 +372,40 @@ pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
     let r = pcs[0] * D50_X + pcs[1] * D50_Y + pcs[2] * D50_Z
     let g = pcs[3] * D50_X + pcs[4] * D50_Y + pcs[5] * D50_Z
     let b = pcs[6] * D50_X + pcs[7] * D50_Y + pcs[8] * D50_Z
-    return Option<Transform>.Some {
-      value: Transform {
-        red: run table(data, &gray),
-        green: run table(data, &gray),
-        blue: run table(data, &gray),
+    return Option<Model>.Some {
+      value: Model {
+        curves: [gray, gray, gray],
         matrix: [r, 0.0, 0.0, 0.0, g, 0.0, 0.0, 0.0, b],
+        channels: 1,
       },
     }
   }
   if !signature(data, 16, b"RGB ") {
-    return Option<Transform>.None
+    return Option<Model>.None
   }
   let mut red: [f64; 3] = [0.0, 0.0, 0.0]
   let mut green: [f64; 3] = [0.0, 0.0, 0.0]
   let mut blue: [f64; 3] = [0.0, 0.0, 0.0]
   if !xyz(data, b"rXYZ", &mut red) || !xyz(data, b"gXYZ", &mut green)
     || !xyz(data, b"bXYZ", &mut blue) {
-    return Option<Transform>.None
+    return Option<Model>.None
   }
   let redCurve = match curve(data, b"rTRC") {
     Option<Curve>.Some { value } => value
     Option<Curve>.None => {
-      return Option<Transform>.None
+      return Option<Model>.None
     }
   }
   let greenCurve = match curve(data, b"gTRC") {
     Option<Curve>.Some { value } => value
     Option<Curve>.None => {
-      return Option<Transform>.None
+      return Option<Model>.None
     }
   }
   let blueCurve = match curve(data, b"bTRC") {
     Option<Curve>.Some { value } => value
     Option<Curve>.None => {
-      return Option<Transform>.None
+      return Option<Model>.None
     }
   }
 
@@ -434,13 +421,78 @@ pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
     green[2],
     blue[2],
   ]
+  return Option<Model>.Some {
+    value: Model {
+      curves: [redCurve, greenCurve, blueCurve],
+      matrix: multiply(&pcs, &source),
+      channels: 3,
+    },
+  }
+}
+
+/// Builds the conversion for an embedded ICC profile, or None when the profile is
+/// malformed or not a matrix/TRC (RGB) or TRC (gray) profile with an XYZ PCS.
+pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = match model(data) {
+    Option<Model>.Some { value } => value
+    Option<Model>.None => {
+      return Option<Transform>.None
+    }
+  }
   return Option<Transform>.Some {
     value: Transform {
-      red: run table(data, &redCurve),
-      green: run table(data, &greenCurve),
-      blue: run table(data, &blueCurve),
-      matrix: multiply(&pcs, &source),
+      red: run table(data, &parsed.curves[0]),
+      green: run table(data, &parsed.curves[1]),
+      blue: run table(data, &parsed.curves[2]),
+      matrix: parsed.matrix,
     },
+  }
+}
+
+fn encode(value: f64) -> f64 {
+  let v = clamp(value)
+  return clamp(
+    if v <= 0.0031308 {
+      v * 12.92
+    } else {
+      1.055 * f64.pow(v, 1.0 / 2.4) - 0.055
+    },
+  )
+}
+
+/// Converts device components in [0, 1] (one for gray profiles, three for RGB) to
+/// sRGB components in [0, 1], without 8-bit quantization. None when the profile
+/// cannot be evaluated or the component count does not match its colour space.
+pub fn deviceColor(data: &[u8], components: &[f64]) -> Option<[f64; 3]> {
+  let parsed = match model(data) {
+    Option<Model>.Some { value } => value
+    Option<Model>.None => {
+      return Option<[f64; 3]>.None
+    }
+  }
+  if components.length != parsed.channels {
+    return Option<[f64; 3]>.None
+  }
+  let mut linear: [f64; 3] = [0.0, 0.0, 0.0]
+  let mut index: usize = 0
+  while index < 3 {
+    let component = if parsed.channels == 1 {
+      components[0]
+    } else {
+      components[index]
+    }
+    linear[index] = evaluate(data, &parsed.curves[index], clamp(component))
+    index = index + 1
+  }
+  let m = &parsed.matrix
+  return Option<[f64; 3]>.Some {
+    value: [
+      encode(m[0] * linear[0] + m[1] * linear[1] + m[2] * linear[2]),
+      encode(m[3] * linear[0] + m[4] * linear[1] + m[5] * linear[2]),
+      encode(m[6] * linear[0] + m[7] * linear[1] + m[8] * linear[2]),
+    ],
   }
 }
 
