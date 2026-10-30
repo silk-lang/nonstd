@@ -480,7 +480,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
-- [ ] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
+- [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
 - [ ] 1.1 only: `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
 - [ ] `a` inside text (§16.2)
@@ -793,6 +793,21 @@ decisions:
   a path), and `dy` moves glyphs along the normal. The algorithm's "unset
   resolve_y[index]" reads as all characters of the element. Applying the text element's
   own `y` along the normal would contradict that note.
+- Text decoration (§11.11, CSS Text Decoration 3) is painted by the element that declares
+  it, with that element's fill, stroke and paint order, across its descendants' glyphs.
+  Underlines and overlines paint before the element's glyphs and line-throughs after its
+  whole content (#painting-order). Positions come from the element's first face: the
+  post table's underline position and thickness, the OS/2 strikeout, and the overline
+  at the ascent, so a descendant with another font or baseline shift does not move the
+  line (#line-decoration). A numeric `text-decoration-thickness` replaces both
+  thicknesses. Each run of unrotated glyphs on one baseline gets one rectangle; a rotated
+  glyph, including one on a path, gets its own
+  rectangle in its rotated frame.
+  `text-decoration-style` is drawn as solid, `text-decoration-fill`/`-stroke` are not
+  applied, and decorations do not add to the bounding box (SVG 2 #TextBoundingBox counts
+  glyph cells only) or to a clipping path.
+- Text in a `clipPath` contributes the glyph outlines of the text element and of each
+  descendant that renders characters (CSS Masking 1 #ClipPathElement).
 - Baselines follow CSS Inline 3 #baseline-alignment on horizontal text. The text
   element's dominant baseline sits on the text position. Each child aligns its baseline
   of the alignment type (`alignment-baseline`, or the parent's dominant baseline for
