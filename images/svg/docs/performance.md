@@ -493,3 +493,87 @@ Reproduce using the `ab` and `bench` commands above with `--mode parse --samples
 section for all three stages. Raw reports with samples, input and binary hashes
 are retained as `build/svg/orientation-ab.json`, `orientation-reference.json`
 and `orientation-images-perf.json` (ignored artifacts).
+
+### CSS image sampling and coincident clipping (2026-10-30)
+
+Compared orientation implementation `6eef054` (the code merged in main
+`fd93085`) with sampling/clipping implementation `ee670ef`. Linux aarch64,
+four virtual CPUs, Silk dev.33, LLVM 22.1.8, Rust 1.90.0, Valgrind 3.22.0,
+and the same pinned resvg as above. Three alternating native samples, one
+iteration, no warmup. Ir measures a separate full process, including startup,
+loading, checksums and any untimed work; it is not stage-only Ir.
+
+All ten broad workload checksums agree before and after the change. Parse wall
+time varies in this small sample; the full-process instruction counts provide
+a more stable measure of the added work. Existing phase 14 gaps remain open.
+
+| Workload, parse | New ms | New/old time | New/old process Ir |
+|---|---:|---:|---:|
+| clipping/parse | 3.052 | 1.0655 | 1.0000 |
+| compositing/parse | 3.645 | 0.9507 | 1.0000 |
+| iconset/parse | 21.903 | 0.9805 | 1.0003 |
+| instances/parse | 58.219 | 1.0196 | 1.0068 |
+| largemap/parse | 29.451 | 0.9436 | 1.0001 |
+| masking/parse | 2.757 | 1.0100 | 1.0000 |
+| mixedcurves/parse | 10.265 | 0.9654 | 1.0000 |
+| paintservers/parse | 4.371 | 0.9820 | 1.0002 |
+| stylesheets/parse | 44.654 | 0.9179 | 1.0001 |
+| tiger/parse | 6.465 | 0.9243 | 1.0000 |
+
+`bench/sampling.py` generates original 16×16 RGB PNGs with one large placement
+or 64 shared placements, in auto, pixelated and independently expanded smooth
+forms. The single image uses a 27×19 integer intermediate; repeated images use
+3×3 intermediates. New pixelated and expanded-smooth checksums agree in every
+stage for both workloads, confirming that caching does not change the result.
+All resvg comparisons differ in checksum, so these timings compare the engines'
+chosen algorithms, not identical pixels. CSS leaves the smooth algorithm open;
+conformance is established by the independent two-stage reftests.
+
+| Input, end-to-end | Silk ms | resvg ms | Silk/resvg time | Silk/resvg process Ir |
+|---|---:|---:|---:|---:|
+| auto-1.svg | 2.310 | 3.639 | 0.635 | 0.747 |
+| auto-64.svg | 3.843 | 5.662 | 0.679 | 0.900 |
+| expanded-smooth-1.svg | 6.773 | 2.088 | 3.244 | 7.425 |
+| expanded-smooth-64.svg | 3.994 | 3.408 | 1.172 | 1.437 |
+| pixelated-1.svg | 2.765 | 0.850 | 3.251 | 3.652 |
+| pixelated-64.svg | 3.834 | 1.972 | 1.944 | 2.422 |
+
+The old renderer exits with a geometry failure on `expanded-smooth-64.svg`;
+that control succeeds with the coincident-plane correction. It has no valid old
+performance sample. The A/B image comparison therefore covers the four auto and
+pixelated inputs, with this missing baseline recorded rather than assigned a
+zero time or instruction count. Before the feature, `pixelated` fell back to
+auto, so its A/B measures the cost of implementing the specified extra stage.
+
+Reproduce the reference comparison:
+
+```sh
+python3 images/svg/bench/sampling.py build/svg/sampling-bench-inputs
+python3 images/svg/bench/images.py --inputs build/svg/sampling-bench-inputs \
+  --silk build/llvm/aarch64-unknown-linux-gnu/release/images-svg-bench \
+  --rust images/svg/scripts/rust-bench/target/release/svg-reference-bench \
+  --samples 3 --iterations 1 --warmup 0 --callgrind \
+  --output build/svg/sampling-reference.json
+```
+
+The image harness now rejects an empty input directory rather than writing a
+report with no samples. Raw reports are ignored `build/svg/sampling-ab.json`,
+`sampling-reference.json` and `sampling-images-ab.json`; the last uses the image
+harness's `resvg` field for the old Silk binary, whose exact hash and version are
+recorded in the report. The broad A/B uses the normal `ab` command with parse
+mode. No stage-only instruction claim is made from any of these reports.
+
+| Input/mode | New ms | New/old time | New/old process Ir | Checksum equal |
+|---|---:|---:|---:|---|
+| auto-1.svg/parse | 0.196 | 1.0140 | 1.0002 | True |
+| auto-1.svg/render | 2.215 | 1.0143 | 1.0001 | True |
+| auto-1.svg/end-to-end | 2.317 | 1.0141 | 1.0002 | True |
+| auto-64.svg/parse | 1.294 | 0.9223 | 1.0039 | True |
+| auto-64.svg/render | 3.091 | 1.0329 | 1.0045 | True |
+| auto-64.svg/end-to-end | 3.825 | 1.0062 | 1.0039 | True |
+| pixelated-1.svg/parse | 0.188 | 0.9837 | 1.1487 | False |
+| pixelated-1.svg/render | 2.475 | 1.1802 | 1.1574 | False |
+| pixelated-1.svg/end-to-end | 2.734 | 1.1822 | 1.1487 | False |
+| pixelated-64.svg/parse | 1.274 | 0.9749 | 1.0179 | False |
+| pixelated-64.svg/render | 2.566 | 1.0204 | 1.0159 | False |
+| pixelated-64.svg/end-to-end | 3.897 | 0.9537 | 1.0179 | False |
