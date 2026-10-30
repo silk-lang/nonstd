@@ -498,8 +498,8 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] `mix-blend-mode` (all separable and non-separable modes), `isolation`, Porter-Duff operators
 
 ### 5.10 Filters (Filter Effects 1, 1.1 ch. 15)
-- [ ] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
-- [ ] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
+- [x] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
+- [x] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
 - [ ] Inputs: `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
 - [ ] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
 - [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color` (all but `lighting-color` done)
@@ -598,11 +598,23 @@ decisions:
   is transparent black. Blur and morphology read their input across the whole filter region
   and are clipped to their subregion afterwards.
 - `feDropShadow` is its spec expansion; a negative `stdDeviation` there means no blur.
-- In this first step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint`
-  read as transparent black, the primitives `feImage`, `feTurbulence`, `feConvolveMatrix`,
-  `feDisplacementMap` and the lighting primitives produce transparent black, filter
-  functions in a `filter` list are skipped, and `filter` `href` templates and `filterRes`
-  are ignored. Each is still to be implemented in phase 8.
+- Filter functions are programs of their
+  [markup equivalents](https://www.w3.org/TR/filter-effects-1/#FilterPrimitiveRepresentation),
+  always in sRGB. Their [UA-defined region](https://www.w3.org/TR/filter-effects-1/#filter-region-for-shorthands)
+  is the stroke bounding box, grown by `3σ + 2` user units for each blur (the box
+  approximation reaches a little past 3σ) and by drop-shadow offsets, cumulatively through
+  the list; a referenced filter grows it to its own region.
+- `href` on `filter` follows SVG 1.1
+  ([#FilterElementHrefAttribute](https://www.w3.org/TR/2011/REC-SVG11-20110816/filters.html#FilterElementHrefAttribute)),
+  which FE1 dropped: unspecified attributes, and the primitives when the element has none,
+  come from the template chain, sharing the paint-server template machinery and its cycle rules.
+- SVG 1.1 `filterRes` sets the surface to exactly that many pixels over the filter region,
+  drawn back with bilinear sampling; non-integers truncate, zero hides the element, and a
+  negative value is an error that leaves the automatic resolution.
+- In this step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` read as
+  transparent black, and the primitives `feImage`, `feTurbulence`, `feConvolveMatrix`,
+  `feDisplacementMap` and the lighting primitives produce transparent black. Each is still
+  to be implemented in phase 8.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),

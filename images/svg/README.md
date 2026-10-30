@@ -35,8 +35,8 @@ affine/projective placement, and CSS nearest, smooth, or two-stage `pixelated`
 sampling. Nested SVG images render as independent secure documents with their own
 viewport and styles, apply CSS image orientation before sizing, and retain vector
 geometry through final placement.
-`filter` elements render with their regions, subregions and most primitives; lighting,
-turbulence, convolution, displacement, `feImage` and the CSS filter functions are still to come.
+`filter` elements and the CSS filter functions render with their regions, subregions and
+most primitives; lighting, turbulence, convolution, displacement and `feImage` are still to come.
 Text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example
