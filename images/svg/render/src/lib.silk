@@ -4,14 +4,22 @@ pub import vector.pixmap { Pixmap }
 pub import record { record }
 import svg_core.structure { Graph, StructureError }
 import svg_core.structure
+import svg_core.url { Url }
 import svg_core.resolve
 import svg_core.image_assets
+import svg_core.image_assets { DocumentSource }
+import document_images
+import svg_geometry.geometry { Size }
 import svg_raster.cpu
+import vector.geometry_error { GeometryError }
 pub import environment { Environment }
 import environment
 import native_environment
-import svg_core.resources { Resolver }
+import svg_core.resources { Resolver, ResourceError }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u32
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 effect fn invalidStructure(error: StructureError) -> Graph
@@ -29,25 +37,196 @@ effect fn invalidStructure(error: StructureError) -> Graph
   }
 }
 
-/// Parse XML, compute CSS for every element, and resolve retained geometry.
+struct Budget {
+  documentCount: usize,
+  documents: usize,
+  assets: usize,
+  pixels: usize,
+  occurrences: usize,
+}
+
+fn budget(options: &RenderOptions, host: &Environment) -> Budget {
+  return Budget {
+    documentCount: host.structure.limits.maxDocuments,
+    documents: host.structure.limits.maxTotalBytes,
+    assets: host.structure.limits.maxTotalBytes,
+    pixels: options.maxPixels,
+    occurrences: host.structure.limits.maxOccurrences,
+  }
+}
+
+effect fn loaded(
+  input: Graph,
+  options: &RenderOptions,
+  host: &Environment,
+  viewport: Option<Size>,
+  depth: usize,
+  remaining: &mut Budget,
+) -> RenderTree
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut graph = move input
+  let styles = run environment.styles(&mut graph, host)
+  if graph.documents.length() > remaining.documentCount
+    || graph.resourceBytes() > remaining.documents
+    || graph.occurrences.length() > remaining.occurrences {
+    fail RenderError.TooLarge
+  }
+  remaining.documentCount = remaining.documentCount - graph.documents.length()
+  remaining.documents = remaining.documents - graph.resourceBytes()
+  remaining.occurrences = remaining.occurrences - graph.occurrences.length()
+  let mut images = run image_assets.load(&graph, remaining.pixels)
+  if images.retainedBytes > remaining.assets {
+    fail RenderError.TooLarge
+  }
+  remaining.assets = remaining.assets - images.retainedBytes
+  let mut i: usize = 0
+  while i < images.assets.length() {
+    let image = &images.assets.asSlice()[i].image
+    let count = u32.toUsize(image.width()) * u32.toUsize(image.height())
+    if count > remaining.pixels {
+      fail RenderError.TooLarge
+    }
+    remaining.pixels = remaining.pixels - count
+    i = i + 1
+  }
+  run document_images.prepare(&mut images, host)
+  let mut tree = match &viewport {
+    Option<Size>.Some { value } => run resolve.resolveEmbedded(
+      move images,
+      move graph,
+      move styles,
+      options,
+      &host.cssLimits,
+      value,
+    )
+    _ => run resolve.resolveWithImages(
+      move images,
+      move graph,
+      move styles,
+      options,
+      &host.cssLimits,
+      host.media.initial.viewportWidth,
+      host.media.initial.viewportHeight,
+    )
+  }
+  i = 0
+  while i < tree.embedded.length() {
+    let entry = &tree.embedded.asSlice()[i]
+    let result = run Effect.result(
+      parseSource(
+        &tree.documents.asSlice()[entry.source],
+        options,
+        host,
+        entry.viewport,
+        depth + 1,
+        &mut remaining.*,
+      ),
+    )
+    match move result {
+      Result<RenderTree, RenderError | OutOfMemoryError>.Success { value } => {
+        let entries = tree.embedded.asMutSlice()
+        entries[i].tree = Option<RenderTree>.some(move value)
+      }
+      Result<RenderTree, RenderError | OutOfMemoryError>.Failure { error } => match &error {
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+        RenderError problem => {
+          if problem == RenderError.TooLarge {
+            fail problem
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  run Effect.catch<GeometryError>(resolve.finishEmbedded(&mut tree), invalidBounds)
+  return move tree
+}
+
+effect fn invalidBounds(error: GeometryError) -> ()
+  ! RenderError {
+  drop error
+  fail RenderError.InvalidGeometry
+}
+
+effect fn invalidResource(error: ResourceError) -> Graph
+  ! RenderError {
+  if error == ResourceError.TooLarge {
+    fail RenderError.TooLarge
+  }
+  fail RenderError.InvalidXml
+}
+
+effect fn parseSource(
+  source: &DocumentSource,
+  options: &RenderOptions,
+  host: &Environment,
+  viewport: Size,
+  depth: usize,
+  remaining: &mut Budget,
+) -> RenderTree
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  if depth > host.structure.limits.maxReferenceDepth {
+    fail RenderError.TooLarge
+  }
+  let base = match &source.response.finalUrl {
+    Option<Url>.Some { value } => &value
+    _ => &source.request
+  }
+  let mut local = environment.embedded(host, base, viewport)
+  local.structure.fragment = source.request.fragment()
+  local.structure.limits.maxDocuments = remaining.documentCount
+  local.structure.limits.maxTotalBytes = remaining.documents
+  local.structure.limits.maxOccurrences = remaining.occurrences
+  let graph = run Effect.catch<ResourceError>(
+    Effect.catch<StructureError>(
+      structure.buildResponse(&source.response, &source.request, &local.structure),
+      invalidStructure,
+    ),
+    invalidResource,
+  )
+  return run loaded(
+    move graph,
+    options,
+    &local,
+    Option<Size>.some(viewport),
+    depth,
+    &mut remaining.*,
+  )
+}
+
+/// Parse XML, compute CSS and retain independent embedded SVG pictures.
 pub effect fn parse(data: &[u8], options: &RenderOptions, host: &Environment) -> RenderTree
   ! RenderError | OutOfMemoryError
   ? &mut Resolver | &mut Allocator {
-  let mut graph = run Effect.catch<StructureError>(
-    structure.build(data, &host.base, &host.structure),
+  let graph = run Effect.catch<StructureError>(
+    structure.build(data, host.base, &host.structure),
     invalidStructure,
   )
-  let styles = run environment.styles(&mut graph, host)
-  let images = run image_assets.load(&graph, options.maxPixels)
-  return run resolve.resolveWithImages(
-    move images,
-    move graph,
-    move styles,
-    options,
-    &host.cssLimits,
-    host.media.initial.viewportWidth,
-    host.media.initial.viewportHeight,
+  let mut remaining = budget(options, host)
+  return run loaded(move graph, options, host, Option<Size>.None, 0, &mut remaining)
+}
+
+/// Parse an SVG image in a secure, exact logical viewport, including fractions.
+/// Output overrides and zoom belong to the referencing image's device mapping.
+pub effect fn parseEmbedded(
+  data: &[u8],
+  options: &RenderOptions,
+  host: &Environment,
+  viewport: Size,
+) -> RenderTree
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let local = environment.embedded(host, host.base, viewport)
+  let graph = run Effect.catch<StructureError>(
+    structure.build(data, local.base, &local.structure),
+    invalidStructure,
   )
+  let mut remaining = budget(options, &local)
+  return run loaded(move graph, options, &local, Option<Size>.some(viewport), 0, &mut remaining)
 }
 
 /// Render a retained display list; callers can reuse it without reparsing XML.

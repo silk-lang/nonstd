@@ -577,3 +577,73 @@ mode. No stage-only instruction claim is made from any of these reports.
 | pixelated-64.svg/parse | 1.274 | 0.9749 | 1.0179 | False |
 | pixelated-64.svg/render | 2.566 | 1.0204 | 1.0159 | False |
 | pixelated-64.svg/end-to-end | 3.897 | 0.9537 | 1.0179 | False |
+
+## Phase 7 retained SVG images
+
+Commit `ff5ac1b` adds independent secure SVG image layouts and retained child
+display lists. Measurements use Ubuntu 24.04 arm64 (four CPUs, 8 GiB), Silk
+`0.1.0-dev.33+b6c479e631a5`, LLVM 22.1.8, Rust 1.90.0 and Valgrind 3.22.0.
+Three alternating native samples use one iteration and no warmup. Separate
+Callgrind passes count the **full process**, including startup, untimed work
+and checksum calculation; these are not stage-only instruction counts. The
+reference is resvg/usvg `91455ee06d08ac2bfeab2b035ed2cfbfd0a68614`.
+
+`bench/nested.py` generates one image, sixteen placements sharing one viewport,
+and sixteen distinct viewports. Each has an independently positioned inline
+rectangle control. Embedded and inline checksums match for every mode in each
+engine. Cross-engine checksums match for single/shared placements, but differ
+for the varying-width workloads, including their inline controls: those widths
+produce half-pixel color boundaries. No tolerance or conformance expectation
+was changed to hide that difference.
+
+| Embedded workload/mode | Silk ms | resvg ms | Time ratio | Full-process Ir ratio | Same checksum |
+|---|---:|---:|---:|---:|---|
+| single/parse | 0.3352 | 0.0099 | 33.945 | 5.345 | yes |
+| single/render | 0.0387 | 0.0926 | 0.418 | 3.160 | yes |
+| single/end-to-end | 0.3778 | 0.1059 | 3.567 | 5.345 | yes |
+| shared/parse | 0.5562 | 0.0852 | 6.527 | 1.232 | yes |
+| shared/render | 0.5078 | 1.0458 | 0.486 | 0.909 | yes |
+| shared/end-to-end | 1.0577 | 1.1348 | 0.932 | 1.232 | yes |
+| viewports/parse | 2.2343 | 0.0869 | 25.718 | 3.606 | no |
+| viewports/render | 0.5236 | 1.0625 | 0.493 | 2.168 | no |
+| viewports/end-to-end | 2.7800 | 1.1535 | 2.410 | 3.606 | no |
+
+The retained stage is faster in these native samples, but parsing and most
+full-process instruction counts remain above resvg. This does not establish phase-14 performance parity.
+Raw measurements are in ignored `build/svg/nested-reference.json`.
+
+```sh
+python3 images/svg/bench/nested.py build/svg/nested-inputs
+python3 images/svg/bench/images.py --inputs build/svg/nested-inputs \
+  --silk build/llvm/aarch64-unknown-linux-gnu/release/images-svg-bench \
+  --rust images/svg/scripts/rust-bench/target/release/svg-reference-bench \
+  --samples 3 --iterations 1 --warmup 0 --callgrind \
+  --output build/svg/nested-reference.json
+```
+
+The broad A/B baseline is `ee670ef`, whose renderer code matches main
+`e7c7815` (later changes are documentation, fixtures and benchmark scripts). All
+30 workload/stage checksums agree. Across those comparisons, full-process Ir
+changes range from −0.685% to +0.175%. The table uses a separate native-only run
+with five alternating samples, three iterations and one warmup; instruction
+counts remain from the one-iteration, zero-warmup Callgrind runs. Small wall-time
+differences are noisy, not evidence of optimization.
+
+| Workload | Parse time ratio | Render time ratio | End-to-end time ratio | Old render-process Ir | New render-process Ir |
+|---|---:|---:|---:|---:|---:|
+| iconset | 1.0152 | 0.9972 | 1.0097 | 389,892,247 | 390,480,535 |
+| tiger | 0.9932 | 0.9795 | 1.0073 | 363,464,787 | 363,553,789 |
+| largemap | 0.9906 | 0.9901 | 1.0053 | 688,691,616 | 689,163,587 |
+| mixedcurves | 0.9995 | 0.9866 | 0.9724 | 360,902,837 | 361,041,251 |
+| stylesheets | 0.9904 | 1.0149 | 0.9966 | 537,678,600 | 538,051,802 |
+| instances | 1.0078 | 0.9805 | 1.0208 | 618,177,383 | 618,932,345 |
+| paintservers | 0.9268 | 1.0048 | 0.9981 | 287,375,882 | 287,452,061 |
+| compositing | 1.0441 | 0.9978 | 1.0058 | 507,741,251 | 504,265,129 |
+| clipping | 0.9668 | 1.0033 | 0.9847 | 1,832,152,931 | 1,832,457,165 |
+| masking | 1.0130 | 0.9881 | 1.0085 | 4,933,824,339 | 4,934,202,093 |
+
+The raw A/B reports are ignored `build/svg/nested-ab.json` and
+`build/svg/nested-ab-native.json`. They retain binary hashes, input hashes,
+all samples, stage checksums and full-process instruction counts. The new SVG
+image workloads have no equivalent old-renderer timing: the old renderer drops
+SVG image sources, so timing that blank output would not measure the same work.

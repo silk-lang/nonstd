@@ -543,7 +543,7 @@ before comparison. APNG selects the first animation frame, including when the
 fallback IDAT image is outside the animation, on a transparent initial canvas
 ([frame controls](https://www.w3.org/TR/png-3/#fcTL-chunk)). Later frame payloads
 are not inflated for this first-frame API. Color metadata is retained; its
-interpretation/conversion and SVG image integration remain incomplete.
+interpretation/conversion remains incomplete; PNG samples are integrated into SVG image rendering.
 
 ### JPEG scan reconstruction
 
@@ -620,8 +620,8 @@ budget failures propagate; unavailable or malformed images paint nothing. Each
 image is sampled with its full projective transform, then participates in the
 existing clip/mask/group compositing pipeline. Fill and stroke properties do not
 paint the image rectangle. SVG `optimizeSpeed` selects nearest sampling; `auto`
-and `optimizeQuality` currently select bilinear sampling. CSS Images 3 sampling
-keywords and nested SVG image documents remain open.
+and `optimizeQuality` select bilinear sampling. The subsequent sampling and
+embedded-document sections describe CSS Images 3 keywords and nested SVG images.
 
 The projective nearest-sampling fixture uses a continuous blue field, a binary red
 band and one antialiased outer clip as its reference. Two separately antialiased
@@ -708,3 +708,41 @@ existing geometric tolerance. It charges the displacement to the vertex's error
 bound. Horizon clipping retains its original handling; high-uncertainty vertices
 still fail. A fractional translated 90-degree image and a vector-level rectangle
 area test exercise this case without relaxing pixel comparisons.
+
+
+### Embedded SVG image documents
+
+SVG 2 CR2018 [§12.3 `#ImageElement`](https://www.w3.org/TR/2018/CR-SVG2-20181004/embedded.html#ImageElement)
+(pinned SHA256 `9f2286fa76c0d82df7f8f2f373fb1d083ee2e30c468305ae542373aedd964e8c`)
+makes the image-rendering rectangle the independent document's SVG viewport.
+The outer image's `preserveAspectRatio` determines that rectangle; the child
+root's value is treated as `none` during layout. SVG 1.1 `defer` selects an
+explicit child root/view aspect-ratio value before fitting. Absolute computed
+root dimensions supply intrinsic sizes; percentages and `auto` do not. A selected
+viewBox supplies the ratio when definite root dimensions do not supply one,
+following [§8.12 `#IntrinsicSizing`](https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#IntrinsicSizing).
+Without a viewBox, changing the viewport does not scale fixed user-unit geometry.
+
+Each child starts an independent cascade and media context. Static parents select
+secure-static children; animated parents select secure-animated children. External
+requests are blocked before resolver dispatch, while data resources remain usable.
+Response MIME/charset validation and decompression share the external SVG parser.
+A redirect changes the base URL; the requested fragment still selects the view
+and `:target` before intrinsic measurement and layout.
+
+Child display lists retain geometry, paints and physical clip planes. Execution
+composes their placement with the parent mapping and transforms clip planes by
+the inverse transpose, retaining positive-w boundaries. Image and child-root
+`overflow` independently govern the positioning and image-rendering rectangles.
+Isolated child output receives the image element's opacity and compositing once.
+Exact original fixtures cover intrinsic/percentage sizing, meet/none, stylesheet
+isolation, secure external-resource rejection, source reuse across viewports,
+rotation, perspective, recursive data images, overflow and group opacity.
+
+Image-bearing pattern pictures remain live while child layouts are pending.
+Once those layouts exist, visible pattern overflow includes their painted content;
+fully clipped tiles use the finite tile boundary directly. A translucent overlap
+fixture distinguishes correct neighboring tile enumeration from simply using the
+image positioning rectangle. Document counts, bytes, occurrences and decoded
+pixels share a budget across nested documents; recursive execution also shares the
+remaining isolated-surface allowance instead of restarting it for each child.

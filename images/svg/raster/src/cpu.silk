@@ -72,12 +72,13 @@ struct Prepared {
 
 struct ClipPlanes {
   selected: Option<usize>,
+  ready: bool,
   planes: List<HalfPlane>,
 }
 
 impl ClipPlanes {
   fn make() -> ClipPlanes {
-    return ClipPlanes { selected: Option<usize>.None, planes: List<HalfPlane>.make() }
+    return ClipPlanes { selected: Option<usize>.None, ready: false, planes: List<HalfPlane>.make() }
   }
 
   effect fn select(
@@ -85,8 +86,9 @@ impl ClipPlanes {
     index: Option<usize>,
     clips: &[ProjectionClip],
     placement: Option<Mapping>,
+    inherited: &[HalfPlane],
   ) -> ()
-    ! RenderError | OutOfMemoryError
+    ! RenderError | GeometryError | OutOfMemoryError
     ? &mut Allocator {
     let same = match &index {
       Option<usize>.Some { value } => match &self.selected {
@@ -102,7 +104,7 @@ impl ClipPlanes {
       Option<Mapping>.None => true
       _ => false
     }
-    if same && root {
+    if self.ready && same && root {
       return
     }
     self.planes.clear()
@@ -116,18 +118,23 @@ impl ClipPlanes {
       }
       let mut plane = clips[next].plane
       match &placement {
-        Option<Mapping>.Some { value: placed } => match &placed {
-          Mapping.Affine { value } => {
-            plane = HalfPlane {
-              x: plane.x / value.a,
-              y: plane.y / value.d,
-              w: plane.w - plane.x * value.e / value.a - plane.y * value.f / value.d,
-            }
-            if !f64.isFinite(plane.x) || !f64.isFinite(plane.y) || !f64.isFinite(plane.w) {
+        Option<Mapping>.Some { value: placed } => {
+          let matrix = match &placed {
+            Mapping.Affine { value } => Homography.fromAffine(&mapping.affine(value))
+            Mapping.Projective { value } => value
+          }
+          let inverse = match &matrix.inverse() {
+            Option<Homography>.Some { value } => value
+            _ => {
               fail RenderError.InvalidGeometry
             }
           }
-          _ => {
+          plane = HalfPlane {
+            x: plane.x * inverse.xx + plane.y * inverse.yx + plane.w * inverse.wx,
+            y: plane.x * inverse.xy + plane.y * inverse.yy + plane.w * inverse.wy,
+            w: plane.x * inverse.xw + plane.y * inverse.yw + plane.w * inverse.ww,
+          }
+          if !f64.isFinite(plane.x) || !f64.isFinite(plane.y) || !f64.isFinite(plane.w) {
             fail RenderError.InvalidGeometry
           }
         }
@@ -136,6 +143,17 @@ impl ClipPlanes {
       run self.planes.append(plane)
       cursor = clips[next].parent
     }
+    if let Option<Mapping>.Some { value } = &placement {
+      if let Option<HalfPlane>.Some { value: plane } = &(run value.flatteningClip()) {
+        run self.planes.append(plane)
+      }
+    }
+    let mut i: usize = 0
+    while i < inherited.length {
+      run self.planes.append(inherited[i])
+      i = i + 1
+    }
+    self.ready = true
     self.selected = index
   }
 }
@@ -170,10 +188,36 @@ effect fn geometryFailure(error: GeometryError) -> Pixmap
 effect fn executeChecked(list: &DisplayList) -> Pixmap
   ! RenderError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
+  return run executePlaced(
+    list,
+    list.width,
+    list.height,
+    Option<Mapping>.None,
+    &[],
+    checked.MAX_SURFACE_PIXELS,
+    0,
+  )
+}
+
+effect fn executePlaced(
+  list: &DisplayList,
+  width: u32,
+  height: u32,
+  placement: Option<Mapping>,
+  inherited: &[HalfPlane],
+  surfaceLimit: usize,
+  depth: usize,
+) -> Pixmap
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth >= 64 {
+    fail RenderError.TooLarge
+  }
+  run checked.dimensions(width, height)
   run checked.dimensions(list.width, list.height)
   run paints.validate(list)
   run validateClips(list.projectionClips.asSlice())
-  run validateCommands(list, list.commands.asSlice(), list.width, list.height)
+  run validateCommands(list, list.commands.asSlice(), width, height)
   let mut resource: usize = 0
   while resource < list.patterns.length() {
     let picture = &list.patterns.asSlice()[resource]
@@ -196,14 +240,18 @@ effect fn executeChecked(list: &DisplayList) -> Pixmap
     p = p + 1
   }
   let mut textures = run patterns.make(list.patterns.length())
-  run patterns.surface(&mut textures, u32.toUsize(list.width) * u32.toUsize(list.height))
+  textures.surfaceLimit = surfaceLimit
+  run patterns.surface(&mut textures, u32.toUsize(width) * u32.toUsize(height))
   return run picture(
     list,
     list.commands.asSlice(),
-    list.width,
-    list.height,
+    width,
+    height,
     &patterns.root(),
     true,
+    placement,
+    inherited,
+    depth,
     &mut cache,
     &mut paintCache,
     &mut textures,
@@ -217,6 +265,9 @@ effect fn picture(
   height: u32,
   copies: &patterns.Copies,
   root: bool,
+  rootPlacement: Option<Mapping>,
+  inherited: &[HalfPlane],
+  depth: usize,
   cache: &mut List<Prepared>,
   paintCache: &mut paints.Cache,
   textures: &mut patterns.Cache,
@@ -244,13 +295,35 @@ effect fn picture(
     let mut column: usize = 0
     while column < copies.columns {
       let placement = if root {
-        Option<Mapping>.None
+        rootPlacement
       } else {
         Option<Mapping>.some(run patterns.placement(copies, column, row))
       }
       let mut i: usize = 0
       while i < commands.length {
         match &commands[i] {
+          Command.Embedded { image, transform, clip } => {
+            if let Option<DisplayList>.Some { value } = &list.embedded.asSlice()[image] {
+              run planes.select(clip, list.projectionClips.asSlice(), placement, inherited)
+              let placed = run placedMapping(&transform, placement)
+              let pixels = run executePlaced(
+                &value,
+                width,
+                height,
+                Option<Mapping>.some(placed),
+                planes.planes.asSlice(),
+                textures.surfaceLimit - textures.surfaces,
+                depth + 1,
+              )
+              let target = stack.length() - 1
+              layers.composite(
+                &mut stack.asMutSlice()[target].pixels,
+                &pixels,
+                layers.BLEND_NORMAL,
+                255,
+              )
+            }
+          }
           Command.FillPath {
             path,
             transform,
@@ -271,8 +344,9 @@ effect fn picture(
               &mut cache.*,
               &mut paintCache.*,
               &mut textures.*,
+              depth,
             )
-            run planes.select(clip, list.projectionClips.asSlice(), placement)
+            run planes.select(clip, list.projectionClips.asSlice(), placement, inherited)
             let placed = run placedMapping(&transform, placement)
             run prepare(&sourcePaths[path], &mut cache.asMutSlice()[path])
             let prepared = &cache.asSlice()[path].path
@@ -330,8 +404,9 @@ effect fn picture(
               &mut cache.*,
               &mut paintCache.*,
               &mut textures.*,
+              depth,
             )
-            run planes.select(clip, list.projectionClips.asSlice(), placement)
+            run planes.select(clip, list.projectionClips.asSlice(), placement, inherited)
             let placed = run placedMapping(&transform, placement)
             run prepare(&sourcePaths[path], &mut cache.asMutSlice()[path])
             let prepared = &cache.asSlice()[path].path
@@ -454,7 +529,7 @@ effect fn picture(
           }
           Command.ConvertMask { luminance, linearRgb } => {
             let maskPixels = u32.toUsize(width) * u32.toUsize(height)
-            if maskPixels > checked.MAX_SURFACE_PIXELS - textures.surfaces {
+            if maskPixels > textures.surfaceLimit - textures.surfaces {
               fail RenderError.TooLarge
             }
             let top = stack.length() - 1
@@ -506,7 +581,7 @@ effect fn picture(
           }
           Command.ApplyMask { luminance, linearRgb } => {
             let maskPixels = u32.toUsize(width) * u32.toUsize(height)
-            if maskPixels > checked.MAX_SURFACE_PIXELS - textures.surfaces {
+            if maskPixels > textures.surfaceLimit - textures.surfaces {
               fail RenderError.TooLarge
             }
             let top = stack.length() - 1
@@ -547,7 +622,7 @@ effect fn picture(
               width,
               height,
               &placed,
-              checked.MAX_SURFACE_PIXELS - textures.surfaces,
+              textures.surfaceLimit - textures.surfaces,
             )
             let target = stack.length() - 1
             let pixels = stack.asMutSlice()[target].pixels.dataMut()
@@ -627,6 +702,7 @@ effect fn prepareBrush(
   paths: &mut List<Prepared>,
   paintCache: &mut paints.Cache,
   textures: &mut patterns.Cache,
+  depth: usize,
 ) -> Option<usize>
   ! RenderError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
@@ -674,6 +750,9 @@ effect fn prepareBrush(
           size.height,
           &copies,
           false,
+          Option<Mapping>.None,
+          &[],
+          depth,
           &mut paths.*,
           &mut paintCache.*,
           &mut textures.*,
@@ -810,6 +889,12 @@ effect fn validateCommands(list: &DisplayList, commands: &[Command], width: u32,
   let mut i: usize = 0
   while i < commands.length {
     match &commands[i] {
+      Command.Embedded { image, transform, clip } => {
+        if image >= list.embedded.length() || !transform.isFinite() {
+          fail RenderError.InvalidGeometry
+        }
+        run clipIndex(clip, clips.length)
+      }
       Command.FillPath {
         path,
         transform,
