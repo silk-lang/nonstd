@@ -482,7 +482,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
-- [ ] 1.1 only: `tref` (done), `altGlyph` family (falls back to its content until SVG fonts land), SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
+- [ ] 1.1 only (done except `vkern`, `lang` selection, glyph child elements and external SVG fonts): `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
 - [ ] `a` inside text (§16.2)
 
 ### 5.8 Embedded content (§12)
@@ -906,9 +906,42 @@ decisions:
 - `tref` (SVG 1.1 #TRefElement) takes the character data of the same-document element its
   `href` or `xlink:href` names, markup removed, and treats it as its own text with its own
   style, white space and positioning attributes, including `textLength`. Its own children
-  add nothing, and an unresolved reference adds no characters. `altGlyph` renders its
-  content like a `tspan` when its glyphs cannot be found (SVG 1.1 #AltGlyphElement), which
-  is always the case until SVG fonts are implemented.
+  add nothing, and an unresolved reference adds no characters.
+- `altGlyph` (SVG 1.1 #AltGlyphElement) names a `glyph` of one of the document's SVG fonts,
+  or an `altGlyphDef` whose glyphRefs, or whose first altGlyphItem with only resolvable
+  glyphRefs, name such glyphs. The glyphs replace the element's characters and come from
+  their font whatever the `font-family`; in positioning lists the first glyph takes the
+  characters' place. Glyphs from more than one font, `glyphRef`'s `glyphRef`/`format`
+  attributes and glyphs of other documents are not supported, and fall back to rendering
+  the content like a `tspan`, as for any unresolved reference.
+- SVG fonts (SVG 1.1 ch. 20): each `font` of the main document with a `font-face` child
+  adds a face of the family that `font-face` names, after the @font-face faces. The font is
+  compiled into OpenType data (`fonts/src/opentype.silk`), so matching, fallback, shaping,
+  baselines and decorations work as for any face:
+  - Glyph selection (#GlyphSelectionRules) takes the first glyph in document order whose
+    `unicode` matches. The `cmap` maps each character to the first single-character glyph
+    for it; a multi-character glyph becomes a mandatory ligature (`ccmp`) unless an earlier
+    glyph's `unicode` is a prefix of its own. A character that only appears inside
+    ligatures maps to a copy of the `missing-glyph`.
+  - `arabic-form` glyphs become the `init`, `medi` and `fina` substitutions, so the joining
+    of the shaper picks them; a glyph without the attribute serves every form. In upright
+    vertical text, `vert` substitutions switch to the first glyph that allows vertical
+    use when it differs from the horizontal choice.
+  - `hkern` pairs (`u1`/`g1`, `u2`/`g2`) become a `kern` table; the first `hkern` for a pair
+    wins. `vkern` is not supported.
+  - Outlines (`d` only) become CFF charstrings in 16.16 fixed point, moved by
+    `horiz-origin-x`/`-y`; quadratic segments are raised to cubics and arcs become curves.
+    Advances, metrics and kerning values round to whole font units. Glyph child elements
+    are not rendered.
+  - `ascent` and `vert-origin-y` default to each other in 1.1; with neither given, the
+    ascent is `units-per-em` and the descent 0. `font-weight` lists become the range they
+    span. `font-style` and `font-stretch` lists and `all` keep an upright, normal-width
+    face. A `unicode-range` makes glyphs for characters outside it unselectable. Glyphs
+    with a `lang` attribute are never selected, since the shaper is not told the text's
+    language.
+  - Each glyph is also mapped from U+F0000 plus its index, so `altGlyph` can name it.
+    Text that uses those private-use characters therefore shows these glyphs.
+  - External SVG fonts (`font-face-uri`, @font-face `format("svg")`) are not loaded.
 - Vertical text (CSS Writing Modes 3 #vertical-layout): the `text` element's `writing-mode`
   (`vertical-rl`, `vertical-lr`, and the SVG 1.1 `tb`/`tb-rl` mapped to `vertical-rl`) lays
   the text out as horizontal text in a frame turned a quarter clockwise. The inline axis
