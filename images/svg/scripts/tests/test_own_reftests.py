@@ -51,6 +51,16 @@ class OwnManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unlisted"):
             self.load()
 
+    def test_svgz_inputs_preserve_complete_manifest_coverage(self):
+        # SVG 1.1 G.7 #ConformingSVGViewers; manifest enumeration remains strict.
+        (self.root / "input.svg").rename(self.root / "input.svgz")
+        self.entry["input"] = "input.svgz"
+        _, cases, _ = self.load()
+        self.assertEqual(cases[0]["input"], "input.svgz")
+        (self.root / "unlisted.svgz").write_bytes(b"gzip fixture")
+        with self.assertRaisesRegex(ValueError, "unlisted"):
+            self.load()
+
     def test_invalid_tolerances_fail_during_validation(self):
         for tolerance in ({"channel": -1}, {"channel": 256}, {"pixels": -1}, {"pixels": True}, {"pixels": 1.5}, {"channel": 1}, {"unknown": 0}, []):
             with self.subTest(tolerance=tolerance):
