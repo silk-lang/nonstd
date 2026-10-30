@@ -475,7 +475,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
 - [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
-- [ ] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
+- [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [ ] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
@@ -773,6 +773,26 @@ decisions:
   `FT_Outline_EmboldenXY` and `FT_GlyphSlot_Embolden`: outlines grow by 1/24 em in x and y
   (in font units, before scaling), and each advancing glyph's advance grows by the same
   amount. Marks with no advance keep it.
+- Text on a path follows the algorithm's "Position on path" step. Each typographic
+  character's midpoint (position plus half its advance plus `startOffset`) maps to the
+  point that far along the path. The character turns to the tangent there, and its
+  baseline offset (`dy`, baseline alignment) goes along the normal. Characters whose
+  midpoints fall off an open path are hidden. A single closed subpath wraps for one
+  circuit, with the anchor- and direction-dependent bounds. Characters after the
+  element continue from the path's end until the next anchored chunk. A `textPath`
+  always starts an anchored chunk, so also a bidi and shaping block.
+- The distance along a path is measured on a polyline. Lines are exact, and each
+  quadratic or cubic Bézier becomes 64 chords uniform in its parameter. Arcs become
+  curves first (tolerance 0.01). `method="stretch"` and `spacing="auto"` are allowed
+  adjustments the algorithm leaves to the UA, and we make none. The path is the `path`
+  attribute when it has a segment, else the `path` or basic shape that a same-document
+  fragment `href` names. That element's transform applies as a supplemental
+  transformation, and its `pathLength` scales a length `startOffset`. Any other
+  reference renders none of the element's characters.
+- Inside a `textPath`, `y` values are ignored (the algorithm's note on horizontal text on
+  a path), and `dy` moves glyphs along the normal. The algorithm's "unset
+  resolve_y[index]" reads as all characters of the element. Applying the text element's
+  own `y` along the normal would contradict that note.
 - Baselines follow CSS Inline 3 #baseline-alignment on horizontal text. The text
   element's dominant baseline sits on the text position. Each child aligns its baseline
   of the alignment type (`alignment-baseline`, or the parent's dominant baseline for
@@ -792,8 +812,7 @@ decisions:
 `src/used_text.silk` feeds it from the document:
 
 - Addressable characters come from the `text` subtree in document order. Text content
-  children are `tspan`, `a`, `textPath` (laid out as a `tspan` until phase 9D) and
-  unknown elements, which render as unpositioned spans. Other SVG elements inside text
+  children are `tspan`, `a`, `textPath` and unknown elements, which render as unpositioned spans. Other SVG elements inside text
   render nothing. Characters inside `display: none` elements are not addressable.
 - White space follows CSS Text 4 #white-space-phase-1 on one line. With `collapse`,
   segment breaks and tabs become spaces, a space after a collapsible space is removed,
