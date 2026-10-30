@@ -1,0 +1,428 @@
+//! Font faces available to text layout, filled by the host (CSS Fonts 4
+//! #font-matching-algorithm: "the set of installed fonts ... is explicitly undefined").
+//! Each face records the family names and the width, style and weight values it can
+//! produce, with font-width/font-style/font-weight mapped as the descriptors define.
+import names
+import read_fonts.lib { FileRef, FontRef, ReadError, Name, NameRecord, Os2, Post, Head, Fvar }
+import read_fonts.lib { ComputedArray }
+import read_fonts.tables.fvar { VariationAxisRecord }
+import read_fonts.tables.name { NameString }
+import read_fonts.tables.head { MacStyle }
+import font_types.lib { Fixed, Tag, NameId }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.num.u32
+import silk.text.char
+
+/// An inclusive range of descriptor values.
+pub struct Range {
+  pub min: f64,
+  pub max: f64,
+}
+
+impl Copy for Range {}
+
+impl Range {
+  pub fn point(value: f64) -> Range {
+    return Range { min: value, max: value }
+  }
+
+  pub fn contains(self: &Self, value: f64) -> bool {
+    return self.min <= value && value <= self.max
+  }
+}
+
+/// CSS Fonts 4 #generic-font-families.
+pub enum Generic {
+  Serif,
+  SansSerif,
+  Monospace,
+  Cursive,
+  Fantasy,
+  SystemUi,
+  UiSerif,
+  UiSansSerif,
+  UiMonospace,
+  UiRounded,
+  Emoji,
+  Math,
+  Fangsong,
+}
+
+/// Variation axes a face has, as `Face.axes` bits.
+pub const AXIS_WEIGHT: u32 = 1
+
+pub const AXIS_WIDTH: u32 = 2
+
+pub const AXIS_ITALIC: u32 = 4
+
+pub const AXIS_SLANT: u32 = 8
+
+pub struct Face {
+  /// Index of the font data this face was read from.
+  pub source: usize,
+  /// Face index within that data (non-zero only in collections).
+  pub index: u32,
+  /// UTF-8 family names: typographic (name ID 16) and legacy (name ID 1) in every language.
+  pub families: List<Bytes>,
+  pub weight: Range,
+  /// font-width percentages.
+  pub width: Range,
+  /// Italic values: 1 for an italic face, the `ital` axis range, 0 for an upright face.
+  pub italic: Option<Range>,
+  /// Oblique angles in degrees, positive leaning forward: 0 for an upright face, the
+  /// negated `slnt` axis range, or the face's own angle for an oblique face.
+  pub oblique: Option<Range>,
+  pub axes: u32,
+}
+
+struct GenericName {
+  generic: Generic,
+  name: Bytes,
+}
+
+pub struct FontDatabase {
+  sources: List<Bytes>,
+  faces: List<Face>,
+  generics: List<GenericName>,
+}
+
+/// The default oblique angle (CSS Fonts 4 #font-style-prop).
+pub const DEFAULT_OBLIQUE: f64 = 14.0
+
+const NAME_FAMILY: u16 = 1
+
+const NAME_TYPOGRAPHIC_FAMILY: u16 = 16
+
+const TAG_WGHT: u32 = 0x77676874
+
+const TAG_WDTH: u32 = 0x77647468
+
+const TAG_ITAL: u32 = 0x6974616c
+
+const TAG_SLNT: u32 = 0x736c6e74
+
+// CSS Fonts 4 #font-width-prop: usWidthClass 1 to 9.
+fn widthClass(value: u16) -> f64 {
+  return match value {
+    1 => 50.0
+    2 => 62.5
+    3 => 75.0
+    4 => 87.5
+    6 => 112.5
+    7 => 125.0
+    8 => 150.0
+    9 => 200.0
+    _ => 100.0
+  }
+}
+
+effect fn decodeName(string: &NameString, out: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut chars = string.chars()
+  while true {
+    match chars.next() {
+      Option<char>.Some { value } => run names.appendScalar(&mut out, char.toU32(value))
+      Option<char>.None => {
+        return
+      }
+    }
+  }
+}
+
+effect fn addFamily(families: &mut List<Bytes>, name: Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if Bytes.length(&name) == 0 {
+    return
+  }
+  let mut index: usize = 0
+  while index < List<Bytes>.length(&families.*) {
+    if names.same(Bytes.asSlice(&List<Bytes>.asSlice(&families.*)[index]), Bytes.asSlice(&name)) {
+      return
+    }
+    index = index + 1
+  }
+  run List<Bytes>.append(&mut families, move name)
+}
+
+effect fn familyNames<'a>(font: &FontRef<'a>, families: &mut List<Bytes>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let table = match move font.name() {
+    Result<Name<'a>, ReadError>.Success { value } => value
+    Result<Name<'a>, ReadError>.Failure { error } => {
+      return
+    }
+  }
+  let data = table.stringData()
+  let records = table.nameRecord()
+
+  // Typographic names first, so they are the family's preferred names.
+  let mut pass: usize = 0
+  while pass < 2 {
+    let wanted = if pass == 0 {
+      NAME_TYPOGRAPHIC_FAMILY
+    } else {
+      NAME_FAMILY
+    }
+    let mut index: usize = 0
+    while index < records.len() {
+      if let Result<NameRecord<'a>, ReadError>.Success { value: record } = move records.get(index) {
+        if NameId.toU16(record.nameId()) == wanted {
+          if let Result<NameString<'a>, ReadError>.Success { value: string } = move record.string(
+            data,
+          ) {
+            let mut name = Bytes.make()
+            run decodeName(&string, &mut name)
+            run addFamily(&mut families, move name)
+          }
+        }
+      }
+      index = index + 1
+    }
+    pass = pass + 1
+  }
+}
+
+/// Reads the matching descriptors of one face; None when it has no family name.
+effect fn describe<'a>(font: &FontRef<'a>, source: usize, index: u32) -> Option<Face>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut families = List<Bytes>.make()
+  run familyNames(font, &mut families)
+  if List<Bytes>.length(&families) == 0 {
+    return Option<Face>.None
+  }
+  let mut weight: f64 = 400.0
+  let mut width: f64 = 100.0
+  let mut italic = false
+  let mut oblique = false
+  match move font.os2() {
+    Result<Os2<'a>, ReadError>.Success { value: os2 } => {
+      let class = os2.usWeightClass()
+      if class >= 1 && class <= 1000 {
+        weight = u16.toF64(class)
+      }
+      width = widthClass(os2.usWidthClass())
+      let selection = os2.fsSelection().bits()
+      italic = (selection & 1) != 0
+      oblique = (selection & 0x200) != 0
+    }
+    Result<Os2<'a>, ReadError>.Failure { error } => {
+      if let Result<Head<'a>, ReadError>.Success { value: head } = move font.head() {
+        let style = head.macStyle().bits()
+        if (style & 1) != 0 {
+          weight = 700.0
+        }
+        italic = (style & 2) != 0
+      }
+    }
+  }
+  let mut angle = DEFAULT_OBLIQUE
+  if let Result<Post<'a>, ReadError>.Success { value: post } = move font.post() {
+    let slope = -Fixed.toF64(post.italicAngle())
+    if slope != 0.0 {
+      angle = slope
+    }
+  }
+  let mut face = Face {
+    source: source,
+    index: index,
+    families: move families,
+    weight: Range.point(weight),
+    width: Range.point(width),
+    italic: if italic {
+      Option<Range>.Some { value: Range.point(1.0) }
+    } else if oblique {
+      Option<Range>.None
+    } else {
+      Option<Range>.Some { value: Range.point(0.0) }
+    },
+    oblique: if italic {
+      Option<Range>.None
+    } else if oblique {
+      Option<Range>.Some { value: Range.point(angle) }
+    } else {
+      Option<Range>.Some { value: Range.point(0.0) }
+    },
+    axes: 0,
+  }
+  run applyAxes(font, &mut face)
+  return Option<Face>.Some { value: move face }
+}
+
+// CSS Fonts 4 #font-matching-algorithm: a variable face supports every value of its
+// registered axes' ranges.
+effect fn applyAxes<'a>(font: &FontRef<'a>, face: &mut Face) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let table = match move font.fvar() {
+    Result<Fvar<'a>, ReadError>.Success { value } => value
+    Result<Fvar<'a>, ReadError>.Failure { error } => {
+      return
+    }
+  }
+  let axes = match move table.axes() {
+    Result<ComputedArray<'a, (), VariationAxisRecord<'a>>, ReadError>.Success { value } => value
+    Result<ComputedArray<'a, (), VariationAxisRecord<'a>>, ReadError>.Failure { error } => {
+      return
+    }
+  }
+  let mut index: usize = 0
+  while index < axes.len() {
+    if let Result<VariationAxisRecord<'a>, ReadError>.Success { value: axis } = move axes.get(
+      index,
+    ) {
+      let low = Fixed.toF64(axis.minValue())
+      let high = Fixed.toF64(axis.maxValue())
+      if low <= high {
+        let tag = Tag.toU32(axis.axisTag())
+        if tag == TAG_WGHT {
+          face.weight = Range { min: f64Max(low, 1.0), max: f64Min(high, 1000.0) }
+          face.axes = face.axes | AXIS_WEIGHT
+        } else if tag == TAG_WDTH {
+          face.width = Range { min: f64Max(low, 0.0), max: high }
+          face.axes = face.axes | AXIS_WIDTH
+        } else if tag == TAG_ITAL {
+          face.italic = Option<Range>.Some { value: Range { min: low, max: high } }
+          face.axes = face.axes | AXIS_ITALIC
+        } else if tag == TAG_SLNT {
+          face.oblique = Option<Range>.Some { value: Range { min: -high, max: -low } }
+          face.axes = face.axes | AXIS_SLANT
+        }
+      }
+    }
+    index = index + 1
+  }
+}
+
+effect fn parseFaces(bytes: &[u8], source: usize, found: &mut List<Face>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Result<FileRef, ReadError>.Success { value: file } = move FileRef.new(bytes) {
+    let count = file.len()
+    let mut index: u32 = 0
+    while index < count {
+      if let Result<FontRef, ReadError>.Success { value: font } = move file.get(index) {
+        if let Option<Face>.Some { value: face } = move run describe(&font, source, index) {
+          run List<Face>.append(&mut found, move face)
+        }
+      }
+      index = index + 1
+    }
+  }
+}
+
+fn f64Max(a: f64, b: f64) -> f64 {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn f64Min(a: f64, b: f64) -> f64 {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+impl FontDatabase {
+  pub fn make() -> FontDatabase {
+    return FontDatabase {
+      sources: List<Bytes>.make(),
+      faces: List<Face>.make(),
+      generics: List<GenericName>.make(),
+    }
+  }
+
+  /// Adds every usable face of an sfnt font or collection and returns how many were
+  /// added. Unreadable data and faces without a family name are skipped.
+  pub effect fn add(self: &mut Self, data: Bytes) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let source = List<Bytes>.length(&self.sources)
+    let mut found = List<Face>.make()
+    run parseFaces(Bytes.asSlice(&data), source, &mut found)
+    let added = List<Face>.length(&found)
+    if added == 0 {
+      return 0
+    }
+    run List<Bytes>.append(&mut self.sources, move data)
+    while List<Face>.length(&found) > 0 {
+      let face = List<Face>.remove(&mut found, 0)
+      run List<Face>.append(&mut self.faces, move face)
+    }
+    return added
+  }
+
+  /// Appends a family to the list a generic family name resolves to, in order.
+  pub effect fn addGeneric(self: &mut Self, generic: Generic, name: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = Bytes.make()
+    run Bytes.append(&mut copy, name)
+    run List<GenericName>.append(
+      &mut self.generics,
+      GenericName { generic: generic, name: move copy },
+    )
+  }
+
+  pub fn faceCount(self: &Self) -> usize {
+    return List<Face>.length(&self.faces)
+  }
+
+  pub fn face(self: &Self, index: usize) -> &Face {
+    return &List<Face>.asSlice(&self.faces)[index]
+  }
+
+  /// The font data holding face `index`.
+  pub fn data(self: &Self, index: usize) -> &[u8] {
+    return Bytes.asSlice(&List<Bytes>.asSlice(&self.sources)[self.face(index).source])
+  }
+
+  /// The faces of the family named `name` (case-insensitively), in insertion order.
+  pub effect fn family(self: &Self, name: &[u8], out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < List<Face>.length(&self.faces) {
+      let face = &List<Face>.asSlice(&self.faces)[index]
+      let mut name_index: usize = 0
+      while name_index < List<Bytes>.length(&face.families) {
+        if names.same(Bytes.asSlice(&List<Bytes>.asSlice(&face.families)[name_index]), name) {
+          run List<usize>.append(&mut out, index)
+          name_index = List<Bytes>.length(&face.families)
+        }
+        name_index = name_index + 1
+      }
+      index = index + 1
+    }
+  }
+
+  /// The faces of the first family configured for `generic` that has any.
+  pub effect fn generic(self: &Self, generic: Generic, out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < List<GenericName>.length(&self.generics) {
+      let entry = &List<GenericName>.asSlice(&self.generics)[index]
+      if entry.generic == generic {
+        run self.family(Bytes.asSlice(&entry.name), &mut out)
+        if List<usize>.length(&out.*) > 0 {
+          return
+        }
+      }
+      index = index + 1
+    }
+  }
+}

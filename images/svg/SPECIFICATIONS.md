@@ -500,10 +500,10 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 ### 5.10 Filters (Filter Effects 1, 1.1 ch. 15)
 - [x] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
 - [x] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
-- [ ] Inputs (all but `enable-background` done): `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
-- [ ] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
-- [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color` (all but `lighting-color` done)
-- [ ] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
+- [x] Inputs: `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
+- [x] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
+- [x] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color`
+- [x] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
 
 ### 5.11 Linking (§16, 1.1 ch. 17)
 - [ ] URL references: same-document, external through the resolver, `data:`, invalid references (each property defines its fallback) (§16.1)
@@ -592,6 +592,10 @@ decisions:
   matching browsers. Bounding-box units on an empty box, and a filter with no primitives
   ([#FilterPrimitiveTree](https://www.w3.org/TR/filter-effects-1/#FilterPrimitiveTree)),
   also leave the element unrendered.
+- Empty groups. A filter region in `userSpaceOnUse` does not depend on content, so a group
+  with no rendered children still runs its filter on a transparent `SourceGraphic` (an
+  `feFlood` shows). Huge or practically infinite regions are clipped like any other to
+  the working surface.
 - `color-interpolation-filters: auto` uses linearRGB. Flood colors are converted with the
   same byte conversion as images, after premultiplying.
 - A primitive whose subregion has zero or negative width or height is disabled: its result
@@ -621,11 +625,17 @@ decisions:
   `numOctaves` values are unsupported and give transparent black, a non-integer
   `numOctaves` is invalid and leaves 1, and `numOctaves` is clamped to 32, which the spec's
   clamping note allows.
+- `feBlend`'s `no-composite` (Compositing 1 #blending, FE1 #element-attrdef-feblend-no-composite)
+  writes the mixed color `(1 - αb)·Cs + αb·B(Cb, Cs)` with the source's alpha and no
+  Porter-Duff source-over step, so the backdrop shows only through the blend function.
 - `feConvolveMatrix` acts as a pass through filter on every unfulfilled precondition
   (the change log's "pass through on unfulfilled pre-conditions"): orders below 1 after
   truncation, a kernel whose length is not `orderX * orderY`, and a target outside the
   kernel or not an integer. The input's extent for `edgeMode` is the primitive subregion.
-  `kernelUnitLength` is not implemented: the kernel always steps one surface pixel.
+  `kernelUnitLength` is honoured by resampling the input bilinearly to one pixel per kernel
+  unit, running the kernel there and resampling the result back; a unit is at least half a
+  surface pixel, and a unit that maps to one pixel skips the resampling. A missing,
+  negative or zero value means one surface pixel.
 - `feDisplacementMap` displaces by whole pixels (nearest sampling), with a table per axis,
   since `scale` is in `primitiveUnits` and maps to pixels differently along x and y. Its
   `in` image stays in its own color space and only `in2` is converted.
@@ -637,7 +647,8 @@ decisions:
   and leave 1. The sign of `limitingConeAngle` is ignored (the cone is symmetric).
   `feSpecularLighting`'s `(Sr, Sg, Sb, max)` is taken as a premultiplied color, as its alpha
   rule intends.
-  `kernelUnitLength` (deprecated) is not implemented: normals use one-pixel deltas.
+  `kernelUnitLength` (deprecated) is honoured like `feConvolveMatrix`'s: the normals are
+  computed on the input resampled to one pixel per kernel unit, with the light in that grid.
 - `feImage`. A reference without a fragment loads an image resource (PNG, JPEG or an SVG
   document) and renders it like `image` in the primitive subregion with the feImage's
   `preserveAspectRatio` and `image-rendering`; whatever falls outside the subregion is cut.
@@ -655,8 +666,16 @@ decisions:
   (including the one the filtered element's own opacity, blending or masking creates, as
   those apply after the filter) it holds only what the group drew so far. `BackgroundAlpha`
   is its alpha with black color. Chrome reads both as transparent black.
-- `enable-background` (FE1 Appendix A) is parsed but not used yet: BackgroundImage does not
-  restart at an `enable-background: new` ancestor.
+- `enable-background` (FE1 Appendix A lets user agents keep SVG 1.1's) is implemented
+  additively. `new` on a container makes it an isolated group, so BackgroundImage for
+  its descendants starts there. The optional `x y width height` region limits
+  BackgroundImage to that rectangle in the container's user space. A negative width or
+  height is an error, which leaves `accumulate`. Without a `new` ancestor, FE1's
+  isolation model applies instead of SVG 1.1's transparent black, since the two
+  conflict there. Background accumulation stops at any closer isolated group, such as
+  an opacity group, where SVG 1.1 would accumulate through it.
+- The filtered element's own group (opacity, blending, masking or clipping) applies after
+  the filter, so BackgroundImage reads the layer beneath it.
 - `FillPaint` and `StrokePaint` are the filtered element's used fill or stroke paint with
   `fill-opacity` or `stroke-opacity` over the whole filter region; paint servers keep the
   element's bounding box and spread past it. The opacity follows FE1's subregion example,
@@ -674,6 +693,36 @@ fallback IDAT image is outside the animation, on a transparent initial canvas
 ([frame controls](https://www.w3.org/TR/png-3/#fcTL-chunk)). Later frame payloads
 are not inflated for this first-frame API. Color metadata is retained; its
 interpretation/conversion remains incomplete; PNG samples are integrated into SVG image rendering.
+
+### Font database and matching
+
+`images/svg/fonts` holds the faces text layout may use. The host fills it with font
+data. CSS Fonts 4 #font-matching-algorithm leaves the set of installed fonts undefined.
+Generic families resolve to the first configured family that has faces. Interpretation
+decisions:
+
+- Family names are the typographic (name ID 16) and legacy (name ID 1) names in every
+  language. They are compared with Unicode Default Caseless Matching (#localized-name-matching):
+  full case folding (status C and F) from the Unicode 18 `CaseFolding.txt` that `ucd` pins,
+  with no normalization, generated by `scripts/generate-casefold`.
+- Static faces map to descriptor values as the font descriptors do:
+  - `usWeightClass` gives the weight (400 when outside 1 to 1000; `head.macStyle` bold
+    gives 700 without OS/2).
+  - `usWidthClass` gives the font-width keyword percentage.
+  - fsSelection ITALIC gives italic value 1 and no oblique angles.
+  - fsSelection OBLIQUE gives the `post.italicAngle` slope, or 14deg when that is 0.
+  - Upright faces have italic value 0 and oblique angle 0.
+- Variable faces support their `wght`, `wdth`, `ital` and `slnt` ranges. `slnt` is
+  negated, so oblique angles lean forward. The selection carries the values the "Apply
+  font matching variations" step sets.
+- #font-style-matching is applied on the two scales it names, italic values and oblique
+  angles. For a negative oblique request ("negated values and opposite directions"),
+  the oblique scale is mirrored and the italic steps are kept, since negative italic
+  values do not exist.
+- Synthesis (`font-synthesis` initial value `weight style`):
+  - An italic or oblique request that ends on an upright face is sheared by the requested
+    angle, or by 14deg for italic.
+  - A request of 600 or more on a face whose weights all lie below 600 is emboldened.
 
 ### JPEG scan reconstruction
 

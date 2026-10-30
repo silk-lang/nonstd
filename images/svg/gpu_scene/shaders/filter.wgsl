@@ -495,6 +495,7 @@ fn lighting(pixel: vec2u) -> vec4u {
     case OP_BLEND: {
       let s = bytes(first, pixel);
       let b = bytes(second, pixel);
+      if params.p1 == 1u { return emit(mixed(b, s, params.p0)); }
       if s.w == 0u { return emit(b); }
       return emit(blend(b, s, params.p0));
     }
