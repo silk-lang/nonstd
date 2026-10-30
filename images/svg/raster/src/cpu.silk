@@ -18,7 +18,7 @@ import svg_core.mapping { Mapping, ProjectionClip }
 import svg_core.mapping
 import svg_core.vector_path
 import vector.path { Path as VectorPath }
-import vector.geometry { Rect as VectorRect }
+import vector.geometry { Rect as VectorRect, Point as VectorPoint }
 import vector.projective { Homography, HalfPlane }
 import vector.projective
 import vector.geometry_error { GeometryError }
@@ -31,12 +31,20 @@ import vector.flatten as flattening
 import vector.layer { Mask }
 import vector.filter as filters
 import vector.layer as layers
+import vector.paint { ImagePattern, SAMPLE_BILINEAR, SAMPLE_NEAREST, EXTEND_CLAMP }
+import vector.paint as painting
+import svg_filters.execute { Space, floorSnapped, ceilSnapped }
+import svg_filters.execute as filterGraph
+import silk.core.ownership { Copy }
+import svg_geometry.geometry { Rect, Transform }
+import silk.collections.slice { Slice }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.option { Option }
 import silk.num.f64
 import silk.num.u32
+import silk.num.usize
 import clip_mask
 import silk.num.u8
 import vector.pixmap { div255 }
@@ -639,6 +647,70 @@ effect fn picture(
               pixel = pixel + 1
             }
           }
+          Command.BeginFilter { filter, transform, clip } => {
+            let end = filterEnd(commands, i)
+            run planes.select(clip, list.projectionClips.asSlice(), placement, inherited)
+            let placed = run placedMapping(&transform, placement)
+            let program = &list.filters.asSlice()[filter]
+            let found = run filterSurface(program.region, &placed, placement, width, height)
+            if let Option<FilterSurface>.Some { value: surface } = &found {
+              let area = u32.toUsize(surface.width) * u32.toUsize(surface.height)
+              let buffers = program.primitives.length() + 8
+              if buffers > (textures.surfaceLimit - textures.surfaces) / area {
+                fail RenderError.TooLarge
+              }
+              run patterns.surface(&mut textures.*, area * buffers)
+              let source = run picture(
+                list,
+                Slice.view<Command>(commands, i + 1, end - i - 1),
+                surface.width,
+                surface.height,
+                &patterns.root(),
+                true,
+                Option<Mapping>.some(surface.content),
+                &[],
+                depth,
+                &mut cache.*,
+                &mut paintCache.*,
+                &mut textures.*,
+              )
+              let result = run filterGraph.apply(program, &source, surface.space)
+              textures.surfaces = textures.surfaces - area * buffers
+              let mut rectangle = VectorPath.make()
+              run rectangle.rect(
+                VectorRect.make(0.0, 0.0, u32.toF64(surface.width), u32.toF64(surface.height)),
+              )
+              run fill(
+                &rectangle,
+                &surface.output,
+                viewport,
+                planes.planes.asSlice(),
+                NONZERO,
+                TOLERANCE,
+                &mut rasterizer,
+                &mut coverage,
+                &mut lines,
+              )
+              let output = match &surface.output {
+                Mapping.Affine { value } => Homography.fromAffine(&mapping.affine(value))
+                Mapping.Projective { value } => value
+              }
+              let shader = run ImagePattern.makeProjective(
+                &result,
+                &output,
+                if surface.axis {
+                  SAMPLE_NEAREST
+                } else {
+                  SAMPLE_BILINEAR
+                },
+                EXTEND_CLAMP,
+              )
+              let target = stack.length() - 1
+              painting.fill(&mut stack.asMutSlice()[target].pixels, &coverage, &shader, 255)
+            }
+            i = end
+          }
+          Command.EndFilter => {}
           Command.PopLayer => {
             let top = stack.length() - 1
             let layer = stack.remove(top)
@@ -670,6 +742,181 @@ effect fn picture(
   textures.surfaces = textures.surfaces - spare.length() * u32.toUsize(width) * u32.toUsize(height)
   let output = stack.remove(0)
   return move output.pixels
+}
+
+// The EndFilter matching the BeginFilter at `begin`; validation guarantees one.
+fn filterEnd(commands: &[Command], begin: usize) -> usize {
+  let mut nested: usize = 0
+  let mut i = begin + 1
+  while i < commands.length {
+    match &commands[i] {
+      Command.BeginFilter { filter, transform, clip } => {
+        nested = nested + 1
+      }
+      Command.EndFilter => {
+        if nested == 0 {
+          return i
+        }
+        nested = nested - 1
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return commands.length
+}
+
+/// Where a filter runs: a pixel surface in filter space, a scaled copy of the filtered
+/// element's user space (Filter Effects 1 #filter-region: the region's axes stay parallel to
+/// user space). When user space maps to the device by a positive scale and translation, the
+/// surface's pixels are the device's pixels.
+struct FilterSurface {
+  width: u32,
+  height: u32,
+  space: Space,
+  /// Display-list root to surface pixels.
+  content: Mapping,
+  /// Surface pixels to device pixels.
+  output: Mapping,
+  axis: bool,
+}
+
+impl Copy for FilterSurface {}
+
+effect fn homography(value: &Mapping) -> Homography {
+  return match &value.* {
+    Mapping.Affine { value: affine } => Homography.fromAffine(&mapping.affine(affine))
+    Mapping.Projective { value: projective } => projective
+  }
+}
+
+effect fn filterSurface(
+  region: Rect,
+  placed: &Mapping,
+  placement: Option<Mapping>,
+  width: u32,
+  height: u32,
+) -> Option<FilterSurface>
+  ! RenderError | GeometryError {
+  let mut axis = false
+  let mut sx = 1.0
+  let mut sy = 1.0
+  let mut tx = 0.0
+  let mut ty = 0.0
+  match &placed.* {
+    Mapping.Affine { value } => {
+      if value.b == 0.0 && value.c == 0.0 && value.a > 0.0 && value.d > 0.0 {
+        axis = true
+        sx = value.a
+        sy = value.d
+        tx = value.e
+        ty = value.f
+      } else {
+        sx = f64.sqrt(value.a * value.a + value.b * value.b)
+        sy = f64.sqrt(value.c * value.c + value.d * value.d)
+      }
+    }
+    _ => {}
+  }
+  if !(sx > 0.0) || !(sy > 0.0) || !f64.isFinite(sx) || !f64.isFinite(sy) {
+    return Option<FilterSurface>.None
+  }
+  let mut x0 = floorSnapped(region.xMin * sx + tx)
+  let mut y0 = floorSnapped(region.yMin * sy + ty)
+  let mut x1 = ceilSnapped(region.xMax * sx + tx)
+  let mut y1 = ceilSnapped(region.yMax * sy + ty)
+
+  // Keep what can reach the canvas: the canvas grown by its own size on every side.
+  let w = u32.toF64(width)
+  let h = u32.toF64(height)
+  let corners = [
+    VectorPoint.make(0.0 - w, 0.0 - h),
+    VectorPoint.make(2.0 * w, 0.0 - h),
+    VectorPoint.make(0.0 - w, 2.0 * h),
+    VectorPoint.make(2.0 * w, 2.0 * h),
+  ]
+  let device = run homography(placed)
+  let mut limited = axis
+  let mut lx0 = 0.0 - w
+  let mut ly0 = 0.0 - h
+  let mut lx1 = 2.0 * w
+  let mut ly1 = 2.0 * h
+  if !axis {
+    if let Option<Homography>.Some { value: inverse } = &device.inverse() {
+      limited = true
+      lx0 = f64.INFINITY
+      ly0 = f64.INFINITY
+      lx1 = -f64.INFINITY
+      ly1 = -f64.INFINITY
+      let mut c: usize = 0
+      while c < 4 {
+        match &inverse.project(corners[c]) {
+          Option<VectorPoint>.Some { value } => {
+            lx0 = f64.min(lx0, value.x * sx)
+            ly0 = f64.min(ly0, value.y * sy)
+            lx1 = f64.max(lx1, value.x * sx)
+            ly1 = f64.max(ly1, value.y * sy)
+          }
+          _ => {
+            limited = false
+          }
+        }
+        c = c + 1
+      }
+    }
+  }
+  if limited {
+    x0 = f64.max(x0, f64.floor(lx0))
+    y0 = f64.max(y0, f64.floor(ly0))
+    x1 = f64.min(x1, f64.ceil(lx1))
+    y1 = f64.min(y1, f64.ceil(ly1))
+  }
+  if !(x1 > x0) || !(y1 > y0) {
+    return Option<FilterSurface>.None
+  }
+  if x1 - x0 > usize.toF64(checked.MAX_SURFACE_PIXELS)
+    || y1 - y0 > usize.toF64(checked.MAX_SURFACE_PIXELS)
+    || (x1 - x0) * (y1 - y0) > usize.toF64(checked.MAX_SURFACE_PIXELS) {
+    fail RenderError.TooLarge
+  }
+  let local = Transform.new(sx, 0.0, 0.0, sy, tx - x0, ty - y0)
+  let mut content = Mapping.Affine { value: Transform.new(1.0, 0.0, 0.0, 1.0, 0.0 - x0, 0.0 - y0) }
+  let mut output = Mapping.Affine { value: Transform.new(1.0, 0.0, 0.0, 1.0, x0, y0) }
+  if axis {
+    if let Option<Mapping>.Some { value } = &placement {
+      content = run content.compose(&value)
+    }
+  } else {
+    let inverse = match &device.inverse() {
+      Option<Homography>.Some { value } => value
+      _ => {
+        return Option<FilterSurface>.None
+      }
+    }
+    let scaled = Homography.fromAffine(&mapping.affine(local))
+    let mut toSurface = run scaled.compose(&inverse)
+    if let Option<Mapping>.Some { value } = &placement {
+      toSurface = run toSurface.compose(&(run homography(&value)))
+    }
+    content = run Mapping.fromHomography(toSurface)
+    let unscaled = match &scaled.inverse() {
+      Option<Homography>.Some { value } => value
+      _ => {
+        return Option<FilterSurface>.None
+      }
+    }
+    output = run Mapping.fromHomography(run device.compose(&unscaled))
+  }
+  return Option<FilterSurface>.some(
+    FilterSurface {
+      width: f64.toU32(x1 - x0),
+      height: f64.toU32(y1 - y0),
+      space: Space { sx: sx, sy: sy, tx: tx - x0, ty: ty - y0 },
+      content: content,
+      output: output,
+      axis: axis,
+    },
+  )
 }
 
 effect fn placedMapping(matrix: &Mapping, placement: Option<Mapping>) -> Mapping
@@ -880,7 +1127,10 @@ effect fn validateClips(clips: &[ProjectionClip]) -> ()
 }
 
 effect fn validateCommands(list: &DisplayList, commands: &[Command], width: u32, height: u32) -> ()
-  ! RenderError {
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  // Layer depth at each open BeginFilter: filtered content must close its own layers.
+  let mut filterDepths = List<usize>.make()
   let clips = list.projectionClips.asSlice()
 
   // dimensions() established a positive, checked pixel count before this call.
@@ -986,8 +1236,34 @@ effect fn validateCommands(list: &DisplayList, commands: &[Command], width: u32,
         }
         depth = depth - 1
       }
+      Command.BeginFilter { filter, transform, clip } => {
+        if filter >= list.filters.length() || !transform.isFinite()
+          || !filterGraph.valid(&list.filters.asSlice()[filter]) {
+          fail RenderError.InvalidGeometry
+        }
+        run clipIndex(clip, clips.length)
+        if filterDepths.length() >= 64 {
+          fail RenderError.TooLarge
+        }
+        run filterDepths.append(depth)
+      }
+      Command.EndFilter => {
+        if filterDepths.length() == 0 {
+          fail RenderError.InvalidGeometry
+        }
+        let top = filterDepths.length() - 1
+        if filterDepths.remove(top) != depth {
+          fail RenderError.InvalidGeometry
+        }
+      }
+    }
+    if filterDepths.length() > 0 && depth < filterDepths.asSlice()[filterDepths.length() - 1] {
+      fail RenderError.InvalidGeometry
     }
     i = i + 1
+  }
+  if filterDepths.length() != 0 {
+    fail RenderError.InvalidGeometry
   }
   if depth != 0 {
     fail RenderError.InvalidGeometry

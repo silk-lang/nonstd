@@ -35,7 +35,9 @@ affine/projective placement, and CSS nearest, smooth, or two-stage `pixelated`
 sampling. Nested SVG images render as independent secure documents with their own
 viewport and styles, apply CSS image orientation before sizing, and retain vector
 geometry through final placement.
-Filters, text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
+`filter` elements render with their regions, subregions and most primitives; lighting,
+turbulence, convolution, displacement, `feImage` and the CSS filter functions are still to come.
+Text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example
 
@@ -89,7 +91,7 @@ writes nothing unless parsing, rendering and encoding all succeed.
 | `images/svg/raster` | `images-svg-raster` | Executes display lists on the CPU through `vector` |
 | `images/svg/geometry` | `images-svg-geometry` | f64 geometry, path and points parsing, arcs, transforms |
 | `images/svg/image` | `images-svg-image` | PNG/JPEG decoding, orientation, premultiplied RGBA storage and PNG encoding |
-| `images/svg/filters` | `images-svg-filters` | Filter boundary (filters themselves are a later phase) |
+| `images/svg/filters` | `images-svg-filters` | Filter programs and their execution over `vector.filter` |
 | `images/svg/cli` | `images-svg-cli` | The command-line renderer |
 | `images/svg/tests` | `images-svg-tests` | Test inputs, suite pins and reviewed expectations |
 | `images/svg/bench` | `images-svg-bench` | Renderer workloads and the resvg comparison |
