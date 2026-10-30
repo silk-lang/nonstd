@@ -45,7 +45,7 @@ All installers require Python 3.12+ and `curl`, install under the repository's i
 The Silk and LLVM installers are shared at the repository root (`scripts/install-silk`,
 `scripts/install-llvm`); Dawn's is `gpu/webgpu/scripts/install-webgpu`.
 
-- `install-silk` pins **0.1.0-dev.31+2fc1811f535e**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
+- `install-silk` pins **0.1.0-dev.32+ebc526403637**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
 - `install-webgpu` pins Dawn's Release archives and prints the **installation root**. macOS has `lib/libwebgpu_dawn.a`; Linux has `lib64/libwebgpu_dawn.a`; Windows has `lib/webgpu_dawn.lib`.
 - `install-llvm` accepts a working absolute `SILK_CLANG` pointing to LLVM 22, or discovers Homebrew LLVM / `clang-22`; otherwise it downloads checksum-pinned **LLVM 22.1.8**. It prints the **absolute clang executable path**. Published LLVM archives are large (Linux x86_64: 1,938,859,476 bytes); preinstall LLVM 22 for a short cold gate. The full downloaded distribution includes resource headers and `wasm-ld`; a supplied system toolchain must also provide `wasm-ld` for browser builds.
 
