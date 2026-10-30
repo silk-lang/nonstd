@@ -22,7 +22,7 @@ import svg_fonts.database { FontDatabase, Generic }
 import svg_fonts.matching { Request, Selection, Style as FontStyle }
 import svg_fonts.matching
 import svg_fonts.names
-import svg_text.layout { Anchor, Span, Character, Layout, TextLength, layout }
+import svg_text.layout { Anchor, Baseline, Shift, Span, Character, Layout, TextLength, layout }
 import svg_text.paths { spanGeometry }
 import svg_geometry.geometry { Path }
 import silk.collections.bytes { Bytes }
@@ -315,19 +315,96 @@ effect fn families(fonts: &FontDatabase) -> List<List<usize>>
   return move result
 }
 
+fn textKeyword(engine: &Engine, style: StyleId, property: Property) -> Option<TextKeyword> {
+  if let Option<&TextValue>.Some { value: text } = textValue(engine, style, property) {
+    let items = text.items.asSlice()
+    if items.length > 0 {
+      if let Atom.Keyword { value } = items[0].atom {
+        return Option<TextKeyword>.Some { value: value }
+      }
+    }
+  }
+  return Option<TextKeyword>.None
+}
+
+/// A baseline keyword as a horizontal baseline type; None for auto and the values that
+/// defer to the parent (CSS Inline 3 #dominant-baseline-property, #alignment-baseline-property).
+/// The SVG 1.1 edge keywords map to the text-over/under edges (text-top/text-bottom).
+fn baselineType(keyword: TextKeyword) -> Option<Baseline> {
+  return match keyword {
+    TextKeyword.Alphabetic => Option<Baseline>.Some { value: Baseline.Alphabetic }
+    TextKeyword.TextTop => Option<Baseline>.Some { value: Baseline.TextTop }
+    TextKeyword.BeforeEdge => Option<Baseline>.Some { value: Baseline.TextTop }
+    TextKeyword.TextBeforeEdge => Option<Baseline>.Some { value: Baseline.TextTop }
+    TextKeyword.TextBottom => Option<Baseline>.Some { value: Baseline.TextBottom }
+    TextKeyword.AfterEdge => Option<Baseline>.Some { value: Baseline.TextBottom }
+    TextKeyword.TextAfterEdge => Option<Baseline>.Some { value: Baseline.TextBottom }
+    TextKeyword.Ideographic => Option<Baseline>.Some { value: Baseline.Ideographic }
+    TextKeyword.Middle => Option<Baseline>.Some { value: Baseline.Middle }
+    TextKeyword.Central => Option<Baseline>.Some { value: Baseline.Central }
+    TextKeyword.Mathematical => Option<Baseline>.Some { value: Baseline.Mathematical }
+    TextKeyword.Hanging => Option<Baseline>.Some { value: Baseline.Hanging }
+    _ => Option<Baseline>.None
+  }
+}
+
+/// baseline-shift. Percentages refer to line-height (CSS Inline 3 #baseline-shift-property).
+/// top/center/bottom align to the line box, which SVG text does not have, so they do not shift.
+fn shiftValue(engine: &Engine, style: StyleId, lineHeight: f64) -> Shift {
+  if let Option<TextKeyword>.Some { value } = textKeyword(engine, style, Property.BaselineShift) {
+    return match value {
+      TextKeyword.Sub => Shift.Sub
+      TextKeyword.Super => Shift.Super
+      _ => Shift.Length { value: 0.0 }
+    }
+  }
+  let value = match &engine.textNumber(style, Property.BaselineShift, lineHeight) {
+    Option<f64>.Some { value } => value
+    _ => 0.0
+  }
+  return Shift.Length {
+    value: if f64.isFinite(value) {
+      value
+    } else {
+      0.0
+    },
+  }
+}
+
 effect fn span(
   fonts: &FontDatabase,
   installed: &List<List<usize>>,
   engine: &Engine,
   style: StyleId,
+  parent: Option<usize>,
+  inherited: Baseline,
 ) -> Span
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
-  let size = match &engine.metrics(style) {
-    Option<Context>.Some { value } => value.fontSize
+  let metrics = match &engine.metrics(style) {
+    Option<Context>.Some { value } => value
     _ => {
       fail RenderError.InvalidStyleContext
     }
+  }
+  let size = metrics.fontSize
+  let mut dominant = inherited
+  if let Option<TextKeyword>.Some { value } = textKeyword(
+    engine,
+    style,
+    Property.DominantBaseline,
+  ) {
+    if let Option<Baseline>.Some { value: kind } = baselineType(value) {
+      dominant = kind
+    }
+  }
+  let mut alignment = Option<Baseline>.None
+  if let Option<TextKeyword>.Some { value } = textKeyword(
+    engine,
+    style,
+    Property.AlignmentBaseline,
+  ) {
+    alignment = baselineType(value)
   }
   let request = Request {
     weight: weight(engine, style),
@@ -370,6 +447,10 @@ effect fn span(
     anchor: anchor,
     letterSpacing: spacingValue(engine, style, Property.LetterSpacing),
     wordSpacing: spacingValue(engine, style, Property.WordSpacing),
+    dominant: dominant,
+    alignment: alignment,
+    shift: shiftValue(engine, style, metrics.lineHeight),
+    parent: parent,
   }
 }
 
@@ -496,6 +577,7 @@ effect fn walk(
   fonts: &FontDatabase,
   installed: &List<List<usize>>,
   occurrence: OccurrenceId,
+  parent: Option<usize>,
   gather: &mut Gather,
 ) -> ()
   ! RenderError | OutOfMemoryError
@@ -514,7 +596,11 @@ effect fn walk(
     return
   }
   let spanIndex = gather.spans.length()
-  run gather.spans.append(run span(fonts, installed, engine, style))
+  let inherited = match parent {
+    Option<usize>.Some { value } => gather.spans.asSlice()[value].dominant
+    Option<usize>.None => Baseline.Alphabetic
+  }
+  run gather.spans.append(run span(fonts, installed, engine, style, parent, inherited))
   let position = gather.entries.length()
   run gather.entries.append(
     Entry {
@@ -536,7 +622,15 @@ effect fn walk(
     } else if kind == NodeKind.Element {
       if let Option<OccurrenceId>.Some { value: nested } = element {
         if graph.occurrences.asSlice()[nested.index].eligible && contentChild(document, node) {
-          run walk(graph, styles, fonts, installed, nested, &mut gather)
+          run walk(
+            graph,
+            styles,
+            fonts,
+            installed,
+            nested,
+            Option<usize>.Some { value: spanIndex },
+            &mut gather,
+          )
         }
         element = graph.occurrences.asSlice()[nested.index].nextSibling
       }
@@ -746,7 +840,7 @@ pub effect fn resolve(
     lengths: List<TextLength>.make(),
     collapsible: false,
   }
-  run walk(graph, &styles.*, fonts, &installed, text, &mut gather)
+  run walk(graph, &styles.*, fonts, &installed, text, Option<usize>.None, &mut gather)
 
   // A collapsible space at the end of the line is removed.
   if gather.collapsible {
