@@ -21,6 +21,7 @@ are grouped by area, and every package is a member of one workspace that pins Si
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
+| [`packages/typescript`](packages/typescript) | `silk-typescript` (npm) | Spike: import Silk functions from TypeScript 7.1 through a content mapper and wasm |
 
 Each library's README lists its helper packages (command-line tools, benchmarks, test runners).
 Package names follow their paths, with hyphens. `text/ucd`, `text/xml` and `packages/cli` are
