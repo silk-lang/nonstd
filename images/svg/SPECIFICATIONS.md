@@ -500,7 +500,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 ### 5.10 Filters (Filter Effects 1, 1.1 ch. 15)
 - [x] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
 - [x] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
-- [ ] Inputs (all but `enable-background` done): `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
+- [x] Inputs: `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
 - [ ] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
 - [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color` (all but `lighting-color` done)
 - [ ] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
@@ -655,8 +655,16 @@ decisions:
   (including the one the filtered element's own opacity, blending or masking creates, as
   those apply after the filter) it holds only what the group drew so far. `BackgroundAlpha`
   is its alpha with black color. Chrome reads both as transparent black.
-- `enable-background` (FE1 Appendix A) is parsed but not used yet: BackgroundImage does not
-  restart at an `enable-background: new` ancestor.
+- `enable-background` (FE1 Appendix A lets user agents keep SVG 1.1's) is implemented
+  additively. `new` on a container makes it an isolated group, so BackgroundImage for
+  its descendants starts there. The optional `x y width height` region limits
+  BackgroundImage to that rectangle in the container's user space. A negative width or
+  height is an error, which leaves `accumulate`. Without a `new` ancestor, FE1's
+  isolation model applies instead of SVG 1.1's transparent black, since the two
+  conflict there. Background accumulation stops at any closer isolated group, such as
+  an opacity group, where SVG 1.1 would accumulate through it.
+- The filtered element's own group (opacity, blending, masking or clipping) applies after
+  the filter, so BackgroundImage reads the layer beneath it.
 - `FillPaint` and `StrokePaint` are the filtered element's used fill or stroke paint with
   `fill-opacity` or `stroke-opacity` over the whole filter region; paint servers keep the
   element's bounding box and spread past it. The opacity follows FE1's subregion example,
