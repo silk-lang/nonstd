@@ -544,3 +544,23 @@ fallback IDAT image is outside the animation, on a transparent initial canvas
 ([frame controls](https://www.w3.org/TR/png-3/#fcTL-chunk)). Later frame payloads
 are not inflated for this first-frame API. Color metadata is retained; its
 interpretation/conversion and SVG image integration remain incomplete.
+
+### JPEG scan reconstruction
+
+The local JPEG decoder follows the pinned `jpeg-t81` document's B.2 marker/frame/
+scan syntax, C Huffman table construction, F sequential DCT decoding, and G.1.2 /
+G.2 progressive coefficient coding and decoding. Coefficients survive scans;
+spectral bands track their current successive-approximation level per component.
+Refinement requires the preceding level, AC scans contain one component, and
+restart boundaries reset DC predictors and require any EOB run to be exhausted.
+Single-component scans traverse their actual block dimensions; interleaved scans
+traverse the padded frame MCU grid. Quantization is retained when each component
+first appears, before final inverse DCT reconstruction.
+
+Current resource policy limits coefficient storage to 1,048,576 blocks (256 MiB),
+scan count to 256 and cumulative block visits to 16,777,216. These limits return
+`TooLarge`; they are application limits, not JPEG validity rules. Coefficient
+storage, output planes and the RGBA image can coexist, so 256 MiB is not an
+aggregate allocation promise. The decoder's current 8-bit one/three-component
+scope and nearest chroma reconstruction do not establish the full phase-7 image
+or phase-12 color-management requirements.
