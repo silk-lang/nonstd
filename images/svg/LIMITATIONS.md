@@ -49,10 +49,20 @@ are in [SPECIFICATIONS.md](SPECIFICATIONS.md#xml-error-and-resource-policy).
 ## LIMITATION-5 — no stdlib PNG codec
 
 Filed [silk-lang/silk#2564](https://github.com/silk-lang/silk/issues/2564).
-`svg_image` owns PNG framing and premultiplied-to-straight sample conversion;
-DEFLATE/zlib and checksums remain stdlib-owned. PNG/JPEG decoding is not yet
-implemented. The image package boundary allows later codec replacement without
-changing display-list consumers.
+`svg_image` owns PNG framing, sample conversion, scanline filters and Adam7/APNG
+first-frame decoding; DEFLATE/zlib and checksums remain stdlib-owned. JPEG decoding
+and SVG image integration remain pending. The image package boundary allows later
+codec replacement without changing display-list consumers.
+
+PNG decoding accepts at most 256 MiB of input and the existing 64 Mi-pixel image
+limit. Inflation is capped at the exact scanline byte count computed from the
+validated dimensions and pass geometry; ICC extraction is separately capped at
+16 MiB. The implementation retains compressed scanlines, inflated scanlines and
+the output image during decoding, so these are allocation bounds, not a 256 MiB
+aggregate-memory promise. CRC/zlib integrity, chunk structure, frame controls and
+selected-frame samples are checked; later APNG frame streams are not inflated.
+ICC bytes are retained for later profile interpretation and color conversion.
+Malformed input returns an error rather than a partial image.
 
 These missing-API reports contain self-contained manifests/sources and observed
 compiler diagnostics. There is no working pre-workaround stdlib path, so no
