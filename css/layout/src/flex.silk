@@ -467,7 +467,8 @@ effect fn collectLines(items: &[Item], count: usize, lines: &mut List<Line>, mai
   if start < count { run lines.append(Line { start: start, end: count, count: activeCount, cross: 0.0, baseline: 0.0, lastBaseline: 0.0, baselineCross: 0.0, lastBaselineCross: 0.0 }) }
 }
 // Measures the automatic minimums prepare deferred, once a line shrinks.
-effect fn deferredMinimums<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, items: &mut [Item], line: &Line, childInput: &Input, axis: &Axes, main: f32, gap: f32, collapsed: bool) ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
+// The memo of the pass's `request` keeps what it measured.
+effect fn deferredMinimums<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, items: &mut [Item], line: &Line, childInput: &Input, axis: &Axes, main: f32, gap: f32, collapsed: bool, request: usize) ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
   let mut pending = false
   let mut hypothetical: f32 = 0.0
   let mut index = line.start
@@ -493,6 +494,7 @@ effect fn deferredMinimums<'pass, 'source, M: Measure + TextMeasure>(nodes: &Box
       let minimum = min(axisSize(measured.size, axis.horizontal), item.pendingPreferred)
       item.minimum = max(item.inset, min(minimum, item.maximum))
       item.minimumPending = false
+      if request != 0 { output.cache.flexMemos.settle(item.id, request, item.minimum) }
     }
     index = index + 1
   }
@@ -814,6 +816,42 @@ fn scanBaselineItems(nodes: &BoxTree, output: &LayoutPass, items: &[Item], start
   }
 }
 
+// In a row whose items[start..end] have no baseline-aligned item, the first
+// and last items with a baseline make the picks (§8.5): found from either end
+// without reading the other items' layouts. False when that does not hold.
+fn scanBaselineEdges(nodes: &BoxTree, output: &LayoutPass, items: &[Item], start: usize, end: usize, blockHorizontal: bool, axis: &Axes, first: bool, last: bool, picks: &mut BaselinePicks) -> bool {
+  let mut index = start
+  while index < end {
+    let item = &items[index]
+    if !item.collapsed && item.baselineEligible && (item.align == Align.Baseline || item.align == Align.LastBaseline) { return false }
+    index = index + 1
+  }
+  if first && !edgeBaseline(nodes, output, items, start, end, blockHorizontal, axis, false, &mut picks.first) { return false }
+  if last && !edgeBaseline(nodes, output, items, start, end, blockHorizontal, axis, true, &mut picks.last) { return false }
+  return true
+}
+fn edgeBaseline(nodes: &BoxTree, output: &LayoutPass, items: &[Item], start: usize, end: usize, blockHorizontal: bool, axis: &Axes, last: bool, pick: &mut BaselinePick) -> bool {
+  let mut at: usize = 0
+  while at < end - start {
+    let mut index = start + at
+    if last { index = end - 1 - at }
+    let item = &items[index]
+    if !item.collapsed {
+      let child = &output.boxes[item.id]
+      let compatible = (nodes.style(item.id).writingMode != WritingMode.HorizontalTb) == blockHorizontal
+      if compatible && ((!last && child.hasFirstBaseline) || (last && child.hasLastBaseline)) {
+        let mut position = child.location.y
+        if axis.horizontal { position = child.location.x }
+        if axis.mainStartReverse { position = -position - axisSize(child.size, axis.horizontal) }
+        considerBaseline(&mut pick, item, child, compatible, position, axis, last)
+        return true
+      }
+    }
+    at = at + 1
+  }
+  return false
+}
+
 fn containerBaselines<M: Measure>(nodes: &BoxTree, output: &LayoutPass, measurer: &mut M, items: &[Item], lines: &[Line], lineCount: usize, style: &Style, axis: &Axes, fragmented: bool, result: &mut Layout) {
   if lineCount == 0 { return }
   let mut firstLine: usize = 0
@@ -860,8 +898,14 @@ fn containerBaselines<M: Measure>(nodes: &BoxTree, output: &LayoutPass, measurer
   }
   let mut picks = BaselinePicks { first: BaselinePick.none(false), last: BaselinePick.none(true) }
   let shared = firstStart == lastStart && firstEnd == lastEnd
-  scanBaselineItems(nodes, &output, items, firstStart, firstEnd, blockHorizontal, &axis, fragmented, true, shared, &mut picks)
-  if !shared { scanBaselineItems(nodes, &output, items, lastStart, lastEnd, blockHorizontal, &axis, fragmented, false, true, &mut picks) }
+  let edges = axis.row && !fragmented
+    && scanBaselineEdges(nodes, &output, items, firstStart, firstEnd, blockHorizontal, &axis, true, shared, &mut picks)
+    && (shared || scanBaselineEdges(nodes, &output, items, lastStart, lastEnd, blockHorizontal, &axis, false, true, &mut picks))
+  if !edges {
+    picks = BaselinePicks { first: BaselinePick.none(false), last: BaselinePick.none(true) }
+    scanBaselineItems(nodes, &output, items, firstStart, firstEnd, blockHorizontal, &axis, fragmented, true, shared, &mut picks)
+    if !shared { scanBaselineItems(nodes, &output, items, lastStart, lastEnd, blockHorizontal, &axis, fragmented, false, true, &mut picks) }
+  }
   let mut pass: usize = 0
   while pass < 2 {
     let last = pass == 1
@@ -954,9 +998,11 @@ pub struct FlexScratch { items: List<Item>, lines: List<Line> }
 // the size cache compares requests), axes, alignment, wrapping, main-axis
 // constraint and the two flags.
 //
-// A compute after one in which few lookups found an entry (a resize gives
+// A compute after one in which few items found an entry (a resize gives
 // every container new sizes) neither looks up nor keeps entries, but for
-// every SAMPLE-th, so that edits after a drag find them again.
+// every SAMPLE-th, so that edits after a drag find them again. Only items of
+// containers sized in an earlier compute count: a container met for the
+// first time, or sized several ways in one compute, finds nothing by design.
 // A fresh compute (the cache was just cleared) skips the memo too: it can
 // reuse nothing, and its entries would only be overwritten.
 pub struct FlexMemos {
@@ -965,6 +1011,9 @@ pub struct FlexMemos {
   // Each container's last REQUESTS_PER_BOX item requests, from
   // `requests[requestHeads[container]]` on; see request.
   requestHeads: List<usize>, requests: List<FlexRequest>, nextRequest: usize,
+  // The first request id of this compute, and whether the container of
+  // the last request had one from an earlier compute.
+  computeStart: usize, earlier: bool, found: usize,
 }
 // What a container pass gives every item's prepare besides the item. `id`
 // numbers distinct requests, never reused; an item memo names the request
@@ -983,10 +1032,11 @@ const MEMOS: usize = 16384
 const SAMPLE: usize = 8
 const REQUESTS_PER_BOX: usize = 4
 impl FlexMemos {
-  pub fn make() -> FlexMemos { return FlexMemos { heads: List<usize>.make(), entries: List<FlexMemo>.make(), free: NO_NODE, enabled: true, fresh: false, lookups: 0, hits: 0, skipped: 0, requestHeads: List<usize>.make(), requests: List<FlexRequest>.make(), nextRequest: 1 } }
+  pub fn make() -> FlexMemos { return FlexMemos { heads: List<usize>.make(), entries: List<FlexMemo>.make(), free: NO_NODE, enabled: true, fresh: false, lookups: 0, hits: 0, skipped: 0, requestHeads: List<usize>.make(), requests: List<FlexRequest>.make(), nextRequest: 1, computeStart: 1, earlier: false, found: 0 } }
   // Starts a compute that keeps the previous one's cache.
   pub fn rotate(self: &mut Self) {
     self.fresh = false
+    self.computeStart = self.nextRequest
     if self.lookups != 0 { self.enabled = self.hits * 4 >= self.lookups }
     if self.enabled { self.skipped = 0 }
     else {
@@ -1030,11 +1080,22 @@ impl FlexMemos {
     let requests = self.requests.asMutSlice()
     let mut oldest = first
     let mut slot = first
+    // Whether the container has a request from an earlier compute (see
+    // weigh).
+    let mut earlier = false
+    while slot < first + REQUESTS_PER_BOX {
+      earlier = earlier || (requests[slot].id != 0 && requests[slot].id < self.computeStart)
+      slot = slot + 1
+    }
+    self.earlier = earlier
+    slot = first
     while slot < first + REQUESTS_PER_BOX {
       let known = &requests[slot]
       if known.id != 0 && known.main.kind == main.kind && known.main.value == main.value && known.intrinsic == intrinsic && known.mainDefinite == mainDefinite
         && known.align == parentStyle.alignItems && known.wrap == parentStyle.flexWrap && sameAxes(&known.axis, axis)
-        && LayoutCache.sameRequest(&known.input, input) { return known.id }
+        && LayoutCache.sameRequest(&known.input, input) {
+        return known.id
+      }
       if known.id < requests[oldest].id { oldest = slot }
       slot = slot + 1
     }
@@ -1043,6 +1104,13 @@ impl FlexMemos {
     self.nextRequest = id + 1
     requests[oldest] = FlexRequest { id: id, input: input.*, main: main, axis: axis.*, align: parentStyle.alignItems, wrap: parentStyle.flexWrap, intrinsic: intrinsic, mainDefinite: mainDefinite }
     return id
+  }
+  // Counts a container pass's items toward the hit rate, when the container
+  // had requests from an earlier compute: the items it found again of
+  // `count`, `found` since the pass started.
+  fn weigh(self: &mut Self, count: usize, found: usize) {
+    self.lookups = self.lookups + count
+    self.hits = self.hits + (self.found - found)
   }
   // Starts a compute with nothing kept, which skips the memo.
   pub fn startFresh(self: &mut Self) { self.fresh = true }
@@ -1062,18 +1130,30 @@ impl FlexMemos {
     if id >= self.heads.length() { return NO_NODE }
     let entries = self.entries.asSlice()
     let mut index = self.heads.get(id)
-    // Only boxes with memos count toward the hit rate: a compute after a
-    // fresh one fills them without turning the memo off.
-    if index != NO_NODE { self.lookups = self.lookups + 1 }
     while index != NO_NODE {
       let entry = &entries[index]
       if entry.request == request {
-        self.hits = self.hits + 1
+        self.found = self.found + 1
         return index
       }
       index = entry.next
     }
     return NO_NODE
+  }
+  // Records an item's deferred automatic minimum in its memo for the request,
+  // which depends on nothing else the memo does not.
+  fn settle(self: &mut Self, id: usize, request: usize, minimum: f32) {
+    if id >= self.heads.length() { return }
+    let entries = self.entries.asMutSlice()
+    let mut index = self.heads.get(id)
+    while index != NO_NODE {
+      if entries[index].request == request {
+        entries[index].item.minimum = minimum
+        entries[index].item.minimumPending = false
+        return
+      }
+      index = entries[index].next
+    }
   }
   effect fn remember(self: &mut Self, id: usize, request: usize, item: &Item) ! OutOfMemoryError ? &mut Allocator {
     if id >= self.heads.length() {
@@ -1191,12 +1271,18 @@ effect fn layoutFlexPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTr
   let mut index: usize = 0
   let mut hasCollapsed = false
   let mut request: usize = 0
-  if output.frame == NO_NODE { request = run output.cache.flexMemos.request(id, &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite) }
+  let mut weighed = false
+  if output.frame == NO_NODE {
+    request = run output.cache.flexMemos.request(id, &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite)
+    weighed = request != 0 && output.cache.flexMemos.earlier
+  }
+  let found = output.cache.flexMemos.found
   while index < count {
     run prepare(nodes, &mut output, &mut measurer, &mut scratch.items.asMutSlice()[index], &childInput, &axis, style, mainConstraint, !mainKnown, mainDefinite, request)
     hasCollapsed = hasCollapsed || scratch.items.asSlice()[index].collapsed
     index = index + 1
   }
+  if weighed { output.cache.flexMemos.weigh(count, found) }
   if !mainKnown {
     let mut contributionSum: f32 = 0.0
     let mut largest: f32 = 0.0
@@ -1248,7 +1334,7 @@ effect fn layoutFlexPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTr
     let mut totalCross = gaps(scratch.lines.length(), crossGap)
     while lineIndex < scratch.lines.length() {
       let line = scratch.lines.get(lineIndex)
-      run deferredMinimums(nodes, &mut output, &mut measurer, scratch.items.asMutSlice(), &line, &childInput, &axis, main, mainGap, collapsed)
+      run deferredMinimums(nodes, &mut output, &mut measurer, scratch.items.asMutSlice(), &line, &childInput, &axis, main, mainGap, collapsed, request)
       resolveFlexible(scratch.items.asMutSlice(), &line, main, mainGap, collapsed)
       let mut measuredLine = run crossSizes(nodes, &mut output, &mut measurer, scratch.items.asMutSlice(), &line, &childInput, &axis, style, collapsed, style.flexWrap == FlexWrap.NoWrap && crossKnown && !input.fragmentation.active)
       if style.flexWrap == FlexWrap.NoWrap {
