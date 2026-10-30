@@ -152,3 +152,14 @@ Measured masking snapshot `6c5408b` against main `a34ecd7` on the Ubuntu 24.04 A
 | tiger/render | 362,122,324 | 363,305,922 | 1.0033 | True |
 
 All nine pre-existing workloads retain their checksums. The masking workload uses 64 translated groups with nested object-bounding-box alpha and luminance masks. Its old/new ratio is not an equivalent-output speed comparison: the old renderer ignores masks. New rendering takes 272.788 ms median in this run; full-surface mask allocation, conversion, and composition remain performance work for phase 14.
+
+The same snapshot was compared with the pinned resvg/usvg revision
+`91455ee06d08ac2bfeab2b035ed2cfbfd0a68614` using identical inputs and sampling settings.
+
+| Masking stage | Silk median ms | resvg median ms | Silk/resvg |
+| --- | ---: | ---: | ---: |
+| masking/end-to-end | 276.3355 | 11.8557 | 23.3082 |
+| masking/parse | 3.0036 | 0.4921 | 6.1035 |
+| masking/render | 272.8032 | 10.7761 | 25.3155 |
+
+The output checksums differ in every mode, so these measurements do not establish pixel conformance. The 25.3× render-time gap remains open for phase 14. The reference measurement used a temporary baseline file; the tracked baseline and conformance tolerances were not changed.
