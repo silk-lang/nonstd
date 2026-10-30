@@ -133,3 +133,22 @@ The clipping before/after ratio is not an equal-output speed comparison: the old
 | clipping/render | 105.9303 | 5.3687 | 19.7310 |
 
 Clipping output checksums differ from pinned resvg in all three modes; these measurements do not establish pixel conformance. The approximately 19.7× render-time gap remains open for phase 14. The evaluator currently builds full-size clip/layer surfaces and performs bounded geometric intersection work independently for each occurrence; profiling and caching/cropping work remain required. No tracked baseline or conformance tolerance was replaced.
+
+## Phase 6 masking checkpoint
+
+Measured masking snapshot `6c5408b` against main `a34ecd7` on the Ubuntu 24.04 ARM64 VM. Both binaries were rebuilt with Silk `0.1.0-dev.32+ebc526403637` and LLVM 22.1.8. Three native samples, one iteration, no warmup; separate Callgrind measurements count complete processes, including parsing and recording. The subsequent mask-root transform fix does not change this workload, which has no transform on its mask elements.
+
+| Workload | Old process Ir | New process Ir | New/old Ir | Render checksum equal |
+| --- | ---: | ---: | ---: | --- |
+| clipping/render | 1,831,522,451 | 1,831,964,461 | 1.0002 | True |
+| compositing/render | 506,891,939 | 507,503,980 | 1.0012 | True |
+| iconset/render | 385,563,133 | 387,764,349 | 1.0057 | True |
+| instances/render | 592,170,993 | 607,259,294 | 1.0255 | True |
+| largemap/render | 682,541,423 | 687,665,152 | 1.0075 | True |
+| masking/render | 63,389,777 | 4,933,716,518 | 77.8314 | False |
+| mixedcurves/render | 358,532,338 | 360,423,407 | 1.0053 | True |
+| paintservers/render | 286,332,159 | 287,050,108 | 1.0025 | True |
+| stylesheets/render | 530,793,676 | 535,913,154 | 1.0096 | True |
+| tiger/render | 362,122,324 | 363,305,922 | 1.0033 | True |
+
+All nine pre-existing workloads retain their checksums. The masking workload uses 64 translated groups with nested object-bounding-box alpha and luminance masks. Its old/new ratio is not an equivalent-output speed comparison: the old renderer ignores masks. New rendering takes 272.788 ms median in this run; full-surface mask allocation, conversion, and composition remain performance work for phase 14.
