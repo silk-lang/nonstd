@@ -514,7 +514,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] `color-profile` element and property, `icc-color()`, embedded profiles in PNG/JPEG, `rendering-intent`. Requires an ICC transform engine (matrix/TRC profiles first, LUT profiles after). Defaults to sRGB when no profile applies
 
 ### 5.13 Animation (1.1 ch. 19, SMIL Animation, SVG Animations 2)
-- [ ] Elements: `animate`, `set`, `animateTransform`, 1.1 `animateColor` (done); `animateMotion` (+ `mpath`, `path`, `keyPoints`, `rotate="auto|auto-reverse"`) is phase 11B
+- [x] Elements: `animate`, `set`, `animateMotion` (+ `mpath`, `path`, `keyPoints`, `rotate="auto|auto-reverse"`), `animateTransform`, 1.1 `animateColor`
 - [x] Targets: `href`/`xlink:href`, `attributeName` (with an `xlink:` prefix), `attributeType` (CSS/XML/auto)
 - [x] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`, `a.begin`), `repeat(n)` syncbase-style values, indefinite; event, accessKey and wallclock values stay unresolved (no host timeline); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
 - [x] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
@@ -1002,6 +1002,19 @@ attributes are written back onto the element. Sampled CSS properties are
 written as attributes in the `urn:silk:svg:animated` namespace, and the cascade
 reads those at the animation origin, above normal author declarations and below
 `!important` ([CSS Cascade 4](https://www.w3.org/TR/css-cascade-4/#cascade-origin)).
+`animateMotion` follows its `mpath` child, else `path`, else the polyline
+through `values` or `from`/`to`/`by`. It defaults to paced timing. With
+linear, spline or discrete timing, each value is a path vertex, and movetos
+after the first don't count as vertices
+([SVG 1.1](https://www.w3.org/TR/SVG11/animate.html#AnimateMotionElement)).
+Curves are measured as 64 chords each, the same flattening `textPath` uses.
+All motion animations on an element combine into one `translate(x y)
+rotate(a)`, which goes in front of the element's transform (animated or
+not). The angle comes from the highest-priority motion. This approximates a
+separate supplemental matrix in two ways. A non-default `transform-origin`
+also shifts the motion's rotation. A `transform` set in a stylesheet or
+`style` attribute overrides the written attribute, motion included.
+
 Two choices differ from the specification:
 
 - The underlying value of a CSS property is its presentation attribute (or the
