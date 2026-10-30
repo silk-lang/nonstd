@@ -1,0 +1,606 @@
+//! Bounded PNG chunk parsing, inflation and sample reconstruction.
+import image { Image, ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.compress.checksum { CompressionChecksum }
+import silk.compress.inflate { Decoder, DecodeError, Format, Limits, Progress, Status }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+pub enum PngError {
+  InvalidData,
+  TooLarge,
+  Unsupported
+}
+
+/// PNG cHRM coordinates, represented as their exact values multiplied by 100000.
+pub struct Chromaticities {
+  pub whiteX: u32,
+  pub whiteY: u32,
+  pub redX: u32,
+  pub redY: u32,
+  pub greenX: u32,
+  pub greenY: u32,
+  pub blueX: u32,
+  pub blueY: u32,
+}
+
+impl Copy for Chromaticities {}
+
+/// Source color description. Profile interpretation and color conversion are separate.
+pub struct Metadata {
+  pub gamma: Option<u32>,
+  pub chromaticities: Option<Chromaticities>,
+  pub srgbIntent: Option<u8>,
+  pub iccProfile: Bytes,
+}
+
+/// Decoded sample image plus its source color metadata; no ICC transform has been applied.
+pub struct Decoded {
+  pub image: Image,
+  pub metadata: Metadata,
+}
+
+// ICC data is untrusted compressed input; cap the decompressed profile at 16 MiB.
+effect fn profile(data: &[u8]) -> Bytes
+  ! PngError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut name: usize = 0
+  while name < data.length && data[name] != 0 {
+    let b = data[name]
+    if !((b >= 32 && b <= 126) || b >= 161) {
+      fail PngError.InvalidData
+    }
+    if b == 32 && (name == 0 || data[name - 1] == 32) {
+      fail PngError.InvalidData
+    }
+    name = name + 1
+  }
+  if name == 0 || name > 79 || name + 2 >= data.length || data[name - 1] == 32
+    || data[name + 1] != 0 {
+    fail PngError.InvalidData
+  }
+  let input = Slice.view<u8>(data, name + 2, data.length - name - 2)
+  let maximum: usize = 16777216
+  let mut result = run Bytes.zeroed(maximum + 1)
+  let limits = Limits {
+    maxInputBytes: usize.toU64(input.length),
+    maxOutputBytes: usize.toU64(maximum),
+    maxMembers: 1,
+    maxHeaderBytes: 2,
+    maxMemoryBytes: 65536,
+  }
+  let created = run Effect.result(Decoder.make(Format.Zlib, move limits))
+  let mut decoder = match move created {
+    Result<Decoder, DecodeError | OutOfMemoryError>.Success { value } => move value
+    Result<Decoder, DecodeError | OutOfMemoryError>.Failure { error } => match &error {
+      OutOfMemoryError problem => {
+        fail OutOfMemoryError {}
+      }
+      DecodeError problem => {
+        fail PngError.InvalidData
+      }
+    }
+  }
+  match &Decoder.step(&mut decoder, input, result.asMutSlice(), true) {
+    Result<Progress, DecodeError>.Success { value } => {
+      if value.status != Status.Finished || value.consumed != input.length {
+        fail PngError.InvalidData
+      }
+      result.truncate(value.written)
+    }
+    Result<Progress, DecodeError>.Failure { error } => {
+      fail PngError.InvalidData
+    }
+  }
+  return move result
+}
+
+fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn read32(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) * 16777216 + u8.toU32(data[at + 1]) * 65536
+    + u8.toU32(data[at + 2]) * 256
+    + u8.toU32(data[at + 3])
+}
+
+fn read16(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) * 256 + u8.toU32(data[at + 1])
+}
+
+fn distance(a: u32, b: u32) -> u32 {
+  return if a >= b {
+    a - b
+  } else {
+    b - a
+  }
+}
+
+fn paeth(a: u32, b: u32, c: u32) -> u32 {
+  let da = distance(b, c)
+  let db = distance(a, c)
+  let dc = distance(a + b, c * 2)
+  return if da <= db && da <= dc {
+    a
+  } else if db <= dc {
+    b
+  } else {
+    c
+  }
+}
+
+fn sample(row: &[u8], index: usize, depth: usize) -> u32 {
+  if depth == 16 {
+    return read16(row, index * 2)
+  }
+  if depth == 8 {
+    return u8.toU32(row[index])
+  }
+  let bit = index * depth
+  let shift = 8 - depth - bit % 8
+  let mut divisor: u32 = 1
+  let mut i: usize = 0
+  while i < shift {
+    divisor = divisor * 2
+    i = i + 1
+  }
+  let limit: u32 = if depth == 1 {
+    2
+  } else if depth == 2 {
+    4
+  } else {
+    16
+  }
+  return (u8.toU32(row[bit / 8]) / divisor) % limit
+}
+
+// PNG 3 #11tRNS requires masking unused high bits, even if encoders set them.
+fn transparentSample(data: &[u8], at: usize, depth: usize) -> u32 {
+  let range: u32 = if depth == 16 {
+    65536
+  } else if depth == 8 {
+    256
+  } else if depth == 4 {
+    16
+  } else if depth == 2 {
+    4
+  } else {
+    2
+  }
+  return read16(data, at) % range
+}
+
+fn scale(value: u32, depth: usize) -> u32 {
+  let maximum: u32 = if depth == 16 {
+    65535
+  } else if depth == 8 {
+    255
+  } else if depth == 4 {
+    15
+  } else if depth == 2 {
+    3
+  } else {
+    1
+  }
+  return (value * 255 + maximum / 2) / maximum
+}
+
+struct Pass {
+  x: usize,
+  y: usize,
+  dx: usize,
+  dy: usize,
+  width: usize,
+  height: usize,
+  stride: usize,
+}
+
+// https://www.w3.org/TR/png-3/#8Interlace
+fn pass(
+  width: usize,
+  height: usize,
+  channels: usize,
+  depth: usize,
+  interlaced: bool,
+  index: usize,
+) -> Pass {
+  let xs: [usize; 7] = [0, 4, 0, 2, 0, 1, 0]
+  let ys: [usize; 7] = [0, 0, 4, 0, 2, 0, 1]
+  let dxs: [usize; 7] = [8, 8, 4, 4, 2, 2, 1]
+  let dys: [usize; 7] = [8, 8, 8, 4, 4, 2, 2]
+  let x = if interlaced {
+    xs[index]
+  } else {
+    0
+  }
+  let y = if interlaced {
+    ys[index]
+  } else {
+    0
+  }
+  let dx = if interlaced {
+    dxs[index]
+  } else {
+    1
+  }
+  let dy = if interlaced {
+    dys[index]
+  } else {
+    1
+  }
+  let w = if width > x {
+    (width - x + dx - 1) / dx
+  } else {
+    0
+  }
+  let h = if height > y && w > 0 {
+    (height - y + dy - 1) / dy
+  } else {
+    0
+  }
+
+  // Divide the sample depth first so the intermediate also fits wasm32.
+  let stride = if depth >= 8 {
+    w * channels * (depth / 8)
+  } else {
+    (w * depth + 7) / 8
+  }
+  return Pass { x: x, y: y, dx: dx, dy: dy, width: w, height: h, stride: stride }
+}
+
+/// Decodes PNG samples to owned premultiplied RGBA8; limits compressed input to 256 MiB.
+/// CRC and zlib checksums are verified before returning an image.
+pub effect fn decodeWithMetadata<'a>(data: &'a [u8]) -> Decoded
+  ! PngError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  if data.length > 268435456 {
+    fail PngError.TooLarge
+  }
+  if data.length < 33 || !equal(Slice.view<u8>(data, 0, 8), b"\x89PNG\r\n\x1a\n") {
+    fail PngError.InvalidData
+  }
+  let mut metadata = Metadata {
+    gamma: Option<u32>.None,
+    chromaticities: Option<Chromaticities>.None,
+    srgbIntent: Option<u8>.None,
+    iccProfile: Bytes.make(),
+  }
+  let mut sawProfile = false
+  let mut width: u32 = 0
+  let mut height: u32 = 0
+  let mut depth: usize = 0
+  let mut color: u8 = 0
+  let mut channels: usize = 0
+  let mut interlaced = false
+  let mut palette: &'a [u8] = b""
+  let mut transparency: &'a [u8] = b""
+  let mut sawPalette = false
+  let mut sawTransparency = false
+  let mut sawData = false
+  let mut endedData = false
+  let mut ended = false
+  let mut compressed = Bytes.make()
+  let mut position: usize = 8
+  while position < data.length {
+    if data.length - position < 12 {
+      fail PngError.InvalidData
+    }
+    let length = u32.toUsize(read32(data, position))
+    if length > 2147483647 || length > data.length - position - 12 {
+      fail PngError.InvalidData
+    }
+    let name = Slice.view<u8>(data, position + 4, 4)
+    let start = position + 8
+    let end = start + length
+    let payload = Slice.view<u8>(data, start, length)
+    if CompressionChecksum.crc32(Slice.view<u8>(data, position + 4, length + 4))
+      != read32(data, end) {
+      fail PngError.InvalidData
+    }
+    let mut letter: usize = 0
+    while letter < 4 {
+      let b = name[letter]
+      if !((b >= 65 && b <= 90) || (b >= 97 && b <= 122)) {
+        fail PngError.InvalidData
+      }
+      letter = letter + 1
+    }
+    if name[2] >= 97 {
+      fail PngError.InvalidData
+    }
+    if position == 8 && !equal(name, b"IHDR") {
+      fail PngError.InvalidData
+    }
+    if equal(name, b"IHDR") {
+      if position != 8 || length != 13 {
+        fail PngError.InvalidData
+      }
+      width = read32(payload, 0)
+      height = read32(payload, 4)
+      drop run Image.validateSize(width, height)
+      depth = u32.toUsize(u8.toU32(payload[8]))
+      color = payload[9]
+      channels = if color == 0 {
+        1
+      } else if color == 2 {
+        3
+      } else if color == 3 {
+        1
+      } else if color == 4 {
+        2
+      } else if color == 6 {
+        4
+      } else {
+        0
+      }
+      let valid = if color == 0 {
+        depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16
+      } else if color == 3 {
+        depth == 1 || depth == 2 || depth == 4 || depth == 8
+      } else {
+        depth == 8 || depth == 16
+      }
+      if channels == 0 || !valid || payload[10] != 0 || payload[11] != 0 || payload[12] > 1 {
+        fail PngError.InvalidData
+      }
+      interlaced = payload[12] == 1
+    } else if equal(name, b"gAMA") {
+      if sawPalette || sawData || metadata.gamma.isSome() || length != 4 {
+        fail PngError.InvalidData
+      }
+      let gamma = read32(payload, 0)
+      if gamma == 0 {
+        fail PngError.InvalidData
+      }
+      metadata.gamma = Option<u32>.some(gamma)
+    } else if equal(name, b"cHRM") {
+      if sawPalette || sawData || metadata.chromaticities.isSome() || length != 32 {
+        fail PngError.InvalidData
+      }
+      metadata.chromaticities = Option<Chromaticities>.some(
+        Chromaticities {
+          whiteX: read32(payload, 0),
+          whiteY: read32(payload, 4),
+          redX: read32(payload, 8),
+          redY: read32(payload, 12),
+          greenX: read32(payload, 16),
+          greenY: read32(payload, 20),
+          blueX: read32(payload, 24),
+          blueY: read32(payload, 28),
+        },
+      )
+    } else if equal(name, b"sRGB") {
+      if sawPalette || sawData || metadata.srgbIntent.isSome() || length != 1 {
+        fail PngError.InvalidData
+      }
+      if payload[0] > 3 {
+        fail PngError.InvalidData
+      }
+      metadata.srgbIntent = Option<u8>.some(payload[0])
+    } else if equal(name, b"iCCP") {
+      if sawPalette || sawData || sawProfile {
+        fail PngError.InvalidData
+      }
+      metadata.iccProfile = run profile(payload)
+      sawProfile = true
+    } else if equal(name, b"PLTE") {
+      if sawPalette || sawData || sawTransparency || color == 0 || color == 4 || length == 0
+        || length > 768
+        || length % 3 != 0 {
+        fail PngError.InvalidData
+      }
+      if color == 3
+        && ((depth == 1 && length > 6) || (depth == 2 && length > 12)
+          || (depth == 4 && length > 48)) {
+        fail PngError.InvalidData
+      }
+      palette = payload
+      sawPalette = true
+    } else if equal(name, b"tRNS") {
+      if sawTransparency || sawData {
+        fail PngError.InvalidData
+      }
+      if (color == 0 && length != 2) || (color == 2 && length != 6)
+        || (color == 3 && (!sawPalette || length > palette.length / 3))
+        || color == 4
+        || color == 6 {
+        fail PngError.InvalidData
+      }
+      transparency = payload
+      sawTransparency = true
+    } else if equal(name, b"IDAT") {
+      if endedData || (color == 3 && !sawPalette) {
+        fail PngError.InvalidData
+      }
+      sawData = true
+      run Bytes.append(&mut compressed, payload)
+    } else if equal(name, b"IEND") {
+      if !sawData || length != 0 || end + 4 != data.length {
+        fail PngError.InvalidData
+      }
+      ended = true
+    } else {
+      if name[0] < 97 {
+        fail PngError.Unsupported
+      }
+      if sawData {
+        endedData = true
+      }
+    }
+    position = end + 4
+  }
+  if !ended {
+    fail PngError.InvalidData
+  }
+  let w = u32.toUsize(width)
+  let h = u32.toUsize(height)
+  let passes: usize = if interlaced {
+    7
+  } else {
+    1
+  }
+  let mut rawSize: usize = 0
+  let mut index: usize = 0
+  while index < passes {
+    let current = pass(w, h, channels, depth, interlaced, index)
+    rawSize = rawSize + (current.stride + 1) * current.height
+    index = index + 1
+  }
+  let mut raw = run Bytes.zeroed(rawSize + 1)
+  let limits = Limits {
+    maxInputBytes: usize.toU64(compressed.asSlice().length),
+    maxOutputBytes: usize.toU64(rawSize),
+    maxMembers: 1,
+    maxHeaderBytes: 2,
+    maxMemoryBytes: 65536,
+  }
+  let created = run Effect.result(Decoder.make(Format.Zlib, move limits))
+  let mut decoder = match move created {
+    Result<Decoder, DecodeError | OutOfMemoryError>.Success { value } => move value
+    Result<Decoder, DecodeError | OutOfMemoryError>.Failure { error } => {
+      match &error {
+        OutOfMemoryError problem => {
+          fail OutOfMemoryError {}
+        }
+        DecodeError problem => {
+          fail PngError.InvalidData
+        }
+      }
+    }
+  }
+  match &Decoder.step(&mut decoder, compressed.asSlice(), raw.asMutSlice(), true) {
+    Result<Progress, DecodeError>.Success { value } => {
+      if value.status != Status.Finished || value.written != rawSize
+        || value.consumed != compressed.asSlice().length {
+        fail PngError.InvalidData
+      }
+    }
+    Result<Progress, DecodeError>.Failure { error } => {
+      fail PngError.InvalidData
+    }
+  }
+  let bpp = (channels * depth + 7) / 8
+  let mut image = run Image.make(width, height)
+  let output = image.dataMut()
+  let rows = raw.asMutSlice()
+  let mut offset: usize = 0
+  index = 0
+  while index < passes {
+    let current = pass(w, h, channels, depth, interlaced, index)
+    let stride = current.stride
+    let mut y: usize = 0
+    while y < current.height {
+      let start = offset + y * (stride + 1) + 1
+      let filter = rows[start - 1]
+      if filter > 4 {
+        fail PngError.InvalidData
+      }
+      let mut x: usize = 0
+      while x < stride {
+        let a = if x >= bpp {
+          u8.toU32(rows[start + x - bpp])
+        } else {
+          0
+        }
+        let b = if y > 0 {
+          u8.toU32(rows[start + x - stride - 1])
+        } else {
+          0
+        }
+        let c = if y > 0 && x >= bpp {
+          u8.toU32(rows[start + x - stride - 1 - bpp])
+        } else {
+          0
+        }
+        let predictor = if filter == 1 {
+          a
+        } else if filter == 2 {
+          b
+        } else if filter == 3 {
+          (a + b) / 2
+        } else if filter == 4 {
+          paeth(a, b, c)
+        } else {
+          0
+        }
+        rows[start + x] = u32.toU8((u8.toU32(rows[start + x]) + predictor) % 256)
+        x = x + 1
+      }
+      let row = Slice.view<u8>(&rows, start, stride)
+      x = 0
+      while x < current.width {
+        let at = x * channels
+        let first = sample(row, at, depth)
+        let mut red = scale(first, depth)
+        let mut green = red
+        let mut blue = red
+        let mut alpha: u32 = 255
+        if color == 3 {
+          let index = u32.toUsize(first)
+          if index >= palette.length / 3 {
+            fail PngError.InvalidData
+          }
+          red = u8.toU32(palette[index * 3])
+          green = u8.toU32(palette[index * 3 + 1])
+          blue = u8.toU32(palette[index * 3 + 2])
+          if index < transparency.length {
+            alpha = u8.toU32(transparency[index])
+          }
+        } else if color == 2 || color == 6 {
+          let second = sample(row, at + 1, depth)
+          let third = sample(row, at + 2, depth)
+          green = scale(second, depth)
+          blue = scale(third, depth)
+          if color == 6 {
+            alpha = scale(sample(row, at + 3, depth), depth)
+          } else if sawTransparency && first == transparentSample(transparency, 0, depth)
+            && second == transparentSample(transparency, 2, depth)
+            && third == transparentSample(transparency, 4, depth) {
+            alpha = 0
+          }
+        } else if color == 4 {
+          alpha = scale(sample(row, at + 1, depth), depth)
+        } else if sawTransparency && first == transparentSample(transparency, 0, depth) {
+          alpha = 0
+        }
+        let destination = ((current.y + y * current.dy) * w + current.x + x * current.dx) * 4
+        output[destination] = u32.toU8((red * alpha + 127) / 255)
+        output[destination + 1] = u32.toU8((green * alpha + 127) / 255)
+        output[destination + 2] = u32.toU8((blue * alpha + 127) / 255)
+        output[destination + 3] = u32.toU8(alpha)
+        x = x + 1
+      }
+      y = y + 1
+    }
+    offset = offset + (stride + 1) * current.height
+    index = index + 1
+  }
+  return Decoded { image: move image, metadata: move metadata }
+}
+
+/// Decodes PNG samples without performing a color-space transform.
+/// Use decodeWithMetadata to retain gamma, chromaticities, sRGB intent and ICC data.
+pub effect fn decode(data: &[u8]) -> Image
+  ! PngError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let decoded = run decodeWithMetadata(data)
+  return move decoded.image
+}
