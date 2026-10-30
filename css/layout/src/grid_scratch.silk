@@ -18,6 +18,7 @@ import grid_contributions { ItemContribution }
 import context { Input }
 import geometry { OptionalSize, Size }
 import layout_cache { LayoutCache }
+import tree { NO_NODE }
 
 pub struct GridAxisScratch {
   pub tracks: List<TrackState>,
@@ -40,47 +41,229 @@ pub struct ContributionMemo {
   pub horizontal: bool, pub automatic: bool, pub cap: f32, pub crossCap: f32,
   pub needMin: bool, pub needMax: bool,
   pub result: ItemContribution,
+  // The pass (ContributionMemos.stamp) that last found it standing, and the
+  // single tracks it was measured in, or NO_NODE (see ContributionMemos.kept).
+  pub pass: usize, pub track: usize, pub crossTrack: usize,
 }
 impl Copy for ContributionMemo {}
 
+// What a sizing pass's keys took from its tracks: each track's policy and
+// each cross track's policy and, once final, its size.
+struct MemoPass {
+  stamp: usize,
+  horizontal: bool,
+  ownFinal: bool,
+  crossFinal: bool,
+  policies: List<TrackPolicy>,
+  crossPolicies: List<TrackPolicy>,
+  crossSizes: List<f32>,
+  sizes: List<f32>,
+}
+
+impl MemoPass {
+  fn make() -> MemoPass {
+    return MemoPass {
+      stamp: 0, horizontal: false, ownFinal: false, crossFinal: false, policies: List<TrackPolicy>.make(),
+      crossPolicies: List<TrackPolicy>.make(), crossSizes: List<f32>.make(), sizes: List<f32>.make(),
+    }
+  }
+
+  fn reset(self: &mut Self) {
+    self.stamp = 0
+    self.policies.clear()
+    self.crossPolicies.clear()
+    self.crossSizes.clear()
+    self.sizes.clear()
+  }
+}
+
+// Records which of `tracks`' sizes match `seen`'s, then makes them `seen`'s.
+effect fn compareSizes(seen: &mut List<f32>, tracks: &[TrackState], same: &mut List<bool>)
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut index: usize = 0
+  while index < tracks.length {
+    let size = tracks[index].base
+    if index < seen.length() {
+      if seen.asSlice()[index] != size { same.set(index, false) }
+      seen.set(index, size)
+    } else {
+      same.set(index, false)
+      run seen.append(size)
+    }
+    index = index + 1
+  }
+  seen.truncate(tracks.length)
+}
+
+fn samePolicy(a: &TrackPolicy, b: &TrackPolicy) -> bool {
+  return a.automatic == b.automatic && a.fixed == b.fixed && a.cap == b.cap && a.intrinsic == b.intrinsic
+    && a.needMin == b.needMin && a.needMax == b.needMax
+}
+
+// Records which of `policies` match `seen`'s, then makes them `seen`'s.
+effect fn comparePolicies(seen: &mut List<TrackPolicy>, policies: &[TrackPolicy], comparable: bool, same: &mut List<bool>)
+  ! OutOfMemoryError ? &mut Allocator {
+  same.clear()
+  let mut index: usize = 0
+  while index < policies.length {
+    if index < seen.length() {
+      run same.append(comparable && samePolicy(&seen.asSlice()[index], &policies[index]))
+      seen.set(index, policies[index])
+    } else {
+      run same.append(false)
+      run seen.append(policies[index])
+    }
+    index = index + 1
+  }
+  seen.truncate(policies.length)
+}
+
 // Item requests are the grid's base request plus each item's area, so a memo
 // list compares the base once per pass instead of whole requests per item.
+//
+// A pass whose tracks keep their policies, and cross tracks their areas, from
+// the previous pass of its kind finds its single-track items' keys unchanged:
+// such an item's entry stands if that pass found it standing and the cache
+// cleared nothing of it since (`kept`), with no key built or compared.
 pub struct ContributionMemos {
   base: Input,
   entries: List<ContributionMemo>,
+  stamp: usize,
+  previous: usize,
+  sizing: MemoPass,
+  recheck: MemoPass,
+  same: List<bool>,
+  crossSame: List<bool>,
+  // By item, for final requests (see laidOut).
+  marks: List<ItemMark>,
 }
+
+// An item laid out by a final pass in single tracks `column` and `row`, when
+// the cache had cleared nothing of it since `clock`.
+struct ItemMark { id: usize, pass: usize, column: usize, row: usize, clock: usize }
+impl Copy for ItemMark {}
 
 impl ContributionMemos {
   pub fn make() -> ContributionMemos {
-    return ContributionMemos { base: Input.make(OptionalSize.none()), entries: List<ContributionMemo>.make() }
+    return ContributionMemos {
+      base: Input.make(OptionalSize.none()), entries: List<ContributionMemo>.make(), stamp: 0, previous: 0,
+      sizing: MemoPass.make(), recheck: MemoPass.make(), same: List<bool>.make(), crossSame: List<bool>.make(),
+      marks: List<ItemMark>.make(),
+    }
   }
 
-  pub fn clear(self: &mut Self) { self.entries.clear() }
+  pub fn clear(self: &mut Self) {
+    self.entries.clear()
+    self.marks.clear()
+    self.sizing.reset()
+    self.recheck.reset()
+  }
 
   // Keeps the entries only if they were measured under the same base.
   pub fn begin(self: &mut Self, base: &Input) {
-    if self.entries.length() != 0 && LayoutCache.sameBase(&self.base, base) { return }
-    self.entries.clear()
+    if (self.entries.length() != 0 || self.marks.length() != 0) && LayoutCache.sameBase(&self.base, base) { return }
+    self.clear()
     self.base = base.*
   }
 
-  pub fn lookup(self: &Self, slot: usize, key: &ContributionMemo, cleared: usize) -> Option<ItemContribution> {
+  // Starts a sizing pass (or re-check pass) over `tracks` with `policies`,
+  // across `crossTracks` with `crossPolicies`. Keys read each axis's sizes
+  // only once final (`ownFinal`, `crossFinal`).
+  pub effect fn startPass(
+    self: &mut Self, recheck: bool, horizontal: bool, ownFinal: bool, crossFinal: bool,
+    policies: &[TrackPolicy], crossPolicies: &[TrackPolicy], tracks: &[TrackState], crossTracks: &[TrackState],
+  ) ! OutOfMemoryError ? &mut Allocator {
+    self.stamp = self.stamp + 1
+    if recheck {
+      self.previous = run startKind(&mut self.recheck, &mut self.same, &mut self.crossSame, self.stamp,
+        horizontal, ownFinal, crossFinal, policies, crossPolicies, tracks, crossTracks)
+    } else {
+      self.previous = run startKind(&mut self.sizing, &mut self.same, &mut self.crossSame, self.stamp,
+        horizontal, ownFinal, crossFinal, policies, crossPolicies, tracks, crossTracks)
+    }
+  }
+
+  // The entry of an item in single tracks `track` and `crossTrack`, if the
+  // previous pass of this kind found it standing and nothing changed since.
+  pub fn kept(self: &mut Self, slot: usize, id: usize, track: usize, crossTrack: usize, cleared: usize) -> Option<ItemContribution> {
+    if slot >= self.entries.length() || self.previous == 0 { return Option<ItemContribution>.None }
+    let memo = &mut self.entries.asMutSlice()[slot]
+    if memo.pass == self.previous && memo.id == id && memo.track == track && memo.crossTrack == crossTrack
+      && cleared <= memo.clock && self.same.asSlice()[track] && self.crossSame.asSlice()[crossTrack] {
+      memo.pass = self.stamp
+      return Option<ItemContribution>.Some { value: memo.result }
+    }
+    return Option<ItemContribution>.None
+  }
+
+  // Whether the previous final pass laid out the item at `index` in the same
+  // single tracks, unchanged since: if so its request is the one it made then.
+  pub fn laidOut(self: &mut Self, index: usize, id: usize, column: usize, row: usize, cleared: usize) -> bool {
+    if index >= self.marks.length() || self.previous == 0 { return false }
+    let mark = &mut self.marks.asMutSlice()[index]
+    if mark.pass == self.previous && mark.id == id && mark.column == column && mark.row == row
+      && cleared <= mark.clock && self.same.asSlice()[column] && self.crossSame.asSlice()[row] {
+      mark.pass = self.stamp
+      return true
+    }
+    return false
+  }
+
+  pub fn forgetLaidOut(self: &mut Self) { self.marks.clear() }
+
+  pub effect fn markLaidOut(self: &mut Self, index: usize, id: usize, column: usize, row: usize, clock: usize)
+    ! OutOfMemoryError ? &mut Allocator {
+    let mark = ItemMark { id: id, pass: self.stamp, column: column, row: row, clock: clock }
+    while self.marks.length() <= index { run self.marks.append(ItemMark { id: NO_NODE, pass: 0, column: 0, row: 0, clock: 0 }) }
+    self.marks.set(index, mark)
+  }
+
+  pub fn lookup(self: &mut Self, slot: usize, key: &ContributionMemo, cleared: usize) -> Option<ItemContribution> {
     if slot >= self.entries.length() { return Option<ItemContribution>.None }
-    let memo = &self.entries.asSlice()[slot]
+    let memo = &mut self.entries.asMutSlice()[slot]
     if memo.id == key.id && cleared <= memo.clock && sameOptional(&memo.area, &key.area)
       && memo.minimum.width == key.minimum.width && memo.minimum.height == key.minimum.height
       && memo.horizontal == key.horizontal && memo.automatic == key.automatic
       && memo.cap == key.cap && memo.crossCap == key.crossCap
       && memo.needMin == key.needMin && memo.needMax == key.needMax {
+      memo.pass = self.stamp
+      memo.track = key.track
+      memo.crossTrack = key.crossTrack
       return Option<ItemContribution>.Some { value: memo.result }
     }
     return Option<ItemContribution>.None
   }
 
   pub effect fn store(self: &mut Self, slot: usize, value: ContributionMemo) ! OutOfMemoryError ? &mut Allocator {
-    while self.entries.length() <= slot { run self.entries.append(value) }
-    self.entries.set(slot, value)
+    let mut stored = value
+    stored.pass = self.stamp
+    let mut gap = value
+    gap.id = NO_NODE
+    while self.entries.length() <= slot { run self.entries.append(gap) }
+    self.entries.set(slot, stored)
   }
+}
+
+// Compares a pass with the previous one of its kind, `seen`, and returns that
+// pass's stamp, or 0 if its keys took anything else from the pass itself.
+effect fn startKind(
+  seen: &mut MemoPass, same: &mut List<bool>, crossSame: &mut List<bool>, stamp: usize,
+  horizontal: bool, ownFinal: bool, crossFinal: bool, policies: &[TrackPolicy], crossPolicies: &[TrackPolicy],
+  tracks: &[TrackState], crossTracks: &[TrackState],
+) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let comparable = seen.stamp != 0 && seen.horizontal == horizontal && seen.ownFinal == ownFinal
+    && seen.crossFinal == crossFinal
+  let previous = seen.stamp
+  seen.stamp = stamp
+  seen.horizontal = horizontal
+  seen.ownFinal = ownFinal
+  seen.crossFinal = crossFinal
+  run comparePolicies(&mut seen.policies, policies, comparable, &mut same)
+  run comparePolicies(&mut seen.crossPolicies, crossPolicies, comparable, &mut crossSame)
+  if ownFinal { run compareSizes(&mut seen.sizes, tracks, &mut same) }
+  if crossFinal { run compareSizes(&mut seen.crossSizes, crossTracks, &mut crossSame) }
+  if !comparable { return 0 }
+  return previous
 }
 
 fn sameOptional(a: &OptionalSize, b: &OptionalSize) -> bool {
@@ -159,6 +342,11 @@ pub struct GridScratch {
   pub baselines: List<GridBaselines>,
   // Two per item, for its automatic minimum on each axis (see requestItem).
   pub finalMemos: ContributionMemos,
+  // Final passes' items, by what they requested (see ContributionMemos.laidOut).
+  pub finals: ContributionMemos,
+  // Each final track's policy, for single-track items' requests.
+  pub finalColumns: List<TrackPolicy>,
+  pub finalRows: List<TrackPolicy>,
   pub columnGap: f32,
   pub rowGap: f32,
 }
@@ -175,6 +363,9 @@ impl GridScratch {
       template: List<GridTemplateScratch>.make(),
       baselines: List<GridBaselines>.make(),
       finalMemos: ContributionMemos.make(),
+      finals: ContributionMemos.make(),
+      finalColumns: List<TrackPolicy>.make(),
+      finalRows: List<TrackPolicy>.make(),
       columnGap: 0.0,
       rowGap: 0.0,
     }
@@ -337,6 +528,7 @@ impl GridMemos {
       scratch.columns.clear()
       scratch.rows.clear()
       scratch.finalMemos.clear()
+      scratch.finals.clear()
     }
     return GridLease { fresh: fresh, value: move value, slot: slot }
   }
