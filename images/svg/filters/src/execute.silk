@@ -33,6 +33,7 @@ import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
+import silk.core.option { Option }
 import silk.num.f32
 import silk.num.u32
 import silk.num.i32
@@ -455,6 +456,87 @@ fn validInput(input: Input, before: usize, program: &Program) -> bool {
   }
 }
 
+fn validUnit(unit: [f64; 2]) -> bool {
+  return finite(&unit) && unit[0] >= 0.0 && unit[1] >= 0.0
+}
+
+/// Smallest kernel unit, in surface pixels, that a resampled kernel steps by.
+const MIN_KERNEL_PIXELS: f64 = 0.5
+
+/// Surface pixels per kernel unit along each axis, or None when `unit` is unset or is one
+/// pixel already.
+fn kernelScale(unit: [f64; 2], space: &Space) -> Option<[f64; 2]> {
+  if !(unit[0] > 0.0) || !(unit[1] > 0.0) {
+    return Option<[f64; 2]>.None
+  }
+  let kx = f64.max(unit[0] * f64.abs(space.sx), MIN_KERNEL_PIXELS)
+  let ky = f64.max(unit[1] * f64.abs(space.sy), MIN_KERNEL_PIXELS)
+  if !f64.isFinite(kx) || !f64.isFinite(ky)
+    || (f64.abs(kx - 1.0) < SNAP && f64.abs(ky - 1.0) < SNAP) {
+    return Option<[f64; 2]>.None
+  }
+  return Option<[f64; 2]>.some([kx, ky])
+}
+
+/// The grid of kernel units over a `width`×`height` surface.
+fn unitSize(length: u32, scale: f64) -> u32 {
+  return maxU32(f64.toU32(f64.ceil(u32.toF64(length) / scale)), 1)
+}
+
+fn unitRegion(region: Region, scale: [f64; 2], width: u32, height: u32) -> Region {
+  let x0 = minU32(f64.toU32(f64.floor(u32.toF64(region.x0) / scale[0])), width)
+  let y0 = minU32(f64.toU32(f64.floor(u32.toF64(region.y0) / scale[1])), height)
+  let x1 = minU32(f64.toU32(f64.ceil(u32.toF64(region.x1) / scale[0])), width)
+  let y1 = minU32(f64.toU32(f64.ceil(u32.toF64(region.y1) / scale[1])), height)
+  return Region.make(x0, y0, maxU32(x0, x1), maxU32(y0, y1))
+}
+
+/// A `width`×`height` image whose pixel (i, j) samples `from` bilinearly at
+/// ((i + 0.5) fx, (j + 0.5) fy), clamped to its edges.
+effect fn resample(from: &Pixmap, width: u32, height: u32, fx: f64, fy: f64) -> Pixmap
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run Pixmap.make(width, height)
+  let w = from.width()
+  let h = from.height()
+  if w == 0 || h == 0 {
+    return move out
+  }
+  let source = from.data()
+  let to = out.dataMut()
+  let maxX = u32.toF64(w - 1)
+  let maxY = u32.toF64(h - 1)
+  let mut j: u32 = 0
+  while j < height {
+    let y = f64.min(f64.max((u32.toF64(j) + 0.5) * fy - 0.5, 0.0), maxY)
+    let y0 = f64.toU32(f64.floor(y))
+    let y1 = minU32(y0 + 1, h - 1)
+    let ty = y - u32.toF64(y0)
+    let mut i: u32 = 0
+    while i < width {
+      let x = f64.min(f64.max((u32.toF64(i) + 0.5) * fx - 0.5, 0.0), maxX)
+      let x0 = f64.toU32(f64.floor(x))
+      let x1 = minU32(x0 + 1, w - 1)
+      let tx = x - u32.toF64(x0)
+      let a = (u32.toUsize(y0) * u32.toUsize(w) + u32.toUsize(x0)) * 4
+      let b = (u32.toUsize(y0) * u32.toUsize(w) + u32.toUsize(x1)) * 4
+      let c = (u32.toUsize(y1) * u32.toUsize(w) + u32.toUsize(x0)) * 4
+      let d = (u32.toUsize(y1) * u32.toUsize(w) + u32.toUsize(x1)) * 4
+      let at = (u32.toUsize(j) * u32.toUsize(width) + u32.toUsize(i)) * 4
+      let mut k: usize = 0
+      while k < 4 {
+        let top = u8.toF64(source[a + k]) * (1.0 - tx) + u8.toF64(source[b + k]) * tx
+        let bottom = u8.toF64(source[c + k]) * (1.0 - tx) + u8.toF64(source[d + k]) * tx
+        to[at + k] = f64.toU8(f64.min(f64.max(top * (1.0 - ty) + bottom * ty + 0.5, 0.0), 255.0))
+        k = k + 1
+      }
+      i = i + 1
+    }
+    j = j + 1
+  }
+  return move out
+}
+
 fn validRange(first: usize, count: usize, length: usize) -> bool {
   return first <= length && count <= length - first
 }
@@ -560,7 +642,8 @@ pub fn valid(program: &Program) -> bool {
         targetY,
         edgeMode,
         preserveAlpha,
-      } => orderX > 0 && orderY > 0 && targetX < orderX && targetY < orderY
+        unit,
+      } => orderX > 0 && orderY > 0 && targetX < orderX && targetY < orderY && validUnit(unit)
         && validRange(first, u32.toUsize(orderX) * u32.toUsize(orderY), numbers)
         && f64.isFinite(divisor)
         && divisor != 0.0
@@ -573,9 +656,11 @@ pub fn valid(program: &Program) -> bool {
         constant,
         exponent,
         color,
-        light
+        light,
+        unit
       } => f64.isFinite(surfaceScale) && f64.isFinite(constant) && f64.isFinite(exponent)
         && validLight(light)
+        && validUnit(unit)
       _ => true
     }
     if !ok {
@@ -661,10 +746,14 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
             i = i + 1
           }
         }
-        Operation.Blend { mode } => {
+        Operation.Blend { mode, composite } => {
           let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let b = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input2, linear)
-          filters.blend(&mut out, &a.pixels, &b.pixels, mode, region)
+          if composite {
+            filters.blend(&mut out, &a.pixels, &b.pixels, mode, region)
+          } else {
+            filters.blendWithoutCompositing(&mut out, &a.pixels, &b.pixels, mode, region)
+          }
         }
         Operation.Composite { operator, k } => {
           let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
@@ -771,6 +860,7 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
           targetY,
           edgeMode,
           preserveAlpha,
+          unit,
         } => {
           let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let kernel = run floats(numbers, first, u32.toUsize(orderX) * u32.toUsize(orderY))
@@ -785,7 +875,28 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
             edgeMode: edgeCode(edgeMode),
             preserveAlpha: preserveAlpha,
           }
-          run filters.convolveMatrix(&mut out, &a.pixels, &convolution, region)
+
+          // #element-attrdef-feconvolvematrix-kernelunitlength: the kernel steps by
+          // kernel units, so it runs on the image resampled to one pixel per unit.
+          match &kernelScale(unit, &space) {
+            Option<[f64; 2]>.Some { value: scale } => {
+              let sw = unitSize(width, scale[0])
+              let sh = unitSize(height, scale[1])
+              let small = run resample(&a.pixels, sw, sh, scale[0], scale[1])
+              let mut done = run Pixmap.make(sw, sh)
+              run filters.convolveMatrix(
+                &mut done,
+                &small,
+                &convolution,
+                unitRegion(region, scale, sw, sh),
+              )
+              let grown = run resample(&done, width, height, 1.0 / scale[0], 1.0 / scale[1])
+              filters.copy(&mut out, &grown, region)
+            }
+            _ => {
+              run filters.convolveMatrix(&mut out, &a.pixels, &convolution, region)
+            }
+          }
         }
         Operation.DisplacementMap { scale, x, y } => {
           // `in` stays in its own color space; only the map is converted.
@@ -820,17 +931,40 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
             filters.copy(&mut out, &images[index], region)
           }
         }
-        Operation.Lighting { specular, surfaceScale, constant, exponent, color, light } => {
+        Operation.Lighting { specular, surfaceScale, constant, exponent, color, light, unit } => {
           let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
+          let scale = match &kernelScale(unit, &space) {
+            Option<[f64; 2]>.Some { value } => value
+            _ => [1.0, 1.0]
+          }
+
+          // #element-attrdef-fediffuselighting-kernelunitlength: normals step by kernel
+          // units, so lighting runs on the image resampled to one pixel per unit.
+          let grid = Space {
+            sx: space.sx / scale[0],
+            sy: space.sy / scale[1],
+            tx: space.tx / scale[0],
+            ty: space.ty / scale[1],
+          }
           let lighting = Lighting {
             specular: specular,
             surfaceScale: f64.toF32(surfaceScale),
             constant: f64.toF32(constant),
             exponent: f64.toF32(exponent),
             color: lightColor(color, linear),
-            light: deviceLight(light, &space),
+            light: deviceLight(light, &grid),
           }
-          filters.lighting(&mut out, &a.pixels, &lighting, region)
+          if scale[0] == 1.0 && scale[1] == 1.0 {
+            filters.lighting(&mut out, &a.pixels, &lighting, region)
+          } else {
+            let sw = unitSize(width, scale[0])
+            let sh = unitSize(height, scale[1])
+            let small = run resample(&a.pixels, sw, sh, scale[0], scale[1])
+            let mut done = run Pixmap.make(sw, sh)
+            filters.lighting(&mut done, &small, &lighting, unitRegion(region, scale, sw, sh))
+            let grown = run resample(&done, width, height, 1.0 / scale[0], 1.0 / scale[1])
+            filters.copy(&mut out, &grown, region)
+          }
         }
       }
     }

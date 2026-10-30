@@ -501,9 +501,9 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
 - [x] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
 - [x] Inputs: `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
-- [ ] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
-- [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color` (all but `lighting-color` done)
-- [ ] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
+- [x] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
+- [x] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color`
+- [x] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
 
 ### 5.11 Linking (§16, 1.1 ch. 17)
 - [ ] URL references: same-document, external through the resolver, `data:`, invalid references (each property defines its fallback) (§16.1)
@@ -592,6 +592,10 @@ decisions:
   matching browsers. Bounding-box units on an empty box, and a filter with no primitives
   ([#FilterPrimitiveTree](https://www.w3.org/TR/filter-effects-1/#FilterPrimitiveTree)),
   also leave the element unrendered.
+- Empty groups. A filter region in `userSpaceOnUse` does not depend on content, so a group
+  with no rendered children still runs its filter on a transparent `SourceGraphic` (an
+  `feFlood` shows). Huge or practically infinite regions are clipped like any other to
+  the working surface.
 - `color-interpolation-filters: auto` uses linearRGB. Flood colors are converted with the
   same byte conversion as images, after premultiplying.
 - A primitive whose subregion has zero or negative width or height is disabled: its result
@@ -621,11 +625,17 @@ decisions:
   `numOctaves` values are unsupported and give transparent black, a non-integer
   `numOctaves` is invalid and leaves 1, and `numOctaves` is clamped to 32, which the spec's
   clamping note allows.
+- `feBlend`'s `no-composite` (Compositing 1 #blending, FE1 #element-attrdef-feblend-no-composite)
+  writes the mixed color `(1 - αb)·Cs + αb·B(Cb, Cs)` with the source's alpha and no
+  Porter-Duff source-over step, so the backdrop shows only through the blend function.
 - `feConvolveMatrix` acts as a pass through filter on every unfulfilled precondition
   (the change log's "pass through on unfulfilled pre-conditions"): orders below 1 after
   truncation, a kernel whose length is not `orderX * orderY`, and a target outside the
   kernel or not an integer. The input's extent for `edgeMode` is the primitive subregion.
-  `kernelUnitLength` is not implemented: the kernel always steps one surface pixel.
+  `kernelUnitLength` is honoured by resampling the input bilinearly to one pixel per kernel
+  unit, running the kernel there and resampling the result back; a unit is at least half a
+  surface pixel, and a unit that maps to one pixel skips the resampling. A missing,
+  negative or zero value means one surface pixel.
 - `feDisplacementMap` displaces by whole pixels (nearest sampling), with a table per axis,
   since `scale` is in `primitiveUnits` and maps to pixels differently along x and y. Its
   `in` image stays in its own color space and only `in2` is converted.
@@ -637,7 +647,8 @@ decisions:
   and leave 1. The sign of `limitingConeAngle` is ignored (the cone is symmetric).
   `feSpecularLighting`'s `(Sr, Sg, Sb, max)` is taken as a premultiplied color, as its alpha
   rule intends.
-  `kernelUnitLength` (deprecated) is not implemented: normals use one-pixel deltas.
+  `kernelUnitLength` (deprecated) is honoured like `feConvolveMatrix`'s: the normals are
+  computed on the input resampled to one pixel per kernel unit, with the light in that grid.
 - `feImage`. A reference without a fragment loads an image resource (PNG, JPEG or an SVG
   document) and renders it like `image` in the primitive subregion with the feImage's
   `preserveAspectRatio` and `image-rendering`; whatever falls outside the subregion is cut.
