@@ -66,8 +66,13 @@ regions and content coordinates. Alpha and luminance extraction honor `mask-type
 `mask-mode`, and the mask element’s `color-interpolation`. Layer lists compose from
 back to front using add, subtract, intersect, or exclude; shorter mode/operator lists
 repeat. Exact fixtures include partial alpha, three-layer ordering, nested masks,
-missing resources, and preservation of earlier siblings. Image/gradient mask sources,
-their positioning/repetition, broader conformance, and mask performance gates remain open.
+missing resources, and preservation of earlier siblings. CSS `<gradient>` layers
+(linear, radial and repeating, with hints, currentColor stops and premultiplied
+interpolation) are sized, positioned and tiled per mask-size, mask-position,
+mask-repeat (repeat, space, round, no-repeat), mask-origin and mask-clip. Twenty-three
+exact reftests compare them with equivalent SVG gradient masks or literal geometry.
+`url()` layers naming raster or SVG images, broader conformance and mask performance
+gates remain open.
 
 Filters, text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current

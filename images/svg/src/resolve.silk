@@ -24,6 +24,9 @@ import used_viewports
 import used_clip_shapes
 import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, Composite }
 import used_masks
+import used_mask_images
+import used_mask_images { Reference as LayerReference, Natural, Painted, Placement }
+import svg_css.effect_values { Image as MaskImage }
 import used_clips
 import svg_css.value_keywords { Keyword }
 import image_assets { DocumentMetadata, Store as ImageStore }
@@ -2757,6 +2760,256 @@ effect fn referencedClip(
   return Option<usize>.some(result)
 }
 
+fn layerMode(engine: &Engine, style: StyleId, layerIndex: usize) -> MaskMode {
+  if let Option<ComputedValue>.Some { value: entry } = &engine.get(style, Property.MaskMode) {
+    if let Value.Effect { value } = &engine.values.get(entry.value).* {
+      if let EffectValue.Masks { layers, resetBorder } = &value {
+        if layers.length() > 0 {
+          return layers.asSlice()[layerIndex % layers.length()].mode
+        }
+      }
+    }
+  }
+  return MaskMode.MatchSource
+}
+
+effect fn layerBox(
+  graph: &Graph,
+  id: usize,
+  state: &mut Planning,
+  reference: LayerReference,
+) -> Option<Rect>
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = state.plans.asSlice()[id]
+  return match reference {
+    LayerReference.View => Option<Rect>.some(state.spaces.asSlice()[plan.viewport])
+    LayerReference.None => Option<Rect>.None
+    _ => Option<Rect>.some(
+      match &(run gather(
+        graph,
+        id,
+        state.plans.asSlice(),
+        state.layouts.asSlice(),
+        state.paths.asSlice(),
+        &Mapping.identity(),
+        false,
+        reference == LayerReference.Stroke,
+        &mut state.bounds,
+      )) {
+        Option<Rect>.Some { value } => value
+        _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+      },
+    )
+  }
+}
+
+/// Paints one non-mask-element layer image into the open mask group and returns
+/// whether its mask values are luminance. #the-mask-mode: match-source uses alpha
+/// for <image> values.
+effect fn paintImageLayer(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  layerIndex: usize,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  matrix: &Mapping,
+  outputBounds: Rect,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+) -> bool
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = state.plans.asSlice()[id]
+  let style = plan.styleId
+  let luminance = layerMode(&styles.catalog.engine, style, layerIndex) == MaskMode.Luminance
+  let image = match run used_mask_images.layerImage(&styles.catalog.engine, style, layerIndex) {
+    Option<MaskImage>.Some { value } => move value
+    _ => {
+      return luminance
+    }
+  }
+  let origin = match &(run layerBox(
+    graph,
+    id,
+    &mut state.*,
+    used_mask_images.origin(&styles.catalog.engine, style, layerIndex),
+  )) {
+    Option<Rect>.Some { value } => value
+    _ => {
+      return luminance
+    }
+  }
+  let clipBox = run layerBox(
+    graph,
+    id,
+    &mut state.*,
+    used_mask_images.clip(&styles.catalog.engine, style, layerIndex),
+  )
+  let placement = match &(run used_mask_images.place(
+    &mut styles.catalog.engine,
+    style,
+    layerIndex,
+    origin,
+    Natural.none(),
+  )) {
+    Option<Placement>.Some { value } => value
+    _ => {
+      return luminance
+    }
+  }
+  let width = placement.image.width()
+  let height = placement.image.height()
+  let painted = match &(run used_mask_images.gradient(
+    &mut paints.*,
+    &mut styles.catalog.engine,
+    style,
+    &image,
+    width,
+    height,
+    plan.style.color,
+  )) {
+    Option<Painted>.Some { value } => value
+    _ => {
+      return luminance
+    }
+  }
+
+  // Repeated axes cover the painting area; with no-clip, the stroke box bounds
+  // everything the element itself can paint.
+  let extent = match &clipBox {
+    Option<Rect>.Some { value } => value
+    _ => match &(run layerBox(graph, id, &mut state.*, LayerReference.Stroke)) {
+      Option<Rect>.Some { value } => value
+      _ => placement.image
+    }
+  }
+  let x0 = if placement.repeatX {
+    extent.xMin
+  } else {
+    placement.image.xMin
+  }
+  let x1 = if placement.repeatX {
+    extent.xMax
+  } else {
+    placement.image.xMax
+  }
+  let y0 = if placement.repeatY {
+    extent.yMin
+  } else {
+    placement.image.yMin
+  }
+  let y1 = if placement.repeatY {
+    extent.yMax
+  } else {
+    placement.image.yMax
+  }
+  if !(x1 > x0) || !(y1 > y0) {
+    return luminance
+  }
+  let offset = Mapping.Affine {
+    value: Transform.new(1.0, 0.0, 0.0, 1.0, placement.image.xMin, placement.image.yMin),
+  }
+  let repeated = placement.repeatX || placement.repeatY
+  let mut used = plan.style
+  used.fillOpacity = 1.0
+  used.stroke = Paint.None
+  used.opacity = 1.0
+  used.blendMode = BlendMode.Normal
+  used.isolated = false
+  used.visible = true
+  used.displayed = true
+  used.crispEdges = false
+  used.linearRgb = false
+  used.fillRule = FillRule.Nonzero
+  used.fill = match &painted {
+    Painted.Solid { color } => Paint.Solid { color: color }
+    Painted.Gradient { gradient, local } => {
+      // A repeated image is drawn once in the picture's own space.
+      let space = if repeated {
+        Mapping.identity()
+      } else {
+        run matrix.compose(&offset)
+      }
+      let instance = paints.paints.length()
+      run paints.paints.append(
+        PaintInstance.Gradient {
+          gradient: gradient,
+          transform: run space.compose(&Mapping.Affine { value: local }),
+        },
+      )
+      Paint.Server { index: instance }
+    }
+  }
+  if repeated {
+    // One image per tile of a retained picture; the pattern tile is the step.
+    let tile = Rect { xMin: 0.0, yMin: 0.0, xMax: placement.stepX, yMax: placement.stepY }
+    let content = used
+    let path = state.paths.length()
+    run state.paths.append(run svg.rectangle(0.0, 0.0, width, height, 0.0, 0.0))
+    let mut pictureShapes = List<ResolvedShape>.make()
+    run pictureShapes.append(
+      ResolvedShape {
+        path: path,
+        transform: Mapping.identity(),
+        strokeSpace: Option<usize>.None,
+        clip: Option<usize>.None,
+        bounds: tile,
+        style: content,
+      },
+    )
+    let mut pictureNodes = List<ResolvedNode>.make()
+    run pictureNodes.append(ResolvedNode.Paint { shape: 0, layer: PaintLayer.Fill })
+    let pattern = state.patterns.length()
+    if pattern >= graph.limits.maxOccurrences {
+      fail RenderError.TooLarge
+    }
+    run state.patterns.append(
+      ResolvedPattern {
+        clip: Option<Clip>.some(Clip { rectangle: tile, x: true, y: true }),
+        tile: tile,
+        contentBounds: Rect { xMin: 0.0, yMin: 0.0, xMax: width, yMax: height },
+        shapes: move pictureShapes,
+        nodes: move pictureNodes,
+      },
+    )
+    run state.patternDepths.append(0)
+    run state.patternReferences.append(0)
+    let instance = paints.paints.length()
+    run paints.paints.append(
+      PaintInstance.Pattern { pattern: pattern, transform: run matrix.compose(&offset) },
+    )
+    used.fill = Paint.Server { index: instance }
+  }
+  let path = state.paths.length()
+  run state.paths.append(run svg.rectangle(x0, y0, x1 - x0, y1 - y0, 0.0, 0.0))
+  let shape = shapes.length()
+  run shapes.append(
+    ResolvedShape {
+      path: path,
+      transform: matrix.*,
+      strokeSpace: Option<usize>.None,
+      clip: Option<usize>.None,
+      bounds: outputBounds,
+      style: used,
+    },
+  )
+  run nodes.append(ResolvedNode.Paint { shape: shape, layer: PaintLayer.Fill })
+  if let Option<Rect>.Some { value: area } = &clipBox {
+    let clipPath = state.paths.length()
+    run state.paths.append(
+      run svg.rectangle(area.xMin, area.yMin, area.width(), area.height(), 0.0, 0.0),
+    )
+    let clipping = state.clipNodes.length()
+    run state.clipNodes.append(
+      ClipNode.Shape { path: clipPath, transform: matrix.*, rule: FillRule.Nonzero },
+    )
+    run nodes.append(ResolvedNode.ApplyClip { index: clipping })
+  }
+  return luminance
+}
+
 effect fn paintMaskLayer(
   graph: &Graph,
   styles: &mut StyledGraph,
@@ -2788,7 +3041,22 @@ effect fn paintMaskLayer(
           blendMode: BlendMode.Normal,
         },
       )
-      run nodes.append(ResolvedNode.ConvertMask { luminance: false, linearRgb: false })
+
+      // #the-mask-image: none and unresolved references are transparent black
+      // layers; <image> layers are sized, positioned and tiled like backgrounds.
+      let luminance = run paintImageLayer(
+        graph,
+        &mut styles.*,
+        id,
+        layerIndex,
+        &mut state.*,
+        &mut paints.*,
+        matrix,
+        outputBounds,
+        &mut nodes.*,
+        &mut shapes.*,
+      )
+      run nodes.append(ResolvedNode.ConvertMask { luminance: luminance, linearRgb: false })
       return
     }
   }
