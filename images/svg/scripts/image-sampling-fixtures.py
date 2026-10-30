@@ -84,6 +84,14 @@ for name, transform in [('scaled', 'scale(1.8)'),
         wrap(image(source(3, 3), 2.8, 2.8, 'smooth')),
         'Complete device mapping determines the nearest integer expansion; the independent reference expands threefold before the same scale and rotation.')
 
+# This mild perspective keeps both finite-device magnification bounds between
+# 2.5 and 3.5, so the selected intermediate is independently threefold.
+wrap = lambda body: ('<g style="transform:matrix3d(1,0,0,0.01,0,1,0,0,0,0,1,0,0,0,0,1)">'
+                     + body + '</g>')
+add('projective', wrap(image(source(), 6, 6, 'pixelated')),
+    wrap(image(source(3, 3), 6, 6, 'smooth')),
+    'A finite perspective image uses a threefold independently expanded reference before the same projective bilinear mapping.')
+
 actual = image(source(), 5.2, 3.2, 'pixelated')
 reference = image(source(3, 2), 5.2, 3.2, 'smooth')
 for shift, width, height, mx, my in [(4, 3.2, 5.2, 2, 3), (8, 5.2, 3.2, 3, 2)]:
