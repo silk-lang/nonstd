@@ -82,7 +82,7 @@ references, and `feFlood`, `feOffset`, `feGaussianBlur`, `feMerge`, `feBlend`,
 `feDropShadow`, `feTurbulence`, `feConvolveMatrix`, `feDisplacementMap`,
 `feDiffuseLighting` and `feSpecularLighting` with the three light sources, in sRGB or
 linearRGB, also under rotation and skew; the CSS filter functions; `href` templates and
-SVG 1.1 `filterRes`. 115 reftests in `tests/fixtures/filters` compare them with equivalent
+SVG 1.1 `filterRes`. 116 reftests in `tests/fixtures/filters` compare them with equivalent
 shapes, spec expansions, markup equivalents or, for turbulence, images of the reference
 code's output. `feImage` and the background and paint inputs follow.
 

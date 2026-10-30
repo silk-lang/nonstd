@@ -635,6 +635,8 @@ decisions:
   space. A lighting primitive without a light source child produces transparent black; with
   several, the first counts. Negative `diffuseConstant` and `specularConstant` are invalid
   and leave 1. The sign of `limitingConeAngle` is ignored (the cone is symmetric).
+  `feSpecularLighting`'s `(Sr, Sg, Sb, max)` is taken as a premultiplied color, as its alpha
+  rule intends.
   `kernelUnitLength` (deprecated) is not implemented: normals use one-pixel deltas.
 - In this step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` read as
   transparent black, and `feImage` produces transparent black. They are still to be
