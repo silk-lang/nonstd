@@ -519,7 +519,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`, `a.begin`), `repeat(n)` syncbase-style values, indefinite; event, accessKey and wallclock values stay unresolved (no host timeline); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
 - [x] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
 - [ ] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes)
-- [ ] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t*
+- [x] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t* (see Animation sampling for the approximations)
 
 ### 5.14 Optional, last
 - [ ] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts. Not part of any mode, so only if Julia wants it
@@ -1014,6 +1014,26 @@ not). The angle comes from the highest-priority motion. This approximates a
 separate supplemental matrix in two ways. A non-default `transform-origin`
 also shifts the motion's rotation. A `transform` set in a stylesheet or
 `style` attribute overrides the written attribute, motion included.
+
+CSS Animations run in the same modes. After a first cascade, each element's
+computed `animation` and `animation-*` values (kept as source text by
+css/style) choose `@keyframes` rules, timed per
+[Web Animations](https://www.w3.org/TR/web-animations-1/#calculating-the-directed-progress)
+with delays, iteration counts, directions, fill modes and `paused`. Each
+keyframe segment is eased by the keyframe's own `animation-timing-function`,
+or else the animation's (cubic Bézier and steps; `linear()` counts as
+`linear`). The sampled declarations go into an animated `style` attribute,
+and a second cascade reads them at the animation origin, below SMIL values for
+the same property. Each source element is sampled once, from its first
+occurrence. The approximations are these:
+
+- Longhands that differ from their initial value override the matching part
+  of the `animation` shorthand, whatever their order.
+- A missing 0% or 100% keyframe uses the element's presentation attribute, or
+  else the property's initial value, not the computed value. A unitless
+  attribute next to px keyframes interpolates as px.
+- Values interpolate as for SMIL: numbers inside matching text, and colours
+  per channel.
 
 Two choices differ from the specification:
 
