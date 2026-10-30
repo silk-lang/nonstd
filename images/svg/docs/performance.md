@@ -351,3 +351,88 @@ python3 images/svg/bench/compressed.py \
 JSON records input and binary hashes, all native samples and output checksums.
 Callgrind uses one iteration and zero warmup in separate runs and includes setup,
 parsing, rendering, hashing and destruction. Omit it on hosts without Valgrind.
+
+### Raster image integration
+
+PNG/JPEG `<image>` loading and retained sampling were measured on the same
+Linux ARM64 VM with dev.32 and LLVM 22.1.8. The A/B below isolates renderer
+snapshot `085bb87` against `92c0ad9` (compressed documents plus JPEG codecs),
+using three fresh-process samples, one parse+record iteration, no warmup, and
+separate full-process Callgrind runs. Every output checksum remained identical.
+The later data-URL correction has no input in these 138 workload SVG files
+(they contain no data URLs); the unrelated main-branch cmap optimization is
+also excluded from this isolation. Wall times are noisy shared-VM observations;
+Ir is the regression measure. The tracked baseline was not replaced.
+
+| Workload | Old Ir | Image integration Ir | Ir change | Old parse+record ms | New ms |
+|---|---:|---:|---:|---:|---:|
+| clipping | 1,863,818,283 | 1,863,985,808 | +0.009% | 2.773 | 3.031 |
+| compositing | 548,509,457 | 548,731,873 | +0.041% | 3.845 | 4.384 |
+| iconset | 649,437,253 | 650,719,208 | +0.197% | 21.624 | 21.571 |
+| instances | 1,150,868,416 | 1,152,453,435 | +0.138% | 70.540 | 76.767 |
+| largemap | 1,005,917,101 | 1,006,953,070 | +0.103% | 31.462 | 32.438 |
+| masking | 4,967,157,708 | 4,967,301,204 | +0.003% | 4.143 | 3.473 |
+| mixedcurves | 476,219,009 | 476,712,391 | +0.104% | 10.603 | 10.443 |
+| paintservers | 338,732,028 | 338,978,647 | +0.073% | 5.135 | 4.951 |
+| stylesheets | 1,039,134,399 | 1,040,664,198 | +0.147% | 59.091 | 84.993 |
+| tiger | 444,419,652 | 444,670,607 | +0.056% | 6.798 | 6.496 |
+
+The pinned resvg benchmark now explicitly enables `raster-images` as well as
+`svgz`; its Git revision and registry versions/checksums remain unchanged.
+The existing-workload reference comparison uses the same sample configuration.
+It does not claim identical outputs where earlier geometry/paint differences remain.
+
+| Workload | Silk parse+record ms | resvg ms | Silk/resvg | Equal checksum |
+|---|---:|---:|---:|---|
+| clipping | 3.107 | 0.437 | 7.112 | no |
+| compositing | 4.495 | 0.320 | 14.029 | no |
+| iconset | 24.968 | 2.290 | 10.902 | no |
+| instances | 80.696 | 6.772 | 11.916 | yes |
+| largemap | 38.589 | 3.348 | 11.525 | no |
+| masking | 2.918 | 0.505 | 5.780 | no |
+| mixedcurves | 12.472 | 1.302 | 9.582 | no |
+| paintservers | 5.823 | 0.765 | 7.616 | no |
+| stylesheets | 48.746 | 74.623 | 0.653 | yes |
+| tiger | 8.153 | 1.224 | 6.661 | no |
+
+`bench/images.py` generates original 512×384 grayscale-block PNG/JPEG inputs,
+with either one image or 64 references to the same data URL. The following
+measurement uses `a8d7ca1`, including the forgiving-Base64 fix and main rebase,
+with one iteration, zero warmup and three alternating fresh-process samples.
+All four inputs have equal Silk/resvg output checksums in every measured stage.
+
+Silk decodes once while constructing the retained tree and reuses samples;
+[pinned resvg decodes raster bytes while rendering each image](https://github.com/linebender/resvg/blob/91455ee06d08ac2bfeab2b035ed2cfbfd0a68614/crates/resvg/src/image.rs#L159).
+Consequently parse and render timings include different work; end-to-end cost
+is the comparable total. Full-process Ir includes startup, input loading and
+checksum work, and must not be read as stage-only instructions.
+
+| Input | Silk parse ms | resvg parse ms | Silk render ms | resvg render ms | Silk total ms | resvg total ms | Total Ir Silk/resvg |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| jpeg-1.svg | 1.605 | 0.015 | 3.463 | 1.268 | 5.278 | 1.299 | 6.745 |
+| jpeg-64.svg | 3.712 | 0.975 | 3.185 | 11.102 | 6.975 | 12.189 | 0.897 |
+| png-1.svg | 2.997 | 0.008 | 3.219 | 1.949 | 6.353 | 1.733 | 6.665 |
+| png-64.svg | 4.406 | 0.337 | 3.277 | 43.895 | 7.271 | 43.976 | 0.243 |
+
+Single-image total cost remains slower than resvg and belongs to phase 14.
+Shared decoded assets make the repeated-image cases cheaper; this is a measured
+cache benefit, not a claim of overall renderer parity or complete image conformance.
+The retained CPU executor currently copies each decoded asset into its backend
+pixmap once per execution; removing that copy is an open performance opportunity.
+
+Reproduction (the input generator needs Pillow; the measurement runner uses only
+Python's standard library):
+
+```sh
+python3 images/svg/bench/images.py --generate build/svg/image-bench-inputs
+python3 images/svg/scripts/rust-bench/build
+silk build --release --manifest-path images/svg/bench/silk.toml
+python3 images/svg/bench/images.py --inputs build/svg/image-bench-inputs \
+  --silk build/llvm/aarch64-unknown-linux-gnu/release/images-svg-bench \
+  --rust images/svg/scripts/rust-bench/target/release/svg-reference-bench \
+  --iterations 1 --warmup 0 --samples 3 --callgrind \
+  --output build/svg/images-measured.json
+```
+
+The JSON includes binary/input hashes, native samples, output checksums and full
+process instruction counts. Reports remain ignored build artifacts.
