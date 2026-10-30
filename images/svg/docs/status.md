@@ -103,7 +103,7 @@ Phase-7 compressed-document work recognizes gzip/zlib root SVG sources and
 external SVG source references, including compressed data URLs and concatenated
 gzip members. XML encoding detection follows decompression. Checksums, truncation,
 optional headers, streaming output and aggregate expansion limits have dedicated
-tests. Nested SVG image consumers are still pending.
+tests. Nested SVG images use the same compressed-response parser.
 
 Raster image integration now retains PNG/JPEG assets across image occurrences,
 resolves intrinsic/auto sizes, applies EXIF orientation, and maps samples through
@@ -115,7 +115,13 @@ fixtures cover sizing, meet/slice/none, opacity, use instances and projective
 placement. CSS `image-orientation` supports inherited metadata selection, `none`,
 angles rounded to quarter turns, and horizontal flipping after rotation. Natural
 dimensions follow each occurrence’s orientation while decoded pixels remain shared.
-Nested SVG images and CSS image masks still need integration; phase 7 is not complete.
+Nested SVG images now retain independent secure documents with per-viewport layout.
+Root intrinsic dimensions, selected fragments and viewBox ratios determine image
+fitting; outer CSS does not enter the child. Equal sources and logical viewports
+share a retained picture, while different viewports compute separate media and
+percentage contexts. Child geometry, paints and clip planes execute under the
+full device mapping, including projective placement, without an intrinsic-size
+raster intermediate. CSS image masks still need integration; phase 7 is not complete.
 
 The curated resvg set includes eight image cases with strict non-pass expectations.
 Six retain sampling/sample-conversion or transformed-edge differences; two reference

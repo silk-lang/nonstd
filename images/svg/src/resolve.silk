@@ -7,6 +7,7 @@ import scene {
   RenderOptions,
   RenderError,
   RenderTree,
+  EmbeddedImage,
   ResolvedNode,
   ResolvedShape,
   StrokeSpace,
@@ -25,7 +26,7 @@ import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, C
 import used_masks
 import used_clips
 import svg_css.value_keywords { Keyword }
-import image_assets { Store as ImageStore }
+import image_assets { DocumentMetadata, Store as ImageStore }
 import used_images
 import used_images { NaturalSize }
 import used_geometry
@@ -266,6 +267,9 @@ effect fn embeddedSizing(size: Size, maxPixels: usize) -> Viewport
 }
 
 struct Plan {
+  document: Option<usize>,
+  imageViewport: Size,
+  imageBounds: Rect,
   image: Option<usize>,
   imageMapping: Transform,
   occurrence: OccurrenceId,
@@ -459,6 +463,7 @@ fn paintComponents(paint: &Paint) -> [f64; 4] {
 // A referenced subtree gets one plan per renderable node, not an entire
 // document-sized array for every marker or pattern instance.
 struct Planning {
+  embedded: List<EmbeddedImage>,
   images: ImageStore,
   metadata: MetadataCache,
   paths: List<Path>,
@@ -789,6 +794,9 @@ effect fn prepare(
   let mut disabled = false
   let mut path = Option<usize>.None
   let mut image = Option<usize>.None
+  let mut imageDocument = Option<usize>.None
+  let mut imageViewport = Size.new(0.0, 0.0)
+  let mut imageBounds = Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
   let mut imageMapping = Transform.identity()
   let mut paintable = false
   let mut ownBounds = false
@@ -906,6 +914,61 @@ effect fn prepare(
         paintable = true
         ownBounds = true
       }
+    } else if let Option<usize>.Some { value: candidate } = &state.images.findDocument(source) {
+      if let Option<DocumentMetadata>.Some {
+        value: metadata
+      } = &state.images.documents.asSlice()[candidate].metadata {
+        let engine = &styles.catalog.engine
+        let size = run used_images.size(
+          engine.number(styleId, Property.Width, viewport.width()),
+          engine.number(styleId, Property.Height, viewport.height()),
+          metadata.natural,
+        )
+        let x = match &engine.number(styleId, Property.X, viewport.width()) {
+          Option<f64>.Some { value } => value
+          _ => 0.0
+        }
+        let y = match &engine.number(styleId, Property.Y, viewport.height()) {
+          Option<f64>.Some { value } => value
+          _ => 0.0
+        }
+        let target = run rectangle(x, y, size.width, size.height)
+        let bytes = match &Document.attribute(document, source.node, b"", b"preserveAspectRatio") {
+          Option<&[u8]>.Some { value } => value
+          _ => b""
+        }
+        let mut aspect = match &svg.aspectRatio(bytes) {
+          Option<AspectRatio>.Some { value } => value
+          _ => AspectRatio { alignment: Alignment.XMidYMid, slice: false, defer: false }
+        }
+        if aspect.defer {
+          if let Option<AspectRatio>.Some { value } = &metadata.aspect {
+            aspect = value
+          }
+        }
+        let rendered = match &metadata.natural.ratio {
+          Option<f64>.Some { value: ratio } => match &used_images.fit(ratio, 1.0, target, aspect) {
+            Option<Transform>.Some { value } => run rectangle(
+              value.e,
+              value.f,
+              value.a * ratio,
+              value.d,
+            )
+            _ => target
+          }
+          _ => target
+        }
+        if rendered.width() > 0.0 && rendered.height() > 0.0 {
+          imageDocument = Option<usize>.some(candidate)
+          imageViewport = Size.new(rendered.width(), rendered.height())
+          imageBounds = target
+          imageMapping = Transform.translation(rendered.xMin, rendered.yMin)
+          path = Option<usize>.some(state.paths.length())
+          run state.paths.append(run svg.rectangle(x, y, size.width, size.height, 0.0, 0.0))
+          paintable = true
+          ownBounds = true
+        }
+      }
     }
   } else if drawable {
     let geometry = run used_geometry.shape(
@@ -951,6 +1014,9 @@ effect fn prepare(
   run state.plans.append(
     Plan {
       image: image,
+      document: imageDocument,
+      imageViewport: imageViewport,
+      imageBounds: imageBounds,
       imageMapping: imageMapping,
       occurrence: id,
       firstChild: Option<usize>.None,
@@ -1793,10 +1859,21 @@ effect fn pictureBounds(
   shapes: &mut List<ResolvedShape>,
   nodes: &mut List<ResolvedNode>,
   clip: Option<Clip>,
+  tile: Rect,
 ) -> Rect
   ! RenderError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
   let mut result = Option<Rect>.None
+  let mut n: usize = 0
+  while n < nodes.length() {
+    if let ResolvedNode.Embedded { image: _, transform: _, clip: _ } = &nodes.asSlice()[n] {
+      // Child layouts arrive after occurrence sizing. Keep the paint server live;
+      // finishEmbedded expands this provisional bound before recording.
+      result = Option<Rect>.some(tile)
+      break
+    }
+    n = n + 1
+  }
   let mut i: usize = 0
   while i < shapes.length() {
     let shape = &shapes.asSlice()[i]
@@ -2082,6 +2159,7 @@ effect fn resourcePaint(
       // arena indices while their shape indices remain local to each picture.
       run state.patterns.append(
         ResolvedPattern {
+          clip: layout.clip,
           tile: layout.physical,
           contentBounds: Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 },
           shapes: List<ResolvedShape>.make(),
@@ -2167,7 +2245,13 @@ effect fn resourcePaint(
         state.resourceAncestry = previous
         drop state.activePatterns.pop()
       }
-      let contentBounds = run pictureBounds(&mut state.*, &mut shapes, &mut nodes, layout.clip)
+      let contentBounds = run pictureBounds(
+        &mut state.*,
+        &mut shapes,
+        &mut nodes,
+        layout.clip,
+        layout.physical,
+      )
       let mut depths = state.patternDepths.asMutSlice()
       depths[index] = state.depthPeak - depth
       let mut referenceDepths = state.patternReferences.asMutSlice()
@@ -2180,6 +2264,7 @@ effect fn resourcePaint(
       }
       let mut entries = state.patterns.asMutSlice()
       entries[index] = ResolvedPattern {
+        clip: layout.clip,
         tile: layout.physical,
         contentBounds: contentBounds,
         shapes: move shapes,
@@ -2993,7 +3078,7 @@ effect fn paintPrepared(
     }
     _ => {}
   }
-  let mut used = if plan.image.isNone()
+  let mut used = if plan.image.isNone() && plan.document.isNone()
     && ((plan.paintable && plan.style.visible) || plan.instance) {
     run nodePaints(
       graph,
@@ -3078,7 +3163,8 @@ effect fn paintPrepared(
   }
   let clipping = run referencedClip(graph, &mut styles.*, id, &mut state.*, matrix, limits, depth)
   let masked = used_masks.present(&styles.catalog.engine, plan.styleId)
-  let layer = masked || clipping.isSome() || plan.style.opacity != 1.0 || plan.style.isolated
+  let layer = plan.document.isSome() || masked || clipping.isSome() || plan.style.opacity != 1.0
+    || plan.style.isolated
     || plan.style.blendMode != BlendMode.Normal
   if layer {
     run nodes.append(
@@ -3090,7 +3176,48 @@ effect fn paintPrepared(
       },
     )
   }
-  if plan.paintable && plan.style.visible {
+  if plan.paintable && plan.style.visible && plan.document.isSome() {
+    if let Option<usize>.Some { value: source } = &plan.document {
+      let boundary = run used_viewports.clipping(
+        &styles.catalog.engine,
+        plan.styleId,
+        plan.imageBounds,
+        Transform.identity(),
+      )
+      let mut imageClip = clip
+      if let Option<Clip>.Some { value } = &boundary {
+        imageClip = run matrix.clipRectangle(
+          value.rectangle,
+          value.x,
+          value.y,
+          imageClip,
+          &mut clips.*,
+        )
+      }
+      let mut image: usize = 0
+      while image < state.embedded.length() {
+        let entry = &state.embedded.asSlice()[image]
+        if entry.source == source && entry.viewport.width == plan.imageViewport.width
+          && entry.viewport.height == plan.imageViewport.height {
+          break
+        }
+        image = image + 1
+      }
+      if image == state.embedded.length() {
+        run state.embedded.append(
+          EmbeddedImage {
+            source: source,
+            viewport: plan.imageViewport,
+            tree: Option<RenderTree>.None,
+          },
+        )
+      }
+      let transform = run matrix.compose(&Mapping.Affine { value: plan.imageMapping })
+      run nodes.append(
+        ResolvedNode.Embedded { image: image, transform: transform, clip: imageClip },
+      )
+    }
+  } else if plan.paintable && plan.style.visible {
     match &plan.path {
       Option<usize>.Some { value } => {
         let shape = shapes.length()
@@ -3341,6 +3468,7 @@ effect fn resolveStyled(
   let mut dashes = List<List<f64>>.make()
   run dashes.append(List<f64>.make())
   let mut state = Planning {
+    embedded: List<EmbeddedImage>.make(),
     images: move images,
     metadata: move sourceMetadata,
     paths: move paths,
@@ -3459,6 +3587,8 @@ effect fn resolveStyled(
     _ => {}
   }
   return RenderTree {
+    documents: move state.images.documents,
+    embedded: move state.embedded,
     images: move state.images.assets,
     width: viewport.pixelsWidth,
     height: viewport.pixelsHeight,
@@ -3590,4 +3720,162 @@ pub effect fn resolve(
     initialWidth,
     initialHeight,
   )
+}
+
+// Bound a rectangle using the same affine/projective geometry machinery as paths.
+effect fn mappedImageRectangle(rectangle: Rect, transform: &Mapping) -> Option<Rect>
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut paths = List<Path>.make()
+  run paths.append(
+    run svg.rectangle(
+      rectangle.xMin,
+      rectangle.yMin,
+      rectangle.width(),
+      rectangle.height(),
+      0.0,
+      0.0,
+    ),
+  )
+  let mut cache = ReferenceBoundsCache.make()
+  return run cache.fillBounds(paths.asSlice(), 0, transform, 0.0000001)
+}
+
+effect fn embeddedPaintBounds(
+  tree: &RenderTree,
+  viewport: Size,
+  placement: &Mapping,
+  depth: usize,
+) -> Option<Rect>
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if depth >= 64 {
+    fail RenderError.TooLarge
+  }
+  let physical = Rect { xMin: 0.0, yMin: 0.0, xMax: viewport.width, yMax: viewport.height }
+  if let Option<StyleId>.Some { value } = &tree.styles.nodeStyle(tree.graph.root) {
+    if let Option<Clip>.Some { value: boundary } = &(run used_viewports.clipping(
+      &tree.styles.catalog.engine,
+      value,
+      physical,
+      Transform.identity(),
+    )) {
+      if boundary.x && boundary.y {
+        return run mappedImageRectangle(boundary.rectangle, placement)
+      }
+    }
+  }
+  let mut result = Option<Rect>.None
+  let mut cache = ReferenceBoundsCache.make()
+  let mut i: usize = 0
+  while i < tree.shapes.length() {
+    let shape = &tree.shapes.asSlice()[i]
+    let transform = run placement.compose(&shape.transform)
+    if present(&shape.style.fill, 0) && shape.style.fillOpacity > 0.0 {
+      result = run paintedUnion(
+        result,
+        run cache.fillBounds(tree.paths.asSlice(), shape.path, &transform, 0.0000001),
+      )
+    }
+    if present(&shape.style.stroke, 0) && shape.style.strokeOpacity > 0.0
+      && shape.style.strokeWidth > 0.0 {
+      let space = match &shape.strokeSpace {
+        Option<usize>.Some { value } => {
+          let original = tree.strokeSpaces.asSlice()[value]
+          Option<StrokeSpace>.some(
+            StrokeSpace {
+              pathToHost: original.pathToHost,
+              hostToDevice: run placement.compose(&original.hostToDevice),
+            },
+          )
+        }
+        _ => Option<StrokeSpace>.None
+      }
+      result = run paintedUnion(
+        result,
+        run cache.paintedStrokeBounds(
+          tree.paths.asSlice(),
+          shape.path,
+          &shape.style,
+          &transform,
+          space,
+          tree.dashes.asSlice()[shape.style.dashIndex].asSlice(),
+        ),
+      )
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < tree.nodes.length() {
+    if let ResolvedNode.Embedded { image, transform, clip: _ } = &tree.nodes.asSlice()[i] {
+      let entry = &tree.embedded.asSlice()[image]
+      if let Option<RenderTree>.Some { value } = &entry.tree {
+        result = run paintedUnion(
+          result,
+          run embeddedPaintBounds(
+            &value,
+            entry.viewport,
+            &(run placement.compose(&transform)),
+            depth + 1,
+          ),
+        )
+      }
+    }
+    i = i + 1
+  }
+  return result
+}
+
+/// Complete pattern overflow bounds after independent image layouts are loaded.
+/// Fully clipped tiles already have a conservative bound
+/// visible overflow must
+/// include the child picture rather than only the image positioning rectangle.
+pub effect fn finishEmbedded(tree: &mut RenderTree) -> ()
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut p: usize = 0
+  while p < tree.patterns.length() {
+    let pattern = &tree.patterns.asSlice()[p]
+    let fullyClipped = match &pattern.clip {
+      Option<Clip>.Some { value } => value.x && value.y
+      _ => false
+    }
+    if fullyClipped {
+      p = p + 1
+      continue
+    }
+    let mut result = Option<Rect>.some(pattern.contentBounds)
+    let mut i: usize = 0
+    while i < pattern.nodes.length() {
+      if let ResolvedNode.Embedded { image, transform, clip: _ } = &pattern.nodes.asSlice()[i] {
+        let entry = &tree.embedded.asSlice()[image]
+        if let Option<RenderTree>.Some { value } = &entry.tree {
+          result = run paintedUnion(
+            result,
+            run embeddedPaintBounds(&value, entry.viewport, &transform, 0),
+          )
+        }
+      }
+      i = i + 1
+    }
+    if let Option<Rect>.Some { value } = &result {
+      let mut bounds = value
+      if let Option<Clip>.Some { value: boundary } = &pattern.clip {
+        if boundary.x {
+          bounds.xMin = f64.max(bounds.xMin, boundary.rectangle.xMin)
+          bounds.xMax = f64.min(bounds.xMax, boundary.rectangle.xMax)
+        }
+        if boundary.y {
+          bounds.yMin = f64.max(bounds.yMin, boundary.rectangle.yMin)
+          bounds.yMax = f64.min(bounds.yMax, boundary.rectangle.yMax)
+        }
+      }
+      if bounds.xMax < bounds.xMin || bounds.yMax < bounds.yMin {
+        bounds = Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+      }
+      let entries = tree.patterns.asMutSlice()
+      entries[p].contentBounds = bounds
+    }
+    p = p + 1
+  }
 }

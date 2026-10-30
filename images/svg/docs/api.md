@@ -71,7 +71,12 @@ graph retains non-rendering sources as well as selected rendering instances.
 selected view. A stylesheet rule set is scoped to its source document, while
 all sets share one value/path arena. CSS path handles resolve in `RenderTree.paths`
 after its single move from the CSS store. `record` consumes the tree and retains
-only drawing data.
+only drawing data. `RenderTree.documents` owns embedded image responses and
+`RenderTree.embedded` holds layouts keyed by source and logical viewport. Recording
+moves these into `DisplayList.embedded`; `Command.Embedded` references a child
+picture and carries its placement and viewport clip. Broken sources have no child
+picture. `parseEmbedded` provides independent secure layout in an exact logical
+viewport; rounding only affects its standalone output allocation, not geometry.
 `DisplayList.projectionClips` contains device-space homogeneous halfplane chains
 for physical viewport boundaries and nested positive-w flattening boundaries.
 Parents precede children; execution validates that ordering and command indices.
