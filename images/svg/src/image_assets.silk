@@ -1,5 +1,5 @@
 //! Owned decoded image resources, shared by all occurrences of a source node.
-import structure { Graph, SourceId }
+import structure { Graph, SourceId, OccurrenceId }
 import structure
 import resources { Resolver, ResourceKind, ResourceError, Policy, Response, fetchWithPolicy }
 import url { Url, UrlError }
@@ -9,11 +9,20 @@ import svg_geometry.svg { AspectRatio }
 import svg_xml.xml { Document, NodeId }
 import svg_css.tokens { equal }
 import svg_image.image { Image, ImageError }
-import svg_image.png { PngError, Metadata as PngMetadata }
+import svg_image.png { PngError, Metadata as PngMetadata, Chromaticities }
 import svg_image.png
 import svg_image.jpeg { JpegError, Metadata as JpegMetadata }
 import svg_image.jpeg
+import svg_image.icc { Transform }
+import svg_image.icc
+import document_styles { StyledGraph }
+import color_profiles { Profiles }
+import svg_css.computed { ComputedValue, StyleId }
+import svg_css.properties { Property }
+import svg_css.values { Value }
+import svg_css.value_keywords { Keyword }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.collections.hash { Hash, HashKey, HashSeed }
 import silk.collections.hash_map { HashMap }
 import silk.core.ownership { Copy }
@@ -105,6 +114,8 @@ pub struct Store {
   layers: HashMap<LayerKey, LayerSource>,
   cache: List<Cached>,
   budget: Option<Budget>,
+  // Per-occurrence assets converted for a non-auto `color-profile`.
+  variants: HashMap<usize, usize>,
 }
 
 impl Store {
@@ -118,6 +129,7 @@ impl Store {
       layers: HashMap<LayerKey, LayerSource>.make(Hash.seed(0)),
       cache: List<Cached>.make(),
       budget: Option<Budget>.None,
+      variants: HashMap<usize, usize>.make(Hash.seed(0)),
     }
   }
 
@@ -136,6 +148,15 @@ impl Store {
     return Option<usize>.some(nodes[source.node.index])
   }
 
+  /// The asset an image occurrence paints: its `color-profile` variant, if any,
+  /// else the element's shared asset.
+  pub fn findOccurrence(self: &Self, occurrence: OccurrenceId, source: SourceId) -> Option<usize> {
+    if let Option<usize>.Some { value } = &self.variants.get(occurrence.index) {
+      return Option<usize>.some(value)
+    }
+    return self.find(source)
+  }
+
   pub fn findDocument(self: &Self, source: SourceId) -> Option<usize> {
     if source.document.index >= self.documentIndices.length() {
       return Option<usize>.None
@@ -152,6 +173,53 @@ struct Cached {
   url: Url,
   asset: usize,
   document: usize,
+}
+
+fn convert(transform: &Option<Transform>, image: &mut Image) -> () {
+  match &transform.* {
+    Option<Transform>.Some { value } => {
+      if !icc.isIdentity(&value) {
+        icc.apply(&value, &mut image.*)
+      }
+    }
+    Option<Transform>.None => {}
+  }
+}
+
+fn present<T>(value: &Option<T>) -> bool {
+  return match &value.* {
+    Option<T>.Some { value: _ } => true
+    Option<T>.None => false
+  }
+}
+
+/// The conversion the image's own colour description asks for. PNG-3 §12.2: iCCP,
+/// then sRGB, then gAMA/cHRM; JPEG uses its APP2 profile. None means sRGB.
+effect fn embedded(color: &ColorMetadata) -> Option<Transform>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &color.* {
+    ColorMetadata.Png { value } => {
+      let profile = Bytes.asSlice(&value.iccProfile)
+      if profile.length > 0 {
+        run icc.fromProfile(profile)
+      } else if present<u8>(&value.srgbIntent) {
+        Option<Transform>.None
+      } else if present<u32>(&value.gamma) || present<Chromaticities>(&value.chromaticities) {
+        run icc.fromPng(&value.gamma, &value.chromaticities)
+      } else {
+        Option<Transform>.None
+      }
+    }
+    ColorMetadata.Jpeg { value } => {
+      let profile = Bytes.asSlice(&value.iccProfile)
+      if profile.length > 0 {
+        run icc.fromProfile(profile)
+      } else {
+        Option<Transform>.None
+      }
+    }
+  }
 }
 
 effect fn decode(data: &[u8]) -> Asset
@@ -456,4 +524,208 @@ effect fn fetchInto(
   }
   run store.cache.append(Cached { url: move url, asset: index, document: documentIndex })
   return Found { asset: index, document: documentIndex }
+}
+
+union Choice {
+  Embedded,
+  Srgb,
+  Profile { entry: usize },
+}
+
+impl Copy for Choice {}
+
+// The SVG 1.1 `color-profile` property on an image (1.1 §12.3.3): auto keeps the
+// embedded description, sRGB ignores it, and a name or IRI selects a
+// `color-profile` element. Unknown names and IRIs keep the embedded description.
+fn choice(
+  styles: &StyledGraph,
+  profiles: &Profiles,
+  occurrence: OccurrenceId,
+  document: usize,
+) -> Choice {
+  let engine = &styles.catalog.engine
+  let style = match &styles.nodeStyle(occurrence) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      return Choice.Embedded
+    }
+  }
+  let entry = match &engine.get(style, Property.ColorProfile) {
+    Option<ComputedValue>.Some { value } => value
+    _ => {
+      return Choice.Embedded
+    }
+  }
+  let found = match &engine.values.get(entry.value).* {
+    Value.Keyword { keyword } => {
+      if keyword == Keyword.SRGB {
+        return Choice.Srgb
+      }
+      return Choice.Embedded
+    }
+    Value.Profile { name } => profiles.named(document, engine.values.text(name))
+    Value.Resource { url } => {
+      let text = engine.values.text(url)
+      if text.length < 2 || text[0] != 35 {
+        return Choice.Embedded
+      }
+      profiles.element(document, Slice.view<u8>(text, 1, text.length - 1))
+    }
+    _ => Option<usize>.None
+  }
+  return match &found {
+    Option<usize>.Some { value } => Choice.Profile { entry: value }
+    _ => Choice.Embedded
+  }
+}
+
+effect fn metadataCopy(color: &ColorMetadata) -> ColorMetadata
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &color.* {
+    ColorMetadata.Png { value } => ColorMetadata.Png {
+      value: PngMetadata {
+        gamma: value.gamma,
+        chromaticities: value.chromaticities,
+        srgbIntent: value.srgbIntent,
+        iccProfile: Bytes.make(),
+      },
+    }
+    ColorMetadata.Jpeg { value } => ColorMetadata.Jpeg {
+      value: JpegMetadata { orientation: value.orientation, iccProfile: Bytes.make() },
+    }
+  }
+}
+
+struct Variant {
+  asset: usize,
+  choice: Choice,
+  index: usize,
+}
+
+impl Copy for Variant {}
+
+fn sameChoice(a: Choice, b: Choice) -> bool {
+  return match &a {
+    Choice.Embedded => match &b {
+      Choice.Embedded => true
+      _ => false
+    }
+    Choice.Srgb => match &b {
+      Choice.Srgb => true
+      _ => false
+    }
+    Choice.Profile { entry: left } => match &b {
+      Choice.Profile { entry: right } => left == right
+      _ => false
+    }
+  }
+}
+
+/// Converts every decoded image to sRGB. Image occurrences whose `color-profile`
+/// is not `auto` get their own converted copy, shared between occurrences that make
+/// the same choice for the same asset; the rest share the asset converted with its
+/// embedded description. Copies count against the retained-byte budget.
+pub effect fn applyProfiles(
+  store: &mut Store,
+  graph: &Graph,
+  styles: &StyledGraph,
+  profiles: &Profiles,
+) -> ()
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let sources = store.assets.length()
+  let mut made = List<Variant>.make()
+  let mut index: usize = 0
+  while index < graph.occurrences.length() {
+    let occurrence = OccurrenceId { index: index }
+    index = index + 1
+    let source = graph.occurrences.asSlice()[occurrence.index].source
+    let asset = match &store.find(source) {
+      Option<usize>.Some { value } => value
+      _ => {
+        continue
+      }
+    }
+    let document = &graph.documents.asSlice()[source.document.index].document
+    if !equal(Document.localName(document, source.node), b"image") {
+      continue
+    }
+    let selected = choice(styles, profiles, occurrence, source.document.index)
+    if sameChoice(selected, Choice.Embedded) {
+      continue
+    }
+    let mut existing = usize.MAX
+    let mut v: usize = 0
+    while v < made.length() {
+      let entry = made.get(v)
+      if entry.asset == asset && sameChoice(entry.choice, selected) {
+        existing = entry.index
+      }
+      v = v + 1
+    }
+    if existing == usize.MAX {
+      let original = &store.assets.asSlice()[asset]
+      let width = original.image.width()
+      let height = original.image.height()
+      let count = u32.toUsize(width) * u32.toUsize(height) * 4
+      if let Option<Budget>.Some { value } = &store.budget {
+        if count > value.retained {
+          fail RenderError.TooLarge
+        }
+        store.budget = Option<Budget>.some(
+          Budget {
+            pixels: value.pixels,
+            remaining: value.remaining,
+            retained: value.retained - count,
+            urls: value.urls,
+          },
+        )
+      }
+
+      // The source already passed the same dimension checks.
+      let allocated = run Effect.result(Image.make(width, height))
+      let mut image = match move allocated {
+        Result<Image, ImageError | OutOfMemoryError>.Success { value } => move value
+        Result<Image, ImageError | OutOfMemoryError>.Failure { error } => {
+          match &error {
+            OutOfMemoryError problem => {
+              fail OutOfMemoryError {}
+            }
+            _ => {
+              fail RenderError.TooLarge
+            }
+          }
+        }
+      }
+      let target = image.dataMut()
+      let samples = original.image.data()
+      let mut i: usize = 0
+      while i < samples.length {
+        target[i] = samples[i]
+        i = i + 1
+      }
+      drop target
+      match &selected {
+        Choice.Profile { entry } => {
+          let chosen = &profiles.entries.asSlice()[entry]
+          let transform = run icc.fromProfileWith(chosen.data.asSlice(), chosen.renderingIntent())
+          convert(&transform, &mut image)
+        }
+        _ => {}
+      }
+      let color = run metadataCopy(&original.color)
+      existing = store.assets.length()
+      run store.assets.append(Asset { image: move image, color: move color })
+      run made.append(Variant { asset: asset, choice: selected, index: existing })
+    }
+    drop run store.variants.insert(occurrence.index, existing)
+  }
+  let mut a: usize = 0
+  while a < sources {
+    let transform = run embedded(&store.assets.asSlice()[a].color)
+    convert(&transform, &mut store.assets.asMutSlice()[a].image)
+    a = a + 1
+  }
+  run settle(&mut store.*, graph)
 }

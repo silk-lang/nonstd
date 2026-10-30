@@ -46,12 +46,18 @@ import svg_css.encoding { Encoding }
 import svg_css.encoding
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.option { Option }
 import silk.num.usize
+
+fn startsInsensitive(bytes: &[u8], prefix: &[u8]) -> bool {
+  return bytes.length >= prefix.length
+    && insensitive(Slice.view<u8>(bytes, 0, prefix.length), prefix)
+}
 
 pub struct RuleSetId {
   pub index: usize,
@@ -89,12 +95,42 @@ struct StyleRule {
   origin: Origin,
 }
 
+/// One declaration of a keyframe: the property name and its value text, both verbatim.
+pub struct KeyframeValue {
+  pub name: Bytes,
+  pub value: Bytes,
+}
+
+/// A keyframe block with its offsets in [0, 1] (CSS Animations 1 #keyframes).
+pub struct Keyframe {
+  pub offsets: List<f64>,
+  pub values: List<KeyframeValue>,
+  /// animation-timing-function inside the keyframe, which times the segment after it.
+  pub timing: Option<Bytes>,
+}
+
+/// An SVG 1.1 @color-profile rule whose `src` loaded (1.1 §12.3.1 #ColorProfileAtRule).
+pub struct SheetProfile {
+  pub name: Bytes,
+  pub data: Bytes,
+  /// The `rendering-intent` descriptor as an ICC intent 0 to 3, or 4 for `auto`.
+  pub intent: u32,
+}
+
+/// An @keyframes rule. A later rule with the same name replaces an earlier one.
+pub struct Keyframes {
+  pub name: Bytes,
+  pub frames: List<Keyframe>,
+}
+
 pub struct Catalog {
   pub buffers: List<TokenBuffer>,
   pub declarations: List<Declaration>,
   pub engine: Engine,
   /// The faces of @font-face rules whose source loaded, in rule order.
   pub fontFaces: List<DocumentFace>,
+  pub keyframes: List<Keyframes>,
+  pub colorProfiles: List<SheetProfile>,
   sources: List<Source>,
   urls: List<Url>,
   cache: List<Cached>,
@@ -251,6 +287,8 @@ impl Catalog {
       declarations: List<Declaration>.make(),
       engine: Engine.make(closing),
       fontFaces: List<DocumentFace>.make(),
+      keyframes: List<Keyframes>.make(),
+      colorProfiles: List<SheetProfile>.make(),
       sources: move sources,
       urls: List<Url>.make(),
       cache: List<Cached>.make(),
@@ -675,10 +713,247 @@ impl Catalog {
         } else if insensitive(name, b"keyframes") && rule.kind == RuleKind.AtBlock {
           importsAllowed = false
           namespacesAllowed = false
+          run self.keyframesRule(buffer, rule.prelude, rule.body, limits)
+        } else if insensitive(name, b"color-profile") && rule.kind == RuleKind.AtBlock {
+          importsAllowed = false
+          namespacesAllowed = false
+          run self.colorProfile(buffer, rule.body, limits)
         }
       }
       i = i + 1
     }
+  }
+
+  /// Records an @keyframes rule whose name is a custom ident or a string (CSS Animations 1
+  /// #keyframes). Keyframes with invalid selectors are dropped, and `!important`
+  /// declarations are ignored.
+  effect fn keyframesRule(
+    self: &mut Self,
+    buffer: usize,
+    prelude: TokenRange,
+    body: TokenRange,
+    limits: &Limits,
+  ) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let source = &self.buffers.asSlice()[buffer]
+    let mut name = Option<Bytes>.None
+    let mut at = prelude.start
+    while at < prelude.end {
+      match &source.tokens.asSlice()[at].kind {
+        Kind.Whitespace => {}
+        Kind.Ident { text } => {
+          let word = source.text(text)
+          if name.isSome() || insensitive(word, b"none") || insensitive(word, b"initial")
+            || insensitive(word, b"inherit")
+            || insensitive(word, b"unset")
+            || insensitive(word, b"default") {
+            return
+          }
+          name = Option<Bytes>.Some { value: run Bytes.copy(word) }
+        }
+        Kind.String { text } => {
+          if name.isSome() {
+            return
+          }
+          name = Option<Bytes>.Some { value: run Bytes.copy(source.text(text)) }
+        }
+        _ => {
+          return
+        }
+      }
+      at = at + 1
+    }
+    let named = match move name {
+      Option<Bytes>.Some { value } => move value
+      _ => {
+        return
+      }
+    }
+    let blocks = run syntax.parseRules(source, body, false, limits)
+    let mut frames = List<Keyframe>.make()
+    let mut b: usize = 0
+    while b < blocks.length() {
+      let block = blocks.asSlice()[b]
+      b = b + 1
+      if block.kind != RuleKind.Qualified {
+        continue
+      }
+      let mut offsets = List<f64>.make()
+      let mut valid = true
+      let mut expecting = true
+      let mut k = block.prelude.start
+      while k < block.prelude.end && valid {
+        match &source.tokens.asSlice()[k].kind {
+          Kind.Whitespace => {}
+          Kind.Comma => {
+            valid = !expecting
+            expecting = true
+          }
+          Kind.Ident { text } => {
+            let word = source.text(text)
+            if !expecting {
+              valid = false
+            } else if insensitive(word, b"from") {
+              run offsets.append(0.0)
+            } else if insensitive(word, b"to") {
+              run offsets.append(1.0)
+            } else {
+              valid = false
+            }
+            expecting = false
+          }
+          Kind.Percentage { value, integer } => {
+            if !expecting || value < 0.0 || value > 100.0 {
+              valid = false
+            } else {
+              run offsets.append(value / 100.0)
+            }
+            expecting = false
+          }
+          _ => {
+            valid = false
+          }
+        }
+        k = k + 1
+      }
+      if !valid || expecting || offsets.length() == 0 {
+        continue
+      }
+      let declarations = run syntax.parseDeclarations(source, block.body, limits)
+      let mut values = List<KeyframeValue>.make()
+      let mut timing = Option<Bytes>.None
+      let mut d: usize = 0
+      while d < declarations.length() {
+        let declaration = declarations.asSlice()[d]
+        d = d + 1
+        if declaration.important {
+          continue
+        }
+        let property = source.text(declaration.name)
+        let mut text = Bytes.make()
+        let mut t = declaration.value.start
+        while t < declaration.value.end {
+          run text.append(source.text(source.tokens.asSlice()[t].source))
+          t = t + 1
+        }
+        if insensitive(property, b"animation-timing-function") {
+          timing = Option<Bytes>.Some { value: move text }
+        } else if !insensitive(property, b"animation")
+          && !startsInsensitive(property, b"animation-") {
+          run values.append(KeyframeValue { name: run Bytes.copy(property), value: move text })
+        }
+      }
+      run frames.append(
+        Keyframe { offsets: move offsets, values: move values, timing: move timing },
+      )
+    }
+    run self.keyframes.append(Keyframes { name: move named, frames: move frames })
+  }
+
+  /// Records an @color-profile rule's `name` and fetches its `src` url under the sheet's
+  /// policy (1.1 #ColorProfileAtRule). `src: sRGB` and `local()` sources, and rules
+  /// without a name, add nothing.
+  effect fn colorProfile(self: &mut Self, buffer: usize, body: TokenRange, limits: &Limits) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let source = &self.buffers.asSlice()[buffer]
+    let declarations = run syntax.parseDeclarations(source, body, limits)
+    let mut name = Option<Bytes>.None
+    let mut address = Option<Span>.None
+    let mut intent: u32 = 4
+    let mut d: usize = 0
+    while d < declarations.length() {
+      let declaration = declarations.asSlice()[d]
+      d = d + 1
+      let property = source.text(declaration.name)
+      let start = font_faces.skip(source, declaration.value.start, declaration.value.end)
+      if start >= declaration.value.end {
+        continue
+      }
+      if insensitive(property, b"name") {
+        match &source.tokens.asSlice()[start].kind {
+          Kind.Ident { text } => {
+            if font_faces.skip(source, start + 1, declaration.value.end) == declaration.value.end {
+              name = Option<Bytes>.Some { value: run Bytes.copy(source.text(text)) }
+            }
+          }
+          _ => {}
+        }
+      } else if insensitive(property, b"src") {
+        address = font_faces.address(source, start, declaration.value.end)
+      } else if insensitive(property, b"rendering-intent") {
+        match &source.tokens.asSlice()[start].kind {
+          Kind.Ident { text } => {
+            let word = source.text(text)
+            intent = if insensitive(word, b"perceptual") {
+              0
+            } else if insensitive(word, b"relative-colorimetric") {
+              1
+            } else if insensitive(word, b"saturation") {
+              2
+            } else if insensitive(word, b"absolute-colorimetric") {
+              3
+            } else {
+              4
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    let named = match move name {
+      Option<Bytes>.Some { value } => move value
+      _ => {
+        return
+      }
+    }
+    let text = match &address {
+      Option<Span>.Some { value } => source.text(value)
+      _ => {
+        return
+      }
+    }
+    let parent = self.sources.asSlice()[buffer]
+    if parent.url >= self.urls.length() || parent.ruleSet.index >= self.sets.length() {
+      return
+    }
+    let policy = self.sets.asSlice()[parent.ruleSet.index].policy
+    let resolved = run Effect.result(Url.resolve(&self.urls.asSlice()[parent.url], text))
+    let url = match move resolved {
+      Result<Url, UrlError | OutOfMemoryError>.Success { value } => move value
+      Result<Url, UrlError | OutOfMemoryError>.Failure { error } => match move error {
+        UrlError invalid => {
+          return
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let fetched = run Effect.result(
+      resources.fetchWithPolicy(&url, ResourceKind.ColorProfile, &policy),
+    )
+    let response = match move fetched {
+      Result<Response, ResourceError | OutOfMemoryError>.Success { value } => move value
+      Result<Response, ResourceError | OutOfMemoryError>.Failure { error } => match move error {
+        ResourceError failure => {
+          return
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let size = Bytes.length(&response.bytes)
+    if self.storageBytes > limits.maxStorageBytes
+      || size > limits.maxStorageBytes - self.storageBytes {
+      return
+    }
+    self.storageBytes = self.storageBytes + size
+    run self.colorProfiles.append(
+      SheetProfile { name: move named, data: move response.bytes, intent: intent },
+    )
   }
 
   /// Loads the first `src` of an @font-face rule that fetches under the sheet's policy and

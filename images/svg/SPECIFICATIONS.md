@@ -511,7 +511,9 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] Fragment identifiers: bare `#id` (render the view/element), `#svgView(viewBox(...);preserveAspectRatio(...);transform(...);zoomAndPan(...);viewTarget(...))`, `view` elements (§16.3, 1.1 §17.2)
 
 ### 5.12 Colour (1.1 ch. 12)
-- [ ] `color-profile` element and property, `icc-color()`, embedded profiles in PNG/JPEG, `rendering-intent`. Requires an ICC transform engine (matrix/TRC profiles first, LUT profiles after). Defaults to sRGB when no profile applies
+- [x] Embedded profiles in PNG/JPEG and PNG `gAMA`/`cHRM` with matrix/TRC and gray TRC profiles (see Source colour management)
+- [x] `color-profile` element and property, `icc-color()` and `@color-profile` (see SVG 1.1 colour profiles)
+- [x] LUT profiles (`mft1`, `mft2`, `mAB`) and `rendering-intent` (see ICC LUT profiles). Defaults to sRGB when no profile applies
 
 ### 5.13 Animation (1.1 ch. 19, SMIL Animation, SVG Animations 2)
 - [x] Elements: `animate`, `set`, `animateMotion` (+ `mpath`, `path`, `keyPoints`, `rotate="auto|auto-reverse"`), `animateTransform`, 1.1 `animateColor`
@@ -519,7 +521,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`, `a.begin`), `repeat(n)` syncbase-style values, indefinite; event, accessKey and wallclock values stay unresolved (no host timeline); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
 - [x] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
 - [ ] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes)
-- [ ] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t*
+- [x] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t* (see Animation sampling for the approximations)
 
 ### 5.14 Optional, last
 - [ ] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts. Not part of any mode, so only if Julia wants it
@@ -1015,6 +1017,26 @@ separate supplemental matrix in two ways. A non-default `transform-origin`
 also shifts the motion's rotation. A `transform` set in a stylesheet or
 `style` attribute overrides the written attribute, motion included.
 
+CSS Animations run in the same modes. After a first cascade, each element's
+computed `animation` and `animation-*` values (kept as source text by
+css/style) choose `@keyframes` rules, timed per
+[Web Animations](https://www.w3.org/TR/web-animations-1/#calculating-the-directed-progress)
+with delays, iteration counts, directions, fill modes and `paused`. Each
+keyframe segment is eased by the keyframe's own `animation-timing-function`,
+or else the animation's (cubic Bézier and steps; `linear()` counts as
+`linear`). The sampled declarations go into an animated `style` attribute,
+and a second cascade reads them at the animation origin, below SMIL values for
+the same property. Each source element is sampled once, from its first
+occurrence. The approximations are these:
+
+- Longhands that differ from their initial value override the matching part
+  of the `animation` shorthand, whatever their order.
+- A missing 0% or 100% keyframe uses the element's presentation attribute, or
+  else the property's initial value, not the computed value. A unitless
+  attribute next to px keyframes interpolates as px.
+- Values interpolate as for SMIL: numbers inside matching text, and colours
+  per channel.
+
 Two choices differ from the specification:
 
 - The underlying value of a CSS property is its presentation attribute (or the
@@ -1245,3 +1267,105 @@ sizing from definite dimensions or a viewBox-only ratio, percentage viewport
 geometry, inherited orientation with a shared raw layout, and perspective after
 orientation. This extends the already supported deprecated angle/flip values to
 SVG content sources; decorative CSS image rules remain separately applicable.
+
+### Source colour management
+
+Decoded PNG and JPEG samples are converted to sRGB once, after every image of
+the render is loaded, so every later use (image elements, patterns, masks,
+`feImage`) sees sRGB. The source description follows PNG-3 precedence: an `iCCP` profile
+([`#11iCCP`](https://www.w3.org/TR/png-3/#11iCCP)), else `sRGB`
+([`#11sRGB`](https://www.w3.org/TR/png-3/#11sRGB)) which needs no conversion,
+else `gAMA` and `cHRM` ([`#11gAMA`](https://www.w3.org/TR/png-3/#11gAMA),
+[`#11cHRM`](https://www.w3.org/TR/png-3/#11cHRM)). JPEG uses its APP2
+`ICC_PROFILE` segments. `cICP` is not read yet.
+
+ICC profiles are evaluated with the matrix/TRC model of ICC.1:2022 Annex F.3
+(RGB, XYZ PCS) and the gray TRC model of F.2, with `curv` (identity, gamma and
+linearly interpolated tables) and every `para` function type, and with the LUT
+models described under "ICC LUT profiles". The PCS is converted to sRGB with the
+inverse of the sRGB profile's D50 colorants. Malformed profiles, and profiles
+whose usable transform does not take one or three channels (CMYK images), leave the
+samples as sRGB. A malformed `iCCP` does not
+fall back to `gAMA`/`cHRM`, because the PNG text gives `iCCP` precedence once
+present.
+
+`gAMA` alone decodes samples as `sample^(100000/gAMA)` with sRGB primaries.
+`cHRM` builds the RGB-to-XYZ matrix from the chromaticities and adapts its white
+to D50 with the linear Bradford transform (ICC.1:2022 Annex E). `cHRM` without
+`gAMA` uses the sRGB transfer function. Common files tag sRGB-like content with
+`gAMA` 45455 and no `sRGB` chunk; they are decoded with the pure 2.2 power the
+chunk states, not the sRGB curve, so dark tones shift slightly against browsers
+that ignore `gAMA`.
+
+Linear values are clamped to [0, 1] before sRGB encoding (no gamut mapping, no
+black-point compensation), and rounded to the nearest 8-bit value. Translucent
+samples are un-premultiplied, converted and premultiplied again; transparent
+samples are untouched. A transform that maps every single-channel ramp and the
+gray ramp to itself is skipped, so sRGB profiles never perturb samples through
+s15Fixed16 rounding of their colorants. Fixtures in `tests/fixtures/color` are
+generated by `scripts/color-fixtures.py`, which crafts the profiles byte by byte
+and evaluates the expected colours independently.
+
+### SVG 1.1 colour profiles
+
+`color-profile` elements ([1.1 §12.3.2](https://www.w3.org/TR/SVG11/color.html#ColorProfileElement))
+are loaded before images: each `href` (or `xlink:href`) is fetched as a colour
+profile resource under the document's policy and the shared byte budget. `local`
+names a platform profile store, which this renderer does not have, so it is
+ignored. A profile that fails to load still claims its `name`, so a later element
+with the same name does not replace it.
+
+`icc-color(name, c1, ...)` ([1.1 §11.2](https://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint))
+in `fill`, `stroke`, paint-server fallbacks, `stop-color`, `flood-color` and
+`lighting-color` is evaluated after the cascade: when the named profile is a
+matrix/TRC (three components) or gray TRC (one component) profile and the
+component count matches, the colour is that profile's device colour converted to
+sRGB in floating point, with the fallback colour's alpha. Otherwise the sRGB
+fallback paints, as the section requires when a profile is unavailable. Style
+values are shared by all documents of a render, so a name resolves against the
+first document that declares it. Components outside [0, 1] are clamped.
+
+The `color-profile` property ([1.1 §12.3.3](https://www.w3.org/TR/SVG11/color.html#ColorProfileProperty))
+applies to `image` occurrences. `auto` uses the image's embedded description;
+`sRGB` ignores it and uses the samples as sRGB; a name or a `url(#id)` naming a
+`color-profile` element converts the samples with that profile instead. Names and
+IRIs that match no element, or name an element in another document, behave like
+`auto`. Each distinct (image, choice) pair gets its own converted copy, counted
+against the retained-byte budget, so occurrences with different choices can share
+one URL.
+
+The element's `rendering-intent` (and the rule's descriptor) selects the AToB
+tag of LUT profiles; `auto` uses the profile header's intent.
+
+[`@color-profile`](https://www.w3.org/TR/SVG11/color.html#ColorProfileAtRule) rules
+take a `name` identifier and a `src` url, fetched under the sheet's policy and
+storage budget. Their names apply to every document of the render and come after
+`color-profile` elements of the same name. `src: sRGB` and `local()` add nothing.
+
+### ICC LUT profiles
+
+Input profiles with an AToB tag use it in preference to matrix/TRC tags, as
+ICC.1:2022 §8.3 requires. The tag is chosen by rendering intent: perceptual reads
+`A2B0`, relative and absolute colorimetric read `A2B1`, saturation reads `A2B2`,
+and a missing tag falls back to `A2B0`. Embedded image profiles use the header's
+intent (§7.2.15). Absolute colorimetric is evaluated like relative colorimetric:
+there is no media-white scaling.
+
+All three LUT tag types are evaluated in floating point. `lut8Type` and
+`lut16Type` (§10.10, §10.11) run their input tables, the CLUT and the output
+tables. The 3x3 matrix is skipped, because it applies only to PCSXYZ input.
+`lutAToBType` (§10.12) runs the A curves, the CLUT, the M curves, the 3x4 matrix
+(clipped to [0, 1]) and the B curves, skipping absent elements. One-dimensional
+tables interpolate linearly. CLUTs interpolate multilinearly over up to eight
+inputs, with the first input varying least rapidly.
+
+PCS values are then decoded. PCSXYZ uses the 16-bit encoding, where 1.0 is
+8000h. PCSLAB uses the legacy encoding for `lut16Type` (100 at FF00h) and the
+current encoding for the others. Lab converts to XYZ against the D50 PCS white.
+
+Tags with other than three outputs, more than eight inputs, grids smaller than two
+points, CLUTs over 16 MiB, or data past the tag end are rejected, and the profile
+is then unusable. `icc-color()` accepts any input count matching the tag, so CMYK
+profiles work there. Images accept one- and three-channel tags only.
+
+There is no black-point compensation and no gamut mapping beyond clipping.
