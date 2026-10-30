@@ -146,3 +146,10 @@ Required backend changes stay upstream; there is no second local rasterizer.
 - The approved 3D profile flattens planes and retains each boundary's positive-w
   domain. It does not retain `preserve-3d` rendering contexts or perform 3D depth
   sorting; this is a profile choice, not SVG property inapplicability.
+
+## JPEG codec API gap
+
+No JPEG codec is present in the pinned dev.32 stdlib. The baseline/progressive
+codec request is tracked in [silk-lang/silk#2617](https://github.com/silk-lang/silk/issues/2617).
+The general-purpose `images/svg/image` package is implementing bounded marker,
+metadata and entropy decoding locally; its API contains no SVG types.

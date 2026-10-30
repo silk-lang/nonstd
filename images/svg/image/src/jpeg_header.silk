@@ -1,0 +1,259 @@
+//! JPEG marker framing and first-scan metadata (ITU T.81 Annex B).
+import image { Image, ImageError }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u32
+
+pub enum JpegError {
+  InvalidData,
+  Unsupported,
+  TooLarge
+}
+
+pub struct Component {
+  pub id: u8,
+  pub horizontal: u8,
+  pub vertical: u8,
+  pub quantization: u8,
+}
+
+impl Copy for Component {}
+
+/// Header prefix through the first SOS. Entropy data is not validated by inspect.
+pub struct Header {
+  pub width: u32,
+  pub height: u32,
+  pub progressive: bool,
+  pub components: [Component; 4],
+  pub componentCount: usize,
+  pub scanOffset: usize,
+  pub orientation: u8,
+  pub jfif: bool,
+  pub adobeTransform: Option<u8>,
+}
+
+fn be16(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) * 256 + u8.toU32(data[at + 1])
+}
+
+fn word(data: &[u8], at: usize, little: bool) -> u32 {
+  return if little {
+    u8.toU32(data[at]) + u8.toU32(data[at + 1]) * 256
+  } else {
+    be16(data, at)
+  }
+}
+
+fn integer(data: &[u8], at: usize, little: bool) -> u32 {
+  return if little {
+    word(data, at, true) + word(data, at + 2, true) * 65536
+  } else {
+    word(data, at, false) * 65536 + word(data, at + 2, false)
+  }
+}
+
+fn starts(data: &[u8], prefix: &[u8]) -> bool {
+  if data.length < prefix.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < prefix.length {
+    if data[i] != prefix[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Only the bounded IFD0 orientation entry is read; unrelated TIFF pointers are not followed.
+fn orientation(payload: &[u8]) -> u8 {
+  if !starts(payload, b"Exif\x00\x00") || payload.length < 14 {
+    return 1
+  }
+  let data = Slice.view<u8>(payload, 6, payload.length - 6)
+  let little = starts(data, b"II")
+  if !little && !starts(data, b"MM") {
+    return 1
+  }
+  if word(data, 2, little) != 42 {
+    return 1
+  }
+  let ifd = u32.toUsize(integer(data, 4, little))
+  if ifd > data.length - 2 {
+    return 1
+  }
+  let count = u32.toUsize(word(data, ifd, little))
+  if count > (data.length - ifd - 2) / 12 {
+    return 1
+  }
+  let mut i: usize = 0
+  while i < count {
+    let at = ifd + 2 + i * 12
+    if word(data, at, little) == 274 && word(data, at + 2, little) == 3
+      && integer(data, at + 4, little) == 1 {
+      let value = word(data, at + 8, little)
+      if value >= 1 && value <= 8 {
+        return u32.toU8(value)
+      }
+      return 1
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+/// Reads JPEG dimensions, sampling, frame kind and orientation without allocating.
+/// Accepts 8-bit sequential and progressive frames and at most four components.
+/// Limits input to 256 MiB and dimensions to Image's 64 Mi-pixel ceiling.
+/// This function validates the header prefix, not complete compressed-image integrity.
+pub effect fn inspect(data: &[u8]) -> Header
+  ! JpegError | ImageError {
+  if data.length > 268435456 {
+    fail JpegError.TooLarge
+  }
+  if data.length < 2 || data[0] != 255 || data[1] != 216 {
+    fail JpegError.InvalidData
+  }
+  let empty = Component { id: 0, horizontal: 0, vertical: 0, quantization: 0 }
+  let mut header = Header {
+    width: 0,
+    height: 0,
+    progressive: false,
+    components: [empty, empty, empty, empty],
+    componentCount: 0,
+    scanOffset: 0,
+    orientation: 1,
+    jfif: false,
+    adobeTransform: Option<u8>.None,
+  }
+  let mut position: usize = 2
+  let mut sawFrame = false
+  while position < data.length {
+    if data[position] != 255 {
+      fail JpegError.InvalidData
+    }
+    while position < data.length && data[position] == 255 {
+      position = position + 1
+    }
+    if position == data.length {
+      fail JpegError.InvalidData
+    }
+    let marker = data[position]
+    position = position + 1
+    if marker == 0 || marker == 1 || (marker >= 208 && marker <= 217) {
+      fail JpegError.InvalidData
+    }
+    if data.length - position < 2 {
+      fail JpegError.InvalidData
+    }
+    let length = u32.toUsize(be16(data, position))
+    if length < 2 || length > data.length - position {
+      fail JpegError.InvalidData
+    }
+    let payload = Slice.view<u8>(data, position + 2, length - 2)
+    if marker == 192 || marker == 193 || marker == 194 {
+      if sawFrame || payload.length < 6 {
+        fail JpegError.InvalidData
+      }
+      if payload[0] != 8 {
+        fail JpegError.Unsupported
+      }
+      header.height = be16(payload, 1)
+      header.width = be16(payload, 3)
+      drop run Image.validateSize(header.width, header.height)
+      header.componentCount = u32.toUsize(u8.toU32(payload[5]))
+      if header.componentCount == 0 || header.componentCount > 4 {
+        fail JpegError.Unsupported
+      }
+      if payload.length != 6 + 3 * header.componentCount {
+        fail JpegError.InvalidData
+      }
+      let mut i: usize = 0
+      let mut blocks: u32 = 0
+      while i < header.componentCount {
+        let at = 6 + i * 3
+        let h = payload[at + 1] / 16
+        let v = payload[at + 1] % 16
+        if h == 0 || h > 4 || v == 0 || v > 4 || payload[at + 2] > 3 {
+          fail JpegError.InvalidData
+        }
+        let mut previous: usize = 0
+        while previous < i {
+          if header.components[previous].id == payload[at] {
+            fail JpegError.InvalidData
+          }
+          previous = previous + 1
+        }
+        blocks = blocks + u8.toU32(h) * u8.toU32(v)
+        header.components[i] = Component {
+          id: payload[at],
+          horizontal: h,
+          vertical: v,
+          quantization: payload[at + 2],
+        }
+        i = i + 1
+      }
+      if blocks > 10 {
+        fail JpegError.InvalidData
+      }
+      header.progressive = marker == 194
+      sawFrame = true
+    } else if marker >= 192 && marker <= 207 && marker != 196 && marker != 204 {
+      fail JpegError.Unsupported
+    } else if marker == 224 && starts(payload, b"JFIF\x00") {
+      if payload.length < 14 {
+        fail JpegError.InvalidData
+      }
+      header.jfif = true
+    } else if marker == 225 {
+      header.orientation = orientation(payload)
+    } else if marker == 238 && starts(payload, b"Adobe") {
+      if payload.length < 12 {
+        fail JpegError.InvalidData
+      }
+      header.adobeTransform = Option<u8>.some(payload[11])
+    } else if marker == 218 {
+      if !sawFrame || payload.length < 4 {
+        fail JpegError.InvalidData
+      }
+      let count = u32.toUsize(u8.toU32(payload[0]))
+      if count == 0 || count > header.componentCount || payload.length != 1 + count * 2 + 3 {
+        fail JpegError.InvalidData
+      }
+      let mut scan: usize = 0
+      while scan < count {
+        let id = payload[1 + scan * 2]
+        let tables = payload[2 + scan * 2]
+        if tables / 16 > 3 || tables % 16 > 3 {
+          fail JpegError.InvalidData
+        }
+        let mut found = false
+        let mut component: usize = 0
+        while component < header.componentCount {
+          if header.components[component].id == id {
+            found = true
+          }
+          component = component + 1
+        }
+        if !found {
+          fail JpegError.InvalidData
+        }
+        let mut previous: usize = 0
+        while previous < scan {
+          if payload[1 + previous * 2] == id {
+            fail JpegError.InvalidData
+          }
+          previous = previous + 1
+        }
+        scan = scan + 1
+      }
+      header.scanOffset = position - 2
+      return move header
+    }
+    position = position + length
+  }
+  fail JpegError.InvalidData
+}
