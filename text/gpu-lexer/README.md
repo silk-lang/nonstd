@@ -113,6 +113,23 @@ from the original (Node, plus Playwright's Chromium for the spans).
 same workloads: the 18 fixtures in one batch, and one 127 KB source (the fixtures 16 times).
 Steps are each CPU pass alone and each model end to end (CPU pass, upload, GPU, readback, spans).
 
+On a 4-vCPU Linux container (2026-10-30), with both engines on SwiftShader for the GPU steps:
+
+| Step | Input | Original (ms) | Port (ms) | Port speedup |
+|---|---|---:|---:|---:|
+| CPU pass, tree | 18 fixtures, 8 KB | 0.09 | 0.05 | 1.96x |
+| CPU pass, tree | one 127 KB file | 1.86 | 0.77 | 2.41x |
+| CPU pass, lite | 18 fixtures, 8 KB | 0.34 | 0.06 | 6.02x |
+| CPU pass, lite | one 127 KB file | 3.78 | 0.92 | 4.10x |
+| Tree, end to end | 18 fixtures, 8 KB | 382.5 | 372.8 | 1.03x |
+| Tree, end to end | one 127 KB file | 3,932 | 3,906 | 1.01x |
+| Lite, end to end | 18 fixtures, 8 KB | 2,651 | 2,360 | 1.12x |
+| Lite, end to end | one 127 KB file | 14,698 | 14,548 | 1.01x |
+
+The original's CPU passes ran in Node 22 and its models in Chromium's WebGPU. SwiftShader
+emulates the GPU on the CPU, so the GPU dominates end to end; on lavapipe the port takes 26 ms
+(tree) and 72 ms (lite) for the fixtures.
+
 ## Training
 
 `training/` adds Silk to gpu-lexer's training pipeline: `node training/apply.mjs <gpu-lexer
