@@ -229,6 +229,38 @@ def generate_masking(config):
     return {"masking.svg": svg(size, shapes)}
 
 
+def generate_filters(config):
+    """Tiles with blur, drop shadow, colour matrix, morphology, turbulence and lighting."""
+    size, grid = config["size"], config["grid"]
+    step = size // grid
+    filters = (
+        '<feGaussianBlur stdDeviation="3"/>',
+        '<feDropShadow dx="2" dy="3" stdDeviation="2" flood-color="#102030"/>',
+        '<feColorMatrix type="hueRotate" values="90"/>',
+        '<feMorphology operator="dilate" radius="2"/>',
+        '<feTurbulence baseFrequency="0.08" numOctaves="3" result="t"/>'
+        '<feComposite in="t" in2="SourceAlpha" operator="in"/>',
+        '<feGaussianBlur in="SourceAlpha" stdDeviation="2" result="b"/>'
+        '<feDiffuseLighting in="b" surfaceScale="3" lighting-color="#ffe0b0">'
+        '<feDistantLight azimuth="225" elevation="45"/></feDiffuseLighting>'
+        '<feComposite in2="SourceGraphic" operator="arithmetic" k1="1"/>',
+        '<feOffset dx="3" dy="3" result="o"/><feBlend in="SourceGraphic" in2="o" mode="multiply"/>',
+        '<feComponentTransfer><feFuncR type="gamma" exponent="0.5"/>'
+        '<feFuncG type="table" tableValues="0 1 0.5"/></feComponentTransfer>',
+    )
+    shapes = ["<defs>" + "".join(f'<filter id="f{i}">{body}</filter>' for i, body in enumerate(filters)) + "</defs>",
+              f'<rect width="{size}" height="{size}" fill="#315579"/>']
+    for row in range(grid):
+        for column in range(grid):
+            index = (row * grid + column) % len(filters)
+            left, top = column * step, row * step
+            shapes.append(
+                f'<g filter="url(#f{index})">'
+                f'<rect x="{left + step // 6}" y="{top + step // 6}" width="{step * 2 // 3}" height="{step // 2}" fill="#cc6633"/>'
+                f'<circle cx="{left + step * 2 // 3}" cy="{top + step * 2 // 3}" r="{step // 4}" fill="#99cc55"/></g>')
+    return {"filters.svg": svg(size, shapes)}
+
+
 def verify_asset(data, spec):
     if hashlib.sha256(data).hexdigest() != spec["sha256"]:
         raise ValueError("Tiger SHA-256 mismatch; refusing unpinned content")
@@ -250,7 +282,7 @@ def normalize_tiger(data, config):
 def prepare(manifest, cache, fetch_tiger=False, selected=None):
     cache = Path(cache)
     result = {}
-    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing, "clipping": generate_clipping, "masking": generate_masking}
+    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing, "clipping": generate_clipping, "masking": generate_masking, "filters": generate_filters}
     for name, spec in manifest["workloads"].items():
         if selected is not None and name not in selected:
             continue
