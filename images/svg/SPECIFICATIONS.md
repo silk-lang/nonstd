@@ -471,15 +471,15 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] Degenerate cases: zero-length gradient vectors, single stop, bounding-box units on zero-size boxes (each has a defined result)
 
 ### 5.7 Text (§11, 1.1 ch. 10, ch. 20)
-- [ ] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
+- [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`
-- [ ] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
+- [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
 - [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
 - [ ] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [ ] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [ ] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
-- [ ] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
+- [ ] `letter-spacing`, `word-spacing` (done), `direction`, `unicode-bidi`
 - [ ] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
 - [ ] 1.1 only: `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
@@ -733,13 +733,60 @@ decisions:
 - Per-character font choice follows CSS Fonts 4 #cluster-matching in a simplified form:
   each character takes the first face of its span that maps it in `cmap`. Marks, ZWJ, ZWNJ
   and variation selectors keep the face of the character before them in the same span.
-- Runs of characters with the same span and face are shaped with HarfBuzz's algorithm
-  (`font/shape`) and default features. The pen continues across runs.
+- Runs of characters with the same font instance (face, variation values, synthesis and
+  size) are shaped with HarfBuzz's algorithm (`font/shape`) and default features, across
+  element boundaries (CSS Text 3 #boundary-shaping). The pen continues across runs.
 - A cluster's glyphs move with its first character. Characters that do not start a cluster
   (after composition or ligation) are not the first character of a typographic character,
   so their `x`, `y`, `dx` and `dy` values are ignored.
 - Anchoring uses the extent of the glyph advances of each text chunk, as the
   "Apply anchoring" step defines it.
+- Letter spacing follows the pinned CSS Text 3: half of each character's amount on each
+  side of its typographic character, and none at the start or end of the line (the whole
+  text). Where it is nonzero, the `liga`, `clig`, `dlig` and `hlig` features are off.
+  Word spacing adds to the advance of each word separator (U+0020, U+00A0, U+1361,
+  U+10100, U+10101, U+1039F, U+1091F).
+- The steps run in the algorithm's order: dx/dy, then `textLength`, then x/y, then
+  anchoring. The algorithm's x/y step would discard a character's own `dx` when the same
+  character has an `x`. The attribute definitions say `dx` shifts from the new position,
+  so a character with an `x` lands at `x + dx` (likewise for `y` and `dy`).
+- `textLength` is followed literally: only the element's characters move. With
+  `spacing`, the difference spreads over its typographic characters, and a nested element
+  with its own `textLength` counts as one. With `spacingAndGlyphs`, positions and glyphs
+  scale horizontally about the start of the extent. Characters after the element do not
+  move, since the algorithm shifts only the range `[i, j]`.
+
+`src/used_text.silk` feeds it from the document:
+
+- Addressable characters come from the `text` subtree in document order. Text content
+  children are `tspan`, `a`, `textPath` (laid out as a `tspan` until phase 9D) and
+  unknown elements, which render as unpositioned spans. Other SVG elements inside text
+  render nothing. Characters inside `display: none` elements are not addressable.
+- White space follows CSS Text 4 #white-space-phase-1 on one line. With `collapse`,
+  segment breaks and tabs become spaces, a space after a collapsible space is removed,
+  and spaces at the start and end of the line are removed. The preserving values keep
+  spaces; tabs and segment breaks render as spaces, because SVG text without
+  `inline-size` has no line breaking. `xml:space="preserve"` reaches this as
+  `white-space-collapse: preserve-spaces` through the UA stylesheet.
+- `x`, `y`, `dx`, `dy` and `rotate` are lists of CSS lengths, percentages or numbers
+  separated by white space or commas. Percentages resolve against the viewport width
+  (`x`, `dx`) or height (`y`, `dy`). An invalid list is ignored as a whole. Lists count
+  UTF-16 code units, as #TermAddressableCharacter requires; the second unit of a
+  surrogate pair takes no value. Elements apply their lists in document order, so a
+  descendant's values replace an ancestor's for the descendant's characters. The last
+  `rotate` value repeats over the rest of the element's characters.
+- Each element's face list holds one selection per `font-family` entry, then one per
+  installed family in database order. That last part is our system fallback for
+  #cluster-matching. The host's measured initial face is in the database, so text in a
+  missing family still renders.
+- Each element paints its own glyph outlines as one path, before its child elements. When
+  a child's glyphs fall between a parent's (`A<tspan>B</tspan>C`), the parent's glyphs
+  still paint first. This differs from painting in document order only where glyphs of
+  different elements overlap.
+- The fill bounding box of a text content element is the union of its glyph cells
+  (#TextBoundingBox): advance by ascent and descent from the font's horizontal line
+  metrics. The stroke bounding box still uses the outlines.
+- Markers do not apply to text.
 
 ### JPEG scan reconstruction
 

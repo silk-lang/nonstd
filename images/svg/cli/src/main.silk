@@ -15,7 +15,7 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.host_input { HostInput, HostInputError }
-import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.filesystem { Path, FileSystem, FileError, DirectoryEntry }
 import silk.system.filesystem_native { OsFileSystem }
 import silk.io.writer { Writer, WriterError }
 import silk.io.writer_native { StdoutWriter, StderrWriter }
@@ -31,7 +31,7 @@ enum Failure {
 
 const HELP: string<
   'static
-> = "usage: svg_cli input.svg -o output.png [--width N] [--height N] [--zoom Z]\n       [--mode static|animated|secure-static|secure-animated] [--fragment FRAGMENT]\n       svg_cli --help | --version\n\nRender an SVG to a PNG file. Width and height are positive decimal integers;\nzoom is a positive finite decimal number. Omitted dimensions use SVG sizing.\nThe renderer applies its pixel limit after sizing and zoom.\nMode selects the SVG processing policy and defaults to static.\nFragment is encoded URL-fragment text; one optional leading # is stripped.\nAn empty fragment value explicitly clears the base fragment. Percent escapes\nare passed unchanged to SVG fragment resolution.\nOptions take separate values and cannot repeat. Use -- before a dash-prefixed\ninput path, or prefix such file paths with ./ (including output paths).\nResources may use data URLs or files confined to the input directory.\nSecure modes block external resource requests; data URLs remain available.\nNo stdin or stdout PNG, network resources, animation-time or CSS options.\n"
+> = "usage: svg_cli input.svg -o output.png [--width N] [--height N] [--zoom Z]\n       [--mode static|animated|secure-static|secure-animated] [--fragment FRAGMENT]\n       [--font-dir DIR]\n       svg_cli --help | --version\n\nRender an SVG to a PNG file. Width and height are positive decimal integers;\nzoom is a positive finite decimal number. Omitted dimensions use SVG sizing.\nThe renderer applies its pixel limit after sizing and zoom.\nMode selects the SVG processing policy and defaults to static.\nFragment is encoded URL-fragment text; one optional leading # is stripped.\nAn empty fragment value explicitly clears the base fragment. Percent escapes\nare passed unchanged to SVG fragment resolution.\nText uses the fonts (.ttf, .otf, .ttc) in the font directory, read in name\norder, after the measured default face.\nOptions take separate values and cannot repeat. Use -- before a dash-prefixed\ninput path, or prefix such file paths with ./ (including output paths).\nResources may use data URLs or files confined to the input directory.\nSecure modes block external resource requests; data URLs remain available.\nNo stdin or stdout PNG, network resources, animation-time or CSS options.\n"
 
 effect fn stderr(text: string) -> ()
   ! WriterError {
@@ -72,6 +72,57 @@ effect fn pathFromArgument(base: &Path, raw: &[u8]) -> Path
   return run Path.joinBytes(base, raw)
 }
 
+fn fontFile(name: &[u8]) -> bool {
+  if name.length < 4 || name[name.length - 4] != 46 {
+    return false
+  }
+  let a = name[name.length - 3] | 32
+  let b = name[name.length - 2] | 32
+  let c = name[name.length - 1] | 32
+  return (a == 116 && b == 116 && (c == 102 || c == 99)) || (a == 111 && b == 116 && c == 102)
+}
+
+fn before(left: &[u8], right: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < left.length && index < right.length {
+    if left[index] != right[index] {
+      return left[index] < right[index]
+    }
+    index = index + 1
+  }
+  return left.length < right.length
+}
+
+/// Adds the font files directly in `directory`, in byte order of their paths.
+effect fn addFonts(host: &mut NativeHost, directory: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let entries = run FileSystem.listDirectory(directory)
+  let listed = List<DirectoryEntry>.asSlice(&entries)
+  let mut order = List<usize>.make()
+  let mut index: usize = 0
+  while index < listed.length {
+    if fontFile(Path.rawBytes(&listed[index].path)) {
+      let mut at = List<usize>.length(&order)
+      run List<usize>.append(&mut order, index)
+      let slots = List<usize>.asMutSlice(&mut order)
+      while at > 0
+        && before(Path.rawBytes(&listed[index].path), Path.rawBytes(&listed[slots[at - 1]].path)) {
+        slots[at] = slots[at - 1]
+        slots[at - 1] = index
+        at = at - 1
+      }
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < List<usize>.length(&order) {
+    let data = run FileSystem.readFile(&listed[List<usize>.get(&order, index)].path)
+    drop run host.fonts.add(move data)
+    index = index + 1
+  }
+}
+
 effect fn renderFile(args: &[Bytes], parsed: &Parsed) -> i32
   ! Failure | HostInputError | FileError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator {
@@ -106,7 +157,15 @@ effect fn renderFile(args: &[Bytes], parsed: &Parsed) -> i32
   )
 
   // The embedding viewport is host policy; intrinsic SVG sizing remains in resolve.
-  let host = run Effect.mapError(NativeHost.make(300.0, 150.0), renderFailure)
+  let mut host = run Effect.mapError(NativeHost.make(300.0, 150.0), renderFailure)
+  if parsed.fontDir != args.length {
+    let directory = run Effect.mapError(
+      pathFromArgument(&base, Bytes.asSlice(&args[parsed.fontDir])),
+      inputFailure,
+    )
+    run Effect.mapError(addFonts(&mut host, &directory), inputFailure)
+      |> Effect.provideMut<FileSystem>(&mut files)
+  }
   let mut environment = host.environment(&address)
   environment.structure.policy.mode = parsed.mode
   if parsed.fragment != args.length {

@@ -1,0 +1,169 @@
+//! Glyph geometry in user space: outlines for painting and glyph cells for the bounding box.
+import layout { Layout, PlacedGlyph, Instance, fontOf }
+import outline { Outlines, Recorder, Op }
+import svg_fonts.database { FontDatabase }
+import svg_geometry.geometry { Path, Point, Segment }
+import read_fonts.lib { FontRef }
+import font_types.lib { F2Dot14, GlyphId }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+
+/// Font units to user space for one glyph: scale, y flip, synthetic oblique shear, the
+/// shaper offset, then the glyph's rotation about its position.
+struct Placement {
+  scale: f64,
+  scaleX: f64,
+  shear: f64,
+  offsetX: f64,
+  offsetY: f64,
+  cos: f64,
+  sin: f64,
+  x: f64,
+  y: f64,
+}
+
+impl Copy for Placement {}
+
+fn placement(glyph: &PlacedGlyph, instance: &Instance) -> Placement {
+  let radians = glyph.rotate * f64.PI / 180.0
+  return Placement {
+    scale: instance.scale,
+    scaleX: glyph.scaleX,
+    shear: f64.tan(instance.selection.syntheticOblique * f64.PI / 180.0),
+    offsetX: glyph.offsetX,
+    offsetY: glyph.offsetY,
+    cos: f64.cos(radians),
+    sin: f64.sin(radians),
+    x: glyph.x,
+    y: glyph.y,
+  }
+}
+
+/// A point already in unscaled user units relative to the glyph position.
+fn rotated(at: Placement, u: f64, v: f64) -> Point {
+  if at.sin == 0.0 && at.cos == 1.0 {
+    return Point.new(at.x + u, at.y + v)
+  }
+  return Point.new(at.x + u * at.cos - v * at.sin, at.y + u * at.sin + v * at.cos)
+}
+
+fn mapped(at: Placement, fx: f32, fy: f32) -> Point {
+  let x = f32.toF64(fx)
+  let y = f32.toF64(fy)
+  return rotated(
+    at,
+    (x + at.shear * y) * at.scale * at.scaleX + at.offsetX,
+    at.offsetY - y * at.scale,
+  )
+}
+
+effect fn segment(path: &mut Path, value: Segment) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run path.append(value)
+}
+
+/// Converts recorded font-unit commands into path segments.
+effect fn emit(commands: &[f32], at: Placement, path: &mut Path) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: usize = 0
+  while index < commands.length {
+    let op = commands[index]
+    if op == 0.0 {
+      run segment(
+        &mut path,
+        Segment.MoveTo { to: mapped(at, commands[index + 1], commands[index + 2]) },
+      )
+      index = index + 3
+    } else if op == 1.0 {
+      run segment(
+        &mut path,
+        Segment.LineTo { to: mapped(at, commands[index + 1], commands[index + 2]) },
+      )
+      index = index + 3
+    } else if op == 2.0 {
+      run segment(
+        &mut path,
+        Segment.QuadraticTo {
+          control: mapped(at, commands[index + 1], commands[index + 2]),
+          to: mapped(at, commands[index + 3], commands[index + 4]),
+        },
+      )
+      index = index + 5
+    } else if op == 3.0 {
+      run segment(
+        &mut path,
+        Segment.CubicTo {
+          control1: mapped(at, commands[index + 1], commands[index + 2]),
+          control2: mapped(at, commands[index + 3], commands[index + 4]),
+          to: mapped(at, commands[index + 5], commands[index + 6]),
+        },
+      )
+      index = index + 7
+    } else {
+      run segment(&mut path, Segment.Close)
+      index = index + 1
+    }
+  }
+}
+
+/// Appends the glyph cell (#TermGlyphCell): the advance by the ascent and descent.
+effect fn cell(glyph: &PlacedGlyph, instance: &Instance, at: Placement, cells: &mut Path) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let top = -instance.ascent
+  let bottom = instance.descent
+  run segment(&mut cells, Segment.MoveTo { to: rotated(at, 0.0, top) })
+  run segment(&mut cells, Segment.LineTo { to: rotated(at, glyph.advance, top) })
+  run segment(&mut cells, Segment.LineTo { to: rotated(at, glyph.advance, bottom) })
+  run segment(&mut cells, Segment.LineTo { to: rotated(at, 0.0, bottom) })
+  run segment(&mut cells, Segment.Close)
+}
+
+/// Appends the outlines and glyph cells of the glyphs of `span`.
+pub effect fn spanGeometry(
+  database: &FontDatabase,
+  layout: &Layout,
+  span: usize,
+  outlines: &mut Path,
+  cells: &mut Path,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let glyphs = List<PlacedGlyph>.asSlice(&layout.glyphs)
+  let instances = List<Instance>.asSlice(&layout.instances)
+  let mut commands = List<f32>.make()
+  let mut current: usize = 0
+  while current < instances.length {
+    let instance = &instances[current]
+    if let Option<FontRef>.Some { value: font } = fontOf(database, instance.face) {
+      let reader = Outlines.new(&font, instance.glyphCount, instance.unitsPerEm)
+      let mut index: usize = 0
+      while index < glyphs.length {
+        let glyph = &glyphs[index]
+        if glyph.span == span && glyph.instance == current {
+          let at = placement(glyph, instance)
+          run cell(glyph, instance, at, &mut cells)
+          List<f32>.clear(&mut commands)
+          let mut sink = Recorder { out: &mut commands, failed: false }
+          drop run reader.draw(
+            GlyphId.new(glyph.glyph),
+            List<F2Dot14>.asSlice(&instance.coords),
+            &mut sink,
+          )
+          if sink.failed {
+            fail OutOfMemoryError {}
+          }
+          run emit(List<f32>.asSlice(&commands), at, &mut outlines)
+        }
+        index = index + 1
+      }
+    }
+    current = current + 1
+  }
+}
