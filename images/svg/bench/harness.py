@@ -221,7 +221,7 @@ def options(parser):
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--mode", action="append", choices=MODES)
-    parser.add_argument("--workload", action="append", choices=("iconset", "tiger", "largemap", "mixedcurves", "stylesheets", "instances", "paintservers", "compositing", "clipping"))
+    parser.add_argument("--workload", action="append", choices=("iconset", "tiger", "largemap", "mixedcurves", "stylesheets", "instances", "paintservers", "compositing", "clipping", "masking"))
     parser.add_argument("--fetch-workloads", action="store_true", help="explicitly fetch missing content-pinned, licensed Tiger")
     parser.add_argument("--callgrind", action="store_true", help="Linux only: separately collect full-process Ir, not stage-only instructions")
     parser.add_argument("--timeout", type=float, default=300, help="maximum seconds per native invocation")

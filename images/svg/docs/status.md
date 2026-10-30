@@ -61,7 +61,20 @@ stacking context. Legacy viewport `clip` also has exact reftests for viewBox sca
 and inapplicability to ordinary shapes. Text clipping, broader projective cases
 and performance improvements are still pending.
 
-Masking, image decoding, filters, text, animation and ICC remain
-required later work, not exclusions from scope. `shape-rendering` controls current
+SVG mask resources now render in isolated surfaces with user-space/object-bounding-box
+regions and content coordinates. Alpha and luminance extraction honor `mask-type`,
+`mask-mode`, and the mask element’s `color-interpolation`. Layer lists compose from
+back to front using add, subtract, intersect, or exclude; shorter mode/operator lists
+repeat. Exact fixtures include partial alpha, three-layer ordering, nested masks,
+missing resources, and preservation of earlier siblings. Image/gradient mask sources,
+their positioning/repetition, broader conformance, and mask performance gates remain open.
+
+Image decoding, filters, text, animation and ICC remain required later work, not
+exclusions from scope. `shape-rendering` controls current
 shape rasterization; computed image/text hints gain consumers in their own phases.
 Parsing those properties does not implement their rendering.
+
+The curated resvg set also includes eleven mask-resource cases: seven exact PNG
+matches and four strict non-passes covering gradient luminance/alpha and the mask
+root transform. The latter retain measured differences without tolerance; they
+remain open conformance work alongside the exact own fixtures.

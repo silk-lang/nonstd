@@ -210,6 +210,25 @@ def generate_clipping(config):
     return {"clipping.svg": svg(size, shapes)}
 
 
+def generate_masking(config):
+    """Nested luminance/alpha masks shared by transformed groups."""
+    size, grid = config["size"], config["grid"]
+    step = size // grid
+    shapes = ['<defs><mask id="alpha" maskContentUnits="objectBoundingBox" mask-type="alpha">'
+              '<rect width="1" height="1" opacity=".75"/></mask>'
+              '<mask id="luma" maskContentUnits="objectBoundingBox">'
+              '<g mask="url(#alpha)"><circle cx=".5" cy=".5" r=".48" fill="#80c040"/>'
+              '<rect x=".25" y=".25" width=".5" height=".5" fill="white"/></g>'
+              '</mask></defs>', f'<rect width="{size}" height="{size}" fill="#315579"/>']
+    for row in range(grid):
+        for column in range(grid):
+            shapes.append(
+                f'<g transform="translate({column * step} {row * step})" mask="url(#luma)">'
+                f'<rect width="{step}" height="{step}" fill="#cc6633"/>'
+                f'<circle cx="{step / 2}" cy="{step / 2}" r="{step / 3}" fill="#3399cc"/></g>')
+    return {"masking.svg": svg(size, shapes)}
+
+
 def verify_asset(data, spec):
     if hashlib.sha256(data).hexdigest() != spec["sha256"]:
         raise ValueError("Tiger SHA-256 mismatch; refusing unpinned content")
@@ -231,7 +250,7 @@ def normalize_tiger(data, config):
 def prepare(manifest, cache, fetch_tiger=False, selected=None):
     cache = Path(cache)
     result = {}
-    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing, "clipping": generate_clipping}
+    generators = {"iconset": generate_icons, "largemap": generate_map, "mixedcurves": generate_curves, "stylesheets": generate_stylesheets, "instances": generate_instances, "paintservers": generate_paintservers, "compositing": generate_compositing, "clipping": generate_clipping, "masking": generate_masking}
     for name, spec in manifest["workloads"].items():
         if selected is not None and name not in selected:
             continue
