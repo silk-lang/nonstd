@@ -199,3 +199,77 @@ Pinned-resvg comparison on the same machine and snapshot (render mode):
 | tiger/render | 21.5213 | 11.8752 | 1.8123 |
 
 Only stylesheet and instance checksums match resvg. This is the existing SVG workload comparison, not a PNG decoding benchmark. The tracked baseline was not overwritten, and the clipping/masking gaps remain phase-14 work.
+
+## Phase 7 standalone JPEG decoder checkpoint
+
+Measured decoder snapshot `e0c9c40` on Ubuntu 24.04 ARM64 with Silk dev.32 and
+LLVM 22.1.8. The A/B baseline binary was built at `1605d54`; its only difference
+from parent main `a282ea1` is performance documentation. Three native samples,
+one iteration, no warmup; separate Callgrind runs count complete processes.
+JPEG decoding is not yet called by SVG rendering, so this comparison checks
+existing renderer workloads rather than codec speed.
+
+| Workload | Old process Ir | New process Ir | Render checksum equal |
+| --- | ---: | ---: | --- |
+| clipping/render | 1,831,973,363 | 1,831,973,359 | True |
+| compositing/render | 507,509,097 | 507,509,128 | True |
+| iconset/render | 388,403,837 | 388,404,477 | True |
+| instances/render | 607,295,015 | 607,295,046 | True |
+| largemap/render | 687,670,160 | 687,670,156 | True |
+| masking/render | 4,933,710,656 | 4,933,710,668 | True |
+| mixedcurves/render | 360,428,524 | 360,428,555 | True |
+| paintservers/render | 287,070,870 | 287,070,853 | True |
+| stylesheets/render | 535,919,081 | 535,919,112 | True |
+| tiger/render | 363,310,924 | 363,310,920 | True |
+
+All ten checksums match and process instruction changes are below 0.001%.
+Native medians varied by up to about 10%; these short samples do not establish
+an equivalent throughput change. Pinned resvg/usvg revision
+`91455ee06d08ac2bfeab2b035ed2cfbfd0a68614`, measured on the same VM:
+
+| Workload | Silk median ms | resvg median ms | Silk/resvg |
+| --- | ---: | ---: | ---: |
+| clipping/render | 111.7690 | 5.3416 | 20.9244 |
+| compositing/render | 30.6655 | 5.1902 | 5.9084 |
+| iconset/render | 7.5067 | 3.9706 | 1.8906 |
+| instances/render | 3.1880 | 9.4913 | 0.3359 |
+| largemap/render | 21.0360 | 15.4865 | 1.3583 |
+| masking/render | 280.0987 | 10.9029 | 25.6904 |
+| mixedcurves/render | 17.0469 | 4.8633 | 3.5052 |
+| paintservers/render | 19.1106 | 6.6225 | 2.8857 |
+| stylesheets/render | 1.5162 | 2.8442 | 0.5331 |
+| tiger/render | 20.0217 | 10.2720 | 1.9491 |
+
+Only stylesheet and instance checksums match resvg. Existing clipping/masking
+performance and pixel differences remain open; the tracked baseline and
+conformance expectations were not changed.
+
+The separate `images/svg/scripts/bench-jpeg` harness builds the exact image
+sources as a temporary executable package. It times fresh decoding after loading
+the input, then hashes every output byte after timing and destroys the image.
+The original 512×384 inputs come from `image/tests/jpeg_benchmark_fixtures.py`;
+three fresh-process samples each use five measured decodes and one warmup.
+Complete-process Callgrind counts below instead use one decode and no warmup,
+and include startup, file I/O, hashing and destruction. No ICC transform or
+orientation is timed. The baseline/progressive pairs produce equal checksums.
+
+| Input | Bytes | Median ms/decode | Process Ir | Output checksum |
+| --- | ---: | ---: | ---: | --- |
+| L-baseline.jpg | 53,206 | 3.9206 | 72,353,667 | 13556602978170945557 |
+| L-progressive.jpg | 42,390 | 4.8272 | 81,825,421 | 13556602978170945557 |
+| RGB-baseline.jpg | 129,157 | 9.8238 | 150,399,912 | 17310860685485942489 |
+| RGB-progressive.jpg | 115,572 | 12.1438 | 167,084,452 | 17310860685485942489 |
+
+These codec results have no previous Silk JPEG implementation or native JPEG
+reference timing to compare against. They are a reproducible initial measurement,
+not proof of the phase-14 resvg target or JPEG pixel conformance. Reproduce with:
+
+```sh
+python3 images/svg/image/tests/jpeg_benchmark_fixtures.py build/svg/jpeg-inputs
+SILK_CLANG=/absolute/path/to/clang images/svg/scripts/bench-jpeg \
+  build/svg/jpeg-inputs/*.jpg --callgrind --output build/svg/jpeg-codec.json
+```
+
+Pillow is needed only to regenerate the original input fixtures. The benchmark
+runner uses the Python standard library; its JSON includes hashes of each input
+and the measured binary, native samples and checksums. Omit `--callgrind` on macOS.

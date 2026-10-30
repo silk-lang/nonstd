@@ -1,0 +1,161 @@
+//! JPEG decode wall time excludes input I/O, output hashing and destruction.
+//! Built as a temporary executable package by images/svg/scripts/bench-jpeg.
+import jpeg
+import jpeg_header { JpegError }
+import image { ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.text.format { Format, ParseError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+
+fn nanos(start: &Instant, end: &Instant) -> i64 {
+  return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000
+    + SystemClock.nanoseconds(end)
+    - SystemClock.nanoseconds(start)
+}
+
+fn checksum(pixels: &[u8]) -> u64 {
+  let mut hash: u64 = 14695981039346656037
+  let mut index: usize = 0
+  while index < pixels.length {
+    hash = u64.wrappingMultiply(hash ^ u8.toU64(pixels[index]), 1099511628211)
+    index = index + 1
+  }
+  return hash
+}
+
+struct Measurement {
+  elapsed: i64,
+  checksum: u64,
+  width: u32,
+  height: u32
+}
+
+effect fn iteration(data: &[u8]) -> Measurement
+  ! JpegError | ImageError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let start = run MonotonicClock.now()
+  let image = run jpeg.decode(data)
+  let end = run MonotonicClock.now()
+  return Measurement {
+    elapsed: nanos(&start, &end),
+    checksum: checksum(image.data()),
+    width: image.width(),
+    height: image.height(),
+  }
+}
+
+effect fn process() -> i32
+  ! HostInputError | FileError | OutOfMemoryError | WriterError | JpegError | ImageError
+  ? &mut HostInput | &mut Allocator | &mut MonotonicClock {
+  let mut args = List<String>.make()
+  let count = run HostInput.argumentCount()
+  let mut index: usize = 1
+  while index < count {
+    if let Option<Bytes>.Some { value: raw } = run HostInput.argument(index) {
+      if let Result<String, InvalidUtf8>.Success { value: text } = move String.fromBytes(move raw) {
+        run args.append(move text)
+      } else {
+        return 2
+      }
+    } else {
+      return 2
+    }
+    index = index + 1
+  }
+  let values = args.asSlice()
+  let mut writer = StdoutWriter.make()
+  if values.length == 1 && String.view(&values[0]) == "--version" {
+    run Writer.writeString("jpeg_bench protocol 1; fresh JPEG decode; hash outside timing\n")
+      |> Effect.provideMut<Writer>(&mut writer)
+    return 0
+  }
+  if values.length != 4 {
+    run Writer.writeString("usage: jpeg_bench decode FILE ITERATIONS WARMUP\n")
+      |> Effect.provideMut<Writer>(&mut writer)
+    return 2
+  }
+  let mode = String.view(&values[0])
+  if mode != "decode" {
+    return 2
+  }
+  let iterations = u32.parse(String.view(&values[2])) |> Result<u32, ParseError>.unwrapOr(0)
+  let warmup = u32.parse(String.view(&values[3])) |> Result<u32, ParseError>.unwrapOr(100001)
+  if iterations == 0 || iterations > 100000 || warmup > 10000 {
+    return 2
+  }
+  let cwd = run HostInput.workingDirectory()
+  let base = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let file = String.view(&values[1])
+  let path = if String.startsWith(file, "/") {
+    run Path.fromBytes(String.utf8Bytes(file))
+  } else {
+    run Path.resolve(&base, file)
+  }
+  let mut files = run OsFileSystem.make("/")
+  let input = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  let data = Bytes.asSlice(&input)
+  let mut frame: u32 = 0
+  let mut elapsed: i64 = 0
+  let mut hash: u64 = 0
+  let mut consumed: u64 = 0
+  let mut width: u32 = 0
+  let mut height: u32 = 0
+  while frame < warmup + iterations {
+    let measured = run iteration(data)
+    consumed = u64.wrappingAdd(consumed, measured.checksum)
+    if frame >= warmup {
+      elapsed = elapsed + measured.elapsed
+      hash = measured.checksum
+      width = measured.width
+      height = measured.height
+    }
+    frame = frame + 1
+  }
+  run Writer.writeString("{") |> Effect.provideMut<Writer>(&mut writer)
+  run Format.format(
+    "\"protocol\":1,\"iterations\":{iterations},\"warmup\":{warmup},\"elapsed_ns\":{elapsed},\"checksum\":\"{hash}\",\"consumed\":\"{consumed}\",\"width\":{width},\"height\":{height}",
+    &.{
+      iterations: iterations,
+      warmup: warmup,
+      elapsed: elapsed,
+      hash: hash,
+      consumed: consumed,
+      width: width,
+      height: height,
+    },
+  )
+    |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.writeString("}\n") |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("jpeg_bench: input, decoding, allocation or output failed\n", &())
+  return 1
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catchAll(process(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
