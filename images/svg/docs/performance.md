@@ -436,3 +436,60 @@ python3 images/svg/bench/images.py --inputs build/svg/image-bench-inputs \
 
 The JSON includes binary/input hashes, native samples, output checksums and full
 process instruction counts. Reports remain ignored build artifacts.
+
+### Computed image orientation (2026-10-30)
+
+Compared main `5ec8a91` with orientation `6eef054` using Silk dev.33,
+LLVM 22.1.8, Rust 1.90.0 and pinned resvg `91455ee06d08ac2bfeab2b035ed2cfbfd0a68614`
+on Linux aarch64 (four virtual CPUs). Three alternating native samples, one
+iteration, no warmup; Callgrind 3.22.0 runs separately. Ir covers the complete
+process, including startup, loading, checksums and untimed rasterization after
+parse measurements. It is not a stage-only instruction count.
+
+Every baseline/feature workload checksum agrees. The resvg comparison retains
+existing cross-renderer differences; only instances and stylesheets agree in
+this broad suite. All four raster-image inputs agree across all three engines
+in every mode. These checksums supplement the exact conformance fixtures.
+
+| Workload, parse | New ms | New/old time | New/old process Ir | New/resvg time | New/resvg process Ir |
+|---|---:|---:|---:|---:|---:|
+| clipping/parse | 2.728 | 0.9893 | 1.0001 | 6.702 | 19.961 |
+| compositing/parse | 3.591 | 0.9588 | 1.0005 | 11.842 | 6.318 |
+| iconset/parse | 22.366 | 1.0266 | 1.0035 | 11.330 | 5.633 |
+| instances/parse | 57.322 | 1.0143 | 1.0039 | 11.213 | 4.083 |
+| largemap/parse | 30.347 | 0.9887 | 1.0015 | 12.074 | 3.095 |
+| masking/parse | 2.958 | 1.0733 | 1.0000 | 5.502 | 27.557 |
+| mixedcurves/parse | 10.239 | 0.9325 | 1.0014 | 8.419 | 4.580 |
+| paintservers/parse | 4.410 | 0.9036 | 1.0009 | 6.266 | 2.865 |
+| stylesheets/parse | 40.998 | 0.9432 | 1.0020 | 0.577 | 0.398 |
+| tiger/parse | 6.868 | 1.0463 | 1.0007 | 6.140 | 3.085 |
+
+Original 512×384 grayscale PNG/JPEG inputs, one or 64 shared references:
+
+| Input/mode | New ms | New/old time | New/old process Ir | New/resvg time | New/resvg process Ir |
+|---|---:|---:|---:|---:|---:|
+| jpeg-1.svg/parse | 1.618 | 1.0080 | 1.0005 | 103.809 | 6.826 |
+| jpeg-1.svg/render | 3.499 | 1.0048 | 1.0003 | 2.700 | 5.063 |
+| jpeg-1.svg/end-to-end | 4.971 | 1.0131 | 1.0005 | 4.136 | 6.826 |
+| jpeg-64.svg/parse | 3.672 | 1.0085 | 1.0007 | 4.341 | 0.884 |
+| jpeg-64.svg/render | 3.137 | 0.9994 | 1.0006 | 0.277 | 0.620 |
+| jpeg-64.svg/end-to-end | 6.699 | 1.0003 | 1.0007 | 0.557 | 0.884 |
+| png-1.svg/parse | 3.116 | 0.9941 | 1.0001 | 377.688 | 6.735 |
+| png-1.svg/render | 3.130 | 0.9829 | 1.0001 | 1.744 | 4.320 |
+| png-1.svg/end-to-end | 6.265 | 1.0015 | 1.0001 | 3.304 | 6.735 |
+| png-64.svg/parse | 4.219 | 1.0136 | 1.0004 | 12.196 | 0.244 |
+| png-64.svg/render | 3.176 | 0.9990 | 1.0003 | 0.067 | 0.152 |
+| png-64.svg/end-to-end | 7.168 | 1.0005 | 1.0004 | 0.153 | 0.244 |
+
+Stage boundaries differ for raster images: Silk decodes while building its
+retained tree; resvg decodes while rendering. End-to-end timings compare the
+whole operation. Native timing fluctuations here are not evidence of a speedup;
+the deterministic process instruction ratios characterize the incremental
+orientation cost. Broad parse and single-image performance gaps remain phase 14
+work. No performance-parity claim follows from this change.
+
+Reproduce using the `ab` and `bench` commands above with `--mode parse --samples 3
+--iterations 1 --warmup 0 --callgrind`, and the image harness in the preceding
+section for all three stages. Raw reports with samples, input and binary hashes
+are retained as `build/svg/orientation-ab.json`, `orientation-reference.json`
+and `orientation-images-perf.json` (ignored artifacts).

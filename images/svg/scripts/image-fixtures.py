@@ -8,13 +8,14 @@ def chunk(k,d):return struct.pack('>I',len(d))+k+d+struct.pack('>I',zlib.crc32(k
 png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',2,1,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(b'\0\xff\0\0\xff\0\0\xff\xff'))+chunk(b'IEND',b'')
 url='data:image/png;base64,'+base64.b64encode(png).decode()
 def svg(s): return '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8">'+s+'</svg>\n'
+manifest_path=root/'manifest.json'
+previous=json.loads(manifest_path.read_text())['cases'] if manifest_path.exists() else []
 cases=[]
 for name,attrs,ref in [('natural','x="2" y="3"','<rect x="2" y="3" width="1" height="1" fill="red"/><rect x="3" y="3" width="1" height="1" fill="blue"/>'),('none','x="2" y="2" width="8" height="4" preserveAspectRatio="none"','<rect x="2" y="2" width="4" height="4" fill="red"/><rect x="6" y="2" width="4" height="4" fill="blue"/>'),('meet','x="2" y="0" width="8" height="8"','<rect x="2" y="2" width="4" height="4" fill="red"/><rect x="6" y="2" width="4" height="4" fill="blue"/>'),('zero','width="0" height="8"',''),('broken','width="8" height="8"','')]:
  source=url if name!='broken' else 'data:image/png;base64,AAAA'
  (root/'inputs'/f'{name}.svg').write_text(svg(f'<image href="{source}" {attrs} style="image-rendering:optimizeSpeed"/>'))
  (root/'references'/f'{name}.svg').write_text(svg(ref))
  cases.append(dict(id='image-'+name,input=f'inputs/{name}.svg',references=[dict(path=f'references/{name}.svg',relation='==')],status='pass',reason='Original 2x1 red/blue RGBA PNG built with Python zlib and explicit PNG chunks; reference rectangles follow SVG image geometry and nearest sampling.',spec='https://www.w3.org/TR/2018/CR-SVG2-20181004/embedded.html#ImageElement',tolerance={}))
-(root/'manifest.json').write_text(json.dumps(dict(version=1,suite='own',mode='reference',cases=cases),indent=2)+'\n')
 # Additional original fixtures. Constant JPEG blocks have only DC coefficients;
 # value 128 remains exactly 128 after IDCT, independently of lossy quality.
 from PIL import Image
@@ -36,7 +37,6 @@ extras=[
 for name,source,ref in extras:
  (root/'inputs'/f'{name}.svg').write_text(svg(source));(root/'references'/f'{name}.svg').write_text(svg(ref))
  cases.append(dict(id='image-'+name,input=f'inputs/{name}.svg',references=[dict(path=f'references/{name}.svg',relation='==')],status='pass',reason='Original sample data; reference rectangles independently express orientation, image placement and compositing. JPEG is uniform gray 128 with EXIF orientation 6.',spec='https://www.w3.org/TR/2018/CR-SVG2-20181004/embedded.html#ImageElement',tolerance={}))
-(root/'manifest.json').write_text(json.dumps(dict(version=1,suite='own',mode='reference',cases=cases),indent=2)+'\n')
 alpha_png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',2,1,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(b'\0\xff\0\0\x80\0\0\xff\x40'))+chunk(b'IEND',b'')
 alpha_url='data:image/png;base64,'+base64.b64encode(alpha_png).decode()
 extras=[
@@ -47,4 +47,6 @@ extras=[
 for name,source,ref in extras:
  (root/'inputs'/f'{name}.svg').write_text(svg(source));(root/'references'/f'{name}.svg').write_text(svg(ref))
  cases.append(dict(id='image-'+name,input=f'inputs/{name}.svg',references=[dict(path=f'references/{name}.svg',relation='==')],status='pass',reason='Original two-sample PNG verifies premultiplied source alpha and images used inside retained mask/pattern pictures.',spec='https://www.w3.org/TR/2018/CR-SVG2-20181004/embedded.html#ImageElement',tolerance={}))
-(root/'manifest.json').write_text(json.dumps(dict(version=1,suite='own',mode='reference',cases=cases),indent=2)+'\n')
+ids={c['id'] for c in cases}
+cases.extend(c for c in previous if c['id'] not in ids)
+manifest_path.write_text(json.dumps(dict(version=1,suite='own',mode='reference',cases=cases),indent=2)+'\n')

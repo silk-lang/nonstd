@@ -578,10 +578,10 @@ The format itself bounds profile bytes below 16 MiB; no decompression is involve
 `jpeg.decodeWithMetadata` returns unrotated samples, orientation and profile bytes.
 `orientation.apply` implements the eight EXIF pixel permutations, swapping intrinsic
 width/height for orientations 5–8 and preserving premultiplied channels exactly.
-The image consumer will select this helper for CSS Images 3 `image-orientation:
-from-image`; decoding itself does not silently override CSS orientation. Unrelated
+The image consumer uses an equivalent sample-coordinate transform for CSS Images 3
+`image-orientation: from-image`; decoding itself does not silently override CSS orientation. Unrelated
 APP1 data (for example XMP) does not erase an earlier EXIF orientation. Invalid or
-absent orientation metadata uses the identity. Renderer integration remains open.
+absent orientation metadata uses the identity.
 
 ### Compressed SVG source documents
 
@@ -620,8 +620,8 @@ budget failures propagate; unavailable or malformed images paint nothing. Each
 image is sampled with its full projective transform, then participates in the
 existing clip/mask/group compositing pipeline. Fill and stroke properties do not
 paint the image rectangle. SVG `optimizeSpeed` selects nearest sampling; `auto`
-and `optimizeQuality` currently select bilinear sampling. CSS orientation overrides,
-CSS Images 3 sampling keywords and nested SVG image documents remain open.
+and `optimizeQuality` currently select bilinear sampling. CSS Images 3 sampling
+keywords and nested SVG image documents remain open.
 
 The projective nearest-sampling fixture uses a continuous blue field, a binary red
 band and one antialiased outer clip as its reference. Two separately antialiased
@@ -644,3 +644,31 @@ acceptance assertions under that normative algorithm. The allocator preflight te
 now uses an invalid alphabet character instead of nonzero discarded bits. This is
 a correction of expected behavior, not a pixel-tolerance change. Existing
 percent-escape and metadata parsing policies are unchanged by this payload fix.
+
+### Per-occurrence image orientation
+
+CSS Images 3 [`#the-image-orientation`](https://www.w3.org/TR/css-images-3/#the-image-orientation)
+(pinned SHA256 `74eb4b475aa0845a50ebedb4bbb3ba7bf3966f975817d1c5cf8e3d512f53447e`)
+defines inherited `from-image` as the initial value. `none` uses raw samples;
+explicit angles replace metadata, round to the nearest quarter turn with ties
+toward positive infinity, and normalize to one turn. Horizontal `flip` follows
+rotation. The deprecated angle/flip grammar is supported, including `calc()`.
+The property participates in Cascade 4 [`#all-shorthand`](https://www.w3.org/TR/css-cascade-4/#all-shorthand).
+
+Decoded assets retain raw pixels and metadata. Each image occurrence computes its
+oriented natural dimensions and composes sample orientation before aspect-ratio
+fitting and the element’s transform. This avoids repeated pixel allocations and
+allows different CSS orientations to share a normalized image URL. Exact references
+use six distinct PNG samples and independently rotated integer coordinates;
+shared-resource and JPEG `none` cases distinguish occurrence styling from decoding.
+The `all` probes restore `x` and `y` after the shorthand, because `all` also resets
+those positioning properties. Decorative CSS image consumers remain pending and
+must apply the specification’s separate decorative-image orientation rule.
+
+Orientation math also follows CSS Values 4
+[`#numeric-data-types`](https://www.w3.org/TR/css-values-4/#numeric-data-types) and
+[`#calc-infinities`](https://www.w3.org/TR/css-values-4/#calc-infinities)
+(pinned SHA256 `7b6b68c34d00d7f6945e66e4e2efa913266299f597d5825393cae85dac1cc78c`).
+The finite angle limit is the supported binary64 whole-turn limit already used by
+the numeric unit converter. Overflow and either infinity therefore normalize to
+zero degrees, as does a NaN calculation after its outermost-boundary censorship.
