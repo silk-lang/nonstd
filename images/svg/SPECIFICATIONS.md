@@ -582,3 +582,23 @@ The image consumer will select this helper for CSS Images 3 `image-orientation:
 from-image`; decoding itself does not silently override CSS orientation. Unrelated
 APP1 data (for example XMP) does not erase an earlier EXIF orientation. Invalid or
 absent orientation metadata uses the identity. Renderer integration remains open.
+
+### Compressed SVG source documents
+
+SVG 1.1 G.7 (`#ConformingSVGViewers`) requires gzip/deflate input support.
+Root documents and fetched SVG source documents now recognize RFC 1952 gzip
+and RFC 1950 zlib headers before XML parsing; the stdlib `silk.compress.inflate`
+validates framing, DEFLATE, checksums, trailers and concatenated gzip members.
+Decoded bytes still pass through XML's mandatory encoding detection, including
+UTF-16 BOMs. A gzip filename is not required, and file extensions do not select
+the decoder. Raw headerless DEFLATE is not guessed from arbitrary XML bytes.
+
+The structure budget charges both encoded bytes and successfully expanded bytes.
+Each expansion is additionally capped by XML's 16 MiB input ceiling, 1,024 gzip
+members and 64 KiB of cumulative gzip headers. Inflation uses an 8 KiB output
+chunk and the stdlib's fixed 64 KiB state; output grows only as validated steps
+produce it. These are resource-policy limits, not format-validity rules. Limit
+failures remain `TooLarge`; malformed root streams are `InvalidXml`, and malformed
+external documents follow the existing unavailable-reference behavior. Trailing
+bytes after the compressed stream are rejected. Transport hosts remain responsible
+for any content codings they remove before returning a resource response.

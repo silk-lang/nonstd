@@ -98,3 +98,9 @@ coefficients; malformed scans and every truncation of a progressive fixture are
 rejected. Chroma reconstruction currently uses nearest samples. JPEG ICC chunks
 are assembled in sequence order, including between progressive scans, with missing/duplicate/inconsistent chunk rejection. ICC interpretation,
 broader format coverage and SVG integration remain open.
+
+Phase-7 compressed-document work recognizes gzip/zlib root SVG sources and
+external SVG source references, including compressed data URLs and concatenated
+gzip members. XML encoding detection follows decompression. Checksums, truncation,
+optional headers, streaming output and aggregate expansion limits have dedicated
+tests. Image rendering and nested SVG image consumers are still pending.

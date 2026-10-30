@@ -11,6 +11,7 @@ import resources {
   Limits as ResourceLimits
 }
 import resources
+import compressed_document
 import url { Url, UrlError, percentDecode }
 import svg_xml.xml {
   Document,
@@ -443,11 +444,24 @@ effect fn addDocument(
 
 // Parser limits are independent of occurrence expansion: every source has the XML
 // parser's 16 MiB input, one-million-node and 256-XML-depth bounds.
-effect fn parseDocument(data: &[u8]) -> Document
+effect fn parseDocument(data: &[u8], remaining: usize, expanded: &mut usize) -> Document
   ! StructureError | OutOfMemoryError
   ? &mut Allocator {
   let limits = XmlLimits.make()
-  let parsed = run Effect.result(parseWithLimits(data, &limits))
+  let maximum = if remaining < limits.maxInputBytes {
+    remaining
+  } else {
+    limits.maxInputBytes
+  }
+  let decoded = run compressed_document.expand(data, maximum)
+  let xml = match &decoded {
+    Option<Bytes>.Some { value } => {
+      expanded.* = Bytes.length(&value)
+      Bytes.asSlice(&value)
+    }
+    _ => data
+  }
+  let parsed = run Effect.result(parseWithLimits(xml, &limits))
   return match move parsed {
     Result<Document, XmlError | OutOfMemoryError>.Success { value } => move value
     Result<Document, XmlError | OutOfMemoryError>.Failure { error } => match move error {
@@ -488,6 +502,8 @@ effect fn responseDocument(
   mediaType: &Option<Bytes>,
   charset: &Option<Bytes>,
   request: &Url,
+  remaining: usize,
+  expanded: &mut usize,
 ) -> Option<Document>
   ! StructureError | ResourceError | OutOfMemoryError
   ? &mut Allocator {
@@ -508,7 +524,7 @@ effect fn responseDocument(
     }
     dataCharset = run metadata.decodedCharset()
   }
-  let document = run parseDocument(Bytes.asSlice(bytes))
+  let document = run parseDocument(Bytes.asSlice(bytes), remaining, &mut expanded.*)
   if !svgRoot(&document) {
     return Option<Document>.None
   }
@@ -663,14 +679,18 @@ effect fn externalDocument(
     }
     i = i + 1
   }
+  let mut expandedBytes: usize = 0
   let parsed = run Effect.result(
     responseDocument(
       &response.bytes,
       &response.mediaType,
       &response.charset,
       &graph.urls.asSlice()[request],
+      limits.maxTotalBytes - graph.totalBytes,
+      &mut expandedBytes,
     ),
   )
+  graph.totalBytes = graph.totalBytes + expandedBytes
   let document = match move parsed {
     Result<Option<Document>, StructureError | ResourceError | OutOfMemoryError>.Success {
       value
@@ -900,7 +920,12 @@ pub effect fn build(data: &[u8], base: &Url, options: &Options) -> Graph
   if data.length > options.limits.maxTotalBytes || options.limits.maxDocuments == 0 {
     fail StructureError.TooLarge
   }
-  let document = run parseDocument(data)
+  let mut expandedBytes: usize = 0
+  let document = run parseDocument(
+    data,
+    options.limits.maxTotalBytes - data.length,
+    &mut expandedBytes,
+  )
   if !svgRoot(&document) {
     fail StructureError.InvalidRoot
   }
@@ -912,7 +937,7 @@ pub effect fn build(data: &[u8], base: &Url, options: &Options) -> Graph
     root: OccurrenceId { index: 0 },
     limits: options.limits,
     cache: List<CachedDocument>.make(),
-    totalBytes: data.length,
+    totalBytes: data.length + expandedBytes,
     urlBytes: 0,
     requests: 0,
     templates: HashMap<usize, SourceId>.make(Hash.seed(0)),
