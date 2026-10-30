@@ -44,6 +44,12 @@ The project opts in from `tsconfig.json`:
 `tsc` needs `--runExternalCode`; the language server takes `"runExternalCode": true` in its
 initialization options (VS Code asks for workspace trust instead).
 
+In VS Code, open `example` itself as the folder, so "TypeScript: Select TypeScript Version"
+offers "Use Workspace Version" (7.1.0-beta). The server bundled with the TypeScript Native
+Preview extension (7.0) does not support content mappers and logs
+`unknown method 'custom/setContentMapperContributions'`. Start VS Code from a terminal
+(`code example`) so the mapper finds `silk` on `PATH`.
+
 ## What was verified
 
 On x86-64 Linux with Silk `0.1.0-dev.33`, TypeScript `7.1.0-beta`, Node 22.22 and Vite 7.3:
