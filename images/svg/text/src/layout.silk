@@ -15,13 +15,15 @@ import harfrust.lib {
   GlyphInfo,
   GlyphPosition,
   shapeWithFeatures,
-  ShapeError
+  ShapeError,
+  Direction
 }
 import read_fonts.lib { FontRef, ReadError, Os2 }
 import read_fonts.model.charmap { Charmap }
 import read_fonts.model.metrics { Metrics, LineBox }
 import font_types.lib { F2Dot14, F48Dot16, GlyphId, Tag }
 import ucd.lib as Ucd
+import ucd.bidi { BidiWorkspace, ParagraphDirection, analyzeCodepoints, reorder }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
@@ -58,6 +60,19 @@ pub struct Span {
   pub shift: Shift,
   /// The enclosing element's span, which must come earlier.
   pub parent: Option<usize>,
+  /// direction: rtl.
+  pub rtl: bool,
+  pub bidi: Bidi,
+}
+
+/// unicode-bidi (CSS Writing Modes 3 #unicode-bidi).
+pub enum Bidi {
+  Normal,
+  Embed,
+  Isolate,
+  Override,
+  IsolateOverride,
+  Plaintext,
 }
 
 /// Baseline types (CSS Inline 3 #baseline-types), horizontal only.
@@ -90,6 +105,8 @@ pub struct TextLength {
   pub length: f64,
   /// lengthAdjust="spacingAndGlyphs".
   pub glyphs: bool,
+  /// The element's direction is rtl: the adjustment moves later characters left.
+  pub rtl: bool,
 }
 
 impl Copy for TextLength {}
@@ -362,6 +379,7 @@ effect fn shapeRun(
   end: usize,
   spans: &[Span],
   pen: f64,
+  rtl: bool,
   spacing: &mut Spacing,
   offsets: &mut List<f64>,
   owners: &mut List<usize>,
@@ -370,6 +388,11 @@ effect fn shapeRun(
   ? &mut Allocator {
   let instance = &List<Instance>.asSlice(&layout.instances)[instanceIndex]
   let scale = instance.scale
+  let bold = if instance.selection.syntheticBold {
+    u16.toF64(instance.unitsPerEm) / 24.0 * scale
+  } else {
+    0.0
+  }
   let font = match fontOf(database, instance.face) {
     Option<FontRef>.Some { value } => value
     Option<FontRef>.None => {
@@ -385,6 +408,9 @@ effect fn shapeRun(
   while index < end {
     run buffer.add(characters[index].cp, usize.toU32(index - start))
     index = index + 1
+  }
+  if rtl {
+    buffer.setDirection(Direction.RightToLeft)
   }
   buffer.guessSegmentProperties()
 
@@ -421,6 +447,7 @@ effect fn shapeRun(
     return pen
   }
   let mut advance = pen
+  let first = List<PlacedGlyph>.length(&layout.glyphs)
   let count = buffer.len()
   let mut glyph: usize = 0
   while glyph < count {
@@ -433,6 +460,13 @@ effect fn shapeRun(
       Option<GlyphPosition>.None => GlyphPosition.zero()
     }
     let owner = start + u32.toUsize(info.cluster)
+
+    // Synthetic bold widens each advancing glyph by the emboldening strength.
+    let width = if position.xAdvance != 0 {
+      i32.toF64(position.xAdvance) * scale + bold
+    } else {
+      0.0
+    }
     if List<usize>.get(&owners.*, owner) == usize.MAX {
       // Letter spacing puts half its amount on each side of a typographic character, but
       // none at the line start or end; word spacing follows word separators.
@@ -471,12 +505,25 @@ effect fn shapeRun(
         offsetY: -i32.toF64(position.yOffset) * scale,
         rotate: 0.0,
         scaleX: 1.0,
-        advance: i32.toF64(position.xAdvance) * scale,
+        advance: width,
       },
     )
     spacing.last = List<PlacedGlyph>.length(&layout.glyphs) - 1
-    advance = advance + i32.toF64(position.xAdvance) * scale
+    advance = advance + width
     glyph = glyph + 1
+  }
+
+  // A right-to-left character's position is the right edge of its cluster, where its
+  // advance starts (SVG 2 #TextLayoutAlgorithm takes such advances as negative).
+  if rtl {
+    let placed = List<PlacedGlyph>.asSlice(&layout.glyphs)
+    let mut g = first
+    while g < placed.length {
+      let owner = placed[g].owner
+      let moved = List<f64>.get(&offsets.*, owner) + placed[g].advance
+      List<f64>.set(&mut offsets, owner, moved)
+      g = g + 1
+    }
   }
 
   // Characters without a glyph of their own belong to the cluster before them.
@@ -495,6 +542,183 @@ effect fn shapeRun(
     index = index + 1
   }
   return advance
+}
+
+/// The formatting characters CSS Writing Modes 3 #bidi-control-codes gives an element with
+/// `unicode-bidi`, at its start (`opening`) or end.
+effect fn controls(span: &Span, opening: bool, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let isolate: u32 = if span.rtl {
+    0x2067
+  } else {
+    0x2066
+  }
+  let embed: u32 = if span.rtl {
+    0x202B
+  } else {
+    0x202A
+  }
+  let force: u32 = if span.rtl {
+    0x202E
+  } else {
+    0x202D
+  }
+  match span.bidi {
+    Bidi.Normal => {}
+    Bidi.Embed => {
+      run List<u32>.append(
+        &mut out,
+        if opening {
+          embed
+        } else {
+          0x202C
+        },
+      )
+    }
+    Bidi.Isolate => {
+      run List<u32>.append(
+        &mut out,
+        if opening {
+          isolate
+        } else {
+          0x2069
+        },
+      )
+    }
+    Bidi.Override => {
+      run List<u32>.append(
+        &mut out,
+        if opening {
+          force
+        } else {
+          0x202C
+        },
+      )
+    }
+    Bidi.IsolateOverride => {
+      if opening {
+        run List<u32>.append(&mut out, isolate)
+        run List<u32>.append(&mut out, force)
+      } else {
+        run List<u32>.append(&mut out, 0x202C)
+        run List<u32>.append(&mut out, 0x2069)
+      }
+    }
+    Bidi.Plaintext => {
+      run List<u32>.append(
+        &mut out,
+        if opening {
+          0x2068
+        } else {
+          0x2069
+        },
+      )
+    }
+  }
+}
+
+/// Whether `span` is `inner` or one of its ancestors.
+fn encloses(spans: &[Span], span: usize, inner: usize) -> bool {
+  let mut at = Option<usize>.Some { value: inner }
+  while let Option<usize>.Some { value } = at {
+    if value == span {
+      return true
+    }
+    at = spans[value].parent
+  }
+  return false
+}
+
+/// The unwrapped embedding level of each character of the text chunk `[start, end)`, which
+/// is an independent block for the Unicode bidirectional algorithm (SVG 2 #TextLayoutIntroduction).
+/// The text element's direction sets the paragraph level; descendants' `unicode-bidi` and
+/// `direction` become formatting characters around their content.
+effect fn chunkLevels(
+  spans: &[Span],
+  characters: &[Character],
+  start: usize,
+  end: usize,
+  workspace: &mut BidiWorkspace,
+  levels: &mut List<u8>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = &spans[0]
+  let direction = if root.bidi == Bidi.Plaintext {
+    ParagraphDirection.Auto
+  } else if root.rtl {
+    ParagraphDirection.Rtl
+  } else {
+    ParagraphDirection.Ltr
+  }
+  let mut codepoints = List<u32>.make()
+  let mut slots = List<usize>.make()
+  if root.bidi == Bidi.Override || root.bidi == Bidi.IsolateOverride {
+    run List<u32>.append(
+      &mut codepoints,
+      if root.rtl {
+        0x202E
+      } else {
+        0x202D
+      },
+    )
+  }
+  let mut open = List<usize>.make()
+  let mut index = start
+  while index < end {
+    let span = characters[index].span
+
+    // Close the elements this character is outside of, then open the ones it is inside.
+    while List<usize>.length(&open) > 0
+      && !encloses(spans, List<usize>.get(&open, List<usize>.length(&open) - 1), span) {
+      let closing = List<usize>.get(&open, List<usize>.length(&open) - 1)
+      drop List<usize>.pop(&mut open)
+      run controls(&spans[closing], false, &mut codepoints)
+    }
+    let mut chain = List<usize>.make()
+    let mut at = Option<usize>.Some { value: span }
+    while let Option<usize>.Some { value } = at {
+      let inside = List<usize>.length(&open) > 0
+        && List<usize>.get(&open, List<usize>.length(&open) - 1) == value
+      let top = match spans[value].parent {
+        Option<usize>.Some { value: above } => false
+        Option<usize>.None => true
+      }
+      if inside || top {
+        at = Option<usize>.None
+      } else {
+        run List<usize>.append(&mut chain, value)
+        at = spans[value].parent
+      }
+    }
+    while List<usize>.length(&chain) > 0 {
+      let opening = List<usize>.get(&chain, List<usize>.length(&chain) - 1)
+      drop List<usize>.pop(&mut chain)
+      run controls(&spans[opening], true, &mut codepoints)
+      run List<usize>.append(&mut open, opening)
+    }
+    run List<usize>.append(&mut slots, List<u32>.length(&codepoints))
+    run List<u32>.append(&mut codepoints, characters[index].cp)
+    index = index + 1
+  }
+  drop run analyzeCodepoints(List<u32>.asSlice(&codepoints), direction, &mut workspace)
+  index = 0
+  while index < List<usize>.length(&slots) {
+    run List<u8>.append(&mut levels, workspace.unwrappedLevel(List<usize>.get(&slots, index)))
+    index = index + 1
+  }
+}
+
+/// Whether the character has an absolute position, which starts a text chunk.
+fn positioned(character: &Character) -> bool {
+  if let Option<f64>.Some { value } = character.x {
+    return true
+  }
+  if let Option<f64>.Some { value } = character.y {
+    return true
+  }
+  return false
 }
 
 /// Lays out one text element's addressable characters.
@@ -542,40 +766,71 @@ pub effect fn layout(
     index = index + 1
   }
 
-  // Step "CSS layout" along one line. Runs end where the font instance changes: CSS Text 3
-  // #boundary-shaping keeps shaping across element boundaries that do not change formatting.
+  // Step "CSS layout" along one line. Each text chunk (begun by an x or y value) is an
+  // independent block for ligatures and bidi reordering (SVG 2 #TermTextChunk). Within a
+  // chunk, runs end where the font instance or embedding level changes, and are placed in
+  // visual order. CSS Text 3 #boundary-shaping keeps shaping across other element boundaries.
+  let mut chunks = List<usize>.make()
+  let mut levels = List<u8>.make()
+  let mut workspace = BidiWorkspace.make()
   let mut pen = 0.0
   let mut spacing = Spacing { started: false, letter: 0.0, word: 0.0, last: 0 }
-  let mut start: usize = 0
-  while start < count {
-    let instanceIndex = List<usize>.get(&used, start)
-    let mut end = start + 1
-    while end < count && List<usize>.get(&used, end) == instanceIndex {
-      end = end + 1
+  let mut chunkStart: usize = 0
+  while chunkStart < count {
+    let mut chunkEnd = chunkStart + 1
+    while chunkEnd < count && !positioned(&characters[chunkEnd]) {
+      chunkEnd = chunkEnd + 1
     }
-    if instanceIndex != usize.MAX {
-      pen = run shapeRun(
-        database,
-        &mut result,
-        instanceIndex,
-        characters,
-        start,
-        end,
-        spans,
-        pen,
-        &mut spacing,
-        &mut offsets,
-        &mut owners,
-      )
-    } else {
-      index = start
-      while index < end {
-        List<usize>.set(&mut owners, index, index)
-        List<f64>.set(&mut offsets, index, pen)
-        index = index + 1
+    run List<usize>.appendRepeated(&mut chunks, chunkStart, chunkEnd - chunkStart)
+    run chunkLevels(spans, characters, chunkStart, chunkEnd, &mut workspace, &mut levels)
+    let mut runStarts = List<usize>.make()
+    let mut runLevels = List<u8>.make()
+    let mut start = chunkStart
+    while start < chunkEnd {
+      run List<usize>.append(&mut runStarts, start)
+      run List<u8>.append(&mut runLevels, List<u8>.get(&levels, start))
+      let mut end = start + 1
+      while end < chunkEnd && List<usize>.get(&used, end) == List<usize>.get(&used, start)
+        && List<u8>.get(&levels, end) == List<u8>.get(&levels, start) {
+        end = end + 1
       }
+      start = end
     }
-    start = end
+    run List<usize>.append(&mut runStarts, chunkEnd)
+    let mut order = List<usize>.make()
+    run reorder(List<u8>.asSlice(&runLevels), &mut order)
+    let mut visual: usize = 0
+    while visual < List<usize>.length(&order) {
+      let item = List<usize>.get(&order, visual)
+      let start = List<usize>.get(&runStarts, item)
+      let end = List<usize>.get(&runStarts, item + 1)
+      let instanceIndex = List<usize>.get(&used, start)
+      if instanceIndex != usize.MAX {
+        pen = run shapeRun(
+          database,
+          &mut result,
+          instanceIndex,
+          characters,
+          start,
+          end,
+          spans,
+          pen,
+          List<u8>.get(&runLevels, item) % 2 == 1,
+          &mut spacing,
+          &mut offsets,
+          &mut owners,
+        )
+      } else {
+        index = start
+        while index < end {
+          List<usize>.set(&mut owners, index, index)
+          List<f64>.set(&mut offsets, index, pen)
+          index = index + 1
+        }
+      }
+      visual = visual + 1
+    }
+    chunkStart = chunkEnd
   }
 
   // Step "Adjust positions: dx, dy". Only the first character of a typographic character
@@ -597,11 +852,10 @@ pub effect fn layout(
     index = index + 1
   }
 
-  run applyLengths(&result, &owners, lengths, &mut positionsX, &mut scales)
+  run applyLengths(&result, &owners, &levels, lengths, &mut positionsX, &mut scales)
 
   // Step "Adjust positions: x, y": x and y start a text chunk. The character's own dx and
   // dy still apply after its x and y, as the attribute definitions say.
-  let mut chunkStarts = List<bool>.make()
   shiftX = 0.0
   shiftY = 0.0
   let xs = List<f64>.asMutSlice(&mut positionsX)
@@ -609,20 +863,16 @@ pub effect fn layout(
   index = 0
   while index < count {
     let character = characters[index]
-    let mut chunk = index == 0
     if List<usize>.get(&owners, index) == index {
       if let Option<f64>.Some { value } = character.x {
         shiftX = (value + character.dx) - xs[index]
-        chunk = true
       }
       if let Option<f64>.Some { value } = character.y {
         shiftY = (value + character.dy) - ys[index]
-        chunk = true
       }
     }
     xs[index] = xs[index] + shiftX
     ys[index] = ys[index] + shiftY
-    run List<bool>.append(&mut chunkStarts, chunk)
     index = index + 1
   }
 
@@ -640,7 +890,7 @@ pub effect fn layout(
     glyphs[g].offsetX = glyphs[g].offsetX * scale
     g = g + 1
   }
-  anchor(spans, characters, &chunkStarts, &mut glyphs)
+  anchor(spans, characters, &chunks, &positionsX, &mut glyphs)
 
   // Baseline alignment: each glyph's alphabetic baseline moves to its span's.
   let mut drops = List<f64>.make()
@@ -754,6 +1004,7 @@ fn advances(result: &Layout, count: usize, out: &mut List<f64>) -> () {
 effect fn applyLengths(
   result: &Layout,
   owners: &List<usize>,
+  levels: &List<u8>,
   lengths: &[TextLength],
   positions: &mut List<f64>,
   scales: &mut List<f64>,
@@ -775,7 +1026,13 @@ effect fn applyLengths(
     let mut k = length.start
     while k < length.end && k < count {
       if List<usize>.get(owners, k) == k {
-        let advance = List<f64>.get(&sizes, k) * factors[k]
+        // Right-to-left advances are negative from the character's position.
+        let size = if List<u8>.get(levels, k) % 2 == 1 {
+          -List<f64>.get(&sizes, k)
+        } else {
+          List<f64>.get(&sizes, k)
+        }
+        let advance = size * factors[k]
         low = f64.min(low, f64.min(xs[k], xs[k] + advance))
         high = f64.max(high, f64.max(xs[k], xs[k] + advance))
       }
@@ -790,9 +1047,16 @@ effect fn applyLengths(
         } else {
           1.0
         }
+
+        // The extent keeps its start edge: the right one for rtl.
+        let fixed = if length.rtl {
+          high
+        } else {
+          low
+        }
         k = length.start
         while k < length.end && k < count {
-          xs[k] = low + (xs[k] - low) * factor
+          xs[k] = fixed + (xs[k] - fixed) * factor
           factors[k] = factors[k] * factor
           k = k + 1
         }
@@ -806,10 +1070,15 @@ effect fn applyLengths(
           }
           k = k + 1
         }
-        let delta = if units > 1 {
+        let step = if units > 1 {
           delta / usize.toF64(units - 1)
         } else {
           0.0
+        }
+        let delta = if length.rtl {
+          -step
+        } else {
+          step
         }
         let mut shift = 0.0
         k = length.start
@@ -841,24 +1110,21 @@ fn insideResolved(lengths: &[TextLength], item: usize, k: usize, first: bool) ->
   return first
 }
 
-/// Whether a glyph of `owner`, after a glyph of `previous`, begins a text chunk.
-fn startsChunk(chunkStarts: &List<bool>, owner: usize, previous: usize) -> bool {
-  return List<bool>.get(chunkStarts, owner) && previous != owner
-}
-
 // Step "Apply anchoring": each chunk shifts so its advance extent [a, b] starts, centers or
-// ends on the chunk's start position, per the text-anchor of its first character.
+// ends on the position of its first character, per that character's text-anchor and
+// direction. A chunk's glyphs are contiguous.
 fn anchor(
   spans: &[Span],
   characters: &[Character],
-  chunkStarts: &List<bool>,
+  chunks: &List<usize>,
+  xs: &List<f64>,
   glyphs: &mut [PlacedGlyph],
 ) -> () {
   let mut first: usize = 0
   while first < glyphs.length {
+    let chunk = List<usize>.get(chunks, glyphs[first].owner)
     let mut last = first + 1
-    while last < glyphs.length
-      && !startsChunk(chunkStarts, glyphs[last].owner, glyphs[last - 1].owner) {
+    while last < glyphs.length && List<usize>.get(chunks, glyphs[last].owner) == chunk {
       last = last + 1
     }
     let mut low = f64.INFINITY
@@ -871,11 +1137,20 @@ fn anchor(
       high = f64.max(high, right)
       g = g + 1
     }
-    let origin = glyphs[first].x
-    let shift = match spans[characters[glyphs[first].owner].span].anchor {
-      Anchor.Start => origin - low
+    let origin = List<f64>.get(xs, chunk)
+    let span = &spans[characters[chunk].span]
+    let shift = match span.anchor {
+      Anchor.Start => if span.rtl {
+        origin - high
+      } else {
+        origin - low
+      }
       Anchor.Middle => origin - (low + high) / 2.0
-      Anchor.End => origin - high
+      Anchor.End => if span.rtl {
+        origin - low
+      } else {
+        origin - high
+      }
     }
     g = first
     while g < last {

@@ -8,5 +8,7 @@ under the SIL Open Font License; the license files sit next to them.
   `pyftsubset <font>.ttf --unicodes="U+0020-007E" --layout-features='*' --name-IDs='*' --name-languages='*'`
 - `NotoSans-Regular`: the same, with `--unicodes="U+0020-007E,U+00A0-00FF,U+0300-036F,U+0370-03FF,U+FB01-FB02"`
   for marks, composition and fallback.
+- `Amiri-Regular`: `pyftsubset Amiri-Regular.ttf --unicodes="U+0020-007E,U+0621-064A,U+0660-0669" --layout-features='*' --name-IDs='*' --name-languages='*'`
+  for Arabic shaping and bidi.
 - `RobotoFlex`: resvg's subset with every axis but `wght`, `wdth` and `slnt` pinned to its
   default (`fontTools.varLib.instancer`).
