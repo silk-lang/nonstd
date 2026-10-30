@@ -523,3 +523,13 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 
 ### 5.14 Optional, last
 - [ ] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts. Not part of any mode, so only if Julia wants it
+
+Mask resources use CSS Masking 1 [mask element coordinates](https://www.w3.org/TR/css-masking-1/#MaskElement)
+and [mask value calculation](https://www.w3.org/TR/css-masking-1/#MaskValues).
+Each layer is converted to coverage before [mask-composite](https://www.w3.org/TR/css-masking-1/#the-mask-composite)
+combines it with the accumulated layers below it. The bottom layer ignores its
+operator. [Mask mode](https://www.w3.org/TR/css-masking-1/#the-mask-mode) overrides
+the resource's mask type; shorter property lists repeat across image layers.
+Literal reference fixtures independently exercise partial-alpha Porter–Duff
+results and order-sensitive three-layer expressions. These checks do not complete
+the open phase-6 requirements for image/gradient mask sources or performance.

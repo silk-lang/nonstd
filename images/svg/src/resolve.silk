@@ -3,6 +3,7 @@ import scene {
   ClipNode,
   FillRule,
   BlendMode,
+  MaskComposite,
   RenderOptions,
   RenderError,
   RenderTree,
@@ -19,7 +20,8 @@ import structure { Graph, OccurrenceId }
 import used_viewports { Metadata, Clip, ElementKind }
 import used_viewports
 import used_clip_shapes
-import svg_css.effect_values { EffectValue, ClipSource, GeometryBox }
+import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, Composite }
+import used_masks
 import used_clips
 import svg_css.value_keywords { Keyword }
 import used_geometry
@@ -441,6 +443,7 @@ struct Planning {
   activePatterns: List<usize>,
   clipNodes: List<ClipNode>,
   activeClips: List<usize>,
+  activeMasks: List<usize>,
   resourceAncestry: usize,
   ancestryKeys: HashMap<ReferenceKey, usize>,
   ancestryCount: usize,
@@ -2551,6 +2554,289 @@ effect fn referencedClip(
   return Option<usize>.some(result)
 }
 
+effect fn paintMaskLayer(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  layerIndex: usize,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  matrix: &Mapping,
+  outputBounds: Rect,
+  context: &PaintContext,
+  depth: usize,
+  references: usize,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+  clips: &mut List<ProjectionClip>,
+) -> ()
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = state.plans.asSlice()[id]
+  let node = match &styles.resourceAt(plan.occurrence, Property.MaskImage, layerIndex) {
+    Option<OccurrenceId>.Some { value } => value
+    _ => {
+      run nodes.append(
+        ResolvedNode.BeginGroup {
+          opacity: 1.0,
+          bounds: outputBounds,
+          linearRgb: false,
+          blendMode: BlendMode.Normal,
+        },
+      )
+      run nodes.append(ResolvedNode.ConvertMask { luminance: false, linearRgb: false })
+      return
+    }
+  }
+  if references >= graph.limits.maxReferenceDepth || depth >= 256 {
+    fail RenderError.TooLarge
+  }
+  run nodes.append(
+    ResolvedNode.BeginGroup {
+      opacity: 1.0,
+      bounds: outputBounds,
+      linearRgb: false,
+      blendMode: BlendMode.Normal,
+    },
+  )
+  let mut cycle = false
+  let mut i: usize = 0
+  while i < state.activeMasks.length() {
+    if state.activeMasks.asSlice()[i] == node.index {
+      cycle = true
+    }
+    i = i + 1
+  }
+  let style = match &styles.nodeStyle(node) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let mut luminance = match &styles.catalog.engine.get(style, Property.MaskType) {
+    Option<ComputedValue>.Some { value: entry } => match &styles.catalog.engine.values.get(
+      entry.value,
+    ).* {
+      Value.Keyword { keyword } => keyword != Keyword.Alpha
+      _ => true
+    }
+    _ => true
+  }
+  if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
+    plan.styleId,
+    Property.MaskMode,
+  ) {
+    if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+      if let EffectValue.Masks { layers, resetBorder } = &value {
+        if layers.length() > 0 {
+          let mode = layers.asSlice()[layerIndex % layers.length()].mode
+          if mode == MaskMode.Alpha {
+            luminance = false
+          } else if mode == MaskMode.Luminance {
+            luminance = true
+          }
+        }
+      }
+    }
+  }
+  let linearRgb = match &styles.catalog.engine.get(style, Property.ColorInterpolation) {
+    Option<ComputedValue>.Some { value: entry } => match &styles.catalog.engine.values.get(
+      entry.value,
+    ).* {
+      Value.Keyword { keyword } => keyword == Keyword.LinearRGB
+      _ => false
+    }
+    _ => false
+  }
+  if !cycle {
+    let bounds = match &(run gather(
+      graph,
+      id,
+      state.plans.asSlice(),
+      state.layouts.asSlice(),
+      state.paths.asSlice(),
+      &Mapping.identity(),
+      false,
+      false,
+      &mut state.bounds,
+    )) {
+      Option<Rect>.Some { value } => value
+      _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+    }
+    let source = graph.occurrences.asSlice()[node.index].source
+    let layout = run used_masks.resolve(
+      graph.sourceDocument(source),
+      source.node,
+      &mut styles.catalog.engine,
+      style,
+      state.spaces.asSlice()[plan.viewport],
+      bounds,
+      limits,
+    )
+    if let Option<used_masks.Layout>.Some { value: mask } = &layout {
+      let viewport = state.spaces.length()
+      run state.spaces.append(mask.user)
+      let layoutIndex = state.layouts.length()
+      run state.layouts.append(
+        Layout {
+          supplement: mask.content,
+          clip: Option<Clip>.None,
+          clipMapping: Mapping.identity(),
+          referenceMapping: true,
+          viewportHost: Option<Mapping>.None,
+        },
+      )
+      let root = PreparationRoot {
+        occurrence: node,
+        viewport: viewport,
+        childViewport: viewport,
+        layout: layoutIndex,
+        definition: true,
+        externalTransform: false,
+      }
+      let prepared = run prepare(
+        graph,
+        &mut styles.*,
+        node,
+        &root,
+        Option<usize>.None,
+        0,
+        &mut state.*,
+        limits,
+      )
+      if let Option<usize>.Some { value } = &prepared {
+        run place(
+          graph,
+          value,
+          &styles.catalog.engine,
+          state.spaces.asSlice(),
+          &transforms.identity(),
+          false,
+          &mut state.plans,
+          &mut state.layouts,
+          &mut state.pending,
+          state.paths.asSlice(),
+          &mut state.bounds,
+        )
+        state.pending.truncate(0)
+        run state.activeMasks.append(node.index)
+        run paint(
+          graph,
+          &mut styles.*,
+          value,
+          &mut state.*,
+          &mut paints.*,
+          limits,
+          matrix,
+          &Frame.root(matrix.*),
+          Option<usize>.None,
+          outputBounds,
+          context,
+          depth + 1,
+          references + 1,
+          &mut nodes.*,
+          &mut shapes.*,
+          &mut clips.*,
+        )
+        drop state.activeMasks.pop()
+      }
+      let path = state.paths.length()
+      run state.paths.append(
+        run svg.rectangle(
+          mask.region.xMin,
+          mask.region.yMin,
+          mask.region.width(),
+          mask.region.height(),
+          0.0,
+          0.0,
+        ),
+      )
+      let clipping = state.clipNodes.length()
+      run state.clipNodes.append(
+        ClipNode.Shape { path: path, transform: matrix.*, rule: FillRule.Nonzero },
+      )
+      run nodes.append(ResolvedNode.ApplyClip { index: clipping })
+    }
+  }
+  run nodes.append(ResolvedNode.ConvertMask { luminance: luminance, linearRgb: linearRgb })
+}
+
+effect fn applyMask(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  matrix: &Mapping,
+  outputBounds: Rect,
+  context: &PaintContext,
+  depth: usize,
+  references: usize,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+  clips: &mut List<ProjectionClip>,
+) -> ()
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let style = state.plans.asSlice()[id].styleId
+  let mut count: usize = 0
+  if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
+    style,
+    Property.MaskImage,
+  ) {
+    if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+      if let EffectValue.Masks { layers, resetBorder } = &value {
+        count = layers.length()
+      }
+    }
+  }
+  let mut index = count
+  while index > 0 {
+    index = index - 1
+    run paintMaskLayer(
+      graph,
+      &mut styles.*,
+      id,
+      index,
+      &mut state.*,
+      &mut paints.*,
+      limits,
+      matrix,
+      outputBounds,
+      context,
+      depth,
+      references,
+      &mut nodes.*,
+      &mut shapes.*,
+      &mut clips.*,
+    )
+    if index + 1 < count {
+      let mut operation = MaskComposite.Add
+      if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
+        style,
+        Property.MaskComposite,
+      ) {
+        if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+          if let EffectValue.Masks { layers, resetBorder } = &value {
+            if layers.length() > 0 {
+              operation = match layers.asSlice()[index % layers.length()].composite {
+                Composite.Add => MaskComposite.Add
+                Composite.Subtract => MaskComposite.Subtract
+                Composite.Intersect => MaskComposite.Intersect
+                Composite.Exclude => MaskComposite.Exclude
+              }
+            }
+          }
+        }
+      }
+      run nodes.append(ResolvedNode.CompositeMask { operation: operation })
+    }
+  }
+  run nodes.append(ResolvedNode.ApplyMask { luminance: false, linearRgb: false })
+}
+
 effect fn paintPrepared(
   graph: &Graph,
   styles: &mut StyledGraph,
@@ -2647,7 +2933,8 @@ effect fn paintPrepared(
     context.*
   }
   let clipping = run referencedClip(graph, &mut styles.*, id, &mut state.*, matrix, limits, depth)
-  let layer = clipping.isSome() || plan.style.opacity != 1.0 || plan.style.isolated
+  let masked = used_masks.present(&styles.catalog.engine, plan.styleId)
+  let layer = masked || clipping.isSome() || plan.style.opacity != 1.0 || plan.style.isolated
     || plan.style.blendMode != BlendMode.Normal
   if layer {
     run nodes.append(
@@ -2770,6 +3057,24 @@ effect fn paintPrepared(
   }
   if let Option<usize>.Some { value } = &clipping {
     run nodes.append(ResolvedNode.ApplyClip { index: value })
+  }
+  if masked {
+    run applyMask(
+      graph,
+      &mut styles.*,
+      id,
+      &mut state.*,
+      &mut paints.*,
+      limits,
+      matrix,
+      outputBounds,
+      context,
+      depth,
+      references,
+      &mut nodes.*,
+      &mut shapes.*,
+      &mut clips.*,
+    )
   }
   if layer {
     run nodes.append(ResolvedNode.EndGroup)
@@ -2916,6 +3221,7 @@ effect fn resolveStyled(
     activePatterns: List<usize>.make(),
     clipNodes: List<ClipNode>.make(),
     activeClips: List<usize>.make(),
+    activeMasks: List<usize>.make(),
     resourceAncestry: usize.MAX,
     ancestryKeys: HashMap<ReferenceKey, usize>.make(Hash.seed(0)),
     ancestryCount: 0,
