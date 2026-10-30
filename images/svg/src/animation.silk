@@ -756,6 +756,13 @@ effect fn piece(bytes: &[u8]) -> Bytes
 effect fn numbers(bytes: &[u8], loose: bool) -> Value
   ! OutOfMemoryError
   ? &mut Allocator {
+  return run numbersIn(bytes, loose, false)
+}
+
+// Numbers within text; `keep` keeps separators in the pieces, as CSS syntax needs them.
+effect fn numbersIn(bytes: &[u8], loose: bool, keep: bool) -> Value
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut pieces = List<Bytes>.make()
   let mut values = List<f64>.make()
   let mut start: usize = 0
@@ -769,7 +776,13 @@ effect fn numbers(bytes: &[u8], loose: bool) -> Value
           return Value.Text { bytes: run Bytes.copy(bytes) }
         }
       }
-      run pieces.append(run piece(view(bytes, start, k)))
+      run pieces.append(
+        if keep {
+          run Bytes.copy(view(bytes, start, k))
+        } else {
+          run piece(view(bytes, start, k))
+        },
+      )
       run values.append(parsed)
       k = end
       start = end
@@ -777,7 +790,13 @@ effect fn numbers(bytes: &[u8], loose: bool) -> Value
       k = k + 1
     }
   }
-  run pieces.append(run piece(view(bytes, start, bytes.length)))
+  run pieces.append(
+    if keep {
+      run Bytes.copy(view(bytes, start, bytes.length))
+    } else {
+      run piece(view(bytes, start, bytes.length))
+    },
+  )
   return Value.Numbers { pieces: move pieces, numbers: move values }
 }
 
@@ -1095,7 +1114,10 @@ effect fn render(value: &Value, out: &mut Bytes) -> ()
         let part = Bytes.asSlice(&texts[k])
         run out.append(part)
         if k < list.length {
-          if out.length() > 0 && part.length == 0 {
+          // A number after a unit or another number needs a space to stay separate.
+          let glued = part.length > 0
+            && (letter(part[part.length - 1]) || part[part.length - 1] == 37)
+          if out.length() > 0 && (part.length == 0 || glued) {
             run out.append(b" ")
           }
           run writeNumber(&mut out.*, list[k])
@@ -1170,7 +1192,8 @@ effect fn zero(like: &Value) -> Value
 }
 
 // The y of a keySplines cubic at x (both from 0 to 1), by bisection on x.
-fn spline(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
+/// The cubic Bézier timing curve through (x1, y1) and (x2, y2), evaluated at `x`.
+pub fn spline(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
   let mut low: f64 = 0.0
   let mut high: f64 = 1.0
   let mut t = x
@@ -1188,6 +1211,97 @@ fn spline(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
   }
   let u = 1.0 - t
   return 3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t * t * t
+}
+
+/// Interpolates between CSS value texts for property `name` at `amount`: colours per
+/// channel, numbers inside matching text, and otherwise a switch at the halfway point
+/// (CSS Values 4 #combining-values).
+pub effect fn interpolate(name: &[u8], from: &[u8], to: &[u8], amount: f64, out: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let left = run textValue(name, from)
+  let right = run textValue(name, to)
+
+  // A unitless underlying value meets px keyframes: px is the user unit, so the numbers
+  // interpolate and keep the keyframe's units.
+  if let Value.Numbers { pieces: first, numbers: a } = &left {
+    if let Value.Numbers { pieces: second, numbers: b } = &right {
+      if !samePieces(&first, &second) && a.length() == b.length() {
+        let plainFirst = run withoutPx(&first)
+        let plainSecond = run withoutPx(&second)
+        if samePieces(&plainFirst, &plainSecond) {
+          let mut list = List<f64>.make()
+          let x = a.asSlice()
+          let y = b.asSlice()
+          let mut k: usize = 0
+          while k < x.length {
+            run list.append(x[k] + (y[k] - x[k]) * amount)
+            k = k + 1
+          }
+          let pieces = if px(&second) {
+            run copyPieces(&second)
+          } else {
+            run copyPieces(&first)
+          }
+          run render(&Value.Numbers { pieces: move pieces, numbers: move list }, &mut out.*)
+          return
+        }
+      }
+    }
+  }
+  let value = run combine(&left, &right, amount, false)
+  run render(&value, &mut out.*)
+}
+
+fn pxAt(piece: &[u8]) -> bool {
+  return piece.length >= 2 && (piece[0] == 112 || piece[0] == 80)
+    && (piece[1] == 120 || piece[1] == 88)
+    && (piece.length == 2 || !letter(piece[2]))
+}
+
+fn px(pieces: &List<Bytes>) -> bool {
+  let all = pieces.asSlice()
+  let mut k: usize = 1
+  while k < all.length {
+    if pxAt(Bytes.asSlice(&all[k])) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+// The pieces with a px unit right after each number removed.
+effect fn withoutPx(pieces: &List<Bytes>) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let all = pieces.asSlice()
+  let mut k: usize = 0
+  while k < all.length {
+    let text = Bytes.asSlice(&all[k])
+    run out.append(
+      if k > 0 && pxAt(text) {
+        run Bytes.copy(view(text, 2, text.length))
+      } else {
+        run Bytes.copy(text)
+      },
+    )
+    k = k + 1
+  }
+  return move out
+}
+
+effect fn textValue(name: &[u8], bytes: &[u8]) -> Value
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if colored(name) {
+    if let Option<[f64; 4]>.Some { value } = run color(trim(bytes)) {
+      return Value.Color { channels: value }
+    }
+    return Value.Text { bytes: run Bytes.copy(trim(bytes)) }
+  }
+  return run numbersIn(trim(bytes), equal(name, b"d") || equal(name, b"points"), true)
 }
 
 /// The animation's values list resolved against the underlying value `base`.
