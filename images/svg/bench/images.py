@@ -65,11 +65,14 @@ def main():
         return
     if not all([args.inputs, args.silk, args.rust, args.output]):
         parser.error('measurement requires --inputs, --silk, --rust and --output')
+    sources = sorted(args.inputs.glob('*.svg'))
+    if not sources:
+        parser.error('input directory contains no SVG workloads')
     binaries = {'silk': args.silk.resolve(), 'resvg': args.rust.resolve()}
     report = {'environment': environment(binaries), 'rows': [],
               'iterations': args.iterations, 'warmup': args.warmup, 'samples': args.samples,
               'callgrind_scope': 'full process, including startup, I/O and output checksum'}
-    for source in sorted(args.inputs.glob('*.svg')):
+    for source in sources:
         for mode in ('parse', 'render', 'end-to-end'):
             rows = {name: {'engine': name, 'input': source.name, 'mode': mode,
                            'input_sha256': sha256(source), 'samples_ns': []}
