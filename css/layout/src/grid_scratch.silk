@@ -79,45 +79,71 @@ impl MemoPass {
   }
 }
 
-// Records which of `tracks`' sizes match `seen`'s, then makes them `seen`'s.
-effect fn compareSizes(seen: &mut List<f32>, tracks: &[TrackState], same: &mut List<bool>)
-  ! OutOfMemoryError ? &mut Allocator {
-  let mut index: usize = 0
-  while index < tracks.length {
-    let size = tracks[index].base
-    if index < seen.length() {
-      if seen.asSlice()[index] != size { same.set(index, false) }
-      seen.set(index, size)
-    } else {
-      same.set(index, false)
-      run seen.append(size)
-    }
-    index = index + 1
-  }
-  seen.truncate(tracks.length)
-}
-
 fn samePolicy(a: &TrackPolicy, b: &TrackPolicy) -> bool {
   return a.automatic == b.automatic && a.fixed == b.fixed && a.cap == b.cap && a.intrinsic == b.intrinsic
     && a.needMin == b.needMin && a.needMax == b.needMax
 }
 
-// Records which of `policies` match `seen`'s, then makes them `seen`'s.
-effect fn comparePolicies(seen: &mut List<TrackPolicy>, policies: &[TrackPolicy], comparable: bool, same: &mut List<bool>)
-  ! OutOfMemoryError ? &mut Allocator {
-  same.clear()
-  let mut index: usize = 0
-  while index < policies.length {
-    if index < seen.length() {
-      run same.append(comparable && samePolicy(&seen.asSlice()[index], &policies[index]))
-      seen.set(index, policies[index])
-    } else {
-      run same.append(false)
-      run seen.append(policies[index])
+// Compares `policies` (and, when `final`, `tracks`' sizes) with `seen`'s,
+// then makes them `seen`'s. changed[i] counts the tracks before i that differ
+// or that `seen` lacked; every track differs unless `comparable`.
+effect fn compareTracks(
+  seenPolicies: &mut List<TrackPolicy>, seenSizes: &mut List<f32>, policies: &[TrackPolicy], tracks: &[TrackState],
+  final: bool, comparable: bool, changed: &mut List<usize>,
+) ! OutOfMemoryError ? &mut Allocator {
+  let count = policies.length
+  changed.clear()
+  run changed.reserve(count + 1)
+  if !comparable {
+    let mut index: usize = 0
+    while index <= count {
+      run changed.append(index)
+      index = index + 1
     }
+    seenPolicies.clear()
+    run seenPolicies.appendSlice(policies)
+    if final { run copySizes(&mut seenSizes, tracks) }
+    return
+  }
+  let mut common = seenPolicies.length()
+  if count < common { common = count }
+  let mut sizeCommon: usize = 0
+  if final {
+    sizeCommon = seenSizes.length()
+    if tracks.length < sizeCommon { sizeCommon = tracks.length }
+  }
+  let mut differing: usize = 0
+  run changed.append(0)
+  let seen = seenPolicies.asMutSlice()
+  let sizes = seenSizes.asSlice()
+  let mut index: usize = 0
+  while index < count {
+    let mut same = index < common && samePolicy(&seen[index], &policies[index])
+    if final && index < tracks.length {
+      same = same && index < sizeCommon && sizes[index] == tracks[index].base
+    }
+    if index < common { seen[index] = policies[index] }
+    if !same { differing = differing + 1 }
+    run changed.append(differing)
     index = index + 1
   }
-  seen.truncate(policies.length)
+  seenPolicies.truncate(count)
+  let mut tail = common
+  while tail < count {
+    run seenPolicies.append(policies[tail])
+    tail = tail + 1
+  }
+  if final { run copySizes(&mut seenSizes, tracks) }
+}
+
+effect fn copySizes(seen: &mut List<f32>, tracks: &[TrackState]) ! OutOfMemoryError ? &mut Allocator {
+  seen.clear()
+  run seen.reserve(tracks.length)
+  let mut index: usize = 0
+  while index < tracks.length {
+    run seen.append(tracks[index].base)
+    index = index + 1
+  }
 }
 
 // Item requests are the grid's base request plus each item's area, so a memo
@@ -134,9 +160,7 @@ pub struct ContributionMemos {
   previous: usize,
   sizing: MemoPass,
   recheck: MemoPass,
-  same: List<bool>,
-  crossSame: List<bool>,
-  // How many tracks before each one changed, from `same` (see spanSame).
+  // How many tracks before each one changed (see spanSame).
   changed: List<usize>,
   crossChanged: List<usize>,
   // By item, for final requests (see laidOut).
@@ -159,24 +183,11 @@ impl TrackArea {
   }
 }
 
-// counts[i]: how many of the tracks before i are not `same`.
-effect fn countChanged(same: &[bool], counts: &mut List<usize>) ! OutOfMemoryError ? &mut Allocator {
-  counts.clear()
-  let mut count: usize = 0
-  run counts.append(0)
-  let mut index: usize = 0
-  while index < same.length {
-    if !same[index] { count = count + 1 }
-    run counts.append(count)
-    index = index + 1
-  }
-}
-
 impl ContributionMemos {
   pub fn make() -> ContributionMemos {
     return ContributionMemos {
       base: Input.make(OptionalSize.none()), entries: List<ContributionMemo>.make(), stamp: 0, previous: 0,
-      sizing: MemoPass.make(), recheck: MemoPass.make(), same: List<bool>.make(), crossSame: List<bool>.make(),
+      sizing: MemoPass.make(), recheck: MemoPass.make(),
       changed: List<usize>.make(), crossChanged: List<usize>.make(),
       marks: List<ItemMark>.make(),
     }
@@ -205,14 +216,12 @@ impl ContributionMemos {
   ) ! OutOfMemoryError ? &mut Allocator {
     self.stamp = self.stamp + 1
     if recheck {
-      self.previous = run startKind(&mut self.recheck, &mut self.same, &mut self.crossSame, self.stamp,
+      self.previous = run startKind(&mut self.recheck, &mut self.changed, &mut self.crossChanged, self.stamp,
         horizontal, ownFinal, crossFinal, gap, crossGap, policies, crossPolicies, tracks, crossTracks)
     } else {
-      self.previous = run startKind(&mut self.sizing, &mut self.same, &mut self.crossSame, self.stamp,
+      self.previous = run startKind(&mut self.sizing, &mut self.changed, &mut self.crossChanged, self.stamp,
         horizontal, ownFinal, crossFinal, gap, crossGap, policies, crossPolicies, tracks, crossTracks)
     }
-    run countChanged(self.same.asSlice(), &mut self.changed)
-    run countChanged(self.crossSame.asSlice(), &mut self.crossChanged)
   }
 
   // Whether tracks `start` to `end` all kept what keys read of them.
@@ -294,7 +303,7 @@ impl ContributionMemos {
 // Compares a pass with the previous one of its kind, `seen`, and returns that
 // pass's stamp, or 0 if its keys took anything else from the pass itself.
 effect fn startKind(
-  seen: &mut MemoPass, same: &mut List<bool>, crossSame: &mut List<bool>, stamp: usize,
+  seen: &mut MemoPass, changed: &mut List<usize>, crossChanged: &mut List<usize>, stamp: usize,
   horizontal: bool, ownFinal: bool, crossFinal: bool, gap: f32, crossGap: f32,
   policies: &[TrackPolicy], crossPolicies: &[TrackPolicy], tracks: &[TrackState], crossTracks: &[TrackState],
 ) -> usize ! OutOfMemoryError ? &mut Allocator {
@@ -307,10 +316,9 @@ effect fn startKind(
   seen.crossGap = crossGap
   seen.ownFinal = ownFinal
   seen.crossFinal = crossFinal
-  run comparePolicies(&mut seen.policies, policies, comparable, &mut same)
-  run comparePolicies(&mut seen.crossPolicies, crossPolicies, comparable, &mut crossSame)
-  if ownFinal { run compareSizes(&mut seen.sizes, tracks, &mut same) }
-  if crossFinal { run compareSizes(&mut seen.crossSizes, crossTracks, &mut crossSame) }
+  run compareTracks(&mut seen.policies, &mut seen.sizes, policies, tracks, ownFinal, comparable, &mut changed)
+  run compareTracks(&mut seen.crossPolicies, &mut seen.crossSizes, crossPolicies, crossTracks, crossFinal, comparable,
+    &mut crossChanged)
   if !comparable { return 0 }
   return previous
 }
