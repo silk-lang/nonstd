@@ -57,8 +57,9 @@ Clipping is in progress: retained boolean geometry handles sibling unions and ne
 intersections before antialiasing. Own fixtures cover resource units, transforms,
 `use`, invalid children, paint-independent geometry, duplicate and shared edges,
 CSS basic shapes and geometry boxes. Unresolved clip URLs retain their required
-stacking context. Text clipping, broader projective cases, legacy `clip`, external
-conformance cases and performance validation are still pending.
+stacking context. Legacy viewport `clip` also has exact reftests for viewBox scaling, auto edges
+and inapplicability to ordinary shapes. Text clipping, broader projective cases
+and performance improvements are still pending.
 
 Masking, image decoding, filters, text, animation and ICC remain
 required later work, not exclusions from scope. `shape-rendering` controls current

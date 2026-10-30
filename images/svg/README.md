@@ -22,7 +22,8 @@ coverage.
 
 Clipping now includes referenced `clipPath` geometry, nested intersections, child unions,
 `use`, basic CSS shapes and geometry boxes. Geometric unions are evaluated before
-antialias rasterization. Text clipping and projective clip edge cases remain in progress.
+antialias rasterization. Legacy viewport `clip` uses the existing viewport resolver.
+Text clipping and projective clip edge cases remain in progress.
 
 Masking, filters, image decoding, text, animation and ICC colour are planned
 later phases. [Status](docs/status.md) describes what each phase delivered.
