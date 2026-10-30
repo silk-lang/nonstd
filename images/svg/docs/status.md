@@ -88,6 +88,15 @@ SVG 1.1 `filterRes`. 135 reftests in `tests/fixtures/filters` compare them with 
 shapes, spec expansions, markup equivalents or, for turbulence, images of the reference
 code's output. `enable-background` is still to come.
 
+The curated resvg set gains 85 of resvg's 410 filter cases. Rendered at width 300
+over all 410 cases, 77 match resvg's PNG exactly, and those 77 are curated as passes.
+Seven are curated as spec differences, where FE1 and resvg disagree (FillPaint,
+default subregions, feImage element references, missing filter references, a
+pass-through feConvolveMatrix and oversaturation). One more, a Gaussian blur, is a
+strict non-pass from the two engines' different blur approximations. Most of the other
+filter cases differ from resvg by blur approximation, turbulence initialization (FE1's
+reference code), or resvg behaviour that the spec does not share.
+
 Text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current
 shape rasterization; computed image/text hints gain consumers in their own phases.
