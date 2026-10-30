@@ -1,6 +1,6 @@
 # SVG implementation limitations
 
-Toolchain: Silk `0.1.0-dev.31+2fc1811f535e`. No compiler or stdlib patches.
+Toolchain: Silk `0.1.0-dev.32+ebc526403637`. No compiler or stdlib patches.
 This file records implementation workarounds, not the unimplemented SVG coverage
 listed in [SPECIFICATIONS.md](SPECIFICATIONS.md).
 

@@ -156,8 +156,8 @@ def emit(namespace, name, params, result, body, notes='', rust_type=None, static
     silk_params = ', '.join(pname + ': ' + stype for pname, stype, _ in params)
     foreign_params = ', '.join(pname + ': ' + ('u8' if stype == 'bool' else stype) for pname, stype, _ in params)
     callbacks = [pname for pname, stype, _ in params if stype.startswith('extern ')]
-    property_clause = ' with Intrinsic.foreign(callbacks: (' + ', '.join('"' + name + '"' for name in callbacks) + ',))' if callbacks else ''
-    declarations.append('unsafe extern "C" fn ' + symbol + '(' + foreign_params + ') -> ' + ('u8' if result == 'bool' else result) + property_clause)
+    directive = '@callbacks(' + ', '.join('"' + name + '"' for name in callbacks) + ')\n' if callbacks else ''
+    declarations.append(directive + 'unsafe extern "C" fn ' + symbol + '(' + foreign_params + ') -> ' + ('u8' if result == 'bool' else result))
     lines = []
     for pname, stype, _ in params:
         if stype == 'bool':
