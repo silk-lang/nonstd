@@ -602,3 +602,28 @@ failures remain `TooLarge`; malformed root streams are `InvalidXml`, and malform
 external documents follow the existing unavailable-reference behavior. Trailing
 bytes after the compressed stream are rejected. Transport hosts remain responsible
 for any content codings they remove before returning a resource response.
+
+### Raster image positioning and retained samples
+
+SVG2 embedded content `#Placement` and `#ImageElement` define the positioning
+rectangle and reference CSS Images 3 `#default-sizing`. Images use oriented natural
+dimensions for auto sizing, with the 300 by 150 fallback when dimensions are absent.
+The positioning rectangle remains the geometry reference box; preserveAspectRatio
+controls sample placement, including meet, slice, none and all alignments. Zero
+size disables painting. Raster resources ignore `defer`, as SVG2
+coords `#PreserveAspectRatioAttribute` requires.
+
+PNG/JPEG assets and their source colour metadata remain owned by the display list.
+Repeated normalized URLs share a decode, including negative caching for broken
+images. Resource policy runs before cache lookup. Out-of-memory and aggregate
+budget failures propagate; unavailable or malformed images paint nothing. Each
+image is sampled with its full projective transform, then participates in the
+existing clip/mask/group compositing pipeline. Fill and stroke properties do not
+paint the image rectangle. SVG `optimizeSpeed` selects nearest sampling; `auto`
+and `optimizeQuality` currently select bilinear sampling. CSS orientation overrides,
+CSS Images 3 sampling keywords and nested SVG image documents remain open.
+
+The projective nearest-sampling fixture uses a continuous blue field, a binary red
+band and one antialiased outer clip as its reference. Two separately antialiased
+adjoining rectangles create a partial-alpha seam that an opaque sampled image
+does not have; they are not an equivalent reference for that test.

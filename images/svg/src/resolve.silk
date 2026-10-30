@@ -24,6 +24,9 @@ import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, C
 import used_masks
 import used_clips
 import svg_css.value_keywords { Keyword }
+import image_assets { Store as ImageStore }
+import used_images
+import used_images { NaturalSize }
 import used_geometry
 import used_style { DashCache }
 import used_style
@@ -58,7 +61,7 @@ import svg_geometry.geometry { Rect, Point, Path, Transform }
 import svg_geometry.transforms { Matrix, Facing }
 import svg_geometry.transforms
 import svg_geometry.svg
-import svg_geometry.svg { AspectRatio }
+import svg_geometry.svg { AspectRatio, Alignment }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
 import silk.collections.list { List }
@@ -226,6 +229,8 @@ effect fn sizing(
 }
 
 struct Plan {
+  image: Option<usize>,
+  imageMapping: Transform,
   occurrence: OccurrenceId,
   firstChild: Option<usize>,
   nextSibling: Option<usize>,
@@ -417,6 +422,7 @@ fn paintComponents(paint: &Paint) -> [f64; 4] {
 // A referenced subtree gets one plan per renderable node, not an entire
 // document-sized array for every marker or pattern instance.
 struct Planning {
+  images: ImageStore,
   metadata: MetadataCache,
   paths: List<Path>,
   dashes: List<List<f64>>,
@@ -696,12 +702,14 @@ effect fn prepare(
   if !svgElement && !foreign {
     return Option<usize>.None
   }
+  let imageElement = svgElement && !foreign && equal(name, b"image")
   let drawable = svgElement && !foreign
     && (equal(name, b"path") || equal(name, b"rect") || equal(name, b"circle")
       || equal(name, b"ellipse")
       || equal(name, b"line")
       || equal(name, b"polyline")
-      || equal(name, b"polygon"))
+      || equal(name, b"polygon")
+      || imageElement)
   let container = !svgElement || (!drawable && (containerName(name) || (isRoot && root.definition)))
   if !container && !drawable {
     return Option<usize>.None
@@ -743,6 +751,8 @@ effect fn prepare(
   let mut layout = Option<usize>.None
   let mut disabled = false
   let mut path = Option<usize>.None
+  let mut image = Option<usize>.None
+  let mut imageMapping = Transform.identity()
   let mut paintable = false
   let mut ownBounds = false
   let instance = svgElement && equal(name, b"use")
@@ -805,7 +815,50 @@ effect fn prepare(
   if disabled {
     return Option<usize>.None
   }
-  if drawable {
+  if imageElement {
+    image = state.images.find(source)
+    if let Option<usize>.Some { value: assetIndex } = &image {
+      let asset = &state.images.assets.asSlice()[assetIndex].image
+      let iw = u32.toF64(asset.width())
+      let ih = u32.toF64(asset.height())
+      let engine = &styles.catalog.engine
+      let size = run used_images.size(
+        engine.number(styleId, Property.Width, viewport.width()),
+        engine.number(styleId, Property.Height, viewport.height()),
+        NaturalSize {
+          width: Option<f64>.some(iw),
+          height: Option<f64>.some(ih),
+          ratio: Option<f64>.some(iw / ih),
+        },
+      )
+      let x = match &engine.number(styleId, Property.X, viewport.width()) {
+        Option<f64>.Some { value } => value
+        _ => 0.0
+      }
+      let y = match &engine.number(styleId, Property.Y, viewport.height()) {
+        Option<f64>.Some { value } => value
+        _ => 0.0
+      }
+      let target = run rectangle(x, y, size.width, size.height)
+      let bytes = match &Document.attribute(document, source.node, b"", b"preserveAspectRatio") {
+        Option<&[u8]>.Some { value } => value
+        _ => b""
+      }
+      let aspect = match &svg.aspectRatio(bytes) {
+        Option<AspectRatio>.Some { value } => value
+        _ => AspectRatio { alignment: Alignment.XMidYMid, slice: false, defer: false }
+      }
+      if let Option<Transform>.Some { value: fitted } = &used_images.fit(iw, ih, target, aspect) {
+        imageMapping = fitted
+
+        // The image's positioning rectangle supplies its geometry reference box.
+        path = Option<usize>.some(state.paths.length())
+        run state.paths.append(run svg.rectangle(x, y, size.width, size.height, 0.0, 0.0))
+        paintable = true
+        ownBounds = true
+      }
+    }
+  } else if drawable {
     let geometry = run used_geometry.shape(
       document,
       source.node,
@@ -848,13 +901,15 @@ effect fn prepare(
   }
   run state.plans.append(
     Plan {
+      image: image,
+      imageMapping: imageMapping,
       occurrence: id,
       firstChild: Option<usize>.None,
       nextSibling: Option<usize>.None,
       styleId: styleId,
       style: style,
       path: path,
-      pathLength: if drawable {
+      pathLength: if drawable && !imageElement {
         run used_path_length.attribute(
           document,
           source.node,
@@ -866,7 +921,7 @@ effect fn prepare(
         Option<f64>.None
       },
       paintable: paintable,
-      hasStroke: (presence & 2) != 0,
+      hasStroke: !imageElement && (presence & 2) != 0,
       vectorFlags: vectorFlags,
       vectorScreen: vectorScreen,
       subtreeEffects: vectorFlags != 0,
@@ -1642,6 +1697,11 @@ effect fn localContextPaint(value: Paint, inverse: &Mapping, paints: &mut PaintS
     fail RenderError.InvalidGeometry
   }
   let instance = match &paints.paints.asSlice()[source] {
+    PaintInstance.Image { image, transform, nearest } => PaintInstance.Image {
+      image: image,
+      transform: run inverse.compose(&transform),
+      nearest: nearest,
+    }
     PaintInstance.Gradient { gradient, transform } => PaintInstance.Gradient {
       gradient: gradient,
       transform: run inverse.compose(&transform),
@@ -2884,7 +2944,8 @@ effect fn paintPrepared(
     }
     _ => {}
   }
-  let mut used = if (plan.paintable && plan.style.visible) || plan.instance {
+  let mut used = if plan.image.isNone()
+    && ((plan.paintable && plan.style.visible) || plan.instance) {
     run nodePaints(
       graph,
       &mut styles.*,
@@ -2900,6 +2961,32 @@ effect fn paintPrepared(
     )
   } else {
     plan.style
+  }
+  if let Option<usize>.Some { value: image } = &plan.image {
+    let placement = Mapping.Affine { value: plan.imageMapping }
+    let transform = run matrix.compose(&placement)
+    let nearest = match &styles.catalog.engine.get(plan.styleId, Property.ImageRendering) {
+      Option<ComputedValue>.Some { value } => match &styles.catalog.engine.values.get(
+        value.value,
+      ).* {
+        Value.Keyword { keyword } => keyword == Keyword.OptimizeSpeed
+        _ => false
+      }
+      _ => false
+    }
+    let index = paints.paints.length()
+    run paints.paints.append(
+      PaintInstance.Image { image: image, transform: transform, nearest: nearest },
+    )
+    used.fill = Paint.Server { index: index }
+    used.fillOpacity = 1.0
+    used.stroke = Paint.None
+    used.crispEdges = false
+
+    // Limit image coverage to its actual fitted sample rectangle for meet.
+    let asset = &state.images.assets.asSlice()[image].image
+    let samples = run rectangle(0.0, 0.0, u32.toF64(asset.width()), u32.toF64(asset.height()))
+    clip = run transform.clipRectangle(samples, true, true, clip, &mut clips.*)
   }
   if plan.paintable && plan.style.visible && present(&used.stroke, 0) && used.strokeWidth > 0.0
     && used.strokeOpacity > 0.0 {
@@ -2963,7 +3050,7 @@ effect fn paintPrepared(
         let mut part: usize = 0
         while part < 3 {
           let layer = plan.style.paintOrder[part]
-          if layer == PaintLayer.Markers {
+          if layer == PaintLayer.Markers && plan.image.isNone() {
             run paintMarkers(
               graph,
               &mut styles.*,
@@ -2983,7 +3070,7 @@ effect fn paintPrepared(
               &mut shapes.*,
               &mut clips.*,
             )
-          } else {
+          } else if layer != PaintLayer.Markers {
             run nodes.append(ResolvedNode.Paint { shape: shape, layer: layer })
           }
           part = part + 1
@@ -3082,6 +3169,7 @@ effect fn paintPrepared(
 }
 
 effect fn resolveStyled(
+  images: ImageStore,
   graph: Graph,
   inputStyles: StyledGraph,
   options: &RenderOptions,
@@ -3195,6 +3283,7 @@ effect fn resolveStyled(
   let mut dashes = List<List<f64>>.make()
   run dashes.append(List<f64>.make())
   let mut state = Planning {
+    images: move images,
     metadata: move sourceMetadata,
     paths: move paths,
     dashes: move dashes,
@@ -3308,6 +3397,7 @@ effect fn resolveStyled(
     _ => {}
   }
   return RenderTree {
+    images: move state.images.assets,
     width: viewport.pixelsWidth,
     height: viewport.pixelsHeight,
     maxPixels: options.maxPixels,
@@ -3339,7 +3429,8 @@ effect fn geometryLimit(error: GeometryError) -> RenderTree
   fail RenderError.InvalidGeometry
 }
 
-pub effect fn resolve(
+pub effect fn resolveWithImages(
+  images: ImageStore,
   graph: Graph,
   styles: StyledGraph,
   options: &RenderOptions,
@@ -3351,9 +3442,40 @@ pub effect fn resolve(
   ? &mut Allocator {
   return run Effect.catch<GeometryError>(
     Effect.catch<CssError>(
-      resolveStyled(move graph, move styles, options, limits, initialWidth, initialHeight),
+      resolveStyled(
+        move images,
+        move graph,
+        move styles,
+        options,
+        limits,
+        initialWidth,
+        initialHeight,
+      ),
       cssLimit,
     ),
     geometryLimit,
+  )
+}
+
+/// Resolve geometry without fetching external image assets. Rendering entry points
+/// supply an asset store through resolveWithImages.
+pub effect fn resolve(
+  graph: Graph,
+  styles: StyledGraph,
+  options: &RenderOptions,
+  limits: &Limits,
+  initialWidth: f64,
+  initialHeight: f64,
+) -> RenderTree
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  return run resolveWithImages(
+    ImageStore.empty(),
+    move graph,
+    move styles,
+    options,
+    limits,
+    initialWidth,
+    initialHeight,
   )
 }

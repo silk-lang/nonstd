@@ -1,0 +1,226 @@
+//! Owned decoded image resources, shared by all occurrences of a source node.
+import structure { Graph, SourceId }
+import resources { Resolver, ResourceKind, ResourceError, Policy, fetchWithPolicy }
+import url { Url, UrlError }
+import scene { RenderError }
+import svg_xml.xml { Document, NodeId }
+import svg_css.tokens { equal }
+import svg_image.image { Image, ImageError }
+import svg_image.png { PngError, Metadata as PngMetadata }
+import svg_image.png
+import svg_image.jpeg { JpegError, Metadata as JpegMetadata }
+import svg_image.jpeg
+import svg_image.orientation
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+pub union ColorMetadata {
+  Png { pub value: PngMetadata },
+  Jpeg { pub value: JpegMetadata },
+}
+
+pub struct Asset {
+  pub image: Image,
+  pub color: ColorMetadata
+}
+
+pub struct Store {
+  pub assets: List<Asset>,
+  indices: List<List<usize>>,
+}
+
+impl Store {
+  pub fn empty() -> Store {
+    return Store { assets: List<Asset>.make(), indices: List<List<usize>>.make() }
+  }
+
+  pub fn find(self: &Self, source: SourceId) -> Option<usize> {
+    if source.document.index >= self.indices.length() {
+      return Option<usize>.None
+    }
+    let nodes = self.indices.asSlice()[source.document.index].asSlice()
+    if source.node.index >= nodes.length || nodes[source.node.index] == usize.MAX {
+      return Option<usize>.None
+    }
+    return Option<usize>.some(nodes[source.node.index])
+  }
+}
+
+struct Cached {
+  url: Url,
+  asset: usize
+}
+
+effect fn decode(data: &[u8]) -> Asset
+  ! PngError | JpegError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  if data.length >= 8 && data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71 {
+    let decoded = run png.decodeWithMetadata(data)
+    return Asset {
+      image: move decoded.image,
+      color: ColorMetadata.Png { value: move decoded.metadata },
+    }
+  }
+  if data.length >= 2 && data[0] == 255 && data[1] == 216 {
+    let decoded = run jpeg.decodeWithMetadata(data)
+    let image = if decoded.metadata.orientation > 1 && decoded.metadata.orientation <= 8 {
+      run orientation.apply(&decoded.image, decoded.metadata.orientation)
+    } else {
+      move decoded.image
+    }
+    return Asset { image: move image, color: ColorMetadata.Jpeg { value: move decoded.metadata } }
+  }
+  fail PngError.Unsupported
+}
+
+effect fn fetched(url: &Url, policy: &Policy, remaining: &mut usize) -> Asset
+  ! RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let response = run fetchWithPolicy(url, ResourceKind.Image, policy)
+  let count = Bytes.length(&response.bytes)
+  if count > remaining.* {
+    fail RenderError.TooLarge
+  }
+  remaining.* = remaining.* - count
+  return run decode(Bytes.asSlice(&response.bytes))
+}
+
+/// Resource errors and unsupported/malformed images paint nothing. Allocator
+/// failure is never swallowed. Source bytes and retained pixels have separate caps.
+pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut store = Store.empty()
+  let mut cache = List<Cached>.make()
+  let mut pixels: usize = 0
+  let mut remaining = graph.limits.maxTotalBytes
+  let mut retained = graph.limits.maxTotalBytes
+  let mut urls = graph.limits.maxUrlBytes
+  let mut documentIndex: usize = 0
+  while documentIndex < graph.documents.length() {
+    let source = &graph.documents.asSlice()[documentIndex]
+    let document = &source.document
+    let mut indices = List<usize>.make()
+    let mut n: usize = 0
+    while n < Document.nodes(document).length {
+      run indices.append(usize.MAX)
+      let node = NodeId { index: n }
+      n = n + 1
+      if !equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg")
+        || !equal(Document.localName(document, node), b"image") {
+        continue
+      }
+      let href = match &Document.attribute(document, node, b"", b"href") {
+        Option<&[u8]>.Some { value } => Option<&[u8]>.some(value)
+        _ => Document.attribute(document, node, b"http://www.w3.org/1999/xlink", b"href")
+      }
+      let text = match &href {
+        Option<&[u8]>.Some { value } => value
+        _ => {
+          continue
+        }
+      }
+      if text.length == 0 {
+        continue
+      }
+      let parsed = run Effect.result(
+        Url.resolve(&graph.urls.asSlice()[source.nodeBases.asSlice()[node.index]], text),
+      )
+      let url = match move parsed {
+        Result<Url, UrlError | OutOfMemoryError>.Success { value } => move value
+        Result<Url, UrlError | OutOfMemoryError>.Failure { error } => {
+          match &error {
+            OutOfMemoryError value => {
+              fail OutOfMemoryError {}
+            }
+            _ => {}
+          }
+          continue
+        }
+      }
+
+      // Secure authorization precedes cache lookup, so an unrestricted earlier
+      // document cannot lend a forbidden image to a secure document.
+      if source.policy.mode.isSecure() && !equal(url.scheme(), b"data") {
+        continue
+      }
+      let mut found = false
+      let mut i: usize = 0
+      while i < cache.length() {
+        if equal(cache.asSlice()[i].url.bytes(), url.bytes()) {
+          indices.set(node.index, cache.asSlice()[i].asset)
+          found = true
+          break
+        }
+        i = i + 1
+      }
+      if found {
+        continue
+      }
+      if cache.length() >= graph.limits.maxRequests {
+        fail RenderError.TooLarge
+      }
+      if url.bytes().length > urls {
+        fail RenderError.TooLarge
+      }
+      urls = urls - url.bytes().length
+      let decoded = run Effect.result(fetched(&url, &source.policy, &mut remaining))
+      let mut index = usize.MAX
+      match move decoded {
+        Result<
+          Asset,
+          RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+        >.Success {
+          value
+        } => {
+          let count = u32.toUsize(value.image.width()) * u32.toUsize(value.image.height())
+          if count > maxPixels - pixels {
+            fail RenderError.TooLarge
+          }
+          let profile = match &value.color {
+            ColorMetadata.Png { value: color } => Bytes.length(&color.iccProfile)
+            ColorMetadata.Jpeg { value: color } => Bytes.length(&color.iccProfile)
+          }
+          if count > retained / 4 {
+            fail RenderError.TooLarge
+          }
+          retained = retained - count * 4
+          if profile > retained {
+            fail RenderError.TooLarge
+          }
+          retained = retained - profile
+          pixels = pixels + count
+          index = store.assets.length()
+          run store.assets.append(move value)
+        }
+        Result<
+          Asset,
+          RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+        >.Failure {
+          error
+        } => {
+          match &error {
+            RenderError value => {
+              fail value
+            }
+            OutOfMemoryError value => {
+              fail OutOfMemoryError {}
+            }
+            _ => {}
+          }
+        }
+      }
+      indices.set(node.index, index)
+      run cache.append(Cached { url: move url, asset: index })
+    }
+    run store.indices.append(move indices)
+    documentIndex = documentIndex + 1
+  }
+  return move store
+}

@@ -69,7 +69,7 @@ repeat. Exact fixtures include partial alpha, three-layer ordering, nested masks
 missing resources, and preservation of earlier siblings. Image/gradient mask sources,
 their positioning/repetition, broader conformance, and mask performance gates remain open.
 
-Image decoding, filters, text, animation and ICC remain required later work, not
+Filters, text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current
 shape rasterization; computed image/text hints gain consumers in their own phases.
 Parsing those properties does not implement their rendering.
@@ -85,8 +85,8 @@ filters, Adam7, and APNG's first animation frame. The decoder retains gAMA, cHRM
 sRGB intent and bounded decompressed iCCP data for the color-management consumer;
 it does not yet transform source samples. Independent fixtures and malformed-input
 tests cover framing, CRC/zlib integrity, output limits, truncated streams, palette
-indices, metadata order, and APNG frame bounds/sequences. SVG image rendering,
-source color conversion and the remaining phase-7 integrations are still open.
+indices, metadata order, and APNG frame bounds/sequences. PNG samples now feed SVG image rendering; source color conversion and the remaining
+phase-7 integrations are still open.
 
 JPEG work now reconstructs 8-bit grayscale and three-component sequential and
 progressive streams, including separate-component scans, spectral selection,
@@ -97,10 +97,19 @@ rotations/reflections without resampling. Progressive regression fixtures cover 
 coefficients; malformed scans and every truncation of a progressive fixture are
 rejected. Chroma reconstruction currently uses nearest samples. JPEG ICC chunks
 are assembled in sequence order, including between progressive scans, with missing/duplicate/inconsistent chunk rejection. ICC interpretation,
-broader format coverage and SVG integration remain open.
+broader format coverage remain open. SVG image rendering now consumes these samples.
 
 Phase-7 compressed-document work recognizes gzip/zlib root SVG sources and
 external SVG source references, including compressed data URLs and concatenated
 gzip members. XML encoding detection follows decompression. Checksums, truncation,
 optional headers, streaming output and aggregate expansion limits have dedicated
-tests. Image rendering and nested SVG image consumers are still pending.
+tests. Nested SVG image consumers are still pending.
+
+Raster image integration now retains PNG/JPEG assets across image occurrences,
+resolves intrinsic/auto sizes, applies EXIF orientation, and maps samples through
+preserveAspectRatio and full projective transforms. Broken images paint nothing;
+secure-mode external requests never reach the resolver. SVG image hints select
+nearest (`optimizeSpeed`) or bilinear (`auto`/`optimizeQuality`) sampling. Exact
+fixtures cover sizing, meet/slice/none, opacity, use instances and projective
+placement. Nested SVG images, CSS image masks, CSS Images 3 sampling keywords and
+the CSS orientation override still need integration; phase 7 is not complete.
