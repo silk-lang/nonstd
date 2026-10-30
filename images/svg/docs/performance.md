@@ -699,3 +699,27 @@ display list outside the parse timer. Small wall differences are noisy.
 | tiger/parse | 1.0181 | 445,150,358 | 445,150,365 | 1.000000 |
 
 The complete alternating A/B report is ignored `build/svg/svg-orientation-ab.json`.
+
+## Phase 8 filters
+
+The `filters` workload (512×512, 64 tiles) applies one of eight filters to each tile:
+blur, drop shadow, hue rotation, dilation, turbulence clipped to the shape, diffuse
+lighting, offset with multiply blending, and component transfer. Most of them run in
+the default linearRGB.
+
+Measured in a 4-CPU x86_64 cloud container with Silk dev.33 against resvg at the
+pinned corpus revision, using seven samples of five iterations. Ratios are Silk/resvg.
+
+| Stage | Before | After |
+|---|---:|---:|
+| render | 3.31× | 0.94× |
+| end-to-end | 3.18× | 0.96× |
+| parse + record | 10.2× | 10.7× |
+
+"Before" is main at `e2653e9`, where each sRGB↔linearRGB pixel conversion evaluated
+the series `pow`. That was 37% of the process's instructions. "After" remembers each
+conversion per (alpha, channel) pair for the whole surface. The output is
+byte-identical (same checksum), and process Ir fell from 625M to 330M. The parse
+gap is the same one every workload shares. The checksums differ from resvg's
+because the two engines' filter arithmetic differs (box blur, lighting normals,
+rounding). Agreement is judged by the reftests, not by the benchmark.
