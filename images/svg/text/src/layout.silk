@@ -2,6 +2,7 @@
 //! `text` element: per-character font selection, shaping, the positioning attributes and
 //! text-anchor, producing positioned glyphs in the element's user space.
 import outline { Outlines, Recorder }
+import on_path { OnPath }
 import svg_fonts.database { FontDatabase, Face, AXIS_WEIGHT, AXIS_WIDTH, AXIS_ITALIC, AXIS_SLANT }
 import svg_fonts.matching { Selection }
 import harfrust.lib {
@@ -130,6 +131,8 @@ pub struct Character {
   pub dy: f64,
   /// Degrees.
   pub rotate: f64,
+  /// The `textPath` (an index into `layout`'s paths) the character is in.
+  pub path: Option<usize>,
 }
 
 impl Copy for Character {}
@@ -173,6 +176,8 @@ pub struct PlacedGlyph {
   pub scaleX: f64,
   /// Horizontal advance in user units.
   pub advance: f64,
+  /// Off the end of its text path, so not rendered.
+  pub hidden: bool,
 }
 
 impl Copy for PlacedGlyph {}
@@ -504,6 +509,7 @@ effect fn shapeRun(
         offsetX: i32.toF64(position.xOffset) * scale,
         offsetY: -i32.toF64(position.yOffset) * scale,
         rotate: 0.0,
+        hidden: false,
         scaleX: 1.0,
         advance: width,
       },
@@ -721,12 +727,27 @@ fn positioned(character: &Character) -> bool {
   return false
 }
 
+/// Whether the character starts a `textPath`, which always starts an anchored chunk.
+fn pathStart(characters: &[Character], index: usize) -> bool {
+  if let Option<usize>.Some { value } = characters[index].path {
+    if index == 0 {
+      return true
+    }
+    if let Option<usize>.Some { value: before } = characters[index - 1].path {
+      return before != value
+    }
+    return true
+  }
+  return false
+}
+
 /// Lays out one text element's addressable characters.
 pub effect fn layout(
   database: &FontDatabase,
   spans: &[Span],
   characters: &[Character],
   lengths: &[TextLength],
+  paths: &[OnPath],
 ) -> Layout
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -778,7 +799,8 @@ pub effect fn layout(
   let mut chunkStart: usize = 0
   while chunkStart < count {
     let mut chunkEnd = chunkStart + 1
-    while chunkEnd < count && !positioned(&characters[chunkEnd]) {
+    while chunkEnd < count && !positioned(&characters[chunkEnd])
+      && !pathStart(characters, chunkEnd) {
       chunkEnd = chunkEnd + 1
     }
     run List<usize>.appendRepeated(&mut chunks, chunkStart, chunkEnd - chunkStart)
@@ -890,7 +912,7 @@ pub effect fn layout(
     glyphs[g].offsetX = glyphs[g].offsetX * scale
     g = g + 1
   }
-  anchor(spans, characters, &chunks, &positionsX, &mut glyphs)
+  anchor(spans, characters, &chunks, &mut positionsX, &mut glyphs)
 
   // Baseline alignment: each glyph's alphabetic baseline moves to its span's.
   let mut drops = List<f64>.make()
@@ -901,7 +923,151 @@ pub effect fn layout(
     placed[g].y = placed[g].y + List<f64>.get(&drops, placed[g].span)
     g = g + 1
   }
+  if paths.length > 0 {
+    run onPaths(
+      spans,
+      characters,
+      paths,
+      &owners,
+      &chunks,
+      &levels,
+      &positionsX,
+      &positionsY,
+      &drops,
+      &mut result,
+    )
+  }
   return move result
+}
+
+// How "Position on path" moves one typographic character.
+union Placement {
+  Line,
+  Hidden,
+  Path { pub x: f64, pub y: f64, pub tangentX: f64, pub tangentY: f64 },
+  After { pub x: f64, pub y: f64 },
+}
+
+impl Copy for Placement {}
+
+// Step "Position on path": each typographic character of a textPath goes to the point
+// its midpoint reaches along the path, turned to the tangent there. Characters after
+// the element continue from the path's end until the next anchored chunk.
+effect fn onPaths(
+  spans: &[Span],
+  characters: &[Character],
+  paths: &[OnPath],
+  owners: &List<usize>,
+  chunks: &List<usize>,
+  levels: &List<u8>,
+  positionsX: &List<f64>,
+  positionsY: &List<f64>,
+  drops: &List<f64>,
+  result: &mut Layout,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = characters.length
+  let mut sizes = List<f64>.make()
+  run List<f64>.appendRepeated(&mut sizes, 0.0, count)
+  advances(&result.*, count, &mut sizes)
+  let xs = List<f64>.asSlice(positionsX)
+  let ys = List<f64>.asSlice(positionsY)
+  let mut placements = List<Placement>.make()
+  let mut current = Option<usize>.None
+  let mut after = false
+  let mut shiftX = 0.0
+  let mut shiftY = 0.0
+  let mut index: usize = 0
+  while index < count {
+    let owner = List<usize>.get(owners, index) == index
+    let mut placement = Placement.Line
+    if let Option<usize>.Some { value: which } = characters[index].path {
+      current = Option<usize>.Some { value: which }
+      after = false
+      let path = &paths[which]
+      if !path.valid {
+        placement = Placement.Hidden
+      } else if owner {
+        let advance = if List<u8>.get(levels, index) % 2 == 1 {
+          -List<f64>.get(&sizes, index)
+        } else {
+          List<f64>.get(&sizes, index)
+        }
+        let mut mid = xs[index] + advance / 2.0 + path.offset
+        let mut hidden = false
+        if !path.closed {
+          hidden = mid < 0.0 || mid > path.length
+        } else {
+          let span = &spans[characters[index].span]
+          let along = mid - path.offset
+          let first = (span.anchor == Anchor.Start && !span.rtl)
+            || (span.anchor == Anchor.End && span.rtl)
+          let middle = span.anchor == Anchor.Middle
+          hidden = if first {
+            along < 0.0 || along > path.length
+          } else if middle {
+            along < -path.length / 2.0 || along > path.length / 2.0
+          } else {
+            along < -path.length || along > 0.0
+          }
+          mid = mid - f64.floor(mid / path.length) * path.length
+        }
+        if hidden {
+          placement = Placement.Hidden
+        } else {
+          let frame = path.at(mid)
+          let y = ys[index] + List<f64>.get(drops, characters[index].span)
+          let half = advance / 2.0
+          placement = Placement.Path {
+            x: frame.point.x - half * frame.tangentX + y * -frame.tangentY,
+            y: frame.point.y - half * frame.tangentY + y * frame.tangentX,
+            tangentX: frame.tangentX,
+            tangentY: frame.tangentY,
+          }
+        }
+      }
+    } else if owner {
+      if let Option<usize>.Some { value: which } = current {
+        current = Option<usize>.None
+        after = true
+        shiftX = paths[which].last.x - xs[index]
+        shiftY = paths[which].last.y - ys[index]
+      }
+      if after {
+        if List<usize>.get(chunks, index) == index {
+          after = false
+        } else {
+          placement = Placement.After { x: shiftX, y: shiftY }
+        }
+      }
+    }
+    run List<Placement>.append(&mut placements, placement)
+    index = index + 1
+  }
+
+  let glyphs = List<PlacedGlyph>.asMutSlice(&mut result.glyphs)
+  let mut g: usize = 0
+  while g < glyphs.length {
+    let owner = glyphs[g].owner
+    match List<Placement>.get(&placements, owner) {
+      Placement.Line => {}
+      Placement.Hidden => {
+        glyphs[g].hidden = true
+      }
+      Placement.Path { x, y, tangentX, tangentY } => {
+        let along = glyphs[g].x - xs[owner]
+        glyphs[g].x = x + along * tangentX
+        glyphs[g].y = y + along * tangentY
+        glyphs[g].rotate = glyphs[g].rotate + f64.atan2(tangentY, tangentX) * 180.0 / f64.PI
+      }
+      Placement.After { x, y } => {
+        glyphs[g].x = glyphs[g].x + x
+        glyphs[g].y = glyphs[g].y + y
+      }
+    }
+    g = g + 1
+  }
 }
 
 /// The height of `baseline` above the alphabetic baseline, in user units, from the metrics
@@ -1117,7 +1283,7 @@ fn anchor(
   spans: &[Span],
   characters: &[Character],
   chunks: &List<usize>,
-  xs: &List<f64>,
+  xs: &mut List<f64>,
   glyphs: &mut [PlacedGlyph],
 ) -> () {
   let mut first: usize = 0
@@ -1137,7 +1303,7 @@ fn anchor(
       high = f64.max(high, right)
       g = g + 1
     }
-    let origin = List<f64>.get(xs, chunk)
+    let origin = List<f64>.get(&xs.*, chunk)
     let span = &spans[characters[chunk].span]
     let shift = match span.anchor {
       Anchor.Start => if span.rtl {
@@ -1156,6 +1322,12 @@ fn anchor(
     while g < last {
       glyphs[g].x = glyphs[g].x + shift
       g = g + 1
+    }
+    let mut c = chunk
+    while c < List<usize>.length(chunks) && List<usize>.get(chunks, c) == chunk {
+      let moved = List<f64>.get(&xs.*, c) + shift
+      List<f64>.set(&mut xs, c, moved)
+      c = c + 1
     }
     first = last
   }

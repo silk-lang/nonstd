@@ -2,7 +2,7 @@
 //! characters of a `text` element and its text content children, resolves their fonts and
 //! positioning attributes, and lays them out with `images/svg/text`. Each element gets its
 //! glyph outlines and glyph cells as user-space paths.
-import structure { Graph, OccurrenceId }
+import structure { Graph, OccurrenceId, SourceId }
 import document_styles { StyledGraph }
 import scene { RenderError }
 import used_style
@@ -34,7 +34,17 @@ import svg_text.layout {
   layout
 }
 import svg_text.paths { spanGeometry }
-import svg_geometry.geometry { Path }
+import svg_text.on_path { OnPath, Offset }
+import used_geometry
+import used_path_length
+import svg_geometry.svg
+import svg_geometry.geometry { Path, Transform, Rect }
+import svg_geometry.bounds { Result }
+import svg_geometry.bounds
+import svg_geometry.transforms { Matrix, Projection }
+import svg_geometry.transforms
+import used_transforms
+import silk.collections.slice { Slice }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.option { Option }
@@ -73,6 +83,9 @@ struct Gather {
   lengths: List<TextLength>,
   /// The last character is a collapsible space (CSS Text 4 #white-space-phase-1).
   collapsible: bool,
+  /// The entry of each textPath element, and the one the walk is inside.
+  paths: List<usize>,
+  path: Option<usize>,
 }
 
 fn equal(left: &[u8], right: &[u8]) -> bool {
@@ -550,6 +563,7 @@ effect fn push(gather: &mut Gather, cp: u32, span: usize) -> ()
       dx: 0.0,
       dy: 0.0,
       rotate: 0.0,
+      path: gather.path,
     },
   )
   run gather.units.append(
@@ -631,6 +645,13 @@ effect fn walk(
       end: 0,
     },
   )
+
+  // A textPath inside another one lays out as a tspan of the outer path.
+  let outer = gather.path
+  if outer.isNone() && equal(Document.localName(document, source.node), b"textPath") {
+    gather.path = Option<usize>.Some { value: gather.paths.length() }
+    run gather.paths.append(position)
+  }
   let mode = collapse(engine, style)
   let mut child = Document.firstChild(document, source.node)
   let mut element = entry.firstChild
@@ -658,6 +679,7 @@ effect fn walk(
   }
   let entries = gather.entries.asMutSlice()
   entries[position].end = gather.characters.length()
+  gather.path = outer
 }
 
 // --- Positioning attributes ----------------------------------------------------------------
@@ -740,7 +762,7 @@ effect fn position(
     let source = graph.occurrences.asSlice()[entry.occurrence.index].source
     let document = graph.sourceDocument(source)
     let name = Document.localName(document, entry.node)
-    if equal(name, b"text") || equal(name, b"tspan") {
+    if equal(name, b"text") || equal(name, b"tspan") || equal(name, b"textPath") {
       run list(
         attribute(document, entry.node, b"textLength"),
         Dimension.LengthPercentage,
@@ -838,6 +860,206 @@ effect fn position(
   }
 }
 
+// --- Text on a path ---------------------------------------------------------------------
+
+/// The basic shapes and `path`, which a textPath may follow (#TextPathElementHrefAttribute).
+fn shapeElement(name: &[u8]) -> bool {
+  return equal(name, b"path") || equal(name, b"rect") || equal(name, b"circle")
+    || equal(name, b"ellipse")
+    || equal(name, b"line")
+    || equal(name, b"polyline")
+    || equal(name, b"polygon")
+}
+
+/// An occurrence of `target`, preferring the scope of `near`.
+fn occurrenceOf(graph: &Graph, near: OccurrenceId, target: SourceId) -> Option<OccurrenceId> {
+  let scope = graph.occurrences.asSlice()[near.index].scope
+  let mut found = Option<OccurrenceId>.None
+  let occurrences = graph.occurrences.asSlice()
+  let mut index: usize = 0
+  while index < occurrences.length {
+    let source = occurrences[index].source
+    if source.document.index == target.document.index && source.node.index == target.node.index {
+      if occurrences[index].scope == scope {
+        return Option<OccurrenceId>.Some { value: OccurrenceId { index: index } }
+      }
+      if found.isNone() {
+        found = Option<OccurrenceId>.Some { value: OccurrenceId { index: index } }
+      }
+    }
+    index = index + 1
+  }
+  return found
+}
+
+/// startOffset: a length or number in user units, or a percentage of the path length.
+effect fn startOffset(bytes: &[u8], engine: &mut Engine, style: StyleId, limits: &Limits) -> Offset
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut end = bytes.length
+  while end > 0
+    && (bytes[end - 1] == 0x20 || bytes[end - 1] == 0x09 || bytes[end - 1] == 0x0A
+      || bytes[end - 1] == 0x0D) {
+    end = end - 1
+  }
+  if end > 0 && bytes[end - 1] == 0x25 {
+    let mut values = List<f64>.make()
+    run list(bytes, Dimension.LengthPercentage, &mut engine.*, style, 100.0, limits, &mut values)
+    if values.length() == 1 {
+      return Offset.Fraction { value: values.asSlice()[0] / 100.0 }
+    }
+    return Offset.Length { value: 0.0 }
+  }
+  let mut values = List<f64>.make()
+  run list(bytes, Dimension.LengthPercentage, &mut engine.*, style, 0.0, limits, &mut values)
+  return Offset.Length {
+    value: if values.length() == 1 {
+      values.asSlice()[0]
+    } else {
+      0.0
+    },
+  }
+}
+
+/// The path a textPath element follows: its `path` attribute, else the shape `href` names.
+effect fn textPath(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  entry: Entry,
+  paths: &mut List<Path>,
+  width: f64,
+  height: f64,
+  limits: &Limits,
+) -> OnPath
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let source = graph.occurrences.asSlice()[entry.occurrence.index].source
+  let document = graph.sourceDocument(source)
+  let reverse = equal(attribute(document, entry.node, b"side"), b"right")
+  let offset = run startOffset(
+    attribute(document, entry.node, b"startOffset"),
+    &mut styles.catalog.engine,
+    entry.style,
+    limits,
+  )
+  let data = attribute(document, entry.node, b"path")
+  if data.length > 0 {
+    let parsed = run svg.parsePath(data)
+    if parsed.path.length() > 0 {
+      return run OnPath.make(
+        &parsed.path,
+        Transform.identity(),
+        reverse,
+        entry.start,
+        entry.end,
+        offset,
+        Option<f64>.None,
+      )
+    }
+  }
+  let mut href = attribute(document, entry.node, b"href")
+  if href.length == 0 {
+    href = match Document.attribute(
+      document,
+      entry.node,
+      b"http://www.w3.org/1999/xlink",
+      b"href",
+    ) {
+      Option<&[u8]>.Some { value } => value
+      _ => b""
+    }
+  }
+  let empty = Path.make()
+  let invalid = run OnPath.make(
+    &empty,
+    Transform.identity(),
+    reverse,
+    entry.start,
+    entry.end,
+    offset,
+    Option<f64>.None,
+  )
+  if href.length < 2 || href[0] != 0x23 {
+    return move invalid
+  }
+  let target = match graph.findId(source.document, Slice.view<u8>(href, 1, href.length - 1)) {
+    Option<SourceId>.Some { value } => value
+    _ => {
+      return move invalid
+    }
+  }
+  let targetDocument = graph.sourceDocument(target)
+  if !equal(Document.namespaceUri(targetDocument, target.node), b"http://www.w3.org/2000/svg")
+    || !shapeElement(Document.localName(targetDocument, target.node)) {
+    return move invalid
+  }
+  let occurrence = match occurrenceOf(graph, entry.occurrence, target) {
+    Option<OccurrenceId>.Some { value } => value
+    _ => {
+      return move invalid
+    }
+  }
+  let style = match &styles.nodeStyle(occurrence) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      return move invalid
+    }
+  }
+  let shape = run used_geometry.shape(
+    targetDocument,
+    target.node,
+    &mut styles.catalog.engine,
+    style,
+    width,
+    height,
+    &mut paths,
+    limits,
+  )
+  let index = match shape.path {
+    Option<usize>.Some { value } => value
+    _ => {
+      return move invalid
+    }
+  }
+  let length = run used_path_length.attribute(
+    targetDocument,
+    target.node,
+    &mut styles.catalog.engine,
+    style,
+    limits,
+  )
+
+  // The referenced element's transform is a supplemental transformation (#TextPathElement).
+  let engine = &styles.catalog.engine
+  let mut transform = Transform.identity()
+  if used_transforms.transformed(engine, style) {
+    if let Result.Finite { rect } = bounds.path(&paths.asSlice()[index]) {
+      if let Option<Rect>.Some { value: viewport } = Rect.new(0.0, 0.0, width, height) {
+        if let Option<Matrix>.Some { value: matrix } = used_transforms.element(
+          engine,
+          style,
+          viewport,
+          rect,
+          rect,
+        ) {
+          if let Projection.Affine { value } = transforms.flattened(&matrix) {
+            transform = value
+          }
+        }
+      }
+    }
+  }
+  return run OnPath.make(
+    &paths.asSlice()[index],
+    transform,
+    reverse,
+    entry.start,
+    entry.end,
+    offset,
+    length,
+  )
+}
+
 /// Lays out the `text` element `text` and returns the glyph geometry of each element in its
 /// subtree that renders characters of its own.
 pub effect fn resolve(
@@ -845,6 +1067,7 @@ pub effect fn resolve(
   styles: &mut StyledGraph,
   text: OccurrenceId,
   fonts: &FontDatabase,
+  paths: &mut List<Path>,
   width: f64,
   height: f64,
   limits: &Limits,
@@ -859,6 +1082,8 @@ pub effect fn resolve(
     units: List<u8>.make(),
     lengths: List<TextLength>.make(),
     collapsible: false,
+    paths: List<usize>.make(),
+    path: Option<usize>.None,
   }
   run walk(graph, &styles.*, fonts, &installed, text, Option<usize>.None, &mut gather)
 
@@ -868,11 +1093,29 @@ pub effect fn resolve(
     drop gather.units.pop()
   }
   run position(graph, &mut styles.*, &mut gather, width, height, limits)
+  let mut onPaths = List<OnPath>.make()
+  let mut which: usize = 0
+  while which < gather.paths.length() {
+    let entry = gather.entries.asSlice()[gather.paths.asSlice()[which]]
+    run onPaths.append(run textPath(graph, &mut styles.*, entry, &mut paths, width, height, limits))
+    which = which + 1
+  }
+
+  // y values are ignored for horizontal text on a path (#TextLayoutAlgorithm).
+  let characters = gather.characters.asMutSlice()
+  which = 0
+  while which < characters.length {
+    if characters[which].path.isSome() {
+      characters[which].y = Option<f64>.None
+    }
+    which = which + 1
+  }
   let result = run layout(
     fonts,
     gather.spans.asSlice(),
     gather.characters.asSlice(),
     gather.lengths.asSlice(),
+    onPaths.asSlice(),
   )
   let mut pieces = List<TextPiece>.make()
   let mut index: usize = 0
