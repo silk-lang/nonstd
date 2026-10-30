@@ -769,6 +769,10 @@ decisions:
   character: `start` aligns the right end of the extent for `rtl`. With `textLength`,
   an `rtl` element's characters move left (`spacing`) or scale about the right edge
   (`spacingAndGlyphs`).
+- Synthetic bold (#font-synthesis-weight, method left to the UA) follows FreeType's
+  `FT_Outline_EmboldenXY` and `FT_GlyphSlot_Embolden`: outlines grow by 1/24 em in x and y
+  (in font units, before scaling), and each advancing glyph's advance grows by the same
+  amount. Marks with no advance keep it.
 - Baselines follow CSS Inline 3 #baseline-alignment on horizontal text. The text
   element's dominant baseline sits on the text position. Each child aligns its baseline
   of the alignment type (`alignment-baseline`, or the parent's dominant baseline for
