@@ -70,6 +70,8 @@ pub struct Face {
   pub index: u32,
   /// UTF-8 family names: typographic (name ID 16) and legacy (name ID 1) in every language.
   pub families: List<Bytes>,
+  /// Full and PostScript names, which `local()` font sources match.
+  pub names: List<Bytes>,
   pub weight: Range,
   /// font-width percentages.
   pub width: Range,
@@ -96,6 +98,10 @@ pub struct FontDatabase {
 pub const DEFAULT_OBLIQUE: f64 = 14.0
 
 const NAME_FAMILY: u16 = 1
+
+const NAME_FULL: u16 = 4
+
+const NAME_POSTSCRIPT: u16 = 6
 
 const NAME_TYPOGRAPHIC_FAMILY: u16 = 16
 
@@ -155,6 +161,13 @@ effect fn addFamily(families: &mut List<Bytes>, name: Bytes) -> ()
 effect fn familyNames<'a>(font: &FontRef<'a>, families: &mut List<Bytes>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  run namesWith(font, &[NAME_TYPOGRAPHIC_FAMILY, NAME_FAMILY], &mut families)
+}
+
+/// The decoded names with the given IDs, in that order of IDs, without duplicates.
+effect fn namesWith<'a>(font: &FontRef<'a>, ids: &[u16], families: &mut List<Bytes>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let table = match move font.name() {
     Result<Name<'a>, ReadError>.Success { value } => value
     Result<Name<'a>, ReadError>.Failure { error } => {
@@ -166,12 +179,8 @@ effect fn familyNames<'a>(font: &FontRef<'a>, families: &mut List<Bytes>) -> ()
 
   // Typographic names first, so they are the family's preferred names.
   let mut pass: usize = 0
-  while pass < 2 {
-    let wanted = if pass == 0 {
-      NAME_TYPOGRAPHIC_FAMILY
-    } else {
-      NAME_FAMILY
-    }
+  while pass < ids.length {
+    let wanted = ids[pass]
     let mut index: usize = 0
     while index < records.len() {
       if let Result<NameRecord<'a>, ReadError>.Success { value: record } = move records.get(index) {
@@ -200,6 +209,8 @@ effect fn describe<'a>(font: &FontRef<'a>, source: usize, index: u32) -> Option<
   if List<Bytes>.length(&families) == 0 {
     return Option<Face>.None
   }
+  let mut full = List<Bytes>.make()
+  run namesWith(font, &[NAME_FULL, NAME_POSTSCRIPT], &mut full)
   let mut weight: f64 = 400.0
   let mut width: f64 = 100.0
   let mut italic = false
@@ -236,6 +247,7 @@ effect fn describe<'a>(font: &FontRef<'a>, source: usize, index: u32) -> Option<
     source: source,
     index: index,
     families: move families,
+    names: move full,
     weight: Range.point(weight),
     width: Range.point(width),
     italic: if italic {
@@ -416,6 +428,172 @@ impl FontDatabase {
     let mut index: usize = 0
     while index < List<GenericName>.length(&self.generics) {
       let entry = &List<GenericName>.asSlice(&self.generics)[index]
+      if entry.generic == generic {
+        run self.family(Bytes.asSlice(&entry.name), &mut out)
+        if List<usize>.length(&out.*) > 0 {
+          return
+        }
+      }
+      index = index + 1
+    }
+  }
+}
+
+/// A face's style as an @font-face `font-style` descriptor gives it.
+pub union FaceStyle {
+  Normal,
+  Italic,
+  Oblique { pub min: f64, pub max: f64 },
+}
+
+impl Copy for FaceStyle {}
+
+impl FontDatabase {
+  /// Whether `data` holds at least one face `add` would accept.
+  pub effect fn usable(data: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = List<Face>.make()
+    run parseFaces(data, 0, &mut found)
+    return List<Face>.length(&found) > 0
+  }
+
+  /// Adds face `index` of `data` under the family `family` only, as an @font-face rule
+  /// does (CSS Fonts 4 #font-face-rule). Descriptors that are given replace the values
+  /// read from the font; absent ones (`auto`) keep them. Returns false for unusable data.
+  pub effect fn addFace(
+    self: &mut Self,
+    data: Bytes,
+    index: u32,
+    family: &[u8],
+    weight: Option<Range>,
+    width: Option<Range>,
+    style: Option<FaceStyle>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let source = List<Bytes>.length(&self.sources)
+    let mut found = List<Face>.make()
+    run parseFaces(Bytes.asSlice(&data), source, &mut found)
+    let mut at: usize = 0
+    while at < List<Face>.length(&found) && List<Face>.asSlice(&found)[at].index != index {
+      at = at + 1
+    }
+    if at == List<Face>.length(&found) {
+      return false
+    }
+    let mut face = List<Face>.remove(&mut found, at)
+    let mut families = List<Bytes>.make()
+    let mut name = Bytes.make()
+    run Bytes.append(&mut name, family)
+    run List<Bytes>.append(&mut families, move name)
+    face.families = move families
+    if let Option<Range>.Some { value } = weight {
+      face.weight = value
+    }
+    if let Option<Range>.Some { value } = width {
+      face.width = value
+    }
+    if let Option<FaceStyle>.Some { value } = style {
+      match value {
+        FaceStyle.Normal => {
+          face.italic = Option<Range>.Some { value: Range.point(0.0) }
+          face.oblique = Option<Range>.Some { value: Range.point(0.0) }
+        }
+        FaceStyle.Italic => {
+          face.italic = Option<Range>.Some { value: Range.point(1.0) }
+          face.oblique = Option<Range>.None
+        }
+        FaceStyle.Oblique { min, max } => {
+          face.italic = Option<Range>.None
+          face.oblique = Option<Range>.Some { value: Range { min: min, max: max } }
+        }
+      }
+    }
+    run List<Bytes>.append(&mut self.sources, move data)
+    run List<Face>.append(&mut self.faces, move face)
+    return true
+  }
+}
+
+/// The faces text can use: the host's, then a document's own @font-face faces. Face
+/// indices continue past the host's. A family that a document defines hides installed
+/// faces of the same name (CSS Fonts 4 #font-face-rule).
+pub struct Fonts<'a> {
+  host: &'a FontDatabase,
+  pub local: FontDatabase,
+}
+
+impl<'a> Fonts<'a> {
+  pub fn make(host: &'a FontDatabase) -> Fonts<'a> {
+    return Fonts { host: host, local: FontDatabase.make() }
+  }
+
+  pub fn faceCount(self: &Self) -> usize {
+    return self.host.faceCount() + self.local.faceCount()
+  }
+
+  pub fn face(self: &Self, index: usize) -> &Face {
+    let hosted = self.host.faceCount()
+    if index < hosted {
+      return self.host.face(index)
+    }
+    return self.local.face(index - hosted)
+  }
+
+  pub fn data(self: &Self, index: usize) -> &[u8] {
+    let hosted = self.host.faceCount()
+    if index < hosted {
+      return self.host.data(index)
+    }
+    return self.local.data(index - hosted)
+  }
+
+  /// The host face whose full or PostScript name is `name`, for a `local()` source.
+  pub fn installed(self: &Self, name: &[u8]) -> Option<usize> {
+    let mut index: usize = 0
+    while index < self.host.faceCount() {
+      let known = List<Bytes>.asSlice(&self.host.face(index).names)
+      let mut entry: usize = 0
+      while entry < known.length {
+        if names.same(Bytes.asSlice(&known[entry]), name) {
+          return Option<usize>.Some { value: index }
+        }
+        entry = entry + 1
+      }
+      index = index + 1
+    }
+    return Option<usize>.None
+  }
+
+  /// The faces of the family named `name`: the document's when it defines the family,
+  /// else the host's.
+  pub effect fn family(self: &Self, name: &[u8], out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let start = List<usize>.length(&out.*)
+    run self.local.family(name, &mut out)
+    let count = List<usize>.length(&out.*)
+    if count > start {
+      let hosted = self.host.faceCount()
+      let entries = List<usize>.asMutSlice(&mut out)
+      let mut index = start
+      while index < count {
+        entries[index] = entries[index] + hosted
+        index = index + 1
+      }
+      return
+    }
+    run self.host.family(name, &mut out)
+  }
+
+  /// The faces of the first family configured for `generic` that has any.
+  pub effect fn generic(self: &Self, generic: Generic, out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < List<GenericName>.length(&self.host.generics) {
+      let entry = &List<GenericName>.asSlice(&self.host.generics)[index]
       if entry.generic == generic {
         run self.family(Bytes.asSlice(&entry.name), &mut out)
         if List<usize>.length(&out.*) > 0 {
