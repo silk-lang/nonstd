@@ -531,8 +531,31 @@ combines it with the accumulated layers below it. The bottom layer ignores its
 operator. [Mask mode](https://www.w3.org/TR/css-masking-1/#the-mask-mode) overrides
 the resource's mask type; shorter property lists repeat across image layers.
 Literal reference fixtures independently exercise partial-alpha Porter–Duff
-results and order-sensitive three-layer expressions. These checks do not complete
-the open phase-6 requirements for image/gradient mask sources or performance.
+results and order-sensitive three-layer expressions.
+
+`<gradient>` mask layers follow [CSS Images 3](https://www.w3.org/TR/css-images-3/#gradients)
+and are sized, positioned and tiled per [mask-size](https://www.w3.org/TR/css-masking-1/#the-mask-size),
+[mask-position](https://www.w3.org/TR/css-masking-1/#the-mask-position) and
+[mask-repeat](https://www.w3.org/TR/css-masking-1/#the-mask-repeat), which defer to
+CSS Backgrounds 3. Interpretation decisions:
+
+- Reference boxes follow [mask-clip](https://www.w3.org/TR/css-masking-1/#the-mask-clip)
+  for SVG elements without a CSS layout box: `content-box`/`padding-box` use the fill box,
+  `border-box`/`margin-box` the stroke box; so the initial origin and clip are the stroke box.
+- `no-clip` with a repeated axis has no painting area to tile; the tiles cover the stroke
+  box, which bounds everything the element can paint.
+- [Transition hints](https://www.w3.org/TR/css-images-3/#coloring-gradient-line) are sampled
+  into sub-stops at the backend ramp's resolution (1,024 entries over the gradient span),
+  so the hint curve's error stays within ramp quantization.
+- [Degenerate radials](https://www.w3.org/TR/css-images-3/#degenerate-radials) with zero
+  height paint the last stop (the period average when repeating); zero width becomes a
+  1e-9 × height ellipse. A zero-length span is widened by 1e-9 of the line length.
+- [Repeating gradients](https://www.w3.org/TR/css-images-3/#repeating-gradients) with an
+  empty period paint the premultiplied average of their first and last stops, as the spec's
+  note describes; a non-empty period averages over the period.
+- Repeated layer images are retained pictures executed as pattern tiles, like SVG patterns.
+
+`url()` mask layers that name raster or SVG images (not mask elements) remain open.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),

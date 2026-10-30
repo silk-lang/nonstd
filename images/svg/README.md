@@ -26,7 +26,9 @@ antialias rasterization. Legacy viewport `clip` uses the existing viewport resol
 Text clipping and projective clip edge cases remain in progress.
 
 SVG mask resources support alpha/luminance coverage, mask units, nested masks,
-and CSS mask-layer composition. Image and gradient mask sources remain pending.
+CSS mask-layer composition, and `linear-gradient()`/`radial-gradient()` (and repeating)
+mask layers with `mask-size`, `mask-position`, `mask-repeat`, `mask-origin` and `mask-clip`.
+`url()` mask layers naming raster or SVG images remain pending.
 PNG and JPEG `<image>` elements now render with intrinsic sizing, aspect-ratio fitting,
 CSS image orientation (including EXIF, quarter-turn rotation and flipping), opacity,
 affine/projective placement, and CSS nearest, smooth, or two-stage `pixelated`
