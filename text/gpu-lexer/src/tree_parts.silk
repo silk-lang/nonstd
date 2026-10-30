@@ -1,0 +1,149 @@
+//! The tree model's CPU pass: one scan that splits source into word runs, horizontal-space runs,
+//! single newlines (CRLF is one) and single symbols, and packs each part's features into two
+//! words the shader reads.
+//!
+//! Word 0: kind (2 bits), length bucket (3) at 2, first code at 5, last code at 12, primary word
+//! hash at 19. Word 1: flags (7 bits: lowercase, uppercase, digit, underscore, line start, tab,
+//! backslash), pair code with the previous part at 7 and with the next at 11, secondary word
+//! hash at 15, symbol-pair bucket with the previous part at 22 and with the next at 27.
+import source { KIND_WORD, KIND_SPACE, KIND_NEWLINE, KIND_SYMBOL, NON_ASCII, asciiKind, wordFlags, pairCode, symbolPairHash, lengthBucket, scalar }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// Features and byte ranges of every part of one or more sources, reused between calls.
+pub struct TreeParts {
+  /// Two words per part, see the module comment.
+  featureWords: List<u32>,
+  /// Start and end byte of every part, relative to its own source.
+  rangeWords: List<u32>,
+  /// First part and part count of every source.
+  streamWords: List<u32>,
+}
+
+impl TreeParts {
+  pub fn make() -> TreeParts {
+    return TreeParts { featureWords: List<u32>.make(), rangeWords: List<u32>.make(), streamWords: List<u32>.make() }
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.featureWords.clear()
+    self.rangeWords.clear()
+    self.streamWords.clear()
+  }
+
+  pub fn count(self: &Self) -> usize { return self.rangeWords.length() / 2 }
+  pub fn features(self: &Self) -> &[u32] { return self.featureWords.asSlice() }
+  pub fn ranges(self: &Self) -> &[u32] { return self.rangeWords.asSlice() }
+  pub fn streams(self: &Self) -> &[u32] { return self.streamWords.asSlice() }
+
+  /// Appends the parts of `text` as a new stream. Sources must be shorter than 4 GiB.
+  pub effect fn append(self: &mut Self, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let streamStart = self.count()
+    // A source never has more parts than bytes; reserve for the typical ratio instead.
+    run self.featureWords.reserve(text.length / 2 + 16)
+    run self.rangeWords.reserve(text.length / 2 + 16)
+    let mut offset: usize = 0
+    let mut lineStart = true
+    let mut previousLast: u32 = 0
+    let mut previousKind: u32 = 4
+    while offset < text.length {
+      let from = offset
+      let byte = text[offset]
+      let mut first = NON_ASCII
+      let mut kind = KIND_WORD
+      let mut units: u32 = 1
+      if byte < 128 {
+        first = u8.toU32(byte)
+        kind = asciiKind(byte)
+        offset = offset + 1
+      } else {
+        let step = scalar(text, offset)
+        units = step.units
+        offset = step.next
+      }
+      let mut flags: u32 = if lineStart { 16 } else { 0 }
+      let mut last = first
+      let mut packed = kind | u32.shiftLeft(first, 5)
+      if kind == KIND_WORD {
+        let mut hash = u32.wrappingMultiply(2166136261 ^ first, 16777619)
+        let mut secondary = u32.wrappingMultiply(0x9e3779b9 ^ first, 2246822519)
+        // A two-unit scalar hashes its second unit too.
+        if units == 2 {
+          hash = u32.wrappingMultiply(hash ^ first, 16777619)
+          secondary = u32.wrappingMultiply(secondary ^ first, 2246822519)
+        }
+        flags = flags | wordFlags(first)
+        while offset < text.length {
+          let next = text[offset]
+          let mut code = NON_ASCII
+          let mut count: u32 = 1
+          if next < 128 {
+            if asciiKind(next) != KIND_WORD { break }
+            code = u8.toU32(next)
+            offset = offset + 1
+          } else {
+            let step = scalar(text, offset)
+            count = step.units
+            offset = step.next
+          }
+          let mut unit: u32 = 0
+          while unit < count {
+            hash = u32.wrappingMultiply(hash ^ code, 16777619)
+            secondary = u32.wrappingMultiply(secondary ^ code, 2246822519)
+            unit = unit + 1
+          }
+          units = u32.saturatingAdd(units, count)
+          flags = flags | wordFlags(code)
+          last = code
+        }
+        packed = packed | u32.shiftLeft(hash & 255, 19)
+        flags = flags | u32.shiftLeft(secondary & 127, 15)
+      } else if kind == KIND_SPACE {
+        if byte == 9 { flags = flags | 32 }
+        while offset < text.length && text[offset] < 128 && asciiKind(text[offset]) == KIND_SPACE {
+          if text[offset] == 9 { flags = flags | 32 }
+          last = u8.toU32(text[offset])
+          units = u32.saturatingAdd(units, 1)
+          offset = offset + 1
+        }
+      } else if kind == KIND_NEWLINE {
+        if byte == 13 && offset < text.length && text[offset] == 10 {
+          last = 10
+          units = 2
+          offset = offset + 1
+        }
+        lineStart = true
+      } else if byte == 92 {
+        flags = flags | 64
+      }
+      if kind == KIND_WORD || kind == KIND_SYMBOL { lineStart = false }
+
+      packed = packed | u32.shiftLeft(lengthBucket(units), 2) | u32.shiftLeft(last, 12)
+      let index = self.featureWords.length()
+      if index / 2 > streamStart {
+        let pair = pairCode(previousLast, first)
+        let mut previousContext = u32.shiftLeft(pair, 11)
+        flags = flags | u32.shiftLeft(pair, 7)
+        if kind == KIND_SYMBOL || previousKind == KIND_SYMBOL {
+          let generic = symbolPairHash(previousLast, first)
+          flags = flags | u32.shiftLeft(generic, 22)
+          previousContext = previousContext | u32.shiftLeft(generic, 27)
+        }
+        let before = self.featureWords.get(index - 1)
+        self.featureWords.set(index - 1, before | previousContext)
+      }
+      run self.featureWords.append(packed)
+      run self.featureWords.append(flags)
+      run self.rangeWords.append(usize.wrappingToU32(from))
+      run self.rangeWords.append(usize.wrappingToU32(offset))
+      previousLast = last
+      previousKind = kind
+    }
+    run self.streamWords.append(usize.wrappingToU32(streamStart))
+    let partCount = self.count() - streamStart
+    run self.streamWords.append(usize.wrappingToU32(partCount))
+  }
+}

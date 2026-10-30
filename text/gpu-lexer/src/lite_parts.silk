@@ -1,0 +1,152 @@
+//! The lite model's CPU pass. It splits source the same way as the tree model but packs
+//! different features: two words per part, see `packed`.
+import source { KIND_WORD, KIND_SPACE, KIND_NEWLINE, KIND_SYMBOL, NON_ASCII, asciiKind, wordFlags, pairCode, symbolPairHash, scalar }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// 0 for one unit, otherwise floor(log2(length)) up to 7.
+fn lengthBucket(length: u32) -> u32 {
+  if length <= 1 { return 0 }
+  let bucket = 31 - u32.leadingZeros(length)
+  return if bucket > 7 { 7 } else { bucket }
+}
+
+@inlineAlways
+fn fnv(hash: u32, code: u32) -> u32 { return u32.wrappingMultiply(hash ^ code, 16777619) }
+
+@inlineAlways
+fn secondary(hash: u32, code: u32) -> u32 { return u32.wrappingMultiply(hash ^ code, 2246822519) }
+
+/// Parts of one or more sources, reused between calls.
+pub struct LiteParts {
+  /// Word 0: kind, length bucket at 2, first code at 5, last code at 12, flags at 19, symbol
+  /// pair with the next part at 27. Word 1: word hash (9 bits), secondary hash at 10, pair codes
+  /// with the previous and next part at 17 and 21, symbol pair with the previous part at 25.
+  packedWords: List<u32>,
+  kindBytes: List<u8>,
+  rangeWords: List<u32>,
+  /// First part and part count of every source.
+  jobWords: List<u32>,
+}
+
+impl LiteParts {
+  pub fn make() -> LiteParts {
+    return LiteParts { packedWords: List<u32>.make(), kindBytes: List<u8>.make(), rangeWords: List<u32>.make(), jobWords: List<u32>.make() }
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.packedWords.clear()
+    self.kindBytes.clear()
+    self.rangeWords.clear()
+    self.jobWords.clear()
+  }
+
+  pub fn count(self: &Self) -> usize { return self.kindBytes.length() }
+  pub fn packed(self: &Self) -> &[u32] { return self.packedWords.asSlice() }
+  pub fn kinds(self: &Self) -> &[u8] { return self.kindBytes.asSlice() }
+  pub fn ranges(self: &Self) -> &[u32] { return self.rangeWords.asSlice() }
+  pub fn jobs(self: &Self) -> &[u32] { return self.jobWords.asSlice() }
+
+  /// Appends the parts of `text` as a new job. Sources must be shorter than 4 GiB.
+  pub effect fn append(self: &mut Self, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let jobStart = self.count()
+    run self.packedWords.reserve(text.length / 2 + 16)
+    run self.rangeWords.reserve(text.length / 2 + 16)
+    run self.kindBytes.reserve(text.length / 4 + 16)
+    let mut offset: usize = 0
+    let mut lineStart = true
+    let mut previousLast: u32 = 0
+    let mut previousKind: u32 = 4
+    while offset < text.length {
+      let from = offset
+      let byte = text[offset]
+      let mut first = NON_ASCII
+      let mut kind = KIND_WORD
+      if byte < 128 {
+        first = u8.toU32(byte)
+        kind = asciiKind(byte)
+      }
+      let mut flags: u32 = if lineStart { 16 } else { 0 }
+      let mut last = first
+      let mut units: u32 = 0
+      let mut word: u32 = 0
+      let mut second: u32 = 0
+      if kind == KIND_WORD {
+        let mut a: u32 = 2166136261
+        let mut b: u32 = 2654435769
+        while offset < text.length {
+          let next = text[offset]
+          let mut code = NON_ASCII
+          let mut count: u32 = 1
+          if next < 128 {
+            if asciiKind(next) != KIND_WORD { break }
+            code = u8.toU32(next)
+            offset = offset + 1
+          } else {
+            let step = scalar(text, offset)
+            count = step.units
+            offset = step.next
+          }
+          let mut unit: u32 = 0
+          while unit < count {
+            a = fnv(a, code)
+            b = secondary(b, code)
+            unit = unit + 1
+          }
+          units = u32.saturatingAdd(units, count)
+          flags = flags | wordFlags(code)
+          last = code
+        }
+        word = (a ^ u32.shiftRight(a, 16)) & 511
+        second = (b ^ u32.shiftRight(b, 16)) & 127
+        if (flags & 2) != 0 && (flags & 1) == 0 { flags = flags | 128 }
+      } else if kind == KIND_SPACE {
+        while offset < text.length && text[offset] < 128 && asciiKind(text[offset]) == KIND_SPACE {
+          if text[offset] == 9 { flags = flags | 32 }
+          last = u8.toU32(text[offset])
+          units = units + 1
+          offset = offset + 1
+        }
+      } else if kind == KIND_NEWLINE {
+        offset = offset + 1
+        units = 1
+        if byte == 13 && offset < text.length && text[offset] == 10 {
+          last = 10
+          units = 2
+          offset = offset + 1
+        }
+      } else {
+        if byte == 92 { flags = flags | 64 }
+        offset = offset + 1
+        units = 1
+      }
+      if kind == KIND_NEWLINE { lineStart = true } else if kind != KIND_SPACE { lineStart = false }
+
+      let index = self.count()
+      let mut transition: u32 = 0
+      let mut symbol: u32 = 0
+      if index > jobStart {
+        transition = pairCode(previousLast, first)
+        if previousKind == KIND_SYMBOL || kind == KIND_SYMBOL { symbol = symbolPairHash(previousLast, first) }
+        // The previous part's "next" fields.
+        let before = self.packedWords.get(index * 2 - 2)
+        self.packedWords.set(index * 2 - 2, before | u32.shiftLeft(symbol, 27))
+        let beforeSecond = self.packedWords.get(index * 2 - 1)
+        self.packedWords.set(index * 2 - 1, beforeSecond | u32.shiftLeft(transition, 21))
+      }
+      run self.packedWords.append(kind | u32.shiftLeft(lengthBucket(units), 2) | u32.shiftLeft(first, 5) | u32.shiftLeft(last, 12) | u32.shiftLeft(flags & 255, 19))
+      run self.packedWords.append(word | u32.shiftLeft(second, 10) | u32.shiftLeft(transition, 17) | u32.shiftLeft(symbol, 25))
+      run self.kindBytes.append(u32.wrappingToU8(kind))
+      run self.rangeWords.append(usize.wrappingToU32(from))
+      run self.rangeWords.append(usize.wrappingToU32(offset))
+      previousLast = last
+      previousKind = kind
+    }
+    run self.jobWords.append(usize.wrappingToU32(jobStart))
+    let partCount = self.count() - jobStart
+    run self.jobWords.append(usize.wrappingToU32(partCount))
+  }
+}

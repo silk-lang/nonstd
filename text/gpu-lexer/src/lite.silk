@@ -1,0 +1,188 @@
+//! The lite model on the GPU: a convolution and scan network, one pass per step. Up to 64
+//! sources ("jobs") run in each dispatch, every job with its own hidden-state slot.
+import gpu_util { Slot, ensure, makeSlot, max, wordBytes }
+import lite_parts { LiteParts }
+import generated_models as models
+import generated_shaders as shaders
+import webgpu.resources as gpu
+import webgpu.resources { BindGroup, BindGroupLayout, Buffer, ComputePipeline, Queue }
+import webgpu.runtime { Device, GpuError, MapReadRequest, mapReadStart }
+import webgpu.descriptors {
+  BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BufferBindingLayout,
+  BufferDescriptor, ComputePassDescriptor, ComputeState, ComputePipelineDescriptor, PipelineLayoutDescriptor,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// Jobs per dispatch; the shader's uniform job table has this many entries.
+pub const MAX_JOBS: usize = 64
+const JOB_BYTES: u64 = 16
+/// Scratch regions per job, as the shader's NREG.
+const SCRATCH_REGIONS: u64 = 8
+
+const TOKENS: usize = 0
+const OUT: usize = 1
+const STAGING: usize = 2
+const HIDDEN: usize = 3
+const SCRATCH: usize = 4
+const SLOTS: usize = 5
+
+fn layoutEntry(binding: u32, kind: u32) -> BindGroupLayoutEntry<'static> {
+  let mut buffer = BufferBindingLayout.default()
+  buffer.setType(kind)
+  let mut result = BindGroupLayoutEntry.default()
+  result.setBinding(binding)
+  result.setVisibility(flags.WGPUShaderStage_Compute)
+  result.setBuffer(buffer)
+  return result
+}
+
+fn whole<'a>(binding: u32, buffer: &'a Buffer) -> BindGroupEntry<'a> {
+  let mut result = BindGroupEntry.default().withBuffer(buffer)
+  result.setBinding(binding)
+  result.setSize(buffer.getSize())
+  return result
+}
+
+effect fn constant(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8], usage: u64) -> Buffer ! GpuError {
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(label, usize.toU64((bytes.length + 3) / 4 * 4), usage | flags.WGPUBufferUsage_CopyDst, false))
+  queue.writeBuffer(&buffer, 0, bytes)
+  return move buffer
+}
+
+/// The lite model's pipelines, weights and grow-only buffers, kept between calls.
+pub struct LiteModel {
+  layout: BindGroupLayout,
+  pipelines: List<ComputePipeline>,
+  planes: Buffer,
+  floats: Buffer,
+  jobs: Buffer,
+  slots: List<Slot>,
+  group: List<BindGroup>,
+  jobData: List<u32>,
+}
+
+impl LiteModel {
+  pub effect fn make(device: &Device, queue: &Queue) -> LiteModel ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let module = run gpu.createShaderModule(device, b"gpu-lexer lite", shaders.lite())
+    let entries = [
+      layoutEntry(0, flags.WGPUBufferBindingType_ReadOnlyStorage), layoutEntry(1, flags.WGPUBufferBindingType_ReadOnlyStorage),
+      layoutEntry(2, flags.WGPUBufferBindingType_ReadOnlyStorage), layoutEntry(3, flags.WGPUBufferBindingType_Storage),
+      layoutEntry(4, flags.WGPUBufferBindingType_Storage), layoutEntry(5, flags.WGPUBufferBindingType_Storage),
+      layoutEntry(6, flags.WGPUBufferBindingType_Uniform),
+    ]
+    let layout = run gpu.createBindGroupLayout(device, &BindGroupLayoutDescriptor.default().withEntries(&entries))
+    let layouts = [layout.reference()]
+    let pipelineLayout = run gpu.createPipelineLayout(device, &PipelineLayoutDescriptor.default().withBindGroupLayouts(&layouts))
+    let mut pipelines = List<ComputePipeline>.make()
+    let mut step: usize = 0
+    while step < models.LITE_STEP_COUNT {
+      let stage = ComputeState.default().withModule(&module).withEntryPoint(models.liteStep(step))
+      let descriptor = ComputePipelineDescriptor.default().withLayout(&pipelineLayout).withCompute(stage)
+      run pipelines.append(run gpu.createComputePipeline(device, &descriptor))
+      step = step + 1
+    }
+    let planes = run constant(device, queue, b"gpu-lexer lite planes", models.litePlanes(), flags.WGPUBufferUsage_Storage)
+    let floats = run constant(device, queue, b"gpu-lexer lite floats", models.liteFloats(), flags.WGPUBufferUsage_Storage)
+    let jobs = run gpu.createBuffer(device, &BufferDescriptor.make(b"gpu-lexer lite jobs", usize.toU64(MAX_JOBS) * JOB_BYTES, flags.WGPUBufferUsage_Uniform | flags.WGPUBufferUsage_CopyDst, false))
+    let mut slots = List<Slot>.make()
+    run slots.append(run makeSlot(device, flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopyDst))
+    run slots.append(run makeSlot(device, flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopySrc | flags.WGPUBufferUsage_CopyDst))
+    run slots.append(run makeSlot(device, flags.WGPUBufferUsage_MapRead | flags.WGPUBufferUsage_CopyDst))
+    run slots.append(run makeSlot(device, flags.WGPUBufferUsage_Storage))
+    run slots.append(run makeSlot(device, flags.WGPUBufferUsage_Storage))
+    return LiteModel {
+      layout: move layout, pipelines: move pipelines, planes: move planes, floats: move floats, jobs: move jobs,
+      slots: move slots, group: List<BindGroup>.make(), jobData: List<u32>.make(),
+    }
+  }
+
+  /// Submits the jobs of `parts` (at most `MAX_JOBS`, none empty) and starts reading back one
+  /// class per part, little-endian u32.
+  pub effect fn submit(self: &mut Self, device: &Device, queue: &Queue, parts: &LiteParts) -> LiteReadback
+    ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let jobs = parts.jobs()
+    let jobCount = jobs.length / 2
+    let total = usize.toU64(parts.count())
+    let mut maxTokens: u32 = 0
+    let mut job: usize = 0
+    while job < jobCount {
+      if jobs[job * 2 + 1] > maxTokens { maxTokens = jobs[job * 2 + 1] }
+      job = job + 1
+    }
+    let stride = maxTokens * usize.wrappingToU32(models.LITE_DIM)
+    let hiddenBytes = usize.toU64(jobCount) * u32.toU64(stride) * 4
+    let mut changed = self.group.length() == 0
+    // Sized like the original: tokens grow to at least 4096, hidden state to at least 64 KiB.
+    if run ensure(device, self.slots.asMutSlice(), TOKENS, max(total, 4096) * 8) { changed = true }
+    if run ensure(device, self.slots.asMutSlice(), OUT, max(total, 4096) * 4) { changed = true }
+    if run ensure(device, self.slots.asMutSlice(), STAGING, max(total, 4096) * 4) { changed = true }
+    if run ensure(device, self.slots.asMutSlice(), HIDDEN, max(hiddenBytes, 65536)) { changed = true }
+    if run ensure(device, self.slots.asMutSlice(), SCRATCH, max(hiddenBytes, 65536) * SCRATCH_REGIONS) { changed = true }
+    if changed {
+      self.group.clear()
+      let s = self.slots.asSlice()
+      let entries = [
+        s[TOKENS].entry(0), whole(1, &self.planes), whole(2, &self.floats), s[HIDDEN].entry(3),
+        s[SCRATCH].entry(4), s[OUT].entry(5), whole(6, &self.jobs),
+      ]
+      run self.group.append(run gpu.createBindGroup(device, &BindGroupDescriptor.default().withLayout(&self.layout).withEntries(&entries)))
+    }
+
+    self.jobData.clear()
+    run self.jobData.appendRepeated(0, MAX_JOBS * 4)
+    job = 0
+    while job < jobCount {
+      self.jobData.set(job * 4, jobs[job * 2 + 1])
+      self.jobData.set(job * 4 + 1, jobs[job * 2])
+      self.jobData.set(job * 4 + 3, stride)
+      job = job + 1
+    }
+    let readBytes = total * 4
+    let slots = self.slots.asSlice()
+    queue.writeBuffer(&slots[TOKENS].buffer, 0, wordBytes(parts.packed()))
+    queue.writeBuffer(&self.jobs, 0, wordBytes(self.jobData.asSlice()))
+    let mut encoder = run gpu.createCommandEncoder(device, b"gpu-lexer lite")
+    encoder.clearBuffer(&slots[OUT].buffer, 0, readBytes)
+    // One pass per step: the steps are a dependency chain, and dispatches within one pass are
+    // not guaranteed to see each other's storage writes.
+    let pipelines = self.pipelines.asSlice()
+    let group = &self.group.asSlice()[0]
+    let mut step: usize = 0
+    while step < pipelines.length {
+      let mut pass = run encoder.beginComputePass(&ComputePassDescriptor.default())
+      pass.setPipeline(&pipelines[step])
+      pass.setBindGroup(0, group, &[])
+      let tile = models.LITE_TILES[step]
+      let x = if tile == 0 { 1 } else { (maxTokens + tile - 1) / tile }
+      pass.dispatchWorkgroups(x, usize.wrappingToU32(jobCount), 1)
+      pass.end()
+      step = step + 1
+    }
+    encoder.copyBufferToBuffer(&slots[OUT].buffer, 0, &slots[STAGING].buffer, 0, readBytes)
+    let commands = run encoder.finish(b"gpu-lexer lite")
+    queue.submit(&[commands.reference()])
+    let request = run mapReadStart(device, &slots[STAGING].buffer, 0, u64.toUsize(readBytes))
+    return LiteReadback { request: move request }
+  }
+}
+
+/// Classes on their way back from the GPU.
+pub struct LiteReadback {
+  request: MapReadRequest,
+}
+
+impl LiteReadback {
+  pub fn poll(self: &mut Self) -> bool { return self.request.poll() }
+
+  /// One little-endian u32 class per part.
+  pub effect fn finish(self: Self) -> List<u8> ! GpuError | OutOfMemoryError {
+    let mut request = move self.request
+    static if Intrinsic.targetArchitecture() != "wasm32" { run request.wait() }
+    return run request.finish()
+  }
+}
