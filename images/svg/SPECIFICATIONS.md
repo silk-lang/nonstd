@@ -474,13 +474,13 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
-- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
-- [ ] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
-- [ ] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
+- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
+- [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
+- [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
-- [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
-- [ ] `letter-spacing`, `word-spacing` (done), `direction`, `unicode-bidi`
-- [ ] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
+- [x] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
+- [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
+- [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
 - [ ] 1.1 only: `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
 - [ ] `a` inside text (§16.2)
@@ -755,6 +755,82 @@ decisions:
   with its own `textLength` counts as one. With `spacingAndGlyphs`, positions and glyphs
   scale horizontally about the start of the extent. Characters after the element do not
   move, since the algorithm shifts only the range `[i, j]`.
+- Each text chunk is an independent block for ligatures and bidi reordering, as the
+  #TermTextChunk definition says, so shaping also breaks where an `x` or `y` value starts
+  a chunk. The text element's `direction` sets the paragraph level (`unicode-bidi:
+  plaintext` on it picks the level from the text). Descendants' `unicode-bidi` and
+  `direction` become the formatting characters of CSS Writing Modes 3
+  #bidi-control-codes around their content. Levels come from `ucd`'s UAX #9 on the
+  whole chunk as one line. Runs split where the font instance or level changes, are
+  placed in L2 visual order and shaped right to left at odd levels.
+- A right-to-left character's position is the right edge of its cluster, so its advance
+  runs negative from it, as the algorithm notes. `x` therefore places the right edge of
+  a right-to-left first character. Anchoring takes the direction of the chunk's first
+  character: `start` aligns the right end of the extent for `rtl`. With `textLength`,
+  an `rtl` element's characters move left (`spacing`) or scale about the right edge
+  (`spacingAndGlyphs`).
+- Font features follow CSS Fonts 4 #feature-precedence: `font-kerning`, then
+  `font-variant-*`, then `font-feature-settings`, each a ranged shaper feature over the
+  element's own characters, so a later setting of a tag wins. Letter-spacing's ligature
+  suppression comes last. SVG 1.1 `kerning` with a length turns `kern` off and adds the
+  length to `letter-spacing` (1.1 §10.11). `font-kerning` and the `font-variant-*`
+  longhands are not presentation attributes in SVG 2, so only CSS sets them; the
+  `font-variant` shorthand is. Variants are not synthesized when the font lacks the
+  feature (CSS Fonts 4 allows synthesizing small caps and sub/superscripts).
+- `@font-face` (CSS Fonts 4 #font-face-rule) uses its first `src` entry that yields a face.
+  `local()` matches an installed face's full or PostScript name (case-insensitively, as
+  family names). A url works when its format is absent, `truetype`, `opentype` or
+  `collection`, when the sheet's processing mode may fetch it (secure modes allow `data:`
+  only), and when it holds a readable sfnt face. The url's first face is used. The face
+  joins font matching for this render only. WOFF/WOFF2 and `tech()` sources are skipped. `font-weight`, `font-width`/`font-stretch` and
+  `font-style` descriptors replace the face's own values, and `auto` keeps them. A family
+  that a document defines hides installed faces of the same name. `unicode-range`,
+  `font-display`, `size-adjust` and the metric overrides are ignored.
+- `font-variation-settings` axis values follow the ones font matching sets, so they win.
+  `font-optical-sizing` is not applied yet (no test font has an `opsz` axis).
+- `font-size-adjust` takes a number (the ex-height metric). The used size makes the x-height
+  of the span's first available font (its first matched face, at default variations) that
+  fraction of the computed size. Without an x-height metric the size is unchanged. `em`
+  units still use the computed size.
+- Synthetic bold (#font-synthesis-weight, method left to the UA) follows FreeType's
+  `FT_Outline_EmboldenXY` and `FT_GlyphSlot_Embolden`: outlines grow by 1/24 em in x and y
+  (in font units, before scaling), and each advancing glyph's advance grows by the same
+  amount. Marks with no advance keep it.
+- Text on a path follows the algorithm's "Position on path" step. Each typographic
+  character's midpoint (position plus half its advance plus `startOffset`) maps to the
+  point that far along the path. The character turns to the tangent there, and its
+  baseline offset (`dy`, baseline alignment) goes along the normal. Characters whose
+  midpoints fall off an open path are hidden. A single closed subpath wraps for one
+  circuit, with the anchor- and direction-dependent bounds. Characters after the
+  element continue from the path's end until the next anchored chunk. A `textPath`
+  always starts an anchored chunk, so also a bidi and shaping block.
+- The distance along a path is measured on a polyline. Lines are exact, and each
+  quadratic or cubic Bézier becomes 64 chords uniform in its parameter. Arcs become
+  curves first (tolerance 0.01). `method="stretch"` and `spacing="auto"` are allowed
+  adjustments the algorithm leaves to the UA, and we make none. The path is the `path`
+  attribute when it has a segment, else the `path` or basic shape that a same-document
+  fragment `href` names. That element's transform applies as a supplemental
+  transformation, and its `pathLength` scales a length `startOffset`. Any other
+  reference renders none of the element's characters.
+- Inside a `textPath`, `y` values are ignored (the algorithm's note on horizontal text on
+  a path), and `dy` moves glyphs along the normal. The algorithm's "unset
+  resolve_y[index]" reads as all characters of the element. Applying the text element's
+  own `y` along the normal would contradict that note.
+- Text decoration (§11.11, CSS Text Decoration 3) is painted by the element that declares
+  it, with that element's fill, stroke and paint order, across its descendants' glyphs.
+  Underlines and overlines paint before the element's glyphs and line-throughs after its
+  whole content (#painting-order). Positions come from the element's first face: the
+  post table's underline position and thickness, the OS/2 strikeout, and the overline
+  at the ascent, so a descendant with another font or baseline shift does not move the
+  line (#line-decoration). A numeric `text-decoration-thickness` replaces both
+  thicknesses. Each run of unrotated glyphs on one baseline gets one rectangle; a rotated
+  glyph, including one on a path, gets its own
+  rectangle in its rotated frame.
+  `text-decoration-style` is drawn as solid, `text-decoration-fill`/`-stroke` are not
+  applied, and decorations do not add to the bounding box (SVG 2 #TextBoundingBox counts
+  glyph cells only) or to a clipping path.
+- Text in a `clipPath` contributes the glyph outlines of the text element and of each
+  descendant that renders characters (CSS Masking 1 #ClipPathElement).
 - Baselines follow CSS Inline 3 #baseline-alignment on horizontal text. The text
   element's dominant baseline sits on the text position. Each child aligns its baseline
   of the alignment type (`alignment-baseline`, or the parent's dominant baseline for
@@ -774,15 +850,79 @@ decisions:
 `src/used_text.silk` feeds it from the document:
 
 - Addressable characters come from the `text` subtree in document order. Text content
-  children are `tspan`, `a`, `textPath` (laid out as a `tspan` until phase 9D) and
-  unknown elements, which render as unpositioned spans. Other SVG elements inside text
+  children are `tspan`, `a`, `textPath` and unknown elements, which render as unpositioned spans. Other SVG elements inside text
   render nothing. Characters inside `display: none` elements are not addressable.
 - White space follows CSS Text 4 #white-space-phase-1 on one line. With `collapse`,
   segment breaks and tabs become spaces, a space after a collapsible space is removed,
   and spaces at the start and end of the line are removed. The preserving values keep
-  spaces; tabs and segment breaks render as spaces, because SVG text without
-  `inline-size` has no line breaking. `xml:space="preserve"` reaches this as
-  `white-space-collapse: preserve-spaces` through the UA stylesheet.
+  spaces; tabs render as spaces, and so do segment breaks unless `inline-size` wraps the
+  text. `xml:space="preserve"` reaches this as `white-space-collapse: preserve-spaces`
+  through the UA stylesheet.
+- Auto-wrapped text (#InlineSize, #TextLayoutAuto): a positive `inline-size` on the `text`
+  element wraps it, except when it holds a `textPath`. Percentages refer to the viewport
+  width. `inline-size` is a property only: SVG 2's list of presentation attributes
+  (styling.html) does not include it, although an example in §11.4.1 uses the attribute.
+  The text is laid out once on one line, then broken greedily at UAX #14 opportunities
+  (`ucd`, default options; `line-break` and `word-break` are not read yet). A line ends at
+  the last opportunity whose content fits. A word longer than the line overflows. Without
+  soft wrapping (`text-wrap-mode: nowrap`) only forced breaks apply. A preserved segment
+  break is a forced break.
+- The white space at the end of a line hangs: it has no advance, is not drawn, and does not
+  count for anchoring. With `collapse` CSS removes these spaces instead, which renders the
+  same, but they stay addressable for `dx` and `rotate`. Letter and word spacing start
+  afresh on each line.
+- Each line is an anchored chunk (#TextLayoutAlgorithm sets the flag at each line start).
+  Its first character takes the first character's `x`, and the line's baseline as `y`. All
+  other `x` and `y` values are ignored (§11.7); `dx`, `dy` and `rotate` still apply, and
+  `textLength` does not. §11.4.1 anchors the wrapping area with `text-anchor` while
+  §11.5 requires `text-align: start`. But the algorithm then anchors each line chunk at
+  its own start, so each line is anchored at the first `x`: `middle` centres every line
+  on it, and `end` (or `start` in right-to-left text) ends every line there.
+- Line boxes follow CSS 2.1 #line-height. Each span on the line, and the `text` element's
+  strut, adds an inline box: its first face's ascent and descent (`hhea`, or `OS/2` typo
+  metrics with USE_TYPO_METRICS), set on the span's alphabetic baseline and grown by half
+  the leading above and below. `line-height: normal` is ascent + descent + line gap
+  (CSS Inline 3). The first baseline is at the first `y`, and each next one lies lower by
+  the previous line's bottom minus the new line's top. Bidi levels are resolved per line
+  rather than per paragraph.
+- `shape-inside` and `shape-subtract` follow the SVG 2 Editor's Draft (#TextShapeInside,
+  #TextShapeSubtract); the 2018 Candidate Recommendation drops them. A list of shapes other
+  than `auto` sets the content area instead of `inline-size`, for horizontal text off a
+  path. Basic shapes (`circle()`, `ellipse()`, `polygon()`) resolve against the viewport.
+  A `url()` names an SVG shape element in its geometry and own transform; a reference to
+  anything else is ignored, and so are box values. Shapes become polygons (curves as 64
+  chords) filled nonzero, or by `polygon()`'s fill rule.
+- Lines fill the first shape from its top. Every line is as tall as the text element's
+  strut line box (CSS 2.1 #line-height), and taller inline boxes do not grow it yet. A
+  line's band takes, left to right, the spans of x that lie inside the shape and outside
+  every subtracted shape for the band's whole height (#TextLayoutAutoNotes "broken lines").
+  A span that cannot hold the next word is skipped. A band that holds nothing moves down
+  a pixel, following CSS Shapes' model of a shape's edge as pixel floats. Each part of a
+  line is an anchored chunk. §11.5 fixes `text-align` at its initial value, so
+  `text-anchor` aligns each part at its span's start, middle or end. Text that overflows
+  one shape continues in the next; what is left after the last is not rendered.
+  Not done yet: `shape-padding`, `shape-margin`, `shape-image-threshold` and image
+  shapes, and vertical text in shapes.
+- Vertical text (CSS Writing Modes 3 #vertical-layout): the `text` element's `writing-mode`
+  (`vertical-rl`, `vertical-lr`, and the SVG 1.1 `tb`/`tb-rl` mapped to `vertical-rl`) lays
+  the text out as horizontal text in a frame turned a quarter clockwise. The inline axis
+  runs down, `y` and `dy` position along it and `x` and `dx` across it. Characters are set
+  upright or sideways by `text-orientation`; for `mixed` this uses their UAX #50
+  orientation per grapheme cluster (`ucd.vertical`). Upright runs are shaped top to bottom,
+  which applies `vert` and the font's vertical advances and origins (HarfBuzz's fallbacks
+  without `vmtx`). Sideways runs are shaped as horizontal text, including bidi, and turned
+  90° clockwise. Tu and Tr characters rely on `vert` for their transformed forms.
+- The text position is on the central baseline: `dominant-baseline: auto` resolves to
+  `central` in vertical text, also for sideways text as #DominantBaselineProperty asks.
+  Upright glyphs are centred on their span's central baseline. `text-anchor: start` is the
+  top whatever `direction` says (#TextAnchoringProperties). Wrapped vertical lines stack
+  leftward (`vertical-rl`) or rightward (`vertical-lr`); their inline boxes are centred on
+  the central baseline, except for `text-orientation: sideways`.
+- `glyph-orientation-vertical` aliases `text-orientation` (§11.10.1.3): `0deg` is upright
+  and `90deg` sideways. The two are separate properties in our cascade, so a value other
+  than `auto` wins over `text-orientation`. `glyph-orientation-horizontal` was removed in
+  SVG 2 and is ignored. Not done yet: `text-combine-upright`, the `sideways-*` writing
+  modes of Writing Modes 4, and vertical text on a path, which is laid out horizontally.
 - `x`, `y`, `dx`, `dy` and `rotate` are lists of CSS lengths, percentages or numbers
   separated by white space or commas. Percentages resolve against the viewport width
   (`x`, `dx`) or height (`y`, `dy`). An invalid list is ignored as a whole. Lists count

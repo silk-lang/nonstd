@@ -42,7 +42,9 @@ import used_style { DashCache }
 import used_style
 import used_text
 import used_text { TextPiece }
-import svg_fonts.database { FontDatabase }
+import svg_fonts.database { FontDatabase, Fonts }
+import font_faces { DocumentFace, Candidate }
+import silk.collections.bytes { Bytes }
 import used_path_length
 import used_path_length { Cache as PathLengthCache }
 import used_transforms
@@ -296,6 +298,10 @@ struct Plan {
   path: Option<usize>,
   /// Glyph cells that replace `path` in the fill bounding box (SVG 2 #TextBoundingBox).
   cells: Option<usize>,
+  /// Text decoration painted before and after the glyphs (CSS Text Decoration 3
+  /// #painting-order), in the same paint as the glyphs.
+  early: Option<usize>,
+  late: Option<usize>,
   /// A text content element: `text` or an element rendering its characters.
   text: bool,
   pathLength: Option<f64>,
@@ -477,9 +483,10 @@ fn paintComponents(paint: &Paint) -> [f64; 4] {
 // Prepared geometry is dense and independent of source occurrence numbering.
 // A referenced subtree gets one plan per renderable node, not an entire
 // document-sized array for every marker or pattern instance.
-struct Planning<'f> {
-  fonts: &'f FontDatabase,
-  /// Per text content occurrence, the arena index of its glyph outlines; cells follow.
+struct Planning<'f, 'h> {
+  fonts: &'f Fonts<'h>,
+  /// Per text content occurrence, the arena index of its glyph outlines; cells and the
+  /// early and late decorations follow.
   textPaths: HashMap<usize, usize>,
   embedded: List<EmbeddedImage>,
   images: ImageStore,
@@ -1027,12 +1034,15 @@ effect fn prepare(
     paintable = geometry.paintable
   }
   let mut cells = Option<usize>.None
+  let mut early = Option<usize>.None
+  let mut late = Option<usize>.None
   if textElement {
     let mut pieces = run used_text.resolve(
       graph,
       &mut styles.*,
       id,
       state.fonts,
+      &mut state.paths,
       viewport.width(),
       viewport.height(),
       limits,
@@ -1041,6 +1051,8 @@ effect fn prepare(
       let at = state.paths.length()
       run state.paths.append(move piece.outline)
       run state.paths.append(move piece.cells)
+      run state.paths.append(move piece.early)
+      run state.paths.append(move piece.late)
       drop run state.textPaths.insert(piece.occurrence, at)
     }
   }
@@ -1049,7 +1061,13 @@ effect fn prepare(
     if let Option<usize>.Some { value: at } = found {
       path = Option<usize>.some(at)
       cells = Option<usize>.some(at + 1)
-      paintable = !state.paths.asSlice()[at].isEmpty()
+      if !state.paths.asSlice()[at + 2].isEmpty() {
+        early = Option<usize>.some(at + 2)
+      }
+      if !state.paths.asSlice()[at + 3].isEmpty() {
+        late = Option<usize>.some(at + 3)
+      }
+      paintable = !state.paths.asSlice()[at].isEmpty() || early.isSome() || late.isSome()
     }
   }
   let index = state.plans.length()
@@ -1093,6 +1111,8 @@ effect fn prepare(
       style: style,
       path: path,
       cells: cells,
+      early: early,
+      late: late,
       text: textElement || textChild,
       pathLength: if drawable && !imageElement {
         run used_path_length.attribute(
@@ -2604,8 +2624,9 @@ effect fn clipGeometry(
   }
 
   // Only the resource root and use instances may contain contributing children.
-  // A group directly inside clipPath is not an allowed clipping shape.
-  if root || plan.instance {
+  // A group directly inside clipPath is not an allowed clipping shape. Text content
+  // children contribute the glyphs of their own characters (CSS Masking 1 #ClipPathElement).
+  if root || plan.instance || plan.text {
     let mut child = plan.firstChild
     while let Option<usize>.Some { value: next } = &child {
       let contribution = run clipGeometry(
@@ -3987,6 +4008,41 @@ effect fn paintFilterImage(
   run nodes.append(ResolvedNode.EndFilterImage)
 }
 
+/// One text decoration path, painted in the element's paint order without markers.
+effect fn paintDecoration(
+  path: usize,
+  plan: &Plan,
+  used: &Style,
+  matrix: &Mapping,
+  strokeSpace: Option<usize>,
+  clip: Option<usize>,
+  outputBounds: Rect,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let shape = shapes.length()
+  run shapes.append(
+    ResolvedShape {
+      path: path,
+      transform: matrix.*,
+      strokeSpace: strokeSpace,
+      clip: clip,
+      bounds: outputBounds,
+      style: used.*,
+    },
+  )
+  let mut part: usize = 0
+  while part < 3 {
+    let layer = plan.style.paintOrder[part]
+    if layer != PaintLayer.Markers {
+      run nodes.append(ResolvedNode.Paint { shape: shape, layer: layer })
+    }
+    part = part + 1
+  }
+}
+
 effect fn paintPrepared(
   graph: &Graph,
   styles: &mut StyledGraph,
@@ -4209,7 +4265,26 @@ effect fn paintPrepared(
       )
     }
   } else if plan.paintable && plan.style.visible {
-    match &plan.path {
+    if let Option<usize>.Some { value } = &plan.early {
+      run paintDecoration(
+        value,
+        plan,
+        &used,
+        matrix,
+        strokeSpace,
+        clip,
+        outputBounds,
+        &mut nodes.*,
+        &mut shapes.*,
+      )
+    }
+    let mut drawn = plan.path
+    if let Option<usize>.Some { value } = &plan.path {
+      if plan.text && state.paths.asSlice()[value].isEmpty() {
+        drawn = Option<usize>.None
+      }
+    }
+    match &drawn {
       Option<usize>.Some { value } => {
         let shape = shapes.length()
         run shapes.append(
@@ -4327,6 +4402,21 @@ effect fn paintPrepared(
       child = state.plans.asSlice()[next].nextSibling
     }
   }
+  if plan.document.isNone() && plan.paintable && plan.style.visible {
+    if let Option<usize>.Some { value } = &plan.late {
+      run paintDecoration(
+        value,
+        plan,
+        &used,
+        matrix,
+        strokeSpace,
+        clip,
+        outputBounds,
+        &mut nodes.*,
+        &mut shapes.*,
+      )
+    }
+  }
   if starts {
     drop state.backgrounds.pop()
   }
@@ -4357,6 +4447,47 @@ effect fn paintPrepared(
   }
   if layer {
     run nodes.append(ResolvedNode.EndGroup)
+  }
+}
+
+/// Adds a document's @font-face face from its first candidate that yields one.
+effect fn addDocumentFace(documentFonts: &mut Fonts, host: &FontDatabase, face: DocumentFace) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: usize = 0
+  let mut added = false
+  while index < face.candidates.length() && !added {
+    match &face.candidates.asSlice()[index] {
+      Candidate.Local { name } => {
+        if let Option<usize>.Some { value: installed } = documentFonts.installed(
+          Bytes.asSlice(&name),
+        ) {
+          let mut copy = Bytes.make()
+          run Bytes.append(&mut copy, host.data(installed))
+          added = run documentFonts.local.addFace(
+            move copy,
+            host.face(installed).index,
+            Bytes.asSlice(&face.family),
+            face.weight,
+            face.width,
+            face.style,
+          )
+        }
+      }
+      Candidate.Data { bytes } => {
+        let mut copy = Bytes.make()
+        run Bytes.append(&mut copy, Bytes.asSlice(&bytes))
+        added = run documentFonts.local.addFace(
+          move copy,
+          0,
+          Bytes.asSlice(&face.family),
+          face.weight,
+          face.width,
+          face.style,
+        )
+      }
+    }
+    index = index + 1
   }
 }
 
@@ -4476,8 +4607,14 @@ effect fn resolveStyled(
   styles.catalog.engine.values.paths = List<Path>.make()
   let mut dashes = List<List<f64>>.make()
   run dashes.append(List<f64>.make())
+
+  // The document's @font-face faces join the host's for this render only.
+  let mut documentFonts = Fonts.make(fonts)
+  while styles.catalog.fontFaces.length() > 0 {
+    run addDocumentFace(&mut documentFonts, fonts, styles.catalog.fontFaces.remove(0))
+  }
   let mut state = Planning {
-    fonts: fonts,
+    fonts: &documentFonts,
     textPaths: HashMap<usize, usize>.make(Hash.seed(0)),
     embedded: List<EmbeddedImage>.make(),
     images: move images,

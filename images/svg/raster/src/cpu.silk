@@ -23,7 +23,7 @@ import vector.projective { Homography, HalfPlane }
 import vector.projective
 import vector.geometry_error { GeometryError }
 import vector.pixmap { Pixmap, Rgba8 }
-import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
+import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD, BAND }
 import vector.stroke as strokes
 import vector.stroke { Stroker, Stroke as VectorStroke }
 import vector.flatten { Line, TOLERANCE }
@@ -171,6 +171,113 @@ struct Layer {
   opacity: u8,
   blendMode: u8,
   linearRgb: bool,
+  // Every pixel outside is transparent.
+  dirty: Dirty,
+}
+
+// A half-open pixel box; empty when x0 >= x1 or y0 >= y1.
+struct Dirty {
+  x0: u32,
+  y0: u32,
+  x1: u32,
+  y1: u32,
+}
+
+impl Copy for Dirty {}
+
+impl Dirty {
+  fn none() -> Dirty {
+    return Dirty { x0: 0, y0: 0, x1: 0, y1: 0 }
+  }
+
+  fn all(width: u32, height: u32) -> Dirty {
+    return Dirty { x0: 0, y0: 0, x1: width, y1: height }
+  }
+
+  fn isEmpty(self: &Self) -> bool {
+    return self.x0 >= self.x1 || self.y0 >= self.y1
+  }
+
+  fn merge(self: &Self, other: Dirty) -> Dirty {
+    if self.isEmpty() {
+      return other
+    }
+    if other.isEmpty() {
+      return self.*
+    }
+    return Dirty {
+      x0: if other.x0 < self.x0 {
+        other.x0
+      } else {
+        self.x0
+      },
+      y0: if other.y0 < self.y0 {
+        other.y0
+      } else {
+        self.y0
+      },
+      x1: if other.x1 > self.x1 {
+        other.x1
+      } else {
+        self.x1
+      },
+      y1: if other.y1 > self.y1 {
+        other.y1
+      } else {
+        self.y1
+      },
+    }
+  }
+}
+
+// The pixels coverage touches, clipped to the canvas.
+fn coverageBounds(coverage: &Coverage, width: u32, height: u32) -> Dirty {
+  let mut out = Dirty.none()
+  let strips = coverage.strips()
+  let mut i: usize = 0
+  while i < strips.length {
+    let strip = strips[i]
+    out = out.merge(
+      Dirty { x0: strip.x, y0: strip.y, x1: strip.x + strip.width, y1: strip.y + BAND },
+    )
+    i = i + 1
+  }
+  let fills = coverage.fills()
+  i = 0
+  while i < fills.length {
+    let span = fills[i]
+    out = out.merge(Dirty { x0: span.x, y0: span.y, x1: span.x + span.width, y1: span.y + BAND })
+    i = i + 1
+  }
+  if out.x1 > width {
+    out.x1 = width
+  }
+  if out.y1 > height {
+    out.y1 = height
+  }
+  return out
+}
+
+// Clears a layer's dirty box, leaving its pixmap all transparent for reuse.
+fn recycled(layer: Layer) -> Pixmap {
+  let dirty = layer.dirty
+  let mut pixels = move layer.pixels
+  if !dirty.isEmpty() {
+    let stride = u32.toUsize(pixels.width()) * 4
+    let d = pixels.dataMut()
+    let mut y = dirty.y0
+    while y < dirty.y1 {
+      let row = u32.toUsize(y) * stride
+      let mut at = row + u32.toUsize(dirty.x0) * 4
+      let end = row + u32.toUsize(dirty.x1) * 4
+      while at < end {
+        d[at] = 0
+        at = at + 1
+      }
+      y = y + 1
+    }
+  }
+  return move pixels
 }
 
 /// Executes a display list without copying the returned vector-owned pixel buffer.
@@ -287,7 +394,13 @@ effect fn picture(
   let mut spare = List<Pixmap>.make()
   let pixels = run Pixmap.make(width, height)
   run stack.append(
-    Layer { pixels: move pixels, opacity: 255, linearRgb: false, blendMode: layers.BLEND_NORMAL },
+    Layer {
+      pixels: move pixels,
+      opacity: 255,
+      linearRgb: false,
+      blendMode: layers.BLEND_NORMAL,
+      dirty: Dirty.none(),
+    },
   )
   let mut rasterizer = Rasterizer.make()
   let mut coverage = Coverage.make(width, height)
@@ -330,6 +443,8 @@ effect fn picture(
                 layers.BLEND_NORMAL,
                 255,
               )
+              let written = &mut stack.asMutSlice()[target]
+              written.dirty = Dirty.all(width, height)
             }
           }
           Command.FillPath {
@@ -390,6 +505,9 @@ effect fn picture(
               &textures.*,
               texture,
             )
+            let touched = coverageBounds(&coverage, width, height)
+            let layer = &mut stack.asMutSlice()[target]
+            layer.dirty = layer.dirty.merge(touched)
           }
           Command.StrokePath {
             path,
@@ -515,13 +633,16 @@ effect fn picture(
               &textures.*,
               texture,
             )
+            let touched = coverageBounds(&coverage, width, height)
+            let layer = &mut stack.asMutSlice()[target]
+            layer.dirty = layer.dirty.merge(touched)
           }
           Command.PushLayer { opacity, bounds, linearRgb, blendMode } => {
             let available = spare.length()
+
+            // Spare pixmaps come back cleared (recycled).
             let pixels = if available > 0 {
-              let mut reused = spare.remove(available - 1)
-              reused.clear(Rgba8.make(0, 0, 0, 0))
-              move reused
+              spare.remove(available - 1)
             } else {
               run patterns.surface(&mut textures.*, u32.toUsize(width) * u32.toUsize(height))
               run Pixmap.make(width, height)
@@ -532,6 +653,7 @@ effect fn picture(
                 opacity: run checked.unit(opacity),
                 linearRgb: linearRgb,
                 blendMode: blendCode(blendMode),
+                dirty: Dirty.none(),
               },
             )
           }
@@ -545,21 +667,29 @@ effect fn picture(
             if luminance && linearRgb {
               filters.toLinear(&mut layer.pixels)
             }
-            let mask = if luminance {
-              run Mask.fromLuminance(&layer.pixels)
-            } else {
-              run Mask.fromAlpha(&layer.pixels)
-            }
+
+            // Transparent pixels outside the box convert to transparent.
+            let box = layer.dirty
             let pixels = layer.pixels.dataMut()
-            let alpha = mask.data()
-            let mut pixel: usize = 0
-            while pixel < alpha.length {
-              let mut channel: usize = 0
-              while channel < 4 {
-                pixels[pixel * 4 + channel] = alpha[pixel]
-                channel = channel + 1
+            let mut y = box.y0
+            while y < box.y1 {
+              let mut at = (u32.toUsize(y) * u32.toUsize(width) + u32.toUsize(box.x0)) * 4
+              let end = at + u32.toUsize(box.x1 - box.x0) * 4
+              while at < end {
+                let value = maskValue(
+                  pixels[at],
+                  pixels[at + 1],
+                  pixels[at + 2],
+                  pixels[at + 3],
+                  luminance,
+                )
+                pixels[at] = value
+                pixels[at + 1] = value
+                pixels[at + 2] = value
+                pixels[at + 3] = value
+                at = at + 4
               }
-              pixel = pixel + 1
+              y = y + 1
             }
           }
           Command.CompositeMask { operation } => {
@@ -567,6 +697,9 @@ effect fn picture(
             let layer = stack.remove(top)
             let target = stack.length() - 1
             let source = layer.pixels.data()
+            let merged = stack.asSlice()[target].dirty.merge(layer.dirty)
+            let written = &mut stack.asMutSlice()[target]
+            written.dirty = merged
             let pixels = stack.asMutSlice()[target].pixels.dataMut()
             let mut at: usize = 0
             while at < pixels.length {
@@ -585,7 +718,7 @@ effect fn picture(
               }
               at = at + 4
             }
-            run spare.append(move layer.pixels)
+            run spare.append(recycled(move layer))
           }
           Command.ApplyMask { luminance, linearRgb } => {
             let maskPixels = u32.toUsize(width) * u32.toUsize(height)
@@ -597,26 +730,18 @@ effect fn picture(
             if luminance && linearRgb {
               filters.toLinear(&mut layer.pixels)
             }
-            let mask = if luminance {
-              run Mask.fromLuminance(&layer.pixels)
-            } else {
-              run Mask.fromAlpha(&layer.pixels)
-            }
             let target = stack.length() - 1
+            let targetDirty = stack.asSlice()[target].dirty
             let pixels = stack.asMutSlice()[target].pixels.dataMut()
-            let alpha = mask.data()
-            let mut pixel: usize = 0
-            while pixel < alpha.length {
-              let amount = u8.toU32(alpha[pixel])
-              let mut channel: usize = 0
-              while channel < 4 {
-                let at = pixel * 4 + channel
-                pixels[at] = u32.toU8(div255(u8.toU32(pixels[at]) * amount))
-                channel = channel + 1
-              }
-              pixel = pixel + 1
-            }
-            run spare.append(move layer.pixels)
+            applyMaskLayer(
+              &mut pixels,
+              layer.pixels.data(),
+              luminance,
+              targetDirty,
+              layer.dirty,
+              width,
+            )
+            run spare.append(recycled(move layer))
           }
           Command.ApplyClip { index } => {
             let placed = match &placement {
@@ -633,19 +758,9 @@ effect fn picture(
               textures.surfaceLimit - textures.surfaces,
             )
             let target = stack.length() - 1
+            let targetDirty = stack.asSlice()[target].dirty
             let pixels = stack.asMutSlice()[target].pixels.dataMut()
-            let alpha = mask.data()
-            let mut pixel: usize = 0
-            while pixel < alpha.length {
-              let amount = u8.toU32(alpha[pixel])
-              let mut channel: usize = 0
-              while channel < 4 {
-                let at = pixel * 4 + channel
-                pixels[at] = u32.toU8(div255(u8.toU32(pixels[at]) * amount))
-                channel = channel + 1
-              }
-              pixel = pixel + 1
-            }
+            applyCoverage(&mut pixels, mask.data(), targetDirty, width)
           }
           Command.BeginFilter { filter, transform, clip, beneath, backdrop } => {
             let end = filterEnd(commands, i)
@@ -756,6 +871,9 @@ effect fn picture(
               )
               let target = stack.length() - 1
               painting.fill(&mut stack.asMutSlice()[target].pixels, &coverage, &shader, 255)
+              let touched = coverageBounds(&coverage, width, height)
+              let layer = &mut stack.asMutSlice()[target]
+              layer.dirty = layer.dirty.merge(touched)
             }
             i = end
           }
@@ -767,21 +885,32 @@ effect fn picture(
             let layer = stack.remove(top)
             let target = stack.length() - 1
             if layer.linearRgb {
+              // Linear blending converts every target pixel, transparent sources included.
               layers.compositeLinearRgb(
                 &mut stack.asMutSlice()[target].pixels,
                 &layer.pixels,
                 layer.blendMode,
                 layer.opacity,
               )
-            } else {
-              layers.composite(
+              let written = &mut stack.asMutSlice()[target]
+              written.dirty = Dirty.all(width, height)
+            } else if !layer.dirty.isEmpty() {
+              // Transparent source pixels leave the target as it is.
+              let d = layer.dirty
+              layers.compositeWithin(
                 &mut stack.asMutSlice()[target].pixels,
                 &layer.pixels,
                 layer.blendMode,
                 layer.opacity,
+                d.x0,
+                d.y0,
+                d.x1,
+                d.y1,
               )
+              let below = &mut stack.asMutSlice()[target]
+              below.dirty = below.dirty.merge(d)
             }
-            run spare.append(move layer.pixels)
+            run spare.append(recycled(move layer))
           }
         }
         i = i + 1
@@ -1556,4 +1685,89 @@ effect fn fill(
   // copies these validated lines into its reusable internal scratch. This extra
   // List<Line> is necessary until upstream exposes checked fill without the copy.
   run rasterizer.fillPolylines(lines.asSlice(), rule, &mut coverage)
+}
+
+// Scales each premultiplied pixel by its coverage byte. Full coverage leaves
+// a pixel as div255 would (exact rounding), and none clears it, so only
+// partial coverage takes the per-channel multiply.
+// Pixels outside `dirty` are transparent and stay so.
+fn applyCoverage(pixels: &mut [u8], alpha: &[u8], dirty: Dirty, width: u32) {
+  let mut y = dirty.y0
+  while y < dirty.y1 {
+    let row = u32.toUsize(y) * u32.toUsize(width)
+    let mut pixel = row + u32.toUsize(dirty.x0)
+    let end = row + u32.toUsize(dirty.x1)
+    while pixel < end && pixel < alpha.length {
+      let amount = u8.toU32(alpha[pixel])
+      if amount != 255 {
+        let at = pixel * 4
+        if amount == 0 {
+          pixels[at] = 0
+          pixels[at + 1] = 0
+          pixels[at + 2] = 0
+          pixels[at + 3] = 0
+        } else {
+          let mut channel: usize = 0
+          while channel < 4 {
+            pixels[at + channel] = u32.toU8(div255(u8.toU32(pixels[at + channel]) * amount))
+            channel = channel + 1
+          }
+        }
+      }
+      pixel = pixel + 1
+    }
+    y = y + 1
+  }
+}
+
+// A mask layer pixel's coverage: its alpha, or the luminance of the premultiplied
+// color as Mask.fromLuminance computes it.
+fn maskValue(r: u8, g: u8, b: u8, a: u8, luminance: bool) -> u8 {
+  if !luminance {
+    return a
+  }
+
+  // Fixed point with weights summing to 65536: 13926 + 46884 + 4726.
+  let l = 13926 * u8.toU32(r) + 46884 * u8.toU32(g) + 4726 * u8.toU32(b)
+  return u32.toU8(u32.shiftRight(l + 32768, 16))
+}
+
+// ApplyMask over the target's box: mask pixels outside the mask layer's box are
+// transparent, so they clear the target there.
+fn applyMaskLayer(
+  pixels: &mut [u8],
+  mask: &[u8],
+  luminance: bool,
+  dirty: Dirty,
+  maskDirty: Dirty,
+  width: u32,
+) {
+  let mut y = dirty.y0
+  while y < dirty.y1 {
+    let row = u32.toUsize(y) * u32.toUsize(width)
+    let mut x = dirty.x0
+    while x < dirty.x1 {
+      let at = (row + u32.toUsize(x)) * 4
+      let inside = y >= maskDirty.y0 && y < maskDirty.y1 && x >= maskDirty.x0 && x < maskDirty.x1
+      let amount = if inside {
+        u8.toU32(maskValue(mask[at], mask[at + 1], mask[at + 2], mask[at + 3], luminance))
+      } else {
+        0
+      }
+      if amount == 0 {
+        pixels[at] = 0
+        pixels[at + 1] = 0
+        pixels[at + 2] = 0
+        pixels[at + 3] = 0
+      } else if amount != 255 {
+        let mut channel: usize = 0
+        while channel < 4 {
+          pixels[at + channel] = u32.toU8(div255(u8.toU32(pixels[at + channel]) * amount))
+          channel = channel + 1
+        }
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
 }
