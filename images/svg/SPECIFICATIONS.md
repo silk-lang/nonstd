@@ -514,11 +514,11 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] `color-profile` element and property, `icc-color()`, embedded profiles in PNG/JPEG, `rendering-intent`. Requires an ICC transform engine (matrix/TRC profiles first, LUT profiles after). Defaults to sRGB when no profile applies
 
 ### 5.13 Animation (1.1 ch. 19, SMIL Animation, SVG Animations 2)
-- [ ] Elements: `animate`, `set`, `animateMotion` (+ `mpath`, `path`, `keyPoints`, `rotate="auto|auto-reverse"`), `animateTransform`, 1.1 `animateColor`
-- [ ] Targets: `href`/`xlink:href`, `attributeName`, `attributeType` (CSS/XML/auto)
-- [ ] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`), wallclock (resolved against a host-supplied document start), indefinite; event and accessKey values unresolved (section 2.1); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
-- [ ] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
-- [ ] Which attributes and properties are animatable and how (per-property animation type: discrete, by computed value, colour, length lists, path data morphing with matching segment types, transform lists)
+- [ ] Elements: `animate`, `set`, `animateTransform`, 1.1 `animateColor` (done); `animateMotion` (+ `mpath`, `path`, `keyPoints`, `rotate="auto|auto-reverse"`) is phase 11B
+- [x] Targets: `href`/`xlink:href`, `attributeName` (with an `xlink:` prefix), `attributeType` (CSS/XML/auto)
+- [x] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`, `a.begin`), `repeat(n)` syncbase-style values, indefinite; event, accessKey and wallclock values stay unresolved (no host timeline); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
+- [x] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
+- [ ] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes)
 - [ ] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t*
 
 ### 5.14 Optional, last
@@ -981,6 +981,39 @@ decisions:
   (#TextBoundingBox): advance by ascent and descent from the font's horizontal line
   metrics. The stroke bounding box still uses the outlines.
 - Markers do not apply to text.
+
+### Animation sampling
+
+Animated and secure-animated modes sample every SMIL animation once, at a single
+document time the host passes (`RenderOptions.time`, the CLI's `--time`), before
+styling. Static modes ignore animation elements, as
+[SVG 2 processing modes](https://www.w3.org/TR/2018/CR-SVG2-20181004/conform.html#processing-modes)
+require, and `--time` alone selects the animated mode. Intervals follow
+[SMIL 3 interval timing](https://www.w3.org/TR/SMIL3/smil-timing.html#q90): each
+element's begin and end lists resolve, syncbases recurse (a cycle leaves the
+values unresolved), and at most 10000 intervals are built per element. Event,
+accessKey and wallclock values never resolve, because there is no host
+timeline or input. Invalid `keyTimes` or `keySplines` put the animation in
+error, so it has no effect
+([SMIL 3](https://www.w3.org/TR/SMIL3/smil-animation.html#animationNS-KeyTimesAttribute)).
+
+The sandwich orders animations by begin time, then document order. Sampled XML
+attributes are written back onto the element. Sampled CSS properties are
+written as attributes in the `urn:silk:svg:animated` namespace, and the cascade
+reads those at the animation origin, above normal author declarations and below
+`!important` ([CSS Cascade 4](https://www.w3.org/TR/css-cascade-4/#cascade-origin)).
+Two choices differ from the specification:
+
+- The underlying value of a CSS property is its presentation attribute (or the
+  property's initial value), not the computed value from the cascade. To
+  animations, `by` animations and `additive="sum"` over a property set only in a
+  stylesheet or `style` attribute therefore start from the wrong base. Fixing it
+  needs a second cascade pass, and is planned with CSS Animations.
+- Numbers interpolate inside the text of the first value, so path data morphs
+  only when the command letters match, and `points`, `viewBox` and lengths keep
+  the first value's units. Mismatched skeletons switch at the halfway point, the
+  discrete fallback that [SVG 2 path interpolation](https://www.w3.org/TR/2018/CR-SVG2-20181004/paths.html#PathDataInterpolation)
+  asks for path data.
 
 ### JPEG scan reconstruction
 

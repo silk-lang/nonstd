@@ -68,6 +68,16 @@ class OwnManifestTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.load()
 
+    def test_arguments_must_be_option_strings(self):
+        self.entry["arguments"] = ["--time", "1s"]
+        _, cases, _ = self.load()
+        self.assertEqual(cases[0]["arguments"], ["--time", "1s"])
+        for arguments in ("--time 1s", [1], {"time": "1s"}):
+            with self.subTest(arguments=arguments):
+                self.entry["arguments"] = arguments
+                with self.assertRaisesRegex(ValueError, "arguments"):
+                    self.load()
+
     def test_ordinary_cases_cannot_hide_failures(self):
         for status in ("skip", "fail", "spec-difference"):
             self.entry["status"] = status
