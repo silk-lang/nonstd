@@ -73,3 +73,8 @@ Image decoding, filters, text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current
 shape rasterization; computed image/text hints gain consumers in their own phases.
 Parsing those properties does not implement their rendering.
+
+The curated resvg set also includes eleven mask-resource cases: seven exact PNG
+matches and four strict non-passes covering gradient luminance/alpha and the mask
+root transform. The latter retain measured differences without tolerance; they
+remain open conformance work alongside the exact own fixtures.
