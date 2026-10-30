@@ -78,3 +78,12 @@ The curated resvg set also includes eleven mask-resource cases: seven exact PNG
 matches and four strict non-passes covering gradient luminance/alpha and the mask
 root transform. The latter retain measured differences without tolerance; they
 remain open conformance work alongside the exact own fixtures.
+
+Phase 7 has a standalone PNG decoder in `images/svg/image`: all standard color
+and sample-depth combinations, palette and sample transparency, five scanline
+filters, Adam7, and APNG's first animation frame. The decoder retains gAMA, cHRM,
+sRGB intent and bounded decompressed iCCP data for the color-management consumer;
+it does not yet transform source samples. Independent fixtures and malformed-input
+tests cover framing, CRC/zlib integrity, output limits, truncated streams, palette
+indices, metadata order, and APNG frame bounds/sequences. SVG image rendering,
+JPEG, source color conversion and the remaining phase-7 integrations are still open.

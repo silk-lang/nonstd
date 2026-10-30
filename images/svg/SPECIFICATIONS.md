@@ -533,3 +533,14 @@ the resource's mask type; shorter property lists repeat across image layers.
 Literal reference fixtures independently exercise partial-alpha Porter–Duff
 results and order-sensitive three-layer expressions. These checks do not complete
 the open phase-6 requirements for image/gradient mask sources or performance.
+
+PNG decoding is implemented independently of SVG rendering. Sample reconstruction
+uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),
+[filtering](https://www.w3.org/TR/png-3/#9Filters), and
+[Adam7 passes](https://www.w3.org/TR/png-3/#8Interlace).
+[Transparency samples](https://www.w3.org/TR/png-3/#11tRNS) mask unused high bits
+before comparison. APNG selects the first animation frame, including when the
+fallback IDAT image is outside the animation, on a transparent initial canvas
+([frame controls](https://www.w3.org/TR/png-3/#fcTL-chunk)). Later frame payloads
+are not inflated for this first-frame API. Color metadata is retained; its
+interpretation/conversion and SVG image integration remain incomplete.

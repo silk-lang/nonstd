@@ -122,3 +122,7 @@ library.
 ## License
 
 MIT or Apache-2.0.
+
+The standalone `image` package also decodes PNG samples, Adam7 images and APNG's
+first frame, retaining source color metadata. This decoder is not yet connected
+to SVG `<image>` rendering or color conversion.
