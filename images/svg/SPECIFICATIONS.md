@@ -672,3 +672,39 @@ Orientation math also follows CSS Values 4
 The finite angle limit is the supported binary64 whole-turn limit already used by
 the numeric unit converter. Overflow and either infinity therefore normalize to
 zero degrees, as does a NaN calculation after its outermost-boundary censorship.
+
+### CSS image resampling
+
+[CSS Images 3 §5.3](https://www.w3.org/TR/css-images-3/#the-image-rendering)
+controls image sampling. `crisp-edges` and legacy `optimizeSpeed` select nearest
+neighbors. `auto`, `smooth`, `high-quality` and legacy `optimizeQuality` use
+bilinear interpolation. `high-quality` expresses a preference; this executor
+does not reduce quality under load.
+
+`pixelated` first expands each source axis to its closest positive integer
+multiple using nearest neighbors, then bilinearly maps that intermediate to the
+final destination. Exact halfway values select the larger integer (the section
+does not prescribe a tie rule). Affine scale uses each source-axis column norm
+of the complete device mapping, including occurrence orientation and placement.
+For perspective, whose scale varies over the image, the executor uses the same
+conservative forward-Jacobian bound over the finite destination rectangle as
+pattern resolution. This is an implementation choice for a target scale not
+uniquely specified by that section.
+
+Expanded premultiplied samples are cached by source resource and integer scale
+within one execution. Their aggregate storage plus the original backend image
+copies must fit `maxPatternPixels`; dimensions and products are checked before
+allocation. Exceeding the limit fails with `TooLarge`. It does not silently
+substitute a different sampling algorithm. Original two-by-two color fixtures
+compare integer, fractional, anisotropic and downscaled cases against independently
+expanded PNGs under the same second-stage bilinear mapping, at zero tolerance.
+
+Coincident transformed image bounds can place both ends of a clipped edge within
+floating-point uncertainty of the same halfplane. Computing a crossing parameter
+from those signs magnifies a tiny positional error along the whole edge. After
+finite viewport clipping, the vector backend instead snaps such a vertex to the
+actual plane only when the displacement and retained error fit one eighth of the
+existing geometric tolerance. It charges the displacement to the vertex's error
+bound. Horizon clipping retains its original handling; high-uncertainty vertices
+still fail. A fractional translated 90-degree image and a vector-level rectangle
+area test exercise this case without relaxing pixel comparisons.

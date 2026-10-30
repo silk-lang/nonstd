@@ -29,7 +29,8 @@ SVG mask resources support alpha/luminance coverage, mask units, nested masks,
 and CSS mask-layer composition. Image and gradient mask sources remain pending.
 PNG and JPEG `<image>` elements now render with intrinsic sizing, aspect-ratio fitting,
 CSS image orientation (including EXIF, quarter-turn rotation and flipping), opacity,
-and affine/projective placement. Nested SVG images and
+affine/projective placement, and CSS nearest, smooth, or two-stage `pixelated`
+sampling. Nested SVG images and
 CSS image masks remain in progress. Filters, text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example

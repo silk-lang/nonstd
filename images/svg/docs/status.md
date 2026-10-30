@@ -109,13 +109,13 @@ Raster image integration now retains PNG/JPEG assets across image occurrences,
 resolves intrinsic/auto sizes, applies EXIF orientation, and maps samples through
 preserveAspectRatio and full projective transforms. Broken images paint nothing;
 secure-mode external requests never reach the resolver. SVG image hints select
-nearest (`optimizeSpeed`) or bilinear (`auto`/`optimizeQuality`) sampling. Exact
+nearest (`optimizeSpeed`/`crisp-edges`), bilinear (`auto`/`optimizeQuality`/
+`smooth`/`high-quality`), or two-stage `pixelated` sampling. Exact
 fixtures cover sizing, meet/slice/none, opacity, use instances and projective
 placement. CSS `image-orientation` supports inherited metadata selection, `none`,
 angles rounded to quarter turns, and horizontal flipping after rotation. Natural
 dimensions follow each occurrence’s orientation while decoded pixels remain shared.
-Nested SVG images, CSS image masks and CSS Images 3 sampling keywords still need
-integration; phase 7 is not complete.
+Nested SVG images and CSS image masks still need integration; phase 7 is not complete.
 
 The curated resvg set includes eight image cases with strict non-pass expectations.
 Six retain sampling/sample-conversion or transformed-edge differences; two reference

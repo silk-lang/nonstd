@@ -10,6 +10,9 @@ import svg_geometry.geometry { Transform }
 import silk.core.option { Option }
 import silk.num.u32
 import patterns
+import image_sampling
+import image_sampling { Cache as ImageCache }
+import svg_core.scene { ImageSampling }
 import vector.paint
 import vector.geometry { Affine }
 import vector.geometry_error { GeometryError }
@@ -29,6 +32,8 @@ struct Prepared {
 
 pub struct Cache {
   images: List<Pixmap>,
+  expanded: ImageCache,
+  expansionBudget: usize,
   gradients: List<Prepared>,
   stops: List<Stop>,
 }
@@ -49,9 +54,16 @@ pub effect fn make(list: &DisplayList) -> Cache
     i = i + 1
   }
   let mut images = List<Pixmap>.make()
+  let mut remaining = list.maxPatternPixels
   let mut n: usize = 0
   while n < list.images.length() {
     let source = &list.images.asSlice()[n].image
+    let count = u32.toUsize(source.width()) * u32.toUsize(source.height())
+    remaining = if count > remaining {
+      0
+    } else {
+      remaining - count
+    }
     let mut pixels = run Pixmap.make(source.width(), source.height())
     let destination = pixels.dataMut()
     let bytes = source.data()
@@ -63,7 +75,13 @@ pub effect fn make(list: &DisplayList) -> Cache
     run images.append(move pixels)
     n = n + 1
   }
-  return Cache { images: move images, gradients: move gradients, stops: List<Stop>.make() }
+  return Cache {
+    images: move images,
+    expanded: ImageCache.make(),
+    expansionBudget: remaining,
+    gradients: move gradients,
+    stops: List<Stop>.make(),
+  }
 }
 
 effect fn rgba(color: Color) -> Rgba8
@@ -131,7 +149,7 @@ pub effect fn validate(list: &DisplayList) -> ()
   i = 0
   while i < list.paints.length() {
     match &list.paints.asSlice()[i] {
-      PaintInstance.Image { image, transform, nearest: _ } => {
+      PaintInstance.Image { image, transform, sampling: _ } => {
         if image >= list.images.length() || !transform.isFinite() {
           fail RenderError.InvalidGeometry
         }
@@ -252,19 +270,42 @@ pub effect fn fill(
     }
     Brush.Server { index } => {
       match &list.paints.asSlice()[index] {
-        PaintInstance.Image { image, transform, nearest } => {
-          let placed = match &placement {
+        PaintInstance.Image { image, transform, sampling } => {
+          let mut placed = match &placement {
             Option<Mapping>.Some { value } => run value.compose(&transform)
             _ => transform
+          }
+          let mut expanded = Option<usize>.None
+          if sampling == ImageSampling.Pixelated {
+            let scale = run image_sampling.multipliers(&placed, target.width(), target.height())
+            if scale.width > 1 || scale.height > 1 {
+              let selected = run image_sampling.prepare(
+                &mut cache.expanded,
+                image,
+                &cache.images.asSlice()[image],
+                scale.width,
+                scale.height,
+                cache.expansionBudget,
+              )
+              expanded = Option<usize>.Some { value: selected }
+              let reduction = Mapping.Affine {
+                value: Transform.scale(1.0 / u32.toF64(scale.width), 1.0 / u32.toF64(scale.height)),
+              }
+              placed = run placed.compose(&reduction)
+            }
           }
           let matrix = match &placed {
             Mapping.Affine { value } => Homography.fromAffine(&mapping.affine(value))
             Mapping.Projective { value } => value
           }
+          let pixels = match &expanded {
+            Option<usize>.Some { value } => cache.expanded.get(value)
+            _ => &cache.images.asSlice()[image]
+          }
           let shader = run ImagePattern.makeProjective(
-            &cache.images.asSlice()[image],
+            pixels,
             &matrix,
-            if nearest {
+            if sampling == ImageSampling.Nearest {
               SAMPLE_NEAREST
             } else {
               SAMPLE_BILINEAR
