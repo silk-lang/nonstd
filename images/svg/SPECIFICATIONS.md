@@ -564,3 +564,21 @@ storage, output planes and the RGBA image can coexist, so 256 MiB is not an
 aggregate allocation promise. The decoder's current 8-bit one/three-component
 scope and nearest chroma reconstruction do not establish the full phase-7 image
 or phase-12 color-management requirements.
+
+### JPEG metadata and orientation
+
+ICC.1:2022 Annex B points to Technical Note 10-21 for media embedding. The new
+`icc-embedding` pin adds that note without replacing any existing specification
+snapshot. Its JFIF section (page 5) defines APP2 identification and chunk sequence
+fields. The decoder retains one assembled byte sequence in chunk order, including
+APP2 segments between progressive scans. It rejects missing, duplicate, zero or
+inconsistent sequence/count fields. It does not yet interpret profile contents.
+The format itself bounds profile bytes below 16 MiB; no decompression is involved.
+
+`jpeg.decodeWithMetadata` returns unrotated samples, orientation and profile bytes.
+`orientation.apply` implements the eight EXIF pixel permutations, swapping intrinsic
+width/height for orientations 5–8 and preserving premultiplied channels exactly.
+The image consumer will select this helper for CSS Images 3 `image-orientation:
+from-image`; decoding itself does not silently override CSS orientation. Unrelated
+APP1 data (for example XMP) does not erase an earlier EXIF orientation. Invalid or
+absent orientation metadata uses the identity. Renderer integration remains open.

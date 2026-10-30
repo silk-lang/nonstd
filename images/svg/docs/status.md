@@ -86,14 +86,15 @@ sRGB intent and bounded decompressed iCCP data for the color-management consumer
 it does not yet transform source samples. Independent fixtures and malformed-input
 tests cover framing, CRC/zlib integrity, output limits, truncated streams, palette
 indices, metadata order, and APNG frame bounds/sequences. SVG image rendering,
-JPEG, source color conversion and the remaining phase-7 integrations are still open.
+source color conversion and the remaining phase-7 integrations are still open.
 
 JPEG work now reconstructs 8-bit grayscale and three-component sequential and
 progressive streams, including separate-component scans, spectral selection,
 successive approximation, restart intervals and partial MCUs. EXIF orientation
-is inspected but not yet applied. Progressive regression fixtures cover 4:4:4,
+is retained alongside samples; the general orientation helper handles all eight
+rotations/reflections without resampling. Progressive regression fixtures cover 4:4:4,
 4:2:2 and 4:2:0 with exact comparison against sequential encodings of the same
 coefficients; malformed scans and every truncation of a progressive fixture are
-rejected. Chroma reconstruction currently uses nearest samples. JPEG profile
-metadata, broader format coverage and SVG integration remain open; the module
-is not yet a package export.
+rejected. Chroma reconstruction currently uses nearest samples. JPEG ICC chunks
+are assembled in sequence order, including between progressive scans, with missing/duplicate/inconsistent chunk rejection. ICC interpretation,
+broader format coverage and SVG integration remain open.

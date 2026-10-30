@@ -11,3 +11,9 @@ the same coefficients. This checks scan equivalence, not independent color or
 IDCT accuracy; the separate pixel and IDCT tests cover those contracts. The
 script also assembles a three-scan sequential constant image from T.81 marker
 and Huffman syntax, and generates malformed progression/restart/truncation tests.
+
+`../jpeg_metadata_fixtures.py` inserts original APP1/APP2 segments to cover EXIF
+coexisting with XMP, reordered ICC chunks, chunks between progressive scans and
+invalid sequence framing. Its opaque profile payload tests byte transport only,
+not ICC profile validity. `orientation_tests.silk` independently specifies all
+eight exact pixel permutations of a labelled 3×2 image, including alpha channels.
