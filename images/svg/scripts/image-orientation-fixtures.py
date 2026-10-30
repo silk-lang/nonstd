@@ -31,6 +31,10 @@ cases = [
     ('inherit', 'inherit', 1, False), ('unset', 'unset', 1, False),
     ('initial', 'initial', 0, False), ('all-inherit', 'all:inherit', 1, False),
     ('all-initial', 'all:initial', 0, False),
+    ('infinite-angle', 'calc(infinity * 1deg)', 0, False),
+    ('negative-infinite-angle', 'calc(-infinity * 1deg)', 0, False),
+    ('nan-angle', 'calc(NaN * 1deg)', 0, False),
+    ('overflow-angle', 'calc(1e308deg * 10)', 0, False),
 ]
 manifest_path = root / 'manifest.json'
 manifest = json.loads(manifest_path.read_text())
@@ -58,7 +62,7 @@ for name, value, turns, flip in cases:
     (root / 'references' / filename).write_text(svg(pixels(turns, flip)))
     manifest['cases'].append(dict(id='image-orientation-'+name, input='inputs/'+filename,
         references=[dict(path='references/'+filename, relation='==')], status='pass', tolerance={},
-        spec='https://www.w3.org/TR/css-images-3/#the-image-orientation',
+        spec=('https://www.w3.org/TR/css-values-4/#numeric-data-types' if name in ('infinite-angle', 'negative-infinite-angle', 'nan-angle', 'overflow-angle') else 'https://www.w3.org/TR/css-images-3/#the-image-orientation'),
         reason='Original 2x3 RGB source with six distinct samples; reference rotates integer sample coordinates clockwise, then flips horizontally.'))
 # The same URL is deliberately used by differently styled occurrences.
 # This catches decode-time orientation that incorrectly changes every occurrence.
