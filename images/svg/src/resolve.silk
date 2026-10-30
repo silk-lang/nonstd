@@ -25,7 +25,8 @@ import used_clip_shapes
 import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, Composite }
 import used_masks
 import used_mask_images
-import used_mask_images { Reference as LayerReference, Natural, Painted, Placement }
+import used_mask_images { Reference as LayerReference, Painted, Placement }
+import image_assets { LayerSource }
 import svg_css.effect_values { Image as MaskImage }
 import used_clips
 import svg_css.value_keywords { Keyword }
@@ -2760,6 +2761,25 @@ effect fn referencedClip(
   return Option<usize>.some(result)
 }
 
+/// CSS Images 3 #the-image-rendering as SVG image sampling.
+fn imageSampling(engine: &Engine, style: StyleId) -> ImageSampling {
+  return match &engine.get(style, Property.ImageRendering) {
+    Option<ComputedValue>.Some { value } => match &engine.values.get(value.value).* {
+      Value.Keyword { keyword } => {
+        if keyword == Keyword.OptimizeSpeed || keyword == Keyword.CrispImageEdges {
+          ImageSampling.Nearest
+        } else if keyword == Keyword.Pixelated {
+          ImageSampling.Pixelated
+        } else {
+          ImageSampling.Smooth
+        }
+      }
+      _ => ImageSampling.Smooth
+    }
+    _ => ImageSampling.Smooth
+  }
+}
+
 fn layerMode(engine: &Engine, style: StyleId, layerIndex: usize) -> MaskMode {
   if let Option<ComputedValue>.Some { value: entry } = &engine.get(style, Property.MaskMode) {
     if let Value.Effect { value } = &engine.values.get(entry.value).* {
@@ -2824,10 +2844,51 @@ effect fn paintImageLayer(
   let plan = state.plans.asSlice()[id]
   let style = plan.styleId
   let luminance = layerMode(&styles.catalog.engine, style, layerIndex) == MaskMode.Luminance
-  let image = match run used_mask_images.layerImage(&styles.catalog.engine, style, layerIndex) {
-    Option<MaskImage>.Some { value } => move value
+  let gradientImage = run used_mask_images.layerImage(&styles.catalog.engine, style, layerIndex)
+  let source = state.images.findLayer(plan.occurrence.index, layerIndex)
+  let mut natural = NaturalSize {
+    width: Option<f64>.None,
+    height: Option<f64>.None,
+    ratio: Option<f64>.None,
+  }
+
+  // EXIF and CSS image-orientation apply as for <image>; the raw sample size
+  // and orientation code map samples into the oriented natural rectangle.
+  let mut orientation: u8 = 1
+  let mut raw = Size.new(0.0, 0.0)
+  match &source {
+    Option<LayerSource>.Some { value } => match &value {
+      LayerSource.Raster { asset } => {
+        let entry = &state.images.assets.asSlice()[asset]
+        raw = Size.new(u32.toF64(entry.image.width()), u32.toF64(entry.image.height()))
+        orientation = used_images.orientation(&styles.catalog.engine, style, entry)
+        let oriented = used_images.orientedNatural(
+          NaturalSize {
+            width: Option<f64>.some(raw.width),
+            height: Option<f64>.some(raw.height),
+            ratio: Option<f64>.some(raw.width / raw.height),
+          },
+          orientation,
+        )
+        natural = oriented
+      }
+      LayerSource.Document { document } => {
+        match &state.images.documents.asSlice()[document].metadata {
+          Option<DocumentMetadata>.Some { value: metadata } => {
+            orientation = used_images.orientationFromMetadata(&styles.catalog.engine, style, 1)
+            natural = used_images.orientedNatural(metadata.natural, orientation)
+          }
+          _ => {
+            // Invalid documents are broken images, which paint nothing.
+            return luminance
+          }
+        }
+      }
+    }
     _ => {
-      return luminance
+      if gradientImage.isNone() {
+        return luminance
+      }
     }
   }
   let origin = match &(run layerBox(
@@ -2852,7 +2913,7 @@ effect fn paintImageLayer(
     style,
     layerIndex,
     origin,
-    Natural.none(),
+    natural,
   )) {
     Option<Placement>.Some { value } => value
     _ => {
@@ -2861,20 +2922,6 @@ effect fn paintImageLayer(
   }
   let width = placement.image.width()
   let height = placement.image.height()
-  let painted = match &(run used_mask_images.gradient(
-    &mut paints.*,
-    &mut styles.catalog.engine,
-    style,
-    &image,
-    width,
-    height,
-    plan.style.color,
-  )) {
-    Option<Painted>.Some { value } => value
-    _ => {
-      return luminance
-    }
-  }
 
   // Repeated axes cover the painting area; with no-clip, the stroke box bounds
   // everything the element itself can paint.
@@ -2912,7 +2959,15 @@ effect fn paintImageLayer(
     value: Transform.new(1.0, 0.0, 0.0, 1.0, placement.image.xMin, placement.image.yMin),
   }
   let repeated = placement.repeatX || placement.repeatY
+
+  // A repeated image is drawn once in the picture's own space.
+  let space = if repeated {
+    Mapping.identity()
+  } else {
+    run matrix.compose(&offset)
+  }
   let mut used = plan.style
+  used.fill = Paint.None
   used.fillOpacity = 1.0
   used.stroke = Paint.None
   used.opacity = 1.0
@@ -2923,53 +2978,149 @@ effect fn paintImageLayer(
   used.crispEdges = false
   used.linearRgb = false
   used.fillRule = FillRule.Nonzero
-  used.fill = match &painted {
-    Painted.Solid { color } => Paint.Solid { color: color }
-    Painted.Gradient { gradient, local } => {
-      // A repeated image is drawn once in the picture's own space.
-      let space = if repeated {
-        Mapping.identity()
-      } else {
-        run matrix.compose(&offset)
+  let mut embedded = Option<usize>.None
+  let mut embeddedTransform = Mapping.identity()
+  match &source {
+    Option<LayerSource>.Some { value } => match &value {
+      LayerSource.Raster { asset } => {
+        let naturalWidth = match &natural.width {
+          Option<f64>.Some { value: w } => w
+          _ => width
+        }
+        let naturalHeight = match &natural.height {
+          Option<f64>.Some { value: h } => h
+          _ => height
+        }
+        let local = Transform.multiply(
+          Transform.new(width / naturalWidth, 0.0, 0.0, height / naturalHeight, 0.0, 0.0),
+          used_images.orient(orientation, raw.width, raw.height),
+        )
+        let instance = paints.paints.length()
+        run paints.paints.append(
+          PaintInstance.Image {
+            image: asset,
+            transform: run space.compose(&Mapping.Affine { value: local }),
+            sampling: imageSampling(&styles.catalog.engine, style),
+          },
+        )
+        used.fill = Paint.Server { index: instance }
       }
-      let instance = paints.paints.length()
-      run paints.paints.append(
-        PaintInstance.Gradient {
-          gradient: gradient,
-          transform: run space.compose(&Mapping.Affine { value: local }),
-        },
-      )
-      Paint.Server { index: instance }
+      LayerSource.Document { document } => {
+        let viewport = if orientation >= 5 && orientation <= 8 {
+          Size.new(height, width)
+        } else {
+          Size.new(width, height)
+        }
+        let mut image: usize = 0
+        while image < state.embedded.length() {
+          let entry = &state.embedded.asSlice()[image]
+          if entry.source == document && entry.viewport.width == viewport.width
+            && entry.viewport.height == viewport.height {
+            break
+          }
+          image = image + 1
+        }
+        if image == state.embedded.length() {
+          run state.embedded.append(
+            EmbeddedImage { source: document, viewport: viewport, tree: Option<RenderTree>.None },
+          )
+        }
+        let local = used_images.orient(orientation, viewport.width, viewport.height)
+        embedded = Option<usize>.some(image)
+        embeddedTransform = run space.compose(&Mapping.Affine { value: local })
+      }
+    }
+    _ => {
+      let painted = match &gradientImage {
+        Option<MaskImage>.Some { value: image } => run used_mask_images.gradient(
+          &mut paints.*,
+          &mut styles.catalog.engine,
+          style,
+          &image,
+          width,
+          height,
+          plan.style.color,
+        )
+        _ => Option<Painted>.None
+      }
+      used.fill = match &painted {
+        Option<Painted>.Some { value } => match &value {
+          Painted.Solid { color } => Paint.Solid { color: color }
+          Painted.Gradient { gradient, local } => {
+            let instance = paints.paints.length()
+            run paints.paints.append(
+              PaintInstance.Gradient {
+                gradient: gradient,
+                transform: run space.compose(&Mapping.Affine { value: local }),
+              },
+            )
+            Paint.Server { index: instance }
+          }
+        }
+        _ => {
+          return luminance
+        }
+      }
     }
   }
+
+  // An image paints only inside its own rectangle; SVG documents may overflow
+  // their viewport, so they are clipped to it.
+  let imageRect = Rect { xMin: 0.0, yMin: 0.0, xMax: width, yMax: height }
   if repeated {
     // One image per tile of a retained picture; the pattern tile is the step.
     let tile = Rect { xMin: 0.0, yMin: 0.0, xMax: placement.stepX, yMax: placement.stepY }
-    let content = used
-    let path = state.paths.length()
-    run state.paths.append(run svg.rectangle(0.0, 0.0, width, height, 0.0, 0.0))
     let mut pictureShapes = List<ResolvedShape>.make()
-    run pictureShapes.append(
-      ResolvedShape {
-        path: path,
-        transform: Mapping.identity(),
-        strokeSpace: Option<usize>.None,
-        clip: Option<usize>.None,
-        bounds: tile,
-        style: content,
-      },
-    )
     let mut pictureNodes = List<ResolvedNode>.make()
-    run pictureNodes.append(ResolvedNode.Paint { shape: 0, layer: PaintLayer.Fill })
+    match &embedded {
+      Option<usize>.Some { value } => {
+        run pictureNodes.append(
+          ResolvedNode.BeginGroup {
+            opacity: 1.0,
+            bounds: tile,
+            linearRgb: false,
+            blendMode: BlendMode.Normal,
+          },
+        )
+        run pictureNodes.append(
+          ResolvedNode.Embedded {
+            image: value,
+            transform: embeddedTransform,
+            clip: Option<usize>.None,
+          },
+        )
+        run pictureNodes.append(
+          ResolvedNode.ApplyClip {
+            index: run rectangleClip(&mut state.*, imageRect, &Mapping.identity()),
+          },
+        )
+        run pictureNodes.append(ResolvedNode.EndGroup)
+      }
+      _ => {
+        let path = state.paths.length()
+        run state.paths.append(run svg.rectangle(0.0, 0.0, width, height, 0.0, 0.0))
+        run pictureShapes.append(
+          ResolvedShape {
+            path: path,
+            transform: Mapping.identity(),
+            strokeSpace: Option<usize>.None,
+            clip: Option<usize>.None,
+            bounds: tile,
+            style: used,
+          },
+        )
+        run pictureNodes.append(ResolvedNode.Paint { shape: 0, layer: PaintLayer.Fill })
+      }
+    }
     let pattern = state.patterns.length()
     if pattern >= graph.limits.maxOccurrences {
       fail RenderError.TooLarge
     }
     run state.patterns.append(
       ResolvedPattern {
-        clip: Option<Clip>.some(Clip { rectangle: tile, x: true, y: true }),
+        clip: Option<Clip>.some(Clip { rectangle: imageRect, x: true, y: true }),
         tile: tile,
-        contentBounds: Rect { xMin: 0.0, yMin: 0.0, xMax: width, yMax: height },
+        contentBounds: imageRect,
         shapes: move pictureShapes,
         nodes: move pictureNodes,
       },
@@ -2981,33 +3132,55 @@ effect fn paintImageLayer(
       PaintInstance.Pattern { pattern: pattern, transform: run matrix.compose(&offset) },
     )
     used.fill = Paint.Server { index: instance }
+  } else if let Option<usize>.Some { value } = &embedded {
+    run nodes.append(
+      ResolvedNode.Embedded {
+        image: value,
+        transform: embeddedTransform,
+        clip: Option<usize>.None,
+      },
+    )
+    run nodes.append(
+      ResolvedNode.ApplyClip { index: run rectangleClip(&mut state.*, placement.image, matrix) },
+    )
+    used.fill = Paint.None
   }
-  let path = state.paths.length()
-  run state.paths.append(run svg.rectangle(x0, y0, x1 - x0, y1 - y0, 0.0, 0.0))
-  let shape = shapes.length()
-  run shapes.append(
-    ResolvedShape {
-      path: path,
-      transform: matrix.*,
-      strokeSpace: Option<usize>.None,
-      clip: Option<usize>.None,
-      bounds: outputBounds,
-      style: used,
-    },
-  )
-  run nodes.append(ResolvedNode.Paint { shape: shape, layer: PaintLayer.Fill })
+  if repeated || embedded.isNone() {
+    let path = state.paths.length()
+    run state.paths.append(run svg.rectangle(x0, y0, x1 - x0, y1 - y0, 0.0, 0.0))
+    let shape = shapes.length()
+    run shapes.append(
+      ResolvedShape {
+        path: path,
+        transform: matrix.*,
+        strokeSpace: Option<usize>.None,
+        clip: Option<usize>.None,
+        bounds: outputBounds,
+        style: used,
+      },
+    )
+    run nodes.append(ResolvedNode.Paint { shape: shape, layer: PaintLayer.Fill })
+  }
   if let Option<Rect>.Some { value: area } = &clipBox {
-    let clipPath = state.paths.length()
-    run state.paths.append(
-      run svg.rectangle(area.xMin, area.yMin, area.width(), area.height(), 0.0, 0.0),
+    run nodes.append(
+      ResolvedNode.ApplyClip { index: run rectangleClip(&mut state.*, area, matrix) },
     )
-    let clipping = state.clipNodes.length()
-    run state.clipNodes.append(
-      ClipNode.Shape { path: clipPath, transform: matrix.*, rule: FillRule.Nonzero },
-    )
-    run nodes.append(ResolvedNode.ApplyClip { index: clipping })
   }
   return luminance
+}
+
+effect fn rectangleClip(state: &mut Planning, area: Rect, matrix: &Mapping) -> usize
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let path = state.paths.length()
+  run state.paths.append(
+    run svg.rectangle(area.xMin, area.yMin, area.width(), area.height(), 0.0, 0.0),
+  )
+  let clipping = state.clipNodes.length()
+  run state.clipNodes.append(
+    ClipNode.Shape { path: path, transform: matrix.*, rule: FillRule.Nonzero },
+  )
+  return clipping
 }
 
 effect fn paintMaskLayer(
@@ -3376,23 +3549,7 @@ effect fn paintPrepared(
   if let Option<usize>.Some { value: image } = &plan.image {
     let placement = Mapping.Affine { value: plan.imageMapping }
     let transform = run matrix.compose(&placement)
-    let sampling = match &styles.catalog.engine.get(plan.styleId, Property.ImageRendering) {
-      Option<ComputedValue>.Some { value } => match &styles.catalog.engine.values.get(
-        value.value,
-      ).* {
-        Value.Keyword { keyword } => {
-          if keyword == Keyword.OptimizeSpeed || keyword == Keyword.CrispImageEdges {
-            ImageSampling.Nearest
-          } else if keyword == Keyword.Pixelated {
-            ImageSampling.Pixelated
-          } else {
-            ImageSampling.Smooth
-          }
-        }
-        _ => ImageSampling.Smooth
-      }
-      _ => ImageSampling.Smooth
-    }
+    let sampling = imageSampling(&styles.catalog.engine, plan.styleId)
     let index = paints.paints.length()
     run paints.paints.append(
       PaintInstance.Image { image: image, transform: transform, sampling: sampling },

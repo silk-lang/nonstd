@@ -27,15 +27,15 @@ Text clipping and projective clip edge cases remain in progress.
 
 SVG mask resources support alpha/luminance coverage, mask units, nested masks,
 CSS mask-layer composition, and `linear-gradient()`/`radial-gradient()` (and repeating)
-mask layers with `mask-size`, `mask-position`, `mask-repeat`, `mask-origin` and `mask-clip`.
-`url()` mask layers naming raster or SVG images remain pending.
+and `url()` raster or SVG image mask layers, with `mask-size`, `mask-position`,
+`mask-repeat`, `mask-origin` and `mask-clip`.
 PNG and JPEG `<image>` elements now render with intrinsic sizing, aspect-ratio fitting,
 CSS image orientation (including EXIF, quarter-turn rotation and flipping), opacity,
 affine/projective placement, and CSS nearest, smooth, or two-stage `pixelated`
 sampling. Nested SVG images render as independent secure documents with their own
 viewport and styles, apply CSS image orientation before sizing, and retain vector
 geometry through final placement.
-CSS image masks remain in progress. Filters, text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
+Filters, text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example
 

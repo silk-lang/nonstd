@@ -493,7 +493,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] `clipPath` with `clipPathUnits`, `clip-rule`, nested `clip-path` on the clip path and its children, `use` children, text children, transforms; invalid children ignored
 - [ ] `clip-path` with basic shapes (`inset`, `circle`, `ellipse`, `polygon`, `path()`) and geometry boxes
 - [ ] `mask` element: `maskUnits`, `maskContentUnits`, `mask-type` luminance/alpha, nested masks
-- [ ] CSS `mask` layers as far as they apply to SVG content (`mask-image` with `url()` to SVG masks and to images, `mask-mode`, `mask-repeat`, `mask-position`, `mask-size`, `mask-composite`), `mask-border` only if trivial
+- [x] CSS `mask` layers as far as they apply to SVG content (`mask-image` with `url()` to SVG masks and to images, `mask-mode`, `mask-repeat`, `mask-position`, `mask-size`, `mask-composite`), `mask-border` only if trivial
 - [ ] 1.1 `clip` property on viewport elements
 - [ ] `mix-blend-mode` (all separable and non-separable modes), `isolation`, Porter-Duff operators
 
@@ -555,7 +555,17 @@ CSS Backgrounds 3. Interpretation decisions:
   note describes; a non-empty period averages over the period.
 - Repeated layer images are retained pictures executed as pattern tiles, like SVG patterns.
 
-`url()` mask layers that name raster or SVG images (not mask elements) remain open.
+`url()` mask layers that do not name a `mask` element are `<image>` values
+([#the-mask-image](https://www.w3.org/TR/css-masking-1/#the-mask-image)): they are fetched
+through the resolver under the referencing document's policy (relative URLs against the
+declaring stylesheet), decoded like `<image>` sources, and sized with their natural
+dimensions and ratio. Raster layers honour `image-orientation` and `image-rendering`; SVG
+layers are laid out as independent secure documents in the concrete object size and clipped
+to it. Fragment-only references always name elements: unresolved ones, and anything that is
+not a decodable image, are transparent black layers.
+
+`mask-border` is not implemented: nine-slice border images are not trivial, and the
+checklist admits `mask-border` only if trivial.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),
