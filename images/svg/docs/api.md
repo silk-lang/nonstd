@@ -43,7 +43,10 @@ the current mode selection governs resource access, not a running timeline.
 `--fragment` accepts encoded text with one optional leading `#`.
 The 300×150 embedding viewport is independent of output-resolution overrides.
 Portable hosts can provide measured font bytes through `NativeHost.fromFontBytes`,
-or configure `Environment` directly.
+or configure `Environment` directly. `Environment.fonts` is the font database text
+uses; `NativeHost.fonts` starts with the discovered initial face, and hosts add faces
+with `FontDatabase.add`. `--font-dir DIR` adds the `.ttf`, `.otf` and `.ttc` files
+directly in `DIR`, in path order.
 
 `Resolver.fetch` returns `Response { bytes, finalUrl, mediaType, charset }`.
 `Response.fromBytes` supplies absent transport metadata. Redirect URLs establish
