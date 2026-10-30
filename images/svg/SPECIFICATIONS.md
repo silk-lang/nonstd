@@ -664,3 +664,11 @@ shared-resource and JPEG `none` cases distinguish occurrence styling from decodi
 The `all` probes restore `x` and `y` after the shorthand, because `all` also resets
 those positioning properties. Decorative CSS image consumers remain pending and
 must apply the specification’s separate decorative-image orientation rule.
+
+Orientation math also follows CSS Values 4
+[`#numeric-data-types`](https://www.w3.org/TR/css-values-4/#numeric-data-types) and
+[`#calc-infinities`](https://www.w3.org/TR/css-values-4/#calc-infinities)
+(pinned SHA256 `7b6b68c34d00d7f6945e66e4e2efa913266299f597d5825393cae85dac1cc78c`).
+The finite angle limit is the supported binary64 whole-turn limit already used by
+the numeric unit converter. Overflow and either infinity therefore normalize to
+zero degrees, as does a NaN calculation after its outermost-boundary censorship.
