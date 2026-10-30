@@ -1,0 +1,493 @@
+//! Runs a resolved filter program over `vector.filter` on premultiplied RGBA8 surfaces.
+//! Every intermediate result has the surface's size and is transparent outside its
+//! primitive subregion, which never exceeds the filter region.
+import program {
+  Program,
+  Primitive,
+  Operation,
+  Input,
+  Function,
+  CompositeOperator,
+  ColorMatrixKind,
+  MorphologyOperator,
+  Rgba
+}
+import svg_geometry.geometry { Rect }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.filter { Region, BlurPlan, ComponentTransfer }
+import vector.filter as filters
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.f32
+import silk.num.u32
+import silk.num.i32
+
+/// Maps user space to surface pixels: `x' = sx x + tx`, `y' = sy y + ty`, with positive scales.
+pub struct Space {
+  pub sx: f64,
+  pub sy: f64,
+  pub tx: f64,
+  pub ty: f64,
+}
+
+impl Copy for Space {}
+
+// Edges within this distance of a pixel boundary are snapped to it, so that
+// transforms that land on whole pixels up to rounding do not grow a region.
+const SNAP: f64 = 0.000001
+
+/// `floor`, except that values within rounding noise of a whole number snap to it.
+pub fn floorSnapped(value: f64) -> f64 {
+  let nearest = f64.round(value)
+  if f64.abs(value - nearest) < SNAP {
+    return nearest
+  }
+  return f64.floor(value)
+}
+
+/// `ceil`, except that values within rounding noise of a whole number snap to it.
+pub fn ceilSnapped(value: f64) -> f64 {
+  let nearest = f64.round(value)
+  if f64.abs(value - nearest) < SNAP {
+    return nearest
+  }
+  return f64.ceil(value)
+}
+
+fn clampPixel(value: f64, limit: u32) -> u32 {
+  if !(value > 0.0) {
+    return 0
+  }
+  if value >= u32.toF64(limit) {
+    return limit
+  }
+  return f64.toU32(value)
+}
+
+impl Space {
+  /// The pixels `rect` touches, limited to a `width` x `height` surface.
+  pub fn pixels(self: &Self, rect: Rect, width: u32, height: u32) -> Region {
+    let x0 = clampPixel(floorSnapped(rect.xMin * self.sx + self.tx), width)
+    let y0 = clampPixel(floorSnapped(rect.yMin * self.sy + self.ty), height)
+    let x1 = clampPixel(ceilSnapped(rect.xMax * self.sx + self.tx), width)
+    let y1 = clampPixel(ceilSnapped(rect.yMax * self.sy + self.ty), height)
+    return Region.make(x0, y0, maxU32(x0, x1), maxU32(y0, y1))
+  }
+}
+
+fn maxU32(a: u32, b: u32) -> u32 {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn minU32(a: u32, b: u32) -> u32 {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+fn intersect(a: Region, b: Region) -> Region {
+  let x0 = maxU32(a.x0, b.x0)
+  let y0 = maxU32(a.y0, b.y0)
+  let x1 = maxU32(x0, minU32(a.x1, b.x1))
+  let y1 = maxU32(y0, minU32(a.y1, b.y1))
+  return Region.make(x0, y0, x1, y1)
+}
+
+struct Output {
+  pixels: Pixmap,
+  region: Region,
+  linear: bool,
+}
+
+fn byte(value: f64) -> u8 {
+  return f64.toU8(f64.floor(f64.min(1.0, f64.max(0.0, value)) * 255.0 + 0.5))
+}
+
+fn straight(color: Rgba) -> Rgba8 {
+  return Rgba8.make(byte(color.r), byte(color.g), byte(color.b), byte(color.a))
+}
+
+fn pixels(value: f64) -> i32 {
+  return f64.toI32(f64.round(value))
+}
+
+fn radius(value: f64) -> u32 {
+  if !(value > 0.0) {
+    return 0
+  }
+  return f64.toU32(f64.round(value))
+}
+
+fn compositeCode(operator: CompositeOperator) -> u8 {
+  return match operator {
+    CompositeOperator.Over => filters.COMPOSITE_OVER
+    CompositeOperator.In => filters.COMPOSITE_IN
+    CompositeOperator.Out => filters.COMPOSITE_OUT
+    CompositeOperator.Atop => filters.COMPOSITE_ATOP
+    CompositeOperator.Xor => filters.COMPOSITE_XOR
+    CompositeOperator.Lighter => filters.COMPOSITE_LIGHTER
+    CompositeOperator.Arithmetic => filters.COMPOSITE_ARITHMETIC
+  }
+}
+
+fn matrixCode(kind: ColorMatrixKind) -> u8 {
+  return match kind {
+    ColorMatrixKind.Matrix => filters.MATRIX
+    ColorMatrixKind.Saturate => filters.SATURATE
+    ColorMatrixKind.HueRotate => filters.HUE_ROTATE
+    ColorMatrixKind.LuminanceToAlpha => filters.LUMINANCE_TO_ALPHA
+  }
+}
+
+effect fn floats(numbers: &[f64], first: usize, count: usize) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = List<f32>.make()
+  let mut i: usize = 0
+  while i < count {
+    run values.append(f64.toF32(numbers[first + i]))
+    i = i + 1
+  }
+  return move values
+}
+
+effect fn table(function: Function, numbers: &[f64]) -> [u8; 256]
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match function {
+    Function.Identity => filters.transferIdentity()
+    Function.Table { first, count } => {
+      let values = run floats(numbers, first, count)
+      filters.transferTable(values.asSlice())
+    }
+    Function.Discrete { first, count } => {
+      let values = run floats(numbers, first, count)
+      filters.transferDiscrete(values.asSlice())
+    }
+    Function.Linear { slope, intercept } => filters.transferLinear(
+      f64.toF32(slope),
+      f64.toF32(intercept),
+    )
+    Function.Gamma { amplitude, exponent, offset } => filters.transferGamma(
+      f64.toF32(amplitude),
+      f64.toF32(exponent),
+      f64.toF32(offset),
+    )
+  }
+}
+
+/// A copy of `from` in the requested color space.
+effect fn converted(from: &Output, linear: bool) -> Output
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pixels = run Pixmap.make(from.pixels.width(), from.pixels.height())
+  filters.copy(&mut pixels, &from.pixels, Region.of(&from.pixels))
+  if linear && !from.linear {
+    filters.toLinear(&mut pixels)
+  } else if !linear && from.linear {
+    filters.toSrgb(&mut pixels)
+  }
+  return Output { pixels: move pixels, region: from.region, linear: linear }
+}
+
+effect fn fetch(
+  results: &List<Output>,
+  source: &Output,
+  alpha: &Output,
+  input: Input,
+  linear: bool,
+) -> Output
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match input {
+    Input.SourceGraphic => run converted(source, linear)
+
+    // Alpha alone is the same in either color space.
+    Input.SourceAlpha => run converted(alpha, alpha.linear)
+    Input.Result { index } => run converted(&results.asSlice()[index], linear)
+    Input.Transparent => Output {
+      pixels: run Pixmap.make(source.pixels.width(), source.pixels.height()),
+      region: Region.make(0, 0, 0, 0),
+      linear: linear,
+    }
+  }
+}
+
+/// `input`'s alpha with black color: SourceAlpha, and the shadow of `feDropShadow`.
+effect fn alphaOf(input: &Pixmap) -> Pixmap
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pixels = run Pixmap.make(input.width(), input.height())
+  let from = input.data()
+  let to = pixels.dataMut()
+  let mut i: usize = 0
+  while i < from.length {
+    to[i + 3] = from[i + 3]
+    i = i + 4
+  }
+  return move pixels
+}
+
+/// Floods `region` with `color`, converted to the primitive's color space.
+effect fn flood(out: &mut Pixmap, color: Rgba, linear: bool, region: Region) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  filters.flood(&mut out, straight(color), 255, region)
+  if linear {
+    filters.toLinear(&mut out)
+  }
+}
+
+/// Gaussian blur of `input` read across the whole filter region, kept within `region`.
+effect fn blur(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  x: f64,
+  y: f64,
+  space: &Space,
+  whole: Region,
+  region: Region,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let horizontal = run BlurPlan.make(x * space.sx)
+  let vertical = run BlurPlan.make(y * space.sy)
+  let mut blurred = run Pixmap.make(input.width(), input.height())
+  run filters.gaussianBlur(&mut blurred, input, &horizontal, &vertical, whole)
+  filters.copy(&mut out, &blurred, region)
+}
+
+fn validInput(input: Input, before: usize) -> bool {
+  return match input {
+    Input.Result { index } => index < before
+    _ => true
+  }
+}
+
+fn validRange(first: usize, count: usize, length: usize) -> bool {
+  return first <= length && count <= length - first
+}
+
+fn finite(values: &[f64]) -> bool {
+  let mut i: usize = 0
+  while i < values.length {
+    if !f64.isFinite(values[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn validFunction(function: Function, numbers: usize) -> bool {
+  return match function {
+    Function.Table { first, count } => validRange(first, count, numbers)
+    Function.Discrete { first, count } => validRange(first, count, numbers)
+    Function.Linear { slope, intercept } => f64.isFinite(slope) && f64.isFinite(intercept)
+    Function.Gamma { amplitude, exponent, offset } => f64.isFinite(amplitude)
+      && f64.isFinite(exponent)
+      && f64.isFinite(offset)
+    Function.Identity => true
+  }
+}
+
+/// Whether every index of `program` stays inside it and every number is finite, so that an
+/// exported display list cannot make `apply` read out of bounds.
+pub fn valid(program: &Program) -> bool {
+  if !program.region.isValid() || !finite(program.numbers.asSlice()) {
+    return false
+  }
+  let numbers = program.numbers.length()
+  let inputs = program.inputs.asSlice()
+  let primitives = program.primitives.asSlice()
+  let mut p: usize = 0
+  while p < primitives.length {
+    let primitive = primitives[p]
+    if !primitive.subregion.isValid() || !validInput(primitive.input, p)
+      || !validInput(primitive.input2, p) {
+      return false
+    }
+    let ok = match primitive.operation {
+      Operation.Merge { first, count } => {
+        let mut fine = validRange(first, count, inputs.length)
+        let mut i: usize = 0
+        while fine && i < count {
+          fine = validInput(inputs[first + i], p)
+          i = i + 1
+        }
+        fine
+      }
+      Operation.ColorMatrix { kind, first, count } => validRange(first, count, numbers)
+      Operation.ComponentTransfer { functions } => validFunction(functions[0], numbers)
+        && validFunction(functions[1], numbers)
+        && validFunction(functions[2], numbers)
+        && validFunction(functions[3], numbers)
+      Operation.Offset { dx, dy } => f64.isFinite(dx) && f64.isFinite(dy)
+      Operation.Blur { x, y } => f64.isFinite(x) && f64.isFinite(y)
+      Operation.Morphology { operator, x, y } => f64.isFinite(x) && f64.isFinite(y)
+      Operation.Composite { operator, k } => finite(&k)
+      Operation.DropShadow { dx, dy, x, y, color } => f64.isFinite(dx) && f64.isFinite(dy)
+        && f64.isFinite(x)
+        && f64.isFinite(y)
+      _ => true
+    }
+    if !ok {
+      return false
+    }
+    p = p + 1
+  }
+  return true
+}
+
+/// Runs `program` on `source`, the filtered element's rendering on a surface whose
+/// pixels relate to user space through `space`. The result has the source's size and
+/// is sRGB, transparent outside the filter region.
+pub effect fn apply(program: &Program, source: &Pixmap, space: Space) -> Pixmap
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let width = source.width()
+  let height = source.height()
+  let whole = space.pixels(program.region, width, height)
+
+  // #FilterEffectsRegion: the filter region clips the primitives' input images.
+  let mut clipped = run Pixmap.make(width, height)
+  filters.copy(&mut clipped, source, whole)
+  let alpha = Output { pixels: run alphaOf(&clipped), region: whole, linear: false }
+  let graphic = Output { pixels: move clipped, region: whole, linear: false }
+  let mut results = List<Output>.make()
+  let numbers = program.numbers.asSlice()
+  let primitives = program.primitives.asSlice()
+  let mut p: usize = 0
+  while p < primitives.length {
+    let primitive = primitives[p]
+    let linear = primitive.linearRgb
+    let mut out = run Pixmap.make(width, height)
+    let region = if primitive.subregion.isEmpty() {
+      Region.make(0, 0, 0, 0)
+    } else {
+      intersect(space.pixels(primitive.subregion, width, height), whole)
+    }
+    if region.x1 > region.x0 && region.y1 > region.y0 {
+      match primitive.operation {
+        Operation.Copy => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          filters.copy(&mut out, &a.pixels, region)
+        }
+        Operation.Flood { color } => {
+          run flood(&mut out, color, linear, region)
+        }
+        Operation.Offset { dx, dy } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          filters.offset(&mut out, &a.pixels, pixels(dx * space.sx), pixels(dy * space.sy), region)
+        }
+        Operation.Blur { x, y } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          run blur(&mut out, &a.pixels, x, y, &space, whole, region)
+        }
+        Operation.Merge { first, count } => {
+          let inputs = program.inputs.asSlice()
+          let mut i: usize = 0
+          while i < count {
+            let a = run fetch(&results, &graphic, &alpha, inputs[first + i], linear)
+            filters.mergeOver(&mut out, &a.pixels, region)
+            i = i + 1
+          }
+        }
+        Operation.Blend { mode } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let b = run fetch(&results, &graphic, &alpha, primitive.input2, linear)
+          filters.blend(&mut out, &a.pixels, &b.pixels, mode, region)
+        }
+        Operation.Composite { operator, k } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let b = run fetch(&results, &graphic, &alpha, primitive.input2, linear)
+          filters.composite(
+            &mut out,
+            &a.pixels,
+            &b.pixels,
+            compositeCode(operator),
+            [f64.toF32(k[0]), f64.toF32(k[1]), f64.toF32(k[2]), f64.toF32(k[3])],
+            region,
+          )
+        }
+        Operation.ColorMatrix { kind, first, count } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let values = run floats(numbers, first, count)
+          let matrix = filters.colorMatrixOf(matrixCode(kind), values.asSlice())
+          filters.colorMatrix(&mut out, &a.pixels, matrix, region)
+        }
+        Operation.ComponentTransfer { functions } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let transfer = ComponentTransfer {
+            r: run table(functions[0], numbers),
+            g: run table(functions[1], numbers),
+            b: run table(functions[2], numbers),
+            a: run table(functions[3], numbers),
+          }
+          filters.componentTransfer(&mut out, &a.pixels, &transfer, region)
+        }
+        Operation.Morphology { operator, x, y } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let mut shaped = run Pixmap.make(width, height)
+          run filters.morphology(
+            &mut shaped,
+            &a.pixels,
+            if operator == MorphologyOperator.Dilate {
+              filters.MORPHOLOGY_DILATE
+            } else {
+              filters.MORPHOLOGY_ERODE
+            },
+            radius(x * space.sx),
+            radius(y * space.sy),
+            whole,
+          )
+          filters.copy(&mut out, &shaped, region)
+        }
+        Operation.Tile => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          filters.tile(&mut out, &a.pixels, a.region, region)
+        }
+        Operation.DropShadow { dx, dy, x, y, color } => {
+          // #feDropShadowElement: blur the input's alpha, offset it, color it with the
+          // flood, and merge the input over it.
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let shape = run alphaOf(&a.pixels)
+          let mut blurred = run Pixmap.make(width, height)
+          run blur(&mut blurred, &shape, x, y, &space, whole, whole)
+          let mut moved = run Pixmap.make(width, height)
+          filters.offset(&mut moved, &blurred, pixels(dx * space.sx), pixels(dy * space.sy), region)
+          let mut paint = run Pixmap.make(width, height)
+          run flood(&mut paint, color, linear, region)
+          filters.composite(
+            &mut out,
+            &paint,
+            &moved,
+            filters.COMPOSITE_IN,
+            [0.0, 0.0, 0.0, 0.0],
+            region,
+          )
+          filters.mergeOver(&mut out, &a.pixels, region)
+        }
+      }
+    }
+    run results.append(Output { pixels: move out, region: region, linear: linear })
+    p = p + 1
+  }
+  if results.length() == 0 {
+    return run Pixmap.make(width, height)
+  }
+  let last = results.length() - 1
+  let mut result = results.remove(last)
+  if result.linear {
+    filters.toSrgb(&mut result.pixels)
+  }
+  return move result.pixels
+}

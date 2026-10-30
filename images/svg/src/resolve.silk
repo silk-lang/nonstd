@@ -15,7 +15,8 @@ import scene {
   Paint,
   PaintInstance,
   ImageSampling,
-  ResolvedPattern
+  ResolvedPattern,
+  FilterProgram
 }
 import document_styles { StyledGraph }
 import structure { Graph, OccurrenceId }
@@ -24,6 +25,8 @@ import used_viewports
 import used_clip_shapes
 import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, Composite }
 import used_masks
+import used_filters
+import svg_css.effect_values { Filter }
 import used_mask_images
 import used_mask_images { Reference as LayerReference, Painted, Placement }
 import image_assets { LayerSource }
@@ -496,6 +499,7 @@ struct Planning {
   clipNodes: List<ClipNode>,
   activeClips: List<usize>,
   activeMasks: List<usize>,
+  filters: List<FilterProgram>,
   resourceAncestry: usize,
   ancestryKeys: HashMap<ReferenceKey, usize>,
   ancestryCount: usize,
@@ -3481,6 +3485,100 @@ effect fn applyMask(
   run nodes.append(ResolvedNode.ApplyMask { luminance: false, linearRgb: false })
 }
 
+/// The filter programs an element's `filter` applies, in order. `hidden` means the element
+/// is not rendered at all.
+struct Filtering {
+  hidden: bool,
+  programs: List<usize>,
+}
+
+// https://www.w3.org/TR/filter-effects-1/#FilterProperty
+effect fn filtering(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  state: &mut Planning,
+  limits: &Limits,
+) -> Filtering
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let plan = state.plans.asSlice()[id]
+  let mut targets = List<OccurrenceId>.make()
+  if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
+    plan.styleId,
+    Property.Filter,
+  ) {
+    if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+      if let EffectValue.Filters { items } = &value {
+        let mut item: usize = 0
+        while item < items.length() {
+          match &items.asSlice()[item] {
+            Filter.Url { url } => {
+              match &styles.resourceAt(plan.occurrence, Property.Filter, item) {
+                Option<OccurrenceId>.Some { value: target } => {
+                  run targets.append(target)
+                }
+                _ => {
+                  // A reference to a missing or non-filter element ignores the whole chain.
+                  return Filtering { hidden: false, programs: List<usize>.make() }
+                }
+              }
+            }
+
+            // Filter functions are not implemented yet; they are skipped.
+            _ => {}
+          }
+          item = item + 1
+        }
+      }
+    }
+  }
+  let mut programs = List<usize>.make()
+  if targets.length() == 0 {
+    return Filtering { hidden: false, programs: move programs }
+  }
+  let bounds = match &(run gather(
+    graph,
+    id,
+    state.plans.asSlice(),
+    state.layouts.asSlice(),
+    state.paths.asSlice(),
+    &Mapping.identity(),
+    false,
+    false,
+    &mut state.bounds,
+  )) {
+    Option<Rect>.Some { value } => value
+    _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+  }
+  let viewport = state.spaces.asSlice()[plan.viewport]
+  let mut t: usize = 0
+  while t < targets.length() {
+    let program = run used_filters.resolve(
+      graph,
+      &mut styles.*,
+      targets.asSlice()[t],
+      viewport,
+      bounds,
+      limits,
+    )
+    match move program {
+      Option<FilterProgram>.Some { value } => {
+        if state.filters.length() >= graph.limits.maxOccurrences {
+          fail RenderError.TooLarge
+        }
+        run programs.append(state.filters.length())
+        run state.filters.append(move value)
+      }
+      _ => {
+        return Filtering { hidden: true, programs: move programs }
+      }
+    }
+    t = t + 1
+  }
+  return Filtering { hidden: false, programs: move programs }
+}
+
 effect fn paintPrepared(
   graph: &Graph,
   styles: &mut StyledGraph,
@@ -3595,6 +3693,10 @@ effect fn paintPrepared(
   } else {
     context.*
   }
+  let filtered = run filtering(graph, &mut styles.*, id, &mut state.*, limits)
+  if filtered.hidden {
+    return
+  }
   let clipping = run referencedClip(graph, &mut styles.*, id, &mut state.*, matrix, limits, depth)
   let masked = used_masks.present(&styles.catalog.engine, plan.styleId)
   let layer = plan.document.isSome() || masked || clipping.isSome() || plan.style.opacity != 1.0
@@ -3607,6 +3709,20 @@ effect fn paintPrepared(
         bounds: outputBounds,
         linearRgb: plan.style.linearRgb,
         blendMode: plan.style.blendMode,
+      },
+    )
+  }
+
+  // Filters apply first, then clipping, masking and opacity (#placement). The first
+  // filter of a list is innermost: its result is the next one's SourceGraphic.
+  let mut f = filtered.programs.length()
+  while f > 0 {
+    f = f - 1
+    run nodes.append(
+      ResolvedNode.BeginFilter {
+        filter: filtered.programs.asSlice()[f],
+        transform: matrix.*,
+        clip: inheritedClip,
       },
     )
   }
@@ -3759,6 +3875,10 @@ effect fn paintPrepared(
       )
       child = state.plans.asSlice()[next].nextSibling
     }
+  }
+  while f < filtered.programs.length() {
+    run nodes.append(ResolvedNode.EndFilter)
+    f = f + 1
   }
   if let Option<usize>.Some { value } = &clipping {
     run nodes.append(ResolvedNode.ApplyClip { index: value })
@@ -3931,6 +4051,7 @@ effect fn resolveStyled(
     clipNodes: List<ClipNode>.make(),
     activeClips: List<usize>.make(),
     activeMasks: List<usize>.make(),
+    filters: List<FilterProgram>.make(),
     resourceAncestry: usize.MAX,
     ancestryKeys: HashMap<ReferenceKey, usize>.make(Hash.seed(0)),
     ancestryCount: 0,
@@ -4040,6 +4161,7 @@ effect fn resolveStyled(
     strokeSpaces: move state.strokeSpaces,
     projectionClips: move projectionClips,
     clipNodes: move state.clipNodes,
+    filters: move state.filters,
   }
 }
 
