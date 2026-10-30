@@ -217,12 +217,48 @@ effect fn fetch(
   results: &List<Output>,
   source: &Output,
   alpha: &Output,
+  images: &[Pixmap],
+  backdrop: &List<Output>,
   input: Input,
   linear: bool,
 ) -> Output
   ! OutOfMemoryError
   ? &mut Allocator {
   return match input {
+    Input.Image { index } => {
+      let mut pixels = run Pixmap.make(source.pixels.width(), source.pixels.height())
+      if index < images.length {
+        filters.copy(&mut pixels, &images[index], source.region)
+      }
+      if linear {
+        filters.toLinear(&mut pixels)
+      }
+      Output { pixels: move pixels, region: source.region, linear: linear }
+    }
+    Input.Background { alpha: only } => {
+      let at: usize = if only {
+        1
+      } else {
+        0
+      }
+      if at < backdrop.length() {
+        let from = &backdrop.asSlice()[at]
+        run converted(
+          from,
+          if only {
+            from.linear
+          } else {
+            linear
+          },
+        )
+      } else {
+        Output {
+          pixels: run Pixmap.make(source.pixels.width(), source.pixels.height()),
+          region: Region.make(0, 0, 0, 0),
+          linear: linear,
+        }
+      }
+    }
     Input.SourceGraphic => run converted(source, linear)
 
     // Alpha alone is the same in either color space.
@@ -303,6 +339,8 @@ fn spaceOf(results: &List<Output>, input: Input, linear: bool) -> bool {
     Input.SourceGraphic => false
     Input.SourceAlpha => false
     Input.Result { index } => results.asSlice()[index].linear
+    Input.Image { index } => false
+    Input.Background { alpha } => false
     Input.Transparent => linear
   }
 }
@@ -408,9 +446,11 @@ fn lightColor(color: Rgba, linear: bool) -> Rgba8 {
   )
 }
 
-fn validInput(input: Input, before: usize) -> bool {
+fn validInput(input: Input, before: usize, program: &Program) -> bool {
   return match input {
     Input.Result { index } => index < before
+    Input.Image { index } => index < program.images
+    Input.Background { alpha } => program.background
     _ => true
   }
 }
@@ -473,8 +513,8 @@ pub fn valid(program: &Program) -> bool {
   let mut p: usize = 0
   while p < primitives.length {
     let primitive = primitives[p]
-    if !primitive.subregion.isValid() || !validInput(primitive.input, p)
-      || !validInput(primitive.input2, p) {
+    if !primitive.subregion.isValid() || !validInput(primitive.input, p, program)
+      || !validInput(primitive.input2, p, program) {
       return false
     }
     let ok = match primitive.operation {
@@ -482,7 +522,7 @@ pub fn valid(program: &Program) -> bool {
         let mut fine = validRange(first, count, inputs.length)
         let mut i: usize = 0
         while fine && i < count {
-          fine = validInput(inputs[first + i], p)
+          fine = validInput(inputs[first + i], p, program)
           i = i + 1
         }
         fine
@@ -548,8 +588,9 @@ pub fn valid(program: &Program) -> bool {
 
 /// Runs `program` on `source`, the filtered element's rendering on a surface whose
 /// pixels relate to user space through `space`; `images` are the program's image layers
-/// rendered on the same surface, sRGB. The result has the source's size and is sRGB,
-/// transparent outside the filter region.
+/// rendered on the same surface, sRGB, followed by the backdrop when `program.background`
+/// is set. The result has the source's size and is sRGB, transparent outside the filter
+/// region.
 pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space: Space) -> Pixmap
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -562,6 +603,16 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
   filters.copy(&mut clipped, source, whole)
   let alpha = Output { pixels: run alphaOf(&clipped), region: whole, linear: false }
   let graphic = Output { pixels: move clipped, region: whole, linear: false }
+
+  // #attr-valuedef-in-backgroundimage, clipped to the filter region like the source.
+  let mut backdrop = List<Output>.make()
+  if program.background && program.images < images.length {
+    let mut seen = run Pixmap.make(width, height)
+    filters.copy(&mut seen, &images[program.images], whole)
+    let shade = Output { pixels: run alphaOf(&seen), region: whole, linear: false }
+    run backdrop.append(Output { pixels: move seen, region: whole, linear: false })
+    run backdrop.append(move shade)
+  }
   let mut results = List<Output>.make()
   let numbers = program.numbers.asSlice()
   let primitives = program.primitives.asSlice()
@@ -579,37 +630,45 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
     if region.x1 > region.x0 && region.y1 > region.y0 {
       match primitive.operation {
         Operation.Copy => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           filters.copy(&mut out, &a.pixels, region)
         }
         Operation.Flood { color } => {
           run flood(&mut out, color, linear, region)
         }
         Operation.Offset { dx, dy } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           filters.offset(&mut out, &a.pixels, pixels(dx * space.sx), pixels(dy * space.sy), region)
         }
         Operation.Blur { x, y } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           run blur(&mut out, &a.pixels, x, y, &space, whole, region)
         }
         Operation.Merge { first, count } => {
           let inputs = program.inputs.asSlice()
           let mut i: usize = 0
           while i < count {
-            let a = run fetch(&results, &graphic, &alpha, inputs[first + i], linear)
+            let a = run fetch(
+              &results,
+              &graphic,
+              &alpha,
+              images,
+              &backdrop,
+              inputs[first + i],
+              linear,
+            )
             filters.mergeOver(&mut out, &a.pixels, region)
             i = i + 1
           }
         }
         Operation.Blend { mode } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
-          let b = run fetch(&results, &graphic, &alpha, primitive.input2, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
+          let b = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input2, linear)
           filters.blend(&mut out, &a.pixels, &b.pixels, mode, region)
         }
         Operation.Composite { operator, k } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
-          let b = run fetch(&results, &graphic, &alpha, primitive.input2, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
+          let b = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input2, linear)
           filters.composite(
             &mut out,
             &a.pixels,
@@ -620,13 +679,13 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
           )
         }
         Operation.ColorMatrix { kind, first, count } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let values = run floats(numbers, first, count)
           let matrix = filters.colorMatrixOf(matrixCode(kind), values.asSlice())
           filters.colorMatrix(&mut out, &a.pixels, matrix, region)
         }
         Operation.ComponentTransfer { functions } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let transfer = ComponentTransfer {
             r: run table(functions[0], numbers),
             g: run table(functions[1], numbers),
@@ -636,7 +695,7 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
           filters.componentTransfer(&mut out, &a.pixels, &transfer, region)
         }
         Operation.Morphology { operator, x, y } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let mut shaped = run Pixmap.make(width, height)
           run filters.morphology(
             &mut shaped,
@@ -653,13 +712,13 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
           filters.copy(&mut out, &shaped, region)
         }
         Operation.Tile => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           filters.tile(&mut out, &a.pixels, a.region, region)
         }
         Operation.DropShadow { dx, dy, x, y, color } => {
           // #feDropShadowElement: blur the input's alpha, offset it, color it with the
           // flood, and merge the input over it.
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let shape = run alphaOf(&a.pixels)
           let mut blurred = run Pixmap.make(width, height)
           run blur(&mut blurred, &shape, x, y, &space, whole, whole)
@@ -713,7 +772,7 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
           edgeMode,
           preserveAlpha,
         } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let kernel = run floats(numbers, first, u32.toUsize(orderX) * u32.toUsize(orderY))
           let convolution = Convolution {
             kernel: kernel.asSlice(),
@@ -731,8 +790,16 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
         Operation.DisplacementMap { scale, x, y } => {
           // `in` stays in its own color space; only the map is converted.
           own = spaceOf(&results, primitive.input, linear)
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, own)
-          let map = run fetch(&results, &graphic, &alpha, primitive.input2, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, own)
+          let map = run fetch(
+            &results,
+            &graphic,
+            &alpha,
+            images,
+            &backdrop,
+            primitive.input2,
+            linear,
+          )
           let tables = [
             filters.displacementTable(f64.toF32(scale[0] * space.sx)),
             filters.displacementTable(f64.toF32(scale[1] * space.sy)),
@@ -754,7 +821,7 @@ pub effect fn apply(program: &Program, source: &Pixmap, images: &[Pixmap], space
           }
         }
         Operation.Lighting { specular, surfaceScale, constant, exponent, color, light } => {
-          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, images, &backdrop, primitive.input, linear)
           let lighting = Lighting {
             specular: specular,
             surfaceScale: f64.toF32(surfaceScale),

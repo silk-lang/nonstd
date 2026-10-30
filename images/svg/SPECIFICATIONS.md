@@ -500,7 +500,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 ### 5.10 Filters (Filter Effects 1, 1.1 ch. 15)
 - [x] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
 - [x] `filter` property with `url()` and the filter functions (`blur`, `brightness`, `contrast`, `drop-shadow`, `grayscale`, `hue-rotate`, `invert`, `opacity`, `saturate`, `sepia`) and filter lists
-- [ ] Inputs: `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
+- [ ] Inputs (all but `enable-background` done): `SourceGraphic`, `SourceAlpha`, `BackgroundImage`/`BackgroundAlpha` (isolation groups per FE1 and `enable-background` per FE1 App. A), `FillPaint`, `StrokePaint`, named results, forward/missing references
 - [ ] Every primitive: `feBlend` (incl. `no-composite`), `feColorMatrix`, `feComponentTransfer` (+ `feFuncR/G/B/A`), `feComposite` (incl. `arithmetic`), `feConvolveMatrix`, `feDiffuseLighting`, `feSpecularLighting`, `feDistantLight`, `fePointLight`, `feSpotLight`, `feDisplacementMap`, `feDropShadow`, `feFlood`, `feGaussianBlur` (incl. `edgeMode` and the box-blur approximation rule), `feImage` (element and image references), `feMerge`/`feMergeNode`, `feMorphology`, `feOffset`, `feTile`, `feTurbulence` (the spec's reference code is normative; match it bit for bit)
 - [ ] `color-interpolation-filters`, `flood-color`/`flood-opacity`, `lighting-color` (all but `lighting-color` done)
 - [ ] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
@@ -649,8 +649,20 @@ decisions:
   differs. A reference back into the element being filtered is a cycle and draws
   transparent black, where Chrome draws the element unfiltered. A missing reference fills
   the subregion with transparent black, as FE1 says.
-- In this step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` read as
-  transparent black. They are still to be implemented in phase 8.
+- `BackgroundImage` follows FE1's main text: the backdrop of the current isolation group
+  behind the filter region when the filter runs, sampled at the filter surface's pixel
+  centers and clipped by the filter region like every input. Inside an isolated group
+  (including the one the filtered element's own opacity, blending or masking creates, as
+  those apply after the filter) it holds only what the group drew so far. `BackgroundAlpha`
+  is its alpha with black color. Chrome reads both as transparent black.
+- `enable-background` (FE1 Appendix A) is parsed but not used yet: BackgroundImage does not
+  restart at an `enable-background: new` ancestor.
+- `FillPaint` and `StrokePaint` are the filtered element's used fill or stroke paint with
+  `fill-opacity` or `stroke-opacity` over the whole filter region; paint servers keep the
+  element's bounding box and spread past it. The opacity follows FE1's subregion example,
+  where a circle with `fill-opacity="0.5"` makes the FillPaint rectangle translucent. On a
+  group the paint is the group's own `fill`/`stroke`. Chrome reads both as transparent
+  black.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),

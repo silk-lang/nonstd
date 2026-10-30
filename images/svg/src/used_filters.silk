@@ -313,16 +313,53 @@ struct Named {
 
 impl Copy for Named {}
 
+/// The image layers that hold `FillPaint` and `StrokePaint`, made when first named.
+struct Paints {
+  fill: Option<usize>,
+  stroke: Option<usize>,
+}
+
+impl Copy for Paints {}
+
+fn holds(slot: Option<usize>, index: usize) -> bool {
+  return match &slot {
+    Option<usize>.Some { value } => value == index
+    _ => false
+  }
+}
+
+fn layer(slot: &mut Option<usize>, program: &mut Program) -> Input {
+  if let Option<usize>.Some { value } = &slot.* {
+    return Input.Image { index: value }
+  }
+  let index = program.images
+  program.images = index + 1
+  slot.* = Option<usize>.some(index)
+  return Input.Image { index: index }
+}
+
 // https://www.w3.org/TR/filter-effects-1/#element-attrdef-filter-primitive-in
-fn named(graph: &Graph, entries: &[Entry], value: &[u8]) -> Named {
+fn named(
+  graph: &Graph,
+  entries: &[Entry],
+  program: &mut Program,
+  paints: &mut Paints,
+  value: &[u8],
+) -> Named {
   if equal(value, b"SourceGraphic") {
     return Named { input: Input.SourceGraphic, standard: true }
   } else if equal(value, b"SourceAlpha") {
     return Named { input: Input.SourceAlpha, standard: true }
-  } else if equal(value, b"BackgroundImage") || equal(value, b"BackgroundAlpha")
-    || equal(value, b"FillPaint")
-    || equal(value, b"StrokePaint") {
-    return Named { input: Input.Transparent, standard: true }
+  } else if equal(value, b"BackgroundImage") || equal(value, b"BackgroundAlpha") {
+    program.background = true
+    return Named {
+      input: Input.Background { alpha: equal(value, b"BackgroundAlpha") },
+      standard: true,
+    }
+  } else if equal(value, b"FillPaint") {
+    return Named { input: layer(&mut paints.fill, &mut program.*), standard: true }
+  } else if equal(value, b"StrokePaint") {
+    return Named { input: layer(&mut paints.stroke, &mut program.*), standard: true }
   }
 
   // The closest preceding primitive with that result; missing names act as unspecified.
@@ -534,6 +571,7 @@ effect fn primitive(
   node: OccurrenceId,
   entries: &[Entry],
   program: &mut Program,
+  paints: &mut Paints,
   units: &Units,
   limits: &Limits,
 ) -> Option<Primitive>
@@ -548,8 +586,20 @@ effect fn primitive(
   let name = Document.localName(document, element)
   let style = run styleOf(&styles.*, node)
   let engine = &mut styles.catalog.engine
-  let first = named(graph, entries, attribute(document, element, b"in"))
-  let second = named(graph, entries, attribute(document, element, b"in2"))
+  let first = named(
+    graph,
+    entries,
+    &mut program.*,
+    &mut paints.*,
+    attribute(document, element, b"in"),
+  )
+  let second = named(
+    graph,
+    entries,
+    &mut program.*,
+    &mut paints.*,
+    attribute(document, element, b"in2"),
+  )
   let mut defaults = Defaults.make()
   let mut input = first.input
   let mut input2 = Input.Transparent
@@ -592,6 +642,8 @@ effect fn primitive(
         let mergeName = named(
           graph,
           entries,
+          &mut program.*,
+          &mut paints.*,
           attribute(graph.sourceDocument(nodeSource), nodeSource.node, b"in"),
         )
         defaults.add(mergeName, entries)
@@ -1136,6 +1188,7 @@ pub effect fn resolve(
   let mut program = Program.make(region)
   program.resolution = resolution
   let mut entries = List<Entry>.make()
+  let mut paints = Paints { fill: Option<usize>.None, stroke: Option<usize>.None }
   let mut child = children(graph, node)
   while true {
     let next = match &child {
@@ -1145,31 +1198,53 @@ pub effect fn resolve(
       }
     }
     child = graph.occurrences.asSlice()[next.index].nextSibling
+    let before = program.images
     let found = run primitive(
       graph,
       &mut styles.*,
       next,
       entries.asSlice(),
       &mut program,
+      &mut paints,
       &units,
       limits,
     )
+
+    // One request per layer index, in order: paints as first named, then the feImage.
+    let mut index = before
+    while index < program.images {
+      let kind = if holds(paints.fill, index) {
+        LayerKind.Fill
+      } else if holds(paints.stroke, index) {
+        LayerKind.Stroke
+      } else {
+        LayerKind.Reference
+      }
+      let subregion = match &found {
+        Option<Primitive>.Some { value } => value.subregion
+        _ => region
+      }
+      run images.append(
+        FilterImage {
+          node: next,
+          kind: kind,
+          subregion: if kind == LayerKind.Reference {
+            subregion
+          } else {
+            region
+          },
+          objectBox: objectPrimitives,
+          bounds: bounds,
+        },
+      )
+      index = index + 1
+    }
     if let Option<Primitive>.Some { value } = &found {
       if entries.length() >= MAX_PRIMITIVES {
         fail RenderError.TooLarge
       }
       run entries.append(Entry { node: next, subregion: value.subregion })
       run program.primitives.append(value)
-      if let Operation.Image { index } = &value.operation {
-        run images.append(
-          FilterImage {
-            node: next,
-            subregion: value.subregion,
-            objectBox: objectPrimitives,
-            bounds: bounds,
-          },
-        )
-      }
     }
   }
   if program.primitives.length() == 0 {
@@ -1178,12 +1253,23 @@ pub effect fn resolve(
   return Option<Program>.some(move program)
 }
 
-/// An `feImage` layer for the caller to render, in the program's image order: the
+/// What an image layer holds.
+pub enum LayerKind {
+  /// An `feImage` rendering.
+  Reference,
+  /// #attr-valuedef-in-fillpaint: the filtered element's fill over the filter region.
+  Fill,
+  /// #attr-valuedef-in-strokepaint: its stroke over the filter region.
+  Stroke,
+}
+
+/// An image layer for the caller to render, in the program's image order: the
 /// `feImage` occurrence (its href's shadow, or its image asset), and its subregion in the
 /// filtered element's user space. With `objectBox`, the referenced element renders in
 /// `bounds`' units (#feImageElement: the user coordinate system follows primitiveUnits).
 pub struct FilterImage {
   pub node: OccurrenceId,
+  pub kind: LayerKind,
   pub subregion: Rect,
   pub objectBox: bool,
   pub bounds: Rect,
