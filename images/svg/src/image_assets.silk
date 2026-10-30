@@ -1,8 +1,9 @@
 //! Owned decoded image resources, shared by all occurrences of a source node.
 import structure { Graph, SourceId }
-import resources { Resolver, ResourceKind, ResourceError, Policy, fetchWithPolicy }
+import resources { Resolver, ResourceKind, ResourceError, Policy, Response, fetchWithPolicy }
 import url { Url, UrlError }
 import scene { RenderError }
+import used_images { NaturalSize }
 import svg_xml.xml { Document, NodeId }
 import svg_css.tokens { equal }
 import svg_image.image { Image, ImageError }
@@ -29,14 +30,34 @@ pub struct Asset {
   pub color: ColorMetadata
 }
 
+/// Encoded document response is shared; each image occurrence supplies its own
+/// viewport and secure style context. Transport metadata and redirect base survive.
+pub struct DocumentSource {
+  pub response: Response,
+  pub request: Url,
+  pub natural: Option<NaturalSize>,
+}
+
+union Loaded {
+  Raster { asset: Asset },
+  Document { source: DocumentSource },
+}
+
 pub struct Store {
   pub assets: List<Asset>,
+  pub documents: List<DocumentSource>,
+  documentIndices: List<List<usize>>,
   indices: List<List<usize>>,
 }
 
 impl Store {
   pub fn empty() -> Store {
-    return Store { assets: List<Asset>.make(), indices: List<List<usize>>.make() }
+    return Store {
+      assets: List<Asset>.make(),
+      documents: List<DocumentSource>.make(),
+      documentIndices: List<List<usize>>.make(),
+      indices: List<List<usize>>.make(),
+    }
   }
 
   pub fn find(self: &Self, source: SourceId) -> Option<usize> {
@@ -49,11 +70,23 @@ impl Store {
     }
     return Option<usize>.some(nodes[source.node.index])
   }
+
+  pub fn findDocument(self: &Self, source: SourceId) -> Option<usize> {
+    if source.document.index >= self.documentIndices.length() {
+      return Option<usize>.None
+    }
+    let nodes = self.documentIndices.asSlice()[source.document.index].asSlice()
+    if source.node.index >= nodes.length || nodes[source.node.index] == usize.MAX {
+      return Option<usize>.None
+    }
+    return Option<usize>.some(nodes[source.node.index])
+  }
 }
 
 struct Cached {
   url: Url,
-  asset: usize
+  asset: usize,
+  document: usize,
 }
 
 effect fn decode(data: &[u8]) -> Asset
@@ -76,7 +109,7 @@ effect fn decode(data: &[u8]) -> Asset
   fail PngError.Unsupported
 }
 
-effect fn fetched(url: &Url, policy: &Policy, remaining: &mut usize) -> Asset
+effect fn fetched(url: &Url, policy: &Policy, remaining: &mut usize) -> Loaded
   ! RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
   ? &mut Resolver | &mut Allocator {
   let response = run fetchWithPolicy(url, ResourceKind.Image, policy)
@@ -85,7 +118,21 @@ effect fn fetched(url: &Url, policy: &Policy, remaining: &mut usize) -> Asset
     fail RenderError.TooLarge
   }
   remaining.* = remaining.* - count
-  return run decode(Bytes.asSlice(&response.bytes))
+  let bytes = Bytes.asSlice(&response.bytes)
+  if (bytes.length >= 4 && bytes[0] == 137 && bytes[1] == 80 && bytes[2] == 78 && bytes[3] == 71)
+    || (bytes.length >= 2 && bytes[0] == 255 && bytes[1] == 216) {
+    return Loaded.Raster { asset: run decode(bytes) }
+  }
+
+  // Document validation and intrinsic styles need the renderer's host context.
+  // Unsupported/malformed responses remain non-rendering until that validation.
+  return Loaded.Document {
+    source: DocumentSource {
+      response: move response,
+      request: run url.clone(),
+      natural: Option<NaturalSize>.None,
+    },
+  }
 }
 
 /// Resource errors and unsupported/malformed images paint nothing. Allocator
@@ -104,9 +151,11 @@ pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
     let source = &graph.documents.asSlice()[documentIndex]
     let document = &source.document
     let mut indices = List<usize>.make()
+    let mut documentIndices = List<usize>.make()
     let mut n: usize = 0
     while n < Document.nodes(document).length {
       run indices.append(usize.MAX)
+      run documentIndices.append(usize.MAX)
       let node = NodeId { index: n }
       n = n + 1
       if !equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg")
@@ -152,6 +201,7 @@ pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
       while i < cache.length() {
         if equal(cache.asSlice()[i].url.bytes(), url.bytes()) {
           indices.set(node.index, cache.asSlice()[i].asset)
+          documentIndices.set(node.index, cache.asSlice()[i].document)
           found = true
           break
         }
@@ -169,35 +219,62 @@ pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
       urls = urls - url.bytes().length
       let decoded = run Effect.result(fetched(&url, &source.policy, &mut remaining))
       let mut index = usize.MAX
+      let mut documentIndex = usize.MAX
       match move decoded {
         Result<
-          Asset,
+          Loaded,
           RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
         >.Success {
-          value
+          value: loaded
         } => {
-          let count = u32.toUsize(value.image.width()) * u32.toUsize(value.image.height())
-          if count > maxPixels - pixels {
-            fail RenderError.TooLarge
+          match move loaded {
+            Loaded.Raster { asset: value } => {
+              let count = u32.toUsize(value.image.width()) * u32.toUsize(value.image.height())
+              if count > maxPixels - pixels {
+                fail RenderError.TooLarge
+              }
+              let profile = match &value.color {
+                ColorMetadata.Png { value: color } => Bytes.length(&color.iccProfile)
+                ColorMetadata.Jpeg { value: color } => Bytes.length(&color.iccProfile)
+              }
+              if count > retained / 4 {
+                fail RenderError.TooLarge
+              }
+              retained = retained - count * 4
+              if profile > retained {
+                fail RenderError.TooLarge
+              }
+              retained = retained - profile
+              pixels = pixels + count
+              index = store.assets.length()
+              run store.assets.append(move value)
+            }
+            Loaded.Document { source: value } => {
+              let byteCount = Bytes.length(&value.response.bytes)
+              if byteCount > retained {
+                fail RenderError.TooLarge
+              }
+              retained = retained - byteCount
+              let requestBytes = value.request.bytes().length
+              if requestBytes > retained {
+                fail RenderError.TooLarge
+              }
+              retained = retained - requestBytes
+              let redirectBytes = match &value.response.finalUrl {
+                Option<Url>.Some { value: url } => url.bytes().length
+                _ => 0
+              }
+              if redirectBytes > retained {
+                fail RenderError.TooLarge
+              }
+              retained = retained - redirectBytes
+              documentIndex = store.documents.length()
+              run store.documents.append(move value)
+            }
           }
-          let profile = match &value.color {
-            ColorMetadata.Png { value: color } => Bytes.length(&color.iccProfile)
-            ColorMetadata.Jpeg { value: color } => Bytes.length(&color.iccProfile)
-          }
-          if count > retained / 4 {
-            fail RenderError.TooLarge
-          }
-          retained = retained - count * 4
-          if profile > retained {
-            fail RenderError.TooLarge
-          }
-          retained = retained - profile
-          pixels = pixels + count
-          index = store.assets.length()
-          run store.assets.append(move value)
         }
         Result<
-          Asset,
+          Loaded,
           RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
         >.Failure {
           error
@@ -214,9 +291,11 @@ pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
         }
       }
       indices.set(node.index, index)
-      run cache.append(Cached { url: move url, asset: index })
+      documentIndices.set(node.index, documentIndex)
+      run cache.append(Cached { url: move url, asset: index, document: documentIndex })
     }
     run store.indices.append(move indices)
+    run store.documentIndices.append(move documentIndices)
     documentIndex = documentIndex + 1
   }
   return move store
