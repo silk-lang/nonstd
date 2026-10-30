@@ -86,7 +86,11 @@ class SuiteTests(unittest.TestCase):
         self.assertLessEqual(len(subset), 200)
         for case in subset:
             self.assertEqual(len(case["files"]), 2)
-            self.assertTrue(case["id"].startswith("shapes/"))
+            self.assertTrue(case["id"].startswith(("shapes/", "painting/mix-blend-mode/")))
+            self.assertEqual(
+                {entry["path"] for entry in case["files"]},
+                {f'crates/resvg/tests/tests/{case["id"]}.{extension}' for extension in ("svg", "png")},
+            )
         for suite in lock["suites"].values():
             self.assertRegex(suite["archive"]["sha256"], r"^[0-9a-f]{64}$")
 

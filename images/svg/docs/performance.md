@@ -66,3 +66,44 @@ destruction; end-to-end includes intermediate-tree destruction. Render includes
 a fresh zeroed pixmap in both engines. `--callgrind` on Linux separately records
 **full-process Ir**, including startup, setup, warmups, checksums and the untimed
 parse-result rasterization; it is not stage-only instruction accounting.
+
+## Phase 6 compositing A/B
+
+The compositing implementation at `548f98e` was measured against main `d243855` on the
+existing Ubuntu 24.04 arm64 VM, using Silk dev.31 and LLVM 22.1.8.
+Three wall samples use one iteration and no warmup. Separate Callgrind runs
+measure full render-process instructions, including untimed parsing and recording.
+The seven existing workloads retain identical old/new pixel checksums.
+
+| Workload | Before Ir | After Ir |
+| --- | ---: | ---: |
+| iconset | 385,448,176 | 385,772,656 |
+| tiger | 362,173,949 | 362,355,491 |
+| largemap | 680,584,639 | 681,387,988 |
+| mixedcurves | 358,436,563 | 358,731,712 |
+| stylesheets | 529,005,603 | 529,802,409 |
+| instances | 587,324,322 | 589,606,064 |
+| paintservers | 286,226,163 | 286,328,795 |
+
+The added `compositing` workload draws 64 nested opacity/isolation groups across
+all 16 blend modes. Its old/new checksums differ because the base renderer ignores
+blending and explicit isolation; its A/B ratio is therefore not a regression
+comparison for equivalent rendering. References for the new behavior are the
+19 exact-pixel cases in `tests/fixtures/compositing/manifest.json`.
+
+The same dev.31 binary was compared with resvg/usvg at the pinned revision
+`91455ee06d08ac2bfeab2b035ed2cfbfd0a68614`, using identical workloads and the same
+sampling settings. Ratios below are Silk/resvg median wall time. Pixel checksums
+match only for the stylesheet and instance workloads; the ratios do not establish
+conformance or performance parity.
+
+| Workload | Parse + record | Render | End to end |
+| --- | ---: | ---: | ---: |
+| iconset | 10.859× | 1.962× | 4.982× |
+| tiger | 5.885× | 1.994× | 2.424× |
+| largemap | 10.050× | 1.291× | 2.821× |
+| mixedcurves | 7.838× | 3.713× | 4.611× |
+| stylesheets | 0.571× | 0.528× | 0.588× |
+| instances | 11.255× | 0.331× | 3.903× |
+| paintservers | 6.572× | 2.780× | 3.091× |
+| compositing | 12.123× | 5.909× | 5.856× |
