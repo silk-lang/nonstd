@@ -11,6 +11,8 @@ import svg_css.tokens { Limits, CssError }
 import svg_css.tokens { TokenBuffer }
 import svg_css.value_cursor { Cursor }
 import svg_geometry.svg
+import svg_geometry.geometry { Path, Point, Segment, Transform }
+import svg_text.on_path { OnPath, Offset }
 import svg_xml.xml { Document, NodeId, NodeKind }
 import document_styles
 import silk.collections.bytes { Bytes }
@@ -262,7 +264,17 @@ enum Kind {
   Set,
   AnimateColor,
   AnimateTransform,
+  AnimateMotion,
 }
+
+/// animateMotion's rotate attribute (SVG Animations 2 #RotateAttribute).
+union Rotate {
+  Angle { pub value: f64 },
+  Auto,
+  AutoReverse,
+}
+
+impl Copy for Rotate {}
 
 enum TransformType {
   Translate,
@@ -313,6 +325,10 @@ struct Animation {
   additive: bool,
   accumulate: bool,
   transform: TransformType,
+  /// animateMotion's path data, from an mpath reference or the path attribute.
+  path: Option<Bytes>,
+  keyPoints: List<f64>,
+  rotate: Rotate,
   state: State,
   intervals: List<Interval>,
 }
@@ -1318,14 +1334,16 @@ fn kindOf(name: &[u8]) -> Option<Kind> {
   if equal(name, b"animateTransform") {
     return Option<Kind>.Some { value: Kind.AnimateTransform }
   }
+  if equal(name, b"animateMotion") {
+    return Option<Kind>.Some { value: Kind.AnimateMotion }
+  }
   return Option<Kind>.None
 }
 
 fn timed(document: &Document, node: NodeId) -> bool {
   return element(document, node)
     && equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg")
-    && (kindOf(Document.localName(document, node)).isSome()
-      || equal(Document.localName(document, node), b"animateMotion"))
+    && kindOf(Document.localName(document, node)).isSome()
 }
 
 // A non-negative clock value, `indefinite` as infinity, or nothing for absent or invalid.
@@ -1430,6 +1448,12 @@ effect fn collect(
   if kind == Kind.AnimateTransform && name.length == 0 {
     name = b"transform"
   }
+
+  // Motion is not an attribute: it is a supplemental transform, written in front of the
+  // target's transform once every motion animation is combined.
+  if kind == Kind.AnimateMotion {
+    name = b"animateMotion"
+  }
   if startsWith(name, b"xlink:") {
     namespace = b"http://www.w3.org/1999/xlink"
     name = view(name, 6, name.length)
@@ -1448,7 +1472,9 @@ effect fn collect(
   let typeText = text(document, node, b"attributeType")
   let property = namespace.length == 0
     && document_styles.presentationAttribute(Document.localName(document, target), name)
-  let css = if equal(typeText, b"XML") {
+  let css = if kind == Kind.AnimateMotion {
+    false
+  } else if equal(typeText, b"XML") {
     false
   } else if equal(typeText, b"CSS") {
     if !property {
@@ -1472,7 +1498,7 @@ effect fn collect(
   let calcText = text(document, node, b"calcMode")
   let calc = if kind == Kind.Set || equal(calcText, b"discrete") {
     Calc.Discrete
-  } else if equal(calcText, b"paced") {
+  } else if equal(calcText, b"paced") || kind == Kind.AnimateMotion && calcText.length == 0 {
     Calc.Paced
   } else if equal(calcText, b"spline") {
     Calc.Spline
@@ -1496,11 +1522,47 @@ effect fn collect(
     }
   }
 
+  // A motion path wins over values, from, to and by; its vertex count, or keyPoints,
+  // decides how many keyTimes it needs, checked once the path is measured.
+  let mut path = Option<Bytes>.None
+  let mut keyPoints = List<f64>.make()
+  let mut rotate = Rotate.Angle { value: 0.0 }
+  if kind == Kind.AnimateMotion {
+    path = run motionPath(document, node, ids)
+    if let Option<&[u8]>.Some { value } = attribute(document, node, b"keyPoints") {
+      if !run numberList(value, &mut keyPoints) {
+        return Option<Animation>.None
+      }
+      let points = keyPoints.asSlice()
+      let mut k: usize = 0
+      while k < points.length {
+        if points[k] < 0.0 || points[k] > 1.0 {
+          return Option<Animation>.None
+        }
+        k = k + 1
+      }
+    }
+    let rotateText = trim(text(document, node, b"rotate"))
+    if equal(rotateText, b"auto") {
+      rotate = Rotate.Auto
+    } else if equal(rotateText, b"auto-reverse") {
+      rotate = Rotate.AutoReverse
+    } else if rotateText.length > 0 {
+      rotate = match svg.number(rotateText) {
+        Option<f64>.Some { value } => Rotate.Angle { value: value }
+        _ => {
+          return Option<Animation>.None
+        }
+      }
+    }
+  }
+  let deferred = path.isSome() || keyPoints.length() > 0
+
   // Invalid keyTimes and keySplines disable the animation (SVG 1.1 #AnimationAttributesAndProperties).
   let count = values.length()
   let times = keyTimes.asSlice()
   if times.length > 0 && calc != Calc.Paced {
-    if count == 0 || times.length != count || times[0] != 0.0 {
+    if (!deferred && (count == 0 || times.length != count)) || times[0] != 0.0 {
       return Option<Animation>.None
     }
     let mut k: usize = 1
@@ -1514,7 +1576,7 @@ effect fn collect(
       return Option<Animation>.None
     }
   }
-  if calc == Calc.Spline {
+  if calc == Calc.Spline && !deferred {
     let segments = if count > 0 {
       count - 1
     } else {
@@ -1583,7 +1645,7 @@ effect fn collect(
   if kind == Kind.Set && to.isNone() {
     return Option<Animation>.None
   }
-  if count == 0 && to.isNone() && by.isNone() {
+  if count == 0 && to.isNone() && by.isNone() && path.isNone() {
     return Option<Animation>.None
   }
   return Option<Animation>.Some {
@@ -1623,6 +1685,9 @@ effect fn collect(
       additive: equal(text(document, node, b"additive"), b"sum"),
       accumulate: equal(text(document, node, b"accumulate"), b"sum"),
       transform: transform,
+      path: move path,
+      keyPoints: move keyPoints,
+      rotate: rotate,
       state: State.Pending,
       intervals: List<Interval>.make(),
     },
@@ -1735,6 +1800,278 @@ effect fn apply(animation: &Animation, sample: Sample, underlying: &Value) -> Op
   return Option<Value>.Some { value: move result }
 }
 
+// --- Motion along a path ----------------------------------------------------------------------
+
+// The path data of the first mpath child that names an element with `d`, else the path
+// attribute (SVG Animations 2 #MPathElement, #AnimateMotionElement).
+effect fn motionPath(document: &Document, node: NodeId, ids: &[Identified]) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut child = Document.firstChild(document, node)
+  while let Option<NodeId>.Some { value } = child {
+    if element(document, value)
+      && equal(Document.namespaceUri(document, value), b"http://www.w3.org/2000/svg")
+      && equal(Document.localName(document, value), b"mpath") {
+      let mut href = text(document, value, b"href")
+      if href.length == 0 {
+        href = match Document.attribute(document, value, b"http://www.w3.org/1999/xlink", b"href") {
+          Option<&[u8]>.Some { value: found } => trim(found)
+          _ => b""
+        }
+      }
+      if href.length > 1 && href[0] == 35 {
+        if let Option<NodeId>.Some { value: target } = findId(ids, view(href, 1, href.length)) {
+          if let Option<&[u8]>.Some { value: data } = attribute(document, target, b"d") {
+            return Option<Bytes>.Some { value: run Bytes.copy(data) }
+          }
+        }
+      }
+
+      // Only the first mpath child counts, even when its reference is unusable.
+      break
+    }
+    child = Document.nextSibling(document, value)
+  }
+  return match attribute(document, node, b"path") {
+    Option<&[u8]>.Some { value } => Option<Bytes>.Some { value: run Bytes.copy(value) }
+    _ => Option<Bytes>.None
+  }
+}
+
+// simpleValue for scalar values: discrete, linear or spline, on keyTimes or evenly.
+fn scalarAt(animation: &Animation, values: &[f64], progress: f64) -> f64 {
+  let count = values.length
+  let times = animation.keyTimes.asSlice()
+  if progress >= 1.0 {
+    return values[count - 1]
+  }
+  if animation.calc == Calc.Discrete || count == 1 {
+    let mut chosen: usize = 0
+    let mut k: usize = 0
+    while k < count {
+      let start = if times.length == count {
+        times[k]
+      } else {
+        usize.toF64(k) / usize.toF64(count)
+      }
+      if start <= progress {
+        chosen = k
+      }
+      k = k + 1
+    }
+    return values[chosen]
+  }
+  let mut segment: usize = 0
+  while segment + 2 < count && stop(times, count, segment + 1) <= progress {
+    segment = segment + 1
+  }
+  let first = stop(times, count, segment)
+  let width = stop(times, count, segment + 1) - first
+  let mut local = if width > 0.0 {
+    (progress - first) / width
+  } else {
+    1.0
+  }
+  if animation.calc == Calc.Spline {
+    let splines = animation.keySplines.asSlice()
+    local = spline(
+      splines[4 * segment],
+      splines[4 * segment + 1],
+      splines[4 * segment + 2],
+      splines[4 * segment + 3],
+      local,
+    )
+  }
+  return values[segment] + (values[segment + 1] - values[segment]) * local
+}
+
+fn stop(times: &[f64], count: usize, index: usize) -> f64 {
+  if times.length == count {
+    return times[index]
+  }
+  return usize.toF64(index) / usize.toF64(count - 1)
+}
+
+// A motion value: a translation, as a two-number value so it sums like any other.
+effect fn pair(x: f64, y: f64) -> Value
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pieces = List<Bytes>.make()
+  run pieces.append(Bytes.make())
+  run pieces.append(Bytes.make())
+  run pieces.append(Bytes.make())
+  let mut numbers = List<f64>.make()
+  run numbers.append(x)
+  run numbers.append(y)
+  return Value.Numbers { pieces: move pieces, numbers: move numbers }
+}
+
+fn coordinates(value: &Value) -> [f64; 2] {
+  if let Value.Numbers { pieces, numbers } = &value.* {
+    let list = numbers.asSlice()
+    if list.length >= 2 {
+      return [list[0], list[1]]
+    }
+    if list.length == 1 {
+      return [list[0], 0.0]
+    }
+  }
+  return [0.0, 0.0]
+}
+
+struct Motion {
+  value: Value,
+  angle: f64,
+}
+
+// Path lengths at each value of a motion path: the start, then the end of every segment
+// except moveto commands after the first (SVG 1.1 #AnimateMotionElement).
+effect fn vertices(path: &Path, out: &mut List<f64>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let segments = path.segments()
+  let mut prefix = Path.make()
+  let mut k: usize = 0
+  while k < segments.length {
+    let segment = segments[k]
+    drop run prefix.append(segment)
+    let counted = match segment {
+      Segment.MoveTo { to } => k == 0
+      _ => true
+    }
+    if counted {
+      if k == 0 {
+        run out.append(0.0)
+      } else {
+        let measured = run OnPath.make(
+          &prefix,
+          Transform.identity(),
+          false,
+          0,
+          0,
+          Offset.Length { value: 0.0 },
+          Option<f64>.None,
+        )
+        run out.append(measured.length)
+      }
+    }
+    k = k + 1
+  }
+}
+
+// One animateMotion's position and rotation on top of `underlying` (SVG Animations 2
+// #AnimateMotionElement): along its path or the polyline through its values.
+effect fn motionApply(animation: &Animation, sample: Sample, underlying: &Value) -> Option<Motion>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut path = Path.make()
+  let mut stops = List<f64>.make()
+  let mut toAnimation = false
+  match &animation.path {
+    Option<Bytes>.Some { value } => {
+      let parsed = run svg.parsePath(Bytes.asSlice(&value))
+      path = move parsed.path
+      run vertices(&path, &mut stops)
+    }
+    _ => {
+      let mut values = List<Value>.make()
+      toAnimation = run valueList(animation, underlying, &mut values)
+      let list = values.asSlice()
+      let mut total: f64 = 0.0
+      let mut previous = [0.0, 0.0]
+      let mut k: usize = 0
+      while k < list.length {
+        let point = coordinates(&list[k])
+        let at = Point.new(point[0], point[1])
+        if k == 0 {
+          drop run path.append(Segment.MoveTo { to: at })
+        } else {
+          drop run path.append(Segment.LineTo { to: at })
+          let dx = point[0] - previous[0]
+          let dy = point[1] - previous[1]
+          total = total + f64.sqrt(dx * dx + dy * dy)
+        }
+        run stops.append(total)
+        previous = point
+        k = k + 1
+      }
+    }
+  }
+  let count = stops.length()
+  if count == 0 {
+    return Option<Motion>.None
+  }
+  let points = animation.keyPoints.asSlice()
+  let times = animation.keyTimes.asSlice()
+  let keyed = points.length > 0 && animation.calc != Calc.Paced
+  let needed = if keyed {
+    points.length
+  } else {
+    count
+  }
+  if animation.calc != Calc.Paced
+    && (times.length > 0 && times.length != needed
+      || animation.calc == Calc.Spline && animation.keySplines.length() != 4 * (needed - 1)) {
+    return Option<Motion>.None
+  }
+  if keyed && times.length != points.length {
+    return Option<Motion>.None
+  }
+  let measured = run OnPath.make(
+    &path,
+    Transform.identity(),
+    false,
+    0,
+    0,
+    Offset.Length { value: 0.0 },
+    Option<f64>.None,
+  )
+  let length = measured.length
+  let distance = if keyed {
+    scalarAt(animation, points, sample.progress) * length
+  } else if animation.calc == Calc.Paced {
+    f64.min(sample.progress, 1.0) * length
+  } else {
+    scalarAt(animation, stops.asSlice(), sample.progress)
+  }
+  let mut x: f64 = 0.0
+  let mut y: f64 = 0.0
+  let mut tangent: f64 = 0.0
+  let mut endX: f64 = 0.0
+  let mut endY: f64 = 0.0
+  if measured.valid {
+    let frame = measured.at(f64.max(0.0, f64.min(distance, length)))
+    x = frame.point.x
+    y = frame.point.y
+    tangent = f64.atan2(frame.tangentY, frame.tangentX) * 180.0 / f64.PI
+    let end = measured.at(length)
+    endX = end.point.x
+    endY = end.point.y
+  } else if let Option<Point>.Some { value } = path.currentPoint() {
+    x = value.x
+    y = value.y
+    endX = x
+    endY = y
+  }
+  let mut result = run pair(x, y)
+  let byAnimation = animation.path.isNone() && animation.from.isNone() && animation.to.isNone()
+    && animation.by.isSome()
+    && animation.values.length() == 0
+  if animation.accumulate && !toAnimation && sample.iteration > 0.0 {
+    let last = run pair(endX, endY)
+    result = run combine(&last, &result, sample.iteration, true)
+  }
+  if (animation.additive || byAnimation) && !toAnimation {
+    result = run combine(underlying, &result, 1.0, true)
+  }
+  let angle = match animation.rotate {
+    Rotate.Angle { value } => value
+    Rotate.Auto => tangent
+    Rotate.AutoReverse => tangent + 180.0
+  }
+  return Option<Motion>.Some { value: Motion { value: move result, angle: angle } }
+}
+
 /// Applies every animation of `document` at `time` seconds after the document begins.
 pub effect fn sample(document: &mut Document, time: f64) -> ()
   ! OutOfMemoryError
@@ -1797,6 +2134,9 @@ pub effect fn sample(document: &mut Document, time: f64) -> ()
             additive: false,
             accumulate: false,
             transform: TransformType.Translate,
+            path: Option<Bytes>.None,
+            keyPoints: List<f64>.make(),
+            rotate: Rotate.Angle { value: 0.0 },
             state: State.Done,
             intervals: List<Interval>.make(),
           },
@@ -1849,14 +2189,29 @@ pub effect fn sample(document: &mut Document, time: f64) -> ()
       let first = &animations.asSlice()[list[k].animation]
       let base = run baseText(&document.*, first)
       let mut transformed = run Bytes.copy(Bytes.asSlice(&base))
-      let mut underlying = run parse(first, Bytes.asSlice(&base))
+      let mut underlying = if first.kind == Kind.AnimateMotion {
+        run pair(0.0, 0.0)
+      } else {
+        run parse(first, Bytes.asSlice(&base))
+      }
+      let mut angle: f64 = 0.0
       let mut m = k
       while m < list.length {
         let animation = &animations.asSlice()[list[m].animation]
         if !done.asSlice()[m] && sameTarget(first, animation) {
           let marks = done.asMutSlice()
           marks[m] = true
-          if animation.kind == Kind.AnimateTransform {
+          if animation.kind == Kind.AnimateMotion {
+            if let Option<Motion>.Some { value } = run motionApply(
+              animation,
+              list[m],
+              &underlying,
+            ) {
+              let motion = move value
+              underlying = move motion.value
+              angle = motion.angle
+            }
+          } else if animation.kind == Kind.AnimateTransform {
             let zeroed = run transformValue(animation.transform, &[])
             let start = if animation.transform == TransformType.Scale && animation.by.isNone() {
               run transformValue(animation.transform, &[1.0])
@@ -1882,6 +2237,15 @@ pub effect fn sample(document: &mut Document, time: f64) -> ()
       let mut out = Bytes.make()
       if first.kind == Kind.AnimateTransform {
         out = move transformed
+      } else if first.kind == Kind.AnimateMotion {
+        let offset = coordinates(&underlying)
+        run out.append(b"translate(")
+        run writeNumber(&mut out, offset[0])
+        run out.append(b" ")
+        run writeNumber(&mut out, offset[1])
+        run out.append(b") rotate(")
+        run writeNumber(&mut out, angle)
+        run out.append(b")")
       } else {
         run render(&underlying, &mut out)
       }
@@ -1902,9 +2266,52 @@ pub effect fn sample(document: &mut Document, time: f64) -> ()
     }
     k = k + 1
   }
+
+  // Motion goes in front of the target's transform, animated or not, so it moves the
+  // element in its parent's user space (SVG Animations 2 #AnimateMotionElement).
+  let entries = writes.asMutSlice()
+  k = 0
+  while k < entries.length {
+    if equal(Bytes.asSlice(&entries[k].name), b"animateMotion")
+      && Bytes.length(&entries[k].namespace) == 0 {
+      let mut transform = run Bytes.copy(Bytes.asSlice(&entries[k].value))
+      let mut found = false
+      let mut m: usize = 0
+      while m < entries.length {
+        if entries[m].target.index == entries[k].target.index
+          && Bytes.length(&entries[m].namespace) == 0
+          && equal(Bytes.asSlice(&entries[m].name), b"transform") {
+          run transform.append(b" ")
+          run transform.append(Bytes.asSlice(&entries[m].value))
+          entries[m].value = run Bytes.copy(Bytes.asSlice(&transform))
+          found = true
+        }
+        m = m + 1
+      }
+      if !found {
+        if let Option<&[u8]>.Some { value } = attribute(
+          &document.*,
+          entries[k].target,
+          b"transform",
+        ) {
+          run transform.append(b" ")
+          run transform.append(value)
+        }
+        entries[k].name = run Bytes.copy(b"transform")
+        entries[k].value = move transform
+      } else {
+        entries[k].name = Bytes.make()
+      }
+    }
+    k = k + 1
+  }
   let pending = writes.asSlice()
   k = 0
   while k < pending.length {
+    if Bytes.length(&pending[k].name) == 0 {
+      k = k + 1
+      continue
+    }
     run Document.setAttribute(
       &mut document.*,
       pending[k].target,
