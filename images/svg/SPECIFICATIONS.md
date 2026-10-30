@@ -698,3 +698,13 @@ allocation. Exceeding the limit fails with `TooLarge`. It does not silently
 substitute a different sampling algorithm. Original two-by-two color fixtures
 compare integer, fractional, anisotropic and downscaled cases against independently
 expanded PNGs under the same second-stage bilinear mapping, at zero tolerance.
+
+Coincident transformed image bounds can place both ends of a clipped edge within
+floating-point uncertainty of the same halfplane. Computing a crossing parameter
+from those signs magnifies a tiny positional error along the whole edge. After
+finite viewport clipping, the vector backend instead snaps such a vertex to the
+actual plane only when the displacement and retained error fit one eighth of the
+existing geometric tolerance. It charges the displacement to the vertex's error
+bound. Horizon clipping retains its original handling; high-uncertainty vertices
+still fail. A fractional translated 90-degree image and a vector-level rectangle
+area test exercise this case without relaxing pixel comparisons.
