@@ -478,7 +478,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
-- [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
+- [x] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
@@ -885,6 +885,26 @@ decisions:
   (CSS Inline 3). The first baseline is at the first `y`, and each next one lies lower by
   the previous line's bottom minus the new line's top. Bidi levels are resolved per line
   rather than per paragraph.
+- Vertical text (CSS Writing Modes 3 #vertical-layout): the `text` element's `writing-mode`
+  (`vertical-rl`, `vertical-lr`, and the SVG 1.1 `tb`/`tb-rl` mapped to `vertical-rl`) lays
+  the text out as horizontal text in a frame turned a quarter clockwise. The inline axis
+  runs down, `y` and `dy` position along it and `x` and `dx` across it. Characters are set
+  upright or sideways by `text-orientation`; for `mixed` this uses their UAX #50
+  orientation per grapheme cluster (`ucd.vertical`). Upright runs are shaped top to bottom,
+  which applies `vert` and the font's vertical advances and origins (HarfBuzz's fallbacks
+  without `vmtx`). Sideways runs are shaped as horizontal text, including bidi, and turned
+  90° clockwise. Tu and Tr characters rely on `vert` for their transformed forms.
+- The text position is on the central baseline: `dominant-baseline: auto` resolves to
+  `central` in vertical text, also for sideways text as #DominantBaselineProperty asks.
+  Upright glyphs are centred on their span's central baseline. `text-anchor: start` is the
+  top whatever `direction` says (#TextAnchoringProperties). Wrapped vertical lines stack
+  leftward (`vertical-rl`) or rightward (`vertical-lr`); their inline boxes are centred on
+  the central baseline, except for `text-orientation: sideways`.
+- `glyph-orientation-vertical` aliases `text-orientation` (§11.10.1.3): `0deg` is upright
+  and `90deg` sideways. The two are separate properties in our cascade, so a value other
+  than `auto` wins over `text-orientation`. `glyph-orientation-horizontal` was removed in
+  SVG 2 and is ignored. Not done yet: `text-combine-upright`, the `sideways-*` writing
+  modes of Writing Modes 4, and vertical text on a path, which is laid out horizontally.
 - `x`, `y`, `dx`, `dy` and `rotate` are lists of CSS lengths, percentages or numbers
   separated by white space or commas. Percentages resolve against the viewport width
   (`x`, `dx`) or height (`y`, `dy`). An invalid list is ignored as a whole. Lists count
