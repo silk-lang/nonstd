@@ -474,7 +474,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
-- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size` (done), `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
+- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
@@ -885,6 +885,24 @@ decisions:
   (CSS Inline 3). The first baseline is at the first `y`, and each next one lies lower by
   the previous line's bottom minus the new line's top. Bidi levels are resolved per line
   rather than per paragraph.
+- `shape-inside` and `shape-subtract` follow the SVG 2 Editor's Draft (#TextShapeInside,
+  #TextShapeSubtract); the 2018 Candidate Recommendation drops them. A list of shapes other
+  than `auto` sets the content area instead of `inline-size`, for horizontal text off a
+  path. Basic shapes (`circle()`, `ellipse()`, `polygon()`) resolve against the viewport.
+  A `url()` names an SVG shape element in its geometry and own transform; a reference to
+  anything else is ignored, and so are box values. Shapes become polygons (curves as 64
+  chords) filled nonzero, or by `polygon()`'s fill rule.
+- Lines fill the first shape from its top. Every line is as tall as the text element's
+  strut line box (CSS 2.1 #line-height), and taller inline boxes do not grow it yet. A
+  line's band takes, left to right, the spans of x that lie inside the shape and outside
+  every subtracted shape for the band's whole height (#TextLayoutAutoNotes "broken lines").
+  A span that cannot hold the next word is skipped. A band that holds nothing moves down
+  a pixel, following CSS Shapes' model of a shape's edge as pixel floats. Each part of a
+  line is an anchored chunk. §11.5 fixes `text-align` at its initial value, so
+  `text-anchor` aligns each part at its span's start, middle or end. Text that overflows
+  one shape continues in the next; what is left after the last is not rendered.
+  Not done yet: `shape-padding`, `shape-margin`, `shape-image-threshold` and image
+  shapes, and vertical text in shapes.
 - Vertical text (CSS Writing Modes 3 #vertical-layout): the `text` element's `writing-mode`
   (`vertical-rl`, `vertical-lr`, and the SVG 1.1 `tb`/`tb-rl` mapped to `vertical-rl`) lays
   the text out as horizontal text in a frame turned a quarter clockwise. The inline axis
