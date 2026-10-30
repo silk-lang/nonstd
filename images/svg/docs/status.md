@@ -84,7 +84,7 @@ references, and `feFlood`, `feOffset`, `feGaussianBlur`, `feMerge`, `feBlend`,
 with image resources, SVG documents and element references, the `BackgroundImage`,
 `BackgroundAlpha`, `FillPaint` and `StrokePaint` inputs, in sRGB or
 linearRGB, also under rotation and skew; the CSS filter functions; `href` templates and
-SVG 1.1 `filterRes`. 138 reftests in `tests/fixtures/filters` compare them with equivalent
+SVG 1.1 `filterRes`, `feBlend`'s `no-composite` and `kernelUnitLength`. 151 reftests in `tests/fixtures/filters` compare them with equivalent
 shapes, spec expansions, markup equivalents or, for turbulence, images of the reference
 code's output. `enable-background: new` with its optional region is honoured as
 FE1 Appendix A allows.

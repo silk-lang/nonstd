@@ -117,3 +117,30 @@ fn blend(b: vec4u, s: vec4u, mode: u32) -> vec4u {
   let o = sc * (1.0 - ba) + bc * (1.0 - sa) + k * r;
   return vec4u(toByte(o.x), toByte(o.y), toByte(o.z), toByte(sa + ba * (1.0 - sa)));
 }
+
+// Blending without compositing (feBlend no-composite): `s` mixed with B(Cb, Cs), keeping
+// its alpha; vector.layer mixPixel.
+fn mixed(b: vec4u, s: vec4u, mode: u32) -> vec4u {
+  if mode == NORMAL || s.w == 0u { return s; }
+  let sa = f32(s.w) / 255.0;
+  let ba = f32(b.w) / 255.0;
+  let sc = vec3f(f32(s.x) / 255.0, f32(s.y) / 255.0, f32(s.z) / 255.0);
+  let bc = vec3f(f32(b.x) / 255.0, f32(b.y) / 255.0, f32(b.z) / 255.0);
+  let cs = sc / sa;
+  var cb = vec3f(0.0);
+  if ba > 0.0 { cb = bc / ba; }
+  var r = vec3f(0.0);
+  if mode == HUE {
+    r = setLum(setSat(cs, sat(cb)), lum(cb));
+  } else if mode == SATURATION {
+    r = setLum(setSat(cb, sat(cs)), lum(cb));
+  } else if mode == COLOR {
+    r = setLum(cs, lum(cb));
+  } else if mode > COLOR {
+    r = setLum(cb, lum(cs));
+  } else {
+    r = vec3f(separable(cb.x, cs.x, mode), separable(cb.y, cs.y, mode), separable(cb.z, cs.z, mode));
+  }
+  let o = sc * (1.0 - ba) + sa * ba * r;
+  return vec4u(toByte(o.x), toByte(o.y), toByte(o.z), s.w);
+}
