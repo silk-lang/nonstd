@@ -482,7 +482,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
-- [ ] 1.1 only: `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
+- [ ] 1.1 only: `tref` (done), `altGlyph` family (falls back to its content until SVG fonts land), SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
 - [ ] `a` inside text (§16.2)
 
 ### 5.8 Embedded content (§12)
@@ -903,6 +903,12 @@ decisions:
   one shape continues in the next; what is left after the last is not rendered.
   Not done yet: `shape-padding`, `shape-margin`, `shape-image-threshold` and image
   shapes, and vertical text in shapes.
+- `tref` (SVG 1.1 #TRefElement) takes the character data of the same-document element its
+  `href` or `xlink:href` names, markup removed, and treats it as its own text with its own
+  style, white space and positioning attributes, including `textLength`. Its own children
+  add nothing, and an unresolved reference adds no characters. `altGlyph` renders its
+  content like a `tspan` when its glyphs cannot be found (SVG 1.1 #AltGlyphElement), which
+  is always the case until SVG fonts are implemented.
 - Vertical text (CSS Writing Modes 3 #vertical-layout): the `text` element's `writing-mode`
   (`vertical-rl`, `vertical-lr`, and the SVG 1.1 `tb`/`tb-rl` mapped to `vertical-rl`) lays
   the text out as horizontal text in a frame turned a quarter clockwise. The inline axis
