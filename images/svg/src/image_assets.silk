@@ -13,6 +13,9 @@ import svg_image.png
 import svg_image.jpeg { JpegError, Metadata as JpegMetadata }
 import svg_image.jpeg
 import silk.collections.list { List }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.core.ownership { Copy }
 import silk.collections.bytes { Bytes }
 import silk.core.option { Option }
 import silk.core.result { Result }
@@ -49,12 +52,58 @@ union Loaded {
   Document { source: DocumentSource },
 }
 
+/// A CSS mask layer image (CSS Masking 1 #the-mask-image) by occurrence and layer.
+pub struct LayerRequest {
+  pub occurrence: usize,
+  pub layer: usize,
+  pub url: Url,
+  pub policy: Policy,
+}
+
+struct LayerKey {
+  occurrence: usize,
+  layer: usize
+}
+
+impl Copy for LayerKey {}
+
+impl HashKey for LayerKey {
+  fn equals(a: &Self, b: &Self) -> bool {
+    return a.occurrence == b.occurrence && a.layer == b.layer
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    return Hash.combine(Hash.mix(seed, usize.toU64(value.occurrence)), usize.toU64(value.layer))
+  }
+}
+
+/// A loaded layer image: a decoded raster asset or an SVG document source.
+pub union LayerSource {
+  Raster { pub asset: usize },
+  Document { pub document: usize },
+}
+
+impl Copy for LayerSource {}
+
+/// Byte, pixel and request budgets shared by every load into one store.
+struct Budget {
+  pixels: usize,
+  remaining: usize,
+  retained: usize,
+  urls: usize,
+}
+
+impl Copy for Budget {}
+
 pub struct Store {
   pub retainedBytes: usize,
   pub assets: List<Asset>,
   pub documents: List<DocumentSource>,
   documentIndices: List<List<usize>>,
   indices: List<List<usize>>,
+  layers: HashMap<LayerKey, LayerSource>,
+  cache: List<Cached>,
+  budget: Option<Budget>,
 }
 
 impl Store {
@@ -65,7 +114,14 @@ impl Store {
       documents: List<DocumentSource>.make(),
       documentIndices: List<List<usize>>.make(),
       indices: List<List<usize>>.make(),
+      layers: HashMap<LayerKey, LayerSource>.make(Hash.seed(0)),
+      cache: List<Cached>.make(),
+      budget: Option<Budget>.None,
     }
+  }
+
+  pub fn findLayer(self: &Self, occurrence: usize, layer: usize) -> Option<LayerSource> {
+    return self.layers.get(LayerKey { occurrence: occurrence, layer: layer })
   }
 
   pub fn find(self: &Self, source: SourceId) -> Option<usize> {
@@ -149,11 +205,14 @@ pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
   ! RenderError | OutOfMemoryError
   ? &mut Resolver | &mut Allocator {
   let mut store = Store.empty()
-  let mut cache = List<Cached>.make()
-  let mut pixels: usize = 0
-  let mut remaining = graph.limits.maxTotalBytes
-  let mut retained = graph.limits.maxTotalBytes
-  let mut urls = graph.limits.maxUrlBytes
+  store.budget = Option<Budget>.some(
+    Budget {
+      pixels: 0,
+      remaining: graph.limits.maxTotalBytes,
+      retained: graph.limits.maxTotalBytes,
+      urls: graph.limits.maxUrlBytes,
+    },
+  )
   let mut documentIndex: usize = 0
   while documentIndex < graph.documents.length() {
     let source = &graph.documents.asSlice()[documentIndex]
@@ -198,130 +257,196 @@ pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
           continue
         }
       }
-
-      // Secure authorization precedes cache lookup, so an unrestricted earlier
-      // document cannot lend a forbidden image to a secure document.
-      if source.policy.mode.isSecure() && !equal(url.scheme(), b"data") {
-        continue
-      }
-      let mut found = false
-      let mut i: usize = 0
-      while i < cache.length() {
-        if equal(cache.asSlice()[i].url.bytes(), url.bytes()) {
-          indices.set(node.index, cache.asSlice()[i].asset)
-          documentIndices.set(node.index, cache.asSlice()[i].document)
-          found = true
-          break
-        }
-        i = i + 1
-      }
-      if found {
-        continue
-      }
-      if cache.length() >= graph.limits.maxRequests {
-        fail RenderError.TooLarge
-      }
-      if url.bytes().length > urls {
-        fail RenderError.TooLarge
-      }
-      urls = urls - url.bytes().length
-      let decoded = run Effect.result(fetched(&url, &source.policy, &mut remaining))
-      let mut index = usize.MAX
-      let mut documentIndex = usize.MAX
-      match move decoded {
-        Result<
-          Loaded,
-          RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
-        >.Success {
-          value: loaded
-        } => {
-          match move loaded {
-            Loaded.Raster { asset: value } => {
-              let count = u32.toUsize(value.image.width()) * u32.toUsize(value.image.height())
-              if count > maxPixels - pixels {
-                fail RenderError.TooLarge
-              }
-              let profile = match &value.color {
-                ColorMetadata.Png { value: color } => Bytes.length(&color.iccProfile)
-                ColorMetadata.Jpeg { value: color } => Bytes.length(&color.iccProfile)
-              }
-              if count > retained / 4 {
-                fail RenderError.TooLarge
-              }
-              retained = retained - count * 4
-              if profile > retained {
-                fail RenderError.TooLarge
-              }
-              retained = retained - profile
-              pixels = pixels + count
-              index = store.assets.length()
-              run store.assets.append(move value)
-            }
-            Loaded.Document { source: value } => {
-              let byteCount = Bytes.length(&value.response.bytes)
-              if byteCount > retained {
-                fail RenderError.TooLarge
-              }
-              retained = retained - byteCount
-              let requestBytes = value.request.bytes().length
-              if requestBytes > retained {
-                fail RenderError.TooLarge
-              }
-              retained = retained - requestBytes
-              let redirectBytes = match &value.response.finalUrl {
-                Option<Url>.Some { value: redirect } => redirect.bytes().length
-                _ => 0
-              }
-              if redirectBytes > retained {
-                fail RenderError.TooLarge
-              }
-              retained = retained - redirectBytes
-              let mimeBytes = match &value.response.mediaType {
-                Option<Bytes>.Some { value: mime } => Bytes.length(&mime)
-                _ => 0
-              }
-              if mimeBytes > retained {
-                fail RenderError.TooLarge
-              }
-              retained = retained - mimeBytes
-              let charsetBytes = match &value.response.charset {
-                Option<Bytes>.Some { value: charset } => Bytes.length(&charset)
-                _ => 0
-              }
-              if charsetBytes > retained {
-                fail RenderError.TooLarge
-              }
-              retained = retained - charsetBytes
-              documentIndex = store.documents.length()
-              run store.documents.append(move value)
-            }
-          }
-        }
-        Result<
-          Loaded,
-          RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
-        >.Failure {
-          error
-        } => {
-          match &error {
-            RenderError value => {
-              fail value
-            }
-            OutOfMemoryError value => {
-              fail OutOfMemoryError {}
-            }
-            _ => {}
-          }
-        }
-      }
-      indices.set(node.index, index)
-      documentIndices.set(node.index, documentIndex)
-      run cache.append(Cached { url: move url, asset: index, document: documentIndex })
+      let found = run obtain(&mut store, graph, move url, &source.policy, maxPixels)
+      indices.set(node.index, found.asset)
+      documentIndices.set(node.index, found.document)
     }
     run store.indices.append(move indices)
     run store.documentIndices.append(move documentIndices)
     documentIndex = documentIndex + 1
   }
-  store.retainedBytes = graph.limits.maxTotalBytes - retained
+  run settle(&mut store, graph)
   return move store
+}
+
+/// Loads CSS mask layer images into a store built by [`load`], under the same
+/// budgets and URL cache.
+pub effect fn loadLayers(
+  store: &mut Store,
+  graph: &Graph,
+  requests: List<LayerRequest>,
+  maxPixels: usize,
+) -> ()
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut pending = move requests
+  while pending.length() != 0 {
+    let request = pending.remove(0)
+    let found = run obtain(&mut store.*, graph, move request.url, &request.policy, maxPixels)
+    let key = LayerKey { occurrence: request.occurrence, layer: request.layer }
+    if found.asset != usize.MAX {
+      drop run store.layers.insert(key, LayerSource.Raster { asset: found.asset })
+    } else if found.document != usize.MAX {
+      drop run store.layers.insert(key, LayerSource.Document { document: found.document })
+    }
+  }
+  run settle(&mut store.*, graph)
+}
+
+effect fn settle(store: &mut Store, graph: &Graph) -> () {
+  if let Option<Budget>.Some { value } = &store.budget {
+    store.retainedBytes = graph.limits.maxTotalBytes - value.retained
+  }
+}
+
+struct Found {
+  asset: usize,
+  document: usize,
+}
+
+impl Copy for Found {}
+
+/// Fetches and retains one image URL, or reuses an earlier response for the same
+/// URL. Unavailable or undecodable images return usize.MAX indices.
+effect fn obtain(
+  store: &mut Store,
+  graph: &Graph,
+  url: Url,
+  policy: &Policy,
+  maxPixels: usize,
+) -> Found
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut budget = match &store.budget {
+    Option<Budget>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidGeometry
+    }
+  }
+  let found = run fetchInto(&mut store.*, graph, move url, policy, maxPixels, &mut budget)
+  store.budget = Option<Budget>.some(budget)
+  return found
+}
+
+effect fn fetchInto(
+  store: &mut Store,
+  graph: &Graph,
+  url: Url,
+  policy: &Policy,
+  maxPixels: usize,
+  budget: &mut Budget,
+) -> Found
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  // Secure authorization precedes cache lookup, so an unrestricted earlier
+  // document cannot lend a forbidden image to a secure document.
+  if policy.mode.isSecure() && !equal(url.scheme(), b"data") {
+    return Found { asset: usize.MAX, document: usize.MAX }
+  }
+  let mut i: usize = 0
+  while i < store.cache.length() {
+    let cached = &store.cache.asSlice()[i]
+    if equal(cached.url.bytes(), url.bytes()) {
+      return Found { asset: cached.asset, document: cached.document }
+    }
+    i = i + 1
+  }
+  if store.cache.length() >= graph.limits.maxRequests {
+    fail RenderError.TooLarge
+  }
+  if url.bytes().length > budget.urls {
+    fail RenderError.TooLarge
+  }
+  budget.urls = budget.urls - url.bytes().length
+  let decoded = run Effect.result(fetched(&url, policy, &mut budget.remaining))
+  let mut index = usize.MAX
+  let mut documentIndex = usize.MAX
+  match move decoded {
+    Result<
+      Loaded,
+      RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+    >.Success {
+      value: loaded
+    } => {
+      match move loaded {
+        Loaded.Raster { asset: value } => {
+          let count = u32.toUsize(value.image.width()) * u32.toUsize(value.image.height())
+          if count > maxPixels - budget.pixels {
+            fail RenderError.TooLarge
+          }
+          let profile = match &value.color {
+            ColorMetadata.Png { value: color } => Bytes.length(&color.iccProfile)
+            ColorMetadata.Jpeg { value: color } => Bytes.length(&color.iccProfile)
+          }
+          if count > budget.retained / 4 {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - count * 4
+          if profile > budget.retained {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - profile
+          budget.pixels = budget.pixels + count
+          index = store.assets.length()
+          run store.assets.append(move value)
+        }
+        Loaded.Document { source: value } => {
+          let byteCount = Bytes.length(&value.response.bytes)
+          if byteCount > budget.retained {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - byteCount
+          let requestBytes = value.request.bytes().length
+          if requestBytes > budget.retained {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - requestBytes
+          let redirectBytes = match &value.response.finalUrl {
+            Option<Url>.Some { value: redirect } => redirect.bytes().length
+            _ => 0
+          }
+          if redirectBytes > budget.retained {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - redirectBytes
+          let mimeBytes = match &value.response.mediaType {
+            Option<Bytes>.Some { value: mime } => Bytes.length(&mime)
+            _ => 0
+          }
+          if mimeBytes > budget.retained {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - mimeBytes
+          let charsetBytes = match &value.response.charset {
+            Option<Bytes>.Some { value: charset } => Bytes.length(&charset)
+            _ => 0
+          }
+          if charsetBytes > budget.retained {
+            fail RenderError.TooLarge
+          }
+          budget.retained = budget.retained - charsetBytes
+          documentIndex = store.documents.length()
+          run store.documents.append(move value)
+        }
+      }
+    }
+    Result<
+      Loaded,
+      RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+    >.Failure {
+      error
+    } => {
+      match &error {
+        RenderError value => {
+          fail value
+        }
+        OutOfMemoryError value => {
+          fail OutOfMemoryError {}
+        }
+        _ => {}
+      }
+    }
+  }
+  run store.cache.append(Cached { url: move url, asset: index, document: documentIndex })
+  return Found { asset: index, document: documentIndex }
 }
