@@ -121,7 +121,8 @@ fitting; outer CSS does not enter the child. Equal sources and logical viewports
 share a retained picture, while different viewports compute separate media and
 percentage contexts. Child geometry, paints and clip planes execute under the
 full device mapping, including projective placement, without an intrinsic-size
-raster intermediate. CSS image masks still need integration; phase 7 is not complete.
+raster intermediate. SVG image orientation swaps intrinsic axes and the child
+viewport before composing the final rotation/flip, including ratio-only sizing. CSS image masks still need integration; phase 7 is not complete.
 
 The curated resvg set includes eight image cases with strict non-pass expectations.
 Six retain sampling/sample-conversion or transformed-edge differences; two reference

@@ -31,7 +31,8 @@ PNG and JPEG `<image>` elements now render with intrinsic sizing, aspect-ratio f
 CSS image orientation (including EXIF, quarter-turn rotation and flipping), opacity,
 affine/projective placement, and CSS nearest, smooth, or two-stage `pixelated`
 sampling. Nested SVG images render as independent secure documents with their own
-viewport and styles, retaining vector geometry through final placement.
+viewport and styles, apply CSS image orientation before sizing, and retain vector
+geometry through final placement.
 CSS image masks remain in progress. Filters, text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example
