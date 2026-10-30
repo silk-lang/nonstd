@@ -46,6 +46,13 @@ order, linear-RGB compositing and calibrated dashes. Nanounit geometry magnified
 by a billion retains dash placement; signed-zero and unrepresentable period
 arithmetic have dedicated regression coverage. No existing expectation was relaxed.
 
+Phase 6 begins with typed blend modes retained through scene recording and CPU
+layer execution. Ordinary groups share their parent's backdrop; explicit
+isolation, non-normal blending, opacity and specified 3D transforms establish
+isolated surfaces. The compositing manifest checks all 16 blend functions against
+literal colors calculated from the normative equations, plus group opacity,
+non-inheritance and 2D/3D isolation. No comparison tolerance is used.
+
 General clipping/masking, image decoding, filters, text, animation and ICC remain
 required later work, not exclusions from scope. `shape-rendering` controls current
 shape rasterization; computed image/text hints gain consumers in their own phases.
