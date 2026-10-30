@@ -3,7 +3,7 @@
 // editor's unsaved text is what gets analyzed and no silk.toml is needed next to it.
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -14,8 +14,10 @@ const silk = process.env.SILK ?? 'silk'
 
 async function scratchPackage(fileName, kind) {
   const hash = createHash('sha256').update(fileName).digest('hex').slice(0, 16)
-  const root = join(tmpdir(), 'silk-typescript', `${hash}-${kind}`)
+  let root = join(tmpdir(), 'silk-typescript', `${hash}-${kind}`)
   await mkdir(join(root, 'src'), { recursive: true })
+  // Silk reports canonical paths; on macOS the temporary directory is a symlink into /private.
+  root = await realpath(root)
   const library = kind === 'library' ? 'kind = "library"\n' : ''
   await writeFile(join(root, 'silk.toml'), `[package]\nname = "silk-ts-${kind}"\nversion = "0.1.0"\n${library}`)
   return root
@@ -95,9 +97,13 @@ export async function describe(fileName, content) {
     })
   }
   const functions = []
+  if (documented.status === 'rejected' && diagnostics.length === 0) {
+    throw new Error(`silk doc failed for ${fileName}: ${documented.reason.stderr || documented.reason.message}`)
+  }
   if (documented.status === 'fulfilled') {
     const doc = JSON.parse(await readFile(output, 'utf8'))
     const module = doc.modules.find((m) => m.sourcePath === source)
+    if (!module) throw new Error(`silk doc did not describe ${source} (modules: ${doc.modules.map((m) => m.sourcePath).join(', ')})`)
     const items = module?.items ?? []
     items.forEach((item, index) => {
       if (item.kind !== 'Function' || item.visibility !== 'Public') return
