@@ -81,11 +81,12 @@ references, and `feFlood`, `feOffset`, `feGaussianBlur`, `feMerge`, `feBlend`,
 `feComposite`, `feColorMatrix`, `feComponentTransfer`, `feMorphology`, `feTile`,
 `feDropShadow`, `feTurbulence`, `feConvolveMatrix`, `feDisplacementMap`,
 `feDiffuseLighting` and `feSpecularLighting` with the three light sources, `feImage`
-with image resources, SVG documents and element references, in sRGB or
+with image resources, SVG documents and element references, the `BackgroundImage`,
+`BackgroundAlpha`, `FillPaint` and `StrokePaint` inputs, in sRGB or
 linearRGB, also under rotation and skew; the CSS filter functions; `href` templates and
-SVG 1.1 `filterRes`. 126 reftests in `tests/fixtures/filters` compare them with equivalent
+SVG 1.1 `filterRes`. 135 reftests in `tests/fixtures/filters` compare them with equivalent
 shapes, spec expansions, markup equivalents or, for turbulence, images of the reference
-code's output. The background and paint inputs follow.
+code's output. `enable-background` is still to come.
 
 Text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current
