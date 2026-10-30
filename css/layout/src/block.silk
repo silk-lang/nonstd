@@ -9,7 +9,7 @@ import tree { NO_NODE }
 import box_tree { BoxTree, BoxKind }
 import axes { Axes }
 import context { Input, ResolvedBox, resolveBox, childrenInput, outOfFlow, establishesContext, selfCollapsingSize, blockContentOffset, blockInlineOffset, blockJustification, blockJustificationSafety, selfStartReversed, alignmentOffset }
-import engine { layoutNode, layoutNodeInPlace, layoutInFlow, probeNode }
+import engine { layoutNode, layoutNodeInPlace, probeRead, layoutInFlow, probeNode }
 import bfc { BfcState, FloatBox, Checkpoint }
 import layout_pass { LayoutPass, PassCheckpoint }
 import text { TextMeasure, TextError }
@@ -329,6 +329,9 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
   // Every path that reads childLayout lays the child out first, so one zeroed
   // value serves all children instead of zeroing 480 bytes per child.
   let mut childLayout = Layout.zero()
+  // Whether the child was a size probe read from the cache, which leaves its
+  // box unwritten: a probe's placement of its children is never read.
+  let mut cachedProbe = false
   while index < children.length() || ((lazy || streaming) && childId != NO_NODE) {
     if streaming {
       prepareChildInto(nodes, childId, &childBase, axes, &box, availableInline, false, &mut current)
@@ -348,6 +351,7 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
       current = children.get(index)
     }
     let item = &mut current
+    cachedProbe = false
     if fragmented && stopped && !item.parallel { index = index + 1
       continue }
     if fragmented && !item.parallel && item.id == endBefore {
@@ -557,6 +561,8 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
       if !item.parallel && !(leading && collapseTop) { y = cursor + joined.value() }
       y = max(y, clearMinimum)
       let mut placed = false
+      // The width x was computed for.
+      let mut placedWidth = item.width
       while !placed {
         // The item is this pass's own copy, so the attempt's placement is written into it
         // directly; a shrink-to-fit relayout below restores the container's origin.
@@ -573,12 +579,17 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
             childLayout = run layoutInFlow(nodes, &mut output, &mut measurer, item.id, &item.input, &mut bfc)
           }
         } else {
-          if independent {
+          if independent && !item.input.performLayout {
+            let index = run probeRead(nodes, &mut output, &mut measurer, item.id, &item.input)
+            readStored(&mut childLayout, output.probed(item.id, index))
+            cachedProbe = index != NO_NODE
+          } else if independent {
             run layoutNodeInPlace(nodes, &mut output, &mut measurer, item.id, &item.input)
+            readStored(&mut childLayout, &output.boxes[item.id])
           } else {
             drop run layoutInFlow(nodes, &mut output, &mut measurer, item.id, &item.input, &mut bfc)
+            readStored(&mut childLayout, &output.boxes[item.id])
           }
-          readStored(&mut childLayout, &output.boxes[item.id])
         }
         childLayout.size = axes.size(childLayout.size)
         if fragmented {
@@ -604,7 +615,9 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
         if item.parallel { nextY = 0.0 }
         else if !(leading && collapseTop) { nextY = cursor + joined.value() }
         nextY = max(nextY, clearMinimum)
-        let nextX = inlineOffset(childStyle, &item.input, &axes, style.usedDirection(), item.margin, childLayout.size.width, contentWidth)
+        // The offset depends on the child's width alone among what changed.
+        let mut nextX = x
+        if childLayout.size.width != placedWidth { nextX = inlineOffset(childStyle, &item.input, &axes, style.usedDirection(), item.margin, childLayout.size.width, contentWidth) }
         let moved = nextX != x || nextY != y
         if moved && ((fragmented && nextY != y) || (!independent && checkpoint.count != 0)) {
           // Fragment capacity changes with the collapsed block position even
@@ -617,6 +630,7 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
         }
         x = nextX
         y = nextY
+        placedWidth = childLayout.size.width
       }
       let mut hypotheticalY = cursor
       if !(leading && collapseTop) { hypotheticalY = cursor + joined.value() }
@@ -847,7 +861,7 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
     childLayout.size = axes.size(childLayout.size)
     // Unfragmented, the child's layout call already stored childLayout.
     if fragmented { run output.store(item.id, &childLayout, input.performLayout) }
-    else { run output.place(item.id, childLayout.location, childLayout.usedMargin, childLayout.hasClearance, input.performLayout) }
+    else if !cachedProbe { run output.place(item.id, childLayout.location, childLayout.usedMargin, childLayout.hasClearance, input.performLayout) }
     if fragmented {
       progressed = true
       let state = output.resumes.get(item.id)
