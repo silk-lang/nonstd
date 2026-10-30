@@ -36,7 +36,7 @@ sampling. Nested SVG images render as independent secure documents with their ow
 viewport and styles, apply CSS image orientation before sizing, and retain vector
 geometry through final placement.
 `filter` elements and the CSS filter functions render with their regions, subregions and
-most primitives; lighting, turbulence, convolution, displacement and `feImage` are still to come.
+every primitive but `feImage`, which is still to come along with the background and paint inputs.
 Text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example

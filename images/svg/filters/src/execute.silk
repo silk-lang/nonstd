@@ -10,11 +10,24 @@ import program {
   CompositeOperator,
   ColorMatrixKind,
   MorphologyOperator,
+  EdgeMode,
+  Channel,
+  LightSource,
   Rgba
 }
 import svg_geometry.geometry { Rect }
+import vector.geometry { Affine }
 import vector.pixmap { Pixmap, Rgba8 }
-import vector.filter { Region, BlurPlan, ComponentTransfer }
+import vector.filter {
+  Region,
+  BlurPlan,
+  ComponentTransfer,
+  Convolution,
+  Turbulence,
+  TurbulenceSettings,
+  Light,
+  Lighting
+}
 import vector.filter as filters
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
@@ -23,6 +36,8 @@ import silk.num.f64
 import silk.num.f32
 import silk.num.u32
 import silk.num.i32
+import silk.num.i64
+import silk.num.u8
 
 /// Maps user space to surface pixels: `x' = sx x + tx`, `y' = sy y + ty`, with positive scales.
 pub struct Space {
@@ -265,6 +280,134 @@ effect fn blur(
   filters.copy(&mut out, &blurred, region)
 }
 
+fn edgeCode(mode: EdgeMode) -> u8 {
+  return match mode {
+    EdgeMode.Duplicate => filters.EDGE_DUPLICATE
+    EdgeMode.Wrap => filters.EDGE_WRAP
+    EdgeMode.None => filters.EDGE_NONE
+  }
+}
+
+fn channelCode(channel: Channel) -> u8 {
+  return match channel {
+    Channel.R => filters.CHANNEL_R
+    Channel.G => filters.CHANNEL_G
+    Channel.B => filters.CHANNEL_B
+    Channel.A => filters.CHANNEL_A
+  }
+}
+
+/// The color space `input` already has: `feDisplacementMap` keeps its `in` image there.
+fn spaceOf(results: &List<Output>, input: Input, linear: bool) -> bool {
+  return match input {
+    Input.SourceGraphic => false
+    Input.SourceAlpha => false
+    Input.Result { index } => results.asSlice()[index].linear
+    Input.Transparent => linear
+  }
+}
+
+/// A map channel's unpremultiplied value, the displacement table's index.
+fn channelByte(pixel: &[u8], at: usize, channel: u8) -> u8 {
+  let alpha = pixel[at + 3]
+  if channel == filters.CHANNEL_A {
+    return alpha
+  }
+  return filters.unpremultiplyByte(pixel[at + u8.toUsize(channel)], alpha)
+}
+
+/// #feDisplacementMapElement with nearest sampling and a table per axis, since the scale
+/// maps to pixels differently along each; samples past the surface are transparent.
+fn displace(
+  out: &mut Pixmap,
+  input: &Pixmap,
+  map: &Pixmap,
+  tables: &[[i32; 256]; 2],
+  channels: [u8; 2],
+  region: Region,
+) -> () {
+  let width = u32.toI64(input.width())
+  let height = u32.toI64(input.height())
+  let stride = u32.toUsize(input.width()) * 4
+  let s = input.data()
+  let m = map.data()
+  let d = out.dataMut()
+  let mut y = region.y0
+  while y < region.y1 {
+    let mut x = region.x0
+    while x < region.x1 {
+      let at = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      let sx = u32.toI64(x) + i32.toI64(tables[0][u8.toUsize(channelByte(m, at, channels[0]))])
+      let sy = u32.toI64(y) + i32.toI64(tables[1][u8.toUsize(channelByte(m, at, channels[1]))])
+      if sx >= 0 && sy >= 0 && sx < width && sy < height {
+        let from = i64.toUsize(sy) * stride + i64.toUsize(sx) * 4
+        d[at] = s[from]
+        d[at + 1] = s[from + 1]
+        d[at + 2] = s[from + 2]
+        d[at + 3] = s[from + 3]
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// The light in surface pixels; z scales by the root mean square of the axis scales.
+fn deviceLight(source: LightSource, space: &Space) -> Light {
+  let depth = f64.sqrt((space.sx * space.sx + space.sy * space.sy) / 2.0)
+  let mut light = Light {
+    kind: filters.LIGHT_DISTANT,
+    azimuth: 0.0,
+    elevation: 0.0,
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
+    pointsAtX: 0.0,
+    pointsAtY: 0.0,
+    pointsAtZ: 0.0,
+    specularExponent: 1.0,
+    limitingConeAngle: -1.0,
+  }
+  match source {
+    LightSource.Distant { azimuth, elevation } => {
+      light.azimuth = azimuth
+      light.elevation = elevation
+    }
+    LightSource.Point { position } => {
+      light.kind = filters.LIGHT_POINT
+      light.x = position[0] * space.sx + space.tx
+      light.y = position[1] * space.sy + space.ty
+      light.z = position[2] * depth
+    }
+    LightSource.Spot { position, pointsAt, exponent, cone } => {
+      light.kind = filters.LIGHT_SPOT
+      light.x = position[0] * space.sx + space.tx
+      light.y = position[1] * space.sy + space.ty
+      light.z = position[2] * depth
+      light.pointsAtX = pointsAt[0] * space.sx + space.tx
+      light.pointsAtY = pointsAt[1] * space.sy + space.ty
+      light.pointsAtZ = pointsAt[2] * depth
+      light.specularExponent = exponent
+      light.limitingConeAngle = cone
+    }
+  }
+  return light
+}
+
+/// `lighting-color` as straight bytes in the primitive's color space.
+fn lightColor(color: Rgba, linear: bool) -> Rgba8 {
+  let c = straight(color)
+  if !linear {
+    return c
+  }
+  return Rgba8.make(
+    filters.convertByte(c.r, 255, true),
+    filters.convertByte(c.g, 255, true),
+    filters.convertByte(c.b, 255, true),
+    c.a,
+  )
+}
+
 fn validInput(input: Input, before: usize) -> bool {
   return match input {
     Input.Result { index } => index < before
@@ -298,6 +441,21 @@ fn validFunction(function: Function, numbers: usize) -> bool {
     Function.Identity => true
   }
 }
+
+fn validLight(light: LightSource) -> bool {
+  return match light {
+    LightSource.Distant { azimuth, elevation } => f64.isFinite(azimuth) && f64.isFinite(elevation)
+    LightSource.Point { position } => finite(&position)
+    LightSource.Spot { position, pointsAt, exponent, cone } => finite(&position)
+      && finite(&pointsAt)
+      && f64.isFinite(exponent)
+      && f64.isFinite(cone)
+  }
+}
+
+/// Octaves past this add less than 2^-32 of the first one's amplitude; Filter Effects 1
+/// lets user agents clamp `numOctaves`.
+pub const MAX_OCTAVES: u32 = 32
 
 /// Whether every index of `program` stays inside it and every number is finite, so that an
 /// exported display list cannot make `apply` read out of bounds.
@@ -341,6 +499,42 @@ pub fn valid(program: &Program) -> bool {
       Operation.DropShadow { dx, dy, x, y, color } => f64.isFinite(dx) && f64.isFinite(dy)
         && f64.isFinite(x)
         && f64.isFinite(y)
+      Operation.Turbulence { frequency, octaves, seed, fractal, stitch, origin, unit } => finite(
+        &frequency,
+      )
+        && frequency[0] >= 0.0
+        && frequency[1] >= 0.0
+        && octaves <= MAX_OCTAVES
+        && f64.isFinite(seed)
+        && finite(&origin)
+        && finite(&unit)
+        && unit[0] > 0.0
+        && unit[1] > 0.0
+      Operation.ConvolveMatrix {
+        orderX,
+        orderY,
+        first,
+        divisor,
+        bias,
+        targetX,
+        targetY,
+        edgeMode,
+        preserveAlpha,
+      } => orderX > 0 && orderY > 0 && targetX < orderX && targetY < orderY
+        && validRange(first, u32.toUsize(orderX) * u32.toUsize(orderY), numbers)
+        && f64.isFinite(divisor)
+        && divisor != 0.0
+        && f64.isFinite(bias)
+      Operation.DisplacementMap { scale, x, y } => finite(&scale)
+      Operation.Lighting {
+        specular,
+        surfaceScale,
+        constant,
+        exponent,
+        color,
+        light
+      } => f64.isFinite(surfaceScale) && f64.isFinite(constant) && f64.isFinite(exponent)
+        && validLight(light)
       _ => true
     }
     if !ok {
@@ -373,6 +567,7 @@ pub effect fn apply(program: &Program, source: &Pixmap, space: Space) -> Pixmap
   while p < primitives.length {
     let primitive = primitives[p]
     let linear = primitive.linearRgb
+    let mut own = linear
     let mut out = run Pixmap.make(width, height)
     let region = if primitive.subregion.isEmpty() {
       Region.make(0, 0, 0, 0)
@@ -480,9 +675,90 @@ pub effect fn apply(program: &Program, source: &Pixmap, space: Space) -> Pixmap
           )
           filters.mergeOver(&mut out, &a.pixels, region)
         }
+        Operation.Turbulence { frequency, octaves, seed, fractal, stitch, origin, unit } => {
+          // #feTurbulenceElement: the primitive subregion is the stitching tile.
+          let noise = run Turbulence.make(seed)
+          let tile = primitive.subregion
+          let settings = TurbulenceSettings {
+            baseFrequencyX: frequency[0],
+            baseFrequencyY: frequency[1],
+            octaves: octaves,
+            fractalNoise: fractal,
+            stitchTiles: stitch,
+            tileX: (tile.xMin - origin[0]) / unit[0],
+            tileY: (tile.yMin - origin[1]) / unit[1],
+            tileWidth: tile.width() / unit[0],
+            tileHeight: tile.height() / unit[1],
+          }
+          let toNoise = Affine {
+            a: 1.0 / (space.sx * unit[0]),
+            b: 0.0,
+            c: 0.0,
+            d: 1.0 / (space.sy * unit[1]),
+            e: 0.0 - (space.tx / space.sx + origin[0]) / unit[0],
+            f: 0.0 - (space.ty / space.sy + origin[1]) / unit[1],
+          }
+          filters.turbulence(&mut out, &noise, &settings, &toNoise, region)
+        }
+        Operation.ConvolveMatrix {
+          orderX,
+          orderY,
+          first,
+          divisor,
+          bias,
+          targetX,
+          targetY,
+          edgeMode,
+          preserveAlpha,
+        } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let kernel = run floats(numbers, first, u32.toUsize(orderX) * u32.toUsize(orderY))
+          let convolution = Convolution {
+            kernel: kernel.asSlice(),
+            orderX: orderX,
+            orderY: orderY,
+            divisor: f64.toF32(divisor),
+            bias: f64.toF32(bias),
+            targetX: targetX,
+            targetY: targetY,
+            edgeMode: edgeCode(edgeMode),
+            preserveAlpha: preserveAlpha,
+          }
+          run filters.convolveMatrix(&mut out, &a.pixels, &convolution, region)
+        }
+        Operation.DisplacementMap { scale, x, y } => {
+          // `in` stays in its own color space; only the map is converted.
+          own = spaceOf(&results, primitive.input, linear)
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, own)
+          let map = run fetch(&results, &graphic, &alpha, primitive.input2, linear)
+          let tables = [
+            filters.displacementTable(f64.toF32(scale[0] * space.sx)),
+            filters.displacementTable(f64.toF32(scale[1] * space.sy)),
+          ]
+          displace(
+            &mut out,
+            &a.pixels,
+            &map.pixels,
+            &tables,
+            [channelCode(x), channelCode(y)],
+            region,
+          )
+        }
+        Operation.Lighting { specular, surfaceScale, constant, exponent, color, light } => {
+          let a = run fetch(&results, &graphic, &alpha, primitive.input, linear)
+          let lighting = Lighting {
+            specular: specular,
+            surfaceScale: f64.toF32(surfaceScale),
+            constant: f64.toF32(constant),
+            exponent: f64.toF32(exponent),
+            color: lightColor(color, linear),
+            light: deviceLight(light, &space),
+          }
+          filters.lighting(&mut out, &a.pixels, &lighting, region)
+        }
       }
     }
-    run results.append(Output { pixels: move out, region: region, linear: linear })
+    run results.append(Output { pixels: move out, region: region, linear: own })
     p = p + 1
   }
   if results.length() == 0 {

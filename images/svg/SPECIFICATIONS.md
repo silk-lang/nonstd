@@ -611,10 +611,34 @@ decisions:
 - SVG 1.1 `filterRes` sets the surface to exactly that many pixels over the filter region,
   drawn back with bilinear sampling; non-integers truncate, zero hides the element, and a
   negative value is an error that leaves the automatic resolution.
+- `feTurbulence` follows the reference code of Filter Effects 1, which differs from SVG 1.1's
+  listing (and from browsers, which follow SVG 1.1): `init` draws a new gradient for a zero
+  vector and discards vectors longer than 1, and the `seed` attribute truncates toward zero
+  instead of rounding. `setup_seed` runs in f64 so that huge seeds stay exact. Noise is
+  sampled at each pixel's top-left corner mapped back to the `primitiveUnits` space (for
+  `objectBoundingBox`, `(user - box origin) / box size`, with `baseFrequency` per box
+  unit); the subregion in that space is the stitching tile. Negative `baseFrequency` or
+  `numOctaves` values are unsupported and give transparent black, a non-integer
+  `numOctaves` is invalid and leaves 1, and `numOctaves` is clamped to 32, which the spec's
+  clamping note allows.
+- `feConvolveMatrix` acts as a pass through filter on every unfulfilled precondition
+  (the change log's "pass through on unfulfilled pre-conditions"): orders below 1 after
+  truncation, a kernel whose length is not `orderX * orderY`, and a target outside the
+  kernel or not an integer. The input's extent for `edgeMode` is the primitive subregion.
+  `kernelUnitLength` is not implemented: the kernel always steps one surface pixel.
+- `feDisplacementMap` displaces by whole pixels (nearest sampling), with a table per axis,
+  since `scale` is in `primitiveUnits` and maps to pixels differently along x and y. Its
+  `in` image stays in its own color space and only `in2` is converted.
+- Lighting. Light positions are in `primitiveUnits`; a bounding box scales z by its
+  normalized diagonal `sqrt((w² + h²) / 2)`, and the surface space scales z by the root mean
+  square of its axis scales. `lighting-color` is converted into the primitive's color
+  space. A lighting primitive without a light source child produces transparent black; with
+  several, the first counts. Negative `diffuseConstant` and `specularConstant` are invalid
+  and leave 1. The sign of `limitingConeAngle` is ignored (the cone is symmetric).
+  `kernelUnitLength` (deprecated) is not implemented: normals use one-pixel deltas.
 - In this step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` read as
-  transparent black, and the primitives `feImage`, `feTurbulence`, `feConvolveMatrix`,
-  `feDisplacementMap` and the lighting primitives produce transparent black. Each is still
-  to be implemented in phase 8.
+  transparent black, and `feImage` produces transparent black. They are still to be
+  implemented in phase 8.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),
