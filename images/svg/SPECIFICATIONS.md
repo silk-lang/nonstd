@@ -746,3 +746,19 @@ fixture distinguishes correct neighboring tile enumeration from simply using the
 image positioning rectangle. Document counts, bytes, occurrences and decoded
 pixels share a budget across nested documents; recursive execution also shares the
 remaining isolated-surface allowance instead of restarting it for each child.
+
+
+SVG content images also follow CSS Images 3
+[`#the-image-orientation`](https://www.w3.org/TR/css-images-3/#the-image-orientation).
+The property applies to image sources referenced by SVG elements, and all sizing
+uses the oriented natural dimensions. Quarter turns therefore swap optional
+intrinsic width/height and invert an available aspect ratio before image sizing.
+The child SVG receives the corresponding unrotated logical viewport; its retained
+geometry is then rotated/flipped before the occurrence's CSS transform. With no
+orientation metadata, SVG `from-image` behaves as `none`.
+
+Explicit color-cell references cover all eight orthogonal orientations, auto
+sizing from definite dimensions or a viewBox-only ratio, percentage viewport
+geometry, inherited orientation with a shared raw layout, and perspective after
+orientation. This extends the already supported deprecated angle/flip values to
+SVG content sources; decorative CSS image rules remain separately applicable.
