@@ -477,9 +477,9 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
 - [ ] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [ ] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
-- [ ] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
+- [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
-- [ ] `letter-spacing`, `word-spacing` (done), `direction`, `unicode-bidi`
+- [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [ ] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
 - [ ] 1.1 only: `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
@@ -755,6 +755,39 @@ decisions:
   with its own `textLength` counts as one. With `spacingAndGlyphs`, positions and glyphs
   scale horizontally about the start of the extent. Characters after the element do not
   move, since the algorithm shifts only the range `[i, j]`.
+- Each text chunk is an independent block for ligatures and bidi reordering, as the
+  #TermTextChunk definition says, so shaping also breaks where an `x` or `y` value starts
+  a chunk. The text element's `direction` sets the paragraph level (`unicode-bidi:
+  plaintext` on it picks the level from the text). Descendants' `unicode-bidi` and
+  `direction` become the formatting characters of CSS Writing Modes 3
+  #bidi-control-codes around their content. Levels come from `ucd`'s UAX #9 on the
+  whole chunk as one line. Runs split where the font instance or level changes, are
+  placed in L2 visual order and shaped right to left at odd levels.
+- A right-to-left character's position is the right edge of its cluster, so its advance
+  runs negative from it, as the algorithm notes. `x` therefore places the right edge of
+  a right-to-left first character. Anchoring takes the direction of the chunk's first
+  character: `start` aligns the right end of the extent for `rtl`. With `textLength`,
+  an `rtl` element's characters move left (`spacing`) or scale about the right edge
+  (`spacingAndGlyphs`).
+- Synthetic bold (#font-synthesis-weight, method left to the UA) follows FreeType's
+  `FT_Outline_EmboldenXY` and `FT_GlyphSlot_Embolden`: outlines grow by 1/24 em in x and y
+  (in font units, before scaling), and each advancing glyph's advance grows by the same
+  amount. Marks with no advance keep it.
+- Baselines follow CSS Inline 3 #baseline-alignment on horizontal text. The text
+  element's dominant baseline sits on the text position. Each child aligns its baseline
+  of the alignment type (`alignment-baseline`, or the parent's dominant baseline for
+  `baseline`/`auto`) with the parent's baseline of that type, then `baseline-shift` moves
+  it. Baseline positions come from each element's first face, synthesized as
+  #baseline-synthesis-fonts allows, because the `BASE` table is not read yet:
+  `text-top`/`text-bottom` are the ascent and descent, `central` is halfway between them,
+  `middle` and `mathematical` are half the x-height (OS/2 `sxHeight`, else 0.5em),
+  `ideographic` is the descent and `hanging` is 0.6em. The SVG 1.1 edge keywords map to
+  `text-top`/`text-bottom`; `auto`, `use-script`, `no-change` and `reset-size` keep the
+  parent's dominant baseline (alphabetic at the root).
+- `baseline-shift: sub` and `super` use the parent's OS/2 subscript and superscript
+  y offsets (else 1/5 and 1/3 of its font size). Percentages refer to `line-height`.
+  `top`, `center` and `bottom` align to a line box, which SVG text without `inline-size`
+  does not have, so they do not shift.
 
 `src/used_text.silk` feeds it from the document:
 
