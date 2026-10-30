@@ -4,6 +4,7 @@ import scene { RenderError }
 import structure { Graph, OccurrenceId }
 import document_styles { StyledGraph }
 import used_masks
+import svg_filters.execute { MAX_OCTAVES }
 import svg_filters.program {
   Program,
   Primitive,
@@ -13,6 +14,9 @@ import svg_filters.program {
   CompositeOperator,
   ColorMatrixKind,
   MorphologyOperator,
+  EdgeMode,
+  Channel,
+  LightSource,
   Rgba
 }
 import svg_xml.xml { Document, NodeId }
@@ -33,6 +37,8 @@ import silk.core.ownership { Copy }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
+import silk.num.u32
+import silk.num.usize
 
 fn svgNamespace() -> &'static [u8] {
   return b"http://www.w3.org/2000/svg"
@@ -157,6 +163,31 @@ impl Units {
       value
     }
   }
+
+  fn pointX(self: &Self, value: f64) -> f64 {
+    return if self.objectBox {
+      self.bounds.xMin + value * self.bounds.width()
+    } else {
+      value
+    }
+  }
+
+  fn pointY(self: &Self, value: f64) -> f64 {
+    return if self.objectBox {
+      self.bounds.yMin + value * self.bounds.height()
+    } else {
+      value
+    }
+  }
+
+  fn z(self: &Self, value: f64) -> f64 {
+    if !self.objectBox {
+      return value
+    }
+    let w = self.bounds.width()
+    let h = self.bounds.height()
+    return value * f64.sqrt((w * w + h * h) / 2.0)
+  }
 }
 
 effect fn styleOf(styles: &StyledGraph, node: OccurrenceId) -> StyleId
@@ -176,7 +207,17 @@ effect fn color(
   opacityProperty: Property,
 ) -> Rgba
   ! RenderError {
-  let entry = match &engine.get(style, colorProperty) {
+  let srgb = run colorOf(engine, style, colorProperty)
+  let opacity = match &engine.number(style, opacityProperty, 1.0) {
+    Option<f64>.Some { value } => f64.min(1.0, f64.max(0.0, value))
+    _ => 1.0
+  }
+  return Rgba { r: srgb.r, g: srgb.g, b: srgb.b, a: srgb.a * opacity }
+}
+
+effect fn colorOf(engine: &Engine, style: StyleId, property: Property) -> Rgba
+  ! RenderError {
+  let entry = match &engine.get(style, property) {
     Option<ComputedValue>.Some { value } => value
     _ => {
       fail RenderError.InvalidStyleContext
@@ -188,11 +229,7 @@ effect fn color(
       fail RenderError.InvalidGeometry
     }
   }
-  let opacity = match &engine.number(style, opacityProperty, 1.0) {
-    Option<f64>.Some { value } => f64.min(1.0, f64.max(0.0, value))
-    _ => 1.0
-  }
-  return Rgba { r: srgb.r, g: srgb.g, b: srgb.b, a: srgb.a * opacity }
+  return Rgba { r: srgb.r, g: srgb.g, b: srgb.b, a: srgb.a }
 }
 
 // https://www.w3.org/TR/filter-effects-1/#ColorInterpolationFiltersProperty: auto
@@ -687,11 +724,49 @@ effect fn primitive(
       y: units.y(y),
       color: run color(&engine.*, style, Property.FloodColor, Property.FloodOpacity),
     }
-  } else if equal(name, b"feImage") || equal(name, b"feTurbulence")
-    || equal(name, b"feConvolveMatrix")
-    || equal(name, b"feDisplacementMap")
-    || equal(name, b"feDiffuseLighting")
-    || equal(name, b"feSpecularLighting") {
+  } else if equal(name, b"feTurbulence") {
+    input = Input.Transparent
+    run turbulence(document, element, units)
+  } else if equal(name, b"feConvolveMatrix") {
+    defaults.add(first, entries)
+    run convolution(document, element, &mut program.*)
+  } else if equal(name, b"feDisplacementMap") {
+    defaults.add(first, entries)
+    defaults.add(second, entries)
+    input2 = second.input
+    let scale = run number(document, element, b"scale", 0.0)
+    Operation.DisplacementMap {
+      scale: [units.x(scale), units.y(scale)],
+      x: channel(attribute(document, element, b"xChannelSelector")),
+      y: channel(attribute(document, element, b"yChannelSelector")),
+    }
+  } else if equal(name, b"feDiffuseLighting") || equal(name, b"feSpecularLighting") {
+    defaults.add(first, entries)
+    let specular = equal(name, b"feSpecularLighting")
+    match &(run lightSource(graph, node, units)) {
+      Option<LightSource>.Some { value } => Operation.Lighting {
+        specular: specular,
+        surfaceScale: run number(document, element, b"surfaceScale", 1.0),
+        constant: run nonNegative(
+          document,
+          element,
+          if specular {
+            b"specularConstant"
+          } else {
+            b"diffuseConstant"
+          },
+        ),
+        exponent: run number(document, element, b"specularExponent", 1.0),
+        color: run colorOf(&engine.*, style, Property.LightingColor),
+        light: value,
+      }
+      _ => {
+        // Without a light source there is no light: transparent black.
+        input = Input.Transparent
+        Operation.Flood { color: Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
+      }
+    }
+  } else if equal(name, b"feImage") {
     // Not implemented yet: a transparent result keeps later references valid.
     input = Input.Transparent
     Operation.Flood { color: Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
@@ -716,6 +791,186 @@ effect fn primitive(
       linearRgb: linearRgb(&engine.*, style),
     },
   )
+}
+
+// https://www.w3.org/TR/filter-effects-1/#feTurbulenceElement
+effect fn turbulence(document: &Document, node: NodeId, units: &Units) -> Operation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let frequency = run pair(document, node, b"baseFrequency", 0.0)
+  let octaves = run number(document, node, b"numOctaves", 1.0)
+  let seed = run number(document, node, b"seed", 0.0)
+
+  // Negative frequencies and octave counts are unsupported: no noise, transparent black.
+  // A `numOctaves` that is not an integer is invalid, which leaves the initial value.
+  if frequency.x < 0.0 || frequency.y < 0.0 || octaves < 0.0 {
+    return Operation.Flood { color: Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
+  }
+  let whole = if f64.trunc(octaves) == octaves {
+    octaves
+  } else {
+    1.0
+  }
+  return Operation.Turbulence {
+    frequency: [frequency.x, frequency.y],
+    octaves: f64.toU32(f64.min(whole, u32.toF64(MAX_OCTAVES))),
+    seed: seed,
+    fractal: equal(attribute(document, node, b"type"), b"fractalNoise"),
+    stitch: equal(attribute(document, node, b"stitchTiles"), b"stitch"),
+    origin: if units.objectBox {
+      [units.bounds.xMin, units.bounds.yMin]
+    } else {
+      [0.0, 0.0]
+    },
+    unit: if units.objectBox {
+      [units.bounds.width(), units.bounds.height()]
+    } else {
+      [1.0, 1.0]
+    },
+  }
+}
+
+// https://www.w3.org/TR/filter-effects-1/#feConvolveMatrixElement: unfulfilled
+// preconditions (orders below 1, a kernel of the wrong length, a target outside the
+// kernel) make the primitive a pass through filter.
+effect fn convolution(document: &Document, node: NodeId, program: &mut Program) -> Operation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let order = run pair(document, node, b"order", 3.0)
+  let columns = f64.trunc(order.x)
+  let rows = f64.trunc(order.y)
+  let values = match move run numbers(attribute(document, node, b"kernelMatrix")) {
+    Option<List<f64>>.Some { value } => move value
+    _ => List<f64>.make()
+  }
+  if !order.valid || columns < 1.0 || rows < 1.0 || columns * rows != usize.toF64(values.length()) {
+    return Operation.Copy
+  }
+  let orderX = f64.toU32(columns)
+  let orderY = f64.toU32(rows)
+  let targetX = run number(document, node, b"targetX", f64.floor(columns / 2.0))
+  let targetY = run number(document, node, b"targetY", f64.floor(rows / 2.0))
+  if targetX < 0.0 || targetX >= columns || targetY < 0.0 || targetY >= rows
+    || f64.trunc(targetX) != targetX
+    || f64.trunc(targetY) != targetY {
+    return Operation.Copy
+  }
+  let first = program.numbers.length()
+  let mut sum = 0.0
+  let mut i: usize = 0
+  while i < values.length() {
+    sum = sum + values.asSlice()[i]
+    run program.numbers.append(values.asSlice()[i])
+    i = i + 1
+  }
+
+  // A zero divisor falls back to the kernel sum, and a zero sum to 1.
+  let mut divisor = run number(document, node, b"divisor", 0.0)
+  if divisor == 0.0 {
+    divisor = sum
+  }
+  if divisor == 0.0 || !f64.isFinite(divisor) {
+    divisor = 1.0
+  }
+  let edge = attribute(document, node, b"edgeMode")
+  return Operation.ConvolveMatrix {
+    orderX: orderX,
+    orderY: orderY,
+    first: first,
+    divisor: divisor,
+    bias: run number(document, node, b"bias", 0.0),
+    targetX: f64.toU32(targetX),
+    targetY: f64.toU32(targetY),
+    edgeMode: if equal(edge, b"wrap") {
+      EdgeMode.Wrap
+    } else if equal(edge, b"none") {
+      EdgeMode.None
+    } else {
+      EdgeMode.Duplicate
+    },
+    preserveAlpha: equal(attribute(document, node, b"preserveAlpha"), b"true"),
+  }
+}
+
+fn channel(name: &[u8]) -> Channel {
+  return if equal(name, b"R") {
+    Channel.R
+  } else if equal(name, b"G") {
+    Channel.G
+  } else if equal(name, b"B") {
+    Channel.B
+  } else {
+    Channel.A
+  }
+}
+
+/// A lighting constant: any non-negative number; negative values are invalid and leave
+/// the initial 1.
+effect fn nonNegative(document: &Document, node: NodeId, name: &[u8]) -> f64
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = run number(document, node, name, 1.0)
+  return if value < 0.0 {
+    1.0
+  } else {
+    value
+  }
+}
+
+// https://www.w3.org/TR/filter-effects-1/#light-source: the first light source child.
+// Positions are in primitiveUnits; z of a bounding box scales by its normalized diagonal.
+effect fn lightSource(graph: &Graph, node: OccurrenceId, units: &Units) -> Option<LightSource>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut child = children(graph, node)
+  while true {
+    let next = match &child {
+      Option<OccurrenceId>.Some { value } => value
+      _ => {
+        break
+      }
+    }
+    child = graph.occurrences.asSlice()[next.index].nextSibling
+    let source = graph.occurrences.asSlice()[next.index].source
+    let document = graph.sourceDocument(source)
+    let element = source.node
+    if isElement(graph, next, b"feDistantLight") {
+      return Option<LightSource>.some(
+        LightSource.Distant {
+          azimuth: run number(document, element, b"azimuth", 0.0),
+          elevation: run number(document, element, b"elevation", 0.0),
+        },
+      )
+    }
+    let point = isElement(graph, next, b"fePointLight")
+    if point || isElement(graph, next, b"feSpotLight") {
+      let position = [
+        units.pointX(run number(document, element, b"x", 0.0)),
+        units.pointY(run number(document, element, b"y", 0.0)),
+        units.z(run number(document, element, b"z", 0.0)),
+      ]
+      if point {
+        return Option<LightSource>.some(LightSource.Point { position: position })
+      }
+      return Option<LightSource>.some(
+        LightSource.Spot {
+          position: position,
+          pointsAt: [
+            units.pointX(run number(document, element, b"pointsAtX", 0.0)),
+            units.pointY(run number(document, element, b"pointsAtY", 0.0)),
+            units.z(run number(document, element, b"pointsAtZ", 0.0)),
+          ],
+          exponent: run number(document, element, b"specularExponent", 1.0),
+          cone: if present(document, element, b"limitingConeAngle") {
+            f64.abs(run number(document, element, b"limitingConeAngle", 0.0))
+          } else {
+            -1.0
+          },
+        },
+      )
+    }
+  }
+  return Option<LightSource>.None
 }
 
 /// The element of `node`'s href template chain that specifies `name`, or `node` itself
