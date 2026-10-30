@@ -69,4 +69,20 @@ add('percentage-viewport',
     f'<image x="2" y="2" width="6" height="4" href="{percentage}" style="image-orientation:90deg"/>',
     '<rect x="2" y="2" width="6" height="2" fill="red"/>',
     'A quarter turn supplies the independent document a 4 by 6 logical viewport before rotating its percentage geometry.')
+add('shared-inherited',
+    '<g style="image-orientation:90deg">'
+    + f'<image width="4" height="6" href="{url}" style="image-orientation:none"/>'
+    + f'<image x="6" width="6" height="4" href="{url}"/></g>',
+    cells(rows[0], 0, 0, 2, 2) + cells(rows[1], 6, 0, 2, 2),
+    'Different inherited orientations share the same raw 4 by 6 layout while retaining separate placements.')
+ratio_only = data(svg(cells(rows[0], 0, 0), 'viewBox="0 0 2 3"'))
+add('viewbox-auto-height',
+    f'<image x="2" y="2" width="6" href="{ratio_only}" style="image-orientation:90deg"/>',
+    cells(rows[1], width=2, height=2),
+    'A viewBox-only natural ratio is inverted before resolving auto height, without inventing intrinsic dimensions.')
+projective = 'transform-origin:0 0;transform:matrix3d(1,0,0,.025,0,1,0,0,0,0,1,0,0,0,0,1)'
+add('projective',
+    f'<image x="2" y="2" width="9" height="4" preserveAspectRatio="none" href="{url}" style="image-orientation:90deg;{projective}"/>',
+    f'<g style="{projective}">' + cells(rows[1], width=3, height=2) + '</g>',
+    'CSS transforms follow image orientation; retained child clips compose through the projective placement.')
 manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
