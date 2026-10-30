@@ -79,9 +79,10 @@ Phase 8 has started with the filter graph: `filter` elements with their region,
 `filterUnits`, `primitiveUnits`, subregions and named results, filter lists of `url()`
 references, and `feFlood`, `feOffset`, `feGaussianBlur`, `feMerge`, `feBlend`,
 `feComposite`, `feColorMatrix`, `feComponentTransfer`, `feMorphology`, `feTile` and
-`feDropShadow`, in sRGB or linearRGB, also under rotation and skew. Sixty reftests in
-`tests/fixtures/filters` compare them with equivalent shapes or spec expansions. The
-remaining primitives, filter functions, background inputs and `filterRes` follow.
+`feDropShadow`, in sRGB or linearRGB, also under rotation and skew; the CSS filter
+functions; `href` templates and SVG 1.1 `filterRes`. Eighty-one reftests in
+`tests/fixtures/filters` compare them with equivalent shapes, spec expansions or markup
+equivalents. The remaining primitives and background inputs follow.
 
 Text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current
