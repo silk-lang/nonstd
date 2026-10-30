@@ -21,6 +21,8 @@ import svg_css.values { Value }
 import svg_css.properties { Property }
 import svg_css.value_keywords { Keyword }
 import svg_css.colors
+import svg_css.effect_values { EffectValue, Filter, FilterKind }
+import svg_css.dimensions
 import svg_css.tokens { Limits, CssError, equal }
 import svg_geometry.geometry { Rect }
 import svg_geometry.numeric { Cursor }
@@ -716,6 +718,65 @@ effect fn primitive(
   )
 }
 
+/// The element of `node`'s href template chain that specifies `name`, or `node` itself
+/// (SVG 1.1 filters.html#FilterElementHrefAttribute).
+fn owner(graph: &Graph, styles: &StyledGraph, node: OccurrenceId, name: &[u8]) -> OccurrenceId {
+  let mut current = node
+  let mut remaining = graph.occurrences.length()
+  while remaining > 0 {
+    let source = graph.occurrences.asSlice()[current.index].source
+    if present(graph.sourceDocument(source), source.node, name) {
+      return current
+    }
+    match &styles.template(current) {
+      Option<OccurrenceId>.Some { value } => {
+        current = value
+      }
+      _ => {
+        return node
+      }
+    }
+    remaining = remaining - 1
+  }
+  return node
+}
+
+fn inherited<'a>(
+  graph: &'a Graph,
+  styles: &StyledGraph,
+  node: OccurrenceId,
+  name: &[u8],
+) -> &'a [u8] {
+  let source = graph.occurrences.asSlice()[owner(graph, styles, node, name).index].source
+  return attribute(graph.sourceDocument(source), source.node, name)
+}
+
+effect fn length(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  node: OccurrenceId,
+  name: &[u8],
+  basis: f64,
+  initial: f64,
+  limits: &Limits,
+) -> f64
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = owner(graph, &styles.*, node, name)
+  let source = graph.occurrences.asSlice()[found.index].source
+  let style = run styleOf(&styles.*, found)
+  return run used_masks.coordinate(
+    graph.sourceDocument(source),
+    source.node,
+    name,
+    &mut styles.catalog.engine,
+    style,
+    basis,
+    initial,
+    limits,
+  )
+}
+
 /// The program of the `filter` element `node` applied to an element with bounding box
 /// `bounds` in a viewport `viewport`. None means the filtered element is not rendered:
 /// an empty filter region (#element-attrdef-filter-width, "Negative or zero values
@@ -731,13 +792,9 @@ pub effect fn resolve(
 ) -> Option<Program>
   ! CssError | RenderError | OutOfMemoryError
   ? &mut Allocator {
-  let source = graph.occurrences.asSlice()[node.index].source
-  let document = graph.sourceDocument(source)
-  let element = source.node
-  let style = run styleOf(&styles.*, node)
-  let objectRegion = !equal(attribute(document, element, b"filterUnits"), b"userSpaceOnUse")
+  let objectRegion = !equal(inherited(graph, &styles.*, node, b"filterUnits"), b"userSpaceOnUse")
   let objectPrimitives = equal(
-    attribute(document, element, b"primitiveUnits"),
+    inherited(graph, &styles.*, node, b"primitiveUnits"),
     b"objectBoundingBox",
   )
   if !viewport.isValid() || !bounds.isValid() {
@@ -751,47 +808,51 @@ pub effect fn resolve(
   } else {
     viewport
   }
-  let engine = &mut styles.catalog.engine
-  let x = run used_masks.coordinate(
-    document,
-    element,
-    b"x",
-    &mut engine.*,
-    style,
-    basis.width(),
-    -0.1 * basis.width(),
-    limits,
-  )
-  let y = run used_masks.coordinate(
-    document,
-    element,
+  let x = run length(graph, &mut styles.*, node, b"x", basis.width(), -0.1 * basis.width(), limits)
+  let y = run length(
+    graph,
+    &mut styles.*,
+    node,
     b"y",
-    &mut engine.*,
-    style,
     basis.height(),
     -0.1 * basis.height(),
     limits,
   )
-  let width = run used_masks.coordinate(
-    document,
-    element,
+  let width = run length(
+    graph,
+    &mut styles.*,
+    node,
     b"width",
-    &mut engine.*,
-    style,
     basis.width(),
     1.2 * basis.width(),
     limits,
   )
-  let height = run used_masks.coordinate(
-    document,
-    element,
+  let height = run length(
+    graph,
+    &mut styles.*,
+    node,
     b"height",
-    &mut engine.*,
-    style,
     basis.height(),
     1.2 * basis.height(),
     limits,
   )
+
+  // SVG 1.1 filters.html#FilterElementFilterResAttribute: whole pixels, truncated; zero
+  // disables rendering; negative values are errors, which leave the attribute unset.
+  let mut resolution = [0.0, 0.0]
+  let res = owner(graph, &styles.*, node, b"filterRes")
+  let resSource = graph.occurrences.asSlice()[res.index].source
+  if present(graph.sourceDocument(resSource), resSource.node, b"filterRes") {
+    let pixels = run pair(graph.sourceDocument(resSource), resSource.node, b"filterRes", 0.0)
+    if pixels.valid && pixels.x >= 0.0 && pixels.y >= 0.0 {
+      let columns = f64.trunc(pixels.x)
+      let rows = f64.trunc(pixels.y)
+      if columns == 0.0 || rows == 0.0 {
+        return Option<Program>.None
+      }
+      resolution = [columns, rows]
+    }
+  }
   if width <= 0.0 || height <= 0.0 {
     return Option<Program>.None
   }
@@ -815,6 +876,7 @@ pub effect fn resolve(
     region: region,
   }
   let mut program = Program.make(region)
+  program.resolution = resolution
   let mut entries = List<Entry>.make()
   let mut child = children(graph, node)
   while true {
@@ -846,4 +908,221 @@ pub effect fn resolve(
     return Option<Program>.None
   }
   return Option<Program>.some(move program)
+}
+
+pub struct Shorthand {
+  pub program: Option<Program>,
+  /// The area the content covers after this function: the next function's region.
+  pub area: Rect,
+}
+
+effect fn matrix(program: &mut Program, values: [f64; 20]) -> Operation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = program.numbers.length()
+  let mut i: usize = 0
+  while i < 20 {
+    run program.numbers.append(values[i])
+    i = i + 1
+  }
+  return Operation.ColorMatrix { kind: ColorMatrixKind.Matrix, first: first, count: 20 }
+}
+
+effect fn listed(program: &mut Program, kind: ColorMatrixKind, value: f64) -> Operation
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = program.numbers.length()
+  run program.numbers.append(value)
+  return Operation.ColorMatrix { kind: kind, first: first, count: 1 }
+}
+
+effect fn table(program: &mut Program, low: f64, high: f64) -> Function
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = program.numbers.length()
+  run program.numbers.append(low)
+  run program.numbers.append(high)
+  return Function.Table { first: first, count: 2 }
+}
+
+// Blurs spread 3 deviations, plus up to two pixels for the box approximation's rounding.
+fn grown(area: Rect, by: f64) -> Rect {
+  return Rect {
+    xMin: area.xMin - by,
+    yMin: area.yMin - by,
+    xMax: area.xMax + by,
+    yMax: area.yMax + by,
+  }
+}
+
+/// The `filter` list item `item` of `style`, a filter function, as the program of its
+/// markup equivalent (#FilterPrimitiveRepresentation), run in sRGB
+/// (#ColorInterpolationFiltersProperty) over `area` grown by what it spreads.
+pub effect fn shorthand(
+  styles: &mut StyledGraph,
+  style: StyleId,
+  item: usize,
+  area: Rect,
+) -> Shorthand
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let engine = &styles.catalog.engine
+  let entry = match &engine.get(style, Property.Filter) {
+    Option<ComputedValue>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let filter = match &engine.values.get(entry.value).* {
+    Value.Effect { value } => match &value {
+      EffectValue.Filters { items } => &items.asSlice()[item]
+      _ => {
+        fail RenderError.InvalidStyleContext
+      }
+    }
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let numerics = &engine.values.numerics
+  let mut covered = area
+  let mut program = Program.make(area)
+  let operation = match &filter.* {
+    Filter.Function { kind, amount } => {
+      let a = dimensions.evaluate(numerics, amount, 1.0)
+      if !f64.isFinite(a) {
+        fail RenderError.InvalidGeometry
+      }
+      let r = 1.0 - a
+      match kind {
+        FilterKind.Grayscale => run matrix(
+          &mut program,
+          [
+            0.2126 + 0.7874 * r,
+            0.7152 - 0.7152 * r,
+            0.0722 - 0.0722 * r,
+            0.0,
+            0.0,
+            0.2126 - 0.2126 * r,
+            0.7152 + 0.2848 * r,
+            0.0722 - 0.0722 * r,
+            0.0,
+            0.0,
+            0.2126 - 0.2126 * r,
+            0.7152 - 0.7152 * r,
+            0.0722 + 0.9278 * r,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+          ],
+        )
+        FilterKind.Sepia => run matrix(
+          &mut program,
+          [
+            0.393 + 0.607 * r,
+            0.769 - 0.769 * r,
+            0.189 - 0.189 * r,
+            0.0,
+            0.0,
+            0.349 - 0.349 * r,
+            0.686 + 0.314 * r,
+            0.168 - 0.168 * r,
+            0.0,
+            0.0,
+            0.272 - 0.272 * r,
+            0.534 - 0.534 * r,
+            0.131 + 0.869 * r,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+          ],
+        )
+        FilterKind.Saturate => run listed(&mut program, ColorMatrixKind.Saturate, a)
+        FilterKind.HueRotate => run listed(&mut program, ColorMatrixKind.HueRotate, a)
+        FilterKind.Invert => {
+          let channel = run table(&mut program, a, 1.0 - a)
+          Operation.ComponentTransfer { functions: [channel, channel, channel, Function.Identity] }
+        }
+        FilterKind.Opacity => {
+          let alpha = run table(&mut program, 0.0, a)
+          Operation.ComponentTransfer {
+            functions: [Function.Identity, Function.Identity, Function.Identity, alpha],
+          }
+        }
+        FilterKind.Brightness => {
+          let channel = Function.Linear { slope: a, intercept: 0.0 }
+          Operation.ComponentTransfer { functions: [channel, channel, channel, Function.Identity] }
+        }
+        FilterKind.Contrast => {
+          let channel = Function.Linear { slope: a, intercept: 0.5 - 0.5 * a }
+          Operation.ComponentTransfer { functions: [channel, channel, channel, Function.Identity] }
+        }
+        FilterKind.Blur => {
+          let deviation = dimensions.evaluate(numerics, amount, 0.0)
+          if !f64.isFinite(deviation) {
+            fail RenderError.InvalidGeometry
+          }
+          if deviation > 0.0 {
+            covered = grown(area, 3.0 * deviation + 2.0)
+            Operation.Blur { x: deviation, y: deviation }
+          } else {
+            Operation.Copy
+          }
+        }
+      }
+    }
+    Filter.DropShadow { x, y, blur, color } => {
+      let dx = dimensions.evaluate(numerics, x, 0.0)
+      let dy = dimensions.evaluate(numerics, y, 0.0)
+      let deviation = f64.max(0.0, dimensions.evaluate(numerics, blur, 0.0))
+      if !f64.isFinite(dx) || !f64.isFinite(dy) || !f64.isFinite(deviation) {
+        fail RenderError.InvalidGeometry
+      }
+      let shadow = grown(
+        Rect {
+          xMin: area.xMin + dx,
+          yMin: area.yMin + dy,
+          xMax: area.xMax + dx,
+          yMax: area.yMax + dy,
+        },
+        3.0 * deviation + 2.0,
+      )
+
+      // The blur runs before the offset, so its spread around the unshifted alpha counts too.
+      covered = match &grown(area, 3.0 * deviation + 2.0).united(shadow) {
+        Option<Rect>.Some { value } => value
+        _ => area
+      }
+      let srgb = colors.toSrgb(color)
+      Operation.DropShadow {
+        dx: dx,
+        dy: dy,
+        x: deviation,
+        y: deviation,
+        color: Rgba { r: srgb.r, g: srgb.g, b: srgb.b, a: srgb.a },
+      }
+    }
+    Filter.Url { url } => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  program.region = covered
+  run program.primitives.append(
+    Primitive {
+      operation: operation,
+      input: Input.SourceGraphic,
+      input2: Input.Transparent,
+      subregion: covered,
+      linearRgb: false,
+    },
+  )
+  return Shorthand { program: Option<Program>.some(move program), area: covered }
 }
