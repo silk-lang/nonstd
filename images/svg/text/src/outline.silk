@@ -1,0 +1,194 @@
+//! Glyph outlines as flat path commands, from `glyf` (with `gvar`), `CFF` or `CFF2`.
+//! Adapted from font/shape/wasm/src/outline.silk.
+import read_fonts.lib {
+  FontRef,
+  TableProvider,
+  GlyfLoca,
+  ReadError,
+  SelectedGvar,
+  Cff,
+  Cff2,
+  FontData
+}
+import read_fonts.model.glyph.outline { PathSink }
+import read_fonts.model.metrics.glyf_outline { GlyfContext, LoadedOutline, load }
+import read_fonts.model.metrics.glyf_path { outlineToPath, PathContourStart }
+import read_fonts.model.error { Error }
+import read_fonts.model.optional { Maybe }
+import read_fonts.tables.glyf { PointFlags }
+import read_fonts.tables.hmtx { GlyphMetricRecords }
+import read_fonts.ps.cff.font { CffFontRef, Subfont }
+import font_types.lib { F2Dot14, GlyphId, Point }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.num.u32
+
+/// Path opcodes, followed by their coordinates: move/line take a point, quad two, cubic three.
+pub enum(u8) Op {
+  Move = 0,
+  Line = 1,
+  Quad = 2,
+  Cubic = 3,
+  Close = 4,
+}
+
+/// Records path commands as `f32` values: the opcode, then its coordinates.
+///
+/// Sinks cannot fail, so the first allocation failure is remembered and reported by the caller.
+pub struct Recorder<'r> {
+  pub out: &'r mut List<f32>,
+  pub failed: bool,
+}
+
+impl<'r> Recorder<'r> {
+  fn push(self: &mut Self, values: &[f32]) -> () {
+    if self.failed {
+      return
+    }
+
+    // PathSink methods have no effects, and the system allocator has no state to share.
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let result = run Effect.result(List<f32>.appendSlice(&mut self.out, values))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    if let Result<(), OutOfMemoryError>.Failure { error } = move result {
+      drop error
+      self.failed = true
+    }
+  }
+}
+
+impl<'r> PathSink for Recorder<'r> {
+  fn moveTo(self: &mut Self, x: f32, y: f32) {
+    Recorder.push(&mut self, &[0.0, x, y])
+  }
+
+  fn lineTo(self: &mut Self, x: f32, y: f32) {
+    Recorder.push(&mut self, &[1.0, x, y])
+  }
+
+  fn quadTo(self: &mut Self, cx: f32, cy: f32, x: f32, y: f32) {
+    Recorder.push(&mut self, &[2.0, cx, cy, x, y])
+  }
+
+  fn curveTo(self: &mut Self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+    Recorder.push(&mut self, &[3.0, cx0, cy0, cx1, cy1, x, y])
+  }
+
+  fn close(self: &mut Self) {
+    Recorder.push(&mut self, &[4.0])
+  }
+}
+
+/// The outline tables of one font, read once per request.
+pub struct Outlines<'a> {
+  glyf: Option<GlyfLoca<'a>>,
+  gvar: Maybe<SelectedGvar<'a>>,
+  hMetrics: GlyphMetricRecords<'a>,
+  vMetrics: GlyphMetricRecords<'a>,
+  cff: Option<CffFontRef<'a>>,
+  glyphCount: u32,
+}
+
+impl<'a> Outlines<'a> {
+  pub fn new(font: &FontRef<'a>, glyphCount: u32, upem: u16) -> Self {
+    let mut cff = Option<CffFontRef<'a>>.None
+    if let Result<Cff2<'a>, ReadError>.Success { value } = TableProvider.cff2(font) {
+      if let Result<CffFontRef<'a>, Error>.Success { value: parsed } = CffFontRef.new(
+        FontData.asBytes(&Cff2.offsetData(&value)),
+        0,
+        Option<i32>.some(u16.toI32(upem)),
+      ) {
+        cff = Option<CffFontRef<'a>>.some(parsed)
+      }
+    } else if let Result<Cff<'a>, ReadError>.Success { value } = TableProvider.cff(font) {
+      if let Result<CffFontRef<'a>, Error>.Success { value: parsed } = CffFontRef.new(
+        FontData.asBytes(&Cff.offsetData(&value)),
+        0,
+        Option<i32>.some(u16.toI32(upem)),
+      ) {
+        cff = Option<CffFontRef<'a>>.some(parsed)
+      }
+    }
+    return Self {
+      glyf: match move TableProvider.selectedGlyfLoca(font, Option<bool>.None) {
+        Result<GlyfLoca<'a>, ReadError>.Success { value } => Option<GlyfLoca<'a>>.some(value)
+        _ => Option<GlyfLoca<'a>>.None
+      },
+      gvar: Maybe<SelectedGvar<'a>>.fromResult(TableProvider.selectedGvar(font)),
+      hMetrics: TableProvider.hGlyphMetricRecords(font)
+        |> Result<GlyphMetricRecords<'a>, ReadError>.unwrapOr(GlyphMetricRecords.default()),
+      vMetrics: TableProvider.vGlyphMetricRecords(font)
+        |> Result<GlyphMetricRecords<'a>, ReadError>.unwrapOr(GlyphMetricRecords.default()),
+      cff: move cff,
+      glyphCount: glyphCount,
+    }
+  }
+
+  /// Appends the outline of `glyph` at `coords` to `sink`. Returns false when the glyph has no
+  /// outline the module can read; the commands appended before a failure stay in the sink.
+  pub effect fn draw(self: &Self, glyph: GlyphId, coords: &[F2Dot14], sink: &mut Recorder) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if GlyphId.toU32(glyph) >= self.glyphCount {
+      return false
+    }
+    if let Option<GlyfLoca<'a>>.Some { value: tables } = &self.glyf {
+      let context = GlyfContext {
+        outlines: tables,
+        gvar: self.gvar,
+        hMetrics: self.hMetrics,
+        vMetrics: self.vMetrics,
+        glyphCount: self.glyphCount,
+        coords: coords,
+        ascender: 0,
+        descender: 0,
+      }
+      let loaded = run Effect.result(load(&context, glyph))
+      return match move loaded {
+        Result<LoadedOutline, Error | OutOfMemoryError>.Success { value: outline } => outlineToPath(
+          List<Point<f32>>.asSlice(&outline.points),
+          List<PointFlags>.asSlice(&outline.flags),
+          List<u16>.asSlice(&outline.contours),
+          PathContourStart.ScanBackward,
+          &mut sink,
+        )
+        Result<LoadedOutline, Error | OutOfMemoryError>.Failure { error } => match move error {
+          Error problem => false
+          OutOfMemoryError problem => {
+            fail move problem
+          }
+        }
+      }
+    }
+    if let Option<CffFontRef<'a>>.Some { value: font } = &self.cff {
+      let index = match move CffFontRef.subfontIndex(&font, glyph) {
+        Option<u16>.Some { value } => value
+        _ => {
+          return false
+        }
+      }
+      let subfont = match move CffFontRef.subfont(&font, index, coords) {
+        Result<Subfont, Error>.Success { value } => move value
+        _ => {
+          return false
+        }
+      }
+      return match move CffFontRef.draw(
+        &font,
+        &subfont,
+        glyph,
+        coords,
+        Option<f32>.None,
+        &mut sink,
+      ) {
+        Result<Option<f32>, Error>.Success { value } => true
+        _ => false
+      }
+    }
+    return false
+  }
+}
