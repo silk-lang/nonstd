@@ -321,6 +321,40 @@ def jpeg_with(icc):
     return out.getvalue()
 
 
+def device_color(d, comps):
+    """Continuous matrix/TRC evaluation, as icc.deviceColor; None means fallback."""
+    space = d[16:20]
+    if space == b'GRAY':
+        if len(comps) != 1:
+            return None
+        y = evaluate(d, b'kTRC', clamp(comps[0]))
+        lin = [y, y, y]
+        w = [PCS[r * 3] * D50[0] + PCS[r * 3 + 1] * D50[1] + PCS[r * 3 + 2] * D50[2] for r in range(3)]
+        m = [w[0], 0.0, 0.0, 0.0, w[1], 0.0, 0.0, 0.0, w[2]]
+    elif space == b'RGB ' and find(d, b'rXYZ') is not None:
+        if len(comps) != 3:
+            return None
+        _, m = icc_transform(d)
+        lin = [evaluate(d, n, clamp(c)) for n, c in zip((b'rTRC', b'gTRC', b'bTRC'), comps)]
+    else:
+        return None
+
+    def enc(v):
+        v = clamp(v)
+        return clamp(v * 12.92 if v <= 0.0031308 else 1.055 * math.pow(v, 1.0 / 2.4) - 0.055)
+    return [enc(m[r * 3] * lin[0] + m[r * 3 + 1] * lin[1] + m[r * 3 + 2] * lin[2]) for r in range(3)]
+
+
+def css_color(rgb):
+    return 'color(srgb %r %r %r)' % tuple(rgb)
+
+
+def profile_element(name, data, ident=''):
+    extra = f' id="{ident}"' if ident else ''
+    return (f'<color-profile name="{name}"{extra} '
+            f'href="{url(data, "application/vnd.iccprofile")}"/>')
+
+
 def main():
     (ROOT / 'inputs').mkdir(parents=True, exist_ok=True)
     (ROOT / 'references').mkdir(exist_ok=True)
@@ -368,6 +402,88 @@ def main():
     add('jpeg-icc', jpeg_with(PROFILES['linear']), icc_transform(PROFILES['linear']),
         'JPEG APP2 ICC_PROFILE (ICC.1:2022 Annex B); uniform gray 128 survives the DCT exactly.',
         SPEC_EMBED, jpeg_pixels, 'image/jpeg')
+
+    # SVG 1.1 color-profile elements, icc-color() and the color-profile property.
+    spec_paint = 'https://www.w3.org/TR/SVG11/painting.html#SpecifyingPaint'
+    spec_prop = 'https://www.w3.org/TR/SVG11/color.html#ColorProfileProperty'
+    spec_element = 'https://www.w3.org/TR/SVG11/color.html#ColorProfileElement'
+
+    def page(name, width, height, body, ref, reason, spec):
+        head = f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+        (ROOT / 'inputs' / f'{name}.svg').write_text(head + body + '</svg>\n')
+        (ROOT / 'references' / f'{name}.svg').write_text(head + ref + '</svg>\n')
+        cases.append(dict(id='color-' + name, input=f'inputs/{name}.svg',
+                          references=[dict(path=f'references/{name}.svg', relation='==')],
+                          status='pass', reason=reason, spec=spec, tolerance={}))
+
+    lin = PROFILES['linear']
+    wide = PROFILES['wide-gamma']
+    gray = PROFILES['gray']
+    defs = profile_element('lin', lin) + profile_element('wide', wide, 'w') + profile_element('g', gray)
+    probes = [('lin', [0.5, 0.5, 0.5]), ('wide', [0.2, 0.7, 0.4]), ('g', [0.25]),
+              ('lin', [0.5, 0.5]), ('missing', [0.1, 0.2, 0.3])]
+    body = ref = ''
+    for x, (name, comps) in enumerate(probes):
+        data = {'lin': lin, 'wide': wide, 'g': gray}.get(name)
+        args = ', '.join(repr(c) for c in comps)
+        body += f'<rect x="{x * 2}" width="2" height="2" fill="#ff8000 icc-color({name}, {args})"/>'
+        out = device_color(data, comps) if data else None
+        fill = css_color(out) if out else '#ff8000'
+        ref += f'<rect x="{x * 2}" width="2" height="2" fill="{fill}"/>'
+    page('icc-paint', 10, 2, '<defs>' + defs + '</defs>' + body, ref,
+         'icc-color() through matrix/TRC and gray profiles; a wrong component count or unknown '
+         'profile uses the sRGB fallback.', spec_paint)
+
+    stop = device_color(wide, [0.9, 0.1, 0.3])
+    flood = device_color(lin, [0.25, 0.5, 0.75])
+    body = ('<defs>' + defs + '<linearGradient id="s"><stop offset="0" stop-color="#000 icc-color(wide, 0.9, 0.1, 0.3)"/>'
+            '<stop offset="1" stop-color="#000 icc-color(wide, 0.9, 0.1, 0.3)"/></linearGradient>'
+            '<filter id="f" x="0" y="0" width="1" height="1"><feFlood flood-color="#000 icc-color(lin, 0.25, 0.5, 0.75)"/></filter>'
+            '</defs><rect width="2" height="2" fill="url(#s)"/><rect x="2" width="2" height="2" filter="url(#f)"/>'
+            '<rect x="4" width="2" height="2" stroke="none" fill="url(#none) #000 icc-color(lin, 0.25, 0.5, 0.75)"/>')
+    ref = (f'<rect width="2" height="2" fill="{css_color(stop)}"/><rect x="2" width="2" height="2" fill="{css_color(flood)}"/>'
+           f'<rect x="4" width="2" height="2" fill="{css_color(flood)}"/>')
+    page('icc-stop-flood', 6, 2, body, ref,
+         'stop-color, flood-color and paint-server fallbacks accept icc-color().', spec_paint)
+
+    tagged = png(PIXELS, [iccp(wide)])
+    untagged = png(PIXELS)
+    width = len(PIXELS)
+
+    def img(data, y, attrs=''):
+        return (f'<image href="{url(data)}" y="{y}" width="{width}" height="1" {attrs} '
+                'style="image-rendering:optimizeSpeed"/>')
+
+    def row(transform, y):
+        t = effective(transform)
+        return ''.join(f'<rect x="{x}" y="{y}" width="1" height="1" fill="{hexcolor(convert(t, p))}"/>'
+                       for x, p in enumerate(PIXELS))
+    body = ('<defs>' + defs + '</defs>' + img(tagged, 0) + img(tagged, 1, 'color-profile="sRGB"')
+            + img(tagged, 2) + img(untagged, 3, 'color-profile="lin"')
+            + img(untagged, 4, 'style="color-profile:url(#w)"')
+            + f'<g color-profile="lin">{img(untagged, 5)}</g>'
+            + img(tagged, 6, 'color-profile="missing"'))
+    ref = (row(icc_transform(wide), 0) + row(None, 1) + row(icc_transform(wide), 2)
+           + row(icc_transform(lin), 3) + row(icc_transform(wide), 4) + row(icc_transform(lin), 5)
+           + row(icc_transform(wide), 6))
+    body = body.replace('style="color-profile:url(#w)" style="image-rendering:optimizeSpeed"',
+                        'style="color-profile:url(#w);image-rendering:optimizeSpeed"')
+    page('image-color-profile', width, 7, body, ref,
+         'color-profile on images: sRGB ignores the embedded profile per occurrence, names and '
+         'IRIs select a color-profile element, the property inherits, unknown names keep auto.', spec_prop)
+
+    sheet = device_color(wide, [0.3, 0.6, 0.9])
+    rule = f'@color-profile {{ name: sheet; src: url("{url(lin, "application/vnd.iccprofile")}") }}'
+    rule2 = f'@color-profile {{ name: sheet2; src: url("{url(wide, "application/vnd.iccprofile")}") }}'
+    body = (f'<style>{rule} {rule2}</style>'
+            '<rect width="2" height="2" fill="#000 icc-color(sheet2, 0.3, 0.6, 0.9)"/>'
+            + img(untagged, 0, 'x="2" color-profile="sheet"').replace('width="8"', 'width="8"'))
+    ref = (f'<rect width="2" height="2" fill="{css_color(sheet)}"/>'
+           + ''.join(f'<rect x="{x + 2}" y="0" width="1" height="1" fill="{hexcolor(convert(effective(icc_transform(lin)), p))}"/>'
+                     for x, p in enumerate(PIXELS)))
+    page('at-color-profile', width + 2, 2, body, ref,
+         '@color-profile rules name profiles for icc-color() and the color-profile property.',
+         'https://www.w3.org/TR/SVG11/color.html#ColorProfileAtRule')
 
     (ROOT / 'manifest.json').write_text(json.dumps(dict(version=1, suite='own', mode='reference', cases=cases),
                                                    indent=2) + '\n')
