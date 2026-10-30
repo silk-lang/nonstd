@@ -1,0 +1,386 @@
+//! CSS Fonts 4 #font-style-matching: narrows a family's faces by font-width, then
+//! font-style, then font-weight. Ranges come from variable axes; the selection carries
+//! the values the "Apply font matching variations" step (#apply-font-matching-variations)
+//! sets on those axes.
+import database { FontDatabase, Face, Range, DEFAULT_OBLIQUE }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+
+pub union Style {
+  Normal,
+  Italic,
+  Oblique { pub degrees: f64 },
+}
+
+impl Copy for Style {}
+
+pub struct Request {
+  /// font-weight, 1 to 1000.
+  pub weight: f64,
+  /// font-width, a percentage.
+  pub width: f64,
+  pub style: Style,
+}
+
+impl Copy for Request {}
+
+pub struct Selection {
+  pub face: usize,
+  pub weight: f64,
+  pub width: f64,
+  /// The italic value chosen, when the style was matched on italic values.
+  pub italic: Option<f64>,
+  /// The oblique angle chosen, when the style was matched on oblique angles.
+  pub oblique: Option<f64>,
+  /// font-synthesis-style: the angle to shear an upright face by, or 0.
+  pub syntheticOblique: f64,
+  /// font-synthesis-weight: embolden a face lighter than a bold request.
+  pub syntheticBold: bool,
+}
+
+impl Copy for Selection {}
+
+enum Dimension {
+  Width,
+  Weight,
+  Italic,
+  Oblique,
+}
+
+/// One "checked in ascending/descending order" step over an interval of values.
+struct Step {
+  low: f64,
+  high: f64,
+  lowOpen: bool,
+  highOpen: bool,
+  ascending: bool,
+}
+
+impl Copy for Step {}
+
+fn ascending(low: f64, lowOpen: bool, high: f64, highOpen: bool) -> Step {
+  return Step { low: low, high: high, lowOpen: lowOpen, highOpen: highOpen, ascending: true }
+}
+
+fn descending(low: f64, lowOpen: bool, high: f64, highOpen: bool) -> Step {
+  return Step { low: low, high: high, lowOpen: lowOpen, highOpen: highOpen, ascending: false }
+}
+
+fn rangeOf(face: &Face, dimension: Dimension, mirror: bool) -> Option<Range> {
+  return match dimension {
+    Dimension.Width => Option<Range>.Some { value: face.width }
+    Dimension.Weight => Option<Range>.Some { value: face.weight }
+    Dimension.Italic => face.italic
+    Dimension.Oblique => match face.oblique {
+      Option<Range>.Some { value } => if mirror {
+        Option<Range>.Some { value: Range { min: -value.max, max: -value.min } }
+      } else {
+        Option<Range>.Some { value: value }
+      }
+      Option<Range>.None => Option<Range>.None
+    }
+  }
+}
+
+/// The first value of `range` the step reaches, if any.
+fn reached(range: Range, step: Step) -> Option<f64> {
+  let low = if range.min > step.low {
+    range.min
+  } else {
+    step.low
+  }
+  let high = if range.max < step.high {
+    range.max
+  } else {
+    step.high
+  }
+  if low > high {
+    return Option<f64>.None
+  }
+  let value = if step.ascending {
+    low
+  } else {
+    high
+  }
+  if (step.lowOpen && value <= step.low) || (step.highOpen && value >= step.high) {
+    return Option<f64>.None
+  }
+  return Option<f64>.Some { value: value }
+}
+
+/// Runs the steps in order; the first one that reaches any face gives the value.
+fn search(
+  database: &FontDatabase,
+  set: &List<usize>,
+  dimension: Dimension,
+  mirror: bool,
+  steps: &[Step],
+) -> Option<f64> {
+  let mut index: usize = 0
+  while index < steps.length {
+    let step = steps[index]
+    let mut best = Option<f64>.None
+    let mut face: usize = 0
+    while face < List<usize>.length(set) {
+      let candidate = rangeOf(database.face(List<usize>.get(set, face)), dimension, mirror)
+      if let Option<Range>.Some { value: range } = candidate {
+        if let Option<f64>.Some { value } = reached(range, step) {
+          best = match best {
+            Option<f64>.Some { value: previous } => if (step.ascending && value < previous)
+              || (!step.ascending && value > previous) {
+              Option<f64>.Some { value: value }
+            } else {
+              Option<f64>.Some { value: previous }
+            }
+            Option<f64>.None => Option<f64>.Some { value: value }
+          }
+        }
+      }
+      face = face + 1
+    }
+    if let Option<f64>.Some { value } = best {
+      return Option<f64>.Some { value: value }
+    }
+    index = index + 1
+  }
+  return Option<f64>.None
+}
+
+/// Removes the faces whose range does not include `value`.
+fn keep(
+  database: &FontDatabase,
+  set: &mut List<usize>,
+  dimension: Dimension,
+  mirror: bool,
+  value: f64,
+) -> () {
+  let mut index: usize = 0
+  while index < List<usize>.length(&set.*) {
+    let kept = match rangeOf(database.face(List<usize>.get(&set.*, index)), dimension, mirror) {
+      Option<Range>.Some { value: range } => range.contains(value)
+      Option<Range>.None => false
+    }
+    if kept {
+      index = index + 1
+    } else {
+      drop List<usize>.remove(&mut set, index)
+    }
+  }
+}
+
+const INF: f64 = f64.INFINITY
+
+// #font-width-prop matching: at or below 100% look narrower first, above it wider first.
+fn widthSteps(desired: f64) -> [Step; 2] {
+  if desired <= 100.0 {
+    return [descending(-INF, false, desired, false), ascending(desired, true, INF, false)]
+  }
+  return [ascending(desired, false, INF, false), descending(-INF, false, desired, true)]
+}
+
+// #font-weight-prop matching, with the 400 to 500 window searched up to 500 first.
+fn weightSteps(desired: f64) -> [Step; 3] {
+  if desired >= 400.0 && desired <= 500.0 {
+    return [
+      ascending(desired, false, 500.0, false),
+      descending(-INF, false, desired, true),
+      ascending(500.0, true, INF, false),
+    ]
+  }
+  if desired < 400.0 {
+    return [
+      descending(-INF, false, desired, false),
+      ascending(desired, true, INF, false),
+      ascending(INF, false, INF, false),
+    ]
+  }
+  return [
+    ascending(desired, false, INF, false),
+    descending(-INF, false, desired, true),
+    ascending(INF, false, INF, false),
+  ]
+}
+
+/// One style search group: a dimension and its steps.
+struct Group {
+  dimension: Dimension,
+  steps: [Step; 3],
+  count: usize,
+}
+
+impl Copy for Group {}
+
+fn group(dimension: Dimension, steps: [Step; 3], count: usize) -> Group {
+  return Group { dimension: dimension, steps: steps, count: count }
+}
+
+fn none() -> Step {
+  return ascending(INF, false, INF, false)
+}
+
+// #font-style-matching, for font-style values with a non-negative angle (italic is
+// treated on its own scale); negative angles mirror the oblique dimension.
+fn styleGroups(style: Style) -> [Group; 4] {
+  let nonPositive = descending(-INF, false, 0.0, false)
+  let lastOblique = group(Dimension.Oblique, [nonPositive, none(), none()], 1)
+  let lastItalic = group(Dimension.Italic, [nonPositive, none(), none()], 1)
+  return match style {
+    Style.Normal => [
+      group(Dimension.Oblique, [ascending(0.0, false, INF, false), none(), none()], 1),
+      group(Dimension.Italic, [ascending(0.0, false, INF, false), none(), none()], 1),
+      group(Dimension.Oblique, [descending(-INF, false, 0.0, true), none(), none()], 1),
+      group(Dimension.Italic, [descending(-INF, false, 0.0, true), none(), none()], 1),
+    ]
+    Style.Italic => [
+      group(
+        Dimension.Italic,
+        [ascending(1.0, false, INF, false), descending(0.0, true, 1.0, true), none()],
+        2,
+      ),
+      group(
+        Dimension.Oblique,
+        [ascending(11.0, false, INF, false), descending(0.0, true, 11.0, true), none()],
+        2,
+      ),
+      lastItalic,
+      lastOblique,
+    ]
+    Style.Oblique { degrees: angle } => {
+      let magnitude = f64.abs(angle)
+      if magnitude >= 11.0 {
+        return [
+          group(
+            Dimension.Oblique,
+            [
+              ascending(magnitude, false, INF, false),
+              descending(0.0, true, magnitude, true),
+              none(),
+            ],
+            2,
+          ),
+          group(
+            Dimension.Italic,
+            [ascending(1.0, false, INF, false), descending(0.0, true, 1.0, true), none()],
+            2,
+          ),
+          lastOblique,
+          lastItalic,
+        ]
+      }
+      return [
+        group(
+          Dimension.Oblique,
+          [
+            ascending(magnitude, false, magnitude, false),
+            descending(0.0, true, magnitude, true),
+            ascending(magnitude, true, INF, false),
+          ],
+          3,
+        ),
+        group(
+          Dimension.Italic,
+          [descending(0.0, true, 1.0, true), ascending(1.0, false, INF, false), none()],
+          2,
+        ),
+        lastOblique,
+        lastItalic,
+      ]
+    }
+  }
+}
+
+/// Narrows `candidates` (faces of one family) to one face, or None when it is empty.
+pub effect fn select(database: &FontDatabase, candidates: &[usize], request: Request) -> Option<
+  Selection
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if candidates.length == 0 {
+    return Option<Selection>.None
+  }
+  let mut set = List<usize>.make()
+  run List<usize>.appendSlice(&mut set, candidates)
+  let widths = widthSteps(request.width)
+  let width = match search(database, &set, Dimension.Width, false, &widths) {
+    Option<f64>.Some { value } => value
+    Option<f64>.None => request.width
+  }
+  keep(database, &mut set, Dimension.Width, false, width)
+
+  let mirror = match request.style {
+    Style.Oblique { degrees: angle } => angle < 0.0
+    _ => false
+  }
+  let groups = styleGroups(request.style)
+  let mut italic = Option<f64>.None
+  let mut oblique = Option<f64>.None
+  let mut index: usize = 0
+  while index < 4 {
+    let entry = groups[index]
+    let steps = Slice.view<Step>(&entry.steps, 0, entry.count)
+    let mirrored = mirror && entry.dimension == Dimension.Oblique
+    if let Option<f64>.Some { value } = search(database, &set, entry.dimension, mirrored, steps) {
+      keep(database, &mut set, entry.dimension, mirrored, value)
+      if entry.dimension == Dimension.Oblique {
+        oblique = Option<f64>.Some {
+          value: if mirrored {
+            -value
+          } else {
+            value
+          }
+        }
+      } else {
+        italic = Option<f64>.Some { value: value }
+      }
+      index = 4
+    }
+    index = index + 1
+  }
+
+  let weights = weightSteps(request.weight)
+  let weight = match search(database, &set, Dimension.Weight, false, &weights) {
+    Option<f64>.Some { value } => value
+    Option<f64>.None => request.weight
+  }
+  keep(database, &mut set, Dimension.Weight, false, weight)
+  if List<usize>.length(&set) == 0 {
+    return Option<Selection>.None
+  }
+  let face = List<usize>.get(&set, 0)
+
+  // #font-synthesis-style: an italic or oblique request on an upright face is sheared.
+  let upright = match oblique {
+    Option<f64>.Some { value } => value == 0.0
+    Option<f64>.None => match italic {
+      Option<f64>.Some { value } => value == 0.0
+      Option<f64>.None => true
+    }
+  }
+  let syntheticOblique = if !upright {
+    0.0
+  } else {
+    match request.style {
+      Style.Normal => 0.0
+      Style.Italic => DEFAULT_OBLIQUE
+      Style.Oblique { degrees: angle } => angle
+    }
+  }
+
+  // #font-synthesis-weight: embolden when the family lacks a bold enough face.
+  let syntheticBold = request.weight >= 600.0 && database.face(face).weight.max < 600.0
+  return Option<Selection>.Some {
+    value: Selection {
+      face: face,
+      weight: weight,
+      width: width,
+      italic: italic,
+      oblique: oblique,
+      syntheticOblique: syntheticOblique,
+      syntheticBold: syntheticBold,
+    },
+  }
+}
