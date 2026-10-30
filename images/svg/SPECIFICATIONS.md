@@ -476,7 +476,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
 - [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
-- [ ] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
+- [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
@@ -769,6 +769,29 @@ decisions:
   character: `start` aligns the right end of the extent for `rtl`. With `textLength`,
   an `rtl` element's characters move left (`spacing`) or scale about the right edge
   (`spacingAndGlyphs`).
+- Font features follow CSS Fonts 4 #feature-precedence: `font-kerning`, then
+  `font-variant-*`, then `font-feature-settings`, each a ranged shaper feature over the
+  element's own characters, so a later setting of a tag wins. Letter-spacing's ligature
+  suppression comes last. SVG 1.1 `kerning` with a length turns `kern` off and adds the
+  length to `letter-spacing` (1.1 §10.11). `font-kerning` and the `font-variant-*`
+  longhands are not presentation attributes in SVG 2, so only CSS sets them; the
+  `font-variant` shorthand is. Variants are not synthesized when the font lacks the
+  feature (CSS Fonts 4 allows synthesizing small caps and sub/superscripts).
+- `@font-face` (CSS Fonts 4 #font-face-rule) uses its first `src` entry that yields a face.
+  `local()` matches an installed face's full or PostScript name (case-insensitively, as
+  family names). A url works when its format is absent, `truetype`, `opentype` or
+  `collection`, when the sheet's processing mode may fetch it (secure modes allow `data:`
+  only), and when it holds a readable sfnt face. The url's first face is used. The face
+  joins font matching for this render only. WOFF/WOFF2 and `tech()` sources are skipped. `font-weight`, `font-width`/`font-stretch` and
+  `font-style` descriptors replace the face's own values, and `auto` keeps them. A family
+  that a document defines hides installed faces of the same name. `unicode-range`,
+  `font-display`, `size-adjust` and the metric overrides are ignored.
+- `font-variation-settings` axis values follow the ones font matching sets, so they win.
+  `font-optical-sizing` is not applied yet (no test font has an `opsz` axis).
+- `font-size-adjust` takes a number (the ex-height metric). The used size makes the x-height
+  of the span's first available font (its first matched face, at default variations) that
+  fraction of the computed size. Without an x-height metric the size is unchanged. `em`
+  units still use the computed size.
 - Synthetic bold (#font-synthesis-weight, method left to the UA) follows FreeType's
   `FT_Outline_EmboldenXY` and `FT_GlyphSlot_Embolden`: outlines grow by 1/24 em in x and y
   (in font units, before scaling), and each advancing glyph's advance grows by the same
