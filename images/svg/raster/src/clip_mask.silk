@@ -1,0 +1,111 @@
+//! Rasterize retained clip geometry without consuming fill, stroke or opacity.
+import svg_core.scene { ClipNode, FillRule, RenderError }
+import svg_core.mapping { Mapping }
+import svg_core.mapping
+import svg_core.vector_path
+import svg_geometry.geometry { Path }
+import vector.geometry { Rect }
+import vector.geometry_error { GeometryError }
+import vector.projective { Homography }
+import vector.projective
+import vector.flatten as flattening
+import vector.flatten { Line, TOLERANCE }
+import vector.strips { Rasterizer, Coverage, EVENODD, NONZERO }
+import vector.layer { Mask }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import clip_geometry
+import checked
+
+pub effect fn render(
+  nodes: &[ClipNode],
+  paths: &[Path],
+  root: usize,
+  width: u32,
+  height: u32,
+  placement: &Mapping,
+  availablePixels: usize,
+) -> Mask
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run checked.dimensions(width, height)
+  if root >= nodes.length || !placement.isFinite() {
+    fail RenderError.InvalidGeometry
+  }
+  let pixels = u32.toUsize(width) * u32.toUsize(height)
+
+  // References point backward, allowing a bounded reverse reachability walk.
+  // Unrelated clips in the global arena must not consume this layer's budget.
+  let mut needed = List<bool>.make()
+  let mut cursor: usize = 0
+  while cursor <= root {
+    run needed.append(cursor == root)
+    cursor = cursor + 1
+  }
+  while cursor > 0 {
+    cursor = cursor - 1
+    if needed.asSlice()[cursor] {
+      match &nodes[cursor] {
+        ClipNode.Intersect { left, right } => {
+          if left >= cursor || right >= cursor {
+            fail RenderError.InvalidGeometry
+          }
+          let mut flags = needed.asMutSlice()
+          flags[left] = true
+          flags[right] = true
+        }
+        ClipNode.Union { left, right } => {
+          if left >= cursor || right >= cursor {
+            fail RenderError.InvalidGeometry
+          }
+          let mut flags = needed.asMutSlice()
+          flags[left] = true
+          flags[right] = true
+        }
+        _ => {}
+      }
+    }
+  }
+  if pixels > availablePixels {
+    fail RenderError.TooLarge
+  }
+  let viewport = Rect.make(0.0, 0.0, u32.toF64(width), u32.toF64(height))
+  let mut leaves = List<List<Line>>.make()
+  let mut index: usize = 0
+  while index <= root {
+    let mut lines = List<Line>.make()
+    if needed.asSlice()[index] {
+      if let ClipNode.Shape { path, transform, rule } = &nodes[index] {
+        if path >= paths.length || !transform.isFinite() {
+          fail RenderError.InvalidGeometry
+        }
+        let source = run vector_path.convert(&paths[path])
+        let composed = run placement.compose(&transform)
+        match &composed {
+          Mapping.Affine { value } => {
+            run flattening.fillClipped(
+              &source,
+              &mapping.affine(value),
+              &viewport,
+              TOLERANCE,
+              &mut lines,
+            )
+          }
+          Mapping.Projective { value } => {
+            run projective.fill(&source, &value, viewport, TOLERANCE, &mut lines)
+          }
+        }
+        run checked.lines(lines.asSlice(), width, height)
+      }
+    }
+    run leaves.append(move lines)
+    index = index + 1
+  }
+  let lines = run clip_geometry.combine(nodes, leaves.asSlice(), root, needed.asSlice())
+  run checked.lines(lines.asSlice(), width, height)
+  let mut rasterizer = Rasterizer.make()
+  let mut coverage = Coverage.make(width, height)
+  run rasterizer.fillPolylines(lines.asSlice(), NONZERO, &mut coverage)
+  return run Mask.fromCoverage(&coverage)
+}

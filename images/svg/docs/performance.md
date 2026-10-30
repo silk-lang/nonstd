@@ -107,3 +107,29 @@ conformance or performance parity.
 | instances | 11.255× | 0.331× | 3.903× |
 | paintservers | 6.572× | 2.780× | 3.091× |
 | compositing | 12.123× | 5.909× | 5.856× |
+
+## Phase 6 clipping checkpoint
+
+Measured commit `f3be1c6` against the compositing renderer on the same Ubuntu 24.04 ARM64 VM and pinned Silk/LLVM 22 toolchain used above. Three native samples, one iteration, no warmup; Callgrind counts include the entire separate process, not only the render stage. The new deterministic clipping workload uses 64 translated groups with overlapping circular clips, nested object-bounding-box intersections and CSS polygon clips.
+
+| Workload | Old process Ir | New process Ir | New/old Ir | Render checksum equal |
+| --- | ---: | ---: | ---: | --- |
+| clipping/render | 64,359,927 | 1,831,535,051 | 28.4577 | False |
+| compositing/render | 506,523,215 | 506,898,509 | 1.0007 | True |
+| iconset/render | 386,115,056 | 386,379,645 | 1.0007 | True |
+| instances/render | 589,639,669 | 592,226,579 | 1.0044 | True |
+| largemap/render | 681,391,004 | 682,547,773 | 1.0017 | True |
+| mixedcurves/render | 358,734,483 | 358,538,860 | 0.9995 | True |
+| paintservers/render | 286,347,263 | 286,363,652 | 1.0001 | True |
+| stylesheets/render | 529,804,299 | 530,799,970 | 1.0019 | True |
+| tiger/render | 362,358,377 | 362,128,684 | 0.9994 | True |
+
+The clipping before/after ratio is not an equal-output speed comparison: the old renderer ignores these clips. Existing workloads retain their checksums.
+
+| Clipping stage | Silk median ms | resvg median ms | Silk/resvg |
+| --- | ---: | ---: | ---: |
+| clipping/end-to-end | 107.3452 | 5.6965 | 18.8440 |
+| clipping/parse | 2.7689 | 0.4166 | 6.6460 |
+| clipping/render | 105.9303 | 5.3687 | 19.7310 |
+
+Clipping output checksums differ from pinned resvg in all three modes; these measurements do not establish pixel conformance. The approximately 19.7× render-time gap remains open for phase 14. The evaluator currently builds full-size clip/layer surfaces and performs bounded geometric intersection work independently for each occurrence; profiling and caching/cropping work remain required. No tracked baseline or conformance tolerance was replaced.
