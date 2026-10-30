@@ -18,7 +18,7 @@ import svg_css.tokens { Limits, CssError }
 import svg_css.lexer
 import svg_css.input { Input }
 import svg_css.value_cursor { Cursor }
-import svg_fonts.database { Fonts, Generic }
+import svg_fonts.database { Fonts, Generic, Alternate }
 import svg_fonts.matching { Request, Selection, Style as FontStyle }
 import svg_fonts.matching
 import svg_fonts.names
@@ -660,6 +660,7 @@ effect fn span(
   style: StyleId,
   parent: Option<usize>,
   inherited: Baseline,
+  preferred: Option<usize>,
 ) -> Span
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
@@ -707,6 +708,12 @@ effect fn span(
   }
   let mut faces = List<Selection>.make()
   let mut candidates = List<usize>.make()
+
+  // An altGlyph's glyphs come from their SVG font first.
+  if let Option<usize>.Some { value } = preferred {
+    run candidates.append(value)
+    run choose(fonts, &candidates, request, &mut faces)
+  }
   if let Option<&TextValue>.Some { value: text } = textValue(engine, style, Property.FontFamily) {
     let items = text.items.asSlice()
     let mut index: usize = 0
@@ -937,7 +944,12 @@ effect fn walk(
     Option<usize>.Some { value } => gather.spans.asSlice()[value].dominant
     Option<usize>.None => Baseline.Alphabetic
   }
-  run gather.spans.append(run span(fonts, installed, engine, style, parent, inherited))
+  let mut alternate = List<u32>.make()
+  let mut preferred = Option<usize>.None
+  if equal(Document.localName(document, source.node), b"altGlyph") {
+    preferred = run alternateGlyphs(graph, fonts, source, &mut alternate)
+  }
+  run gather.spans.append(run span(fonts, installed, engine, style, parent, inherited, preferred))
   let position = gather.entries.length()
   run gather.entries.append(
     Entry {
@@ -975,7 +987,7 @@ effect fn walk(
     let kind = Document.nodes(document)[node.index].kind
     if kind == NodeKind.Text {
       run characters(&mut gather, Document.text(document, node), spanIndex, mode)
-    } else if kind == NodeKind.Element {
+    } else if kind == NodeKind.Element && preferred.isNone() {
       if let Option<OccurrenceId>.Some { value: nested } = element {
         if graph.occurrences.asSlice()[nested.index].eligible && contentChild(document, node) {
           run walk(
@@ -993,9 +1005,149 @@ effect fn walk(
     }
     child = Document.nextSibling(document, node)
   }
+
+  // SVG 1.1 #AltGlyphElement: the glyphs replace the characters, and stand for them in
+  // the positioning lists.
+  if preferred.isSome() {
+    let start = gather.entries.asSlice()[position].start
+    let mut units: usize = 0
+    let mut at = start
+    while at < gather.units.length() {
+      units = units + u8.toUsize(gather.units.asSlice()[at])
+      at = at + 1
+    }
+    while gather.characters.length() > start {
+      drop gather.characters.pop()
+      drop gather.units.pop()
+    }
+    let glyphs = alternate.asSlice()
+    let mut k: usize = 0
+    while k < glyphs.length {
+      run push(&mut gather, glyphs[k], spanIndex)
+      let counts = gather.units.asMutSlice()
+      counts[counts.length - 1] = if k == 0 && units > 255 {
+        255
+      } else if k == 0 {
+        usize.toU8(units)
+      } else {
+        0
+      }
+      k = k + 1
+    }
+    gather.collapsible = false
+  }
   let entries = gather.entries.asMutSlice()
   entries[position].end = gather.characters.length()
   gather.path = outer
+}
+
+// The glyph element `node` of an SVG font, as the face that has it and its character.
+fn alternateOf(fonts: &Fonts, node: NodeId) -> Option<Alternate> {
+  let all = fonts.alternates.asSlice()
+  let mut k: usize = 0
+  while k < all.length {
+    if all[k].node == node.index {
+      return Option<Alternate>.Some { value: all[k] }
+    }
+    k = k + 1
+  }
+  return Option<Alternate>.None
+}
+
+// The glyphRef children of `parent` as characters of one face, or none unless all resolve.
+effect fn glyphRefs(graph: &Graph, fonts: &Fonts, parent: SourceId, out: &mut List<u32>) -> Option<
+  usize
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let document = graph.sourceDocument(parent)
+  let mut face = Option<usize>.None
+  out.clear()
+  let mut child = Document.firstChild(document, parent.node)
+  while let Option<NodeId>.Some { value: node } = child {
+    if Document.nodes(document)[node.index].kind == NodeKind.Element
+      && equal(Document.localName(document, node), b"glyphRef") {
+      let found = match reference(graph, SourceId { document: parent.document, node: node }) {
+        Option<SourceId>.Some { value: target } => alternateOf(fonts, target.node)
+        _ => Option<Alternate>.None
+      }
+      match found {
+        Option<Alternate>.Some { value } => {
+          if let Option<usize>.Some { value: chosen } = face {
+            if chosen != value.face {
+              out.clear()
+              return Option<usize>.None
+            }
+          }
+          face = Option<usize>.Some { value: value.face }
+          run out.append(value.character)
+        }
+        _ => {
+          out.clear()
+          return Option<usize>.None
+        }
+      }
+    }
+    child = Document.nextSibling(document, node)
+  }
+  return face
+}
+
+// The glyphs an altGlyph names (1.1 #AltGlyphElement): a `glyph` of an SVG font, or an
+// `altGlyphDef` with glyphRef children or with altGlyphItem children, of which the first
+// whose references all resolve applies. Glyphs of the main document's SVG fonts only.
+effect fn alternateGlyphs(
+  graph: &Graph,
+  fonts: &Fonts,
+  source: SourceId,
+  out: &mut List<u32>,
+) -> Option<usize,>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let main = graph.occurrences.asSlice()[graph.root.index].source.document
+  let target = match reference(graph, source) {
+    Option<SourceId>.Some { value } => value
+    _ => {
+      return Option<usize>.None
+    }
+  }
+  if target.document.index != main.index {
+    return Option<usize>.None
+  }
+  let document = graph.sourceDocument(target)
+  let name = Document.localName(document, target.node)
+  if equal(name, b"glyph") {
+    if let Option<Alternate>.Some { value } = alternateOf(fonts, target.node) {
+      run out.append(value.character)
+      return Option<usize>.Some { value: value.face }
+    }
+    return Option<usize>.None
+  }
+  if !equal(name, b"altGlyphDef") {
+    return Option<usize>.None
+  }
+  let mut items = false
+  let mut child = Document.firstChild(document, target.node)
+  while let Option<NodeId>.Some { value: node } = child {
+    if Document.nodes(document)[node.index].kind == NodeKind.Element
+      && equal(Document.localName(document, node), b"altGlyphItem") {
+      items = true
+      let face = run glyphRefs(
+        graph,
+        fonts,
+        SourceId { document: target.document, node: node },
+        &mut out.*,
+      )
+      if face.isSome() {
+        return face
+      }
+    }
+    child = Document.nextSibling(document, node)
+  }
+  if items {
+    return Option<usize>.None
+  }
+  return run glyphRefs(graph, fonts, target, &mut out.*)
 }
 
 /// The same-document element an `href` or `xlink:href` fragment names.

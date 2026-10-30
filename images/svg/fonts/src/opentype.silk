@@ -1,0 +1,1298 @@
+//! SVG 1.1 fonts (ch. 20) compiled into OpenType data, so that the font database, shaping
+//! and glyph outlines treat them like any other face. Glyph selection (#GlyphSelectionRules:
+//! the first glyph in document order whose `unicode` matches) becomes a `cmap` for single
+//! characters and `ccmp` ligatures, `arabic-form` becomes the `init`/`medi`/`fina` features,
+//! `orientation` becomes `vert`, and `hkern` becomes a `kern` table. Outlines go into a CFF
+//! table as cubic curves with 16.16 fixed coordinates.
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// Glyph k of the glyph list is also mapped from this character plus k, unless the font
+/// already maps that character, so that `altGlyph` can name any glyph (supplementary
+/// private use plane A).
+pub const ALTERNATES: u32 = 0xf0000
+
+/// The `arabic-form` a glyph is restricted to.
+pub enum Form {
+  Any,
+  Initial,
+  Medial,
+  Terminal,
+  Isolated,
+}
+
+/// The inline-progression direction a glyph is restricted to (`orientation`).
+pub enum Direction {
+  Any,
+  Horizontal,
+  Vertical,
+}
+
+/// One outline command in font units, y up.
+pub union Command {
+  MoveTo { pub x: f64, pub y: f64 },
+  LineTo { pub x: f64, pub y: f64 },
+  CubicTo { pub x1: f64, pub y1: f64, pub x2: f64, pub y2: f64, pub x: f64, pub y: f64 },
+  Close,
+}
+
+impl Copy for Command {}
+
+pub struct Glyph {
+  /// The characters the glyph stands for; empty when only `altGlyph` can use it.
+  pub unicode: List<u32>,
+  pub advance: f64,
+  pub verticalAdvance: f64,
+  /// The y of the vertical origin in font units.
+  pub verticalOrigin: f64,
+  pub form: Form,
+  pub direction: Direction,
+  /// False when the glyph can never be selected, such as for a `lang` that does not apply.
+  pub usable: bool,
+  pub outline: List<Command>,
+}
+
+/// An `hkern` pair set, as indices into the glyph list.
+pub struct Kerning {
+  pub first: List<usize>,
+  pub second: List<usize>,
+  /// The amount the spacing shrinks by, in font units.
+  pub value: f64,
+}
+
+pub struct FontMetrics {
+  pub unitsPerEm: f64,
+  pub ascent: f64,
+  pub descent: f64,
+  pub xHeight: f64,
+  pub capHeight: f64,
+  pub underlinePosition: f64,
+  pub underlineThickness: f64,
+  pub strikethroughPosition: f64,
+  pub strikethroughThickness: f64,
+  pub weight: f64,
+  pub verticalAdvance: f64,
+  pub verticalOrigin: f64,
+}
+
+impl Copy for FontMetrics {}
+
+/// A mapping from one glyph id to another, or from a character to a glyph id.
+struct Pair {
+  from: u32,
+  to: u32,
+}
+
+impl Copy for Pair {}
+
+struct Ligature {
+  glyph: u32,
+  components: List<u32>,
+}
+
+/// One table being assembled.
+struct Table {
+  tag: u32,
+  data: List<u8>,
+}
+
+struct Box {
+  xMin: f64,
+  yMin: f64,
+  xMax: f64,
+  yMax: f64,
+}
+
+impl Copy for Box {}
+
+// --- Writing -------------------------------------------------------------------------------
+
+effect fn put(out: &mut List<u8>, value: i64, size: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bits = i64.wrappingToU64(value)
+  let mut k = size
+  while k > 0 {
+    k = k - 1
+    let mut shifted = bits
+    let mut step: usize = 0
+    while step < k {
+      shifted = shifted / 256
+      step = step + 1
+    }
+    run out.append(u64.wrappingToU8(shifted))
+  }
+}
+
+fn patch(out: &mut List<u8>, at: usize, value: i64, size: usize) -> () {
+  let bytes = out.asMutSlice()
+  let mut bits = i64.wrappingToU64(value)
+  let mut k = size
+  while k > 0 {
+    k = k - 1
+    bytes[at + k] = u64.wrappingToU8(bits)
+    bits = bits / 256
+  }
+}
+
+effect fn tag(out: &mut List<u8>, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut out.*, u32.toI64(value), 4)
+}
+
+// A font unit value, rounded and kept in the signed 16-bit range.
+fn word(value: f64) -> i64 {
+  if !f64.isFinite(value) {
+    return 0
+  }
+  let rounded = f64.round(value)
+  if rounded > 32767.0 {
+    return 32767
+  }
+  if rounded < -32768.0 {
+    return -32768
+  }
+  return f64.toI64(rounded)
+}
+
+fn unsigned(value: f64) -> i64 {
+  let rounded = word(value)
+  return if rounded < 0 {
+    0
+  } else {
+    rounded
+  }
+}
+
+// 16.16 fixed, kept in the signed 32-bit range.
+fn fixed(value: f64) -> i64 {
+  if !f64.isFinite(value) {
+    return 0
+  }
+  let scaled = f64.round(value * 65536.0)
+  if scaled > 2147483647.0 {
+    return 2147483647
+  }
+  if scaled < -2147483648.0 {
+    return -2147483648
+  }
+  return f64.toI64(scaled)
+}
+
+effect fn padded(out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while out.length() % 4 != 0 {
+    run out.append(0)
+  }
+}
+
+fn clamp(value: i64, low: i64, high: i64) -> i64 {
+  if value < low {
+    return low
+  }
+  if value > high {
+    return high
+  }
+  return value
+}
+
+fn lesser(left: u32, right: u32) -> u32 {
+  return if left < right {
+    left
+  } else {
+    right
+  }
+}
+
+fn searchFields(count: usize, unit: usize) -> [i64; 3] {
+  let mut power: usize = 1
+  let mut log: i64 = 0
+  while power * 2 <= count {
+    power = power * 2
+    log = log + 1
+  }
+  let range = power * unit
+  let rest = if count * unit > range {
+    count * unit - range
+  } else {
+    0
+  }
+  return [usize.toI64(range), log, usize.toI64(rest)]
+}
+
+// --- Glyph selection -----------------------------------------------------------------------
+
+fn horizontal(glyph: &Glyph) -> bool {
+  return glyph.usable && glyph.direction != Direction.Vertical
+}
+
+fn allows(glyph: &Glyph, form: Form) -> bool {
+  return glyph.form == Form.Any || glyph.form == form
+}
+
+// The first usable glyph, in document order, for the single character `cp` in `form`,
+// horizontal unless `vertical`.
+fn select(glyphs: &[Glyph], cp: u32, form: Form, vertical: bool) -> Option<usize> {
+  let mut index: usize = 0
+  while index < glyphs.length {
+    let glyph = &glyphs[index]
+    let units = List<u32>.asSlice(&glyph.unicode)
+    let oriented = if vertical {
+      glyph.direction != Direction.Horizontal
+    } else {
+      glyph.direction != Direction.Vertical
+    }
+    if glyph.usable && oriented && units.length == 1 && units[0] == cp && allows(glyph, form) {
+      return Option<usize>.Some { value: index }
+    }
+    index = index + 1
+  }
+  return Option<usize>.None
+}
+
+// Whether `prefix` starts `sequence`.
+fn starts(sequence: &[u32], prefix: &[u32]) -> bool {
+  if prefix.length > sequence.length {
+    return false
+  }
+  let mut k: usize = 0
+  while k < prefix.length {
+    if sequence[k] != prefix[k] {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+// The glyph id that `cp` maps to, adding a placeholder that draws like the missing glyph
+// when no single glyph stands for it.
+effect fn mapped(map: &mut List<Pair>, placeholders: &mut List<u32>, next: &mut u32, cp: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pairs = map.asSlice()
+  let mut k: usize = 0
+  while k < pairs.length {
+    if pairs[k].from == cp {
+      return pairs[k].to
+    }
+    k = k + 1
+  }
+  let id = next.*
+  next.* = id + 1
+  run map.append(Pair { from: cp, to: id })
+  run placeholders.append(cp)
+  return id
+}
+
+effect fn sortPairs(pairs: &mut List<Pair>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut keys = List<u64>.make()
+  let slice = pairs.asSlice()
+  let mut k: usize = 0
+  while k < slice.length {
+    run keys.append(u32.toU64(slice[k].from) * 4294967296 + u32.toU64(slice[k].to))
+    k = k + 1
+  }
+  run keys.sort()
+  pairs.clear()
+  let sorted = keys.asSlice()
+  k = 0
+  while k < sorted.length {
+    run pairs.append(
+      Pair {
+        from: u64.wrappingToU32(sorted[k] / 4294967296),
+        to: u64.wrappingToU32(sorted[k] % 4294967296),
+      },
+    )
+    k = k + 1
+  }
+}
+
+// --- Outlines --------------------------------------------------------------------------------
+
+fn grow(bounds: &mut Box, x: f64, y: f64) -> () {
+  bounds.xMin = f64.min(bounds.xMin, x)
+  bounds.yMin = f64.min(bounds.yMin, y)
+  bounds.xMax = f64.max(bounds.xMax, x)
+  bounds.yMax = f64.max(bounds.yMax, y)
+}
+
+fn extent(outline: &[Command]) -> Option<Box> {
+  let mut bounds = Box {
+    xMin: f64.INFINITY,
+    yMin: f64.INFINITY,
+    xMax: -f64.INFINITY,
+    yMax: -f64.INFINITY,
+  }
+  let mut k: usize = 0
+  while k < outline.length {
+    match outline[k] {
+      Command.MoveTo { x, y } => grow(&mut bounds, x, y)
+      Command.LineTo { x, y } => grow(&mut bounds, x, y)
+      Command.CubicTo { x1, y1, x2, y2, x, y } => {
+        grow(&mut bounds, x1, y1)
+        grow(&mut bounds, x2, y2)
+        grow(&mut bounds, x, y)
+      }
+      Command.Close => {}
+    }
+    k = k + 1
+  }
+  if bounds.xMin > bounds.xMax {
+    return Option<Box>.None
+  }
+  return Option<Box>.Some { value: bounds }
+}
+
+effect fn operand(out: &mut List<u8>, value: i64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(255)
+  run put(&mut out.*, value, 4)
+}
+
+// A Type 2 charstring for `outline`. The pen tracks the last point drawn: CFF closes a
+// contour at the next moveto without moving the pen back to the contour's start.
+effect fn charstring(outline: &[Command], out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut penX: i64 = 0
+  let mut penY: i64 = 0
+  let mut startX: i64 = 0
+  let mut startY: i64 = 0
+  let mut open = false
+  let mut closed = false
+  let mut k: usize = 0
+  while k < outline.length {
+    let command = outline[k]
+    let restarts = match command {
+      Command.LineTo { x, y } => true
+      Command.CubicTo { x1, y1, x2, y2, x, y } => true
+      _ => false
+    }
+    if closed && restarts {
+      // Drawing after a close starts a new contour at the closed one's start.
+      run operand(&mut out.*, startX - penX)
+      run operand(&mut out.*, startY - penY)
+      run out.append(21)
+      penX = startX
+      penY = startY
+      open = true
+      closed = false
+    }
+    match command {
+      Command.MoveTo { x, y } => {
+        let tx = fixed(x)
+        let ty = fixed(y)
+        run operand(&mut out.*, tx - penX)
+        run operand(&mut out.*, ty - penY)
+        run out.append(21)
+        penX = tx
+        penY = ty
+        startX = tx
+        startY = ty
+        open = true
+        closed = false
+      }
+      Command.LineTo { x, y } => {
+        if open {
+          let tx = fixed(x)
+          let ty = fixed(y)
+          run operand(&mut out.*, tx - penX)
+          run operand(&mut out.*, ty - penY)
+          run out.append(5)
+          penX = tx
+          penY = ty
+        }
+      }
+      Command.CubicTo { x1, y1, x2, y2, x, y } => {
+        if open {
+          let ax = fixed(x1)
+          let ay = fixed(y1)
+          let bx = fixed(x2)
+          let by = fixed(y2)
+          let tx = fixed(x)
+          let ty = fixed(y)
+          run operand(&mut out.*, ax - penX)
+          run operand(&mut out.*, ay - penY)
+          run operand(&mut out.*, bx - ax)
+          run operand(&mut out.*, by - ay)
+          run operand(&mut out.*, tx - bx)
+          run operand(&mut out.*, ty - by)
+          run out.append(8)
+          penX = tx
+          penY = ty
+        }
+      }
+      Command.Close => {
+        if open {
+          closed = true
+        }
+      }
+    }
+    k = k + 1
+  }
+  run out.append(14)
+}
+
+// An INDEX of `items`, with 4-byte offsets.
+effect fn index(out: &mut List<u8>, items: &List<List<u8>>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let all = items.asSlice()
+  run put(&mut out.*, usize.toI64(all.length), 2)
+  if all.length == 0 {
+    return
+  }
+  run out.append(4)
+  let mut offset: usize = 1
+  run put(&mut out.*, 1, 4)
+  let mut k: usize = 0
+  while k < all.length {
+    offset = offset + all[k].length()
+    run put(&mut out.*, usize.toI64(offset), 4)
+    k = k + 1
+  }
+  k = 0
+  while k < all.length {
+    run out.appendSlice(all[k].asSlice())
+    k = k + 1
+  }
+}
+
+effect fn dictInteger(out: &mut List<u8>, value: i64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(29)
+  run put(&mut out.*, value, 4)
+}
+
+effect fn cff(outlines: &List<List<u8>>, out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.appendSlice(&[1, 0, 4, 4])
+  let mut names = List<List<u8>>.make()
+  let mut name = List<u8>.make()
+  run name.appendSlice(b"SVGFont")
+  run names.append(move name)
+  run index(&mut out.*, &names)
+
+  // The Top DICT has a fixed size, so the offsets after it are known up front.
+  let top = out.length()
+  let topSize: usize = 2 + 1 + 4 + 4 + 17
+  let strings = top + topSize
+  let charStrings = strings + 2 + 2
+  let mut body = List<u8>.make()
+  run index(&mut body, outlines)
+  let private = charStrings + body.length()
+  let mut dict = List<u8>.make()
+  run dictInteger(&mut dict, usize.toI64(charStrings))
+  run dict.append(17)
+  run dictInteger(&mut dict, 2)
+  run dictInteger(&mut dict, usize.toI64(private))
+  run dict.append(18)
+  let mut dicts = List<List<u8>>.make()
+  run dicts.append(move dict)
+  run index(&mut out.*, &dicts)
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, 0, 2)
+  run out.appendSlice(body.asSlice())
+
+  // defaultWidthX 0.
+  run out.appendSlice(&[139, 20])
+}
+
+// --- GSUB ---------------------------------------------------------------------------------
+
+effect fn coverage(out: &mut List<u8>, glyphs: &[u32]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut out.*, 1, 2)
+  run put(&mut out.*, usize.toI64(glyphs.length), 2)
+  let mut k: usize = 0
+  while k < glyphs.length {
+    run put(&mut out.*, u32.toI64(glyphs[k]), 2)
+    k = k + 1
+  }
+}
+
+// A lookup of one single substitution subtable (format 2) for sorted `pairs`.
+effect fn singles(pairs: &[Pair], out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut out.*, 1, 2)
+  run put(&mut out.*, 0, 2)
+  if pairs.length == 0 {
+    run put(&mut out.*, 0, 2)
+    return
+  }
+  run put(&mut out.*, 1, 2)
+  run put(&mut out.*, 8, 2)
+  let subtable = out.length()
+  let at = subtable + 6 + 2 * pairs.length
+  run put(&mut out.*, 2, 2)
+  run put(&mut out.*, usize.toI64(at - subtable), 2)
+  run put(&mut out.*, usize.toI64(pairs.length), 2)
+  let mut k: usize = 0
+  while k < pairs.length {
+    run put(&mut out.*, u32.toI64(pairs[k].to), 2)
+    k = k + 1
+  }
+  let mut covered = List<u32>.make()
+  k = 0
+  while k < pairs.length {
+    run covered.append(pairs[k].from)
+    k = k + 1
+  }
+  run coverage(&mut out.*, covered.asSlice())
+}
+
+// A lookup of one ligature substitution subtable. `ligatures` are grouped by first
+// component in ascending order, each group in document order.
+effect fn ligatureLookup(ligatures: &[Ligature], out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut out.*, 4, 2)
+  run put(&mut out.*, 0, 2)
+  if ligatures.length == 0 {
+    run put(&mut out.*, 0, 2)
+    return
+  }
+  run put(&mut out.*, 1, 2)
+  run put(&mut out.*, 8, 2)
+  let subtable = out.length()
+  let mut firsts = List<u32>.make()
+  let mut k: usize = 0
+  while k < ligatures.length {
+    let first = List<u32>.asSlice(&ligatures[k].components)[0]
+    if firsts.length() == 0 || firsts.asSlice()[firsts.length() - 1] != first {
+      run firsts.append(first)
+    }
+    k = k + 1
+  }
+  let sets = firsts.length()
+  run put(&mut out.*, 1, 2)
+  let coverageAt = out.length()
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, usize.toI64(sets), 2)
+  let offsets = out.length()
+  k = 0
+  while k < sets {
+    run put(&mut out.*, 0, 2)
+    k = k + 1
+  }
+  let mut next: usize = 0
+  let mut set: usize = 0
+  while set < sets {
+    let first = firsts.asSlice()[set]
+    let mut count: usize = 0
+    while next + count < ligatures.length
+      && List<u32>.asSlice(&ligatures[next + count].components)[0] == first {
+      count = count + 1
+    }
+    let setAt = out.length()
+    patch(&mut out.*, offsets + 2 * set, usize.toI64(setAt - subtable), 2)
+    run put(&mut out.*, usize.toI64(count), 2)
+    let entries = out.length()
+    let mut e: usize = 0
+    while e < count {
+      run put(&mut out.*, 0, 2)
+      e = e + 1
+    }
+    e = 0
+    while e < count {
+      let ligature = &ligatures[next + e]
+      let here = out.length()
+      patch(&mut out.*, entries + 2 * e, usize.toI64(here - setAt), 2)
+      let components = List<u32>.asSlice(&ligature.components)
+      run put(&mut out.*, u32.toI64(ligature.glyph), 2)
+      run put(&mut out.*, usize.toI64(components.length), 2)
+      let mut c: usize = 1
+      while c < components.length {
+        run put(&mut out.*, u32.toI64(components[c]), 2)
+        c = c + 1
+      }
+      e = e + 1
+    }
+    next = next + count
+    set = set + 1
+  }
+  let end = out.length()
+  patch(&mut out.*, coverageAt, usize.toI64(end - subtable), 2)
+  run coverage(&mut out.*, firsts.asSlice())
+}
+
+// GSUB with the features ccmp, fina, init, medi and vert for the DFLT and arab scripts;
+// lookup k serves feature k. Returns false when an offset would not fit in 16 bits.
+effect fn gsub(
+  ligatures: &[Ligature],
+  forms: &[List<Pair>],
+  vertical: &[Pair],
+  out: &mut List<u8>,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut out.*, 0x00010000, 4)
+  run put(&mut out.*, 10, 2)
+  let featuresAt = out.length()
+  run put(&mut out.*, 0, 2)
+  let lookupsAt = out.length()
+  run put(&mut out.*, 0, 2)
+
+  // ScriptList: two scripts sharing one default LangSys layout.
+  let scripts = out.length()
+  run put(&mut out.*, 2, 2)
+  run tag(&mut out.*, 0x44464c54)
+  run put(&mut out.*, 14, 2)
+  run tag(&mut out.*, 0x61726162)
+  run put(&mut out.*, 14, 2)
+  run put(&mut out.*, 4, 2)
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, 0xffff, 2)
+  run put(&mut out.*, 5, 2)
+  let mut f: i64 = 0
+  while f < 5 {
+    run put(&mut out.*, f, 2)
+    f = f + 1
+  }
+  let features = out.length()
+  patch(&mut out.*, featuresAt, usize.toI64(features), 2)
+  let tags: [u32; 5] = [0x63636d70, 0x66696e61, 0x696e6974, 0x6d656469, 0x76657274]
+  run put(&mut out.*, 5, 2)
+  let mut k: usize = 0
+  while k < 5 {
+    run tag(&mut out.*, tags[k])
+    run put(&mut out.*, usize.toI64(2 + 6 * 5 + 6 * k), 2)
+    k = k + 1
+  }
+  k = 0
+  while k < 5 {
+    run put(&mut out.*, 0, 2)
+    run put(&mut out.*, 1, 2)
+    run put(&mut out.*, usize.toI64(k), 2)
+    k = k + 1
+  }
+  let lookups = out.length()
+  patch(&mut out.*, lookupsAt, usize.toI64(lookups), 2)
+  run put(&mut out.*, 5, 2)
+  k = 0
+  while k < 5 {
+    run put(&mut out.*, 0, 2)
+    k = k + 1
+  }
+  k = 0
+  while k < 5 {
+    let start = out.length()
+    if start - lookups > 65535 {
+      return false
+    }
+    patch(&mut out.*, lookups + 2 + 2 * k, usize.toI64(start - lookups), 2)
+    let mut body = List<u8>.make()
+    if k == 0 {
+      run ligatureLookup(ligatures, &mut body)
+    } else if k == 4 {
+      run singles(vertical, &mut body)
+    } else {
+      run singles(List<Pair>.asSlice(&forms[k - 1]), &mut body)
+    }
+    if body.length() > 65535 {
+      return false
+    }
+    run out.appendSlice(body.asSlice())
+    k = k + 1
+  }
+  return true
+}
+
+// --- Other tables -----------------------------------------------------------------------------
+
+effect fn utf16(out: &mut List<u8>, text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < text.length {
+    let lead = text[at]
+    let mut cp = u8.toU32(lead)
+    let mut length: usize = 1
+    if lead >= 0xf0 && at + 3 < text.length {
+      cp = (u8.toU32(lead) % 8) * 262144 + (u8.toU32(text[at + 1]) % 64) * 4096
+        + (u8.toU32(text[at + 2]) % 64) * 64
+        + u8.toU32(text[at + 3]) % 64
+      length = 4
+    } else if lead >= 0xe0 && at + 2 < text.length {
+      cp = (u8.toU32(lead) % 16) * 4096 + (u8.toU32(text[at + 1]) % 64) * 64
+        + u8.toU32(text[at + 2]) % 64
+      length = 3
+    } else if lead >= 0xc0 && at + 1 < text.length {
+      cp = (u8.toU32(lead) % 32) * 64 + u8.toU32(text[at + 1]) % 64
+      length = 2
+    }
+    if cp >= 0x10000 {
+      let rest = cp - 0x10000
+      run put(&mut out.*, u32.toI64(0xd800 + rest / 1024), 2)
+      run put(&mut out.*, u32.toI64(0xdc00 + rest % 1024), 2)
+    } else {
+      run put(&mut out.*, u32.toI64(cp), 2)
+    }
+    at = at + length
+  }
+}
+
+effect fn nameTable(family: &[u8], out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut first = List<u8>.make()
+  run utf16(&mut first, family)
+  let mut second = List<u8>.make()
+  run utf16(&mut second, b"Regular")
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, 2, 2)
+  run put(&mut out.*, 6 + 2 * 12, 2)
+  let records: [i64; 2] = [1, 2]
+  let mut offset: usize = 0
+  let mut k: usize = 0
+  while k < 2 {
+    let length = if k == 0 {
+      first.length()
+    } else {
+      second.length()
+    }
+    run put(&mut out.*, 3, 2)
+    run put(&mut out.*, 1, 2)
+    run put(&mut out.*, 0x409, 2)
+    run put(&mut out.*, records[k], 2)
+    run put(&mut out.*, usize.toI64(length), 2)
+    run put(&mut out.*, usize.toI64(offset), 2)
+    offset = offset + length
+    k = k + 1
+  }
+  run out.appendSlice(first.asSlice())
+  run out.appendSlice(second.asSlice())
+}
+
+effect fn cmapTable(map: &[Pair], out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, 1, 2)
+  run put(&mut out.*, 3, 2)
+  run put(&mut out.*, 10, 2)
+  run put(&mut out.*, 12, 4)
+  run put(&mut out.*, 12, 2)
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, usize.toI64(16 + 12 * map.length), 4)
+  run put(&mut out.*, 0, 4)
+  run put(&mut out.*, usize.toI64(map.length), 4)
+  let mut k: usize = 0
+  while k < map.length {
+    run put(&mut out.*, u32.toI64(map[k].from), 4)
+    run put(&mut out.*, u32.toI64(map[k].from), 4)
+    run put(&mut out.*, u32.toI64(map[k].to), 4)
+    k = k + 1
+  }
+}
+
+// `kern` subtables of at most 10920 pairs each; `pairs` hold (left << 16 | right) -> value.
+effect fn kernTable(keys: &[u64], values: &[i64], out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let limit: usize = 10920
+  let tables = (keys.length + limit - 1) / limit
+  run put(&mut out.*, 0, 2)
+  run put(&mut out.*, usize.toI64(tables), 2)
+  let mut start: usize = 0
+  while start < keys.length {
+    let count = if keys.length - start < limit {
+      keys.length - start
+    } else {
+      limit
+    }
+    run put(&mut out.*, 0, 2)
+    run put(&mut out.*, usize.toI64(14 + 6 * count), 2)
+    run put(&mut out.*, 1, 2)
+    run put(&mut out.*, usize.toI64(count), 2)
+    let search = searchFields(count, 6)
+    run put(&mut out.*, search[0], 2)
+    run put(&mut out.*, search[1], 2)
+    run put(&mut out.*, search[2], 2)
+    let mut k = start
+    while k < start + count {
+      run put(&mut out.*, u64.toI64(keys[k] / 65536), 2)
+      run put(&mut out.*, u64.toI64(keys[k] % 65536), 2)
+      run put(&mut out.*, values[k], 2)
+      k = k + 1
+    }
+    start = start + count
+  }
+}
+
+fn checksum(data: &[u8]) -> u32 {
+  let mut sum: u64 = 0
+  let mut k: usize = 0
+  while k < data.length {
+    let mut word: u64 = 0
+    let mut b: usize = 0
+    while b < 4 {
+      word = word * 256
+      if k + b < data.length {
+        word = word + u8.toU64(data[k + b])
+      }
+      b = b + 1
+    }
+    sum = (sum + word) % 4294967296
+    k = k + 4
+  }
+  return u64.wrappingToU32(sum)
+}
+
+// --- Compile -------------------------------------------------------------------------------
+
+/// OpenType (CFF) data for an SVG font named `family`, whose glyph 0 draws `missing` and
+/// glyph k + 1 draws `glyphs[k]`.
+pub effect fn compile(
+  family: &[u8],
+  metrics: FontMetrics,
+  missing: &Glyph,
+  glyphs: &[Glyph],
+  kernings: &[Kerning],
+) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut next = usize.toU32(glyphs.length) + 1
+
+  // cmap: each character a single glyph stands for, mapped to the first one that applies
+  // horizontally in isolated form.
+  let mut map = List<Pair>.make()
+  let mut index: usize = 0
+  while index < glyphs.length {
+    let units = List<u32>.asSlice(&glyphs[index].unicode)
+    if units.length == 1 {
+      if let Option<usize>.Some { value } = select(glyphs, units[0], Form.Isolated, false) {
+        if value == index {
+          run map.append(Pair { from: units[0], to: usize.toU32(index) + 1 })
+        }
+      }
+    }
+    index = index + 1
+  }
+
+  // Ligatures that no earlier glyph pre-empts with a prefix of their characters.
+  let mut placeholders = List<u32>.make()
+  let mut ligatures = List<Ligature>.make()
+  index = 0
+  while index < glyphs.length {
+    let glyph = &glyphs[index]
+    let units = List<u32>.asSlice(&glyph.unicode)
+    if units.length > 1 && horizontal(glyph) && glyph.form == Form.Any {
+      let mut reachable = true
+      let mut earlier: usize = 0
+      while earlier < index && reachable {
+        let other = &glyphs[earlier]
+        let prefix = List<u32>.asSlice(&other.unicode)
+        if horizontal(other) && prefix.length > 0 && starts(units, prefix) {
+          reachable = false
+        }
+        earlier = earlier + 1
+      }
+      if reachable {
+        let mut components = List<u32>.make()
+        let mut c: usize = 0
+        while c < units.length {
+          run components.append(run mapped(&mut map, &mut placeholders, &mut next, units[c]))
+          c = c + 1
+        }
+        run ligatures.append(
+          Ligature { glyph: usize.toU32(index) + 1, components: move components },
+        )
+      }
+    }
+    index = index + 1
+  }
+
+  // Stable order by first component keeps document order within each set.
+  let mut order = List<u64>.make()
+  index = 0
+  while index < ligatures.length() {
+    let first = List<u32>.asSlice(&ligatures.asSlice()[index].components)[0]
+    run order.append(u32.toU64(first) * 4294967296 + usize.toU64(index))
+    index = index + 1
+  }
+  run order.sort()
+  let mut grouped = List<Ligature>.make()
+  index = 0
+  while index < order.length() {
+    let from = u64.toUsize(order.asSlice()[index] % 4294967296)
+    let source = &ligatures.asSlice()[from]
+    let mut components = List<u32>.make()
+    run components.appendSlice(List<u32>.asSlice(&source.components))
+    run grouped.append(Ligature { glyph: source.glyph, components: move components })
+    index = index + 1
+  }
+
+  // Contextual forms and vertical alternates of each mapped character.
+  let wanted: [Form; 3] = [Form.Terminal, Form.Initial, Form.Medial]
+  let mut forms = List<List<Pair>>.make()
+  let mut f: usize = 0
+  while f < 3 {
+    let mut pairs = List<Pair>.make()
+    let all = map.asSlice()
+    let mut k: usize = 0
+    while k < all.length {
+      if let Option<usize>.Some { value } = select(glyphs, all[k].from, wanted[f], false) {
+        let to = usize.toU32(value) + 1
+        if to != all[k].to {
+          run pairs.append(Pair { from: all[k].to, to: to })
+        }
+      }
+      k = k + 1
+    }
+    run sortPairs(&mut pairs)
+    run forms.append(move pairs)
+    f = f + 1
+  }
+  let mut vertical = List<Pair>.make()
+  let all = map.asSlice()
+  index = 0
+  while index < all.length {
+    if let Option<usize>.Some { value } = select(glyphs, all[index].from, Form.Isolated, true) {
+      let to = usize.toU32(value) + 1
+      if to != all[index].to {
+        run vertical.append(Pair { from: all[index].to, to: to })
+      }
+    }
+    index = index + 1
+  }
+  run sortPairs(&mut vertical)
+
+  // Kerning pairs, the first hkern in document order winning.
+  let mut kernKeys = List<u64>.make()
+  let mut k: usize = 0
+  while k < kernings.length {
+    let firsts = List<usize>.asSlice(&kernings[k].first)
+    let seconds = List<usize>.asSlice(&kernings[k].second)
+    let mut a: usize = 0
+    while a < firsts.length && kernKeys.length() < 1000000 {
+      let mut b: usize = 0
+      while b < seconds.length {
+        let key = (usize.toU64(firsts[a]) + 1) * 65536 + usize.toU64(seconds[b]) + 1
+        run kernKeys.append(key * 1048576 + usize.toU64(k))
+        b = b + 1
+      }
+      a = a + 1
+    }
+    k = k + 1
+  }
+  run kernKeys.sort()
+  let mut pairKeys = List<u64>.make()
+  let mut pairValues = List<i64>.make()
+  k = 0
+  while k < kernKeys.length() {
+    let entry = kernKeys.asSlice()[k]
+    let key = entry / 1048576
+    if pairKeys.length() == 0 || pairKeys.asSlice()[pairKeys.length() - 1] != key {
+      run pairKeys.append(key)
+      run pairValues.append(-word(kernings[u64.toUsize(entry % 1048576)].value))
+    }
+    k = k + 1
+  }
+  let mut private = List<u32>.make()
+  let existing = map.asSlice()
+  index = 0
+  while index < existing.length {
+    if existing[index].from >= ALTERNATES {
+      run private.append(existing[index].from)
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < glyphs.length && index < 0xfffe {
+    let cp = ALTERNATES + usize.toU32(index)
+    let mut taken = false
+    let used = private.asSlice()
+    let mut p: usize = 0
+    while p < used.length && !taken {
+      taken = used[p] == cp
+      p = p + 1
+    }
+    if !taken {
+      run map.append(Pair { from: cp, to: usize.toU32(index) + 1 })
+    }
+    index = index + 1
+  }
+  run sortPairs(&mut map)
+
+  // Per glyph: outline, advances, bounds.
+  let count = u32.toUsize(next)
+  let mut outlines = List<List<u8>>.make()
+  let mut advances = List<i64>.make()
+  let mut heights = List<i64>.make()
+  let mut origins = List<i64>.make()
+  let mut boxes = List<Option<Box>>.make()
+  let mut g: usize = 0
+  while g < count {
+    let glyph = if g == 0 || g > glyphs.length {
+      missing
+    } else {
+      &glyphs[g - 1]
+    }
+    let commands = List<Command>.asSlice(&glyph.outline)
+    let mut program = List<u8>.make()
+    run charstring(commands, &mut program)
+    run outlines.append(move program)
+    run advances.append(unsigned(glyph.advance))
+    run heights.append(unsigned(glyph.verticalAdvance))
+    run origins.append(word(glyph.verticalOrigin))
+    run boxes.append(extent(commands))
+    g = g + 1
+  }
+  let mut total = Box { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+  let mut any = false
+  let mut widest: i64 = 0
+  let mut tallest: i64 = 0
+  g = 0
+  while g < count {
+    if let Option<Box>.Some { value } = boxes.asSlice()[g] {
+      if any {
+        grow(&mut total, value.xMin, value.yMin)
+        grow(&mut total, value.xMax, value.yMax)
+      } else {
+        total = value
+        any = true
+      }
+    }
+    widest = clamp(advances.asSlice()[g], widest, 65535)
+    tallest = clamp(heights.asSlice()[g], tallest, 65535)
+    g = g + 1
+  }
+  let upem = f64.max(16.0, f64.min(16384.0, f64.round(metrics.unitsPerEm)))
+  let ascent = word(metrics.ascent)
+  let descent = -word(metrics.descent)
+
+  let mut tables = List<Table>.make()
+
+  let mut data = List<u8>.make()
+  run cff(&outlines, &mut data)
+  run tables.append(Table { tag: 0x43464620, data: move data })
+
+  data = List<u8>.make()
+  if run gsub(grouped.asSlice(), forms.asSlice(), vertical.asSlice(), &mut data) {
+    run tables.append(Table { tag: 0x47535542, data: move data })
+  }
+
+  data = List<u8>.make()
+  run put(&mut data, 4, 2)
+  run put(&mut data, widest / 2, 2)
+  run put(&mut data, clamp(word(metrics.weight), 1, 1000), 2)
+  run put(&mut data, 5, 2)
+  run put(&mut data, 0, 2)
+  let mut z: usize = 0
+  while z < 8 {
+    run put(&mut data, 0, 2)
+    z = z + 1
+  }
+  run put(&mut data, word(metrics.strikethroughThickness), 2)
+  run put(&mut data, word(metrics.strikethroughPosition), 2)
+  run put(&mut data, 0, 2)
+  z = 0
+  while z < 10 + 16 + 4 {
+    run data.append(0)
+    z = z + 1
+  }
+  run put(&mut data, 0xc0, 2)
+  let first = if map.length() > 0 {
+    lesser(0xffff, map.asSlice()[0].from)
+  } else {
+    0
+  }
+  let last = if map.length() > 0 {
+    lesser(0xffff, map.asSlice()[map.length() - 1].from)
+  } else {
+    0
+  }
+  run put(&mut data, u32.toI64(first), 2)
+  run put(&mut data, u32.toI64(last), 2)
+  run put(&mut data, ascent, 2)
+  run put(&mut data, descent, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, clamp(ascent, 0, 65535), 2)
+  run put(&mut data, clamp(-descent, 0, 65535), 2)
+  run put(&mut data, 0, 8)
+  run put(&mut data, word(metrics.xHeight), 2)
+  run put(&mut data, word(metrics.capHeight), 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 32, 2)
+  run put(&mut data, 2, 2)
+  run tables.append(Table { tag: 0x4f532f32, data: move data })
+
+  data = List<u8>.make()
+  run put(&mut data, 1, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, word(metrics.verticalOrigin), 2)
+  let mut differing = List<Pair>.make()
+  g = 0
+  while g < count {
+    if origins.asSlice()[g] != word(metrics.verticalOrigin) {
+      run differing.append(Pair { from: usize.toU32(g), to: 0 })
+    }
+    g = g + 1
+  }
+  run put(&mut data, usize.toI64(differing.length()), 2)
+  g = 0
+  while g < differing.length() {
+    let glyph = differing.asSlice()[g].from
+    run put(&mut data, u32.toI64(glyph), 2)
+    run put(&mut data, origins.asSlice()[u32.toUsize(glyph)], 2)
+    g = g + 1
+  }
+  run tables.append(Table { tag: 0x564f5247, data: move data })
+
+  data = List<u8>.make()
+  run cmapTable(map.asSlice(), &mut data)
+  run tables.append(Table { tag: 0x636d6170, data: move data })
+
+  data = List<u8>.make()
+  run put(&mut data, 0x00010000, 4)
+  run put(&mut data, 0x00010000, 4)
+  run put(&mut data, 0, 4)
+  run put(&mut data, 0x5f0f3cf5, 4)
+  run put(&mut data, 3, 2)
+  run put(&mut data, f64.toI64(upem), 2)
+  run put(&mut data, 0, 8)
+  run put(&mut data, 0, 8)
+  run put(&mut data, word(f64.floor(total.xMin)), 2)
+  run put(&mut data, word(f64.floor(total.yMin)), 2)
+  run put(&mut data, word(f64.ceil(total.xMax)), 2)
+  run put(&mut data, word(f64.ceil(total.yMax)), 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 8, 2)
+  run put(&mut data, 2, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 2)
+  run tables.append(Table { tag: 0x68656164, data: move data })
+
+  data = List<u8>.make()
+  run put(&mut data, 0x00010000, 4)
+  run put(&mut data, ascent, 2)
+  run put(&mut data, descent, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, widest, 2)
+  run put(&mut data, word(total.xMin), 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, word(total.xMax), 2)
+  run put(&mut data, 1, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 8)
+  run put(&mut data, 0, 2)
+  run put(&mut data, usize.toI64(count), 2)
+  run tables.append(Table { tag: 0x68686561, data: move data })
+
+  data = List<u8>.make()
+  g = 0
+  while g < count {
+    run put(&mut data, advances.asSlice()[g], 2)
+    let bearing = match boxes.asSlice()[g] {
+      Option<Box>.Some { value } => word(value.xMin)
+      Option<Box>.None => 0
+    }
+    run put(&mut data, bearing, 2)
+    g = g + 1
+  }
+  run tables.append(Table { tag: 0x686d7478, data: move data })
+
+  if pairKeys.length() > 0 {
+    data = List<u8>.make()
+    run kernTable(pairKeys.asSlice(), pairValues.asSlice(), &mut data)
+    run tables.append(Table { tag: 0x6b65726e, data: move data })
+  }
+
+  data = List<u8>.make()
+  run put(&mut data, 0x00005000, 4)
+  run put(&mut data, usize.toI64(count), 2)
+  run tables.append(Table { tag: 0x6d617870, data: move data })
+
+  data = List<u8>.make()
+  run nameTable(family, &mut data)
+  run tables.append(Table { tag: 0x6e616d65, data: move data })
+
+  data = List<u8>.make()
+  run put(&mut data, 0x00030000, 4)
+  run put(&mut data, 0, 4)
+  run put(&mut data, word(metrics.underlinePosition), 2)
+  run put(&mut data, word(metrics.underlineThickness), 2)
+  run put(&mut data, 0, 4)
+  run put(&mut data, 0, 16)
+  run tables.append(Table { tag: 0x706f7374, data: move data })
+
+  data = List<u8>.make()
+  run put(&mut data, 0x00011000, 4)
+  run put(&mut data, f64.toI64(upem) / 2, 2)
+  run put(&mut data, -(f64.toI64(upem) / 2), 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, tallest, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 1, 2)
+  run put(&mut data, 0, 2)
+  run put(&mut data, 0, 8)
+  run put(&mut data, 0, 2)
+  run put(&mut data, usize.toI64(count), 2)
+  run tables.append(Table { tag: 0x76686561, data: move data })
+
+  data = List<u8>.make()
+  g = 0
+  while g < count {
+    run put(&mut data, heights.asSlice()[g], 2)
+    let bearing = match boxes.asSlice()[g] {
+      Option<Box>.Some { value } => origins.asSlice()[g] - word(value.yMax)
+      Option<Box>.None => 0
+    }
+    run put(&mut data, bearing, 2)
+    g = g + 1
+  }
+  run tables.append(Table { tag: 0x766d7478, data: move data })
+
+  // The sfnt wrapper; tables were appended in tag order.
+  let entries = tables.asSlice()
+  let mut font = List<u8>.make()
+  run put(&mut font, 0x4f54544f, 4)
+  run put(&mut font, usize.toI64(entries.length), 2)
+  let search = searchFields(entries.length, 16)
+  run put(&mut font, search[0], 2)
+  run put(&mut font, search[1], 2)
+  run put(&mut font, search[2], 2)
+  let mut offset = 12 + 16 * entries.length
+  let mut t: usize = 0
+  while t < entries.length {
+    let bytes = entries[t].data.asSlice()
+    run put(&mut font, u32.toI64(entries[t].tag), 4)
+    run put(&mut font, u32.toI64(checksum(bytes)), 4)
+    run put(&mut font, usize.toI64(offset), 4)
+    run put(&mut font, usize.toI64(bytes.length), 4)
+    offset = offset + (bytes.length + 3) / 4 * 4
+    t = t + 1
+  }
+  t = 0
+  while t < entries.length {
+    run font.appendSlice(entries[t].data.asSlice())
+    run padded(&mut font)
+    t = t + 1
+  }
+  return run Bytes.copy(font.asSlice())
+}
