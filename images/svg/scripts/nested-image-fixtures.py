@@ -59,7 +59,7 @@ add('percentage-viewport', f'<image x="1" y="1" width="8" height="4" preserveAsp
     rect(1, 1, 4, 4, 'red') + rect(5, 1, 4, 4, 'blue'),
     'Percentages in the independent document resolve against its image-rendering viewport.')
 external = document(rect(0, 0, 2, 2, 'red') + '<image width="2" height="2" href="nested-external.svg"/>',
-                    'width="2" height="2"')
+                    'width="2" height="2" viewBox="0 0 2 2"')
 (ROOT / 'inputs/nested-external.svg').write_text(document(rect(0, 0, 2, 2, 'blue'), 'width="2" height="2"'))
 (ROOT / 'inputs/nested-secure-source.svg').write_text(external)
 add('secure-external', '<image x="1" y="1" width="6" height="6" href="nested-secure-source.svg"/>',
@@ -70,6 +70,35 @@ add('shared-viewports', f'<image x="1" y="1" width="4" height="2" href="{url}"/>
     rect(1, 1, 2, 2, 'red') + rect(3, 1, 2, 2, 'blue')
     + rect(1, 5, 4, 4, 'red') + rect(5, 5, 4, 4, 'blue'),
     'The same resource renders at two occurrence-specific viewport sizes without sharing the wrong layout.')
+# These compare retained vector content at the final placement; rasterizing a
+# source-sized intermediate would blur edges or lose visible overflow.
+add('rotated', f'<image width="8" height="4" transform="translate(10 1) rotate(90)" href="{url}"/>',
+    rect(6, 1, 4, 4, 'red') + rect(6, 5, 4, 4, 'blue'),
+    'The image document and its viewport clips follow a non-axis-aligned affine placement.')
+projective = 'transform-origin:0 0;transform:matrix3d(1,0,0,.04,0,1,0,0,0,0,1,0,0,0,0,1)'
+add('projective', f'<image width="8" height="4" style="{projective}" href="{url}"/>',
+    f'<g style="{projective}">' + rect(0, 0, 4, 4, 'red') + rect(4, 0, 4, 4, 'blue') + '</g>',
+    'Projective image placement transforms both child geometry and physical viewport clip planes.')
+overflow = data(document(rect(-2, 0, 6, 2, 'red'),
+                         'width="2" height="2" overflow="visible"'))
+add('overflow-visible', f'<image x="4" y="4" width="2" height="2" overflow="visible" href="{overflow}"/>',
+    rect(2, 4, 6, 2, 'red'),
+    'Visible overflow on both image and document root preserves content beyond the image viewport.')
+fixed = data(document(rect(0, 0, 2, 2, 'red'), 'width="2" height="2"'))
+add('no-viewbox', f'<image x="1" y="1" width="6" height="6" href="{fixed}"/>',
+    rect(1, 1, 2, 2, 'red'),
+    'Without a viewBox the new SVG viewport does not scale fixed user-unit geometry.')
+add('overflow-hidden', f'<image x="4" y="4" width="2" height="2" overflow="hidden" href="{overflow}"/>',
+    rect(4, 4, 2, 2, 'red'),
+    'Hidden overflow on the image clips independently of visible overflow on its document root.')
+nested = data(document(f'<image width="8" height="4" href="{url}"/>',
+                       'width="8" height="4"'))
+add('recursive-data', f'<image x="1" y="1" width="8" height="4" href="{nested}"/>',
+    rect(1, 1, 4, 4, 'red') + rect(5, 1, 4, 4, 'blue'),
+    'Secure embedded documents permit nested data images and retain their independent layouts.')
+add('group-opacity', f'<image x="1" y="1" width="8" height="4" opacity=".5" href="{url}"/>',
+    '<g opacity=".5">' + rect(1, 1, 4, 4, 'red') + rect(5, 1, 4, 4, 'blue') + '</g>',
+    'Image opacity is applied once to the isolated embedded document output.')
 # Resource files are also direct-render controls, so every tracked SVG has an
 # explicit manifest entry and the secure test cannot pass because its payload broke.
 for filename in ('nested-external.svg', 'nested-secure-source.svg'):
