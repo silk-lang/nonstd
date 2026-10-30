@@ -48,6 +48,30 @@ pub struct Span {
   /// font-size in user units.
   pub size: f64,
   pub anchor: Anchor,
+  /// letter-spacing and word-spacing in user units.
+  pub letterSpacing: f64,
+  pub wordSpacing: f64,
+}
+
+/// A `textLength` on the element whose characters are `[start, end)`. Lengths are given
+/// in document order of their elements.
+pub struct TextLength {
+  pub start: usize,
+  pub end: usize,
+  pub length: f64,
+  /// lengthAdjust="spacingAndGlyphs".
+  pub glyphs: bool,
+}
+
+impl Copy for TextLength {}
+
+/// Spacing carried from one cluster to the next across runs.
+struct Spacing {
+  started: bool,
+  letter: f64,
+  word: f64,
+  /// The glyph that ends the previous cluster, which takes the spacing in its advance.
+  last: usize,
 }
 
 /// One addressable character with its resolved positioning values.
@@ -94,6 +118,8 @@ pub struct PlacedGlyph {
   pub offsetY: f64,
   /// Degrees, clockwise.
   pub rotate: f64,
+  /// Horizontal glyph scale from lengthAdjust="spacingAndGlyphs".
+  pub scaleX: f64,
   /// Horizontal advance in user units.
   pub advance: f64,
 }
@@ -279,7 +305,9 @@ effect fn shapeRun(
   characters: &[Character],
   start: usize,
   end: usize,
+  spans: &[Span],
   pen: f64,
+  spacing: &mut Spacing,
   offsets: &mut List<f64>,
   owners: &mut List<usize>,
 ) -> f64
@@ -304,7 +332,36 @@ effect fn shapeRun(
     index = index + 1
   }
   buffer.guessSegmentProperties()
-  let shaped = run shapeWithFeatures(&shaper, &mut buffer, &[])
+
+  // CSS Text 3 #letter-spacing-property: optional ligatures are off where spacing applies.
+  let mut features = List<Feature>.make()
+  index = start
+  while index < end {
+    if spans[characters[index].span].letterSpacing != 0.0 {
+      let mut last = index + 1
+      while last < end && spans[characters[last].span].letterSpacing != 0.0 {
+        last = last + 1
+      }
+      let tags: [u32; 4] = [0x6c696761, 0x636c6967, 0x646c6967, 0x686c6967]
+      let mut tag: usize = 0
+      while tag < 4 {
+        run List<Feature>.append(
+          &mut features,
+          Feature.ranged(
+            Tag.fromU32(tags[tag]),
+            0,
+            usize.toU32(index - start),
+            usize.toU32(last - start),
+          ),
+        )
+        tag = tag + 1
+      }
+      index = last
+    } else {
+      index = index + 1
+    }
+  }
+  let shaped = run shapeWithFeatures(&shaper, &mut buffer, List<Feature>.asSlice(&features))
   if let Result<(), ShapeError>.Failure { error } = move shaped {
     return pen
   }
@@ -322,6 +379,27 @@ effect fn shapeRun(
     }
     let owner = start + u32.toUsize(info.cluster)
     if List<usize>.get(&owners.*, owner) == usize.MAX {
+      // Letter spacing puts half its amount on each side of a typographic character, but
+      // none at the line start or end; word spacing follows word separators.
+      let letter = spans[characters[owner].span].letterSpacing
+      if spacing.started {
+        let gap = spacing.word + spacing.letter / 2.0 + letter / 2.0
+        if gap != 0.0 {
+          advance = advance + gap
+          let previous = List<PlacedGlyph>.asMutSlice(&mut layout.glyphs)
+          previous[spacing.last].advance = previous[spacing.last].advance + gap
+        }
+      }
+      spacing.started = true
+      spacing.letter = letter
+      let cp = characters[owner].cp
+      spacing.word = if cp == 0x20 || cp == 0xA0 || cp == 0x1361 || cp == 0x10100 || cp == 0x10101
+        || cp == 0x1039F
+        || cp == 0x1091F {
+        spans[characters[owner].span].wordSpacing
+      } else {
+        0.0
+      }
       List<f64>.set(&mut offsets, owner, advance)
       List<usize>.set(&mut owners, owner, owner)
     }
@@ -337,9 +415,11 @@ effect fn shapeRun(
         offsetX: i32.toF64(position.xOffset) * scale,
         offsetY: -i32.toF64(position.yOffset) * scale,
         rotate: 0.0,
+        scaleX: 1.0,
         advance: i32.toF64(position.xAdvance) * scale,
       },
     )
+    spacing.last = List<PlacedGlyph>.length(&layout.glyphs) - 1
     advance = advance + i32.toF64(position.xAdvance) * scale
     glyph = glyph + 1
   }
@@ -363,7 +443,12 @@ effect fn shapeRun(
 }
 
 /// Lays out one text element's addressable characters.
-pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Character]) -> Layout
+pub effect fn layout(
+  database: &FontDatabase,
+  spans: &[Span],
+  characters: &[Character],
+  lengths: &[TextLength],
+) -> Layout
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut result = Layout { glyphs: List<PlacedGlyph>.make(), instances: List<Instance>.make() }
@@ -405,6 +490,7 @@ pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Char
   // Step "CSS layout" along one line. Runs end where the font instance changes: CSS Text 3
   // #boundary-shaping keeps shaping across element boundaries that do not change formatting.
   let mut pen = 0.0
+  let mut spacing = Spacing { started: false, letter: 0.0, word: 0.0, last: 0 }
   let mut start: usize = 0
   while start < count {
     let instanceIndex = List<usize>.get(&used, start)
@@ -420,7 +506,9 @@ pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Char
         characters,
         start,
         end,
+        spans,
         pen,
+        &mut spacing,
         &mut offsets,
         &mut owners,
       )
@@ -435,33 +523,50 @@ pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Char
     start = end
   }
 
-  // Steps "Adjust positions: dx, dy" and "Apply absolute positions". Only the first
-  // character of a typographic character takes positioning values; x and y start a new
-  // text chunk and dx, dy shift everything after them.
-  let mut shiftX = 0.0
-  let mut shiftY = 0.0
+  // Step "Adjust positions: dx, dy". Only the first character of a typographic character
+  // takes positioning values.
   let mut positionsX = List<f64>.make()
   let mut positionsY = List<f64>.make()
+  let mut scales = List<f64>.make()
+  let mut shiftX = 0.0
+  let mut shiftY = 0.0
+  index = 0
+  while index < count {
+    if List<usize>.get(&owners, index) == index {
+      shiftX = shiftX + characters[index].dx
+      shiftY = shiftY + characters[index].dy
+    }
+    run List<f64>.append(&mut positionsX, List<f64>.get(&offsets, index) + shiftX)
+    run List<f64>.append(&mut positionsY, shiftY)
+    run List<f64>.append(&mut scales, 1.0)
+    index = index + 1
+  }
+
+  run applyLengths(&result, &owners, lengths, &mut positionsX, &mut scales)
+
+  // Step "Adjust positions: x, y": x and y start a text chunk. The character's own dx and
+  // dy still apply after its x and y, as the attribute definitions say.
   let mut chunkStarts = List<bool>.make()
+  shiftX = 0.0
+  shiftY = 0.0
+  let xs = List<f64>.asMutSlice(&mut positionsX)
+  let ys = List<f64>.asMutSlice(&mut positionsY)
   index = 0
   while index < count {
     let character = characters[index]
-    let css = List<f64>.get(&offsets, index)
     let mut chunk = index == 0
     if List<usize>.get(&owners, index) == index {
-      shiftX = shiftX + character.dx
-      shiftY = shiftY + character.dy
       if let Option<f64>.Some { value } = character.x {
-        shiftX = value + character.dx - css
+        shiftX = (value + character.dx) - xs[index]
         chunk = true
       }
       if let Option<f64>.Some { value } = character.y {
-        shiftY = value + character.dy
+        shiftY = (value + character.dy) - ys[index]
         chunk = true
       }
     }
-    run List<f64>.append(&mut positionsX, css + shiftX)
-    run List<f64>.append(&mut positionsY, shiftY)
+    xs[index] = xs[index] + shiftX
+    ys[index] = ys[index] + shiftY
     run List<bool>.append(&mut chunkStarts, chunk)
     index = index + 1
   }
@@ -471,13 +576,124 @@ pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Char
   let mut g: usize = 0
   while g < glyphs.length {
     let owner = glyphs[g].owner
-    glyphs[g].x = List<f64>.get(&positionsX, owner) + (glyphs[g].x - List<f64>.get(&offsets, owner))
-    glyphs[g].y = List<f64>.get(&positionsY, owner)
+    let scale = List<f64>.get(&scales, owner)
+    glyphs[g].x = xs[owner] + (glyphs[g].x - List<f64>.get(&offsets, owner)) * scale
+    glyphs[g].y = ys[owner]
     glyphs[g].rotate = characters[owner].rotate
+    glyphs[g].scaleX = scale
+    glyphs[g].advance = glyphs[g].advance * scale
+    glyphs[g].offsetX = glyphs[g].offsetX * scale
     g = g + 1
   }
   anchor(spans, characters, &chunkStarts, &mut glyphs)
   return move result
+}
+
+/// The advance of each typographic character: the sum of its glyphs' advances.
+fn advances(result: &Layout, count: usize, out: &mut List<f64>) -> () {
+  let glyphs = List<PlacedGlyph>.asSlice(&result.glyphs)
+  let values = List<f64>.asMutSlice(&mut out)
+  let mut g: usize = 0
+  while g < glyphs.length {
+    if glyphs[g].owner < count {
+      values[glyphs[g].owner] = values[glyphs[g].owner] + glyphs[g].advance
+    }
+    g = g + 1
+  }
+}
+
+// Step "Apply 'textLength' attribute", nested elements before their ancestors. A nested
+// element with its own textLength (a resolved descendant) counts as one typographic
+// character of its ancestor. With spacingAndGlyphs the characters and their glyphs are
+// scaled horizontally about the start of the extent instead.
+effect fn applyLengths(
+  result: &Layout,
+  owners: &List<usize>,
+  lengths: &[TextLength],
+  positions: &mut List<f64>,
+  scales: &mut List<f64>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = List<f64>.length(&positions.*)
+  let mut sizes = List<f64>.make()
+  run List<f64>.appendRepeated(&mut sizes, 0.0, count)
+  advances(result, count, &mut sizes)
+  let mut item = lengths.length
+  while item > 0 {
+    item = item - 1
+    let length = lengths[item]
+    let xs = List<f64>.asMutSlice(&mut positions)
+    let factors = List<f64>.asMutSlice(&mut scales)
+    let mut low = f64.INFINITY
+    let mut high = -f64.INFINITY
+    let mut k = length.start
+    while k < length.end && k < count {
+      if List<usize>.get(owners, k) == k {
+        let advance = List<f64>.get(&sizes, k) * factors[k]
+        low = f64.min(low, f64.min(xs[k], xs[k] + advance))
+        high = f64.max(high, f64.max(xs[k], xs[k] + advance))
+      }
+      k = k + 1
+    }
+    if low != f64.INFINITY {
+      let delta = length.length - (high - low)
+      if length.glyphs {
+        let extent = high - low
+        let factor = if extent > 0.0 {
+          length.length / extent
+        } else {
+          1.0
+        }
+        k = length.start
+        while k < length.end && k < count {
+          xs[k] = low + (xs[k] - low) * factor
+          factors[k] = factors[k] * factor
+          k = k + 1
+        }
+      } else {
+        // n counts typographic characters, a resolved descendant as one.
+        let mut units: usize = 0
+        k = length.start
+        while k < length.end && k < count {
+          if List<usize>.get(owners, k) == k && !insideResolved(lengths, item, k, false) {
+            units = units + 1
+          }
+          k = k + 1
+        }
+        let delta = if units > 1 {
+          delta / usize.toF64(units - 1)
+        } else {
+          0.0
+        }
+        let mut shift = 0.0
+        k = length.start
+        while k < length.end && k < count {
+          xs[k] = xs[k] + shift
+          if List<usize>.get(owners, k) == k && !insideResolved(lengths, item, k, false) {
+            shift = shift + delta
+          }
+          k = k + 1
+        }
+      }
+    }
+  }
+}
+
+/// Whether character `k` lies in a resolved descendant of `lengths[item]` other than as
+/// its first character.
+fn insideResolved(lengths: &[TextLength], item: usize, k: usize, first: bool) -> bool {
+  let outer = lengths[item]
+  let mut index = item + 1
+  while index < lengths.length {
+    let inner = lengths[index]
+    if inner.start >= outer.start && inner.end <= outer.end && k >= inner.start && k < inner.end
+      && k != inner.start {
+      return true
+    }
+    index = index + 1
+  }
+  return first
 }
 
 /// Whether a glyph of `owner`, after a glyph of `previous`, begins a text chunk.

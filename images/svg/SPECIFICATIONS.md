@@ -479,7 +479,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [ ] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [ ] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [ ] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
-- [ ] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
+- [ ] `letter-spacing`, `word-spacing` (done), `direction`, `unicode-bidi`
 - [ ] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
 - [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
 - [ ] 1.1 only: `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
@@ -741,6 +741,20 @@ decisions:
   so their `x`, `y`, `dx` and `dy` values are ignored.
 - Anchoring uses the extent of the glyph advances of each text chunk, as the
   "Apply anchoring" step defines it.
+- Letter spacing follows the pinned CSS Text 3: half of each character's amount on each
+  side of its typographic character, and none at the start or end of the line (the whole
+  text). Where it is nonzero, the `liga`, `clig`, `dlig` and `hlig` features are off.
+  Word spacing adds to the advance of each word separator (U+0020, U+00A0, U+1361,
+  U+10100, U+10101, U+1039F, U+1091F).
+- The steps run in the algorithm's order: dx/dy, then `textLength`, then x/y, then
+  anchoring. The algorithm's x/y step would discard a character's own `dx` when the same
+  character has an `x`. The attribute definitions say `dx` shifts from the new position,
+  so a character with an `x` lands at `x + dx` (likewise for `y` and `dy`).
+- `textLength` is followed literally: only the element's characters move. With
+  `spacing`, the difference spreads over its typographic characters, and a nested element
+  with its own `textLength` counts as one. With `spacingAndGlyphs`, positions and glyphs
+  scale horizontally about the start of the extent. Characters after the element do not
+  move, since the algorithm shifts only the range `[i, j]`.
 
 `src/used_text.silk` feeds it from the document:
 
