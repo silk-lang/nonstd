@@ -71,8 +71,9 @@ missing resources, and preservation of earlier siblings. CSS `<gradient>` layers
 interpolation) are sized, positioned and tiled per mask-size, mask-position,
 mask-repeat (repeat, space, round, no-repeat), mask-origin and mask-clip. Twenty-three
 exact reftests compare them with equivalent SVG gradient masks or literal geometry.
-`url()` layers naming raster or SVG images, broader conformance and mask performance
-gates remain open.
+`url()` layers naming PNG, JPEG or SVG images load through the resolver like `<image>`
+sources and use their natural size, orientation and sampling; eight more reftests cover
+them. Broader conformance and mask performance gates remain open.
 
 Filters, text, animation and ICC remain required later work, not
 exclusions from scope. `shape-rendering` controls current
@@ -127,7 +128,7 @@ share a retained picture, while different viewports compute separate media and
 percentage contexts. Child geometry, paints and clip planes execute under the
 full device mapping, including projective placement, without an intrinsic-size
 raster intermediate. SVG image orientation swaps intrinsic axes and the child
-viewport before composing the final rotation/flip, including ratio-only sizing. CSS image masks still need integration; phase 7 is not complete.
+viewport before composing the final rotation/flip, including ratio-only sizing. CSS image mask layers are integrated as well.
 
 The curated resvg set includes eight image cases with strict non-pass expectations.
 Six retain sampling/sample-conversion or transformed-edge differences; two reference
