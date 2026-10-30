@@ -163,3 +163,39 @@ The same snapshot was compared with the pinned resvg/usvg revision
 | masking/render | 272.8032 | 10.7761 | 25.3155 |
 
 The output checksums differ in every mode, so these measurements do not establish pixel conformance. The 25.3× render-time gap remains open for phase 14. The reference measurement used a temporary baseline file; the tracked baseline and conformance tolerances were not changed.
+
+## Phase 7 standalone PNG decoder checkpoint
+
+Measured PNG snapshot `1605d54` against parent main `24262ac` on the same Ubuntu 24.04 ARM64 VM using Silk dev.32 and LLVM 22.1.8. Three native samples, one iteration, no warmup; separate Callgrind invocations count complete processes. The standalone decoder is not yet invoked by SVG rendering, so this checks existing-workload regressions rather than PNG throughput.
+
+| Workload | Old process Ir | New process Ir | Render checksum equal |
+| --- | ---: | ---: | --- |
+| clipping/render | 1,831,958,390 | 1,831,958,377 | True |
+| compositing/render | 507,501,309 | 507,501,314 | True |
+| iconset/render | 387,399,293 | 387,402,109 | True |
+| instances/render | 607,231,847 | 607,231,856 | True |
+| largemap/render | 687,662,019 | 687,662,006 | True |
+| masking/render | 4,933,695,779 | 4,933,695,788 | True |
+| mixedcurves/render | 360,420,736 | 360,420,741 | True |
+| paintservers/render | 287,034,819 | 287,034,802 | True |
+| stylesheets/render | 535,910,699 | 535,910,704 | True |
+| tiger/render | 363,303,101 | 363,303,088 | True |
+
+All ten workloads retain identical output checksums. Full-process instruction changes are below 0.001%; these measurements make no claim about decoder throughput, image-rendering performance, or the open phase-14 performance targets.
+
+Pinned-resvg comparison on the same machine and snapshot (render mode):
+
+| Workload | Silk median ms | resvg median ms | Silk/resvg |
+| --- | ---: | ---: | ---: |
+| clipping/render | 113.2138 | 5.3628 | 21.1111 |
+| compositing/render | 30.6002 | 5.4036 | 5.6629 |
+| iconset/render | 9.3504 | 4.1675 | 2.2437 |
+| instances/render | 3.1742 | 9.6238 | 0.3298 |
+| largemap/render | 21.6169 | 15.5407 | 1.3910 |
+| masking/render | 272.3610 | 11.1853 | 24.3498 |
+| mixedcurves/render | 17.6009 | 4.7452 | 3.7092 |
+| paintservers/render | 18.7912 | 6.8568 | 2.7405 |
+| stylesheets/render | 1.5288 | 2.9873 | 0.5117 |
+| tiger/render | 21.5213 | 11.8752 | 1.8123 |
+
+Only stylesheet and instance checksums match resvg. This is the existing SVG workload comparison, not a PNG decoding benchmark. The tracked baseline was not overwritten, and the clipping/masking gaps remain phase-14 work.
