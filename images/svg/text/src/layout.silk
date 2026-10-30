@@ -26,6 +26,7 @@ import font_types.lib { F2Dot14, F48Dot16, GlyphId, Tag }
 import ucd.lib as Ucd
 import ucd.bidi { BidiWorkspace, ParagraphDirection, analyzeCodepoints, reorder }
 import ucd.line_break { BreakKind, BreakOpportunity, LineOptions, breaks }
+import ucd.vertical { Orientation, OrientationRun, orientations }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
@@ -71,6 +72,24 @@ pub struct Span {
   pub variations: List<Axis>,
   /// line-height in user units; None is `normal`, the first face's line metrics.
   pub lineHeight: Option<f64>,
+  /// writing-mode; the text element's sets the layout's.
+  pub writing: Writing,
+  /// text-orientation, for vertical text.
+  pub orientation: TextOrientation,
+}
+
+/// writing-mode (CSS Writing Modes 3), with the SVG 1.1 values already mapped.
+pub enum Writing {
+  HorizontalTb,
+  VerticalRl,
+  VerticalLr,
+}
+
+/// text-orientation (CSS Writing Modes 3 #text-orientation).
+pub enum TextOrientation {
+  Mixed,
+  Upright,
+  Sideways,
 }
 
 /// One variation axis value.
@@ -221,6 +240,12 @@ pub struct PlacedGlyph {
   pub advance: f64,
   /// Off the end of its text path, so not rendered.
   pub hidden: bool,
+  /// Set upright in vertical text: shaped top to bottom, its position is on the line's
+  /// central baseline and its offsets are the shaper's vertical ones.
+  pub upright: bool,
+  /// For an upright glyph, how far its span's alphabetic baseline lies beyond its position,
+  /// across the line.
+  pub center: f64,
 }
 
 impl Copy for PlacedGlyph {}
@@ -494,6 +519,7 @@ effect fn shapeRun(
   spans: &[Span],
   pen: f64,
   rtl: bool,
+  upright: bool,
   spacing: &mut Spacing,
   offsets: &mut List<f64>,
   owners: &mut List<usize>,
@@ -523,7 +549,9 @@ effect fn shapeRun(
     run buffer.add(characters[index].cp, usize.toU32(index - start))
     index = index + 1
   }
-  if rtl {
+  if upright {
+    buffer.setDirection(Direction.TopToBottom)
+  } else if rtl {
     buffer.setDirection(Direction.RightToLeft)
   }
   buffer.guessSegmentProperties()
@@ -601,10 +629,15 @@ effect fn shapeRun(
     let hangs = characters[owner].line == Line.Hang
 
     // Synthetic bold widens each advancing glyph by the emboldening strength.
+    let along = if upright {
+      -position.yAdvance
+    } else {
+      position.xAdvance
+    }
     let width = if hangs {
       0.0
-    } else if position.xAdvance != 0 {
-      i32.toF64(position.xAdvance) * scale + bold
+    } else if along != 0 {
+      i32.toF64(along) * scale + bold
     } else {
       0.0
     }
@@ -648,6 +681,8 @@ effect fn shapeRun(
         hidden: hangs,
         scaleX: 1.0,
         advance: width,
+        upright: upright,
+        center: 0.0,
       },
     )
     if !hangs {
@@ -889,7 +924,7 @@ fn pathStart(characters: &[Character], index: usize) -> bool {
 pub effect fn layout(
   database: &Fonts,
   spans: &[Span],
-  characters: &[Character],
+  given: &[Character],
   lengths: &[TextLength],
   paths: &[OnPath],
 ) -> Layout
@@ -900,9 +935,26 @@ pub effect fn layout(
     instances: List<Instance>.make(),
     drops: List<f64>.make(),
   }
-  let count = characters.length
+  let count = given.length
   if count == 0 {
     return move result
+  }
+
+  // Vertical text is laid out as horizontal text in a frame turned a quarter clockwise:
+  // the inline axis runs down and the line's under side is on the left
+  // (CSS Writing Modes 3 #vertical-layout). Text on a path stays horizontal.
+  let vertical = spans[0].writing != Writing.HorizontalTb && paths.length == 0
+  let mut turned = List<Character>.make()
+  let mut uprights = List<bool>.make()
+  if vertical {
+    run turn(spans, given, &mut turned, &mut uprights)
+  } else {
+    run List<bool>.appendRepeated(&mut uprights, false, count)
+  }
+  let characters = if vertical {
+    List<Character>.asSlice(&turned)
+  } else {
+    given
   }
   let mut offsets = List<f64>.make()
   let mut owners = List<usize>.make()
@@ -964,7 +1016,8 @@ pub effect fn layout(
       run List<u8>.append(&mut runLevels, List<u8>.get(&levels, start))
       let mut end = start + 1
       while end < chunkEnd && List<usize>.get(&used, end) == List<usize>.get(&used, start)
-        && List<u8>.get(&levels, end) == List<u8>.get(&levels, start) {
+        && List<u8>.get(&levels, end) == List<u8>.get(&levels, start)
+        && List<bool>.get(&uprights, end) == List<bool>.get(&uprights, start) {
         end = end + 1
       }
       start = end
@@ -988,7 +1041,8 @@ pub effect fn layout(
           end,
           spans,
           pen,
-          List<u8>.get(&runLevels, item) % 2 == 1,
+          List<u8>.get(&runLevels, item) % 2 == 1 && !List<bool>.get(&uprights, start),
+          List<bool>.get(&uprights, start),
           &mut spacing,
           &mut offsets,
           &mut owners,
@@ -1063,7 +1117,7 @@ pub effect fn layout(
     glyphs[g].offsetX = glyphs[g].offsetX * scale
     g = g + 1
   }
-  anchor(spans, characters, &chunks, &mut positionsX, &mut glyphs)
+  anchor(spans, characters, &chunks, vertical, &mut positionsX, &mut glyphs)
 
   // Baseline alignment: each glyph's alphabetic baseline moves to its span's.
   let mut drops = List<f64>.make()
@@ -1075,6 +1129,9 @@ pub effect fn layout(
     g = g + 1
   }
   run List<f64>.appendSlice(&mut result.drops, List<f64>.asSlice(&drops))
+  if vertical {
+    run upright(database, spans, &mut result)
+  }
   if paths.length > 0 {
     run onPaths(
       spans,
@@ -1448,6 +1505,7 @@ fn anchor(
   spans: &[Span],
   characters: &[Character],
   chunks: &List<usize>,
+  vertical: bool,
   xs: &mut List<f64>,
   glyphs: &mut [PlacedGlyph],
 ) -> () {
@@ -1470,14 +1528,17 @@ fn anchor(
     }
     let origin = List<f64>.get(&xs.*, chunk)
     let span = &spans[characters[chunk].span]
+
+    // In vertical text start is the top whatever the direction (#TextAnchoringProperties).
+    let rtl = span.rtl && !vertical
     let shift = match span.anchor {
-      Anchor.Start => if span.rtl {
+      Anchor.Start => if rtl {
         origin - high
       } else {
         origin - low
       }
       Anchor.Middle => origin - (low + high) / 2.0
-      Anchor.End => if span.rtl {
+      Anchor.End => if rtl {
         origin - low
       } else {
         origin - high
@@ -1495,6 +1556,93 @@ fn anchor(
       c = c + 1
     }
     first = last
+  }
+}
+
+// The characters of vertical text in the turned frame: the inline position comes from y,
+// the position across the line from x (negated, as the frame's down is the left), and per
+// character whether it is set upright: by text-orientation, and for `mixed` by its
+// UAX #50 orientation per grapheme cluster (CSS Writing Modes 3 #text-orientation).
+effect fn turn(
+  spans: &[Span],
+  characters: &[Character],
+  out: &mut List<Character>,
+  uprights: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = List<u8>.make()
+  let mut offsets = List<usize>.make()
+  let mut index: usize = 0
+  while index < characters.length {
+    let mut character = characters[index]
+    character.x = characters[index].y
+    character.y = match characters[index].x {
+      Option<f64>.Some { value } => Option<f64>.Some { value: -value }
+      Option<f64>.None => Option<f64>.None
+    }
+    character.dx = characters[index].dy
+    character.dy = -characters[index].dx
+    run List<Character>.append(&mut out, character)
+    run List<usize>.append(&mut offsets, List<u8>.length(&text))
+    run encode(characters[index].cp, &mut text)
+    index = index + 1
+  }
+  let mut runs = List<OrientationRun>.make()
+  run orientations(List<u8>.asSlice(&text), &mut runs)
+  let mut item: usize = 0
+  index = 0
+  while index < characters.length {
+    let offset = List<usize>.get(&offsets, index)
+    while item + 1 < List<OrientationRun>.length(&runs)
+      && List<OrientationRun>.get(&runs, item).end <= offset {
+      item = item + 1
+    }
+    let natural = List<OrientationRun>.length(&runs) > item
+      && List<OrientationRun>.get(&runs, item).orientation == Orientation.Upright
+    let upright = match spans[characters[index].span].orientation {
+      TextOrientation.Mixed => natural
+      TextOrientation.Upright => true
+      TextOrientation.Sideways => false
+    }
+    run List<bool>.append(&mut uprights, upright)
+    index = index + 1
+  }
+}
+
+// Turns the laid-out frame of vertical text back to user space. Sideways glyphs turn with
+// it; upright glyphs move from their span's alphabetic baseline to its central baseline,
+// which the shaper's vertical origin centres them on.
+effect fn upright(database: &Fonts, spans: &[Span], result: &mut Layout) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut centers = List<f64>.make()
+  let mut span: usize = 0
+  while span < spans.length {
+    let mut center = 0.0
+    if List<Selection>.length(&spans[span].faces) > 0 {
+      let own = run instance(database, spans, span, 0, &mut result.instances)
+      let metrics = &List<Instance>.asSlice(&result.instances)[own]
+      center = height(metrics, spans[span].size, Baseline.Central)
+    }
+    run List<f64>.append(&mut centers, center)
+    span = span + 1
+  }
+  let glyphs = List<PlacedGlyph>.asMutSlice(&mut result.glyphs)
+  let mut g: usize = 0
+  while g < glyphs.length {
+    let along = glyphs[g].x
+    let mut across = glyphs[g].y
+    if glyphs[g].upright {
+      let center = List<f64>.get(&centers, glyphs[g].span)
+      across = across - center
+      glyphs[g].center = center
+    } else {
+      glyphs[g].rotate = glyphs[g].rotate + 90.0
+    }
+    glyphs[g].x = -across
+    glyphs[g].y = along
+    g = g + 1
   }
 }
 
@@ -1595,14 +1743,23 @@ effect fn lineBox(
       let own = run instance(database, spans, span, 0, &mut result.instances)
       let metrics = &List<Instance>.asSlice(&result.instances)[own]
       let content = metrics.ascent + metrics.descent
-      let height = match spans[span].lineHeight {
+      let lineHeight = match spans[span].lineHeight {
         Option<f64>.Some { value } => value
         Option<f64>.None => content + metrics.lineGap
       }
-      let leading = (height - content) / 2.0
+      let leading = (lineHeight - content) / 2.0
       let baseline = List<f64>.get(&result.drops, span)
-      box.top = f64.min(box.top, baseline - metrics.ascent - leading)
-      box.bottom = f64.max(box.bottom, baseline + metrics.descent + leading)
+      if spans[0].writing != Writing.HorizontalTb
+        && spans[span].orientation != TextOrientation.Sideways {
+        // In vertical typographic mode the box is centred on the central baseline
+        // (CSS Writing Modes 3 #vertical-font-features).
+        let center = baseline - height(metrics, spans[span].size, Baseline.Central)
+        box.top = f64.min(box.top, center - content / 2.0 - leading)
+        box.bottom = f64.max(box.bottom, center + content / 2.0 + leading)
+      } else {
+        box.top = f64.min(box.top, baseline - metrics.ascent - leading)
+        box.bottom = f64.max(box.bottom, baseline + metrics.descent + leading)
+      }
     }
     index = index + 1
   }
@@ -1632,7 +1789,8 @@ pub effect fn wrap(
     return
   }
   let all = List<Character>.asMutSlice(&mut characters)
-  let x = match all[0].x {
+  let writing = spans[0].writing
+  let mut x = match all[0].x {
     Option<f64>.Some { value } => value
     Option<f64>.None => 0.0
   }
@@ -1723,10 +1881,26 @@ pub effect fn wrap(
       lines[line],
       end,
     )
+
+    // Lines stack down, or in vertical text leftward (vertical-rl) or rightward
+    // (vertical-lr), across the turned frame.
     if line > 0 {
-      y = y + (previous.bottom - box.top)
+      if writing == Writing.HorizontalTb {
+        y = y + (previous.bottom - box.top)
+      } else if writing == Writing.VerticalRl {
+        x = x - (previous.bottom - box.top)
+      } else {
+        x = x + (box.bottom - previous.top)
+      }
     }
-    run List<f64>.append(&mut baselines, y)
+    run List<f64>.append(
+      &mut baselines,
+      if writing == Writing.HorizontalTb {
+        y
+      } else {
+        x
+      },
+    )
     run List<usize>.append(
       &mut hangs,
       contentEnd(List<Character>.asSlice(&characters.*), lines[line], end),
@@ -1751,8 +1925,13 @@ pub effect fn wrap(
     if line > 0 {
       placed[first].line = Line.Start
     }
-    placed[first].x = Option<f64>.Some { value: x }
-    placed[first].y = Option<f64>.Some { value: List<f64>.get(&baselines, line) }
+    if writing == Writing.HorizontalTb {
+      placed[first].x = Option<f64>.Some { value: x }
+      placed[first].y = Option<f64>.Some { value: List<f64>.get(&baselines, line) }
+    } else {
+      placed[first].x = Option<f64>.Some { value: List<f64>.get(&baselines, line) }
+      placed[first].y = Option<f64>.Some { value: y }
+    }
     line = line + 1
   }
 }

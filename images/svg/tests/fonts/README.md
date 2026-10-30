@@ -12,3 +12,5 @@ under the SIL Open Font License; the license files sit next to them.
   for Arabic shaping and bidi.
 - `RobotoFlex`: resvg's subset with every axis but `wght`, `wdth` and `slnt` pinned to its
   default (`fontTools.varLib.instancer`).
+- `MPLUS1p-Regular` (with `vhea`/`vmtx` and `vert`): `pyftsubset MPLUS1p-Regular.ttf --unicodes="U+0020-007E,U+3001-3002,U+300C-300D,U+30FC,U+3042-3093,U+30A2-30F3,U+5B57,U+6F22,U+7E26,U+66F8" --layout-features='*' --name-IDs='*' --name-languages='*'`
+  for vertical text.
