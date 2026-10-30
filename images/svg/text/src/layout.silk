@@ -1,0 +1,483 @@
+//! SVG 2 text layout (https://www.w3.org/TR/SVG2/text.html#TextLayoutAlgorithm) for one
+//! `text` element: per-character font selection, shaping, the positioning attributes and
+//! text-anchor, producing positioned glyphs in the element's user space.
+import outline { Outlines, Recorder }
+import svg_fonts.database { FontDatabase, Face, AXIS_WEIGHT, AXIS_WIDTH, AXIS_ITALIC, AXIS_SLANT }
+import svg_fonts.matching { Selection }
+import harfrust.lib {
+  Buffer,
+  Shaper,
+  ShaperData,
+  ConfiguredShaper,
+  DefaultFontFuncs,
+  Feature,
+  Variation,
+  GlyphInfo,
+  GlyphPosition,
+  shapeWithFeatures,
+  ShapeError
+}
+import read_fonts.lib { FontRef, ReadError }
+import read_fonts.model.charmap { Charmap }
+import read_fonts.model.metrics { Metrics, LineBox }
+import font_types.lib { F2Dot14, F48Dot16, GlyphId, Tag }
+import ucd.lib as Ucd
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+pub enum Anchor {
+  Start,
+  Middle,
+  End,
+}
+
+/// The characters of one element (text, tspan) share a span: its font and anchor.
+pub struct Span {
+  /// Faces to try in order: one selection per font-family entry, then fallbacks.
+  pub faces: List<Selection>,
+  /// font-size in user units.
+  pub size: f64,
+  pub anchor: Anchor,
+}
+
+/// One addressable character with its resolved positioning values.
+pub struct Character {
+  pub cp: u32,
+  pub span: usize,
+  pub x: Option<f64>,
+  pub y: Option<f64>,
+  pub dx: f64,
+  pub dy: f64,
+  /// Degrees.
+  pub rotate: f64,
+}
+
+impl Copy for Character {}
+
+/// A face at one set of variation values, with the metrics glyph placement needs.
+pub struct Instance {
+  pub face: usize,
+  pub selection: Selection,
+  pub coords: List<F2Dot14>,
+  /// User units per font unit.
+  pub scale: f64,
+  /// Ascent and descent in user units, positive above and below the baseline.
+  pub ascent: f64,
+  pub descent: f64,
+  span: usize,
+  choice: usize,
+}
+
+pub struct PlacedGlyph {
+  pub span: usize,
+  pub instance: usize,
+  pub glyph: u32,
+  /// The first character of the glyph's cluster.
+  pub owner: usize,
+  /// The pen position on the baseline, in user space.
+  pub x: f64,
+  pub y: f64,
+  /// The shaper's offset of the glyph from the pen, in user units (y down).
+  pub offsetX: f64,
+  pub offsetY: f64,
+  /// Degrees, clockwise.
+  pub rotate: f64,
+  /// Horizontal advance in user units.
+  pub advance: f64,
+}
+
+impl Copy for PlacedGlyph {}
+
+pub struct Layout {
+  pub glyphs: List<PlacedGlyph>,
+  pub instances: List<Instance>,
+}
+
+const TAG_WGHT: u32 = 0x77676874
+
+const TAG_WDTH: u32 = 0x77647468
+
+const TAG_ITAL: u32 = 0x6974616c
+
+const TAG_SLNT: u32 = 0x736c6e74
+
+fn fontOf<'a>(database: &'a FontDatabase, face: usize) -> Option<FontRef<'a>> {
+  let index = database.face(face).index
+  return match move FontRef.fromIndex(database.data(face), index) {
+    Result<FontRef<'a>, ReadError>.Success { value } => Option<FontRef<'a>>.Some { value: value }
+    Result<FontRef<'a>, ReadError>.Failure { error } => Option<FontRef<'a>>.None
+  }
+}
+
+fn supports(database: &FontDatabase, face: usize, cp: u32) -> bool {
+  return match fontOf(database, face) {
+    Option<FontRef>.Some { value: font } => Charmap.new(&font).mapUnicode(cp).isSome()
+    Option<FontRef>.None => false
+  }
+}
+
+/// Characters that belong to the cluster of the previous one keep its face.
+fn continues(cp: u32) -> bool {
+  return Ucd.isMark(cp) || cp == 0x200C || cp == 0x200D || (cp >= 0xFE00 && cp <= 0xFE0F)
+    || (cp >= 0xE0100 && cp <= 0xE01EF)
+}
+
+/// The variation values the matching step chose, for the axes the face has.
+effect fn variations(face: &Face, selection: &Selection, out: &mut List<Variation>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if (face.axes & AXIS_WEIGHT) != 0 {
+    run List<Variation>.append(
+      &mut out,
+      Variation { tag: Tag.fromU32(TAG_WGHT), value: f64.toF32(selection.weight) },
+    )
+  }
+  if (face.axes & AXIS_WIDTH) != 0 {
+    run List<Variation>.append(
+      &mut out,
+      Variation { tag: Tag.fromU32(TAG_WDTH), value: f64.toF32(selection.width) },
+    )
+  }
+  if (face.axes & AXIS_ITALIC) != 0 {
+    if let Option<f64>.Some { value } = selection.italic {
+      run List<Variation>.append(
+        &mut out,
+        Variation { tag: Tag.fromU32(TAG_ITAL), value: f64.toF32(value) },
+      )
+    }
+  }
+  if (face.axes & AXIS_SLANT) != 0 {
+    if let Option<f64>.Some { value } = selection.oblique {
+      run List<Variation>.append(
+        &mut out,
+        Variation { tag: Tag.fromU32(TAG_SLNT), value: f64.toF32(-value) },
+      )
+    }
+  }
+}
+
+fn lineMetric(value: F48Dot16) -> f64 {
+  return F48Dot16.toF64(value)
+}
+
+/// The instance for a span's face choice, created on first use.
+effect fn instance(
+  database: &FontDatabase,
+  spans: &[Span],
+  span: usize,
+  choice: usize,
+  instances: &mut List<Instance>,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: usize = 0
+  while index < List<Instance>.length(&instances.*) {
+    let existing = &List<Instance>.asSlice(&instances.*)[index]
+    if existing.span == span && existing.choice == choice {
+      return index
+    }
+    index = index + 1
+  }
+  let selection = List<Selection>.asSlice(&spans[span].faces)[choice]
+  let face = database.face(selection.face)
+  let mut coords = List<F2Dot14>.make()
+  let mut scale = 0.0
+  let mut ascent = 0.0
+  let mut descent = 0.0
+  if let Option<FontRef>.Some { value: font } = fontOf(database, selection.face) {
+    let data = ShaperData.new(&font)
+    let mut shaper = Shaper.withFuncs(&data, DefaultFontFuncs {})
+    let mut wanted = List<Variation>.make()
+    run variations(face, &selection, &mut wanted)
+    run shaper.setVariations(List<Variation>.asSlice(&wanted))
+    run List<F2Dot14>.appendSlice(&mut coords, List<F2Dot14>.asSlice(&shaper.coords))
+    let metrics = Metrics.fromSfnt(&font, List<F2Dot14>.asSlice(&coords))
+    scale = spans[span].size / u16.toF64(metrics.unitsPerEm)
+    if let Option<LineBox<F48Dot16>>.Some { value: line } = metrics.hLine() {
+      ascent = lineMetric(line.ascender) * scale
+      descent = -lineMetric(line.descender) * scale
+    }
+  }
+  run List<Instance>.append(
+    &mut instances,
+    Instance {
+      face: selection.face,
+      selection: selection,
+      coords: move coords,
+      scale: scale,
+      ascent: ascent,
+      descent: descent,
+      span: span,
+      choice: choice,
+    },
+  )
+  return List<Instance>.length(&instances.*) - 1
+}
+
+/// Per character: the index of the span face that renders it (CSS Fonts 4 #cluster-matching,
+/// with marks and joiners kept on the face of the character before them).
+fn choose(database: &FontDatabase, spans: &[Span], characters: &[Character], at: usize) -> usize {
+  let character = characters[at]
+  let faces = List<Selection>.asSlice(&spans[character.span].faces)
+  let mut choice: usize = 0
+  while choice < faces.length {
+    if supports(database, faces[choice].face, character.cp) {
+      return choice
+    }
+    choice = choice + 1
+  }
+  return 0
+}
+
+/// Shapes `characters[start..end)` (one span, one face) and appends their glyphs from the
+/// CSS pen position `pen`. Each cluster's first character records the pen offset of the
+/// cluster; the other characters of a cluster record their owner.
+effect fn shapeRun(
+  database: &FontDatabase,
+  layout: &mut Layout,
+  instanceIndex: usize,
+  characters: &[Character],
+  start: usize,
+  end: usize,
+  pen: f64,
+  offsets: &mut List<f64>,
+  owners: &mut List<usize>,
+) -> f64
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let instance = &List<Instance>.asSlice(&layout.instances)[instanceIndex]
+  let scale = instance.scale
+  let font = match fontOf(database, instance.face) {
+    Option<FontRef>.Some { value } => value
+    Option<FontRef>.None => {
+      return pen
+    }
+  }
+  let data = ShaperData.new(&font)
+  let mut shaper = Shaper.withFuncs(&data, DefaultFontFuncs {})
+  List<F2Dot14>.clear(&mut shaper.coords)
+  run List<F2Dot14>.appendSlice(&mut shaper.coords, List<F2Dot14>.asSlice(&instance.coords))
+  let mut buffer = Buffer.new()
+  let mut index = start
+  while index < end {
+    run buffer.add(characters[index].cp, usize.toU32(index - start))
+    index = index + 1
+  }
+  buffer.guessSegmentProperties()
+  let shaped = run shapeWithFeatures(&shaper, &mut buffer, &[])
+  if let Result<(), ShapeError>.Failure { error } = move shaped {
+    return pen
+  }
+  let mut advance = pen
+  let count = buffer.len()
+  let mut glyph: usize = 0
+  while glyph < count {
+    let info = match buffer.glyphInfo(glyph) {
+      Option<GlyphInfo>.Some { value } => value
+      Option<GlyphInfo>.None => GlyphInfo { glyphId: 0, cluster: 0, flags: 0 }
+    }
+    let position = match buffer.glyphPosition(glyph) {
+      Option<GlyphPosition>.Some { value } => value
+      Option<GlyphPosition>.None => GlyphPosition.zero()
+    }
+    let owner = start + u32.toUsize(info.cluster)
+    if List<usize>.get(&owners.*, owner) == usize.MAX {
+      List<f64>.set(&mut offsets, owner, advance)
+      List<usize>.set(&mut owners, owner, owner)
+    }
+    run List<PlacedGlyph>.append(
+      &mut layout.glyphs,
+      PlacedGlyph {
+        span: characters[owner].span,
+        instance: instanceIndex,
+        glyph: info.glyphId,
+        owner: owner,
+        x: advance,
+        y: 0.0,
+        offsetX: i32.toF64(position.xOffset) * scale,
+        offsetY: -i32.toF64(position.yOffset) * scale,
+        rotate: 0.0,
+        advance: i32.toF64(position.xAdvance) * scale,
+      },
+    )
+    advance = advance + i32.toF64(position.xAdvance) * scale
+    glyph = glyph + 1
+  }
+
+  // Characters without a glyph of their own belong to the cluster before them.
+  index = start
+  while index < end {
+    if List<usize>.get(&owners.*, index) == usize.MAX {
+      let previous = if index > start {
+        List<usize>.get(&owners.*, index - 1)
+      } else {
+        index
+      }
+      List<usize>.set(&mut owners, index, previous)
+      let inherited = List<f64>.get(&offsets.*, previous)
+      List<f64>.set(&mut offsets, index, inherited)
+    }
+    index = index + 1
+  }
+  return advance
+}
+
+/// Lays out one text element's addressable characters.
+pub effect fn layout(database: &FontDatabase, spans: &[Span], characters: &[Character]) -> Layout
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = Layout { glyphs: List<PlacedGlyph>.make(), instances: List<Instance>.make() }
+  let count = characters.length
+  if count == 0 {
+    return move result
+  }
+  let mut offsets = List<f64>.make()
+  let mut owners = List<usize>.make()
+  let mut choices = List<usize>.make()
+  run List<f64>.appendRepeated(&mut offsets, 0.0, count)
+  run List<usize>.appendRepeated(&mut owners, usize.MAX, count)
+  let mut index: usize = 0
+  while index < count {
+    let choice = if index > 0 && continues(characters[index].cp)
+      && characters[index - 1].span == characters[index].span {
+      List<usize>.get(&choices, index - 1)
+    } else {
+      choose(database, spans, characters, index)
+    }
+    run List<usize>.append(&mut choices, choice)
+    index = index + 1
+  }
+
+  // Step "CSS layout" along one line. Runs end where the span or the face changes.
+  let mut pen = 0.0
+  let mut start: usize = 0
+  while start < count {
+    let span = characters[start].span
+    let choice = List<usize>.get(&choices, start)
+    let mut end = start + 1
+    while end < count && characters[end].span == span && List<usize>.get(&choices, end) == choice {
+      end = end + 1
+    }
+    if List<Selection>.length(&spans[span].faces) > 0 {
+      let instanceIndex = run instance(database, spans, span, choice, &mut result.instances)
+      pen = run shapeRun(
+        database,
+        &mut result,
+        instanceIndex,
+        characters,
+        start,
+        end,
+        pen,
+        &mut offsets,
+        &mut owners,
+      )
+    } else {
+      index = start
+      while index < end {
+        List<usize>.set(&mut owners, index, index)
+        List<f64>.set(&mut offsets, index, pen)
+        index = index + 1
+      }
+    }
+    start = end
+  }
+
+  // Steps "Adjust positions: dx, dy" and "Apply absolute positions". Only the first
+  // character of a typographic character takes positioning values; x and y start a new
+  // text chunk and dx, dy shift everything after them.
+  let mut shiftX = 0.0
+  let mut shiftY = 0.0
+  let mut positionsX = List<f64>.make()
+  let mut positionsY = List<f64>.make()
+  let mut chunkStarts = List<bool>.make()
+  index = 0
+  while index < count {
+    let character = characters[index]
+    let css = List<f64>.get(&offsets, index)
+    let mut chunk = index == 0
+    if List<usize>.get(&owners, index) == index {
+      shiftX = shiftX + character.dx
+      shiftY = shiftY + character.dy
+      if let Option<f64>.Some { value } = character.x {
+        shiftX = value + character.dx - css
+        chunk = true
+      }
+      if let Option<f64>.Some { value } = character.y {
+        shiftY = value + character.dy
+        chunk = true
+      }
+    }
+    run List<f64>.append(&mut positionsX, css + shiftX)
+    run List<f64>.append(&mut positionsY, shiftY)
+    run List<bool>.append(&mut chunkStarts, chunk)
+    index = index + 1
+  }
+
+  // Glyphs move with the first character of their cluster.
+  let glyphs = List<PlacedGlyph>.asMutSlice(&mut result.glyphs)
+  let mut g: usize = 0
+  while g < glyphs.length {
+    let owner = glyphs[g].owner
+    glyphs[g].x = List<f64>.get(&positionsX, owner) + (glyphs[g].x - List<f64>.get(&offsets, owner))
+    glyphs[g].y = List<f64>.get(&positionsY, owner)
+    glyphs[g].rotate = characters[owner].rotate
+    g = g + 1
+  }
+  anchor(spans, characters, &chunkStarts, &mut glyphs)
+  return move result
+}
+
+/// Whether a glyph of `owner`, after a glyph of `previous`, begins a text chunk.
+fn startsChunk(chunkStarts: &List<bool>, owner: usize, previous: usize) -> bool {
+  return List<bool>.get(chunkStarts, owner) && previous != owner
+}
+
+// Step "Apply anchoring": each chunk shifts so its advance extent [a, b] starts, centers or
+// ends on the chunk's start position, per the text-anchor of its first character.
+fn anchor(
+  spans: &[Span],
+  characters: &[Character],
+  chunkStarts: &List<bool>,
+  glyphs: &mut [PlacedGlyph],
+) -> () {
+  let mut first: usize = 0
+  while first < glyphs.length {
+    let mut last = first + 1
+    while last < glyphs.length
+      && !startsChunk(chunkStarts, glyphs[last].owner, glyphs[last - 1].owner) {
+      last = last + 1
+    }
+    let mut low = f64.INFINITY
+    let mut high = -f64.INFINITY
+    let mut g = first
+    while g < last {
+      let left = f64.min(glyphs[g].x, glyphs[g].x + glyphs[g].advance)
+      let right = f64.max(glyphs[g].x, glyphs[g].x + glyphs[g].advance)
+      low = f64.min(low, left)
+      high = f64.max(high, right)
+      g = g + 1
+    }
+    let origin = glyphs[first].x
+    let shift = match spans[characters[glyphs[first].owner].span].anchor {
+      Anchor.Start => origin - low
+      Anchor.Middle => origin - (low + high) / 2.0
+      Anchor.End => origin - high
+    }
+    g = first
+    while g < last {
+      glyphs[g].x = glyphs[g].x + shift
+      g = g + 1
+    }
+    first = last
+  }
+}

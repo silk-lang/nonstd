@@ -724,6 +724,23 @@ decisions:
     angle, or by 14deg for italic.
   - A request of 600 or more on a face whose weights all lie below 600 is emboldened.
 
+### Text layout
+
+`images/svg/text` runs the SVG 2 text layout algorithm (#TextLayoutAlgorithm) on one
+`text` element's addressable characters, on a single horizontal line. Interpretation
+decisions:
+
+- Per-character font choice follows CSS Fonts 4 #cluster-matching in a simplified form:
+  each character takes the first face of its span that maps it in `cmap`. Marks, ZWJ, ZWNJ
+  and variation selectors keep the face of the character before them in the same span.
+- Runs of characters with the same span and face are shaped with HarfBuzz's algorithm
+  (`font/shape`) and default features. The pen continues across runs.
+- A cluster's glyphs move with its first character. Characters that do not start a cluster
+  (after composition or ligation) are not the first character of a typographic character,
+  so their `x`, `y`, `dx` and `dy` values are ignored.
+- Anchoring uses the extent of the glyph advances of each text chunk, as the
+  "Apply anchoring" step defines it.
+
 ### JPEG scan reconstruction
 
 The local JPEG decoder follows the pinned `jpeg-t81` document's B.2 marker/frame/
