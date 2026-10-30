@@ -83,6 +83,10 @@ To run against SwiftShader locally, point Vulkan at Chromium's copy:
   JavaScript. Invalid UTF-8 counts as one U+FFFD per byte.
 - Batching is explicit (`parseMany`) instead of coalescing calls made in one microtask.
 - Sources must be shorter than 4 GiB.
+- A batch that needs a buffer above the device's `maxBufferSize` or
+  `maxStorageBufferBindingSize` fails with `GpuError` code `TOO_LARGE` (`src/gpu_util.silk`),
+  like the original's `RangeError`. The lite model needs 2 KiB of scratch per part, so on a
+  128 MiB binding limit one lite source tops out around 150 KB; split larger sources.
 
 ## Tests
 
@@ -96,6 +100,21 @@ python3 text/gpu-lexer/scripts/check --skip-native # generated modules, packages
 The native part needs Dawn and a Vulkan driver (lavapipe in CI); see `gpu/webgpu`.
 `node text/gpu-lexer/scripts/expected.mjs <gpu-lexer checkout>` regenerates `tests/expected`
 from the original (Node, plus Playwright's Chromium for the spans).
+
+## Benchmarks
+
+`python3 text/gpu-lexer/scripts/bench` times the port (`bench/`) and
+`node text/gpu-lexer/scripts/bench-original.mjs <gpu-lexer checkout>` times the original on the
+same workloads: the 18 fixtures in one batch, and one 127 KB source (the fixtures 16 times).
+Steps are each CPU pass alone and each model end to end (CPU pass, upload, GPU, readback, spans).
+
+## Training
+
+`training/` adds Silk to gpu-lexer's training pipeline: `node training/apply.mjs <gpu-lexer
+checkout>` adds the Silk TextMate grammar from
+[silk-vscode](https://github.com/silk-lang/silk-vscode) (`syntaxes/silk.tmLanguage.json`, MIT)
+as Shiki's `silk` language, maps `.silk` files to it, and adds Silk repositories to the pinned
+corpus. Then follow gpu-lexer's own training steps (`corpus:prepare`, `train`).
 
 ## License
 

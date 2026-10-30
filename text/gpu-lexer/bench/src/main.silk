@@ -1,0 +1,211 @@
+//! Times the port on the test fixtures: the CPU passes alone and both models end to end
+//! (CPU pass, upload, GPU, readback, spans), batched (all fixtures in one submission) and on one
+//! large source (the fixtures concatenated 16 times). Prints one JSON object per line to stderr, with the
+//! median of at least 5 runs and 1 s of work. Run from text/gpu-lexer.
+//! scripts/bench-original.mjs times the original the same way.
+import gpu_lexer.lexer { Lexer, LiteLexer, Options, openDevice }
+import gpu_lexer.spans { Span }
+import gpu_lexer.tree_parts { TreeParts }
+import gpu_lexer.lite_parts { LiteParts }
+import webgpu.runtime { GpuError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.native.clock { NativeClock }
+import silk.system.system_clock { SystemClock }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInputError }
+import silk.num.i64
+import silk.num.u64
+
+const NAMES: [string; 18] = [
+  "Makefile", "batch.bat", "c.c", "css.css", "go.go", "html.html", "javascript.js", "json.json",
+  "markdown.md", "python.py", "rust.rs", "shader.shader", "shell.sh", "silk.silk", "sql.sql",
+  "typescript.ts", "unicode.txt", "yaml.yaml",
+]
+const LARGE_REPEATS: usize = 16
+
+effect fn read(name: string) -> List<u8> ! FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+  let cwd = run NativeHostInput.workingDirectory()
+  let root = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let folder = run Path.resolve(&root, "tests/fixtures")
+  let path = run folder.joinBytes(String.utf8Bytes(name))
+  let mut files = run OsFileSystem.make("/")
+  let contents = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  let mut result = List<u8>.make()
+  run result.appendBytes(Bytes.asSlice(&contents))
+  return move result
+}
+
+effect fn nanoseconds() -> u64 {
+  let now = run NativeClock.now(true)
+  return u64.wrappingAdd(u64.wrappingMultiply(i64.toU64(SystemClock.seconds(&now)), 1000000000), i64.toU64(SystemClock.nanoseconds(&now)))
+}
+
+/// Run times, in nanoseconds, of one workload.
+struct Samples {
+  times: List<u64>,
+  started: u64,
+  total: u64,
+}
+
+impl Samples {
+  effect fn make() -> Samples {
+    return Samples { times: List<u64>.make(), started: run nanoseconds(), total: 0 }
+  }
+
+  fn more(self: &Self) -> bool { return self.times.length() < 5 || self.total < 1000000000 }
+
+  effect fn start(self: &mut Self) -> () { self.started = run nanoseconds() }
+
+  effect fn stop(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let elapsed = u64.wrappingSubtract(run nanoseconds(), self.started)
+    self.total = self.total + elapsed
+    run self.times.append(elapsed)
+  }
+
+  fn median(self: &mut Self) -> u64 {
+    let times = self.times.asMutSlice()
+    let mut index: usize = 1
+    while index < times.length {
+      let mut at = index
+      while at > 0 && times[at - 1] > times[at] {
+        let swap = times[at]
+        times[at] = times[at - 1]
+        times[at - 1] = swap
+        at = at - 1
+      }
+      index = index + 1
+    }
+    return times[times.length / 2]
+  }
+
+  fn report(self: &mut Self, workload: string, step: string, bytes: usize) -> () {
+    let median = self.median()
+    StderrWriter.print("{{\"engine\":\"silk\",\"workload\":\"{}\",\"step\":\"{}\",\"bytes\":{},\"runs\":{},\"medianUs\":{}}}\n", &(workload, step, bytes, self.times.length(), median / 1000))
+  }
+}
+
+effect fn workload(name: string, views: &[&[u8]], tree: &mut Lexer, lite: &mut LiteLexer) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+  let mut bytes: usize = 0
+  let mut index: usize = 0
+  while index < views.length {
+    bytes = bytes + views[index].length
+    index = index + 1
+  }
+
+  let mut treeParts = TreeParts.make()
+  let mut samples = run Samples.make()
+  while samples.more() {
+    run samples.start()
+    treeParts.clear()
+    index = 0
+    while index < views.length {
+      run treeParts.append(views[index])
+      index = index + 1
+    }
+    run samples.stop()
+  }
+  samples.report(name, "cpu-tree", bytes)
+
+  let mut liteParts = LiteParts.make()
+  samples = run Samples.make()
+  while samples.more() {
+    run samples.start()
+    liteParts.clear()
+    index = 0
+    while index < views.length {
+      run liteParts.append(views[index])
+      index = index + 1
+    }
+    run samples.stop()
+  }
+  samples.report(name, "cpu-lite", bytes)
+
+  let mut output = List<List<Span>>.make()
+  run tree.parseMany(views, &mut output)
+  samples = run Samples.make()
+  while samples.more() {
+    run samples.start()
+    run tree.parseMany(views, &mut output)
+    run samples.stop()
+  }
+  samples.report(name, "tree", bytes)
+
+  run lite.parseMany(views, &mut output)
+  samples = run Samples.make()
+  while samples.more() {
+    run samples.start()
+    run lite.parseMany(views, &mut output)
+    run samples.stop()
+  }
+  samples.report(name, "lite", bytes)
+}
+
+effect fn program() -> i32 ! GpuError | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut sources = List<List<u8>>.make()
+  let mut large = List<u8>.make()
+  let mut index: usize = 0
+  while index < NAMES.length {
+    let source = run read(NAMES[index]) |> Effect.provideMut<Allocator>(&mut allocator)
+    run sources.append(move source) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  let mut views = List<&[u8]>.make()
+  index = 0
+  while index < sources.length() {
+    run views.append(sources.asSlice()[index].asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  let mut repeat: usize = 0
+  while repeat < LARGE_REPEATS {
+    index = 0
+    while index < sources.length() {
+      run large.appendBytes(sources.asSlice()[index].asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+      index = index + 1
+    }
+    repeat = repeat + 1
+  }
+
+  let device = run openDevice(true)
+  let info = run device.getAdapterInfo()
+  let description = match info.description() {
+    Option<&[u8]>.Some { value } => value
+    Option<&[u8]>.None => b""
+  }
+  let adapter = match String.fromUtf8(description) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { error } => "?"
+  }
+  StderrWriter.print("adapter: {}\n", &(adapter,))
+  let mut tree = run Lexer.make(&device, Options.default()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lite = run LiteLexer.make(&device) |> Effect.provideMut<Allocator>(&mut allocator)
+  run workload("fixtures", views.asSlice(), &mut tree, &mut lite) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut one = List<&[u8]>.make()
+  run one.append(large.asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run workload("large", one.asSlice(), &mut tree, &mut lite) |> Effect.provideMut<Allocator>(&mut allocator)
+  return 0
+}
+
+effect fn gpuFailed(error: GpuError) -> i32 ! never {
+  StderrWriter.print("WebGPU error {}: {:?}\n", &(error.code, error.message.asSlice()))
+  return 2
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("bench setup failed (file, allocation or host input)\n", &())
+  return 3
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(Effect.catch<GpuError>(program(), gpuFailed), failed)
+}
