@@ -26,6 +26,7 @@ import used_clip_shapes
 import svg_css.effect_values { EffectValue, ClipSource, GeometryBox, MaskMode, Composite }
 import used_masks
 import used_filters
+import used_filters { FilterImage }
 import svg_css.effect_values { Filter }
 import used_mask_images
 import used_mask_images { Reference as LayerReference, Painted, Placement }
@@ -499,6 +500,8 @@ struct Planning {
   clipNodes: List<ClipNode>,
   activeClips: List<usize>,
   activeMasks: List<usize>,
+  /// feImage occurrences being drawn, so that a filter reaching itself draws nothing.
+  activeFilterImages: List<usize>,
   filters: List<FilterProgram>,
   resourceAncestry: usize,
   ancestryKeys: HashMap<ReferenceKey, usize>,
@@ -3490,6 +3493,8 @@ effect fn applyMask(
 struct Filtering {
   hidden: bool,
   programs: List<usize>,
+  /// Each program's feImage layers, in its image order.
+  images: List<List<FilterImage>>,
 }
 
 // https://www.w3.org/TR/filter-effects-1/#FilterProperty
@@ -3504,6 +3509,7 @@ effect fn filtering(
   ? &mut Allocator {
   let plan = state.plans.asSlice()[id]
   let mut programs = List<usize>.make()
+  let mut images = List<List<FilterImage>>.make()
   let mut count: usize = 0
   if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
     plan.styleId,
@@ -3517,7 +3523,7 @@ effect fn filtering(
           if let Filter.Url { url } = &items.asSlice()[item] {
             // A reference to a missing or non-filter element ignores the whole chain.
             if styles.resourceAt(plan.occurrence, Property.Filter, item).isNone() {
-              return Filtering { hidden: false, programs: move programs }
+              return Filtering { hidden: false, programs: move programs, images: move images }
             }
           }
           item = item + 1
@@ -3526,7 +3532,7 @@ effect fn filtering(
     }
   }
   if count == 0 {
-    return Filtering { hidden: false, programs: move programs }
+    return Filtering { hidden: false, programs: move programs, images: move images }
   }
   let bounds = match &(run gather(
     graph,
@@ -3562,6 +3568,7 @@ effect fn filtering(
   let viewport = state.spaces.asSlice()[plan.viewport]
   let mut item: usize = 0
   while item < count {
+    let mut layers = List<FilterImage>.make()
     let resolved = match &styles.resourceAt(plan.occurrence, Property.Filter, item) {
       Option<OccurrenceId>.Some { value: target } => {
         let program = run used_filters.resolve(
@@ -3571,6 +3578,7 @@ effect fn filtering(
           viewport,
           bounds,
           limits,
+          &mut layers,
         )
 
         // A referenced filter's output lies within its own region.
@@ -3594,14 +3602,286 @@ effect fn filtering(
         }
         run programs.append(state.filters.length())
         run state.filters.append(move value)
+        run images.append(move layers)
       }
       _ => {
-        return Filtering { hidden: true, programs: move programs }
+        return Filtering { hidden: true, programs: move programs, images: move images }
       }
     }
     item = item + 1
   }
-  return Filtering { hidden: false, programs: move programs }
+  return Filtering { hidden: false, programs: move programs, images: move images }
+}
+
+// https://www.w3.org/TR/filter-effects-1/#feImageElement: one image layer of a filter,
+// drawn in the filtered element's user space (or its bounding box units) between
+// BeginFilterImage and EndFilterImage. A missing, broken or cyclic reference draws nothing.
+effect fn paintFilterImage(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  id: usize,
+  request: FilterImage,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+  matrix: &Mapping,
+  outputBounds: Rect,
+  context: &PaintContext,
+  depth: usize,
+  references: usize,
+  nodes: &mut List<ResolvedNode>,
+  shapes: &mut List<ResolvedShape>,
+  clips: &mut List<ProjectionClip>,
+) -> ()
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run nodes.append(ResolvedNode.BeginFilterImage)
+  let plan = state.plans.asSlice()[id]
+  let occurrence = graph.occurrences.asSlice()[request.node.index]
+  let mut active = false
+  let mut i: usize = 0
+  while i < state.activeFilterImages.length() {
+    if state.activeFilterImages.asSlice()[i] == request.node.index {
+      active = true
+    }
+    i = i + 1
+  }
+  if !active && occurrence.shadow.isSome() {
+    if references >= graph.limits.maxReferenceDepth || depth >= 256 {
+      fail RenderError.TooLarge
+    }
+
+    // The referenced element renders like use, in primitiveUnits space.
+    let supplement = if request.objectBox {
+      Transform.new(
+        request.bounds.width(),
+        0.0,
+        0.0,
+        request.bounds.height(),
+        request.bounds.xMin,
+        request.bounds.yMin,
+      )
+    } else {
+      Transform.identity()
+    }
+    let layoutIndex = state.layouts.length()
+    run state.layouts.append(
+      Layout {
+        supplement: supplement,
+        clip: Option<Clip>.None,
+        clipMapping: Mapping.identity(),
+        referenceMapping: true,
+        viewportHost: Option<Mapping>.None,
+      },
+    )
+    let root = PreparationRoot {
+      occurrence: request.node,
+      viewport: plan.viewport,
+      childViewport: plan.viewport,
+      layout: layoutIndex,
+      definition: true,
+      externalTransform: true,
+    }
+    let prepared = run prepare(
+      graph,
+      &mut styles.*,
+      request.node,
+      &root,
+      Option<usize>.None,
+      0,
+      &mut state.*,
+      limits,
+    )
+    if let Option<usize>.Some { value } = &prepared {
+      run place(
+        graph,
+        value,
+        &styles.catalog.engine,
+        state.spaces.asSlice(),
+        &transforms.identity(),
+        false,
+        &mut state.plans,
+        &mut state.layouts,
+        &mut state.pending,
+        state.paths.asSlice(),
+        &mut state.bounds,
+      )
+      state.pending.truncate(0)
+      run state.activeFilterImages.append(request.node.index)
+      run paint(
+        graph,
+        &mut styles.*,
+        value,
+        &mut state.*,
+        &mut paints.*,
+        limits,
+        matrix,
+        &Frame.root(matrix.*),
+        Option<usize>.None,
+        outputBounds,
+        context,
+        depth + 1,
+        references + 1,
+        &mut nodes.*,
+        &mut shapes.*,
+        &mut clips.*,
+      )
+      drop state.activeFilterImages.pop()
+    }
+  } else if let Option<usize>.Some { value: image } = &state.images.find(occurrence.source) {
+    // An image resource renders like the image element in the subregion, with the
+    // feImage's preserveAspectRatio.
+    let asset = &state.images.assets.asSlice()[image]
+    let rw = u32.toF64(asset.image.width())
+    let rh = u32.toF64(asset.image.height())
+    let style = match &styles.nodeStyle(request.node) {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        fail RenderError.InvalidStyleContext
+      }
+    }
+    let orientation = used_images.orientation(&styles.catalog.engine, style, asset)
+    let swapped = orientation >= 5 && orientation <= 8
+    let iw = if swapped {
+      rh
+    } else {
+      rw
+    }
+    let ih = if swapped {
+      rw
+    } else {
+      rh
+    }
+    let document = graph.sourceDocument(occurrence.source)
+    let bytes = match &Document.attribute(
+      document,
+      occurrence.source.node,
+      b"",
+      b"preserveAspectRatio",
+    ) {
+      Option<&[u8]>.Some { value } => value
+      _ => b""
+    }
+    let aspect = match &svg.aspectRatio(bytes) {
+      Option<AspectRatio>.Some { value } => value
+      _ => AspectRatio { alignment: Alignment.XMidYMid, slice: false, defer: false }
+    }
+    if let Option<Transform>.Some { value: fitted } = &used_images.fit(
+      iw,
+      ih,
+      request.subregion,
+      aspect,
+    ) {
+      let placement = Transform.multiply(fitted, used_images.orient(orientation, rw, rh))
+      let samples = run rectangle(0.0, 0.0, rw, rh)
+      let covered = match &placement.mapRect(samples) {
+        Option<Rect>.Some { value } => value.intersection(request.subregion)
+        _ => Option<Rect>.None
+      }
+      if let Option<Rect>.Some { value: area } = &covered {
+        let index = paints.paints.length()
+        run paints.paints.append(
+          PaintInstance.Image {
+            image: image,
+            transform: run matrix.compose(&Mapping.Affine { value: placement }),
+            sampling: imageSampling(&styles.catalog.engine, style),
+          },
+        )
+        let mut used = plan.style
+        used.fill = Paint.Server { index: index }
+        used.fillOpacity = 1.0
+        used.stroke = Paint.None
+        used.opacity = 1.0
+        used.blendMode = BlendMode.Normal
+        used.isolated = false
+        used.visible = true
+        used.displayed = true
+        used.crispEdges = false
+        used.linearRgb = false
+        used.fillRule = FillRule.Nonzero
+        let path = state.paths.length()
+        run state.paths.append(
+          run svg.rectangle(area.xMin, area.yMin, area.width(), area.height(), 0.0, 0.0),
+        )
+        let shape = shapes.length()
+        run shapes.append(
+          ResolvedShape {
+            path: path,
+            transform: matrix.*,
+            strokeSpace: Option<usize>.None,
+            clip: Option<usize>.None,
+            bounds: outputBounds,
+            style: used,
+          },
+        )
+        run nodes.append(ResolvedNode.Paint { shape: shape, layer: PaintLayer.Fill })
+      }
+    }
+  } else if let Option<usize>.Some { value: candidate } = &state.images.findDocument(
+    occurrence.source,
+  ) {
+    // An SVG document renders like the image element in the subregion; the filter
+    // drops whatever falls outside the subregion.
+    if let Option<DocumentMetadata>.Some {
+      value: metadata
+    } = &state.images.documents.asSlice()[candidate].metadata {
+      let document = graph.sourceDocument(occurrence.source)
+      let bytes = match &Document.attribute(
+        document,
+        occurrence.source.node,
+        b"",
+        b"preserveAspectRatio",
+      ) {
+        Option<&[u8]>.Some { value } => value
+        _ => b""
+      }
+      let mut aspect = match &svg.aspectRatio(bytes) {
+        Option<AspectRatio>.Some { value } => value
+        _ => AspectRatio { alignment: Alignment.XMidYMid, slice: false, defer: false }
+      }
+      if aspect.defer {
+        if let Option<AspectRatio>.Some { value } = &metadata.aspect {
+          aspect = value
+        }
+      }
+      let target = request.subregion
+      let rendered = match &metadata.natural.ratio {
+        Option<f64>.Some { value: ratio } => match &used_images.fit(ratio, 1.0, target, aspect) {
+          Option<Transform>.Some { value } => run rectangle(
+            value.e,
+            value.f,
+            value.a * ratio,
+            value.d,
+          )
+          _ => target
+        }
+        _ => target
+      }
+      if rendered.width() > 0.0 && rendered.height() > 0.0 {
+        let viewport = Size.new(rendered.width(), rendered.height())
+        let mut image: usize = 0
+        while image < state.embedded.length() {
+          let entry = &state.embedded.asSlice()[image]
+          if entry.source == candidate && entry.viewport.width == viewport.width
+            && entry.viewport.height == viewport.height {
+            break
+          }
+          image = image + 1
+        }
+        if image == state.embedded.length() {
+          run state.embedded.append(
+            EmbeddedImage { source: candidate, viewport: viewport, tree: Option<RenderTree>.None },
+          )
+        }
+        let placement = Transform.translation(rendered.xMin, rendered.yMin)
+        let transform = run matrix.compose(&Mapping.Affine { value: placement })
+        run nodes.append(
+          ResolvedNode.Embedded { image: image, transform: transform, clip: Option<usize>.None },
+        )
+      }
+    }
+  }
+  run nodes.append(ResolvedNode.EndFilterImage)
 }
 
 effect fn paintPrepared(
@@ -3750,6 +4030,28 @@ effect fn paintPrepared(
         clip: inheritedClip,
       },
     )
+    let layers = filtered.images.asSlice()[f].asSlice()
+    let mut layer: usize = 0
+    while layer < layers.length {
+      run paintFilterImage(
+        graph,
+        &mut styles.*,
+        id,
+        layers[layer],
+        &mut state.*,
+        &mut paints.*,
+        limits,
+        matrix,
+        outputBounds,
+        context,
+        depth,
+        references,
+        &mut nodes.*,
+        &mut shapes.*,
+        &mut clips.*,
+      )
+      layer = layer + 1
+    }
   }
   if plan.paintable && plan.style.visible && plan.document.isSome() {
     if let Option<usize>.Some { value: source } = &plan.document {
@@ -4076,6 +4378,7 @@ effect fn resolveStyled(
     clipNodes: List<ClipNode>.make(),
     activeClips: List<usize>.make(),
     activeMasks: List<usize>.make(),
+    activeFilterImages: List<usize>.make(),
     filters: List<FilterProgram>.make(),
     resourceAncestry: usize.MAX,
     ancestryKeys: HashMap<ReferenceKey, usize>.make(Hash.seed(0)),

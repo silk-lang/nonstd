@@ -662,14 +662,37 @@ effect fn picture(
             )
             if let Option<FilterSurface>.Some { value: surface } = &found {
               let area = u32.toUsize(surface.width) * u32.toUsize(surface.height)
-              let buffers = program.primitives.length() + 8
+              let buffers = program.primitives.length() + program.images + 8
               if buffers > (textures.surfaceLimit - textures.surfaces) / area {
                 fail RenderError.TooLarge
               }
               run patterns.surface(&mut textures.*, area * buffers)
+
+              // Image layers come first, each up to its EndFilterImage; the rest is the source.
+              let mut images = List<Pixmap>.make()
+              let mut start = i + 1
+              while start < end && opensFilterImage(&commands[start]) {
+                let close = filterImageEnd(commands, start)
+                let image = run picture(
+                  list,
+                  Slice.view<Command>(commands, start + 1, close - start - 1),
+                  surface.width,
+                  surface.height,
+                  &patterns.root(),
+                  true,
+                  Option<Mapping>.some(surface.content),
+                  &[],
+                  depth,
+                  &mut cache.*,
+                  &mut paintCache.*,
+                  &mut textures.*,
+                )
+                run images.append(move image)
+                start = close + 1
+              }
               let source = run picture(
                 list,
-                Slice.view<Command>(commands, i + 1, end - i - 1),
+                Slice.view<Command>(commands, start, end - start),
                 surface.width,
                 surface.height,
                 &patterns.root(),
@@ -681,7 +704,7 @@ effect fn picture(
                 &mut paintCache.*,
                 &mut textures.*,
               )
-              let result = run filterGraph.apply(program, &source, surface.space)
+              let result = run filterGraph.apply(program, &source, images.asSlice(), surface.space)
               textures.surfaces = textures.surfaces - area * buffers
               let mut rectangle = VectorPath.make()
               run rectangle.rect(
@@ -718,6 +741,8 @@ effect fn picture(
             i = end
           }
           Command.EndFilter => {}
+          Command.BeginFilterImage => {}
+          Command.EndFilterImage => {}
           Command.PopLayer => {
             let top = stack.length() - 1
             let layer = stack.remove(top)
@@ -749,6 +774,35 @@ effect fn picture(
   textures.surfaces = textures.surfaces - spare.length() * u32.toUsize(width) * u32.toUsize(height)
   let output = stack.remove(0)
   return move output.pixels
+}
+
+fn opensFilterImage(command: &Command) -> bool {
+  return match &command.* {
+    Command.BeginFilterImage => true
+    _ => false
+  }
+}
+
+// The EndFilterImage matching the BeginFilterImage at `begin`; validation guarantees one.
+fn filterImageEnd(commands: &[Command], begin: usize) -> usize {
+  let mut nested: usize = 0
+  let mut i = begin + 1
+  while i < commands.length {
+    match &commands[i] {
+      Command.BeginFilterImage => {
+        nested = nested + 1
+      }
+      Command.EndFilterImage => {
+        if nested == 0 {
+          return i
+        }
+        nested = nested - 1
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return commands.length
 }
 
 // The EndFilter matching the BeginFilter at `begin`; validation guarantees one.
@@ -1153,11 +1207,34 @@ effect fn validateClips(clips: &[ProjectionClip]) -> ()
   }
 }
 
+/// An open BeginFilter or BeginFilterImage during validation.
+struct FilterFrame {
+  /// Layer depth where it opened.
+  depth: usize,
+  filter: usize,
+  image: bool,
+  /// Image layers drawn so far (filters only).
+  images: usize,
+  /// Whether content has started (filters only); image layers come before it.
+  content: bool,
+}
+
+impl Copy for FilterFrame {}
+
+/// Marks the innermost open filter's content as started.
+fn started(frames: &mut List<FilterFrame>) -> () {
+  let count = frames.length()
+  if count > 0 {
+    let mut open = frames.asMutSlice()
+    open[count - 1].content = true
+  }
+}
+
 effect fn validateCommands(list: &DisplayList, commands: &[Command], width: u32, height: u32) -> ()
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
-  // Layer depth at each open BeginFilter: filtered content must close its own layers.
-  let mut filterDepths = List<usize>.make()
+  // Open filters and image layers: filtered content must close its own layers.
+  let mut filterDepths = List<FilterFrame>.make()
   let clips = list.projectionClips.asSlice()
 
   // dimensions() established a positive, checked pixel count before this call.
@@ -1272,19 +1349,67 @@ effect fn validateCommands(list: &DisplayList, commands: &[Command], width: u32,
         if filterDepths.length() >= 64 {
           fail RenderError.TooLarge
         }
-        run filterDepths.append(depth)
+        started(&mut filterDepths)
+        run filterDepths.append(
+          FilterFrame { depth: depth, filter: filter, image: false, images: 0, content: false },
+        )
       }
-      Command.EndFilter => {
-        if filterDepths.length() == 0 {
+      Command.BeginFilterImage => {
+        // Image layers open directly inside a filter, before its content.
+        let count = filterDepths.length()
+        if count == 0 || count >= 64 {
           fail RenderError.InvalidGeometry
         }
-        let top = filterDepths.length() - 1
-        if filterDepths.remove(top) != depth {
+        let parent = filterDepths.asSlice()[count - 1]
+        if parent.image || parent.content
+          || parent.images >= list.filters.asSlice()[parent.filter].images {
+          fail RenderError.InvalidGeometry
+        }
+        let mut open = filterDepths.asMutSlice()
+        open[count - 1].images = parent.images + 1
+        drop open
+        run filterDepths.append(
+          FilterFrame {
+            depth: depth,
+            filter: parent.filter,
+            image: true,
+            images: 0,
+            content: false,
+          },
+        )
+      }
+      Command.EndFilterImage => {
+        let count = filterDepths.length()
+        if count == 0 || !filterDepths.asSlice()[count - 1].image
+          || filterDepths.remove(count - 1).depth != depth {
+          fail RenderError.InvalidGeometry
+        }
+      }
+      Command.EndFilter => {
+        let count = filterDepths.length()
+        if count == 0 {
+          fail RenderError.InvalidGeometry
+        }
+        let frame = filterDepths.remove(count - 1)
+
+        // Every image layer the program reads was drawn.
+        if frame.image || frame.depth != depth
+          || frame.images != list.filters.asSlice()[frame.filter].images {
           fail RenderError.InvalidGeometry
         }
       }
     }
-    if filterDepths.length() > 0 && depth < filterDepths.asSlice()[filterDepths.length() - 1] {
+    match &commands[i] {
+      Command.BeginFilter { filter, transform, clip } => {}
+      Command.BeginFilterImage => {}
+      Command.EndFilterImage => {}
+      Command.EndFilter => {}
+      _ => {
+        started(&mut filterDepths)
+      }
+    }
+    if filterDepths.length() > 0
+      && depth < filterDepths.asSlice()[filterDepths.length() - 1].depth {
       fail RenderError.InvalidGeometry
     }
     i = i + 1
