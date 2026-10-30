@@ -1,5 +1,5 @@
 //! Host-extensible, allocation-bounded resource loading. No network, filesystem, or cache.
-//! RFC 2397 data decoding is strict: malformed escapes, headers and noncanonical Base64 fail.
+//! Data payloads use Fetch/Infra forgiving Base64; malformed escapes and headers fail.
 import url { Url }
 import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
@@ -485,34 +485,125 @@ effect fn base64Into(data: &[u8], output: &mut [u8]) -> usize
   }
 }
 
-// Consume percent escapes before Base64, using only a four-byte stack quantum.
-// A padded quantum is terminal, including when the padding was percent-encoded.
-effect fn readQuantum(data: &[u8], cursor: &mut usize, quantum: &mut [u8; 4]) -> ()
+fn asciiWhitespace(byte: u8) -> bool {
+  return byte == 9 || byte == 10 || byte == 12 || byte == 13 || byte == 32
+}
+
+effect fn base64Byte(data: &[u8], cursor: &mut usize) -> u8
+  ! ResourceError {
+  // URL serialization normally escapes spaces and removes tabs/newlines.
+  // Preserve the same rule for any raw whitespace that survives serialization.
+  if cursor.* < data.length && asciiWhitespace(data[cursor.*]) {
+    let byte = data[cursor.*]
+    cursor.* = cursor.* + 1
+    return byte
+  }
+  return run nextPercent(data, &mut cursor.*)
+}
+
+fn sextet(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte - 65
+  }
+  if byte >= 97 && byte <= 122 {
+    return byte - 97 + 26
+  }
+  if byte >= 48 && byte <= 57 {
+    return byte - 48 + 52
+  }
+  if byte == 43 {
+    return 62
+  }
+  if byte == 47 {
+    return 63
+  }
+  return 255
+}
+
+fn alphabet(value: u8) -> u8 {
+  if value < 26 {
+    return value + 65
+  }
+  if value < 52 {
+    return value - 26 + 97
+  }
+  if value < 62 {
+    return value - 52 + 48
+  }
+  return if value == 62 {
+    43
+  } else {
+    47
+  }
+}
+
+// Fetch #data-url-processor percent-decodes before Infra's forgiving Base64.
+// Normalize one quantum on the stack for the strict stdlib decoder. This keeps
+// exact validation and size preflight allocation-free even for escaped input.
+effect fn readQuantum(data: &[u8], cursor: &mut usize, quantum: &mut [u8; 4]) -> bool
   ! ResourceError {
   let mut index: usize = 0
-  while index < 4 {
-    quantum[index] = run nextPercent(data, &mut cursor.*)
+  while index < 4 && cursor.* < data.length {
+    let byte = run base64Byte(data, &mut cursor.*)
+    if asciiWhitespace(byte) {
+      continue
+    }
+    quantum[index] = byte
     index = index + 1
   }
-  if (quantum[2] == 61 || quantum[3] == 61) && cursor.* != data.length {
+  if index == 0 {
+    return false
+  }
+  if index == 1 {
     fail ResourceError.InvalidData
   }
+  if index < 4 {
+    let mut i: usize = 0
+    while i < index {
+      if quantum[i] == 61 {
+        fail ResourceError.InvalidData
+      }
+      i = i + 1
+    }
+    while index < 4 {
+      quantum[index] = 61
+      index = index + 1
+    }
+  }
+  if quantum[2] == 61 || quantum[3] == 61 {
+    while cursor.* < data.length {
+      if !asciiWhitespace(run base64Byte(data, &mut cursor.*)) {
+        fail ResourceError.InvalidData
+      }
+    }
+    let tail: usize = if quantum[2] == 61 {
+      1
+    } else {
+      2
+    }
+    let value = sextet(quantum[tail])
+    if value == 255 {
+      fail ResourceError.InvalidData
+    }
+
+    // Infra explicitly discards the unused low bits of the final sextet.
+    quantum[tail] = alphabet(
+      if tail == 1 {
+        (value / 16) * 16
+      } else {
+        (value / 4) * 4
+      },
+    )
+  }
+  return true
 }
 
 effect fn decodeBase64(data: &[u8], maximum: usize) -> Bytes
   ! ResourceError | OutOfMemoryError
   ? &mut Allocator {
-  let mut escaped = false
-  let mut scan: usize = 0
-  while scan < data.length {
-    if data[scan] == 37 {
-      escaped = true
-      break
-    }
-    scan = scan + 1
-  }
-  if !escaped {
-    let length = run base64Length(data)
+  // Canonical unescaped input remains on the stdlib's direct path.
+  let directLength = Base64.decodedLength(data)
+  if let Result<usize, Base64Error>.Success { value: length } = &directLength {
     if length > maximum {
       fail ResourceError.TooLarge
     }
@@ -527,7 +618,9 @@ effect fn decodeBase64(data: &[u8], maximum: usize) -> Bytes
   let mut length: usize = 0
   let mut quantum: [u8; 4] = [0; 4]
   while cursor < data.length {
-    run readQuantum(data, &mut cursor, &mut quantum)
+    if !(run readQuantum(data, &mut cursor, &mut quantum)) {
+      break
+    }
     let count = run base64Length(&quantum)
     if count > maximum - length {
       fail ResourceError.TooLarge
@@ -539,7 +632,9 @@ effect fn decodeBase64(data: &[u8], maximum: usize) -> Bytes
   cursor = 0
   let mut written: usize = 0
   while cursor < data.length {
-    run readQuantum(data, &mut cursor, &mut quantum)
+    if !(run readQuantum(data, &mut cursor, &mut quantum)) {
+      break
+    }
     let mut available = length - written
     if available > 3 {
       available = 3

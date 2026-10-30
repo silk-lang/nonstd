@@ -153,3 +153,11 @@ No JPEG codec is present in the pinned dev.32 stdlib. The baseline/progressive
 codec request is tracked in [silk-lang/silk#2617](https://github.com/silk-lang/silk/issues/2617).
 The general-purpose `images/svg/image` package is implementing bounded marker,
 metadata and entropy decoding locally; its API contains no SVG types.
+
+## LIMITATION-10 — native NaN constant reference
+
+The dev.32 native compiler rejects `f64.NAN` as an unsupported construct
+([silk-lang/silk#2621](https://github.com/silk-lang/silk/issues/2621)).
+Image-sizing boundary tests use `f64.fromBits(9221120237041090560)` to construct
+the same quiet-NaN test input. This changes no rendering code. The original
+constant cannot compile, so there is no runnable before/after Ir comparison.

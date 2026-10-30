@@ -27,7 +27,9 @@ Text clipping and projective clip edge cases remain in progress.
 
 SVG mask resources support alpha/luminance coverage, mask units, nested masks,
 and CSS mask-layer composition. Image and gradient mask sources remain pending.
-Filters, image decoding, text, animation and ICC colour are planned later phases. [Status](docs/status.md) describes what each phase delivered.
+PNG and JPEG `<image>` elements now render with intrinsic sizing, aspect-ratio fitting,
+EXIF orientation, opacity, and affine/projective placement. Nested SVG images and
+CSS image masks remain in progress. Filters, text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example
 
@@ -80,7 +82,7 @@ writes nothing unless parsing, rendering and encoding all succeed.
 | `images/svg/render` | `images-svg-render` | Render tree, display list and the rendering entry points (`svg_render`) |
 | `images/svg/raster` | `images-svg-raster` | Executes display lists on the CPU through `vector` |
 | `images/svg/geometry` | `images-svg-geometry` | f64 geometry, path and points parsing, arcs, transforms |
-| `images/svg/image` | `images-svg-image` | Premultiplied RGBA storage and PNG encoding |
+| `images/svg/image` | `images-svg-image` | PNG/JPEG decoding, orientation, premultiplied RGBA storage and PNG encoding |
 | `images/svg/filters` | `images-svg-filters` | Filter boundary (filters themselves are a later phase) |
 | `images/svg/cli` | `images-svg-cli` | The command-line renderer |
 | `images/svg/tests` | `images-svg-tests` | Test inputs, suite pins and reviewed expectations |
@@ -122,7 +124,3 @@ library.
 ## License
 
 MIT or Apache-2.0.
-
-The standalone `image` package also decodes PNG samples, Adam7 images and APNG's
-first frame, retaining source color metadata. This decoder is not yet connected
-to SVG `<image>` rendering or color conversion.
