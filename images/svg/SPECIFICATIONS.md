@@ -777,6 +777,15 @@ decisions:
   longhands are not presentation attributes in SVG 2, so only CSS sets them; the
   `font-variant` shorthand is. Variants are not synthesized when the font lacks the
   feature (CSS Fonts 4 allows synthesizing small caps and sub/superscripts).
+- `@font-face` (CSS Fonts 4 #font-face-rule) uses its first `src` entry that yields a face.
+  `local()` matches an installed face's full or PostScript name (case-insensitively, as
+  family names). A url works when its format is absent, `truetype`, `opentype` or
+  `collection`, when the sheet's processing mode may fetch it (secure modes allow `data:`
+  only), and when it holds a readable sfnt face. The url's first face is used. The face
+  joins font matching for this render only. WOFF/WOFF2 and `tech()` sources are skipped. `font-weight`, `font-width`/`font-stretch` and
+  `font-style` descriptors replace the face's own values, and `auto` keeps them. A family
+  that a document defines hides installed faces of the same name. `unicode-range`,
+  `font-display`, `size-adjust` and the metric overrides are ignored.
 - `font-variation-settings` axis values follow the ones font matching sets, so they win.
   `font-optical-sizing` is not applied yet (no test font has an `opsz` axis).
 - `font-size-adjust` takes a number (the ex-height metric). The used size makes the x-height

@@ -10,6 +10,9 @@ import resources {
   Limits as ResourceLimits
 }
 import resources
+import font_faces { DocumentFace, Candidate as FaceCandidate, Source as FaceSource }
+import font_faces
+import svg_fonts.database { FontDatabase }
 import svg_css.tokens {
   TokenBuffer,
   TokenRange,
@@ -88,6 +91,8 @@ pub struct Catalog {
   pub buffers: List<TokenBuffer>,
   pub declarations: List<Declaration>,
   pub engine: Engine,
+  /// The faces of @font-face rules whose source loaded, in rule order.
+  pub fontFaces: List<DocumentFace>,
   sources: List<Source>,
   urls: List<Url>,
   cache: List<Cached>,
@@ -243,6 +248,7 @@ impl Catalog {
       buffers: move buffers,
       declarations: List<Declaration>.make(),
       engine: Engine.make(closing),
+      fontFaces: List<DocumentFace>.make(),
       sources: move sources,
       urls: List<Url>.make(),
       cache: List<Cached>.make(),
@@ -611,13 +617,98 @@ impl Catalog {
               )
             }
           }
-        } else if (insensitive(name, b"font-face") || insensitive(name, b"keyframes"))
-          && rule.kind == RuleKind.AtBlock {
+        } else if insensitive(name, b"font-face") && rule.kind == RuleKind.AtBlock {
+          importsAllowed = false
+          namespacesAllowed = false
+          run self.fontFace(buffer, rule.body, limits)
+        } else if insensitive(name, b"keyframes") && rule.kind == RuleKind.AtBlock {
           importsAllowed = false
           namespacesAllowed = false
         }
       }
       i = i + 1
+    }
+  }
+
+  /// Loads the first `src` of an @font-face rule that fetches under the sheet's policy and
+  /// holds a usable face (CSS Fonts 4 #src-desc). Sources that fail are skipped.
+  effect fn fontFace(self: &mut Self, buffer: usize, body: TokenRange, limits: &Limits) -> ()
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let parsed = run font_faces.parse(&self.buffers.asSlice()[buffer], body, limits)
+    let rule = match move parsed {
+      Option<font_faces.Rule>.Some { value } => move value
+      _ => {
+        return
+      }
+    }
+    let parent = self.sources.asSlice()[buffer]
+    if parent.url >= self.urls.length() || parent.ruleSet.index >= self.sets.length() {
+      return
+    }
+    let policy = self.sets.asSlice()[parent.ruleSet.index].policy
+    let mut candidates = List<FaceCandidate>.make()
+    let mut index: usize = 0
+    while index < rule.sources.length() {
+      let entry = &rule.sources.asSlice()[index]
+      index = index + 1
+      let text = match &entry.* {
+        FaceSource.Local { name } => {
+          let mut copy = Bytes.make()
+          run Bytes.append(&mut copy, Bytes.asSlice(&name))
+          run candidates.append(FaceCandidate.Local { name: move copy })
+          continue
+        }
+        FaceSource.Url { text } => self.buffers.asSlice()[buffer].text(text)
+      }
+      let resolved = run Effect.result(Url.resolve(&self.urls.asSlice()[parent.url], text))
+      let url = match move resolved {
+        Result<Url, UrlError | OutOfMemoryError>.Success { value } => move value
+        Result<Url, UrlError | OutOfMemoryError>.Failure { error } => match move error {
+          UrlError invalid => {
+            continue
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+      if policy.mode.isSecure() && !equal(Url.scheme(&url), b"data") {
+        continue
+      }
+      let fetched = run Effect.result(resources.fetchWithPolicy(&url, ResourceKind.Font, &policy))
+      let response = match move fetched {
+        Result<Response, ResourceError | OutOfMemoryError>.Success { value } => move value
+        Result<Response, ResourceError | OutOfMemoryError>.Failure { error } => match move error {
+          ResourceError failure => {
+            continue
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
+      let size = Bytes.length(&response.bytes)
+      if self.storageBytes > limits.maxStorageBytes
+        || size > limits.maxStorageBytes - self.storageBytes {
+        continue
+      }
+      if run FontDatabase.usable(Bytes.asSlice(&response.bytes)) {
+        self.storageBytes = self.storageBytes + size
+        run candidates.append(FaceCandidate.Data { bytes: move response.bytes })
+        break
+      }
+    }
+    if candidates.length() > 0 {
+      run self.fontFaces.append(
+        DocumentFace {
+          family: move rule.family,
+          candidates: move candidates,
+          weight: rule.weight,
+          width: rule.width,
+          style: rule.style,
+        },
+      )
     }
   }
 
