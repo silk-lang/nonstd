@@ -1,0 +1,298 @@
+//! JPEG scan assembly and sample reconstruction.
+import image { Image, ImageError }
+import jpeg_header { Header, JpegError }
+import jpeg_header
+import jpeg_entropy { Reader, Table }
+import jpeg_coefficients
+import jpeg_tables { Tables }
+import jpeg_multiscan
+import jpeg_idct
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+
+pub struct Plane {
+  pub width: usize,
+  pub pixels: Bytes
+}
+
+fn be16(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) * 256 + u8.toU32(data[at + 1])
+}
+
+fn sample(
+  planes: &[Plane],
+  header: &Header,
+  component: usize,
+  x: usize,
+  y: usize,
+  maxH: usize,
+  maxV: usize,
+) -> f64 {
+  let h = u32.toUsize(u8.toU32(header.components[component].horizontal))
+  let v = u32.toUsize(u8.toU32(header.components[component].vertical))
+  let at = (y * v / maxV) * planes[component].width + x * h / maxH
+  return u8.toF64(planes[component].pixels.asSlice()[at])
+}
+
+fn channel(value: f64) -> u8 {
+  if value <= 0.0 {
+    return 0
+  }
+  if value >= 255.0 {
+    return 255
+  }
+  return f64.toU8(f64.floor(value + 0.5))
+}
+
+/// Reconstructs an 8-bit JPEG image. Orientation is exposed by inspect for the consumer.
+pub effect fn decode(data: &[u8]) -> Image
+  ! JpegError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let header = run jpeg_header.inspect(data)
+  if header.componentCount != 1 && header.componentCount != 3 {
+    fail JpegError.Unsupported
+  }
+  if header.progressive
+    || u32.toUsize(u8.toU32(data[header.scanOffset + 4])) != header.componentCount {
+    return run jpeg_multiscan.decode(data, &header)
+  }
+  let mut tables = Tables.make()
+  let mut position: usize = 2
+
+  // inspect established segment framing through the first SOS.
+  while position < header.scanOffset {
+    while data[position] == 255 {
+      position = position + 1
+    }
+    let marker = data[position]
+    position = position + 1
+    let length = u32.toUsize(be16(data, position))
+    let payload = Slice.view<u8>(data, position + 2, length - 2)
+    run tables.segment(marker, payload)
+    position = position + length
+  }
+  position = header.scanOffset + 2
+  let scanLength = u32.toUsize(be16(data, position))
+  let scan = Slice.view<u8>(data, position + 2, scanLength - 2)
+  let count = u32.toUsize(u8.toU32(scan[0]))
+  if count != header.componentCount {
+    fail JpegError.Unsupported
+  }
+  if scan[1 + count * 2] != 0 || scan[2 + count * 2] != 63 || scan[3 + count * 2] != 0 {
+    fail JpegError.InvalidData
+  }
+  let mut order: [usize; 4] = [0; 4]
+  let mut dcTable: [usize; 4] = [0; 4]
+  let mut acTable: [usize; 4] = [0; 4]
+  let mut maxH: usize = 1
+  let mut maxV: usize = 1
+  let mut i: usize = 0
+  while i < count {
+    let component = header.components[i]
+    let h = u32.toUsize(u8.toU32(component.horizontal))
+    let v = u32.toUsize(u8.toU32(component.vertical))
+    if h > maxH {
+      maxH = h
+    }
+    if v > maxV {
+      maxV = v
+    }
+    let q = u32.toUsize(u8.toU32(component.quantization))
+    if !tables.present[q] {
+      fail JpegError.InvalidData
+    }
+    let mut j: usize = 0
+    while j < count {
+      if scan[1 + j * 2] == component.id {
+        order[j] = i
+      }
+      j = j + 1
+    }
+    dcTable[i] = u32.toUsize(u8.toU32(scan[2 + i * 2] / 16))
+    acTable[i] = u32.toUsize(u8.toU32(scan[2 + i * 2] % 16))
+    if tables.dc[dcTable[i]].isNone() || tables.ac[acTable[i]].isNone() {
+      fail JpegError.InvalidData
+    }
+    i = i + 1
+  }
+  let width = u32.toUsize(header.width)
+  let height = u32.toUsize(header.height)
+
+  // A noninterleaved single-component scan always uses one block per MCU.
+  if count == 1 {
+    maxH = 1
+    maxV = 1
+  }
+  let columns = (width + maxH * 8 - 1) / (maxH * 8)
+  let rows = (height + maxV * 8 - 1) / (maxV * 8)
+  let mut planes = List<Plane>.make()
+  let mut total: u64 = 0
+  i = 0
+  while i < count {
+    let h = if count == 1 {
+      1
+    } else {
+      u32.toUsize(u8.toU32(header.components[i].horizontal))
+    }
+    let v = if count == 1 {
+      1
+    } else {
+      u32.toUsize(u8.toU32(header.components[i].vertical))
+    }
+    let pw = columns * h * 8
+    let ph = rows * v * 8
+    let size = usize.toU64(pw) * usize.toU64(ph)
+    if size > 268435456 - total {
+      fail JpegError.TooLarge
+    }
+    total = total + size
+    run planes.append(Plane { width: pw, pixels: run Bytes.zeroed(u64.toUsize(size)) })
+    i = i + 1
+  }
+  let entropy = position + scanLength
+  let mut reader = Reader.make(Slice.view<u8>(data, entropy, data.length - entropy))
+  let mut predictors: [i32; 4] = [0; 4]
+  let mut completed: usize = 0
+  let mut restart: u8 = 0
+  let mut my: usize = 0
+  while my < rows {
+    let mut mx: usize = 0
+    while mx < columns {
+      if tables.restartInterval > 0 && completed > 0 && completed % tables.restartInterval == 0 {
+        run reader.restart(restart)
+        restart = (restart + 1) % 8
+        predictors = [0; 4]
+      }
+      i = 0
+      while i < count {
+        let componentIndex = order[i]
+        let component = header.components[componentIndex]
+        let dcCodes = match &tables.dc[dcTable[i]] {
+          Option<Table>.Some { value } => value
+          _ => {
+            fail JpegError.InvalidData
+          }
+        }
+        let acCodes = match &tables.ac[acTable[i]] {
+          Option<Table>.Some { value } => value
+          _ => {
+            fail JpegError.InvalidData
+          }
+        }
+        let h = if count == 1 {
+          1
+        } else {
+          u32.toUsize(u8.toU32(component.horizontal))
+        }
+        let v = if count == 1 {
+          1
+        } else {
+          u32.toUsize(u8.toU32(component.vertical))
+        }
+        let q = u32.toUsize(u8.toU32(component.quantization))
+        let mut by: usize = 0
+        while by < v {
+          let mut bx: usize = 0
+          while bx < h {
+            let coefficients = run jpeg_coefficients.sequential(
+              &mut reader,
+              &dcCodes,
+              &acCodes,
+              &mut predictors[componentIndex],
+            )
+            let pixels = jpeg_idct.block(&coefficients, &tables.quantization[q])
+            let plane = &mut planes.asMutSlice()[componentIndex]
+            let stride = plane.width
+            let samples = plane.pixels.asMutSlice()
+            let mut y: usize = 0
+            while y < 8 {
+              let start = ((my * v + by) * 8 + y) * stride + (mx * h + bx) * 8
+              let mut x: usize = 0
+              while x < 8 {
+                samples[start + x] = pixels[y * 8 + x]
+                x = x + 1
+              }
+              y = y + 1
+            }
+            bx = bx + 1
+          }
+          by = by + 1
+        }
+        i = i + 1
+      }
+      completed = completed + 1
+      mx = mx + 1
+    }
+    my = my + 1
+  }
+  run reader.finish()
+  let mut end = entropy + reader.offset()
+  if end == data.length || data[end] != 255 {
+    fail JpegError.InvalidData
+  }
+  while end < data.length && data[end] == 255 {
+    end = end + 1
+  }
+  if end == data.length || data[end] != 217 {
+    fail JpegError.InvalidData
+  }
+  return run compose(planes.asSlice(), &header, maxH, maxV)
+}
+
+pub effect fn compose(planes: &[Plane], header: &Header, maxH: usize, maxV: usize) -> Image
+  ! ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let width = u32.toUsize(header.width)
+  let height = u32.toUsize(header.height)
+  let count = header.componentCount
+  let mut image = run Image.make(header.width, header.height)
+  let output = image.dataMut()
+  let directRgb = match &header.adobeTransform {
+    Option<u8>.Some { value } => value == 0
+    _ => !header.jfif && count == 3 && header.components[0].id == 82
+      && header.components[1].id == 71
+      && header.components[2].id == 66
+  }
+  let mut y: usize = 0
+  while y < height {
+    let mut x: usize = 0
+    while x < width {
+      let first = if count == 1 {
+        u8.toF64(planes[0].pixels.asSlice()[y * planes[0].width + x])
+      } else {
+        sample(planes, header, 0, x, y, maxH, maxV)
+      }
+      let mut red = first
+      let mut green = first
+      let mut blue = first
+      if count == 3 {
+        let second = sample(planes, header, 1, x, y, maxH, maxV)
+        let third = sample(planes, header, 2, x, y, maxH, maxV)
+        if directRgb {
+          green = second
+          blue = third
+        } else {
+          red = first + 1.402 * (third - 128.0)
+          green = first - 0.344136 * (second - 128.0) - 0.714136 * (third - 128.0)
+          blue = first + 1.772 * (second - 128.0)
+        }
+      }
+      let at = (y * width + x) * 4
+      output[at] = channel(red)
+      output[at + 1] = channel(green)
+      output[at + 2] = channel(blue)
+      output[at + 3] = 255
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return move image
+}

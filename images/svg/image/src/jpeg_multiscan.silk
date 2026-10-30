@@ -1,0 +1,392 @@
+//! Coefficient-retaining JPEG scan assembly for progressive and noninterleaved images.
+import jpeg_header { Header, JpegError }
+import jpeg_tables { Tables }
+import jpeg_entropy { Reader, Table }
+import jpeg_coefficients
+import jpeg_progressive
+import jpeg_idct
+import jpeg_decode { Plane }
+import jpeg_decode
+import image { Image, ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.i32
+
+struct Component {
+  columns: usize,
+  rows: usize,
+  actualColumns: usize,
+  actualRows: usize,
+  h: usize,
+  v: usize,
+  blocks: List<[i32; 64]>,
+  quantization: [u16; 64],
+}
+
+fn be16(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) * 256 + u8.toU32(data[at + 1])
+}
+
+effect fn codes(value: &Option<Table>) -> Table
+  ! JpegError {
+  return match &value.* {
+    Option<Table>.Some { value: found } => found
+    _ => {
+      fail JpegError.InvalidData
+    }
+  }
+}
+
+pub effect fn decode(data: &[u8], header: &Header) -> Image
+  ! JpegError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let width = u32.toUsize(header.width)
+  let height = u32.toUsize(header.height)
+  let mut maxH: usize = 1
+  let mut maxV: usize = 1
+  let mut i: usize = 0
+  while i < header.componentCount {
+    let h = u32.toUsize(u8.toU32(header.components[i].horizontal))
+    let v = u32.toUsize(u8.toU32(header.components[i].vertical))
+    if h > maxH {
+      maxH = h
+    }
+    if v > maxV {
+      maxV = v
+    }
+    i = i + 1
+  }
+
+  // For a single component, its sampling factor has no scaling meaning.
+  if header.componentCount == 1 {
+    maxH = 1
+    maxV = 1
+  }
+  let mcuColumns = (width + maxH * 8 - 1) / (maxH * 8)
+  let mcuRows = (height + maxV * 8 - 1) / (maxV * 8)
+  let mut components = List<Component>.make()
+  let mut totalBlocks: u64 = 0
+  i = 0
+  while i < header.componentCount {
+    let h = if header.componentCount == 1 {
+      1
+    } else {
+      u32.toUsize(u8.toU32(header.components[i].horizontal))
+    }
+    let v = if header.componentCount == 1 {
+      1
+    } else {
+      u32.toUsize(u8.toU32(header.components[i].vertical))
+    }
+    let columns = mcuColumns * h
+    let rows = mcuRows * v
+    let count = usize.toU64(columns) * usize.toU64(rows)
+    if count > 1048576 - totalBlocks {
+      fail JpegError.TooLarge
+    }
+    totalBlocks = totalBlocks + count
+    let mut blocks = run List<[i32; 64]>.makeWithCapacity(u64.toUsize(count))
+    let mut at: usize = 0
+    while at < u64.toUsize(count) {
+      run blocks.append([0; 64])
+      at = at + 1
+    }
+    run components.append(
+      Component {
+        columns: columns,
+        rows: rows,
+        actualColumns: ((width * h + maxH - 1) / maxH + 7) / 8,
+        actualRows: ((height * v + maxV - 1) / maxV + 7) / 8,
+        h: h,
+        v: v,
+        blocks: move blocks,
+        quantization: [0; 64],
+      },
+    )
+    i = i + 1
+  }
+  let mut levels: [[i32; 64]; 4] = [[-1; 64]; 4]
+  let mut tables = Tables.make()
+  let mut position: usize = 2
+  let mut scans: usize = 0
+  let mut work: usize = 0
+  let mut ended = false
+  let mut frame = false
+  while position < data.length {
+    if data[position] != 255 {
+      fail JpegError.InvalidData
+    }
+    while position < data.length && data[position] == 255 {
+      position = position + 1
+    }
+    if position == data.length {
+      fail JpegError.InvalidData
+    }
+    let marker = data[position]
+    position = position + 1
+    if marker == 217 {
+      ended = true
+      break
+    }
+    if marker == 0 || marker == 1 || (marker >= 208 && marker <= 216) {
+      fail JpegError.InvalidData
+    }
+    if data.length - position < 2 {
+      fail JpegError.InvalidData
+    }
+    let length = u32.toUsize(be16(data, position))
+    if length < 2 || length > data.length - position {
+      fail JpegError.InvalidData
+    }
+    let payload = Slice.view<u8>(data, position + 2, length - 2)
+    position = position + length
+    if marker == 192 || marker == 193 || marker == 194 {
+      if frame {
+        fail JpegError.InvalidData
+      }
+      frame = true
+    } else if marker >= 192 && marker <= 207 && marker != 196 && marker != 204 {
+      fail JpegError.Unsupported
+    }
+    if marker != 218 {
+      run tables.segment(marker, payload)
+      continue
+    }
+    if scans >= 256 {
+      fail JpegError.TooLarge
+    }
+    if !frame || payload.length < 4 {
+      fail JpegError.InvalidData
+    }
+    scans = scans + 1
+    let count = u32.toUsize(u8.toU32(payload[0]))
+    if count == 0 || count > header.componentCount || payload.length != 1 + count * 2 + 3 {
+      fail JpegError.InvalidData
+    }
+    let start = u32.toUsize(u8.toU32(payload[1 + count * 2]))
+    let end = u32.toUsize(u8.toU32(payload[2 + count * 2]))
+    let high = payload[3 + count * 2] / 16
+    let low = payload[3 + count * 2] % 16
+    if header.progressive {
+      if start > end || end > 63 || high > 13 || low > 13 || (high != 0 && high != low + 1)
+        || (start == 0 && end != 0)
+        || (start > 0 && count != 1) {
+        fail JpegError.InvalidData
+      }
+    } else if start != 0 || end != 63 || high != 0 || low != 0 {
+      fail JpegError.InvalidData
+    }
+    let mut order: [usize; 4] = [0; 4]
+    let mut dc: [usize; 4] = [0; 4]
+    let mut ac: [usize; 4] = [0; 4]
+    i = 0
+    while i < count {
+      let id = payload[1 + i * 2]
+      let selectors = payload[2 + i * 2]
+      if selectors / 16 > 3 || selectors % 16 > 3 {
+        fail JpegError.InvalidData
+      }
+      let mut found = false
+      let mut component: usize = 0
+      while component < header.componentCount {
+        if header.components[component].id == id {
+          found = true
+          order[i] = component
+        }
+        component = component + 1
+      }
+      if !found {
+        fail JpegError.InvalidData
+      }
+      let index = order[i]
+      let mut previous: usize = 0
+      while previous < i {
+        if order[previous] == index {
+          fail JpegError.InvalidData
+        }
+        previous = previous + 1
+      }
+      if start > 0 && levels[index][0] < 0 {
+        fail JpegError.InvalidData
+      }
+      let q = u32.toUsize(u8.toU32(header.components[index].quantization))
+      if !tables.present[q] {
+        fail JpegError.InvalidData
+      }
+      if levels[index][0] < 0 {
+        let component = &mut components.asMutSlice()[index]
+        component.quantization = tables.quantization[q]
+      }
+      let mut k = start
+      while k <= end {
+        if (high == 0 && levels[index][k] != -1)
+          || (high != 0 && levels[index][k] != u8.toI32(high)) {
+          fail JpegError.InvalidData
+        }
+        levels[index][k] = u8.toI32(low)
+        k = k + 1
+      }
+      dc[i] = u32.toUsize(u8.toU32(selectors / 16))
+      ac[i] = u32.toUsize(u8.toU32(selectors % 16))
+      i = i + 1
+    }
+    let columns = if count == 1 {
+      components.asSlice()[order[0]].actualColumns
+    } else {
+      mcuColumns
+    }
+    let rows = if count == 1 {
+      components.asSlice()[order[0]].actualRows
+    } else {
+      mcuRows
+    }
+    let mut reader = Reader.make(Slice.view<u8>(data, position, data.length - position))
+    let mut predictors: [i32; 4] = [0; 4]
+    let mut eob: u32 = 0
+    let mut restart: u8 = 0
+    let mut completed: usize = 0
+    let mut my: usize = 0
+    while my < rows {
+      let mut mx: usize = 0
+      while mx < columns {
+        if tables.restartInterval > 0 && completed > 0 && completed % tables.restartInterval == 0 {
+          if eob != 0 {
+            fail JpegError.InvalidData
+          }
+          run reader.restart(restart)
+          restart = (restart + 1) % 8
+          predictors = [0; 4]
+        }
+        i = 0
+        while i < count {
+          let index = order[i]
+          let component = &mut components.asMutSlice()[index]
+          let h = if count == 1 {
+            1
+          } else {
+            component.h
+          }
+          let v = if count == 1 {
+            1
+          } else {
+            component.v
+          }
+          let mut by: usize = 0
+          while by < v {
+            let mut bx: usize = 0
+            while bx < h {
+              if work >= 16777216 {
+                fail JpegError.TooLarge
+              }
+              work = work + 1
+              let at = (my * v + by) * component.columns + mx * h + bx
+              let block = &mut component.blocks.asMutSlice()[at]
+              if !header.progressive {
+                let dcCodes = run codes(&tables.dc[dc[i]])
+                let acCodes = run codes(&tables.ac[ac[i]])
+                block.* = run jpeg_coefficients.sequential(
+                  &mut reader,
+                  &dcCodes,
+                  &acCodes,
+                  &mut predictors[index],
+                )
+              } else if start == 0 {
+                if high == 0 {
+                  let table = run codes(&tables.dc[dc[i]])
+                  run jpeg_progressive.dcFirst(
+                    &mut reader,
+                    &table,
+                    &mut predictors[index],
+                    low,
+                    &mut block.*,
+                  )
+                } else {
+                  run jpeg_progressive.dcRefine(&mut reader, low, &mut block.*)
+                }
+              } else {
+                let table = run codes(&tables.ac[ac[i]])
+                if high == 0 {
+                  run jpeg_progressive.acFirst(
+                    &mut reader,
+                    &table,
+                    start,
+                    end,
+                    low,
+                    &mut eob,
+                    &mut block.*,
+                  )
+                } else {
+                  run jpeg_progressive.acRefine(
+                    &mut reader,
+                    &table,
+                    start,
+                    end,
+                    low,
+                    &mut eob,
+                    &mut block.*,
+                  )
+                }
+              }
+              bx = bx + 1
+            }
+            by = by + 1
+          }
+          i = i + 1
+        }
+        completed = completed + 1
+        mx = mx + 1
+      }
+      my = my + 1
+    }
+    if eob != 0 {
+      fail JpegError.InvalidData
+    }
+    run reader.finish()
+    position = position + reader.offset()
+  }
+  if !ended || scans == 0 {
+    fail JpegError.InvalidData
+  }
+  let mut planes = List<Plane>.make()
+  i = 0
+  while i < header.componentCount {
+    if levels[i][0] < 0 {
+      fail JpegError.InvalidData
+    }
+    let component = &components.asSlice()[i]
+    let stride = component.columns * 8
+    let mut pixels = run Bytes.zeroed(stride * component.rows * 8)
+    let output = pixels.asMutSlice()
+    let mut by: usize = 0
+    while by < component.rows {
+      let mut bx: usize = 0
+      while bx < component.columns {
+        let block = jpeg_idct.block(
+          &component.blocks.asSlice()[by * component.columns + bx],
+          &component.quantization,
+        )
+        let mut y: usize = 0
+        while y < 8 {
+          let mut x: usize = 0
+          while x < 8 {
+            output[(by * 8 + y) * stride + bx * 8 + x] = block[y * 8 + x]
+            x = x + 1
+          }
+          y = y + 1
+        }
+        bx = bx + 1
+      }
+      by = by + 1
+    }
+    run planes.append(Plane { width: stride, pixels: move pixels })
+    i = i + 1
+  }
+  return run jpeg_decode.compose(planes.asSlice(), header, maxH, maxV)
+}

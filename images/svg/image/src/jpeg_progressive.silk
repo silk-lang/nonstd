@@ -1,0 +1,195 @@
+//! Progressive JPEG coefficient scans (ITU T.81 Annex G).
+import jpeg_entropy { Reader, Table }
+import jpeg_coefficients { ZIGZAG }
+import jpeg_header { JpegError }
+import silk.num.u8
+import silk.num.u32
+
+fn power(bit: u8) -> u32 {
+  let mut value: u32 = 1
+  let mut i: u8 = 0
+  while i < bit {
+    value = value * 2
+    i = i + 1
+  }
+  return value
+}
+
+effect fn band(start: usize, end: usize, low: u8) -> ()
+  ! JpegError {
+  if start == 0 || start > end || end > 63 || low > 13 {
+    fail JpegError.InvalidData
+  }
+}
+
+pub effect fn dcFirst(
+  reader: &mut Reader,
+  table: &Table,
+  predictor: &mut i32,
+  low: u8,
+  block: &mut [i32; 64],
+) -> ()
+  ! JpegError {
+  if low > 13 || predictor.* < -32767 || predictor.* > 32767 {
+    fail JpegError.InvalidData
+  }
+  let category = run table.decode(&mut reader.*)
+  if category > 11 {
+    fail JpegError.InvalidData
+  }
+  let delta = run reader.receive(category)
+  let value = predictor.* + delta
+  if value < -32767 || value > 32767 {
+    fail JpegError.InvalidData
+  }
+  predictor.* = value
+  block[0] = value * u32.toI32(power(low))
+}
+
+pub effect fn dcRefine(reader: &mut Reader, low: u8, block: &mut [i32; 64]) -> ()
+  ! JpegError {
+  if low > 13 || block[0] < -1073741823 || block[0] > 1073741823 {
+    fail JpegError.InvalidData
+  }
+  let bit = run reader.bits(1)
+  block[0] = block[0] + u32.toI32(bit * power(low))
+}
+
+pub effect fn acFirst(
+  reader: &mut Reader,
+  table: &Table,
+  start: usize,
+  end: usize,
+  low: u8,
+  eob: &mut u32,
+  block: &mut [i32; 64],
+) -> ()
+  ! JpegError {
+  run band(start, end, low)
+  if eob.* > 32767 {
+    fail JpegError.InvalidData
+  }
+  if eob.* > 0 {
+    eob.* = eob.* - 1
+    return
+  }
+  let mut index = start
+  while index <= end {
+    let symbol = run table.decode(&mut reader.*)
+    let runLength = symbol / 16
+    let size = symbol % 16
+    if size == 0 {
+      if runLength < 15 {
+        let extra = run reader.bits(runLength)
+        eob.* = power(runLength) + extra - 1
+        return
+      }
+      if index + 16 > end + 1 {
+        fail JpegError.InvalidData
+      }
+      index = index + 16
+    } else {
+      if size > 10 {
+        fail JpegError.InvalidData
+      }
+      index = index + u32.toUsize(u8.toU32(runLength))
+      if index > end {
+        fail JpegError.InvalidData
+      }
+      let value = run reader.receive(size)
+      block[ZIGZAG[index]] = value * u32.toI32(power(low))
+      index = index + 1
+    }
+  }
+}
+
+effect fn refine(reader: &mut Reader, step: i32, value: &mut i32) -> ()
+  ! JpegError {
+  if value.* < -1073741823 || value.* > 1073741823 {
+    fail JpegError.InvalidData
+  }
+  let bit = run reader.bits(1)
+  let magnitude = if value.* < 0 {
+    -value.*
+  } else {
+    value.*
+  }
+  if bit == 1 && (magnitude / step) % 2 == 0 {
+    value.* = value.* + (if value.* < 0 {
+      -step
+    } else {
+      step
+    })
+  }
+}
+
+pub effect fn acRefine(
+  reader: &mut Reader,
+  table: &Table,
+  start: usize,
+  end: usize,
+  low: u8,
+  eob: &mut u32,
+  block: &mut [i32; 64],
+) -> ()
+  ! JpegError {
+  run band(start, end, low)
+  if eob.* > 32767 {
+    fail JpegError.InvalidData
+  }
+  let step = u32.toI32(power(low))
+  let mut index = start
+  if eob.* == 0 {
+    while index <= end {
+      let symbol = run table.decode(&mut reader.*)
+      let runLength = symbol / 16
+      let size = symbol % 16
+      if size > 1 {
+        fail JpegError.InvalidData
+      }
+      let mut value: i32 = 0
+      let mut zeroes = u32.toUsize(u8.toU32(runLength))
+      if size == 1 {
+        value = (run reader.receive(1)) * step
+      } else if runLength < 15 {
+        let extra = run reader.bits(runLength)
+        eob.* = power(runLength) + extra
+        break
+      } else {
+        zeroes = 16
+      }
+      while index <= end && (zeroes > 0 || value != 0) {
+        let at = ZIGZAG[index]
+        if block[at] != 0 {
+          run refine(&mut reader.*, step, &mut block[at])
+        } else {
+          if zeroes == 0 {
+            break
+          }
+          zeroes = zeroes - 1
+        }
+        index = index + 1
+      }
+      if zeroes != 0 {
+        fail JpegError.InvalidData
+      }
+      if value != 0 {
+        if index > end {
+          fail JpegError.InvalidData
+        }
+        block[ZIGZAG[index]] = value
+        index = index + 1
+      }
+    }
+  }
+  if eob.* > 0 {
+    while index <= end {
+      let at = ZIGZAG[index]
+      if block[at] != 0 {
+        run refine(&mut reader.*, step, &mut block[at])
+      }
+      index = index + 1
+    }
+    eob.* = eob.* - 1
+  }
+}

@@ -1,0 +1,147 @@
+//! JPEG metadata retained for orientation and source colour management.
+import image { Image, ImageError }
+import jpeg_header { JpegError }
+import jpeg_header
+import jpeg_decode
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub struct Metadata {
+  pub orientation: u8,
+  pub iccProfile: Bytes,
+}
+
+pub struct Decoded {
+  pub image: Image,
+  pub metadata: Metadata,
+}
+
+/// Decodes unrotated samples and retains EXIF orientation and embedded ICC bytes.
+/// Profile validation and source colour conversion belong to the colour consumer.
+pub effect fn decodeWithMetadata(data: &[u8]) -> Decoded
+  ! JpegError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let metadata = run read(data)
+  let image = run jpeg_decode.decode(data)
+  return Decoded { image: move image, metadata: move metadata }
+}
+
+pub effect fn read(data: &[u8]) -> Metadata
+  ! JpegError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let header = run jpeg_header.inspect(data)
+  let mut offsets: [usize; 256] = [0; 256]
+  let mut lengths: [usize; 256] = [0; 256]
+  let mut count: usize = 0
+  let mut total: usize = 0
+  let mut position: usize = 2
+  let mut entropy = false
+  let mut ended = false
+  while position < data.length {
+    if entropy {
+      while position < data.length && data[position] != 255 {
+        position = position + 1
+      }
+      if position == data.length {
+        fail JpegError.InvalidData
+      }
+    }
+    if data[position] != 255 {
+      fail JpegError.InvalidData
+    }
+    while position < data.length && data[position] == 255 {
+      position = position + 1
+    }
+    if position == data.length {
+      fail JpegError.InvalidData
+    }
+    let marker = data[position]
+    position = position + 1
+    if entropy && (marker == 0 || (marker >= 208 && marker <= 215)) {
+      continue
+    }
+    entropy = false
+    if marker == 217 {
+      ended = true
+      break
+    }
+    if marker == 0 || marker == 1 || (marker >= 208 && marker <= 216) {
+      fail JpegError.InvalidData
+    }
+    if data.length - position < 2 {
+      fail JpegError.InvalidData
+    }
+    let length = u32.toUsize(u8.toU32(data[position]) * 256 + u8.toU32(data[position + 1]))
+    if length < 2 || length > data.length - position {
+      fail JpegError.InvalidData
+    }
+    let payload = Slice.view<u8>(data, position + 2, length - 2)
+    if marker == 226 && icc(payload) {
+      if payload.length < 14 {
+        fail JpegError.InvalidData
+      }
+      let sequence = u32.toUsize(u8.toU32(payload[12]))
+      let chunks = u32.toUsize(u8.toU32(payload[13]))
+      if sequence == 0 || sequence > chunks || (count != 0 && count != chunks)
+        || offsets[sequence] != 0 {
+        fail JpegError.InvalidData
+      }
+      count = chunks
+      let size = payload.length - 14
+
+      // JPEG's 255 chunks of at most 65519 bytes already bound this below 16 MiB.
+      if size > 16777216 - total {
+        fail JpegError.TooLarge
+      }
+      offsets[sequence] = position + 16
+      lengths[sequence] = size
+      total = total + size
+    }
+    position = position + length
+    if marker == 218 {
+      entropy = true
+    }
+  }
+  if !ended {
+    fail JpegError.InvalidData
+  }
+  let mut i: usize = 1
+  while i <= count {
+    if offsets[i] == 0 {
+      fail JpegError.InvalidData
+    }
+    i = i + 1
+  }
+  let mut profile = run Bytes.zeroed(total)
+  let output = profile.asMutSlice()
+  let mut at: usize = 0
+  i = 1
+  while i <= count {
+    let mut j: usize = 0
+    while j < lengths[i] {
+      output[at] = data[offsets[i] + j]
+      at = at + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return Metadata { orientation: header.orientation, iccProfile: move profile }
+}
+
+fn icc(payload: &[u8]) -> bool {
+  let prefix = b"ICC_PROFILE\x00"
+  if payload.length < prefix.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < prefix.length {
+    if payload[i] != prefix[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

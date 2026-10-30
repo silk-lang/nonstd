@@ -66,6 +66,7 @@ URLS = {
     "url": "https://url.spec.whatwg.org/",
     "jpeg-t81": "https://www.w3.org/Graphics/JPEG/itu-t81.pdf",
     "jpeg-jfif": "https://www.w3.org/Graphics/JPEG/jfif3.pdf",
+    "icc-embedding": "https://archive.color.org/files/technotes/ICC-Technote-ProfileEmbedding.pdf",
     "icc-v4": "https://www.color.org/specification/ICC.1-2022-05.pdf",
 }
 
