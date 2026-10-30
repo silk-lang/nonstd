@@ -3,6 +3,7 @@
 //! Profiles this module cannot evaluate leave the samples unchanged.
 import image { Image }
 import png_decode { Chromaticities }
+import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -27,6 +28,9 @@ pub struct Transform {
   green: List<f64>,
   blue: List<f64>,
   matrix: [f64; 9],
+  // LUT-based profiles evaluate their AToB tag per sample from these bytes.
+  lut: Option<Lut>,
+  profile: Bytes,
 }
 
 /// A tone reproduction curve located in profile bytes.
@@ -118,13 +122,34 @@ fn xyz(data: &[u8], name: &[u8], out: &mut [f64; 3]) -> bool {
 
 // curveType (§10.6) or parametricCurveType (§10.18).
 fn curve(data: &[u8], name: &[u8]) -> Option<Curve> {
-  let offset = match tag(data, name) {
-    Option<usize>.Some { value } => value
-    Option<usize>.None => {
-      return Option<Curve>.None
-    }
+  return match tag(data, name) {
+    Option<usize>.Some { value } => curveAt(data, value, tagSize(data, name))
+    Option<usize>.None => Option<Curve>.None
   }
-  let size = tagSize(data, name)
+}
+
+// The bytes a curveType or parametricCurveType at `offset` occupies, padded to four.
+fn curveLength(data: &[u8], offset: usize) -> usize {
+  if signature(data, offset, b"curv") {
+    return (12 + u32.toUsize(read32(data, offset + 8)) * 2 + 3) / 4 * 4
+  }
+  let kind = read16(data, offset + 8)
+  let count: usize = if kind == 0 {
+    1
+  } else if kind == 1 {
+    3
+  } else if kind == 2 {
+    4
+  } else if kind == 3 {
+    5
+  } else {
+    7
+  }
+  return 12 + 4 * count
+}
+
+// A curve element of `size` bytes at `offset`, validated against those bytes.
+fn curveAt(data: &[u8], offset: usize, size: usize) -> Option<Curve> {
   if size < 12 {
     return Option<Curve>.None
   }
@@ -430,11 +455,47 @@ fn model(data: &[u8]) -> Option<Model> {
   }
 }
 
-/// Builds the conversion for an embedded ICC profile, or None when the profile is
-/// malformed or not a matrix/TRC (RGB) or TRC (gray) profile with an XYZ PCS.
+/// The rendering intent the profile header asks for (ICC.1:2022 §7.2.15), 0 to 3.
+pub fn headerIntent(data: &[u8]) -> u32 {
+  if data.length < 68 {
+    return 0
+  }
+  let intent = read32(data, 64)
+  return if intent > 3 {
+    0
+  } else {
+    intent
+  }
+}
+
+/// Builds the conversion for an embedded ICC profile with its header's rendering intent.
 pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
   ! OutOfMemoryError
   ? &mut Allocator {
+  return run fromProfileWith(data, headerIntent(data))
+}
+
+/// Builds the conversion for an ICC profile, or None when the profile is malformed or
+/// has neither a usable AToB tag nor a matrix/TRC (RGB) or TRC (gray) model. AToB tags
+/// take precedence (ICC.1:2022 §8.3): the intent's tag, else A2B0.
+pub effect fn fromProfileWith(data: &[u8], intent: u32) -> Option<Transform>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<Lut>.Some { value } = &lutFor(data, intent) {
+    if value.inputs == 3 || value.inputs == 1 {
+      return Option<Transform>.Some {
+        value: Transform {
+          red: List<f64>.make(),
+          green: List<f64>.make(),
+          blue: List<f64>.make(),
+          matrix: fromPcs(),
+          lut: Option<Lut>.Some { value: value },
+          profile: run Bytes.copy(data),
+        },
+      }
+    }
+    return Option<Transform>.None
+  }
   let parsed = match model(data) {
     Option<Model>.Some { value } => value
     Option<Model>.None => {
@@ -447,6 +508,8 @@ pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
       green: run table(data, &parsed.curves[1]),
       blue: run table(data, &parsed.curves[2]),
       matrix: parsed.matrix,
+      lut: Option<Lut>.None,
+      profile: Bytes.make(),
     },
   }
 }
@@ -462,10 +525,33 @@ fn encode(value: f64) -> f64 {
   )
 }
 
-/// Converts device components in [0, 1] (one for gray profiles, three for RGB) to
-/// sRGB components in [0, 1], without 8-bit quantization. None when the profile
-/// cannot be evaluated or the component count does not match its colour space.
-pub fn deviceColor(data: &[u8], components: &[f64]) -> Option<[f64; 3]> {
+fn encodeXyz(xyz: &[f64; 3]) -> [f64; 3] {
+  let m = fromPcs()
+  return [
+    encode(m[0] * xyz[0] + m[1] * xyz[1] + m[2] * xyz[2]),
+    encode(m[3] * xyz[0] + m[4] * xyz[1] + m[5] * xyz[2]),
+    encode(m[6] * xyz[0] + m[7] * xyz[1] + m[8] * xyz[2]),
+  ]
+}
+
+/// Converts device components in [0, 1] to sRGB components in [0, 1], without 8-bit
+/// quantization, with the given rendering intent (0 to 3). None when the profile
+/// cannot be evaluated or the component count does not match its input channels.
+pub fn deviceColor(data: &[u8], intent: u32, components: &[f64]) -> Option<[f64; 3]> {
+  if let Option<Lut>.Some { value } = &lutFor(data, intent) {
+    if components.length != value.inputs {
+      return Option<[f64; 3]>.None
+    }
+    let mut input: [f64; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut index: usize = 0
+    while index < components.length {
+      input[index] = clamp(components[index])
+      index = index + 1
+    }
+    let mut xyz: [f64; 3] = [0.0, 0.0, 0.0]
+    lutEvaluate(data, &value, &input, &mut xyz)
+    return Option<[f64; 3]>.Some { value: encodeXyz(&xyz) }
+  }
   let parsed = match model(data) {
     Option<Model>.Some { value } => value
     Option<Model>.None => {
@@ -493,6 +579,466 @@ pub fn deviceColor(data: &[u8], components: &[f64]) -> Option<[f64; 3]> {
       encode(m[3] * linear[0] + m[4] * linear[1] + m[5] * linear[2]),
       encode(m[6] * linear[0] + m[7] * linear[1] + m[8] * linear[2]),
     ],
+  }
+}
+
+// ---- LUT-based transforms (ICC.1:2022 §10.10–10.12) ---------------------------------
+
+/// A validated lut8Type, lut16Type or lutAToBType tag with three PCS outputs.
+struct Lut {
+  // 1 lut8Type, 2 lut16Type, 3 lutAToBType.
+  kind: u8,
+  offset: usize,
+  inputs: usize,
+  lab: bool,
+  // lut8/lut16: entries per input and output table and the CLUT grid size.
+  inputEntries: usize,
+  outputEntries: usize,
+  // CLUT grid points per input dimension, start and precision in bytes (0: no CLUT).
+  grid: [usize; 8],
+  clut: usize,
+  precision: usize,
+  // lutAToBType elements (absent elements are identity).
+  a: [Curve; 8],
+  hasA: bool,
+  m: [Curve; 3],
+  hasM: bool,
+  matrix: usize,
+  b: [Curve; 3],
+}
+
+impl Copy for Lut {}
+
+fn lutFor(data: &[u8], intent: u32) -> Option<Lut> {
+  if data.length < 132 || u32.toUsize(read32(data, 0)) > data.length
+    || !signature(data, 36, b"acsp") {
+    return Option<Lut>.None
+  }
+  let lab = signature(data, 20, b"Lab ")
+  if !lab && !signature(data, 20, b"XYZ ") {
+    return Option<Lut>.None
+  }
+
+  // Absolute colorimetric uses the colorimetric table without media-white scaling.
+  let name: &[u8] = if intent == 0 {
+    b"A2B0"
+  } else if intent == 2 {
+    b"A2B2"
+  } else {
+    b"A2B1"
+  }
+  let preferred = lutTag(data, name, lab)
+  if preferred.isSome() {
+    return preferred
+  }
+  return lutTag(data, b"A2B0", lab)
+}
+
+fn identityCurves8() -> [Curve; 8] {
+  return [
+    Curve.Identity,
+    Curve.Identity,
+    Curve.Identity,
+    Curve.Identity,
+    Curve.Identity,
+    Curve.Identity,
+    Curve.Identity,
+    Curve.Identity,
+  ]
+}
+
+// The product of grid sizes times outputs times precision, or None past 16 MiB.
+fn clutBytes(grid: &[usize; 8], inputs: usize, precision: usize) -> Option<usize> {
+  let mut total: usize = 3 * precision
+  let mut index: usize = 0
+  while index < inputs {
+    if grid[index] < 2 {
+      return Option<usize>.None
+    }
+    total = total * grid[index]
+    if total > 16777216 {
+      return Option<usize>.None
+    }
+    index = index + 1
+  }
+  return Option<usize>.Some { value: total }
+}
+
+fn lutTag(data: &[u8], name: &[u8], lab: bool) -> Option<Lut> {
+  let offset = match tag(data, name) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return Option<Lut>.None
+    }
+  }
+  let size = tagSize(data, name)
+  if size < 32 {
+    return Option<Lut>.None
+  }
+  let inputs = u8.toUsize(data[offset + 8])
+  if inputs < 1 || inputs > 8 || data[offset + 9] != 3 {
+    return Option<Lut>.None
+  }
+  let mut lut = Lut {
+    kind: 0,
+    offset: offset,
+    inputs: inputs,
+    lab: lab,
+    inputEntries: 256,
+    outputEntries: 256,
+    grid: [0, 0, 0, 0, 0, 0, 0, 0],
+    clut: 0,
+    precision: 0,
+    a: identityCurves8(),
+    hasA: false,
+    m: [Curve.Identity, Curve.Identity, Curve.Identity],
+    hasM: false,
+    matrix: 0,
+    b: [Curve.Identity, Curve.Identity, Curve.Identity],
+  }
+  if signature(data, offset, b"mft1") || signature(data, offset, b"mft2") {
+    let wide = signature(data, offset, b"mft2")
+    let points = u8.toUsize(data[offset + 10])
+    let mut d: usize = 0
+    while d < inputs {
+      lut.grid[d] = points
+      d = d + 1
+    }
+    let width: usize = if wide {
+      2
+    } else {
+      1
+    }
+    let header: usize = if wide {
+      52
+    } else {
+      48
+    }
+    if wide {
+      if size < 52 {
+        return Option<Lut>.None
+      }
+      lut.inputEntries = u32.toUsize(read16(data, offset + 48))
+      lut.outputEntries = u32.toUsize(read16(data, offset + 50))
+      if lut.inputEntries < 2 || lut.inputEntries > 4096 || lut.outputEntries < 2
+        || lut.outputEntries > 4096 {
+        return Option<Lut>.None
+      }
+    }
+    let grid = match clutBytes(&lut.grid, inputs, width) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Option<Lut>.None
+      }
+    }
+    let needed = header + lut.inputEntries * inputs * width + grid + lut.outputEntries * 3 * width
+    if needed > size {
+      return Option<Lut>.None
+    }
+    lut.kind = if wide {
+      2
+    } else {
+      1
+    }
+    lut.precision = width
+    lut.clut = offset + header + lut.inputEntries * inputs * width
+    return Option<Lut>.Some { value: lut }
+  }
+  if !signature(data, offset, b"mAB ") {
+    return Option<Lut>.None
+  }
+  lut.kind = 3
+  let bOffset = u32.toUsize(read32(data, offset + 12))
+  let matrixOffset = u32.toUsize(read32(data, offset + 16))
+  let mOffset = u32.toUsize(read32(data, offset + 20))
+  let clutOffset = u32.toUsize(read32(data, offset + 24))
+  let aOffset = u32.toUsize(read32(data, offset + 28))
+  let mut b = identityCurves8()
+  if bOffset == 0 || !curves(data, offset, size, bOffset, 3, &mut b) {
+    return Option<Lut>.None
+  }
+  lut.b = [b[0], b[1], b[2]]
+  if mOffset != 0 {
+    let mut m = identityCurves8()
+    if !curves(data, offset, size, mOffset, 3, &mut m) {
+      return Option<Lut>.None
+    }
+    lut.m = [m[0], m[1], m[2]]
+    lut.hasM = true
+  }
+  if matrixOffset != 0 {
+    if matrixOffset > size || size - matrixOffset < 48 {
+      return Option<Lut>.None
+    }
+    lut.matrix = offset + matrixOffset
+  }
+  if clutOffset != 0 {
+    if clutOffset > size || size - clutOffset < 20 {
+      return Option<Lut>.None
+    }
+    let start = offset + clutOffset
+    let mut d: usize = 0
+    while d < inputs {
+      lut.grid[d] = u8.toUsize(data[start + d])
+      d = d + 1
+    }
+    let precision = u8.toUsize(data[start + 16])
+    if precision != 1 && precision != 2 {
+      return Option<Lut>.None
+    }
+    let bytes = match clutBytes(&lut.grid, inputs, precision) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return Option<Lut>.None
+      }
+    }
+    if bytes > size - clutOffset - 20 {
+      return Option<Lut>.None
+    }
+    lut.clut = start + 20
+    lut.precision = precision
+  } else if inputs != 3 {
+    return Option<Lut>.None
+  }
+  if aOffset != 0 {
+    let mut a = identityCurves8()
+    if !curves(data, offset, size, aOffset, inputs, &mut a) {
+      return Option<Lut>.None
+    }
+    lut.a = a
+    lut.hasA = true
+  }
+  return Option<Lut>.Some { value: lut }
+}
+
+// Reads `count` consecutive curve elements starting `start` bytes into the tag.
+fn curves(
+  data: &[u8],
+  tagOffset: usize,
+  size: usize,
+  start: usize,
+  count: usize,
+  out: &mut [Curve; 8],
+) -> bool {
+  let mut at = start
+  let mut index: usize = 0
+  while index < count {
+    if at > size || size - at < 12 {
+      return false
+    }
+    let parsed = curveAt(data, tagOffset + at, size - at)
+    match &parsed {
+      Option<Curve>.Some { value } => {
+        out[index] = value
+      }
+      Option<Curve>.None => {
+        return false
+      }
+    }
+    at = at + curveLength(data, tagOffset + at)
+    index = index + 1
+  }
+  return true
+}
+
+// A 1-D table of `count` entries of `width` bytes at `start`, linearly interpolated.
+fn tableAt(data: &[u8], start: usize, count: usize, width: usize, x: f64) -> f64 {
+  let position = clamp(x) * usize.toF64(count - 1)
+  let mut index = f64.toUsize(f64.floor(position))
+  if index >= count - 1 {
+    index = count - 2
+  }
+  let t = position - usize.toF64(index)
+  let low = sample(data, start + index * width, width)
+  let high = sample(data, start + (index + 1) * width, width)
+  return low + (high - low) * t
+}
+
+fn sample(data: &[u8], at: usize, width: usize) -> f64 {
+  return if width == 2 {
+    u32.toF64(read16(data, at)) / 65535.0
+  } else {
+    u8.toF64(data[at]) / 255.0
+  }
+}
+
+// Multilinear CLUT interpolation; the first input varies least rapidly (§10.12.3).
+fn clutEvaluate(data: &[u8], lut: &Lut, input: &[f64; 8], out: &mut [f64; 3]) -> () {
+  let inputs = lut.inputs
+  let mut base: [usize; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  let mut fraction: [f64; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  let mut stride: [usize; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  let mut step: usize = 3
+  let mut d = inputs
+  while d > 0 {
+    d = d - 1
+    stride[d] = step
+    step = step * lut.grid[d]
+    let g = lut.grid[d]
+    let position = clamp(input[d]) * usize.toF64(g - 1)
+    let mut index = f64.toUsize(f64.floor(position))
+    if index >= g - 1 {
+      index = g - 2
+    }
+    base[d] = index
+    fraction[d] = position - usize.toF64(index)
+  }
+  out[0] = 0.0
+  out[1] = 0.0
+  out[2] = 0.0
+  let corners = usize.shiftLeft(1, inputs)
+  let mut corner: usize = 0
+  while corner < corners {
+    let mut weight = 1.0
+    let mut at: usize = 0
+    let mut k: usize = 0
+    while k < inputs {
+      let bit = usize.bitAnd(usize.shiftRight(corner, inputs - 1 - k), 1)
+      weight = weight
+        * if bit == 1 {
+          fraction[k]
+        } else {
+          1.0 - fraction[k]
+        }
+      at = at + (base[k] + bit) * stride[k]
+      k = k + 1
+    }
+    let mut o: usize = 0
+    while o < 3 {
+      out[o] = out[o] + weight * sample(data, lut.clut + (at + o) * lut.precision, lut.precision)
+      o = o + 1
+    }
+    corner = corner + 1
+  }
+}
+
+/// Evaluates the tag on device values in [0, 1] and returns PCS XYZ (D50).
+fn lutEvaluate(data: &[u8], lut: &Lut, input: &[f64; 8], xyz: &mut [f64; 3]) -> () {
+  let mut values: [f64; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  let mut pcs: [f64; 3] = [0.0, 0.0, 0.0]
+  let inputs = lut.inputs
+  if lut.kind == 1 || lut.kind == 2 {
+    // The matrix applies only to PCSXYZ input, never to device data.
+    let width = lut.precision
+    let header: usize = if lut.kind == 2 {
+      52
+    } else {
+      48
+    }
+    let tables = lut.offset + header
+    let mut d: usize = 0
+    while d < inputs {
+      values[d] = tableAt(
+        data,
+        tables + d * lut.inputEntries * width,
+        lut.inputEntries,
+        width,
+        input[d],
+      )
+      d = d + 1
+    }
+    clutEvaluate(data, lut, &values, &mut pcs)
+    let outputs = lut.clut + clutBytesKnown(lut)
+    let mut o: usize = 0
+    while o < 3 {
+      pcs[o] = tableAt(
+        data,
+        outputs + o * lut.outputEntries * width,
+        lut.outputEntries,
+        width,
+        pcs[o],
+      )
+      o = o + 1
+    }
+  } else {
+    let mut d: usize = 0
+    while d < inputs {
+      values[d] = if lut.hasA {
+        evaluate(data, &lut.a[d], clamp(input[d]))
+      } else {
+        clamp(input[d])
+      }
+      d = d + 1
+    }
+    if lut.precision != 0 {
+      clutEvaluate(data, lut, &values, &mut pcs)
+    } else {
+      pcs = [values[0], values[1], values[2]]
+    }
+    if lut.hasM {
+      let mut o: usize = 0
+      while o < 3 {
+        pcs[o] = evaluate(data, &lut.m[o], clamp(pcs[o]))
+        o = o + 1
+      }
+    }
+    if lut.matrix != 0 {
+      let e = lut.matrix
+      let x = pcs[0]
+      let y = pcs[1]
+      let z = pcs[2]
+      pcs[0] = clamp(
+        fixed(data, e) * x + fixed(data, e + 4) * y + fixed(data, e + 8) * z + fixed(data, e + 36),
+      )
+      pcs[1] = clamp(
+        fixed(data, e + 12) * x + fixed(data, e + 16) * y + fixed(data, e + 20) * z
+          + fixed(data, e + 40),
+      )
+      pcs[2] = clamp(
+        fixed(data, e + 24) * x + fixed(data, e + 28) * y + fixed(data, e + 32) * z
+          + fixed(data, e + 44),
+      )
+    }
+    let mut o: usize = 0
+    while o < 3 {
+      pcs[o] = evaluate(data, &lut.b[o], clamp(pcs[o]))
+      o = o + 1
+    }
+  }
+  decodePcs(lut, &pcs, &mut xyz.*)
+}
+
+fn clutBytesKnown(lut: &Lut) -> usize {
+  let mut total: usize = 3 * lut.precision
+  let mut index: usize = 0
+  while index < lut.inputs {
+    total = total * lut.grid[index]
+    index = index + 1
+  }
+  return total
+}
+
+// PCS encodings (§6.3.4): 16-bit XYZ has 1.0 at 8000h; lut16Type Lab uses the legacy
+// encoding with 100 at FF00h; lut8Type and lutAToBType Lab use the current one.
+fn decodePcs(lut: &Lut, pcs: &[f64; 3], xyz: &mut [f64; 3]) -> () {
+  if !lut.lab {
+    let scale = 65535.0 / 32768.0
+    xyz[0] = pcs[0] * scale
+    xyz[1] = pcs[1] * scale
+    xyz[2] = pcs[2] * scale
+    return
+  }
+  let legacy = if lut.kind == 2 {
+    65535.0 / 65280.0
+  } else {
+    1.0
+  }
+  let l = pcs[0] * legacy * 100.0
+  let a = pcs[1] * legacy * 255.0 - 128.0
+  let b = pcs[2] * legacy * 255.0 - 128.0
+  let fy = (l + 16.0) / 116.0
+  let fx = fy + a / 500.0
+  let fz = fy - b / 200.0
+  xyz[0] = D50_X * labInverse(fx)
+  xyz[1] = D50_Y * labInverse(fy)
+  xyz[2] = D50_Z * labInverse(fz)
+}
+
+fn labInverse(t: f64) -> f64 {
+  return if t > 6.0 / 29.0 {
+    t * t * t
+  } else {
+    (t - 4.0 / 29.0) * 108.0 / 841.0
   }
 }
 
@@ -572,6 +1118,8 @@ pub effect fn fromPng(gamma: &Option<u32>, primaries: &Option<Chromaticities>) -
       green: run pngTable(&exponent),
       blue: run pngTable(&exponent),
       matrix: matrix,
+      lut: Option<Lut>.None,
+      profile: Bytes.make(),
     },
   }
 }
@@ -595,6 +1143,25 @@ effect fn pngTable(exponent: &Option<f64>) -> List<f64>
 }
 
 fn convertPixel(transform: &Transform, r: u8, g: u8, b: u8, out: &mut [u8; 3]) -> () {
+  if let Option<Lut>.Some { value } = &transform.lut {
+    let input: [f64; 8] = [
+      u8.toF64(r) / 255.0,
+      u8.toF64(g) / 255.0,
+      u8.toF64(b) / 255.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+    ]
+    let mut xyz: [f64; 3] = [0.0, 0.0, 0.0]
+    lutEvaluate(transform.profile.asSlice(), &value, &input, &mut xyz)
+    let rgb = encodeXyz(&xyz)
+    out[0] = f64.toU8(f64.floor(rgb[0] * 255.0 + 0.5))
+    out[1] = f64.toU8(f64.floor(rgb[1] * 255.0 + 0.5))
+    out[2] = f64.toU8(f64.floor(rgb[2] * 255.0 + 0.5))
+    return
+  }
   let lr = transform.red.get(u8.toUsize(r))
   let lg = transform.green.get(u8.toUsize(g))
   let lb = transform.blue.get(u8.toUsize(b))

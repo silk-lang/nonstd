@@ -513,7 +513,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 ### 5.12 Colour (1.1 ch. 12)
 - [x] Embedded profiles in PNG/JPEG and PNG `gAMA`/`cHRM` with matrix/TRC and gray TRC profiles (see Source colour management)
 - [x] `color-profile` element and property, `icc-color()` and `@color-profile` (see SVG 1.1 colour profiles)
-- [ ] LUT profiles (`mft1`, `mft2`, `mAB`). Defaults to sRGB when no profile applies
+- [x] LUT profiles (`mft1`, `mft2`, `mAB`) and `rendering-intent` (see ICC LUT profiles). Defaults to sRGB when no profile applies
 
 ### 5.13 Animation (1.1 ch. 19, SMIL Animation, SVG Animations 2)
 - [x] Elements: `animate`, `set`, `animateMotion` (+ `mpath`, `path`, `keyPoints`, `rotate="auto|auto-reverse"`), `animateTransform`, 1.1 `animateColor`
@@ -1281,11 +1281,11 @@ else `gAMA` and `cHRM` ([`#11gAMA`](https://www.w3.org/TR/png-3/#11gAMA),
 
 ICC profiles are evaluated with the matrix/TRC model of ICC.1:2022 Annex F.3
 (RGB, XYZ PCS) and the gray TRC model of F.2, with `curv` (identity, gamma and
-linearly interpolated tables) and every `para` function type. The PCS is converted
-to sRGB with the inverse of the sRGB profile's D50 colorants, so matrix/TRC
-profiles behave the same under every rendering intent. Profiles that are
-malformed, use a Lab PCS, or carry only LUT transforms (`mft1`, `mft2`, `mAB`)
-leave the samples as sRGB until LUT support lands. A malformed `iCCP` does not
+linearly interpolated tables) and every `para` function type, and with the LUT
+models described under "ICC LUT profiles". The PCS is converted to sRGB with the
+inverse of the sRGB profile's D50 colorants. Malformed profiles, and profiles
+whose usable transform does not take one or three channels (CMYK images), leave the
+samples as sRGB. A malformed `iCCP` does not
 fall back to `gAMA`/`cHRM`, because the PNG text gives `iCCP` precedence once
 present.
 
@@ -1334,10 +1334,38 @@ IRIs that match no element, or name an element in another document, behave like
 against the retained-byte budget, so occurrences with different choices can share
 one URL.
 
-Matrix/TRC profiles have no intent-specific transforms, so `rendering-intent`
-does not change any result yet; it matters once LUT profiles are supported.
+The element's `rendering-intent` (and the rule's descriptor) selects the AToB
+tag of LUT profiles; `auto` uses the profile header's intent.
 
 [`@color-profile`](https://www.w3.org/TR/SVG11/color.html#ColorProfileAtRule) rules
 take a `name` identifier and a `src` url, fetched under the sheet's policy and
 storage budget. Their names apply to every document of the render and come after
 `color-profile` elements of the same name. `src: sRGB` and `local()` add nothing.
+
+### ICC LUT profiles
+
+Input profiles with an AToB tag use it in preference to matrix/TRC tags, as
+ICC.1:2022 §8.3 requires. The tag is chosen by rendering intent: perceptual reads
+`A2B0`, relative and absolute colorimetric read `A2B1`, saturation reads `A2B2`,
+and a missing tag falls back to `A2B0`. Embedded image profiles use the header's
+intent (§7.2.15). Absolute colorimetric is evaluated like relative colorimetric:
+there is no media-white scaling.
+
+All three LUT tag types are evaluated in floating point. `lut8Type` and
+`lut16Type` (§10.10, §10.11) run their input tables, the CLUT and the output
+tables. The 3x3 matrix is skipped, because it applies only to PCSXYZ input.
+`lutAToBType` (§10.12) runs the A curves, the CLUT, the M curves, the 3x4 matrix
+(clipped to [0, 1]) and the B curves, skipping absent elements. One-dimensional
+tables interpolate linearly. CLUTs interpolate multilinearly over up to eight
+inputs, with the first input varying least rapidly.
+
+PCS values are then decoded. PCSXYZ uses the 16-bit encoding, where 1.0 is
+8000h. PCSLAB uses the legacy encoding for `lut16Type` (100 at FF00h) and the
+current encoding for the others. Lab converts to XYZ against the D50 PCS white.
+
+Tags with other than three outputs, more than eight inputs, grids smaller than two
+points, CLUTs over 16 MiB, or data past the tag end are rejected, and the profile
+is then unusable. `icc-color()` accepts any input count matching the tag, so CMYK
+profiles work there. Images accept one- and three-channel tags only.
+
+There is no black-point compensation and no gamut mapping beyond clipping.
