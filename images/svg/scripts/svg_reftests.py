@@ -80,8 +80,8 @@ def load_own_manifest(path, malformed=False):
         expectations[entry["id"]] = entry
         source = entry.get("input")
         input_path = contained(root, source)
-        if input_path.suffix != ".svg":
-            raise ValueError(f"{entry['id']}: input must be SVG")
+        if input_path.suffix not in (".svg", ".svgz"):
+            raise ValueError(f"{entry['id']}: input must be SVG or compressed SVG")
         if source in inputs:
             raise ValueError(f"duplicate own input: {source}")
         inputs.add(source)
@@ -114,7 +114,7 @@ def load_own_manifest(path, malformed=False):
             if not contained(root, name).is_file():
                 raise ValueError(f"{entry['id']}: missing fixture {name}")
             files.add(name)
-    discovered = {item.relative_to(root).as_posix() for item in root.rglob("*") if item.suffix in (".svg", ".png") and item.is_file()}
+    discovered = {item.relative_to(root).as_posix() for item in root.rglob("*") if item.suffix in (".svg", ".svgz", ".png") and item.is_file()}
     unlisted = sorted(discovered - files)
     if unlisted:
         raise ValueError(f"unlisted own fixtures: {', '.join(unlisted[:10])}")

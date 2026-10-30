@@ -273,3 +273,81 @@ SILK_CLANG=/absolute/path/to/clang images/svg/scripts/bench-jpeg \
 Pillow is needed only to regenerate the original input fixtures. The benchmark
 runner uses the Python standard library; its JSON includes hashes of each input
 and the measured binary, native samples and checksums. Omit `--callgrind` on macOS.
+
+## Phase 7 compressed-document checkpoint
+
+Snapshot `237a6cb`, Silk dev.32/LLVM 22.1.8, Ubuntu 24.04 ARM64. The baseline
+`1605d54` differs from parent main `a282ea1` only in performance documentation.
+Three samples, one iteration, no warmup. The timed stage is parse+record; separate
+Callgrind counts include complete processes and output rendering/hashing.
+
+| Workload | Old process Ir | New process Ir | Parse+record new/old |
+| --- | ---: | ---: | ---: |
+| clipping/parse | 1,863,826,908 | 1,863,827,179 | 0.9601 |
+| compositing/parse | 548,511,995 | 548,512,205 | 0.9810 |
+| iconset/parse | 649,769,413 | 649,785,925 | 1.0095 |
+| instances/parse | 1,150,920,191 | 1,150,920,339 | 1.0200 |
+| largemap/parse | 1,005,919,339 | 1,005,919,762 | 1.0185 |
+| masking/parse | 4,967,166,368 | 4,967,166,638 | 1.1623 |
+| mixedcurves/parse | 476,221,611 | 476,221,757 | 0.9967 |
+| paintservers/parse | 338,759,011 | 338,759,545 | 0.7791 |
+| stylesheets/parse | 1,039,136,476 | 1,039,132,361 | 1.1541 |
+| tiger/parse | 444,422,218 | 444,422,361 | 1.0289 |
+
+All ten rendered checksums are unchanged. The maximum full-process instruction
+increase is below 0.003%. Native timings are short samples and include scheduler
+variation; no speedup is inferred from small differences.
+
+Pinned resvg/usvg `91455ee06d08ac2bfeab2b035ed2cfbfd0a68614`, existing uncompressed
+workloads and the prior reference feature configuration:
+
+| Workload | Silk median ms | resvg median ms | Silk/resvg |
+| --- | ---: | ---: | ---: |
+| clipping/parse | 2.9182 | 0.4586 | 6.3629 |
+| compositing/parse | 4.2975 | 0.3118 | 13.7850 |
+| iconset/parse | 24.2750 | 2.2568 | 10.7563 |
+| instances/parse | 122.1529 | 5.7400 | 21.2808 |
+| largemap/parse | 41.5908 | 2.7855 | 14.9309 |
+| masking/parse | 3.2245 | 0.5039 | 6.3989 |
+| mixedcurves/parse | 12.4338 | 1.3395 | 9.2821 |
+| paintservers/parse | 5.3697 | 0.7440 | 7.2169 |
+| stylesheets/parse | 53.9725 | 74.0969 | 0.7284 |
+| tiger/parse | 9.3200 | 1.2022 | 7.7524 |
+
+Only stylesheet and instance checksums match the reference, as in the earlier
+checkpoints. The tracked baseline and conformance tolerances were not changed.
+
+A separate run compresses the exact generated `largemap.svg` input with gzip and
+zlib. Three samples each use five measured parse+record iterations and one warmup.
+Each engine's compressed-output checksum must equal its own plain-input checksum.
+The reference harness now enables resvg's `svgz` feature; the first attempted
+reference run explicitly rejected gzip because that feature had been disabled.
+The benchmark build still enforces the pinned upstream registry versions/hashes.
+
+| Engine/input | Input bytes | Median ms parse+record | Complete-process Ir |
+| --- | ---: | ---: | ---: |
+| silk/plain | 163,569 | 27.4340 | 1,005,650,075 |
+| silk/gzip | 17,986 | 28.0524 | 1,052,887,416 |
+| silk/zlib | 18,323 | 28.2409 | 1,055,887,443 |
+| resvg/plain | 163,569 | 2.6655 | not collected |
+| resvg/gzip | 17,986 | 2.7833 | not collected |
+
+Both engines retain their plain-input checksum for gzip; Silk also retains it for
+zlib. The pinned reference rejects a bare zlib document, which is recorded as
+unsupported rather than a timing sample. Cross-engine pixel equality is not
+claimed for this workload. Parsing, XML, CSS and geometry dominate these totals;
+they are not isolated inflater-throughput measurements. Existing phase-14 targets
+remain open.
+
+Reproduce the compressed-input comparison after building both release benchmarks:
+
+```sh
+python3 images/svg/bench/compressed.py \
+  --silk /path/to/images-svg-bench --rust /path/to/svg-reference-bench \
+  --input images/svg/bench/.cache/workloads/largemap/largemap.svg \
+  --callgrind --output build/svg/compressed-input.json
+```
+
+JSON records input and binary hashes, all native samples and output checksums.
+Callgrind uses one iteration and zero warmup in separate runs and includes setup,
+parsing, rendering, hashing and destruction. Omit it on hosts without Valgrind.
