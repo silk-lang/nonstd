@@ -543,7 +543,7 @@ before comparison. APNG selects the first animation frame, including when the
 fallback IDAT image is outside the animation, on a transparent initial canvas
 ([frame controls](https://www.w3.org/TR/png-3/#fcTL-chunk)). Later frame payloads
 are not inflated for this first-frame API. Color metadata is retained; its
-interpretation/conversion and SVG image integration remain incomplete.
+interpretation/conversion remains incomplete; PNG samples are integrated into SVG image rendering.
 
 ### JPEG scan reconstruction
 
@@ -620,8 +620,8 @@ budget failures propagate; unavailable or malformed images paint nothing. Each
 image is sampled with its full projective transform, then participates in the
 existing clip/mask/group compositing pipeline. Fill and stroke properties do not
 paint the image rectangle. SVG `optimizeSpeed` selects nearest sampling; `auto`
-and `optimizeQuality` currently select bilinear sampling. CSS Images 3 sampling
-keywords and nested SVG image documents remain open.
+and `optimizeQuality` select bilinear sampling. The subsequent sampling and
+embedded-document sections describe CSS Images 3 keywords and nested SVG images.
 
 The projective nearest-sampling fixture uses a continuous blue field, a binary red
 band and one antialiased outer clip as its reference. Two separately antialiased
