@@ -467,8 +467,8 @@ fn lighting(pixel: vec2u) -> vec4u {
   let g = clamp01(k * m[3].y);
   let b = clamp01(k * m[3].z);
   if !specular { return vec4u(byte(r), byte(g), byte(b), 255u); }
-  let a = byte(max(r, max(g, b)));
-  return vec4u(div255(byte(r) * a), div255(byte(g) * a), div255(byte(b) * a), a);
+  // The specular image is already premultiplied: its alpha is the largest component.
+  return vec4u(byte(r), byte(g), byte(b), byte(max(r, max(g, b))));
 }
 
 @fragment fn fs(@builtin(position) position: vec4f) -> @location(0) vec4f {
