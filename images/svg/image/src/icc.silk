@@ -1,0 +1,621 @@
+//! Source colour conversion to sRGB for decoded images: ICC matrix/TRC and
+//! gray TRC profiles (ICC.1:2022 §F.3, §F.2) and PNG gAMA/cHRM descriptions.
+//! Profiles this module cannot evaluate leave the samples unchanged.
+import image { Image }
+import png_decode { Chromaticities }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+/// The PCS illuminant D50 as the s15Fixed16 values the ICC header stores (ICC.1:2022 §7.2.16).
+const D50_X: f64 = 0.964202880859375
+
+const D50_Y: f64 = 1.0
+
+const D50_Z: f64 = 0.8249053955078125
+
+/// A per-channel decode table (8-bit sample to linear light) and a linear 3x3 map
+/// from source linear light to sRGB linear light, row-major.
+pub struct Transform {
+  red: List<f64>,
+  green: List<f64>,
+  blue: List<f64>,
+  matrix: [f64; 9],
+}
+
+/// A tone reproduction curve located in profile bytes.
+union Curve {
+  Identity,
+  Gamma { value: f64 },
+  Table { offset: usize, count: usize },
+  Parametric { kind: u16, g: f64, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64 },
+}
+
+impl Copy for Curve {}
+
+fn read16(data: &[u8], offset: usize) -> u32 {
+  return u8.toU32(data[offset]) * 256 + u8.toU32(data[offset + 1])
+}
+
+fn read32(data: &[u8], offset: usize) -> u32 {
+  return u8.toU32(data[offset]) * 16777216 + u8.toU32(data[offset + 1]) * 65536
+    + read16(data, offset + 2)
+}
+
+// s15Fixed16Number (ICC.1:2022 §4.6).
+fn fixed(data: &[u8], offset: usize) -> f64 {
+  let raw = read32(data, offset)
+  let magnitude = u32.toF64(raw) / 65536.0
+  return if raw >= 2147483648 {
+    magnitude - 65536.0
+  } else {
+    magnitude
+  }
+}
+
+fn signature(data: &[u8], offset: usize, name: &[u8]) -> bool {
+  return data[offset] == name[0] && data[offset + 1] == name[1] && data[offset + 2] == name[2]
+    && data[offset + 3] == name[3]
+}
+
+/// The tag's data offset and size, when the tag table names it in bounds (ICC.1:2022 §7.3).
+fn tag(data: &[u8], name: &[u8]) -> Option<usize> {
+  let count = u32.toUsize(read32(data, 128))
+  if count > (data.length - 132) / 12 {
+    return Option<usize>.None
+  }
+  let mut index: usize = 0
+  while index < count {
+    let entry = 132 + index * 12
+    if signature(data, entry, name) {
+      let offset = u32.toUsize(read32(data, entry + 4))
+      let size = u32.toUsize(read32(data, entry + 8))
+      if offset >= data.length || size > data.length - offset || size < 8 {
+        return Option<usize>.None
+      }
+      return Option<usize>.Some { value: offset }
+    }
+    index = index + 1
+  }
+  return Option<usize>.None
+}
+
+fn tagSize(data: &[u8], name: &[u8]) -> usize {
+  let count = u32.toUsize(read32(data, 128))
+  let mut index: usize = 0
+  while index < count {
+    let entry = 132 + index * 12
+    if signature(data, entry, name) {
+      return u32.toUsize(read32(data, entry + 8))
+    }
+    index = index + 1
+  }
+  return 0
+}
+
+// XYZType with one value (ICC.1:2022 §10.31).
+fn xyz(data: &[u8], name: &[u8], out: &mut [f64; 3]) -> bool {
+  let offset = match tag(data, name) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return false
+    }
+  }
+  if tagSize(data, name) < 20 || !signature(data, offset, b"XYZ ") {
+    return false
+  }
+  out[0] = fixed(data, offset + 8)
+  out[1] = fixed(data, offset + 12)
+  out[2] = fixed(data, offset + 16)
+  return true
+}
+
+// curveType (§10.6) or parametricCurveType (§10.18).
+fn curve(data: &[u8], name: &[u8]) -> Option<Curve> {
+  let offset = match tag(data, name) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return Option<Curve>.None
+    }
+  }
+  let size = tagSize(data, name)
+  if size < 12 {
+    return Option<Curve>.None
+  }
+  if signature(data, offset, b"curv") {
+    let count = u32.toUsize(read32(data, offset + 8))
+    if count > (size - 12) / 2 {
+      return Option<Curve>.None
+    }
+    if count == 0 {
+      return Option<Curve>.Some { value: Curve.Identity }
+    }
+    if count == 1 {
+      // u8Fixed8Number gamma.
+      return Option<Curve>.Some {
+        value: Curve.Gamma { value: u32.toF64(read16(data, offset + 12)) / 256.0 },
+      }
+    }
+    return Option<Curve>.Some { value: Curve.Table { offset: offset + 12, count: count } }
+  }
+  if signature(data, offset, b"para") {
+    let kind = u32.toU16(read16(data, offset + 8))
+    let needed: usize = if kind == 0 {
+      1
+    } else if kind == 1 {
+      3
+    } else if kind == 2 {
+      4
+    } else if kind == 3 {
+      5
+    } else if kind == 4 {
+      7
+    } else {
+      return Option<Curve>.None
+    }
+    if size < 12 + needed * 4 {
+      return Option<Curve>.None
+    }
+    let p = offset + 12
+    return Option<Curve>.Some {
+      value: Curve.Parametric {
+        kind: kind,
+        g: fixed(data, p),
+        a: if needed > 1 {
+          fixed(data, p + 4)
+        } else {
+          1.0
+        },
+        b: if needed > 2 {
+          fixed(data, p + 8)
+        } else {
+          0.0
+        },
+        c: if needed > 3 {
+          fixed(data, p + 12)
+        } else {
+          0.0
+        },
+        d: if needed > 4 {
+          fixed(data, p + 16)
+        } else {
+          0.0
+        },
+        e: if needed > 5 {
+          fixed(data, p + 20)
+        } else {
+          0.0
+        },
+        f: if needed > 6 {
+          fixed(data, p + 24)
+        } else {
+          0.0
+        },
+      },
+    }
+  }
+  return Option<Curve>.None
+}
+
+fn clamp(value: f64) -> f64 {
+  return if value != value || value <= 0.0 {
+    0.0
+  } else if value >= 1.0 {
+    1.0
+  } else {
+    value
+  }
+}
+
+fn power(base: f64, exponent: f64) -> f64 {
+  return if base <= 0.0 {
+    0.0
+  } else {
+    f64.pow(base, exponent)
+  }
+}
+
+fn evaluate(data: &[u8], shape: &Curve, x: f64) -> f64 {
+  return match &shape.* {
+    Curve.Identity => x
+    Curve.Gamma { value } => power(x, value)
+    Curve.Table { offset, count } => {
+      let position = x * usize.toF64(count - 1)
+      let mut index = f64.toUsize(f64.floor(position))
+      if index >= count - 1 {
+        index = count - 2
+      }
+      let low = u32.toF64(read16(data, offset + index * 2)) / 65535.0
+      let high = u32.toF64(read16(data, offset + index * 2 + 2)) / 65535.0
+      let t = position - usize.toF64(index)
+      clamp(low + (high - low) * t)
+    }
+    Curve.Parametric { kind, g, a, b, c, d, e, f } => {
+      let value = if kind == 0 {
+        power(x, g)
+      } else if kind == 1 {
+        if x >= -b / a {
+          power(a * x + b, g)
+        } else {
+          0.0
+        }
+      } else if kind == 2 {
+        if x >= -b / a {
+          power(a * x + b, g) + c
+        } else {
+          c
+        }
+      } else if kind == 3 {
+        if x >= d {
+          power(a * x + b, g)
+        } else {
+          c * x
+        }
+      } else {
+        if x >= d {
+          power(a * x + b, g) + e
+        } else {
+          c * x + f
+        }
+      }
+      clamp(value)
+    }
+  }
+}
+
+effect fn table(data: &[u8], shape: &Curve) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = run List<f64>.makeWithCapacity(256)
+  let mut index: u32 = 0
+  while index < 256 {
+    run values.append(evaluate(data, shape, u32.toF64(index) / 255.0))
+    index = index + 1
+  }
+  return move values
+}
+
+// The sRGB electro-optical transfer function (IEC 61966-2-1).
+pub fn srgbDecode(value: f64) -> f64 {
+  return if value <= 0.04045 {
+    value / 12.92
+  } else {
+    f64.pow((value + 0.055) / 1.055, 2.4)
+  }
+}
+
+fn srgbEncode(value: f64) -> u8 {
+  let v = clamp(value)
+  let encoded = if v <= 0.0031308 {
+    v * 12.92
+  } else {
+    1.055 * f64.pow(v, 1.0 / 2.4) - 0.055
+  }
+  return f64.toU8(f64.floor(clamp(encoded) * 255.0 + 0.5))
+}
+
+effect fn srgbTable() -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = run List<f64>.makeWithCapacity(256)
+  let mut index: u32 = 0
+  while index < 256 {
+    run values.append(srgbDecode(u32.toF64(index) / 255.0))
+    index = index + 1
+  }
+  return move values
+}
+
+fn multiply(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
+  let mut out: [f64; 9] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  let mut row: usize = 0
+  while row < 3 {
+    let mut column: usize = 0
+    while column < 3 {
+      out[row * 3 + column] = a[row * 3] * b[column] + a[row * 3 + 1] * b[3 + column]
+        + a[row * 3 + 2] * b[6 + column]
+      column = column + 1
+    }
+    row = row + 1
+  }
+  return out
+}
+
+fn inverse(m: &[f64; 9]) -> [f64; 9] {
+  let c0 = m[4] * m[8] - m[5] * m[7]
+  let c1 = m[5] * m[6] - m[3] * m[8]
+  let c2 = m[3] * m[7] - m[4] * m[6]
+  let determinant = m[0] * c0 + m[1] * c1 + m[2] * c2
+  return [
+    c0 / determinant,
+    (m[2] * m[7] - m[1] * m[8]) / determinant,
+    (m[1] * m[5] - m[2] * m[4]) / determinant,
+    c1 / determinant,
+    (m[0] * m[8] - m[2] * m[6]) / determinant,
+    (m[2] * m[3] - m[0] * m[5]) / determinant,
+    c2 / determinant,
+    (m[1] * m[6] - m[0] * m[7]) / determinant,
+    (m[0] * m[4] - m[1] * m[3]) / determinant,
+  ]
+}
+
+/// XYZ (D50) to linear sRGB: the inverse of the sRGB profile's D50-adapted colorants.
+fn fromPcs() -> [f64; 9] {
+  let colorants: [f64; 9] = [
+    0.4360747,
+    0.3850649,
+    0.1430804,
+    0.2225045,
+    0.7168786,
+    0.0606169,
+    0.0139322,
+    0.0971045,
+    0.7141733,
+  ]
+  return inverse(&colorants)
+}
+
+/// Builds the conversion for an embedded ICC profile, or None when the profile is
+/// malformed or not a matrix/TRC (RGB) or TRC (gray) profile with an XYZ PCS.
+pub effect fn fromProfile(data: &[u8]) -> Option<Transform>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if data.length < 132 || u32.toUsize(read32(data, 0)) > data.length
+    || !signature(data, 36, b"acsp")
+    || !signature(data, 20, b"XYZ ") {
+    return Option<Transform>.None
+  }
+  let pcs = fromPcs()
+  if signature(data, 16, b"GRAY") {
+    let gray = match curve(data, b"kTRC") {
+      Option<Curve>.Some { value } => value
+      Option<Curve>.None => {
+        return Option<Transform>.None
+      }
+    }
+
+    // Gray maps to the PCS white scaled by luminance (ICC.1:2022 §F.2).
+    let r = pcs[0] * D50_X + pcs[1] * D50_Y + pcs[2] * D50_Z
+    let g = pcs[3] * D50_X + pcs[4] * D50_Y + pcs[5] * D50_Z
+    let b = pcs[6] * D50_X + pcs[7] * D50_Y + pcs[8] * D50_Z
+    return Option<Transform>.Some {
+      value: Transform {
+        red: run table(data, &gray),
+        green: run table(data, &gray),
+        blue: run table(data, &gray),
+        matrix: [r, 0.0, 0.0, 0.0, g, 0.0, 0.0, 0.0, b],
+      },
+    }
+  }
+  if !signature(data, 16, b"RGB ") {
+    return Option<Transform>.None
+  }
+  let mut red: [f64; 3] = [0.0, 0.0, 0.0]
+  let mut green: [f64; 3] = [0.0, 0.0, 0.0]
+  let mut blue: [f64; 3] = [0.0, 0.0, 0.0]
+  if !xyz(data, b"rXYZ", &mut red) || !xyz(data, b"gXYZ", &mut green)
+    || !xyz(data, b"bXYZ", &mut blue) {
+    return Option<Transform>.None
+  }
+  let redCurve = match curve(data, b"rTRC") {
+    Option<Curve>.Some { value } => value
+    Option<Curve>.None => {
+      return Option<Transform>.None
+    }
+  }
+  let greenCurve = match curve(data, b"gTRC") {
+    Option<Curve>.Some { value } => value
+    Option<Curve>.None => {
+      return Option<Transform>.None
+    }
+  }
+  let blueCurve = match curve(data, b"bTRC") {
+    Option<Curve>.Some { value } => value
+    Option<Curve>.None => {
+      return Option<Transform>.None
+    }
+  }
+
+  // Matrix/TRC model (ICC.1:2022 §F.3): XYZ = [rXYZ gXYZ bXYZ] * linear RGB.
+  let source: [f64; 9] = [
+    red[0],
+    green[0],
+    blue[0],
+    red[1],
+    green[1],
+    blue[1],
+    red[2],
+    green[2],
+    blue[2],
+  ]
+  return Option<Transform>.Some {
+    value: Transform {
+      red: run table(data, &redCurve),
+      green: run table(data, &greenCurve),
+      blue: run table(data, &blueCurve),
+      matrix: multiply(&pcs, &source),
+    },
+  }
+}
+
+// Linear Bradford adaptation from a source white to D50 (ICC.1:2022 Annex E).
+fn bradford(x: f64, y: f64, z: f64) -> [f64; 9] {
+  let cone: [f64; 9] = [0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296]
+  let s0 = cone[0] * x + cone[1] * y + cone[2] * z
+  let s1 = cone[3] * x + cone[4] * y + cone[5] * z
+  let s2 = cone[6] * x + cone[7] * y + cone[8] * z
+  let d0 = cone[0] * D50_X + cone[1] * D50_Y + cone[2] * D50_Z
+  let d1 = cone[3] * D50_X + cone[4] * D50_Y + cone[5] * D50_Z
+  let d2 = cone[6] * D50_X + cone[7] * D50_Y + cone[8] * D50_Z
+  let scale: [f64; 9] = [d0 / s0, 0.0, 0.0, 0.0, d1 / s1, 0.0, 0.0, 0.0, d2 / s2]
+  let adapted = multiply(&scale, &cone)
+  return multiply(&inverse(&cone), &adapted)
+}
+
+fn chromaticity(value: u32) -> f64 {
+  return u32.toF64(value) / 100000.0
+}
+
+/// Builds the conversion for PNG gAMA and cHRM when neither iCCP nor sRGB is present
+/// (PNG-3 §12.2). A missing gAMA uses the sRGB curve and a missing cHRM uses sRGB
+/// primaries; None means the samples are already sRGB.
+pub effect fn fromPng(gamma: &Option<u32>, primaries: &Option<Chromaticities>) -> Option<Transform>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let exponent = match &gamma.* {
+    Option<u32>.Some { value } => if value == 0 {
+      return Option<Transform>.None
+    } else {
+      Option<f64>.Some { value: 100000.0 / u32.toF64(value) }
+    }
+    Option<u32>.None => Option<f64>.None
+  }
+  let mut matrix: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  match &primaries.* {
+    Option<Chromaticities>.Some { value } => {
+      if value.whiteY == 0 || value.redY == 0 || value.greenY == 0 || value.blueY == 0 {
+        return Option<Transform>.None
+      }
+      let xr = chromaticity(value.redX)
+      let yr = chromaticity(value.redY)
+      let xg = chromaticity(value.greenX)
+      let yg = chromaticity(value.greenY)
+      let xb = chromaticity(value.blueX)
+      let yb = chromaticity(value.blueY)
+      let xw = chromaticity(value.whiteX)
+      let yw = chromaticity(value.whiteY)
+      let primary: [f64; 9] = [
+        xr / yr,
+        xg / yg,
+        xb / yb,
+        1.0,
+        1.0,
+        1.0,
+        (1.0 - xr - yr) / yr,
+        (1.0 - xg - yg) / yg,
+        (1.0 - xb - yb) / yb,
+      ]
+      let wx = xw / yw
+      let wz = (1.0 - xw - yw) / yw
+      let solved = inverse(&primary)
+      let sr = solved[0] * wx + solved[1] + solved[2] * wz
+      let sg = solved[3] * wx + solved[4] + solved[5] * wz
+      let sb = solved[6] * wx + solved[7] + solved[8] * wz
+      let scale: [f64; 9] = [sr, 0.0, 0.0, 0.0, sg, 0.0, 0.0, 0.0, sb]
+      let toXyz = multiply(&primary, &scale)
+      let adapted = multiply(&bradford(wx, 1.0, wz), &toXyz)
+      matrix = multiply(&fromPcs(), &adapted)
+    }
+    Option<Chromaticities>.None => {}
+  }
+  return Option<Transform>.Some {
+    value: Transform {
+      red: run pngTable(&exponent),
+      green: run pngTable(&exponent),
+      blue: run pngTable(&exponent),
+      matrix: matrix,
+    },
+  }
+}
+
+effect fn pngTable(exponent: &Option<f64>) -> List<f64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = run List<f64>.makeWithCapacity(256)
+  let mut index: u32 = 0
+  while index < 256 {
+    let x = u32.toF64(index) / 255.0
+    run values.append(
+      match &exponent.* {
+        Option<f64>.Some { value } => power(x, value)
+        Option<f64>.None => srgbDecode(x)
+      },
+    )
+    index = index + 1
+  }
+  return move values
+}
+
+fn convertPixel(transform: &Transform, r: u8, g: u8, b: u8, out: &mut [u8; 3]) -> () {
+  let lr = transform.red.get(u8.toUsize(r))
+  let lg = transform.green.get(u8.toUsize(g))
+  let lb = transform.blue.get(u8.toUsize(b))
+  let m = &transform.matrix
+  out[0] = srgbEncode(m[0] * lr + m[1] * lg + m[2] * lb)
+  out[1] = srgbEncode(m[3] * lr + m[4] * lg + m[5] * lb)
+  out[2] = srgbEncode(m[6] * lr + m[7] * lg + m[8] * lb)
+}
+
+/// True when every single-channel ramp and the gray ramp convert to themselves, so
+/// applying the transform cannot change any opaque sample.
+pub fn isIdentity(transform: &Transform) -> bool {
+  let mut out: [u8; 3] = [0, 0, 0]
+  let mut index: u32 = 0
+  while index < 256 {
+    let v = u32.toU8(index)
+    convertPixel(transform, v, 0, 0, &mut out)
+    if out[0] != v || out[1] != 0 || out[2] != 0 {
+      return false
+    }
+    convertPixel(transform, 0, v, 0, &mut out)
+    if out[0] != 0 || out[1] != v || out[2] != 0 {
+      return false
+    }
+    convertPixel(transform, 0, 0, v, &mut out)
+    if out[0] != 0 || out[1] != 0 || out[2] != v {
+      return false
+    }
+    convertPixel(transform, v, v, v, &mut out)
+    if out[0] != v || out[1] != v || out[2] != v {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+fn straight(value: u8, alpha: u32) -> u8 {
+  let scaled = (u8.toU32(value) * 255 + alpha / 2) / alpha
+  return u32.toU8(
+    if scaled > 255 {
+      255
+    } else {
+      scaled
+    },
+  )
+}
+
+/// Converts premultiplied samples in place. Translucent samples are converted from their
+/// straight-alpha values and premultiplied again; transparent samples stay transparent.
+pub fn apply(transform: &Transform, target: &mut Image) -> () {
+  let pixels = target.dataMut()
+  let mut out: [u8; 3] = [0, 0, 0]
+  let mut index: usize = 0
+  while index < pixels.length {
+    let alpha = u8.toU32(pixels[index + 3])
+    if alpha == 255 {
+      convertPixel(transform, pixels[index], pixels[index + 1], pixels[index + 2], &mut out)
+      pixels[index] = out[0]
+      pixels[index + 1] = out[1]
+      pixels[index + 2] = out[2]
+    } else if alpha != 0 {
+      convertPixel(
+        transform,
+        straight(pixels[index], alpha),
+        straight(pixels[index + 1], alpha),
+        straight(pixels[index + 2], alpha),
+        &mut out,
+      )
+      pixels[index] = u32.toU8((u8.toU32(out[0]) * alpha + 127) / 255)
+      pixels[index + 1] = u32.toU8((u8.toU32(out[1]) * alpha + 127) / 255)
+      pixels[index + 2] = u32.toU8((u8.toU32(out[2]) * alpha + 127) / 255)
+    }
+    index = index + 4
+  }
+}
