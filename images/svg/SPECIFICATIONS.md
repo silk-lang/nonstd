@@ -474,7 +474,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
-- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
+- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size` (done), `shape-inside`, `shape-subtract`, `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
@@ -855,9 +855,36 @@ decisions:
 - White space follows CSS Text 4 #white-space-phase-1 on one line. With `collapse`,
   segment breaks and tabs become spaces, a space after a collapsible space is removed,
   and spaces at the start and end of the line are removed. The preserving values keep
-  spaces; tabs and segment breaks render as spaces, because SVG text without
-  `inline-size` has no line breaking. `xml:space="preserve"` reaches this as
-  `white-space-collapse: preserve-spaces` through the UA stylesheet.
+  spaces; tabs render as spaces, and so do segment breaks unless `inline-size` wraps the
+  text. `xml:space="preserve"` reaches this as `white-space-collapse: preserve-spaces`
+  through the UA stylesheet.
+- Auto-wrapped text (#InlineSize, #TextLayoutAuto): a positive `inline-size` on the `text`
+  element wraps it, except when it holds a `textPath`. Percentages refer to the viewport
+  width. `inline-size` is a property only: SVG 2's list of presentation attributes
+  (styling.html) does not include it, although an example in §11.4.1 uses the attribute.
+  The text is laid out once on one line, then broken greedily at UAX #14 opportunities
+  (`ucd`, default options; `line-break` and `word-break` are not read yet). A line ends at
+  the last opportunity whose content fits. A word longer than the line overflows. Without
+  soft wrapping (`text-wrap-mode: nowrap`) only forced breaks apply. A preserved segment
+  break is a forced break.
+- The white space at the end of a line hangs: it has no advance, is not drawn, and does not
+  count for anchoring. With `collapse` CSS removes these spaces instead, which renders the
+  same, but they stay addressable for `dx` and `rotate`. Letter and word spacing start
+  afresh on each line.
+- Each line is an anchored chunk (#TextLayoutAlgorithm sets the flag at each line start).
+  Its first character takes the first character's `x`, and the line's baseline as `y`. All
+  other `x` and `y` values are ignored (§11.7); `dx`, `dy` and `rotate` still apply, and
+  `textLength` does not. §11.4.1 anchors the wrapping area with `text-anchor` while
+  §11.5 requires `text-align: start`. But the algorithm then anchors each line chunk at
+  its own start, so each line is anchored at the first `x`: `middle` centres every line
+  on it, and `end` (or `start` in right-to-left text) ends every line there.
+- Line boxes follow CSS 2.1 #line-height. Each span on the line, and the `text` element's
+  strut, adds an inline box: its first face's ascent and descent (`hhea`, or `OS/2` typo
+  metrics with USE_TYPO_METRICS), set on the span's alphabetic baseline and grown by half
+  the leading above and below. `line-height: normal` is ascent + descent + line gap
+  (CSS Inline 3). The first baseline is at the first `y`, and each next one lies lower by
+  the previous line's bottom minus the new line's top. Bidi levels are resolved per line
+  rather than per paragraph.
 - `x`, `y`, `dx`, `dy` and `rotate` are lists of CSS lengths, percentages or numbers
   separated by white space or commas. Percentages resolve against the viewport width
   (`x`, `dx`) or height (`y`, `dy`). An invalid list is ignored as a whole. Lists count
