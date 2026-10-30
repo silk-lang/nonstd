@@ -85,6 +85,9 @@ def load_own_manifest(path, malformed=False):
         if source in inputs:
             raise ValueError(f"duplicate own input: {source}")
         inputs.add(source)
+        arguments = entry.get("arguments", [])
+        if not isinstance(arguments, list) or any(not isinstance(arg, str) for arg in arguments):
+            raise ValueError(f"{entry['id']}: arguments must be an array of renderer options")
         references = entry.get("references", [])
         if not isinstance(references, list):
             raise ValueError(f"{entry['id']}: references must be an array")
@@ -299,7 +302,8 @@ def run_case(case, expectation, root, command, timeout, diff_dir=None):
     try:
         with tempfile.TemporaryDirectory(prefix="svg-reftest-") as temporary:
             tmp = Path(temporary)
-            actual = render(command, contained(root, case["input"]), tmp / "actual.png", timeout)
+            # Per-case options (such as an animation time) apply to the input only; references are static.
+            actual = render(command + case.get("arguments", []), contained(root, case["input"]), tmp / "actual.png", timeout)
             result["rendered"] = True
             pairs = []
             for index, ref in enumerate(case["references"]):
