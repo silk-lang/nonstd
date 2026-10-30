@@ -81,8 +81,14 @@ add('viewbox-auto-height',
     cells(rows[1], width=2, height=2),
     'A viewBox-only natural ratio is inverted before resolving auto height, without inventing intrinsic dimensions.')
 projective = 'transform-origin:0 0;transform:matrix3d(1,0,0,.025,0,1,0,0,0,0,1,0,0,0,0,1)'
+# SVG2 render.html#RenderingOrder: antialiased adjoining edges retain source
+# painting order. Reordering by the rotated grid would change source-over edges.
+positions = {'red': (2, 0), 'lime': (2, 1), 'blue': (1, 0),
+             'cyan': (1, 1), 'magenta': (0, 0), 'yellow': (0, 1)}
+projective_reference = ''.join(cells([[color]], 2 + 3 * x, 2 + 2 * y, 3, 2)
+                               for color, (x, y) in positions.items())
 add('projective',
     f'<image x="2" y="2" width="9" height="4" preserveAspectRatio="none" href="{url}" style="image-orientation:90deg;{projective}"/>',
-    f'<g style="{projective}">' + cells(rows[1], width=3, height=2) + '</g>',
-    'CSS transforms follow image orientation; retained child clips compose through the projective placement.')
+    f'<g style="{projective}">' + projective_reference + '</g>',
+    'CSS transforms follow image orientation; retained child clips compose through perspective. The independent cell reference preserves source painting order (SVG2 render.html#RenderingOrder).')
 manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
