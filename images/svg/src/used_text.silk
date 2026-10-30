@@ -4,7 +4,7 @@
 //! glyph outlines and glyph cells as user-space paths.
 import structure { Graph, OccurrenceId, SourceId }
 import document_styles { StyledGraph }
-import scene { RenderError }
+import scene { RenderError, FillRule }
 import used_style
 import svg_xml.xml { Document, NodeId, NodeKind }
 import svg_css.computed { Engine, StyleId, ComputedValue }
@@ -34,10 +34,15 @@ import svg_text.layout {
   Layout,
   TextLength,
   Line,
+  Writing,
+  TextOrientation,
   aspect,
-  layout,
-  wrap
+  layout
 }
+import svg_text.lines { wrap, wrapInAreas }
+import svg_text.areas { Region }
+import svg_css.effect_values { EffectValue, ClipSource }
+import used_clip_shapes
 import svg_text.paths { spanGeometry, decorationGeometry, Decoration }
 import svg_text.on_path { OnPath, Offset }
 import used_geometry
@@ -606,6 +611,37 @@ fn shiftValue(engine: &Engine, style: StyleId, lineHeight: f64) -> Shift {
   }
 }
 
+// text-orientation, which SVG 1.1's glyph-orientation-vertical aliases (#GlyphOrientationVerticalProperty):
+// `0deg` is upright and `90deg` sideways; the alias wins when it is not `auto`.
+effect fn orientation(engine: &Engine, style: StyleId) -> TextOrientation
+  ! RenderError {
+  if !keywordIs(engine, style, Property.GlyphOrientationVertical, TextKeyword.Auto) {
+    if let Option<f64>.Some { value } = engine.textNumber(
+      style,
+      Property.GlyphOrientationVertical,
+      0.0,
+    ) {
+      return if value == 0.0 {
+        TextOrientation.Upright
+      } else {
+        TextOrientation.Sideways
+      }
+    }
+  }
+  return match &(run used_style.keyword(engine, style, Property.TextOrientation)) {
+    Keyword.Upright => TextOrientation.Upright
+    Keyword.Sideways => TextOrientation.Sideways
+    _ => TextOrientation.Mixed
+  }
+}
+
+fn keywordIs(engine: &Engine, style: StyleId, property: Property, wanted: TextKeyword) -> bool {
+  if let Option<TextKeyword>.Some { value } = textKeyword(engine, style, property) {
+    return value == wanted
+  }
+  return false
+}
+
 // line-height, or None for `normal`.
 fn lineHeight(engine: &Engine, style: StyleId, computed: f64) -> Option<f64> {
   if let Option<TextKeyword>.Some { value } = textKeyword(engine, style, Property.LineHeight) {
@@ -633,7 +669,19 @@ effect fn span(
     }
   }
   let mut size = metrics.fontSize
-  let mut dominant = inherited
+  let writing = match &(run used_style.keyword(engine, style, Property.WritingMode)) {
+    Keyword.VerticalRl => Writing.VerticalRl
+    Keyword.VerticalLr => Writing.VerticalLr
+    _ => Writing.HorizontalTb
+  }
+
+  // Vertical text aligns on the central baseline by default (#DominantBaselineProperty
+  // keeps `central` for sideways text too).
+  let mut dominant = if parent.isNone() && writing != Writing.HorizontalTb {
+    Baseline.Central
+  } else {
+    inherited
+  }
   if let Option<TextKeyword>.Some { value } = textKeyword(
     engine,
     style,
@@ -726,6 +774,8 @@ effect fn span(
     features: run features(engine, style, size),
     variations: run axes(engine, style),
     lineHeight: lineHeight(engine, style, metrics.lineHeight),
+    writing: writing,
+    orientation: run orientation(engine, style),
   }
 }
 
@@ -1175,6 +1225,131 @@ effect fn startOffset(bytes: &[u8], engine: &mut Engine, style: StyleId, limits:
 }
 
 /// The path a textPath element follows: its `path` attribute, else the shape `href` names.
+// The shapes of `shape-inside` or `shape-subtract` on the text element, in its user space
+// (SVG 2 #TextShapeInside). Basic shapes resolve against the viewport. A reference names
+// an SVG shape element, whose own transform applies; others are ignored, as is a box.
+effect fn regions(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  text: OccurrenceId,
+  style: StyleId,
+  property: Property,
+  paths: &mut List<Path>,
+  width: f64,
+  height: f64,
+  limits: &Limits,
+) -> List<Region>
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Region>.make()
+  let mut count: usize = 0
+  if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(style, property) {
+    if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+      if let EffectValue.Shapes { sources } = &value {
+        count = sources.length()
+      }
+    }
+  }
+  let viewport = Rect { xMin: 0.0, yMin: 0.0, xMax: width, yMax: height }
+  let mut index: usize = 0
+  while index < count {
+    let mut built = Option<used_clip_shapes.Geometry>.None
+    let mut url = false
+    if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
+      style,
+      property,
+    ) {
+      if let Value.Effect { value } = &styles.catalog.engine.values.get(entry.value).* {
+        if let EffectValue.Shapes { sources } = &value {
+          match &sources.asSlice()[index] {
+            ClipSource.Shape { shape, reference } => {
+              built = run used_clip_shapes.build(&styles.catalog.engine, &shape, viewport)
+            }
+            ClipSource.Url { url: ignored } => {
+              url = true
+            }
+            _ => {}
+          }
+        }
+      }
+    }
+    if let Option<used_clip_shapes.Geometry>.Some { value: geometry } = move built {
+      run out.append(
+        run Region.make(&geometry.path, Transform.identity(), geometry.rule == FillRule.EvenOdd),
+      )
+    } else if url {
+      if let Option<OccurrenceId>.Some { value: target } = styles.resourceAt(
+        text,
+        property,
+        index,
+      ) {
+        run referenced(graph, &mut styles.*, target, &mut paths, width, height, limits, &mut out)
+      }
+    }
+    index = index + 1
+  }
+  return move out
+}
+
+// The region of a referenced shape element, with its own transform.
+effect fn referenced(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  target: OccurrenceId,
+  paths: &mut List<Path>,
+  width: f64,
+  height: f64,
+  limits: &Limits,
+  out: &mut List<Region>,
+) -> ()
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let source = graph.occurrences.asSlice()[target.index].source
+  let document = graph.sourceDocument(source)
+  let style = match &styles.nodeStyle(target) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      return
+    }
+  }
+  let shape = run used_geometry.shape(
+    document,
+    source.node,
+    &mut styles.catalog.engine,
+    style,
+    width,
+    height,
+    &mut paths,
+    limits,
+  )
+  let index = match shape.path {
+    Option<usize>.Some { value } => value
+    _ => {
+      return
+    }
+  }
+  let engine = &styles.catalog.engine
+  let mut transform = Transform.identity()
+  if used_transforms.transformed(engine, style) {
+    if let Result.Finite { rect } = bounds.path(&paths.asSlice()[index]) {
+      if let Option<Rect>.Some { value: viewport } = Rect.new(0.0, 0.0, width, height) {
+        if let Option<Matrix>.Some { value: matrix } = used_transforms.element(
+          engine,
+          style,
+          viewport,
+          rect,
+          rect,
+        ) {
+          if let Projection.Affine { value } = transforms.flattened(&matrix) {
+            transform = value
+          }
+        }
+      }
+    }
+  }
+  run out.append(run Region.make(&paths.asSlice()[index], transform, false))
+}
+
 effect fn textPath(
   graph: &Graph,
   styles: &mut StyledGraph,
@@ -1352,17 +1527,72 @@ pub effect fn resolve(
   let mut wrapping = Option<f64>.None
   if gather.entries.length() > 0 && gather.paths.length() == 0 {
     let root = gather.entries.asSlice()[0].style
+
+    // Percentages refer to the viewport's size along the inline axis.
+    let basis = if gather.spans.asSlice()[0].writing == Writing.HorizontalTb {
+      width
+    } else {
+      height
+    }
     if let Option<f64>.Some { value } = styles.catalog.engine.number(
       root,
       Property.InlineSize,
-      width,
+      basis,
     ) {
       if f64.isFinite(value) && value > 0.0 {
         wrapping = Option<f64>.Some { value: value }
       }
     }
   }
-  if let Option<f64>.Some { value: inlineSize } = wrapping {
+
+  // A shape-inside other than `auto` sets the content area instead (SVG 2
+  // #TextShapeInside), for horizontal text off a path.
+  let mut shapes = List<Region>.make()
+  let mut holes = List<Region>.make()
+  if gather.entries.length() > 0 && gather.paths.length() == 0
+    && gather.spans.asSlice()[0].writing == Writing.HorizontalTb {
+    let entry = gather.entries.asSlice()[0]
+    shapes = run regions(
+      graph,
+      &mut styles.*,
+      entry.occurrence,
+      entry.style,
+      Property.ShapeInside,
+      &mut paths,
+      width,
+      height,
+      limits,
+    )
+    if shapes.length() > 0 {
+      holes = run regions(
+        graph,
+        &mut styles.*,
+        entry.occurrence,
+        entry.style,
+        Property.ShapeSubtract,
+        &mut paths,
+        width,
+        height,
+        limits,
+      )
+    }
+  }
+  if shapes.length() > 0 {
+    let root = gather.entries.asSlice()[0].style
+    let soft = match textKeyword(&styles.catalog.engine, root, Property.TextWrapMode) {
+      Option<TextKeyword>.Some { value } => value != TextKeyword.Nowrap
+      Option<TextKeyword>.None => true
+    }
+    gather.lengths.clear()
+    run wrapInAreas(
+      fonts,
+      gather.spans.asSlice(),
+      &mut gather.characters,
+      shapes.asSlice(),
+      holes.asSlice(),
+      soft,
+    )
+  } else if let Option<f64>.Some { value: inlineSize } = wrapping {
     let root = gather.entries.asSlice()[0].style
     let soft = match textKeyword(&styles.catalog.engine, root, Property.TextWrapMode) {
       Option<TextKeyword>.Some { value } => value != TextKeyword.Nowrap
