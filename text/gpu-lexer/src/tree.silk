@@ -1,0 +1,288 @@
+//! The tree model on the GPU: seven compute passes over every part of every source in a batch.
+//!
+//! Sources are cut into 32-part blocks. The first five passes embed parts and run the local
+//! window and the bidirectional affine scans block by block (carrying exact block prefixes), then
+//! merge each block bottom-up into a binary tree. `tree_global` merges block roots across each
+//! whole source, and `tree_down_classify` sends context back down and writes one label per part.
+import gpu_util { Slot, entry, ensure, makeSlot, dispatch, max, wordBytes }
+import tree_parts { TreeParts }
+import generated_models as models
+import generated_shaders as shaders
+import webgpu.resources as gpu
+import webgpu.resources { BindGroup, Buffer, ComputePipeline, Queue }
+import webgpu.runtime { Device, GpuError, MapReadRequest, mapReadStart }
+import webgpu.descriptors { BindGroupDescriptor, BindGroupEntry, BufferDescriptor, ComputePassDescriptor, ComputeState, ComputePipelineDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+const BLOCK: u32 = 32
+
+const FEATURES: usize = 0
+const LABELS: usize = 1
+const READBACK: usize = 2
+const PARAMS: usize = 3
+const STREAMS: usize = 4
+const BLOCKS: usize = 5
+const LEAF_STATES: usize = 6
+const TREE_UP: usize = 7
+const SCRATCH: usize = 8
+const NEIGHBORS: usize = 9
+const SLOTS: usize = 10
+
+const PASSES: usize = 7
+
+fn entryPoint(index: usize) -> &'static [u8] {
+  return match index {
+    0 => b"hybrid_neighbor_blocks"
+    1 => b"hybrid_neighbor_prefixes"
+    2 => b"hybrid_scan_blocks"
+    3 => b"hybrid_scan_prefixes"
+    4 => b"hybrid_mix_tree_up"
+    5 => b"tree_global"
+    _ => b"tree_down_classify"
+  }
+}
+
+/// The promoted int6 weights expanded to f32, in runtime tensor order.
+pub effect fn expandWeights(output: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let symbols = models.treeWeights()
+  run output.reserve(symbols.length * 4)
+  let mut start: usize = 0
+  let mut tensor: usize = 0
+  while tensor < models.TREE_TENSOR_ENDS.length {
+    let end = models.TREE_TENSOR_ENDS[tensor]
+    let scale = models.TREE_TENSOR_SCALES[tensor]
+    let mut index = start
+    while index < end {
+      let code = symbolValue(symbols[index])
+      let half = if (code & 1) == 1 { 0.0 - u32.toF64(code + 1) / 2.0 } else { u32.toF64(code) / 2.0 }
+      let bits = f32.toBits(f64.toF32(half * scale))
+      run output.append(u32.wrappingToU8(bits))
+      run output.append(u32.wrappingToU8(u32.shiftRight(bits, 8)))
+      run output.append(u32.wrappingToU8(u32.shiftRight(bits, 16)))
+      run output.append(u32.wrappingToU8(u32.shiftRight(bits, 24)))
+      index = index + 1
+    }
+    start = end
+    tensor = tensor + 1
+  }
+}
+
+/// `A-Z a-z 0-9 - _` to 0..63.
+fn symbolValue(symbol: u8) -> u32 {
+  let code = u8.toU32(symbol)
+  if code >= 97 { return code - 71 }
+  if code >= 65 { return code - 65 }
+  if code >= 48 { return code + 4 }
+  if code == 45 { return 62 }
+  return 63
+}
+
+/// Stream and block tables for one batch, and the sizes the passes need.
+struct Layout {
+  /// Per stream: first part, part count, first block, block count, tree offset, tree width.
+  streams: List<u32>,
+  /// Per block: first part, part count, stream, block index within the stream.
+  blocks: List<u32>,
+  blockCount: u32,
+  treeNodes: u32,
+}
+
+fn nextPowerOfTwo(value: u32) -> u32 {
+  if value <= 1 { return 1 }
+  return u32.shiftLeft(1, 32 - u32.leadingZeros(value - 1))
+}
+
+effect fn layout(streams: &[u32], result: &mut Layout) -> () ! OutOfMemoryError ? &mut Allocator {
+  result.streams.clear()
+  result.blocks.clear()
+  let mut blockCount: u32 = 0
+  let mut treeNodes: u32 = 0
+  let mut stream: usize = 0
+  while stream < streams.length / 2 {
+    let start = streams[stream * 2]
+    let parts = streams[stream * 2 + 1]
+    let count = (parts + BLOCK - 1) / BLOCK
+    let power = nextPowerOfTwo(count)
+    run result.streams.appendSlice(&[start, parts, blockCount, count, treeNodes, power])
+    let mut offset: u32 = 0
+    while offset < parts {
+      let length = if parts - offset < BLOCK { parts - offset } else { BLOCK }
+      run result.blocks.appendSlice(&[start + offset, length, usize.wrappingToU32(stream), offset / BLOCK])
+      offset = offset + BLOCK
+    }
+    blockCount = blockCount + count
+    treeNodes = treeNodes + power * 2 - 1
+    stream = stream + 1
+  }
+  result.blockCount = blockCount
+  result.treeNodes = treeNodes
+}
+
+/// The tree model's pipelines, weights and grow-only buffers, kept between calls.
+pub struct TreeModel {
+  pipelines: List<ComputePipeline>,
+  weights: Buffer,
+  slots: List<Slot>,
+  groups: List<BindGroup>,
+  layout: Layout,
+  f16: bool,
+}
+
+impl TreeModel {
+  /// Compiles the model for `device`; `f16` keeps part and tree states in half precision and
+  /// needs a device created with shader-f16.
+  pub effect fn make(device: &Device, queue: &Queue, f16: bool) -> TreeModel
+    ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let code = if f16 { shaders.treeF16() } else { shaders.tree() }
+    let module = run gpu.createShaderModule(device, b"gpu-lexer tree", code)
+    let mut pipelines = List<ComputePipeline>.make()
+    let mut index: usize = 0
+    while index < PASSES {
+      let stage = ComputeState.default().withModule(&module).withEntryPoint(entryPoint(index))
+      let pipeline = run gpu.createComputePipeline(device, &ComputePipelineDescriptor.default().withCompute(stage))
+      run pipelines.append(move pipeline)
+      index = index + 1
+    }
+    let mut expanded = List<u8>.make()
+    run expandWeights(&mut expanded)
+    let weights = run gpu.createBuffer(device, &BufferDescriptor.make(b"gpu-lexer tree weights", usize.toU64(expanded.length()), flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopyDst, false))
+    queue.writeBuffer(&weights, 0, expanded.asSlice())
+    let mut slots = List<Slot>.make()
+    let usages = [
+      flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopyDst,
+      flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopySrc | flags.WGPUBufferUsage_CopyDst,
+      flags.WGPUBufferUsage_MapRead | flags.WGPUBufferUsage_CopyDst,
+      flags.WGPUBufferUsage_Uniform | flags.WGPUBufferUsage_CopyDst,
+      flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopyDst,
+      flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopyDst,
+      flags.WGPUBufferUsage_Storage,
+      flags.WGPUBufferUsage_Storage,
+      flags.WGPUBufferUsage_Storage,
+      flags.WGPUBufferUsage_Storage,
+    ]
+    index = 0
+    while index < SLOTS {
+      run slots.append(run makeSlot(device, usages[index]))
+      index = index + 1
+    }
+    return TreeModel {
+      pipelines: move pipelines,
+      weights: move weights,
+      slots: move slots,
+      groups: List<BindGroup>.make(),
+      layout: Layout { streams: List<u32>.make(), blocks: List<u32>.make(), blockCount: 0, treeNodes: 0 },
+      f16: f16,
+    }
+  }
+
+  /// Encodes and submits one batch and starts reading its labels back: one byte per part, in
+  /// part order. Every stream in `parts` must have at least one part.
+  pub effect fn submit(self: &mut Self, device: &Device, queue: &Queue, parts: &TreeParts) -> TreeReadback
+    ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let count = parts.count()
+    let labelBytes = usize.toU64((count + 3) / 4 * 4)
+    run layout(parts.streams(), &mut self.layout)
+    let blockCount = u32.toU64(self.layout.blockCount)
+    let treeNodes = u32.toU64(self.layout.treeNodes)
+    let valueBytes: u64 = if self.f16 { 2 } else { 4 }
+    let hidden = usize.toU64(models.TREE_HIDDEN)
+    let scratch = max(blockCount * hidden * 16, treeNodes * hidden * 4)
+    let sizes = [
+      usize.toU64(parts.features().length * 4), labelBytes, labelBytes, 16,
+      usize.toU64(self.layout.streams.length() * 4), usize.toU64(self.layout.blocks.length() * 4),
+      usize.toU64(count) * hidden * valueBytes, treeNodes * hidden * valueBytes, scratch, blockCount * 8,
+    ]
+    let mut changed = self.groups.length() == 0
+    let mut slot: usize = 0
+    while slot < SLOTS {
+      if run ensure(device, self.slots.asMutSlice(), slot, sizes[slot]) { changed = true }
+      slot = slot + 1
+    }
+    if changed { run self.bind(device) }
+
+    let streamCount = usize.wrappingToU32(parts.streams().length / 2)
+    let params = [streamCount, usize.wrappingToU32(count), self.layout.blockCount, self.layout.treeNodes]
+    let slots = self.slots.asSlice()
+    queue.writeBuffer(&slots[FEATURES].buffer, 0, wordBytes(parts.features()))
+    queue.writeBuffer(&slots[STREAMS].buffer, 0, wordBytes(self.layout.streams.asSlice()))
+    queue.writeBuffer(&slots[BLOCKS].buffer, 0, wordBytes(self.layout.blocks.asSlice()))
+    queue.writeBuffer(&slots[PARAMS].buffer, 0, wordBytes(&params))
+    let mut encoder = run gpu.createCommandEncoder(device, b"gpu-lexer tree")
+    encoder.clearBuffer(&slots[LABELS].buffer, 0, labelBytes)
+    let mut pass = run encoder.beginComputePass(&ComputePassDescriptor.default())
+    let counts = [
+      (self.layout.blockCount + 63) / 64, streamCount, self.layout.blockCount, streamCount * 4,
+      self.layout.blockCount, streamCount, self.layout.blockCount,
+    ]
+    let pipelines = self.pipelines.asSlice()
+    let groups = self.groups.asSlice()
+    let mut index: usize = 0
+    while index < pipelines.length {
+      pass.setPipeline(&pipelines[index])
+      pass.setBindGroup(0, &groups[index], &[])
+      dispatch(&mut pass, counts[index])
+      index = index + 1
+    }
+    pass.end()
+    encoder.copyBufferToBuffer(&slots[LABELS].buffer, 0, &slots[READBACK].buffer, 0, labelBytes)
+    let commands = run encoder.finish(b"gpu-lexer tree")
+    queue.submit(&[commands.reference()])
+    let request = run mapReadStart(device, &slots[READBACK].buffer, 0, u64.toUsize(labelBytes))
+    return TreeReadback { request: move request }
+  }
+
+  /// One bind group per pass, with exactly the bindings its entry point uses.
+  effect fn bind(self: &mut Self, device: &Device) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    self.groups.clear()
+    let s = self.slots.asSlice()
+    let pipelines = self.pipelines.asSlice()
+    let w = &self.weights
+    let weights = entry(4, w, w.getSize())
+    let features = s[FEATURES].entry(0)
+    let labels = s[LABELS].entry(1)
+    let params = s[PARAMS].entry(2)
+    let streams = s[STREAMS].entry(3)
+    let leaves = s[LEAF_STATES].entry(5)
+    let up = s[TREE_UP].entry(6)
+    let blocks = s[BLOCKS].entry(9)
+    let scratch = s[SCRATCH].entry(11)
+    let neighbors = s[NEIGHBORS].entry(12)
+    run self.groups.append(run group(device, &pipelines[0], &[features, params, blocks, neighbors]))
+    run self.groups.append(run group(device, &pipelines[1], &[params, streams, neighbors]))
+    run self.groups.append(run group(device, &pipelines[2], &[features, params, streams, weights, blocks, scratch, neighbors]))
+    run self.groups.append(run group(device, &pipelines[3], &[params, streams, scratch]))
+    run self.groups.append(run group(device, &pipelines[4], &[features, params, streams, weights, leaves, up, blocks, scratch, neighbors]))
+    run self.groups.append(run group(device, &pipelines[5], &[params, streams, weights, up, scratch]))
+    run self.groups.append(run group(device, &pipelines[6], &[features, labels, params, weights, streams, leaves, blocks, scratch]))
+  }
+}
+
+effect fn group(device: &Device, pipeline: &ComputePipeline, entries: &[BindGroupEntry]) -> BindGroup ! GpuError {
+  let layout = run pipeline.getBindGroupLayout(0)
+  return run gpu.createBindGroup(device, &BindGroupDescriptor.default().withLayout(&layout).withEntries(entries))
+}
+
+/// Labels on their way back from the GPU.
+pub struct TreeReadback {
+  request: MapReadRequest,
+}
+
+impl TreeReadback {
+  /// True once `finish` will not wait.
+  pub fn poll(self: &mut Self) -> bool { return self.request.poll() }
+
+  /// One label byte per part, padded to a multiple of four.
+  pub effect fn finish(self: Self) -> List<u8> ! GpuError | OutOfMemoryError {
+    let mut request = move self.request
+    static if Intrinsic.targetArchitecture() != "wasm32" { run request.wait() }
+    return run request.finish()
+  }
+}

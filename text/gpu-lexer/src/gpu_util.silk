@@ -1,0 +1,92 @@
+//! Grow-only buffers and dispatch helpers shared by both models.
+import webgpu.resources as gpu
+import webgpu.resources { Buffer, ComputePassEncoder }
+import webgpu.runtime { Device, GpuError }
+import webgpu.descriptors { BindGroupEntry, BufferDescriptor }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u64
+
+/// A buffer and the size its bindings use, which can be smaller than the buffer.
+pub struct Slot {
+  pub buffer: Buffer,
+  pub binding: u64,
+  usage: u64,
+}
+
+impl Slot {
+  pub fn entry<'a>(self: &'a Self, binding: u32) -> BindGroupEntry<'a> {
+    return entry(binding, &self.buffer, self.binding)
+  }
+}
+
+pub fn entry<'a>(binding: u32, buffer: &'a Buffer, size: u64) -> BindGroupEntry<'a> {
+  let mut result = BindGroupEntry.default().withBuffer(buffer)
+  result.setBinding(binding)
+  result.setSize(size)
+  return result
+}
+
+pub effect fn makeSlot(device: &Device, usage: u64) -> Slot ! GpuError {
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(b"gpu-lexer", 256, usage, false))
+  return Slot { buffer: move buffer, binding: 256, usage: usage }
+}
+
+/// Round up to a sixteenth of the next power of two (at least 256 bytes): at most ~6% slack on
+/// large inputs, while steadily growing inputs reallocate only after meaningful growth.
+/// Never above `maximum`.
+pub fn growCapacity(minimum: u64, maximum: u64) -> u64 {
+  let mut power: u64 = 1
+  while power < minimum { power = power * 2 }
+  let step = max(256, power / 16)
+  let capacity = max(256, (minimum + step - 1) / step * step)
+  return if capacity > maximum { maximum } else { capacity }
+}
+
+/// The `GpuError` code when a source needs a buffer above the device's buffer or storage-binding
+/// limit (the original throws a RangeError). Split the source or use a device with higher limits.
+pub const TOO_LARGE: u32 = 0xfffffffd
+
+/// Makes `slots[index]` hold at least `size` bytes (a multiple of four) and bind exactly that
+/// many. Returns true when a bind group that uses it has to be rebuilt.
+pub effect fn ensure(device: &Device, slots: &mut [Slot], index: usize, size: u64) -> bool ! GpuError {
+  let minimum = max(4, (size + 3) / 4 * 4)
+  if slots[index].buffer.getSize() >= minimum {
+    // Bindings only grow while the buffer is reused, so smaller batches keep their groups.
+    if minimum <= slots[index].binding { return false }
+    slots[index].binding = minimum
+    return true
+  }
+  let limits = run device.getLimits()
+  let maximum = if limits.maxBufferSize() < limits.maxStorageBufferBindingSize() { limits.maxBufferSize() } else { limits.maxStorageBufferBindingSize() }
+  if minimum > maximum { fail GpuError.status(TOO_LARGE) }
+  let usage = slots[index].usage
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(b"gpu-lexer", growCapacity(minimum, maximum), usage, false))
+  slots[index].buffer.destroy()
+  slots[index].buffer = move buffer
+  slots[index].binding = minimum
+  return true
+}
+
+/// Dispatches `workgroups` groups, folding counts above 65535 into a second dimension.
+pub fn dispatch(pass: &mut ComputePassEncoder, workgroups: u32) -> () {
+  let x = if workgroups < 65535 { workgroups } else { 65535 }
+  if x == 0 { return }
+  pass.dispatchWorkgroups(x, (workgroups + x - 1) / x, 1)
+}
+
+pub fn max(left: u64, right: u64) -> u64 {
+  return if left > right { left } else { right }
+}
+
+// LIMITATION-1: no safe byte view of a [u32] (see LIMITATIONS.md).
+/// The bytes of `values` in memory order (little-endian on every supported target), for uploads.
+pub fn wordBytes(values: &[u32]) -> &[u8] {
+  if values.length == 0 { return b"" }
+  let raw = unsafe Intrinsic.pointerReinterpret<?[*]const u32, ?[*]const u8>(Pointer.fromSlice<u32>(values))
+  return match Pointer.nonNullMany<u8>(raw) {
+    Option<[*]const u8>.Some { value } => unsafe Pointer.borrowMany(&values[0], value, values.length * 4)
+    Option<[*]const u8>.None => b""
+  }
+}

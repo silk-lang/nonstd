@@ -1,0 +1,281 @@
+//! The public API: open a lexer on a WebGPU device and parse sources into spans.
+//!
+//! `Lexer` runs the default tree model and `LiteLexer` the smaller lite model. Each keeps its
+//! device, pipelines, weights and grow-only buffers between calls, like gpu-lexer's runtime.
+//! `parse` and `parseMany` wait for the GPU. In a browser, where nothing may block, use
+//! `submit`, poll the returned request from the event loop, then `finish`.
+import tree { TreeModel, TreeReadback }
+import tree_parts { TreeParts }
+import lite { LiteModel, LiteReadback }
+import lite_parts { LiteParts }
+import spans { Span, SyntaxClass, extend }
+import webgpu.resources as gpu
+import webgpu.resources { Queue }
+import webgpu.runtime { Adapter, Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.descriptors { DeviceDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u32
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+
+/// How a lexer uses its device.
+pub struct Options {
+  /// Keep the tree model's part and tree states in f16 where the device supports shader-f16, as
+  /// gpu-lexer does in browsers. Labels can differ from the f32 path in rare near-ties.
+  pub f16: bool,
+}
+
+impl Copy for Options {}
+
+impl Options {
+  /// f16 where available, like the original.
+  pub fn default() -> Options { return Options { f16: true } }
+  /// Always f32, for results that do not depend on the device's features.
+  pub fn exact() -> Options { return Options { f16: false } }
+}
+
+const F16: [u32; 1] = [flags.WGPUFeatureName_ShaderF16]
+const NO_FEATURES: [u32; 0] = []
+
+/// Requests a device with the adapter's own limits (large sources need big storage bindings,
+/// the lite model needs 32 KiB of workgroup storage) and shader-f16 when `f16` and available.
+/// Blocking: native only.
+pub effect fn openDevice(f16: bool) -> Device ! GpuError | OutOfMemoryError {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let limits = run adapter.getLimits()
+  let descriptor = DeviceDescriptor.default().withLabel(b"gpu-lexer").withRequiredLimits(&limits)
+  if f16 && adapter.hasFeature(flags.WGPUFeatureName_ShaderF16) {
+    return run adapter.requestDevice(&descriptor.withRequiredFeatures(&F16))
+  }
+  return run adapter.requestDevice(&descriptor)
+}
+
+/// The default tree model: the most accurate gpu-lexer model.
+pub struct Lexer {
+  device: Device,
+  queue: Queue,
+  model: TreeModel,
+  parts: TreeParts,
+  /// Index of each source's stream in `parts`, or none for an empty source.
+  streams: List<u32>,
+}
+
+/// A submitted batch of sources; keep it until `Lexer.finish`.
+pub struct Request {
+  readback: TreeReadback,
+}
+
+impl Request {
+  /// True once `finish` will not wait for the GPU.
+  pub fn poll(self: &mut Self) -> bool { return self.readback.poll() }
+}
+
+const EMPTY: u32 = 0xffffffff
+
+impl Lexer {
+  /// Opens a native device and a lexer on it.
+  pub effect fn open(options: Options) -> Lexer ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let device = run openDevice(options.f16)
+    return run Lexer.make(&device, options)
+  }
+
+  /// A lexer on an existing device; f16 is used only when the device was created with it.
+  pub effect fn make(device: &Device, options: Options) -> Lexer ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let queue = run gpu.getQueue(device)
+    let f16 = options.f16 && device.hasFeature(flags.WGPUFeatureName_ShaderF16)
+    let model = run TreeModel.make(device, &queue, f16)
+    return Lexer { device: device.dup(), queue: move queue, model: move model, parts: TreeParts.make(), streams: List<u32>.make() }
+  }
+
+  /// Spans of `source` (UTF-8), covering it in order. Waits for the GPU.
+  pub effect fn parse(self: &mut Self, source: &[u8]) -> List<Span> ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let mut result = List<List<Span>>.make()
+    let sources = [source]
+    run self.parseMany(&sources, &mut result)
+    return result.remove(0)
+  }
+
+  /// Spans of every source, in one GPU submission. Appends one list per source to `output`.
+  pub effect fn parseMany(self: &mut Self, sources: &[&[u8]], output: &mut List<List<Span>>) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let request = run self.submit(sources)
+    run self.finish(move request, sources, &mut output)
+  }
+
+  /// Prepares `sources` on the CPU and submits them; nothing waits. Submit the next batch only
+  /// after finishing this one.
+  pub effect fn submit(self: &mut Self, sources: &[&[u8]]) -> Option<Request> ! GpuError | OutOfMemoryError ? &mut Allocator {
+    self.parts.clear()
+    self.streams.clear()
+    let mut index: usize = 0
+    let mut stream: u32 = 0
+    while index < sources.length {
+      if sources[index].length == 0 {
+        run self.streams.append(EMPTY)
+      } else {
+        run self.parts.append(sources[index])
+        run self.streams.append(stream)
+        stream = stream + 1
+      }
+      index = index + 1
+    }
+    if stream == 0 { return Option<Request>.none() }
+    let readback = run self.model.submit(&self.device, &self.queue, &self.parts)
+    return Option<Request>.some(Request { readback: move readback })
+  }
+
+  /// Waits for `request` if needed and appends the spans of each of the `sources` it was
+  /// submitted with to `output`.
+  pub effect fn finish(self: &mut Self, request: Option<Request>, sources: &[&[u8]], output: &mut List<List<Span>>) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let labels = match move request {
+      Option<Request>.Some { value } => run value.readback.finish()
+      Option<Request>.None => List<u8>.make()
+    }
+    let label = labels.asSlice()
+    let ranges = self.parts.ranges()
+    let streams = self.parts.streams()
+    let mut index: usize = 0
+    while index < sources.length {
+      let mut result = List<Span>.make()
+      let stream = self.streams.get(index)
+      if stream != EMPTY {
+        let first = u32.toUsize(streams[u32.toUsize(stream) * 2])
+        let count = u32.toUsize(streams[u32.toUsize(stream) * 2 + 1])
+        run result.reserve(count / 2 + 1)
+        let mut part = first
+        while part < first + count {
+          let kind = SyntaxClass.fromLabel(u8.toU32(label[part]))
+          run extend(&mut result, kind, u32.toUsize(ranges[part * 2]), u32.toUsize(ranges[part * 2 + 1]))
+          part = part + 1
+        }
+      }
+      run output.append(move result)
+      index = index + 1
+    }
+  }
+}
+
+/// The lite model: smaller and faster to compile, less accurate. It was trained without Silk.
+pub struct LiteLexer {
+  device: Device,
+  queue: Queue,
+  model: LiteModel,
+  parts: LiteParts,
+  jobs: List<u32>,
+}
+
+/// A submitted batch of at most `LITE_BATCH` sources; keep it until `LiteLexer.finish`.
+pub struct LiteRequest {
+  readback: LiteReadback,
+}
+
+impl LiteRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.readback.poll() }
+}
+
+/// Sources per lite GPU submission; `LiteLexer.parseMany` splits larger batches.
+pub const LITE_BATCH: usize = 64
+
+impl LiteLexer {
+  pub effect fn open() -> LiteLexer ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let device = run openDevice(false)
+    return run LiteLexer.make(&device)
+  }
+
+  /// A lexer on an existing device; it needs 32 KiB of workgroup storage.
+  pub effect fn make(device: &Device) -> LiteLexer ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let queue = run gpu.getQueue(device)
+    let model = run LiteModel.make(device, &queue)
+    return LiteLexer { device: device.dup(), queue: move queue, model: move model, parts: LiteParts.make(), jobs: List<u32>.make() }
+  }
+
+  pub effect fn parse(self: &mut Self, source: &[u8]) -> List<Span> ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let mut result = List<List<Span>>.make()
+    let sources = [source]
+    run self.parseMany(&sources, &mut result)
+    return result.remove(0)
+  }
+
+  pub effect fn parseMany(self: &mut Self, sources: &[&[u8]], output: &mut List<List<Span>>) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let mut start: usize = 0
+    while start < sources.length {
+      let end = if sources.length - start > LITE_BATCH { start + LITE_BATCH } else { sources.length }
+      let batch = Slice.view(sources, start, end - start)
+      let request = run self.submit(batch)
+      run self.finish(move request, batch, &mut output)
+      start = end
+    }
+  }
+
+  /// Prepares and submits at most `LITE_BATCH` sources; nothing waits.
+  pub effect fn submit(self: &mut Self, sources: &[&[u8]]) -> Option<LiteRequest> ! GpuError | OutOfMemoryError ? &mut Allocator {
+    if sources.length > LITE_BATCH { fail GpuError.status(0xffffffff) }
+    self.parts.clear()
+    self.jobs.clear()
+    let mut index: usize = 0
+    let mut job: u32 = 0
+    while index < sources.length {
+      if sources[index].length == 0 {
+        run self.jobs.append(EMPTY)
+      } else {
+        run self.parts.append(sources[index])
+        run self.jobs.append(job)
+        job = job + 1
+      }
+      index = index + 1
+    }
+    if job == 0 { return Option<LiteRequest>.none() }
+    let readback = run self.model.submit(&self.device, &self.queue, &self.parts)
+    return Option<LiteRequest>.some(LiteRequest { readback: move readback })
+  }
+
+  /// Waits for `request` if needed and appends the spans of each source to `output`.
+  /// Whitespace takes the class of the span before it (the first span starts at 0).
+  pub effect fn finish(self: &mut Self, request: Option<LiteRequest>, sources: &[&[u8]], output: &mut List<List<Span>>) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let classes = match move request {
+      Option<LiteRequest>.Some { value } => run value.readback.finish()
+      Option<LiteRequest>.None => List<u8>.make()
+    }
+    let bytes = classes.asSlice()
+    let ranges = self.parts.ranges()
+    let kinds = self.parts.kinds()
+    let jobs = self.parts.jobs()
+    let mut index: usize = 0
+    while index < sources.length {
+      let mut result = List<Span>.make()
+      let job = self.jobs.get(index)
+      if job != EMPTY {
+        let first = u32.toUsize(jobs[u32.toUsize(job) * 2])
+        let count = u32.toUsize(jobs[u32.toUsize(job) * 2 + 1])
+        let mut part = first
+        while part < first + count {
+          if kinds[part] != 1 && kinds[part] != 2 {
+            let at = part * 4
+            let label = u8.toU32(bytes[at]) | u32.shiftLeft(u8.toU32(bytes[at + 1]), 8) | u32.shiftLeft(u8.toU32(bytes[at + 2]), 16) | u32.shiftLeft(u8.toU32(bytes[at + 3]), 24)
+            let kind = SyntaxClass.fromLabel(label)
+            let length = result.length()
+            if length == 0 {
+              run result.append(Span { kind: kind, start: 0, end: 0 })
+            } else if result.get(length - 1).kind != kind {
+              let start = u32.toUsize(ranges[part * 2])
+              let last = result.get(length - 1)
+              result.set(length - 1, Span { kind: last.kind, start: last.start, end: start })
+              run result.append(Span { kind: kind, start: start, end: 0 })
+            }
+          }
+          part = part + 1
+        }
+        if result.length() == 0 { run result.append(Span { kind: SyntaxClass.Plain, start: 0, end: 0 }) }
+        let length = result.length()
+        let last = result.get(length - 1)
+        result.set(length - 1, Span { kind: last.kind, start: last.start, end: u32.toUsize(ranges[(first + count) * 2 - 1]) })
+      }
+      run output.append(move result)
+      index = index + 1
+    }
+  }
+}

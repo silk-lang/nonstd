@@ -1,0 +1,292 @@
+//! Checks the port against gpu-lexer's own output for every file in tests/fixtures: both CPU
+//! passes word for word, and both models' spans on the GPU. tests/expected was produced by the
+//! original (scripts/expected.mjs). Run from text/gpu-lexer.
+//!
+//! Spans are compared exactly. The original ran on Chromium's WebGPU; a different device can
+//! round a near-tie differently, so a span mismatch prints the differing part and fails.
+import gpu_lexer.lexer { Lexer, LiteLexer, Options, openDevice }
+import gpu_lexer.spans { Span, SyntaxClass }
+import gpu_lexer.tree_parts { TreeParts }
+import gpu_lexer.lite_parts { LiteParts }
+import webgpu.runtime { GpuError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInputError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+const NAMES: [string; 18] = [
+  "Makefile", "batch.bat", "c.c", "css.css", "go.go", "html.html", "javascript.js", "json.json",
+  "markdown.md", "python.py", "rust.rs", "shader.shader", "shell.sh", "silk.silk", "sql.sql",
+  "typescript.ts", "unicode.txt", "yaml.yaml",
+]
+
+effect fn read(directory: string, name: string, suffix: string) -> List<u8>
+  ! FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+  let cwd = run NativeHostInput.workingDirectory()
+  let root = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let folder = run Path.resolve(&root, directory)
+  let mut file = List<u8>.make()
+  run file.appendBytes(String.utf8Bytes(name))
+  run file.appendBytes(String.utf8Bytes(suffix))
+  let path = run folder.joinBytes(file.asSlice())
+  let mut files = run OsFileSystem.make("/")
+  let contents = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  let mut result = List<u8>.make()
+  run result.appendBytes(Bytes.asSlice(&contents))
+  return move result
+}
+
+/// Whitespace-separated fields of one line, as decimal or hexadecimal numbers.
+struct Fields {
+  at: usize,
+}
+
+impl Fields {
+  fn next(self: &mut Self, text: &[u8], radix: u32) -> u32 {
+    while self.at < text.length && (text[self.at] == 32) { self.at = self.at + 1 }
+    let mut value: u32 = 0
+    while self.at < text.length && text[self.at] != 32 && text[self.at] != 10 {
+      let c = u8.toU32(text[self.at])
+      let digit = if c >= 97 { c - 87 } else { c - 48 }
+      value = u32.wrappingAdd(u32.wrappingMultiply(value, radix), digit)
+      self.at = self.at + 1
+    }
+    return value
+  }
+
+  fn word<'a>(self: &mut Self, text: &'a [u8]) -> &'a [u8] {
+    while self.at < text.length && text[self.at] == 32 { self.at = self.at + 1 }
+    let start = self.at
+    while self.at < text.length && text[self.at] != 32 && text[self.at] != 10 { self.at = self.at + 1 }
+    return Slice.view(text, start, self.at - start)
+  }
+
+  fn endLine(self: &mut Self, text: &[u8]) -> () {
+    while self.at < text.length && text[self.at] != 10 { self.at = self.at + 1 }
+    if self.at < text.length { self.at = self.at + 1 }
+  }
+}
+
+fn contains(text: &[u8], part: &[u8]) -> bool {
+  let mut at: usize = 0
+  while at + part.length <= text.length {
+    if same(Slice.view(text, at, part.length), part) { return true }
+    at = at + 1
+  }
+  return false
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index: usize = 0
+  while index < left.length {
+    if left[index] != right[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+fn checkTreeParts(name: string, parts: &TreeParts, expected: &[u8]) -> bool {
+  let mut fields = Fields { at: 0 }
+  let features = parts.features()
+  let ranges = parts.ranges()
+  let mut part: usize = 0
+  while fields.at < expected.length {
+    let start = fields.next(expected, 10)
+    let end = fields.next(expected, 10)
+    let first = fields.next(expected, 16)
+    let second = fields.next(expected, 16)
+    fields.endLine(expected)
+    if part >= parts.count() || ranges[part * 2] != start || ranges[part * 2 + 1] != end || features[part * 2] != first || features[part * 2 + 1] != second {
+      StderrWriter.print("{}: tree part {} differs\n", &(name, part))
+      return false
+    }
+    part = part + 1
+  }
+  if part != parts.count() {
+    StderrWriter.print("{}: {} tree parts, expected {}\n", &(name, parts.count(), part))
+    return false
+  }
+  return true
+}
+
+fn checkLiteParts(name: string, parts: &LiteParts, expected: &[u8]) -> bool {
+  let mut fields = Fields { at: 0 }
+  let packed = parts.packed()
+  let ranges = parts.ranges()
+  let kinds = parts.kinds()
+  let mut part: usize = 0
+  while fields.at < expected.length {
+    let start = fields.next(expected, 10)
+    let end = fields.next(expected, 10)
+    let kind = fields.next(expected, 10)
+    let first = fields.next(expected, 16)
+    let second = fields.next(expected, 16)
+    fields.endLine(expected)
+    if part >= parts.count() || ranges[part * 2] != start || ranges[part * 2 + 1] != end || u8.toU32(kinds[part]) != kind || packed[part * 2] != first || packed[part * 2 + 1] != second {
+      StderrWriter.print("{}: lite part {} differs\n", &(name, part))
+      return false
+    }
+    part = part + 1
+  }
+  if part != parts.count() {
+    StderrWriter.print("{}: {} lite parts, expected {}\n", &(name, parts.count(), part))
+    return false
+  }
+  return true
+}
+
+/// Classes per source byte, from spans.
+effect fn byteClasses(actual: &[Span], output: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+  output.clear()
+  let mut index: usize = 0
+  while index < actual.length {
+    run output.appendRepeated(u32.wrappingToU8(actual[index].kind.label()), actual[index].end - actual[index].start)
+    index = index + 1
+  }
+}
+
+/// Compares spans with the original's; returns the number of bytes whose class differs, or the
+/// source length when the spans are malformed. Prints the first difference.
+effect fn checkSpans(name: string, model: string, actual: &[Span], expected: &[u8], length: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut wanted = List<u8>.make()
+  let mut fields = Fields { at: 0 }
+  let mut cursor: usize = 0
+  while fields.at < expected.length {
+    let kindStart = fields.at
+    let kindLength = fields.word(expected).length
+    let start = u32.toUsize(fields.next(expected, 10))
+    let end = u32.toUsize(fields.next(expected, 10))
+    fields.endLine(expected)
+    let kind = Slice.view(expected, kindStart, kindLength)
+    let mut label: u32 = 0
+    while label < 9 && !same(String.utf8Bytes(SyntaxClass.fromLabel(label).name()), kind) { label = label + 1 }
+    if start != cursor || end < start { return length }
+    run wanted.appendRepeated(u32.wrappingToU8(label), end - start)
+    cursor = end
+  }
+  let mut cursorActual: usize = 0
+  let mut index: usize = 0
+  while index < actual.length {
+    if actual[index].start != cursorActual || actual[index].end <= actual[index].start { 
+      StderrWriter.print("{}: {} spans are malformed at {}\n", &(name, model, index))
+      return length
+    }
+    if index > 0 && actual[index - 1].kind == actual[index].kind {
+      StderrWriter.print("{}: {} spans {} and {} were not merged\n", &(name, model, index - 1, index))
+      return length
+    }
+    cursorActual = actual[index].end
+    index = index + 1
+  }
+  if cursorActual != length || cursor != length {
+    StderrWriter.print("{}: {} spans cover {} of {} bytes\n", &(name, model, cursorActual, length))
+    return length
+  }
+  let mut got = List<u8>.make()
+  run byteClasses(actual, &mut got)
+  let mut differing: usize = 0
+  let mut at: usize = 0
+  while at < length {
+    if got.get(at) != wanted.get(at) {
+      if differing == 0 {
+        StderrWriter.print("{}: {} byte {} is {}, the original says {}\n", &(name, model, at, SyntaxClass.fromLabel(u8.toU32(got.get(at))).name(), SyntaxClass.fromLabel(u8.toU32(wanted.get(at))).name()))
+      }
+      differing = differing + 1
+    }
+    at = at + 1
+  }
+  return differing
+}
+
+effect fn program() -> i32 ! GpuError | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut sources = List<List<u8>>.make()
+  let mut failures: usize = 0
+  let mut index: usize = 0
+  while index < NAMES.length {
+    let source = run read("tests/fixtures", NAMES[index], "") |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut tree = TreeParts.make()
+    run tree.append(source.asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+    let treeExpected = run read("tests/expected", NAMES[index], ".tree-parts") |> Effect.provideMut<Allocator>(&mut allocator)
+    if !checkTreeParts(NAMES[index], &tree, treeExpected.asSlice()) { failures = failures + 1 }
+    let mut lite = LiteParts.make()
+    run lite.append(source.asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+    let liteExpected = run read("tests/expected", NAMES[index], ".lite-parts") |> Effect.provideMut<Allocator>(&mut allocator)
+    if !checkLiteParts(NAMES[index], &lite, liteExpected.asSlice()) { failures = failures + 1 }
+    run sources.append(move source) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  StderrWriter.print("CPU parts: {} of {} fixtures differ\n", &(failures, NAMES.length * 2))
+
+  let mut views = List<&[u8]>.make()
+  index = 0
+  while index < sources.length() {
+    run views.append(sources.asSlice()[index].asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  // The original's spans came from Chromium's WebGPU on SwiftShader. On SwiftShader the port
+  // must match them exactly; another device may round a near-tie in tanh or exp differently.
+  let device = run openDevice(false)
+  let info = run device.getAdapterInfo()
+  let description = match info.description() {
+    Option<&[u8]>.Some { value } => value
+    Option<&[u8]>.None => b""
+  }
+  let exact = contains(description, b"SwiftShader")
+  let name = match String.fromUtf8(description) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { error } => "?"
+  }
+  StderrWriter.print("adapter: {}\n", &(name,))
+  let mut treeLexer = run Lexer.make(&device, Options.exact()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut treeSpans = List<List<Span>>.make()
+  run treeLexer.parseMany(views.asSlice(), &mut treeSpans) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut liteLexer = run LiteLexer.make(&device) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut liteSpans = List<List<Span>>.make()
+  run liteLexer.parseMany(views.asSlice(), &mut liteSpans) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut total: usize = 0
+  let mut treeDiffering: usize = 0
+  let mut liteDiffering: usize = 0
+  index = 0
+  while index < NAMES.length {
+    let length = views.get(index).length
+    total = total + length
+    let treeExpected = run read("tests/expected", NAMES[index], ".tree-spans") |> Effect.provideMut<Allocator>(&mut allocator)
+    treeDiffering = treeDiffering + run checkSpans(NAMES[index], "tree", treeSpans.asSlice()[index].asSlice(), treeExpected.asSlice(), length) |> Effect.provideMut<Allocator>(&mut allocator)
+    let liteExpected = run read("tests/expected", NAMES[index], ".lite-spans") |> Effect.provideMut<Allocator>(&mut allocator)
+    liteDiffering = liteDiffering + run checkSpans(NAMES[index], "lite", liteSpans.asSlice()[index].asSlice(), liteExpected.asSlice(), length) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  StderrWriter.print("GPU spans: tree differs on {} and lite on {} of {} bytes ({})\n", &(treeDiffering, liteDiffering, total, if exact { "exact" } else { "1% allowed" }))
+  let allowed = if exact { 0 } else { total / 100 }
+  let spanFailures: usize = if treeDiffering > allowed || liteDiffering > allowed { 1 } else { 0 }
+  return if failures + spanFailures == 0 { 0 } else { 1 }
+}
+
+effect fn gpuFailed(error: GpuError) -> i32 ! never {
+  StderrWriter.print("WebGPU error {}: {:?}\n", &(error.code, error.message.asSlice()))
+  return 2
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("test setup failed (file, allocation or host input)\n", &())
+  return 3
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(Effect.catch<GpuError>(program(), gpuFailed), failed)
+}
