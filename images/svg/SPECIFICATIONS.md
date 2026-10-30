@@ -638,9 +638,19 @@ decisions:
   `feSpecularLighting`'s `(Sr, Sg, Sb, max)` is taken as a premultiplied color, as its alpha
   rule intends.
   `kernelUnitLength` (deprecated) is not implemented: normals use one-pixel deltas.
+- `feImage`. A reference without a fragment loads an image resource (PNG, JPEG or an SVG
+  document) and renders it like `image` in the primitive subregion with the feImage's
+  `preserveAspectRatio` and `image-rendering`; whatever falls outside the subregion is cut.
+  A fragment reference renders the element like `use`, in the user space set by
+  `primitiveUnits` (bounding box units scale it). The subregion's `x`/`y` do not translate
+  it: FE1 §9.15 says "rendered according to the behavior of the use element" and the
+  feImage has no `x`/`y` of its own in that sense. Chrome translates the element by the
+  subregion origin (the filter region origin when `x`/`y` are absent), so its output
+  differs. A reference back into the element being filtered is a cycle and draws
+  transparent black, where Chrome draws the element unfiltered. A missing reference fills
+  the subregion with transparent black, as FE1 says.
 - In this step `BackgroundImage`, `BackgroundAlpha`, `FillPaint` and `StrokePaint` read as
-  transparent black, and `feImage` produces transparent black. They are still to be
-  implemented in phase 8.
+  transparent black. They are still to be implemented in phase 8.
 
 PNG decoding is implemented independently of SVG rendering. Sample reconstruction
 uses PNG 3 [scanline serialization](https://www.w3.org/TR/png-3/#7Scanline),
