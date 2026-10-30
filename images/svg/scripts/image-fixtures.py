@@ -37,3 +37,14 @@ for name,source,ref in extras:
  (root/'inputs'/f'{name}.svg').write_text(svg(source));(root/'references'/f'{name}.svg').write_text(svg(ref))
  cases.append(dict(id='image-'+name,input=f'inputs/{name}.svg',references=[dict(path=f'references/{name}.svg',relation='==')],status='pass',reason='Original sample data; reference rectangles independently express orientation, image placement and compositing. JPEG is uniform gray 128 with EXIF orientation 6.',spec='https://www.w3.org/TR/2018/CR-SVG2-20181004/embedded.html#ImageElement',tolerance={}))
 (root/'manifest.json').write_text(json.dumps(dict(version=1,suite='own',mode='reference',cases=cases),indent=2)+'\n')
+alpha_png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',2,1,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(b'\0\xff\0\0\x80\0\0\xff\x40'))+chunk(b'IEND',b'')
+alpha_url='data:image/png;base64,'+base64.b64encode(alpha_png).decode()
+extras=[
+ ('source-alpha',f'<image href="{alpha_url}"/>','<rect width="1" height="1" fill="red" fill-opacity="0.5019607843137255"/><rect x="1" width="1" height="1" fill="blue" fill-opacity="0.25098039215686275"/>'),
+ ('mask-content',f'<defs><mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="2" height="1" style="mask-type:alpha"><image href="{url}"/></mask></defs><rect width="8" height="8" fill="lime" mask="url(#m)"/>','<rect width="2" height="1" fill="lime"/>'),
+ ('pattern-content',f'<defs><pattern id="p" patternUnits="userSpaceOnUse" width="2" height="1"><image href="{url}"/></pattern></defs><rect width="8" height="4" fill="url(#p)"/>',''.join(f'<rect x="{x}" width="1" height="4" fill="{("red" if x%2==0 else "blue")}"/>' for x in range(8))),
+]
+for name,source,ref in extras:
+ (root/'inputs'/f'{name}.svg').write_text(svg(source));(root/'references'/f'{name}.svg').write_text(svg(ref))
+ cases.append(dict(id='image-'+name,input=f'inputs/{name}.svg',references=[dict(path=f'references/{name}.svg',relation='==')],status='pass',reason='Original two-sample PNG verifies premultiplied source alpha and images used inside retained mask/pattern pictures.',spec='https://www.w3.org/TR/2018/CR-SVG2-20181004/embedded.html#ImageElement',tolerance={}))
+(root/'manifest.json').write_text(json.dumps(dict(version=1,suite='own',mode='reference',cases=cases),indent=2)+'\n')
