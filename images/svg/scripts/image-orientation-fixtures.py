@@ -3,6 +3,7 @@
 from pathlib import Path
 import base64
 import json
+import re
 import struct
 import zlib
 
@@ -28,11 +29,13 @@ cases = [
     ('negative-half-tie', '-135deg', 3, False), ('wrapped-angle', '450deg', 1, False),
     ('calculated-angle', 'calc(1turn - 90deg)', 3, False),
     ('inherit', 'inherit', 1, False), ('unset', 'unset', 1, False),
+    ('initial', 'initial', 0, False), ('all-inherit', 'all:inherit', 1, False),
+    ('all-initial', 'all:initial', 0, False),
 ]
 manifest_path = root / 'manifest.json'
 manifest = json.loads(manifest_path.read_text())
 manifest['cases'] = [c for c in manifest['cases'] if not c['id'].startswith('image-orientation-')]
-for name, value, turns, flip in cases:
+def pixels(turns, flip, offset_x=1, offset_y=1):
     ref = []
     for y in range(3):
         for x in range(2):
@@ -42,15 +45,36 @@ for name, value, turns, flip in cases:
             if flip:
                 dx = w - 1 - dx
             r, g, b = colors[y*2+x]
-            ref.append(f'<rect x="{dx+1}" y="{dy+1}" width="1" height="1" fill="rgb({r},{g},{b})"/>')
-    image = f'<image x="1" y="1" href="{url}" style="image-orientation:{value}"/>'
-    if name in ('inherit', 'unset'):
+            ref.append(f'<rect x="{dx+offset_x}" y="{dy+offset_y}" width="1" height="1" fill="rgb({r},{g},{b})"/>')
+    return "".join(ref)
+
+for name, value, turns, flip in cases:
+    style = value + ';x:1px;y:1px' if value.startswith('all:') else 'image-orientation:' + value
+    image = f'<image x="1" y="1" href="{url}" style="{style}"/>'
+    if name in ('inherit', 'unset', 'initial', 'all-inherit', 'all-initial'):
         image = '<g style="image-orientation:90deg">' + image + '</g>'
     filename = 'orientation-' + name + '.svg'
     (root / 'inputs' / filename).write_text(svg(image))
-    (root / 'references' / filename).write_text(svg(''.join(ref)))
+    (root / 'references' / filename).write_text(svg(pixels(turns, flip)))
     manifest['cases'].append(dict(id='image-orientation-'+name, input='inputs/'+filename,
         references=[dict(path='references/'+filename, relation='==')], status='pass', tolerance={},
         spec='https://www.w3.org/TR/css-images-3/#the-image-orientation',
         reason='Original 2x3 RGB source with six distinct samples; reference rotates integer sample coordinates clockwise, then flips horizontally.'))
+# The same URL is deliberately used by differently styled occurrences.
+# This catches decode-time orientation that incorrectly changes every occurrence.
+jpeg_source = (root / 'inputs/jpeg-orientation.svg').read_text()
+jpeg_url = re.search(r'href="([^"]+)"', jpeg_source).group(1)
+for name, source, reference in [
+    ('shared-resource', f'<image href="{url}"/><image href="{url}" x="3" style="image-orientation:90deg"/>',
+     pixels(0, False, 0, 0) + pixels(1, False, 3, 0)),
+    ('jpeg-none', f'<image href="{jpeg_url}" style="image-orientation:none"/><image href="{jpeg_url}" x="3"/>',
+     '<rect width="2" height="3" fill="#808080"/><rect x="3" width="3" height="2" fill="#808080"/>'),
+]:
+    filename = 'orientation-' + name + '.svg'
+    (root / 'inputs' / filename).write_text(svg(source))
+    (root / 'references' / filename).write_text(svg(reference))
+    manifest['cases'].append(dict(id='image-orientation-'+name, input='inputs/'+filename,
+        references=[dict(path='references/'+filename, relation='==')], status='pass', tolerance={},
+        spec='https://www.w3.org/TR/css-images-3/#the-image-orientation',
+        reason='Shared source pixels retain independent per-occurrence CSS orientation; EXIF is used only by from-image.'))
 manifest_path.write_text(json.dumps(manifest, indent=2)+'\n')
