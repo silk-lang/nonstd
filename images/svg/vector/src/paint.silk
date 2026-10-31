@@ -889,6 +889,12 @@ pub struct ImagePattern<'a> {
   valid: bool,
   sampling: u8,
   extend: u8,
+  /// Sampling through a whole-pixel translation by (`shiftX`, `shiftY`): each device pixel
+  /// below `shiftLimit` reads texel `p + shift` (wrapped), what [`ImagePattern.sample`] gives.
+  shifted: bool,
+  shiftX: i64,
+  shiftY: i64,
+  shiftLimit: u32,
 }
 
 impl<'a> ImagePattern<'a> {
@@ -918,7 +924,70 @@ impl<'a> ImagePattern<'a> {
       projective: false,
       homography: Homography.fromAffine(&inverse),
       denominator: [0.0, 0.0, 1.0],
+      shifted: false,
+      shiftX: 0,
+      shiftY: 0,
+      shiftLimit: 0,
+    }.withShift()
+  }
+
+  /// Sets `shifted` when the f32 inverse is `k [1 0 0 1 e f]` over a denominator of `k` (the
+  /// packed inverse of a translation) with `e` and `f` close to whole numbers. Every pixel
+  /// center then maps to a texel center up to rounding, which `shiftLimit` bounds: nearest
+  /// sampling floors to `p + shift`, and each bilinear weight is 0 or 1 to within 2^-10, which
+  /// moves no channel by half a step (255 * 2 * 2^-10 < 0.5).
+  fn withShift(self: Self) -> ImagePattern<'a> {
+    let mut pattern = move self
+    let m = pattern.m
+    let k = m[0]
+    let mut shifted = pattern.valid && k > 0.0 && m[3] == k && m[1] == 0.0 && m[2] == 0.0
+    if pattern.projective {
+      shifted = shifted && pattern.denominator[0] == 0.0 && pattern.denominator[1] == 0.0
+        && pattern.denominator[2] == k
+    } else {
+      shifted = shifted && k == 1.0
     }
+    pattern.shifted = false
+    if shifted {
+      let e = f32.toF64(m[4]) / f32.toF64(k)
+      let f = f32.toF64(m[5]) / f32.toF64(k)
+      let nearest = pattern.sampling == SAMPLE_NEAREST
+      pattern.shiftLimit = if nearest {
+        NEAREST_SHIFT_LIMIT
+      } else {
+        BILINEAR_SHIFT_LIMIT
+      }
+      let slack = if nearest {
+        NEAREST_SHIFT_SLACK
+      } else {
+        BILINEAR_SHIFT_SLACK
+      }
+      let limit = u32.toF64(pattern.shiftLimit)
+      if f64.abs(e) < limit && f64.abs(f) < limit {
+        let x = f64.floor(e + 0.5)
+        let y = f64.floor(f + 0.5)
+        if f64.abs(e - x) < slack && f64.abs(f - y) < slack {
+          pattern.shifted = true
+          pattern.shiftX = f64.toI64(x)
+          pattern.shiftY = f64.toI64(y)
+        }
+      }
+    }
+    return move pattern
+  }
+
+  /// The texel index `p + shift` for an image `size` texels long, wrapped like [`wrap`].
+  @inlineAlways
+  fn shiftedIndex(self: &Self, p: i64, size: i64) -> usize {
+    if self.extend == EXTEND_REPEAT {
+      let r = p % size
+      return i64.toUsize(if r < 0 {
+        r + size
+      } else {
+        r
+      })
+    }
+    return i64.toUsize(clampI64(p, 0, size - 1))
   }
 
   /// Borrows the original pixels, sampling through the inverse homogeneous map.
@@ -941,7 +1010,7 @@ impl<'a> ImagePattern<'a> {
       pattern.denominator = [m[6], m[7], m[8]]
       pattern.valid = image.width() > 0 && image.height() > 0
     }
-    return move pattern
+    return (move pattern).withShift()
   }
 
   pub fn isProjective(self: &Self) -> bool {
@@ -1168,6 +1237,18 @@ impl<'a> Shader for ImagePattern<'a> {
 
   fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
     let mut i: usize = 0
+    let limit = self.shiftLimit
+    if self.shifted && x < limit && y < limit && count < u32.toUsize(limit) {
+      let w = u32.toI64(self.image.width())
+      let row = self.shiftedIndex(u32.toI64(y) + self.shiftY, u32.toI64(self.image.height()))
+      let mut column = u32.toI64(x) + self.shiftX
+      while i < count {
+        out[i] = self.word(self.shiftedIndex(column, w), row)
+        column = column + 1
+        i = i + 1
+      }
+      return
+    }
     if self.valid && !self.projective && self.sampling == SAMPLE_BILINEAR {
       while i + 4 <= count {
         if !self.sampleFour(x + usize.toU32(i), y, &mut out, i) {
@@ -1184,6 +1265,29 @@ impl<'a> Shader for ImagePattern<'a> {
       }
       i = i + 1
     }
+  }
+}
+
+/// Pixel, span and shift bounds for [`ImagePattern.shifted`] (all three below the limit keep a
+/// shifted center below 3 times it) and how far the shift may sit from a whole number. Below
+/// 2^14, `sample`'s two f32 roundings move a center by at most 2^-7 of a pixel; below 2^10, by
+/// 2^-11, which with the 2^-12 slack stays under 2^-10.
+const NEAREST_SHIFT_LIMIT: u32 = 16384
+
+const NEAREST_SHIFT_SLACK: f64 = 0.015625
+
+const BILINEAR_SHIFT_LIMIT: u32 = 1024
+
+const BILINEAR_SHIFT_SLACK: f64 = 0.000244140625
+
+@inlineAlways
+fn clampI64(v: i64, low: i64, high: i64) -> i64 {
+  return if v < low {
+    low
+  } else if v > high {
+    high
+  } else {
+    v
   }
 }
 
