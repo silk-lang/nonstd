@@ -810,6 +810,121 @@ fn visibleInFragment(output: &LayoutPass, id: usize, static fragmented: bool) ->
 // Grid 2 §11.6. Stored item tables are already initial-scroll-position tables
 // (engine's baseline normalization); location is unscrolled border-box position.
 // Only sharing-group exports generate a new table from the container's font.
+// The item a container baseline comes from (Grid 2 §11.6), as its scans
+// pick it: the lowest rank, then the first in grid order (the last, for the
+// last baselines).
+struct BaselinePick { chosen: usize, rank: usize, last: bool }
+
+impl BaselinePick {
+  fn make(last: bool) -> BaselinePick { return BaselinePick { chosen: NO_NODE, rank: 4, last: last } }
+
+  // Takes item `index` with `rank` if it beats the pick so far.
+  fn consider(self: &mut Self, items: &[GridItem], index: usize, rank: usize, last: bool, hasFirst: bool,
+    hasLast: bool, itemLast: bool) {
+    let mut earlier = true
+    if self.chosen != NO_NODE {
+      let item = &items[index]
+      let previous = &items[self.chosen]
+      earlier = gridBefore(
+        item.row.start,
+        item.column.start,
+        index,
+        previous.row.start,
+        previous.column.start,
+        self.chosen,
+      )
+      if last {
+        earlier = !earlier
+      }
+    }
+    if rank < self.rank || rank == self.rank && earlier {
+      self.chosen = index
+      self.rank = rank
+      self.last = last
+      if rank < 2 {
+        self.last = itemLast
+      }
+      if rank == 2 {
+        if !last && !hasFirst {
+          self.last = true
+        }
+        if last && !hasLast {
+          self.last = false
+        }
+      }
+    }
+  }
+
+  // consider for an item on edge track `track`, or sharing a baseline.
+  fn considerEdge(self: &mut Self, nodes: &BoxTree, output: &LayoutPass, items: &[GridItem], scratch: &GridBaselines,
+    index: usize, track: i32, last: bool, sharing: bool, horizontal: bool) {
+    let item = &items[index]
+    let layout = &output.boxes[item.id]
+    let compatible = (nodes.style(item.id).writingMode != WritingMode.HorizontalTb) == horizontal
+    let hasFirst = layout.hasFirstBaseline
+    let hasLast = layout.hasLastBaseline
+    let mut itemLast = false
+    if sharing {
+      itemLast = scratch.rows.entries.asSlice()[index].last
+    }
+    let mut rank = exportRank(
+      last,
+      itemLast,
+      item.row.start == track,
+      item.row.end - 1 == track,
+      sharing,
+      compatible && (hasFirst || hasLast),
+    )
+    // Synthesis considers all grid items, not only the occupied edge track.
+    if rank == 4 {
+      rank = 3
+    }
+    self.consider(items, index, rank, last, hasFirst, hasLast, itemLast)
+  }
+}
+
+// Both picks for a grid without baseline groups or fragments: the first
+// track's items are those starting on it, found scanning forward, and the
+// last track's those ending on it, found scanning backward, so in the usual
+// row order each scan ranks the items of one row. Synthesis for the last
+// baselines takes the last item in grid order.
+fn quickPicks(nodes: &BoxTree, output: &LayoutPass, items: &[GridItem], scratch: &GridBaselines, horizontal: bool,
+  first: &mut BaselinePick, final: &mut BaselinePick) {
+  let mut firstTrack = items[0].row.start
+  let mut index: usize = 0
+  while index < items.length {
+    let start = items[index].row.start
+    if start < firstTrack {
+      firstTrack = start
+      first.* = BaselinePick.make(false)
+    }
+    if start == firstTrack {
+      first.considerEdge(nodes, output, items, scratch, index, firstTrack, false, false, horizontal)
+    }
+    index = index + 1
+  }
+  let mut lastTrack = items[items.length - 1].row.end - 1
+  index = items.length
+  while index > 0 {
+    index = index - 1
+    let end = items[index].row.end - 1
+    if end > lastTrack {
+      lastTrack = end
+      final.* = BaselinePick.make(true)
+    }
+    if end == lastTrack {
+      final.considerEdge(nodes, output, items, scratch, index, lastTrack, true, false, horizontal)
+    }
+  }
+  if final.rank == 3 {
+    index = 0
+    while index < items.length {
+      final.consider(items, index, 3, true, false, false, false)
+      index = index + 1
+    }
+  }
+}
+
 pub fn containerBaselines<M: Measure>(
   nodes: &BoxTree,
   output: &LayoutPass,
@@ -820,125 +935,88 @@ pub fn containerBaselines<M: Measure>(
   result: &mut Layout,
   static fragmented: bool,
 ) {
-  let mut first: usize = 0
-  while first < items.length && !visibleInFragment(output, items[first].id, fragmented) {
-    first = first + 1
-  }
-  if first == items.length {
-    return
-  }
   let horizontal = parent.writingMode != WritingMode.HorizontalTb
-  let mut firstTrack = items[first].row.start
-  let mut lastTrack = items[first].row.end - 1
-  let mut index = first + 1
-  while index < items.length {
-    if !visibleInFragment(output, items[index].id, fragmented) {
-      index = index + 1
-      continue
-    }
-    if items[index].row.start < firstTrack {
-      firstTrack = items[index].row.start
-    }
-    if items[index].row.end - 1 > lastTrack {
-      lastTrack = items[index].row.end - 1
-    }
-    index = index + 1
-  }
   let groups = scratch.rows.entries.length() != 0
+  let mut picks = [BaselinePick.make(false), BaselinePick.make(true)]
+  if !fragmented && !groups {
+    if items.length == 0 {
+      return
+    }
+    quickPicks(nodes, output, items, scratch, horizontal, &mut picks[0], &mut picks[1])
+  } else {
+    let mut first: usize = 0
+    while first < items.length && !visibleInFragment(output, items[first].id, fragmented) {
+      first = first + 1
+    }
+    if first == items.length {
+      return
+    }
+    let mut firstTrack = items[first].row.start
+    let mut lastTrack = items[first].row.end - 1
+    let mut index = first + 1
+    while index < items.length {
+      if !visibleInFragment(output, items[index].id, fragmented) {
+        index = index + 1
+        continue
+      }
+      if items[index].row.start < firstTrack {
+        firstTrack = items[index].row.start
+      }
+      if items[index].row.end - 1 > lastTrack {
+        lastTrack = items[index].row.end - 1
+      }
+      index = index + 1
+    }
+    let mut pass: usize = 0
+    while pass < 2 {
+      let last = pass == 1
+      let mut track = firstTrack
+      if last {
+        track = lastTrack
+      }
+      let pick = &mut picks[pass]
+      let mut edgeOnly = true
+      let mut scanned = false
+      while !scanned {
+        index = 0
+        while index < items.length {
+          let item = &items[index]
+          if !visibleInFragment(output, item.id, fragmented) {
+            index = index + 1
+            continue
+          }
+          let sharing = groups && active(scratch, index, false)
+          // Only an item on an edge track, or sharing a baseline, ranks above
+          // synthesis (3), which reads nothing of the item: the first scan
+          // takes those items, the second, if needed, the others by position.
+          let edge = sharing || item.row.start == track || item.row.end - 1 == track
+          if edge != edgeOnly {
+            index = index + 1
+            continue
+          }
+          if edge {
+            pick.considerEdge(nodes, output, items, scratch, index, track, last, sharing, horizontal)
+          } else {
+            pick.consider(items, index, 3, last, false, false, false)
+          }
+          index = index + 1
+        }
+        // Without sharing groups, every item off the first track starts after
+        // the items on it, so only the last baselines' synthesis scans them.
+        scanned = !edgeOnly || pick.rank < 3 || (!groups && !last)
+        edgeOnly = false
+      }
+      pass = pass + 1
+    }
+  }
   let mut fontBaselines = BaselineSet.zero()
   let mut hasFont = false
   let mut pass: usize = 0
   while pass < 2 {
     let last = pass == 1
-    let mut track = firstTrack
-    if last {
-      track = lastTrack
-    }
-    let mut chosen = NO_NODE
-    let mut chosenRank: usize = 4
-    let mut chosenLast = last
-    let mut edgeOnly = true
-    let mut scanned = false
-    while !scanned {
-      index = 0
-      while index < items.length {
-        let item = &items[index]
-        if !visibleInFragment(output, item.id, fragmented) {
-          index = index + 1
-          continue
-        }
-        let sharing = groups && active(scratch, index, false)
-        // Only an item on an edge track, or sharing a baseline, ranks above
-        // synthesis (3), which reads nothing of the item: the first scan
-        // takes those items, the second, if needed, the others by position.
-        let edge = sharing || item.row.start == track || item.row.end - 1 == track
-        if edge != edgeOnly {
-          index = index + 1
-          continue
-        }
-        let mut rank: usize = 3
-        let mut hasFirst = false
-        let mut hasLast = false
-        let mut itemLast = false
-        if edge {
-          let layout = &output.boxes[item.id]
-          let compatible = (nodes.style(item.id).writingMode != WritingMode.HorizontalTb) == horizontal
-          hasFirst = layout.hasFirstBaseline
-          hasLast = layout.hasLastBaseline
-          if sharing {
-            itemLast = scratch.rows.entries.asSlice()[index].last
-          }
-          rank = exportRank(
-            last,
-            itemLast,
-            item.row.start == track,
-            item.row.end - 1 == track,
-            sharing,
-            compatible && (hasFirst || hasLast),
-          )
-          // Synthesis considers all grid items, not only the occupied edge track.
-          if rank == 4 {
-            rank = 3
-          }
-        }
-        let mut earlier = true
-        if chosen != NO_NODE {
-          let previous = &items[chosen]
-          earlier = gridBefore(
-            item.row.start,
-            item.column.start,
-            index,
-            previous.row.start,
-            previous.column.start,
-            chosen,
-          )
-          if last {
-            earlier = !earlier
-          }
-        }
-        if rank < chosenRank || rank == chosenRank && earlier {
-          chosen = index
-          chosenRank = rank
-          chosenLast = last
-          if rank < 2 {
-            chosenLast = itemLast
-          }
-          if rank == 2 {
-            if !last && !hasFirst {
-              chosenLast = true
-            }
-            if last && !hasLast {
-              chosenLast = false
-            }
-          }
-        }
-        index = index + 1
-      }
-      // Without sharing groups, every item off the first track starts after
-      // the items on it, so only the last baselines' synthesis scans them.
-      scanned = !edgeOnly || chosenRank < 3 || (!groups && !last)
-      edgeOnly = false
-    }
+    let chosen = picks[pass].chosen
+    let chosenRank = picks[pass].rank
+    let chosenLast = picks[pass].last
     let item = &items[chosen]
     let child = &output.boxes[item.id]
     let childStyle = nodes.style(item.id)
