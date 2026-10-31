@@ -231,7 +231,7 @@ Not on the skip list, though it's tempting: SVG fonts (1.1 ch. 20), `color-profi
 
 Implement removed SVG 1.1 requirements additively where they do not conflict: SVG fonts and their child elements, `altGlyph` family, `tref`, `color-profile` and `icc-color()`, `enable-background`, `clip`, `kerning`, `glyph-orientation-*`, `filterRes`, `requiredFeatures`, `xml:base`, and `xlink:*`. Check the [SVG 2 changes appendix](https://www.w3.org/TR/2018/CR-SVG2-20181004/changes.html) against the older normative section when each feature is implemented.
 
-For genuine behavior conflicts, default to SVG 2. Do not introduce a speculative profile switch. If that rule cannot resolve a real case, ask Julia before adding a document-level `Profile { svg11, svg2 }`, defaulting to `svg2`. `solidcolor` and `z-index` are outside the pinned CR scope unless Julia requests them. Julia requested mesh gradients and hatches for phase 15; they follow the [2016 CR](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html), the last to define them (see "Mesh gradients" below).
+For genuine behavior conflicts, default to SVG 2. Do not introduce a speculative profile switch. If that rule cannot resolve a real case, ask Julia before adding a document-level `Profile { svg11, svg2 }`, defaulting to `svg2`. `solidcolor` and `z-index` are outside the pinned CR scope unless Julia requests them. Julia requested mesh gradients and hatches for phase 15; they follow the [2016 CR](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html), the last to define them (see "Mesh gradients" and "Hatches" below).
 
 The table is a register of cases to test, not a claim of complete rendering support. No implemented behavior currently needs a profile switch.
 
@@ -545,6 +545,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] OpenType SVG glyphs ([`SVG ` table](https://learn.microsoft.com/en-us/typography/opentype/spec/svg)): see "SVG glyph documents" under Text layout
 - [x] A wasm32 build (`images/svg/wasm`): renders every fixture exactly as the native build
 - [x] Mesh gradients ([2016 CR #MeshGradients](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html#MeshGradients)), bilinear and bicubic: see "Mesh gradients" below
+- [x] Hatches ([2016 CR #Hatches](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html#Hatches)): see "Hatches" below
 
 ### Mesh gradients
 
@@ -572,6 +573,32 @@ lower resolution. Interpretation decisions:
   as applying whenever a line has two or more segments (the text's "n > 2" and its
   `δ1 = δn = Δ0` fallback mix one- and zero-based indices); a single segment uses its secant
   at both ends. Hermite results are clamped to [0, 1].
+
+### Hatches
+
+`hatch` is a paint server drawn as a pattern: one strip wide (`pitch`) across, and along the
+strip long enough to cover the painted element's bounds widened by its stroke. `href`
+templates copy `x`, `y`, `pitch`, `rotate`, `hatchUnits`, `hatchContentUnits` and the
+`transform` presentation attribute, and `hatchpath` children when the referencing element has
+none. Each `hatchpath` is stroked with its own stroke properties; its fill is ignored and a
+stroke that is not a solid colour (or `currentColor`) paints nothing
+([#HatchpathNotes](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html#HatchpathNotes)).
+The UA style sheet gives `hatch` `overflow: hidden`, which clips strokes to their strip;
+`overflow: visible` draws the parts that cross into neighbouring strips, later strips over
+earlier ones ([#HatchNotes](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html#HatchNotes)).
+Interpretation decisions:
+
+- `rotate` turns the strip frame about (x, y) in the `hatchUnits` space, after the `transform`
+  attribute and any bounding-box mapping. A `pitch` percentage resolves against the
+  normalized viewport diagonal, like other non-directional lengths.
+- When `hatchContentUnits` differs from `hatchUnits`, content lengths scale by the bounding
+  box's width and height along the strip frame's axes.
+- A `d` without an initial moveto starts at (x, 0), x being that of the last data point as
+  the path is written with relative data resolved from (0, 0). Such a section continues the
+  previous one's subpath, unless it ends with closepath; a line joins them if relative data
+  moved the start. A last point with y at or below zero renders nothing.
+- A hatch whose transform is projective paints nothing; a picture over one million path
+  segments is a resource error.
 
 Mask resources use CSS Masking 1 [mask element coordinates](https://www.w3.org/TR/css-masking-1/#MaskElement)
 and [mask value calculation](https://www.w3.org/TR/css-masking-1/#MaskValues).
