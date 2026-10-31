@@ -11,11 +11,26 @@ import svg_core.scene {
   Brush,
   Stroke,
   RenderError,
+  HitTarget,
+  Style,
+  FillRule,
 }
+import svg_core.structure { Graph, OccurrenceId, SourceId }
 import svg_css.values { PaintLayer }
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.option { Option }
+
+fn strokeOf(style: &Style) -> Stroke {
+  return Stroke {
+    width: style.strokeWidth,
+    cap: style.lineCap,
+    join: style.lineJoin,
+    miterLimit: style.miterLimit,
+    dashIndex: style.dashIndex,
+    dashOffset: style.dashOffset,
+  }
+}
 
 struct Painting {
   brush: Brush,
@@ -55,7 +70,34 @@ effect fn painting(paint: &Paint, currentColor: Color, opacity: f64) -> Option<P
   }
 }
 
-effect fn recordCommands(nodes: &[ResolvedNode], shapes: &[ResolvedShape]) -> List<Command>
+// The element a hit on `occurrence` targets: its source, and the outermost `use` element
+// whose shadow tree holds it.
+fn hitTarget(graph: &Graph, occurrence: usize) -> HitTarget {
+  let all = graph.occurrences.asSlice()
+  let mut host = Option<SourceId>.None
+  let mut at = occurrence
+  while true {
+    let entry = &all[at]
+    let parent = match &entry.parent {
+      Option<OccurrenceId>.Some { value } => value.index
+      _ => {
+        break
+      }
+    }
+    if entry.shadowRoot {
+      host = Option<SourceId>.some(all[parent].source)
+    }
+    at = parent
+  }
+  return HitTarget { source: all[occurrence].source, host: host }
+}
+
+effect fn recordCommands(
+  nodes: &[ResolvedNode],
+  shapes: &[ResolvedShape],
+  graph: &Graph,
+  targets: &mut List<HitTarget>,
+) -> List<Command>
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
   let mut commands = List<Command>.make()
@@ -110,6 +152,33 @@ effect fn recordCommands(nodes: &[ResolvedNode], shapes: &[ResolvedShape]) -> Li
       ResolvedNode.EndFilterImage => {
         run commands.append(Command.EndFilterImage)
       }
+      ResolvedNode.Hit { shape, occurrence, fill, stroke } => {
+        if shape >= shapes.length || occurrence >= graph.occurrences.length() {
+          fail RenderError.InvalidGeometry
+        }
+        let resolved = &shapes[shape]
+        let style = &resolved.style
+        run commands.append(
+          Command.Hit {
+            path: resolved.path,
+            transform: resolved.transform,
+            strokeSpace: resolved.strokeSpace,
+            clip: resolved.clip,
+            rule: if fill {
+              Option<FillRule>.some(style.fillRule)
+            } else {
+              Option<FillRule>.None
+            },
+            stroke: if stroke && style.strokeWidth > 0.0 {
+              Option<Stroke>.some(strokeOf(style))
+            } else {
+              Option<Stroke>.None
+            },
+            target: targets.length(),
+          },
+        )
+        run targets.append(hitTarget(graph, occurrence))
+      }
       ResolvedNode.Paint { shape, layer } => {
         if shape >= shapes.length || layer == PaintLayer.Markers {
           fail RenderError.InvalidGeometry
@@ -151,14 +220,7 @@ effect fn recordCommands(nodes: &[ResolvedNode], shapes: &[ResolvedShape]) -> Li
                   opacity: value.opacity,
                   linearRgb: style.linearRgb,
                   crispEdges: style.crispEdges,
-                  stroke: Stroke {
-                    width: style.strokeWidth,
-                    cap: style.lineCap,
-                    join: style.lineJoin,
-                    miterLimit: style.miterLimit,
-                    dashIndex: style.dashIndex,
-                    dashOffset: style.dashOffset,
-                  },
+                  stroke: strokeOf(style),
                 },
               )
             }
@@ -175,7 +237,13 @@ effect fn recordCommands(nodes: &[ResolvedNode], shapes: &[ResolvedShape]) -> Li
 pub effect fn record(tree: RenderTree) -> DisplayList
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
-  let commands = run recordCommands(tree.nodes.asSlice(), tree.shapes.asSlice())
+  let mut targets = List<HitTarget>.make()
+  let commands = run recordCommands(
+    tree.nodes.asSlice(),
+    tree.shapes.asSlice(),
+    &tree.graph,
+    &mut targets,
+  )
   let mut patterns = run List<Pattern>.makeWithCapacity(tree.patterns.length())
   let mut i: usize = 0
   while i < tree.patterns.length() {
@@ -184,7 +252,12 @@ pub effect fn record(tree: RenderTree) -> DisplayList
       Pattern {
         tile: picture.tile,
         contentBounds: picture.contentBounds,
-        commands: run recordCommands(picture.nodes.asSlice(), picture.shapes.asSlice()),
+        commands: run recordCommands(
+          picture.nodes.asSlice(),
+          picture.shapes.asSlice(),
+          &tree.graph,
+          &mut targets,
+        ),
       },
     )
     i = i + 1
@@ -219,6 +292,7 @@ pub effect fn record(tree: RenderTree) -> DisplayList
     paths: move tree.paths,
     dashes: move tree.dashes,
     commands: move commands,
+    targets: move targets,
     projectionClips: move tree.projectionClips,
     clipNodes: move tree.clipNodes,
     filters: move tree.filters,
