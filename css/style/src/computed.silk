@@ -11,7 +11,7 @@ import computed_projection
 import computed_queries
 import dimensions { Context, Unit }
 import dimensions
-import colors { Color, Identity, SystemColor }
+import colors { Color, Identity, SystemColor, Context as ColorContext }
 import colors
 import text_values { TextValue, Atom }
 import value_keywords { Keyword }
@@ -21,6 +21,7 @@ import lexer
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import silk.core.option { Option }
+import silk.core.effect { Effect }
 import silk.num.u32
 import silk.num.usize
 import silk.num.u16
@@ -131,6 +132,8 @@ pub struct Engine {
   // Cached initial ValueId indices, u32.MAX until computed.
   initialSpecified: [u32; 172],
   initialComputed: [u32; 172],
+  // Initials computed once for every host (see Initials); they survive a revision change.
+  contextFree: [bool; 172],
   revision: Option<usize>,
   // Canonical longhands some candidate of the style being built declares;
   // resolve skips the cascade scan for the rest.
@@ -187,7 +190,130 @@ fn slotTable(count: &mut usize) -> [Slot; 172] {
   return slots
 }
 
+/// The catalog's initial values parsed once, for engines of many documents to start from
+/// (see [`Engine.makeWith`]). Initials whose values own lists stay out and are parsed per
+/// document, as without this.
+pub struct Initials {
+  values: Store,
+  specified: [u32; 172],
+  // Initials whose computed value is the specified one in any context.
+  contextFree: [bool; 172],
+}
+
+impl Initials {
+  pub effect fn make(limits: &Limits) -> Initials
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut store = Store.make()
+    let mut specified: [u32; 172] = [u32.MAX; 172]
+    let mut contextFree: [bool; 172] = [false; 172]
+    let all = properties.all()
+    let mut i: usize = 0
+    while i < all.length {
+      let property = all[i]
+      let kind = properties.initialKind(property)
+      if kind != InitialKind.HostFontFamily && kind != InitialKind.Shorthand {
+        let mark = store.mark()
+        let parsed = run Effect.catch<CssError>(
+          parseInitial(&mut store, property, limits),
+          unparsed,
+        )
+        let mut kept = false
+        if let Option<ValueId>.Some { value } = parsed {
+          if store.simpleSince(mark) {
+            let index = properties.index(property)
+            specified[index] = usize.toU32(value.index)
+            contextFree[index] = run unchangedWhenComputed(&mut store, value, property)
+            kept = true
+          }
+        }
+        if !kept {
+          store.truncate(mark)
+        }
+      }
+      i = i + 1
+    }
+    return Initials { values: move store, specified: specified, contextFree: contextFree }
+  }
+}
+
+// Whether computing `id` returns it unchanged under two unrelated contexts (sizes, viewport,
+// writing mode and palette all differ), so its computed value needs no context. Whatever the
+// probes add to the store is dropped.
+effect fn unchangedWhenComputed(store: &mut Store, id: ValueId, property: Property) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mark = store.mark()
+  let fonts = [
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+  ]
+  let mut same = true
+  let mut probe: usize = 0
+  while probe < 2 && same {
+    let mut dimensions = if probe == 0 {
+      Context.make(300.0, 150.0, 16.0)
+    } else {
+      Context.make(1234.5, 77.25, 37.5)
+    }
+    dimensions.vertical = probe == 1
+    let shade: f64 = if probe == 0 {
+      0.0
+    } else {
+      0.75
+    }
+    let host = Color.srgb(shade, 1.0 - shade, 0.5, 1.0)
+    let palette = ColorContext.make(
+      if property == Property.Color {
+        host
+      } else {
+        Color.current()
+      },
+      [host; 19],
+    )
+    let computeContext = ComputeContext {
+      dimensions: dimensions,
+      colors: palette,
+      systemFonts: &fonts,
+    }
+    let computed = run computeValue(&mut store.*, id, property, &computeContext)
+    same = computed.index == id.index
+    probe = probe + 1
+  }
+  store.truncate(mark)
+  return same
+}
+
+effect fn parseInitial(store: &mut Store, property: Property, limits: &Limits) -> Option<ValueId>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run lexer.tokenize(properties.initial(property), limits)
+  let source = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+  return run values.parse(&mut store.*, property, &source, Mode.Css)
+}
+
+// An initial over the limits is left to each document, which reports it as before.
+effect fn unparsed(error: CssError) -> Option<ValueId> {
+  drop error
+  return Option<ValueId>.None
+}
+
 impl Engine {
+  /// An engine whose value store starts with the parsed initial values of `initials`.
+  pub effect fn makeWith(closingBuffer: usize, initials: &Initials) -> Engine
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut engine = Engine.make(closingBuffer)
+    engine.values = run initials.values.copy()
+    engine.initialSpecified = initials.specified
+    engine.contextFree = initials.contextFree
+    return move engine
+  }
+
   pub fn make(closingBuffer: usize) -> Engine {
     let mut slotCount: usize = 0
     let slots = slotTable(&mut slotCount)
@@ -204,6 +330,7 @@ impl Engine {
       styles: List<Style>.make(),
       initialSpecified: [u32.MAX; 172],
       initialComputed: [u32.MAX; 172],
+      contextFree: [false; 172],
       covered: [false; 172],
       revision: Option<usize>.None,
     }
@@ -292,6 +419,32 @@ impl Engine {
     }
   }
 
+  // Caches the computed value of every context-free initial, as defaultValue would.
+  fn restoreContextFree(self: &mut Engine) -> () {
+    let all = properties.all()
+    let mut i: usize = 0
+    while i < all.length {
+      let property = all[i]
+      let index = properties.index(property)
+      if self.contextFree[index] {
+        let value = self.initialSpecified[index]
+        self.initialComputed[index] = value
+        let kind = properties.initialKind(property)
+        if kind != InitialKind.DecorationFill && kind != InitialKind.DecorationStroke
+          && properties.canonical(property) == property
+          && properties.longhandCount(property) == 1 {
+          self.initialEntries[index] = Entry {
+            value: value,
+            buffer: u32.MAX,
+            property: property,
+            sourceProperty: property,
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
   pub effect fn build(
     self: &mut Engine,
     buffers: &[TokenBuffer],
@@ -310,6 +463,7 @@ impl Engine {
     if !sameRevision {
       self.initialComputed = [u32.MAX; 172]
       self.initialEntries = [absent(); 172]
+      self.restoreContextFree()
       self.revision = Option<usize>.some(host.revision)
     }
     let parentScope = match &parent {
