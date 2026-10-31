@@ -1,5 +1,5 @@
 //! Immutable computed styles. Source buffers and declarations remain caller-owned.
-import cascade { Declaration, Candidate, Target, Specified }
+import cascade { Declaration, Candidate, Target, Specified, Priority }
 import cascade
 import variables { VariableStore, ScopeId }
 import variables
@@ -26,6 +26,11 @@ import silk.num.u32
 import silk.num.usize
 import silk.num.u16
 import silk.num.u8
+import silk.num.u64
+import silk.num.f64
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 pub struct StyleId {
@@ -115,7 +120,19 @@ struct Style {
   scope: ScopeId,
   dimensions: Context,
   root: StyleId,
+  // Hash of everything a child's build reads from this style (see inheritKey).
+  inheritKey: u64,
 }
+
+// A built style that a later build with the same inputs can return instead (see sharedStyle).
+struct Shared {
+  style: usize,
+  parent: usize,
+  candidates: usize,
+  count: usize,
+}
+
+impl Copy for Shared {}
 
 struct Resolved {
   declaration: usize,
@@ -156,6 +173,10 @@ pub struct Engine {
   pendingStale: bool,
   // The slot position of each entry index, u8.MAX for entries without a slot.
   slotPositions: [u8; 172],
+  // Styles by the hash of their build inputs, with the candidates they were built from.
+  shareKeys: HashMap<u64, usize>,
+  shared: List<Shared>,
+  sharedCandidates: List<Candidate>,
 }
 
 struct Slot {
@@ -343,6 +364,9 @@ impl Engine {
       pendingCount: 0,
       pendingStale: true,
       slotPositions: slotPositions,
+      shareKeys: HashMap<u64, usize>.make(Hash.seed(0)),
+      shared: List<Shared>.make(),
+      sharedCandidates: List<Candidate>.make(),
       values: Store.make(),
       variables: VariableStore.make(closingBuffer),
       styles: List<Style>.make(),
@@ -500,9 +524,23 @@ impl Engine {
       self.pendingStale = true
       self.restoreContextFree()
       self.revision = Option<usize>.some(host.revision)
+      self.shareKeys.clear()
+      self.shared.clear()
+      self.sharedCandidates.clear()
     }
     if self.pendingStale {
       self.listPending()
+    }
+    let shareKey = self.shareKey(declarations, candidates, parent)
+    if let Option<u64>.Some { value: key } = shareKey {
+      if let Option<StyleId>.Some { value: earlier } = self.sharedStyle(
+        key,
+        declarations,
+        candidates,
+        parent,
+      ) {
+        return earlier
+      }
     }
     let parentScope = match &parent {
       Option<StyleId>.Some { value } => self.scope(value)
@@ -595,6 +633,7 @@ impl Engine {
       scope: scope,
       dimensions: metrics,
       root: root,
+      inheritKey: 0,
     }
 
     // Undeclared inherited longhands take the parent's entry, as
@@ -768,9 +807,255 @@ impl Engine {
       )
     }
     run computeOverflow(&mut self.*, &mut style)
+    style.inheritKey = match &parent {
+      Option<StyleId>.Some { value } => self.childInheritKey(
+        &style,
+        value,
+        &coveredIndices,
+        coveredCount,
+      )
+      _ => self.inheritKey(&style)
+    }
     run self.styles.append(move style)
+    if let Option<u64>.Some { value: key } = shareKey {
+      if let Option<StyleId>.Some { value: from } = parent {
+        let record = Shared {
+          style: id.index,
+          parent: from.index,
+          candidates: self.sharedCandidates.length(),
+          count: candidates.length,
+        }
+        run self.sharedCandidates.appendSlice(candidates)
+        drop run self.shareKeys.insert(key, self.shared.length())
+        run self.shared.append(record)
+      }
+    }
     return id
   }
+
+  // A child's build reads its parent's inherited entries, scope, root and the font metrics
+  // copied into its own; nothing else of the parent unless a declaration says inherit, and
+  // such builds are not shared.
+  fn inheritKey(self: &Engine, style: &Style) -> u64 {
+    let mut hash: u64 = 14695981039346656037
+    let mut n: usize = 0
+    while n < self.inheritedCount {
+      let entry = style.entries[u16.toUsize(self.inheritedIndices[n])]
+      hash = mix(hash, u32.toU64(entry.value) | u64.shiftLeft(u32.toU64(entry.buffer), 32))
+      n = n + 1
+    }
+    hash = mix(hash, usize.toU64(style.scope.index))
+    hash = mix(hash, usize.toU64(style.root.index))
+    hash = mix(hash, f64.toBits(style.dimensions.fontSize))
+    hash = mix(hash, f64.toBits(style.dimensions.lineHeight))
+    return mix(hash, f64.toBits(style.dimensions.xHeight))
+  }
+
+  // inheritKey for a child of `parent`: its undeclared inherited entries are the parent's,
+  // so only the declared ones are mixed into the parent's key. Equal inputs reached through
+  // different declarations may hash differently, which only forgoes sharing.
+  fn childInheritKey(
+    self: &Engine,
+    style: &Style,
+    parent: StyleId,
+    covered: &[u16; 172],
+    coveredCount: usize,
+  ) -> u64 {
+    if parent.index >= self.styles.length() {
+      return self.inheritKey(style)
+    }
+    let mut hash = self.styles.asSlice()[parent.index].inheritKey
+    let mut d: usize = 0
+    while d < coveredCount {
+      let index = u16.toUsize(covered[d])
+      let position = self.slotPositions[index]
+      if position != u8.MAX && self.slots[u8.toUsize(position)].inherited {
+        let entry = style.entries[index]
+        hash = mix(
+          mix(hash, usize.toU64(index)),
+          u32.toU64(entry.value) | u64.shiftLeft(u32.toU64(entry.buffer), 32),
+        )
+      }
+      d = d + 1
+    }
+    hash = mix(hash, usize.toU64(style.scope.index))
+    hash = mix(hash, f64.toBits(style.dimensions.fontSize))
+    hash = mix(hash, f64.toBits(style.dimensions.lineHeight))
+    return mix(hash, f64.toBits(style.dimensions.xHeight))
+  }
+
+  // The hash of a build's inputs when another build with equal inputs would give the same
+  // style: a parent, and only parsed property declarations (no var(), wide keywords or
+  // custom properties, which read more of the parent or make a scope).
+  fn shareKey(
+    self: &Engine,
+    declarations: &[Declaration],
+    candidates: &[Candidate],
+    parent: Option<StyleId>,
+  ) -> Option<u64> {
+    let from = match &parent {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        return Option<u64>.None
+      }
+    }
+    if from.index >= self.styles.length() {
+      return Option<u64>.None
+    }
+    let mut hash = mix(14695981039346656037, self.styles.asSlice()[from.index].inheritKey)
+    let mut c: usize = 0
+    while c < candidates.length {
+      let candidate = candidates[c]
+      if candidate.declaration >= declarations.length {
+        return Option<u64>.None
+      }
+      let declaration = declarations[candidate.declaration]
+      let property = match &declaration.target {
+        Target.Property { property } => property
+        _ => {
+          return Option<u64>.None
+        }
+      }
+      let value = match &declaration.specified {
+        Specified.Parsed { value } => value
+        _ => {
+          return Option<u64>.None
+        }
+      }
+      hash = mix(hash, usize.toU64(properties.index(property)))
+      hash = mix(
+        hash,
+        usize.toU64(value.index) | u64.shiftLeft(usize.toU64(declaration.buffer), 32),
+      )
+      hash = mix(
+        hash,
+        usize.toU64(
+          candidate.priority.specificity.ids * 4096 + candidate.priority.specificity.classes * 64
+            + candidate.priority.specificity.types,
+        ),
+      )
+      c = c + 1
+    }
+    return Option<u64>.some(hash)
+  }
+
+  // The earlier style for `key` when its build inputs equal these (see shareKey).
+  fn sharedStyle(
+    self: &Engine,
+    key: u64,
+    declarations: &[Declaration],
+    candidates: &[Candidate],
+    parent: Option<StyleId>,
+  ) -> Option<StyleId> {
+    let record = match &self.shareKeys.get(key) {
+      Option<usize>.Some { value } => self.shared.asSlice()[value]
+      _ => {
+        return Option<StyleId>.None
+      }
+    }
+    let from = match &parent {
+      Option<StyleId>.Some { value } => value.index
+      _ => {
+        return Option<StyleId>.None
+      }
+    }
+    if record.count != candidates.length || !self.sameInheritance(record.parent, from) {
+      return Option<StyleId>.None
+    }
+    let earlier = Slice.view<Candidate>(
+      self.sharedCandidates.asSlice(),
+      record.candidates,
+      record.count,
+    )
+    let mut c: usize = 0
+    while c < candidates.length {
+      let a = earlier[c]
+      let b = candidates[c]
+      if !sameDeclaration(declarations[a.declaration], declarations[b.declaration])
+        || !samePriority(a.priority, b.priority) {
+        return Option<StyleId>.None
+      }
+
+      // Document order only breaks ties, so it must compare the same way for every pair.
+      let mut d: usize = 0
+      while d < c {
+        let earlierA = earlier[d].priority.order
+        let earlierB = candidates[d].priority.order
+        if (a.priority.order < earlierA) != (b.priority.order < earlierB)
+          || (a.priority.order == earlierA) != (b.priority.order == earlierB) {
+          return Option<StyleId>.None
+        }
+        d = d + 1
+      }
+      c = c + 1
+    }
+    return Option<StyleId>.some(StyleId { index: record.style })
+  }
+
+  // Whether children of styles `a` and `b` read the same inputs from them (see inheritKey).
+  fn sameInheritance(self: &Engine, a: usize, b: usize) -> bool {
+    if a == b {
+      return true
+    }
+    let first = &self.styles.asSlice()[a]
+    let second = &self.styles.asSlice()[b]
+    if first.scope.index != second.scope.index || first.root.index != second.root.index {
+      return false
+    }
+    let x = first.dimensions
+    let y = second.dimensions
+    if x.fontSize != y.fontSize || x.xHeight != y.xHeight || x.capHeight != y.capHeight
+      || x.zeroAdvance != y.zeroAdvance
+      || x.ideographAdvance != y.ideographAdvance
+      || x.lineHeight != y.lineHeight {
+      return false
+    }
+    let mut n: usize = 0
+    while n < self.inheritedCount {
+      let index = u16.toUsize(self.inheritedIndices[n])
+      let p = first.entries[index]
+      let q = second.entries[index]
+      if p.value != q.value || p.buffer != q.buffer || p.property != q.property
+        || p.sourceProperty != q.sourceProperty {
+        return false
+      }
+      n = n + 1
+    }
+    return true
+  }
+}
+
+fn mix(hash: u64, value: u64) -> u64 {
+  return u64.wrappingMultiply(hash ^ value, 1099511628211)
+}
+
+fn sameDeclaration(a: Declaration, b: Declaration) -> bool {
+  let same = match &a.target {
+    Target.Property { property: first } => match &b.target {
+      Target.Property { property: second } => first == second
+      _ => false
+    }
+    _ => false
+  }
+  let value = match &a.specified {
+    Specified.Parsed { value: first } => match &b.specified {
+      Specified.Parsed { value: second } => first.index == second.index
+      _ => false
+    }
+    _ => false
+  }
+  return same && value && a.buffer == b.buffer && a.important == b.important
+}
+
+// Equal in everything the cascade compares but document order, which sharedStyle compares
+// pairwise.
+fn samePriority(a: Priority, b: Priority) -> bool {
+  return a.origin == b.origin && a.important == b.important
+    && a.encapsulationDepth == b.encapsulationDepth
+    && a.specificity.ids == b.specificity.ids
+    && a.specificity.classes == b.specificity.classes
+    && a.specificity.types == b.specificity.types
+    && a.inline == b.inline
 }
 
 fn numberOr(value: Option<f64>, fallback: f64) -> f64 {
