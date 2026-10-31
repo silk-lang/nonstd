@@ -63,13 +63,21 @@ import used_transforms
 import used_paints { Store as PaintStore }
 import used_paints
 import used_meshes
+import used_hatches
+import used_hatches { Section }
 import used_markers { Layout as MarkerLayout }
 import used_patterns
 import used_patterns { Layout as PatternLayout }
 import vector.projective { Homography }
 import used_markers
 import used_frames { Frame }
-import paint_metadata { Metadata as PaintMetadata, MarkerOrient, MarkerUnits }
+import paint_metadata {
+  Metadata as PaintMetadata,
+  MarkerOrient,
+  MarkerUnits,
+  HatchMetadata,
+  CoordinateUnits
+}
 import svg_geometry.markers { MarkerPosition, MarkerKind, MarkerError }
 import svg_geometry.markers
 import reference_bounds { Cache as ReferenceBoundsCache }
@@ -83,12 +91,13 @@ import svg_css.tokens { Limits, CssError, equal }
 import svg_css.transform_values { ReferenceBox }
 import svg_css.transform_values
 import svg_css.values { Value, ValueId, PaintLayer, VectorReference }
-import svg_css.dimensions { Context }
+import svg_css.dimensions { Context, ExprId }
 import view_fragment { SpatialView, SpatialUnit }
 import svg_geometry.geometry { Rect, Point, Path, Transform, Size }
 import svg_geometry.transforms { Matrix, Facing }
 import svg_geometry.transforms
 import svg_geometry.svg
+import svg_geometry.math
 import svg_geometry.bounds { Result as BoundsResult }
 import svg_geometry.bounds
 import svg_geometry.svg { AspectRatio, Alignment }
@@ -2159,12 +2168,290 @@ effect fn pictureBounds(
   return bounds
 }
 
+// 2016 CR pservers.html #Hatches: a picture one strip (pitch) wide and as long as the
+// painted area along the strip, tiled across strips. `reach` widens the element's
+// bounds to cover its stroke.
+effect fn hatchPaint(
+  graph: &Graph,
+  styles: &mut StyledGraph,
+  node: OccurrenceId,
+  viewport: Rect,
+  bounds: Rect,
+  reach: f64,
+  transform: &Mapping,
+  state: &mut Planning,
+  paints: &mut PaintStore,
+  limits: &Limits,
+) -> Option<Paint>
+  ! CssError | RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if !used_hatches.named(graph, node, b"hatch") {
+    return Option<Paint>.None
+  }
+  let data = match &(run used_hatches.merged(&mut paints.*, graph, &mut styles.*, node, limits)) {
+    Option<HatchMetadata>.Some { value } => value
+    _ => {
+      return Option<Paint>.None
+    }
+  }
+  let objectUnits = match &data.units {
+    Option<CoordinateUnits>.Some { value } => value == CoordinateUnits.ObjectBoundingBox
+    _ => true
+  }
+  let objectContent = match &data.contentUnits {
+    Option<CoordinateUnits>.Some { value } => value == CoordinateUnits.ObjectBoundingBox
+    _ => false
+  }
+  if (objectUnits || objectContent) && (bounds.width() == 0.0 || bounds.height() == 0.0) {
+    return Option<Paint>.some(Paint.None)
+  }
+  let reference = if objectUnits {
+    Rect { xMin: 0.0, yMin: 0.0, xMax: 1.0, yMax: 1.0 }
+  } else {
+    viewport
+  }
+  let style = match &styles.nodeStyle(node) {
+    Option<StyleId>.Some { value } => value
+    _ => {
+      fail RenderError.InvalidStyleContext
+    }
+  }
+  let width = reference.width()
+  let height = reference.height()
+  let basis = math.hypot(width, height) / 1.4142135623730951
+  let x = run used_paints.number(&mut styles.catalog.engine, style, data.x, width, 0.0)
+  let y = run used_paints.number(&mut styles.catalog.engine, style, data.y, height, 0.0)
+  let pitch = run used_paints.number(&mut styles.catalog.engine, style, data.pitch, basis, 0.0)
+  let degrees = run used_paints.number(&mut styles.catalog.engine, style, data.rotate, 1.0, 0.0)
+  if !(pitch > 0.0) {
+    // #HatchElementAttributes: zero disables the paint; negative values are invalid.
+    return Option<Paint>.some(Paint.None)
+  }
+  let fillReference = if objectUnits {
+    reference
+  } else {
+    bounds
+  }
+  let local = match &used_transforms.element(
+    &styles.catalog.engine,
+    style,
+    reference,
+    fillReference,
+    fillReference,
+  ) {
+    Option<Matrix>.Some { value } => run Mapping.fromMatrix(&value)
+    _ => {
+      fail RenderError.InvalidGeometry
+    }
+  }
+  let boxMap = Transform.new(bounds.width(), 0.0, 0.0, bounds.height(), bounds.xMin, bounds.yMin)
+  let unitsMap = if objectUnits {
+    Mapping.Affine { value: boxMap }
+  } else {
+    Mapping.identity()
+  }
+  let strip = Transform.multiply(
+    Transform.translation(x, y),
+    Transform.rotation(math.radians(degrees)),
+  )
+  let stripMap = run unitsMap.compose(&(run local.compose(&Mapping.Affine { value: strip })))
+  let inverse = match &stripMap {
+    Mapping.Affine { value } => match &value.inverse() {
+      Option<Transform>.Some { value: inverted } => inverted
+      _ => {
+        return Option<Paint>.some(Paint.None)
+      }
+    }
+    _ => {
+      // A projective hatch transform has no finite strip extent to cover.
+      return Option<Paint>.some(Paint.None)
+    }
+  }
+
+  // The painted area along the strip, in strip coordinates.
+  let area = Rect {
+    xMin: bounds.xMin - reach,
+    yMin: bounds.yMin - reach,
+    xMax: bounds.xMax + reach,
+    yMax: bounds.yMax + reach,
+  }
+  let corners = [
+    Point.new(area.xMin, area.yMin),
+    Point.new(area.xMax, area.yMin),
+    Point.new(area.xMax, area.yMax),
+    Point.new(area.xMin, area.yMax),
+  ]
+  let mut top = f64.INFINITY
+  let mut bottom = -f64.INFINITY
+  let mut c: usize = 0
+  while c < 4 {
+    let point = inverse.mapPoint(corners[c])
+    top = f64.min(top, point.y)
+    bottom = f64.max(bottom, point.y)
+    c = c + 1
+  }
+  if !(f64.isFinite(top) && f64.isFinite(bottom)) || bottom <= top {
+    return Option<Paint>.some(Paint.None)
+  }
+
+  // #hatchContentUnits: content lengths scale between the strip and content units.
+  let scale = if objectContent == objectUnits {
+    [1.0, 1.0]
+  } else if objectContent {
+    [bounds.width(), bounds.height()]
+  } else {
+    [1.0 / bounds.width(), 1.0 / bounds.height()]
+  }
+  let contentTop = top / scale[1]
+  let contentBottom = bottom / scale[1]
+  let mut shapes = List<ResolvedShape>.make()
+  let mut nodes = List<ResolvedNode>.make()
+  let mut segments = 0.0
+  let mut child = used_hatches.firstChild(graph, node)
+  while true {
+    let current = match &child {
+      Option<OccurrenceId>.Some { value } => value
+      _ => {
+        break
+      }
+    }
+    child = graph.occurrences.asSlice()[current.index].nextSibling
+    if !used_hatches.named(graph, current, b"hatchpath") {
+      continue
+    }
+    let pathStyle = match &styles.nodeStyle(current) {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        continue
+      }
+    }
+    let used = used_hatches.strokeOnly(
+      run used_style.project(
+        &styles.catalog.engine,
+        pathStyle,
+        viewport.width(),
+        viewport.height(),
+        &mut state.dashCache,
+        &mut state.dashes,
+      ),
+    )
+    if !present(&used.stroke, 0) || !(used.strokeWidth > 0.0) || used.strokeOpacity == 0.0 {
+      continue
+    }
+    let metadata = run used_paints.metadataIndex(
+      &mut paints.*,
+      graph,
+      &mut styles.*,
+      current,
+      limits,
+    )
+    let offsetExpression = match &metadata {
+      Option<usize>.Some { value } => match &paints.metadata.asSlice()[value] {
+        PaintMetadata.Hatchpath { value: entry } => entry.offset
+        _ => Option<ExprId>.None
+      }
+      _ => Option<ExprId>.None
+    }
+    let offset = run used_paints.number(
+      &mut styles.catalog.engine,
+      pathStyle,
+      offsetExpression,
+      viewport.width(),
+      0.0,
+    )
+
+    // Strokes reach past their section's ends; repeat enough sections to cover them.
+    let margin = used.strokeWidth * f64.max(used.miterLimit, 1.5)
+    let source = graph.occurrences.asSlice()[current.index].source
+    let document = graph.sourceDocument(source)
+    let path = match Document.attribute(document, source.node, b"", b"d") {
+      Option<&[u8]>.Some { value: d } => {
+        let section = match move run used_hatches.section(d) {
+          Option<Section>.Some { value } => move value
+          _ => {
+            continue
+          }
+        }
+        let first = f64.floor((contentTop - margin) / section.period) - 1.0
+        let last = f64.ceil((contentBottom + margin) / section.period) + 1.0
+        segments = segments + (last - first + 1.0) * usize.toF64(section.path.length())
+        if !(segments <= used_hatches.MAX_SEGMENTS) {
+          fail RenderError.TooLarge
+        }
+        run used_hatches.repeat(&section, first, last)
+      }
+      _ => run used_hatches.line(contentTop - margin, contentBottom + margin)
+    }
+    let index = state.paths.length()
+    run state.paths.append(move path)
+    let shape = shapes.length()
+    run shapes.append(
+      ResolvedShape {
+        path: index,
+        transform: Mapping.Affine {
+          value: Transform.new(scale[0], 0.0, 0.0, scale[1], offset * scale[0], -top),
+        },
+        strokeSpace: Option<usize>.None,
+        clip: Option<usize>.None,
+        bounds: Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 },
+        style: used,
+      },
+    )
+    run nodes.append(ResolvedNode.Paint { shape: shape, layer: PaintLayer.Stroke })
+  }
+  if shapes.length() == 0 {
+    return Option<Paint>.some(Paint.None)
+  }
+  let tile = Rect { xMin: 0.0, yMin: 0.0, xMax: pitch, yMax: bottom - top }
+
+  // #HatchNotes: overflow hidden clips to the strip; visible draws neighbouring strips'
+  // overflow, later strips over earlier ones. Along the strip the picture covers the
+  // whole painted area, so it is always cut there.
+  let overflow = run used_viewports.clipping(
+    &styles.catalog.engine,
+    style,
+    tile,
+    Transform.identity(),
+  )
+  let across = match &overflow {
+    Option<Clip>.Some { value } => value.x || value.y
+    _ => false
+  }
+  let clip = Option<Clip>.some(Clip { rectangle: tile, x: across, y: true })
+  let contentBounds = run pictureBounds(&mut state.*, &mut shapes, &mut nodes, clip, tile)
+  if contentBounds.width() == 0.0 || contentBounds.height() == 0.0 {
+    return Option<Paint>.some(Paint.None)
+  }
+  let definition = state.patterns.length()
+  if definition >= graph.limits.maxOccurrences {
+    fail RenderError.TooLarge
+  }
+  run state.patterns.append(
+    ResolvedPattern {
+      clip: clip,
+      tile: tile,
+      contentBounds: contentBounds,
+      shapes: move shapes,
+      nodes: move nodes,
+    },
+  )
+  run state.patternDepths.append(0)
+  run state.patternReferences.append(0)
+  let placement = run transform.compose(
+    &(run stripMap.compose(&Mapping.Affine { value: Transform.translation(0.0, top) })),
+  )
+  let index = paints.paints.length()
+  run paints.paints.append(PaintInstance.Pattern { pattern: definition, transform: placement })
+  return Option<Paint>.some(Paint.Server { index: index })
+}
+
 effect fn resourcePaint(
   graph: &Graph,
   styles: &mut StyledGraph,
   node: OccurrenceId,
   viewport: Rect,
   bounds: Rect,
+  reach: f64,
   transform: &Mapping,
   context: &PaintContext,
   state: &mut Planning,
@@ -2176,6 +2463,21 @@ effect fn resourcePaint(
 ) -> Option<Paint>
   ! CssError | RenderError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
+  let hatch = run hatchPaint(
+    graph,
+    &mut styles.*,
+    node,
+    viewport,
+    bounds,
+    reach,
+    transform,
+    &mut state.*,
+    &mut paints.*,
+    limits,
+  )
+  if hatch.isSome() {
+    return hatch
+  }
   let mesh = run used_meshes.paint(
     &mut paints.*,
     &mut state.images.assets,
@@ -2521,6 +2823,9 @@ effect fn nodePaints(
     Option<Rect>.Some { value } => value
     _ => Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
   }
+
+  // How far the element's stroke reaches past its bounds, for hatches.
+  let reach = used.strokeWidth * 0.5 * f64.max(used.miterLimit, 1.5)
   let mut resolvedFill = false
   if let Option<OccurrenceId>.Some { value } = &fill {
     if let Option<Paint>.Some { value: paint } = &(run resourcePaint(
@@ -2529,6 +2834,7 @@ effect fn nodePaints(
       value,
       viewport,
       bounds,
+      reach,
       transform,
       context,
       &mut state.*,
@@ -2556,6 +2862,7 @@ effect fn nodePaints(
       value,
       viewport,
       bounds,
+      reach,
       transform,
       context,
       &mut state.*,
