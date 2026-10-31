@@ -2,6 +2,7 @@
 import url { Url, UrlError }
 import resources {
   Resolver,
+  DataOnly,
   Response,
   ResourceKind,
   ResourceError,
@@ -154,6 +155,190 @@ pub struct Catalog {
   presentations: HashMap<u64, usize>,
   // Copies of the host's pretokenized sheets (Initials.prepareSheet), each used once.
   prepared: List<PreparedSheet>,
+  // The user-agent sheet is already collected (see Catalog.prepareUserAgent).
+  userAgent: bool,
+}
+
+/// A catalog holding only a collected user-agent sheet, which documents copy instead of
+/// collecting the sheet again.
+pub struct PreparedCatalog {
+  catalog: Catalog,
+  limits: Limits,
+}
+
+/// Style state a host prepares once for all its documents.
+pub struct HostStyles {
+  pub initials: Initials,
+  pub catalog: Option<PreparedCatalog>,
+}
+
+impl HostStyles {
+  /// Initial values parsed under `limits`, with the user-agent sheet collected when it can be
+  /// copied (see Catalog.prepareUserAgent).
+  pub effect fn make(sheet: &[u8], environment: &Environment, limits: &Limits) -> HostStyles
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut initials = run Initials.make(limits)
+
+    // A sheet that fails here is collected, or tokenized, per document instead.
+    run Effect.catch<CssError>(initials.prepareSheet(sheet, limits), unprepared)
+    let mut resolver = DataOnly.make(ResourceLimits.defaults())
+    let catalog = run Effect.catch<CssError>(
+      Catalog.prepareUserAgent(Option<&Initials>.some(&initials), sheet, environment, limits),
+      uncollected,
+    )
+      |> Effect.provideMut<Resolver>(&mut resolver)
+    return HostStyles { initials: move initials, catalog: move catalog }
+  }
+
+  /// A catalog for one document, copied from the prepared one when it applies.
+  pub effect fn catalogFor(styles: Option<&HostStyles>, limits: &Limits) -> Catalog
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let host = match &styles {
+      Option<&HostStyles>.Some { value } => value
+      _ => {
+        return run Catalog.make()
+      }
+    }
+    if let Option<PreparedCatalog>.Some { value: prepared } = &host.catalog {
+      let copied = run prepared.copyFor(limits)
+      match move copied {
+        Option<Catalog>.Some { value } => {
+          return move value
+        }
+        _ => {}
+      }
+    }
+    return run Catalog.makeWith(Option<&Initials>.some(&host.initials))
+  }
+}
+
+effect fn unprepared(error: CssError) -> () {
+  drop error
+}
+
+effect fn uncollected(error: CssError) -> Option<PreparedCatalog> {
+  drop error
+  return Option<PreparedCatalog>.None
+}
+
+impl PreparedCatalog {
+  /// A copy of the prepared catalog for a document whose CSS limits are the ones it was
+  /// collected under, so every budget charge and failure matches collecting it; None otherwise.
+  pub effect fn copyFor(self: &PreparedCatalog, limits: &Limits) -> Option<Catalog>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !sameLimits(&self.limits, limits) {
+      return Option<Catalog>.None
+    }
+    let source = &self.catalog
+    let engine = match move run source.engine.copyUnstyled() {
+      Option<Engine>.Some { value } => move value
+      _ => {
+        return Option<Catalog>.None
+      }
+    }
+    let mut buffers = run List<TokenBuffer>.makeWithCapacity(source.buffers.length())
+    let mut i: usize = 0
+    while i < source.buffers.length() {
+      run buffers.append(run source.buffers.asSlice()[i].copy())
+      i = i + 1
+    }
+    let mut declarations = run List<Declaration>.makeWithCapacity(source.declarations.length())
+    run declarations.appendSlice(source.declarations.asSlice())
+    let mut sources = run List<Source>.makeWithCapacity(source.sources.length())
+    run sources.appendSlice(source.sources.asSlice())
+    let mut rules = run List<StyleRule>.makeWithCapacity(source.rules.length())
+    i = 0
+    while i < source.rules.length() {
+      let rule = &source.rules.asSlice()[i]
+      run rules.append(
+        StyleRule {
+          selectors: run rule.selectors.copy(),
+          buffer: rule.buffer,
+          declarations: rule.declarations,
+          origin: rule.origin,
+        },
+      )
+      i = i + 1
+    }
+    let mut sets = run List<RuleSet>.makeWithCapacity(source.sets.length())
+    i = 0
+    while i < source.sets.length() {
+      let set = &source.sets.asSlice()[i]
+      let mut members = run List<usize>.makeWithCapacity(set.rules.length())
+      run members.appendSlice(set.rules.asSlice())
+
+      // Nothing has matched against the prepared catalog, so no index is built yet.
+      run sets.append(
+        RuleSet {
+          base: set.base,
+          policy: set.policy,
+          rules: move members,
+          index: CandidateIndex.make(),
+        },
+      )
+      i = i + 1
+    }
+    let mut prepared = run List<PreparedSheet>.makeWithCapacity(source.prepared.length())
+    i = 0
+    while i < source.prepared.length() {
+      run prepared.append(run source.prepared.asSlice()[i].copy())
+      i = i + 1
+    }
+    return Option<Catalog>.some(
+      Catalog {
+        buffers: move buffers,
+        declarations: move declarations,
+        engine: move engine,
+        fontFaces: List<DocumentFace>.make(),
+        keyframes: List<Keyframes>.make(),
+        colorProfiles: List<SheetProfile>.make(),
+        sources: move sources,
+        urls: List<Url>.make(),
+        cache: List<Cached>.make(),
+        rules: move rules,
+        sets: move sets,
+        active: List<usize>.make(),
+        inputBytes: source.inputBytes,
+        storageBytes: source.storageBytes,
+        tokenCount: source.tokenCount,
+        ruleCount: source.ruleCount,
+        declarationCount: source.declarationCount,
+        presentations: HashMap<u64, usize>.make(Hash.seed(0)),
+        prepared: move prepared,
+        userAgent: true,
+      },
+    )
+  }
+}
+
+fn sameLimits(a: &Limits, b: &Limits) -> bool {
+  return a.maxInputBytes == b.maxInputBytes && a.maxStorageBytes == b.maxStorageBytes
+    && a.maxTokens == b.maxTokens
+    && a.maxDepth == b.maxDepth
+    && a.maxRules == b.maxRules
+    && a.maxDeclarations == b.maxDeclarations
+}
+
+// Whether a sheet's only at-rules are @namespace, so collecting it reads neither the media
+// environment nor any resource.
+fn plainSheet(buffer: &TokenBuffer) -> bool {
+  let tokens = buffer.tokens.asSlice()
+  let mut i: usize = 0
+  while i < tokens.length {
+    match &tokens[i].kind {
+      Kind.AtKeyword { name } => {
+        if !insensitive(buffer.text(name), b"namespace") {
+          return false
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return true
 }
 
 struct SheetMetadata {
@@ -330,7 +515,54 @@ impl Catalog {
       declarationCount: 0,
       presentations: HashMap<u64, usize>.make(Hash.seed(0)),
       prepared: move prepared,
+      userAgent: false,
     }
+  }
+
+  /// Collects `sheet` as the user-agent sheet, as buildGraph adds it under the document's
+  /// first registered base, for documents to copy. None for a sheet with at-rules other than
+  /// @namespace, which may read the environment, or whose values cannot be copied.
+  pub effect fn prepareUserAgent(
+    initials: Option<&Initials>,
+    sheet: &[u8],
+    environment: &Environment,
+    limits: &Limits,
+  ) -> Option<PreparedCatalog>
+    ! CssError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let mut catalog = run Catalog.makeWith(initials)
+    let buffer = run catalog.buffer(
+      sheet,
+      Source { url: 0, encoding: Encoding.Utf8, ruleSet: RuleSetId { index: 0 } },
+      limits,
+    )
+    if !plainSheet(&catalog.buffers.asSlice()[buffer]) {
+      return Option<PreparedCatalog>.None
+    }
+    run catalog.active.append(0)
+    let bindings = List<NamespaceBinding>.make()
+    let range = catalog.buffers.asSlice()[buffer].all()
+    run catalog.collect(
+      buffer,
+      range,
+      bindings.asSlice(),
+      true,
+      Origin.UserAgent,
+      environment,
+      limits,
+      0,
+    )
+    let removed = catalog.active.pop()
+    catalog.userAgent = true
+    if !catalog.engine.values.copyable() {
+      return Option<PreparedCatalog>.None
+    }
+    return Option<PreparedCatalog>.some(PreparedCatalog { catalog: move catalog, limits: limits.* })
+  }
+
+  /// Whether the user-agent sheet is already collected, so buildGraph does not add it.
+  pub fn hasUserAgentSheet(self: &Self) -> bool {
+    return self.userAgent
   }
 
   pub effect fn createRuleSet(self: &mut Self, base: usize, policy: Policy) -> RuleSetId
