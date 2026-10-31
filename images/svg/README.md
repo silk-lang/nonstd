@@ -143,8 +143,8 @@ specification and resvg or the browsers disagree, and this renderer follows the 
 
 The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
 text features: `shape-padding`, `shape-margin`, `text-align` inside `shape-inside`,
-right-to-left and vertical wrapping, `vkern` and external SVG fonts. Two smaller items are
-also open: `paint-order` on text decorations, and `mpath` paths from the CSS `d` property.
+right-to-left and vertical wrapping, `vkern` and external SVG fonts. One smaller item is
+also open: `paint-order` on text decorations.
 Hit testing is optional and not implemented.
 
 ## Performance

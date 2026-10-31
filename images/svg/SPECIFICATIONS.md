@@ -534,7 +534,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Targets: `href`/`xlink:href`, `attributeName` (with an `xlink:` prefix), `attributeType` (CSS/XML/auto)
 - [x] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`, `a.begin`), `repeat(n)` syncbase-style values, indefinite; event, accessKey and wallclock values stay unresolved (no host timeline); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
 - [x] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
-- [ ] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes). Open: an `mpath` target whose path comes from the CSS `d` property is not used (WPT mpath).
+- [x] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes); an `mpath` uses its target's computed `d`
 - [x] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t* (see Animation sampling for the approximations)
 
 ### 5.14 Optional, last
