@@ -85,6 +85,8 @@ class ReftestTests(unittest.TestCase):
     def test_renderer_argv_requires_placeholders_without_shell(self):
         """https://www.w3.org/TR/2018/CR-SVG2-20181004/conform.html#secure-static-mode"""
         self.assertEqual(reftests.renderer_argv(['renderer', '{input}', '-o', '{output}'], Path('a b.svg'), Path('out.png')), ['renderer', 'a b.svg', '-o', 'out.png'])
+        self.assertEqual(reftests.renderer_argv(['r', '{input}', '-o', '{output}', '--resources-dir', '{root}'], Path('a.svg'), Path('o.png'), Path('/suite')),
+                         ['r', 'a.svg', '-o', 'o.png', '--resources-dir', '/suite'])
         with self.assertRaises(ValueError):
             reftests.renderer_argv(['renderer'], Path('a.svg'), Path('out.png'))
 
