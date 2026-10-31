@@ -9,7 +9,7 @@ import dimensions { ExprId, Dimension, Unit, Expr, Store as NumericStore }
 import dimensions
 import colors { Color, Identity }
 import colors
-import text_values { TextValue }
+import text_values { TextValue, Item, PaletteNode, PaletteStop }
 import text_values
 import effect_values { EffectValue }
 import effect_values
@@ -136,6 +136,127 @@ pub union Value {
   Raw { pub text: Span },
 }
 
+/// Arena lengths of a [`Store`] at one point (see [`Store.mark`]).
+pub struct StoreMark {
+  numerics: usize,
+  values: usize,
+  strings: usize,
+  paths: usize,
+  iccColors: usize,
+}
+
+impl Copy for StoreMark {}
+
+// Values that own no list and point at no path or ICC colour, so a copy is a field copy.
+fn simple(item: &Value) -> bool {
+  return match &item.* {
+    Value.Wide { keyword } => true
+    Value.Keyword { keyword } => true
+    Value.Numeric { expression, range, basis } => true
+    Value.Color { color } => true
+    Value.Paint { paint } => match &paint {
+      Paint.IccColor { color, icc } => false
+      Paint.Server { url, fallback } => match &fallback {
+        Fallback.IccColor { color, icc } => false
+        _ => true
+      }
+      _ => true
+    }
+    Value.Resource { url } => true
+    Value.Profile { name } => true
+    Value.PaintOrder { order } => true
+    Value.VectorEffect { flags, reference } => true
+    Value.ImageOrientation { angle, flip } => true
+    Value.Raw { text } => true
+    Value.Text { value } => true
+    Value.Effect { value } => match &value {
+      EffectValue.None => true
+      EffectValue.Clip { edges } => true
+      EffectValue.Background { fresh, region } => true
+      _ => false
+    }
+    Value.Transform { value } => match &value {
+      TransformValue.List { operations } => false
+      TransformValue.Individual { operation } => false
+      _ => true
+    }
+    _ => false
+  }
+}
+
+effect fn copySimple(item: &Value) -> Value
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &item.* {
+    Value.Wide { keyword } => Value.Wide { keyword: keyword }
+    Value.Keyword { keyword } => Value.Keyword { keyword: keyword }
+    Value.Numeric { expression, range, basis } => Value.Numeric {
+      expression: expression,
+      range: range,
+      basis: basis,
+    }
+    Value.Color { color } => Value.Color { color: color }
+    Value.Paint { paint } => Value.Paint { paint: paint }
+    Value.Resource { url } => Value.Resource { url: url }
+    Value.Profile { name } => Value.Profile { name: name }
+    Value.PaintOrder { order } => Value.PaintOrder { order: order }
+    Value.VectorEffect { flags, reference } => Value.VectorEffect {
+      flags: flags,
+      reference: reference,
+    }
+    Value.ImageOrientation { angle, flip } => Value.ImageOrientation { angle: angle, flip: flip }
+    Value.Raw { text } => Value.Raw { text: text }
+    Value.Text { value } => Value.Text { value: run copyText(&value) }
+    Value.Effect { value } => match &value {
+      EffectValue.Clip { edges } => Value.Effect { value: EffectValue.Clip { edges: edges } }
+      EffectValue.Background { fresh, region } => Value.Effect {
+        value: EffectValue.Background { fresh: fresh, region: region },
+      }
+      _ => Value.Effect { value: EffectValue.None }
+    }
+    Value.Transform { value } => match &value {
+      TransformValue.Origin { position, z } => Value.Transform {
+        value: TransformValue.Origin { position: position, z: z },
+      }
+      TransformValue.PerspectiveOrigin { position } => Value.Transform {
+        value: TransformValue.PerspectiveOrigin { position: position },
+      }
+      TransformValue.Perspective { depth } => Value.Transform {
+        value: TransformValue.Perspective { depth: depth },
+      }
+      TransformValue.Box { value: box } => Value.Transform {
+        value: TransformValue.Box { value: box },
+      }
+      TransformValue.Style { value: style } => Value.Transform {
+        value: TransformValue.Style { value: style },
+      }
+      TransformValue.BackfaceVisibility { value: backface } => Value.Transform {
+        value: TransformValue.BackfaceVisibility { value: backface },
+      }
+      _ => Value.Transform { value: TransformValue.None }
+    }
+    _ => Value.Wide { keyword: Wide.Initial }
+  }
+}
+
+effect fn copyText(value: &TextValue) -> TextValue
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut items = run List<Item>.makeWithCapacity(value.items.length())
+  run items.appendSlice(value.items.asSlice())
+  let mut palettes = run List<PaletteNode>.makeWithCapacity(value.palettes.length())
+  run palettes.appendSlice(value.palettes.asSlice())
+  let mut stops = run List<PaletteStop>.makeWithCapacity(value.paletteStops.length())
+  run stops.appendSlice(value.paletteStops.asSlice())
+  return TextValue {
+    property: value.property,
+    items: move items,
+    strings: run Bytes.copy(Bytes.asSlice(&value.strings)),
+    palettes: move palettes,
+    paletteStops: move stops,
+  }
+}
+
 pub struct Store {
   pub numerics: dimensions.Store,
   pub values: List<Value>,
@@ -171,8 +292,72 @@ impl Store {
     ! OutOfMemoryError
     ? &mut Allocator {
     let id = ValueId { index: self.values.length() }
+
+    // Every document's store takes the catalog's initial values (about 160), and Value is
+    // large, so doubling up from four elements copied the whole list several times.
+    if self.values.capacity() == 0 {
+      run self.values.reserve(256)
+    }
     run self.values.append(move value)
     return id
+  }
+
+  /// The lengths of the store's arenas, to roll a parse back to with [`Store.truncate`].
+  pub fn mark(self: &Store) -> StoreMark {
+    return StoreMark {
+      numerics: self.numerics.length(),
+      values: self.values.length(),
+      strings: Bytes.asSlice(&self.strings).length,
+      paths: self.paths.length(),
+      iccColors: self.iccColors.length(),
+    }
+  }
+
+  /// Drops everything added since `mark`.
+  pub fn truncate(self: &mut Store, mark: StoreMark) -> () {
+    self.numerics.truncate(mark.numerics)
+    self.values.truncate(mark.values)
+    Bytes.truncate(&mut self.strings, mark.strings)
+    self.paths.truncate(mark.paths)
+    self.iccColors.truncate(mark.iccColors)
+  }
+
+  /// Whether every value from `mark` on is one [`Store.copy`] can copy, and no path or ICC
+  /// colour was added.
+  pub fn simpleSince(self: &Store, mark: StoreMark) -> bool {
+    if self.paths.length() != mark.paths || self.iccColors.length() != mark.iccColors {
+      return false
+    }
+    let values = self.values.asSlice()
+    let mut i = mark.values
+    while i < values.length {
+      if !simple(&values[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// A copy of a store whose values are all simple (see [`Store.simpleSince`]) and that holds no
+  /// path or ICC colour, with the same ids.
+  pub effect fn copy(self: &Store) -> Store
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut values = run List<Value>.makeWithCapacity(self.values.length() + 256)
+    let source = self.values.asSlice()
+    let mut i: usize = 0
+    while i < source.length {
+      run values.append(run copySimple(&source[i]))
+      i = i + 1
+    }
+    return Store {
+      numerics: run self.numerics.copy(),
+      values: move values,
+      strings: run Bytes.copy(Bytes.asSlice(&self.strings)),
+      paths: List<Path>.make(),
+      iccColors: List<IccColor>.make(),
+    }
   }
 
   pub effect fn storeText(self: &mut Store, text: &[u8]) -> Span
