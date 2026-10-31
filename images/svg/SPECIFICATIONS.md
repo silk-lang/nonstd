@@ -379,12 +379,15 @@ use it.
 Calibrated patterns put dash boundaries exactly on path ends (`pathLength="1"` with
 `stroke-dasharray="1"`). The dasher walks a flattened centerline with its own
 certified uncertainty and refuses a boundary inside it only where the result could
-differ visibly: a corner (join or cap), a round or square cap that may or may not
-appear at an open end, or a seam that may split one cap into two. A dash ending
-within the uncertainty of an open end only moves its end cap, a butt dash beginning
-there is empty either way, and one dash spanning a smooth closed subpath either
-closes into a ring or leaves a gap within the uncertainty between its own caps. These
-three render.
+differ visibly: a corner (join or cap), or a seam that may split one cap into two. A
+dash ending within the uncertainty of an open end only moves its end cap, and one dash
+spanning a smooth closed subpath either closes into a ring or leaves a gap within the
+uncertainty between its own caps. A gap reaching to within the uncertainty of an open
+end, or of a closed seam where a gap also begins, is taken to end there: the dash
+positions algorithm (#StrokeDashing) begins no dash at the subpath length, and a
+boundary that close comes from values meant to coincide. So `stroke-dashoffset` equal
+to `pathLength`, the hidden first frame of a line-drawing animation, draws nothing
+with any cap. All of these render.
 
 For author length zero, follow the positive-scale limit described by
 [SVGWG issue 81](https://github.com/w3c/svgwg/issues/81) and
