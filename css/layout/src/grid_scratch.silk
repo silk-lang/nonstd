@@ -30,6 +30,9 @@ pub struct GridAxisScratch {
   // Two per item, for the sizing pass and the re-check (see
   // collectContributions): what measuring it last returned.
   pub memos: ContributionMemos,
+  // The sizing pass (ContributionMemos.stamp) whose contributions
+  // `contributions` holds, unchanged since, or 0.
+  pub contributionsPass: usize,
 }
 
 // An item's measured contribution and what it was measured for. It stands
@@ -51,6 +54,12 @@ impl Copy for ContributionMemo {}
 // each cross track's policy and, once final, its size.
 struct MemoPass {
   stamp: usize,
+  // The oldest pass of a run ending at `stamp` whose later passes kept every
+  // track as it was and laid out only the items the cache cleared (see
+  // ContributionMemos.carry): entries any of them found standing still stand.
+  floor: usize,
+  // The cache's clear clock when the pass started.
+  clock: usize,
   horizontal: bool,
   gap: f32,
   crossGap: f32,
@@ -65,13 +74,14 @@ struct MemoPass {
 impl MemoPass {
   fn make() -> MemoPass {
     return MemoPass {
-      stamp: 0, horizontal: false, gap: 0.0, crossGap: 0.0, ownFinal: false, crossFinal: false, policies: List<TrackPolicy>.make(),
+      stamp: 0, floor: 0, clock: 0, horizontal: false, gap: 0.0, crossGap: 0.0, ownFinal: false, crossFinal: false, policies: List<TrackPolicy>.make(),
       crossPolicies: List<TrackPolicy>.make(), crossSizes: List<f32>.make(), sizes: List<f32>.make(),
     }
   }
 
   fn reset(self: &mut Self) {
     self.stamp = 0
+    self.floor = 0
     self.policies.clear()
     self.crossPolicies.clear()
     self.crossSizes.clear()
@@ -158,6 +168,12 @@ pub struct ContributionMemos {
   entries: List<ContributionMemo>,
   stamp: usize,
   previous: usize,
+  // The previous pass's floor and clock (see MemoPass), and whether this pass
+  // keeps every track as that pass did.
+  floor: usize,
+  previousClock: usize,
+  flat: bool,
+  recheckPass: bool,
   sizing: MemoPass,
   recheck: MemoPass,
   // How many tracks before each one changed (see spanSame).
@@ -187,6 +203,7 @@ impl ContributionMemos {
   pub fn make() -> ContributionMemos {
     return ContributionMemos {
       base: Input.make(OptionalSize.none()), entries: List<ContributionMemo>.make(), stamp: 0, previous: 0,
+      floor: 0, previousClock: 0, flat: false, recheckPass: false,
       sizing: MemoPass.make(), recheck: MemoPass.make(),
       changed: List<usize>.make(), crossChanged: List<usize>.make(),
       marks: List<ItemMark>.make(),
@@ -225,6 +242,7 @@ impl ContributionMemos {
   pub fn startUntracked(self: &mut Self) {
     self.stamp = self.stamp + 1
     self.previous = 0
+    self.flat = false
     self.sizing.stamp = 0
     self.recheck.stamp = 0
   }
@@ -235,15 +253,37 @@ impl ContributionMemos {
   pub effect fn startPass(
     self: &mut Self, recheck: bool, horizontal: bool, ownFinal: bool, crossFinal: bool, gap: f32, crossGap: f32,
     policies: &[TrackPolicy], crossPolicies: &[TrackPolicy], tracks: &[TrackState], crossTracks: &[TrackState],
+    clock: usize,
   ) ! OutOfMemoryError ? &mut Allocator {
     self.stamp = self.stamp + 1
-    if recheck {
-      self.previous = run startKind(&mut self.recheck, &mut self.changed, &mut self.crossChanged, self.stamp,
-        horizontal, ownFinal, crossFinal, gap, crossGap, policies, crossPolicies, tracks, crossTracks)
-    } else {
-      self.previous = run startKind(&mut self.sizing, &mut self.changed, &mut self.crossChanged, self.stamp,
-        horizontal, ownFinal, crossFinal, gap, crossGap, policies, crossPolicies, tracks, crossTracks)
-    }
+    self.recheckPass = recheck
+    let mut seen = &mut self.sizing
+    if recheck { seen = &mut self.recheck }
+    self.floor = seen.floor
+    self.previousClock = seen.clock
+    seen.clock = clock
+    seen.floor = self.stamp
+    self.previous = run startKind(&mut seen, &mut self.changed, &mut self.crossChanged, self.stamp,
+      horizontal, ownFinal, crossFinal, gap, crossGap, policies, crossPolicies, tracks, crossTracks)
+    // Every track kept what keys read of it, in both axes.
+    let changed = self.changed.asSlice()
+    let crossChanged = self.crossChanged.asSlice()
+    self.flat = self.previous != 0 && changed.length == policies.length + 1 && changed[policies.length] == 0
+      && crossChanged.length == crossPolicies.length + 1 && crossChanged[crossPolicies.length] == 0
+  }
+
+  // Whether this pass keeps every track as the previous pass of its kind did,
+  // which ran when the cache's clear clock was `previousClock()`.
+  pub fn keepsTracks(self: &Self) -> bool { return self.flat }
+  pub fn previousClearClock(self: &Self) -> usize { return self.previousClock }
+  pub fn previousPass(self: &Self) -> usize { return self.previous }
+  pub fn pass(self: &Self) -> usize { return self.stamp }
+
+  // Records that this flat pass looked only at the items cleared since the
+  // previous one: entries the passes since its floor found standing stand.
+  pub fn carry(self: &mut Self) {
+    if self.recheckPass { self.recheck.floor = self.floor }
+    else { self.sizing.floor = self.floor }
   }
 
   // Whether tracks `start` to `end` all kept what keys read of them.
@@ -262,7 +302,7 @@ impl ContributionMemos {
   ) -> Option<ItemContribution> {
     if slot >= self.entries.length() || self.previous == 0 { return Option<ItemContribution>.None }
     let memo = &mut self.entries.asMutSlice()[slot]
-    if memo.pass == self.previous && memo.id == id && memo.track == track && memo.trackEnd == trackEnd
+    if memo.pass >= self.floor && memo.id == id && memo.track == track && memo.trackEnd == trackEnd
       && memo.crossTrack == crossTrack && memo.crossEnd == crossEnd && cleared <= memo.clock
       && ContributionMemos.spanSame(&self.changed, track, trackEnd)
       && ContributionMemos.spanSame(&self.crossChanged, crossTrack, crossEnd) {
@@ -361,6 +401,7 @@ impl GridAxisScratch {
       policies: List<TrackPolicy>.make(),
       crossPolicies: List<TrackPolicy>.make(),
       memos: ContributionMemos.make(),
+      contributionsPass: 0,
     }
   }
 
@@ -372,6 +413,7 @@ impl GridAxisScratch {
     self.policies.clear()
     self.crossPolicies.clear()
     self.memos.clear()
+    self.contributionsPass = 0
   }
 }
 
