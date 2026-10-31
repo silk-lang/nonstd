@@ -1516,6 +1516,7 @@ effect fn collect(
   node: NodeId,
   ids: &[Identified],
   nodes: &[NodeId],
+  computed: &[MotionPath],
 ) -> Option<Animation>
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1642,7 +1643,7 @@ effect fn collect(
   let mut keyPoints = List<f64>.make()
   let mut rotate = Rotate.Angle { value: 0.0 }
   if kind == Kind.AnimateMotion {
-    path = run motionPath(document, node, ids)
+    path = run motionPath(document, node, ids, computed)
     if let Option<&[u8]>.Some { value } = attribute(document, node, b"keyPoints") {
       if !run numberList(value, &mut keyPoints) {
         return Option<Animation>.None
@@ -1916,11 +1917,16 @@ effect fn apply(animation: &Animation, sample: Sample, underlying: &Value) -> Op
 
 // --- Motion along a path ----------------------------------------------------------------------
 
-// The path data of the first mpath child that names an element with `d`, else the path
-// attribute (SVG Animations 2 #MPathElement, #AnimateMotionElement).
-effect fn motionPath(document: &Document, node: NodeId, ids: &[Identified]) -> Option<Bytes>
-  ! OutOfMemoryError
-  ? &mut Allocator {
+/// The computed `d` of an element that an mpath names, from a cascade run before sampling,
+/// so a `d` set in CSS is the motion path (SVG 2 #TheDProperty).
+pub struct MotionPath {
+  pub node: NodeId,
+  pub data: Bytes,
+}
+
+// The element the first mpath child names. Only the first mpath child counts, even when its
+// reference is unusable (SVG Animations 2 #MPathElement).
+fn mpathTarget(document: &Document, node: NodeId, ids: &[Identified]) -> Option<NodeId> {
   let mut child = Document.firstChild(document, node)
   while let Option<NodeId>.Some { value } = child {
     if element(document, value)
@@ -1934,22 +1940,156 @@ effect fn motionPath(document: &Document, node: NodeId, ids: &[Identified]) -> O
         }
       }
       if href.length > 1 && href[0] == 35 {
-        if let Option<NodeId>.Some { value: target } = findId(ids, view(href, 1, href.length)) {
-          if let Option<&[u8]>.Some { value: data } = attribute(document, target, b"d") {
-            return Option<Bytes>.Some { value: run Bytes.copy(data) }
-          }
-        }
+        return findId(ids, view(href, 1, href.length))
       }
-
-      // Only the first mpath child counts, even when its reference is unusable.
-      break
+      return Option<NodeId>.None
     }
     child = Document.nextSibling(document, value)
+  }
+  return Option<NodeId>.None
+}
+
+// The path data of the element the first mpath child names: its computed `d` when the caller
+// has one, else its `d` attribute. Without a usable mpath, the path attribute
+// (SVG Animations 2 #MPathElement, #AnimateMotionElement).
+effect fn motionPath(
+  document: &Document,
+  node: NodeId,
+  ids: &[Identified],
+  computed: &[MotionPath],
+) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<NodeId>.Some { value: target } = mpathTarget(document, node, ids) {
+    let mut k: usize = 0
+    while k < computed.length {
+      if computed[k].node.index == target.index {
+        return Option<Bytes>.Some { value: run Bytes.copy(Bytes.asSlice(&computed[k].data)) }
+      }
+      k = k + 1
+    }
+    if let Option<&[u8]>.Some { value: data } = attribute(document, target, b"d") {
+      return Option<Bytes>.Some { value: run Bytes.copy(data) }
+    }
   }
   return match attribute(document, node, b"path") {
     Option<&[u8]>.Some { value } => Option<Bytes>.Some { value: run Bytes.copy(value) }
     _ => Option<Bytes>.None
   }
+}
+
+effect fn identify(document: &Document) -> List<Identified>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ids = List<Identified>.make()
+  let count = Document.nodes(document).length
+  let mut index: usize = 0
+  while index < count {
+    let node = NodeId { index: index }
+    if element(document, node) {
+      if let Option<&[u8]>.Some { value } = attribute(document, node, b"id") {
+        run ids.append(Identified { id: run Bytes.copy(trim(value)), node: node })
+      }
+    }
+    index = index + 1
+  }
+  return move ids
+}
+
+/// The elements that the mpath children of animateMotion elements name, whose computed `d`
+/// [`sample`] takes as [`MotionPath`] values.
+pub effect fn motionTargets(document: &Document) -> List<NodeId>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut targets = List<NodeId>.make()
+  let ids = run identify(document)
+  let count = Document.nodes(document).length
+  let mut index: usize = 0
+  while index < count {
+    let node = NodeId { index: index }
+    index = index + 1
+    if element(document, node)
+      && equal(Document.namespaceUri(document, node), b"http://www.w3.org/2000/svg")
+      && equal(Document.localName(document, node), b"animateMotion") {
+      if let Option<NodeId>.Some { value } = mpathTarget(document, node, ids.asSlice()) {
+        run targets.append(value)
+      }
+    }
+  }
+  return move targets
+}
+
+/// Absolute path data for `path`, which parses back to the same segments.
+pub effect fn pathData(path: &Path) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  let segments = path.segments()
+  let mut k: usize = 0
+  while k < segments.length {
+    if k > 0 {
+      run out.append(b" ")
+    }
+    match &segments[k] {
+      Segment.MoveTo { to } => {
+        run out.append(b"M")
+        run point(&mut out, to)
+      }
+      Segment.LineTo { to } => {
+        run out.append(b"L")
+        run point(&mut out, to)
+      }
+      Segment.QuadraticTo { control, to } => {
+        run out.append(b"Q")
+        run point(&mut out, control)
+        run out.append(b" ")
+        run point(&mut out, to)
+      }
+      Segment.CubicTo { control1, control2, to } => {
+        run out.append(b"C")
+        run point(&mut out, control1)
+        run out.append(b" ")
+        run point(&mut out, control2)
+        run out.append(b" ")
+        run point(&mut out, to)
+      }
+      Segment.ArcTo { arc } => {
+        run out.append(b"A")
+        run writeNumber(&mut out, arc.radii.width)
+        run out.append(b" ")
+        run writeNumber(&mut out, arc.radii.height)
+        run out.append(b" ")
+        run writeNumber(&mut out, arc.rotationDegrees)
+        run out.append(
+          if arc.largeArc {
+            b" 1 "
+          } else {
+            b" 0 "
+          },
+        )
+        run out.append(
+          if arc.sweep {
+            b"1 "
+          } else {
+            b"0 "
+          },
+        )
+        run point(&mut out, arc.to)
+      }
+      Segment.Close => run out.append(b"Z")
+    }
+    k = k + 1
+  }
+  return move out
+}
+
+effect fn point(out: &mut Bytes, at: Point) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let xy = at.coordinates()
+  run writeNumber(&mut out.*, xy[0])
+  run out.append(b" ")
+  run writeNumber(&mut out.*, xy[1])
 }
 
 // simpleValue for scalar values: discrete, linear or spline, on keyTimes or evenly.
@@ -2187,7 +2327,8 @@ effect fn motionApply(animation: &Animation, sample: Sample, underlying: &Value)
 }
 
 /// Applies every animation of `document` at `time` seconds after the document begins.
-pub effect fn sample(document: &mut Document, time: f64) -> ()
+/// `computed` holds the computed `d` of the [`motionTargets`] that have one; it may be empty.
+pub effect fn sample(document: &mut Document, time: f64, computed: &[MotionPath]) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let count = Document.nodes(&document.*).length
@@ -2216,7 +2357,7 @@ pub effect fn sample(document: &mut Document, time: f64) -> ()
   let all = nodes.asSlice()
   index = 0
   while index < all.length {
-    let found = run collect(&document.*, all[index], ids.asSlice(), all)
+    let found = run collect(&document.*, all[index], ids.asSlice(), all, computed)
     match move found {
       Option<Animation>.Some { value } => run animations.append(move value)
       _ => {
