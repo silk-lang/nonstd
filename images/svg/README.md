@@ -127,7 +127,7 @@ under [tests/expectations](tests/expectations). Each fail or spec difference the
 
 | Suite | Cases | Pass | Fail | Spec difference | Skip |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| resvg | 1,751 | 295 | 1,224 | 230 | 2 |
+| resvg | 1,751 | 295 | 1,220 | 234 | 2 |
 | W3C SVG 1.1 Second Edition | 525 | 1 | 427 | 8 | 89 |
 | WPT SVG reftests | 2,290 | 311 | 29 | 39 | 1,911 |
 
@@ -140,6 +140,12 @@ they are HTML documents or need script; of the SVG reftests that remain, the fai
 wrapped and right-to-left text. A spec difference means the
 specification and resvg or the browsers disagree, and this renderer follows the specification.
 [SPECIFICATIONS.md](SPECIFICATIONS.md) lists each of those decisions.
+
+The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
+text features: `shape-padding`, `shape-margin`, `text-align` inside `shape-inside`,
+right-to-left and vertical wrapping, `vkern` and external SVG fonts. Two smaller items are
+also open: `paint-order` on text decorations, and `mpath` paths from the CSS `d` property.
+Hit testing is optional and not implemented.
 
 ## Performance
 

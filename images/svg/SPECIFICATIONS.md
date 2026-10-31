@@ -428,92 +428,88 @@ Clip-path resource geometry and CSS basic shapes now feed retained boolean clip
 nodes. CSS Masking 1 #the-clip-path requires isolation even for an unresolved URL;
 #ClippingPaths requires child unions and nested intersections independent of paint.
 These are checked with literal-geometry reftests, including antialiased shared edges.
-The phase checklist remains open pending the remaining clipping cases and gates.
-
-Masking, filters and their additional isolation behavior remain under
-implementation; these tests do not complete the combined coverage item below.
 
 ## Section-level coverage checklist
 
 Use this as the coverage map. Each line becomes tests before code. ✓ means done in a merged PR. Keep it updated in `SPECIFICATIONS.md`, not in a separate progress file. Section numbers are SVG 2 unless marked 1.1.
 
 ### 5.1 Document structure and syntax
-- [ ] XML 1.0: elements, attributes, namespaces, CDATA, comments, PIs (ignored except `xml-stylesheet`, which loads a sheet through the resolver), character and entity references, internal DTD subset entity declarations (common in Illustrator files), external DTD not fetched, BOM and UTF-8/UTF-16 decoding
-- [ ] Foreign namespaces and private data kept but not rendered (§5.10, 1.1 §23)
-- [ ] `svg` element: outermost and nested, `x`/`y`/`width`/`height`, `viewBox`, `preserveAspectRatio`, auto sizing (§5.1, §8.3, §8.12 intrinsic sizing), `version`/`baseProfile` ignored
-- [ ] `g`, `defs`, `symbol` (incl. SVG 2 `x`/`y`/`width`/`height`, `refX`/`refY`), `use` with shadow trees, inheritance into instances, CSS matching inside instances, `use` → external file through the resolver (§5.2–5.5)
-- [ ] Conditional processing: `switch`, `systemLanguage` (BCP 47 matching against host languages), `requiredExtensions`, 1.1 `requiredFeatures` (§5.6, 1.1 §5.8)
-- [ ] `desc`, `title`, `metadata` kept in the tree (§5.8)
-- [ ] Common attributes: `id`, `class`, `style`, `lang`, `xml:lang`, `xml:space` (with its 1.1 text behaviour), `tabindex` parsed only, `xml:base` (1.1) (§5.11)
-- [ ] Error handling: invalid attribute values make the attribute behave as unspecified (SVG 2 §2.4.6 and per-attribute rules), non-rendering elements, unknown elements
+- [x] XML 1.0: elements, attributes, namespaces, CDATA, comments, PIs (ignored except `xml-stylesheet`, which loads a sheet through the resolver), character and entity references, internal DTD subset entity declarations (common in Illustrator files), external DTD not fetched, BOM and UTF-8/UTF-16 decoding
+- [x] Foreign namespaces and private data kept but not rendered (§5.10, 1.1 §23)
+- [x] `svg` element: outermost and nested, `x`/`y`/`width`/`height`, `viewBox`, `preserveAspectRatio`, auto sizing (§5.1, §8.3, §8.12 intrinsic sizing), `version`/`baseProfile` ignored
+- [x] `g`, `defs`, `symbol` (incl. SVG 2 `x`/`y`/`width`/`height`, `refX`/`refY`), `use` with shadow trees, inheritance into instances, CSS matching inside instances, `use` → external file through the resolver (§5.2–5.5)
+- [x] Conditional processing: `switch`, `systemLanguage` (BCP 47 matching against host languages), `requiredExtensions`, 1.1 `requiredFeatures` (§5.6, 1.1 §5.8)
+- [x] `desc`, `title`, `metadata` kept in the tree (§5.8)
+- [x] Common attributes: `id`, `class`, `style`, `lang`, `xml:lang`, `xml:space` (with its 1.1 text behaviour), `tabindex` parsed only, `xml:base` (1.1) (§5.11)
+- [x] Error handling: invalid attribute values make the attribute behave as unspecified (SVG 2 §2.4.6 and per-attribute rules), non-rendering elements, unknown elements
 
 ### 5.2 Styling (§6)
-- [ ] `style` element with `type` and `media`; `@import`, `@media`, `@supports`, `@namespace`, `@font-face`, `@keyframes` (if CSS Animations), unknown at-rules skipped per CSS Syntax 3
-- [ ] Selectors 3 in full (type, class, id, attribute selectors incl. namespaces, structural pseudo-classes, combinators, `:not`, `:lang`, `:root`, `:first-child` …), static Selectors 4 additions, specificity
-- [ ] Cascade: origins, `!important`, `inherit`, `initial`, `unset`, `revert`, custom properties and `var()` with fallback and cycle detection, inheritance of every property per its definition
-- [ ] Presentation attributes for every property in SVG 2 §6.6's table, plus the 1.1-only ones (`enable-background`, `clip`, `kerning`, `glyph-orientation-*`, `color-profile`) and SVG 2 geometry properties (`cx`, `cy`, `r`, `rx`, `ry`, `x`, `y`, `width`, `height`, `d`) (§6.6, §7)
-- [ ] Required properties (§6.7) and the user agent style sheet (§6.8)
-- [ ] Values: lengths with all CSS units, percentages, numbers, `calc()` family, angles incl. `turn`, colours (all CSS Color 4 syntaxes: hex, `rgb()`/`hsl()`/`hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()`/`color()`, named colours, `transparent`, `currentColor`, system colours, 1.1 `icc-color()`), `url()`, paint values, lists, the 1.1 attribute grammars (§4.2, 1.1 ch. 4)
+- [x] `style` element with `type` and `media`; `@import`, `@media`, `@supports`, `@namespace`, `@font-face`, `@keyframes` (if CSS Animations), unknown at-rules skipped per CSS Syntax 3
+- [x] Selectors 3 in full (type, class, id, attribute selectors incl. namespaces, structural pseudo-classes, combinators, `:not`, `:lang`, `:root`, `:first-child` …), static Selectors 4 additions, specificity
+- [x] Cascade: origins, `!important`, `inherit`, `initial`, `unset`, `revert`, custom properties and `var()` with fallback and cycle detection, inheritance of every property per its definition
+- [x] Presentation attributes for every property in SVG 2 §6.6's table, plus the 1.1-only ones (`enable-background`, `clip`, `kerning`, `glyph-orientation-*`, `color-profile`) and SVG 2 geometry properties (`cx`, `cy`, `r`, `rx`, `ry`, `x`, `y`, `width`, `height`, `d`) (§6.6, §7)
+- [x] Required properties (§6.7) and the user agent style sheet (§6.8)
+- [x] Values: lengths with all CSS units, percentages, numbers, `calc()` family, angles incl. `turn`, colours (all CSS Color 4 syntaxes: hex, `rgb()`/`hsl()`/`hwb()`/`lab()`/`lch()`/`oklab()`/`oklch()`/`color()`, named colours, `transparent`, `currentColor`, system colours, 1.1 `icc-color()`), `url()`, paint values, lists, the 1.1 attribute grammars (§4.2, 1.1 ch. 4)
 
 ### 5.3 Coordinate systems (§8, 1.1 ch. 7)
-- [ ] Initial viewport and coordinate system from the host size, `width`/`height`/`viewBox` (§8.3, §8.4)
-- [ ] `transform` attribute and property: all functions, the attribute's comma/whitespace grammar, `transform-origin`, `transform-box`, CSS Transforms 1 serialization rules (§8.5)
-- [ ] `viewBox` + `preserveAspectRatio` (all align/meetOrSlice combinations, `defer` on `image`, degenerate boxes disable rendering) (§8.6, §8.7)
-- [ ] Nested viewports and `overflow`/clip on `svg`, `symbol`, `marker`, `pattern`, `image`, `foreignObject` (§8.8, 1.1 §14.3)
-- [ ] Units and percentages (diagonal normalisation for `r` etc.) (§8.9)
-- [ ] Bounding boxes: object, stroke, decorated (§8.10); `objectBoundingBox` units incl. zero-size boxes (§8.11)
-- [ ] `vector-effect`: `non-scaling-stroke` and the SVG 2 at-risk values (`non-scaling-size`, `non-rotation`, `fixed-position`) (§8.13, §13.6)
+- [x] Initial viewport and coordinate system from the host size, `width`/`height`/`viewBox` (§8.3, §8.4)
+- [x] `transform` attribute and property: all functions, the attribute's comma/whitespace grammar, `transform-origin`, `transform-box`, CSS Transforms 1 serialization rules (§8.5)
+- [x] `viewBox` + `preserveAspectRatio` (all align/meetOrSlice combinations, `defer` on `image`, degenerate boxes disable rendering) (§8.6, §8.7)
+- [x] Nested viewports and `overflow`/clip on `svg`, `symbol`, `marker`, `pattern`, `image`, `foreignObject` (§8.8, 1.1 §14.3)
+- [x] Units and percentages (diagonal normalisation for `r` etc.) (§8.9)
+- [x] Bounding boxes: object, stroke, decorated (§8.10); `objectBoundingBox` units incl. zero-size boxes (§8.11)
+- [x] `vector-effect`: `non-scaling-stroke` and the SVG 2 at-risk values (`non-scaling-size`, `non-rotation`, `fixed-position`) (§8.13, §13.6)
 
 ### 5.4 Paths and shapes (§9, §10)
-- [ ] Path data grammar exactly as specified, incl. error recovery (render up to the error, §9.5.4/1.1 F.2), compact arc flags (`a1 1 0 00.5.5`), implicit commands
-- [ ] Arc conversion and out-of-range radii (App. B.2), zero-length segments, `Z` then non-move commands
-- [ ] Path directionality and `pathLength` (§9.4, §9.6)
-- [ ] `d` as a property (SVG 2)
-- [ ] `rect` (incl. auto `rx`/`ry` rules), `circle`, `ellipse` (`auto` radii), `line`, `polyline`, `polygon` (odd point counts) as equivalent paths (§10)
-- [ ] Distance along a path, used by markers, `textPath`, `animateMotion` and dashing (§9.6)
+- [x] Path data grammar exactly as specified, incl. error recovery (render up to the error, §9.5.4/1.1 F.2), compact arc flags (`a1 1 0 00.5.5`), implicit commands
+- [x] Arc conversion and out-of-range radii (App. B.2), zero-length segments, `Z` then non-move commands
+- [x] Path directionality and `pathLength` (§9.4, §9.6)
+- [x] `d` as a property (SVG 2)
+- [x] `rect` (incl. auto `rx`/`ry` rules), `circle`, `ellipse` (`auto` radii), `line`, `polyline`, `polygon` (odd point counts) as equivalent paths (§10)
+- [x] Distance along a path, used by markers, `textPath`, `animateMotion` and dashing (§9.6)
 
 ### 5.5 Painting (§13, 1.1 ch. 11)
-- [ ] Paint: `none`, colours, `url()` with fallback, `context-fill`/`context-stroke` (markers and `use`), `currentColor` (§13.2, §13.3)
-- [ ] `fill`, `fill-rule`, `fill-opacity` (§13.4)
-- [ ] Stroke: width, caps, joins incl. `miter-clip` and `arcs` (SVG 2), miter limit, dashes (incl. odd counts, negative, zero-sum, percentages, `pathLength` scaling), the exact stroke-shape definition (§13.5.7), zero-length subpaths with round/square caps
-- [ ] Markers: `marker` element, `markerUnits`, `refX`/`refY` incl. SVG 2 keywords, `orient` incl. `auto-start-reverse`, `viewBox`, clipping, `marker-start/mid/end`, the `marker` shorthand, markers on all shapes (§13.7)
-- [ ] `paint-order` (§13.8)
-- [ ] `color-interpolation` for gradients and compositing (§13.9)
-- [ ] Rendering hints: `shape-rendering` (`crispEdges`, `optimizeSpeed` → no AA), `text-rendering`, `image-rendering` (incl. `pixelated`/`crisp-edges` from CSS Images 3), `color-rendering` (§13.10)
-- [ ] Rendering model: painter's order, group rendering and isolation, `opacity`, `visibility` vs `display`, parent compositing (§3)
+- [x] Paint: `none`, colours, `url()` with fallback, `context-fill`/`context-stroke` (markers and `use`), `currentColor` (§13.2, §13.3)
+- [x] `fill`, `fill-rule`, `fill-opacity` (§13.4)
+- [x] Stroke: width, caps, joins incl. `miter-clip` and `arcs` (SVG 2), miter limit, dashes (incl. odd counts, negative, zero-sum, percentages, `pathLength` scaling), the exact stroke-shape definition (§13.5.7), zero-length subpaths with round/square caps
+- [x] Markers: `marker` element, `markerUnits`, `refX`/`refY` incl. SVG 2 keywords, `orient` incl. `auto-start-reverse`, `viewBox`, clipping, `marker-start/mid/end`, the `marker` shorthand, markers on all shapes (§13.7)
+- [x] `paint-order` (§13.8)
+- [x] `color-interpolation` for gradients and compositing (§13.9)
+- [x] Rendering hints: `shape-rendering` (`crispEdges`, `optimizeSpeed` → no AA), `text-rendering`, `image-rendering` (incl. `pixelated`/`crisp-edges` from CSS Images 3), `color-rendering` (§13.10)
+- [x] Rendering model: painter's order, group rendering and isolation, `opacity`, `visibility` vs `display`, parent compositing (§3)
 
 ### 5.6 Paint servers (§14, 1.1 ch. 13)
-- [ ] `linearGradient`, `radialGradient` incl. focal point outside the circle, `fr` (SVG 2), `gradientUnits`, `gradientTransform`, `spreadMethod` pad/reflect/repeat, `href` inheritance of attributes and stops
-- [ ] `stop` with `offset` clamping and ordering, `stop-color`, `stop-opacity`
-- [ ] `pattern`: units, `patternContentUnits`, `viewBox`, `patternTransform`, `href` inheritance, overflow, nested patterns
-- [ ] Degenerate cases: zero-length gradient vectors, single stop, bounding-box units on zero-size boxes (each has a defined result)
+- [x] `linearGradient`, `radialGradient` incl. focal point outside the circle, `fr` (SVG 2), `gradientUnits`, `gradientTransform`, `spreadMethod` pad/reflect/repeat, `href` inheritance of attributes and stops
+- [x] `stop` with `offset` clamping and ordering, `stop-color`, `stop-opacity`
+- [x] `pattern`: units, `patternContentUnits`, `viewBox`, `patternTransform`, `href` inheritance, overflow, nested patterns
+- [x] Degenerate cases: zero-length gradient vectors, single stop, bounding-box units on zero-size boxes (each has a defined result)
 
 ### 5.7 Text (§11, 1.1 ch. 10, ch. 20)
 - [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
-- [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`
+- [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`. Open: bidi control characters around anchored chunks measure chunk extents differently from browsers (WPT text-bidi-controls-anchors-2), and letter-spacing is applied inside cursive scripts.
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
-- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7)
+- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7). Open: `shape-padding` and `shape-margin` are not applied, `text-align` is not applied inside `shape-inside`, and right-to-left and vertical wrapped lines are placed differently from the WPT references.
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [x] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
-- [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9)
+- [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9). Open: `paint-order` on text decorations layers them differently from browsers (WPT paint-order-text-decorations).
 - [ ] 1.1 only (done except `vkern`, `lang` selection, glyph child elements and external SVG fonts): `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
-- [ ] `a` inside text (§16.2)
+- [x] `a` inside text (§16.2)
 
 ### 5.8 Embedded content (§12)
-- [ ] `image`: PNG, JPEG, SVG (nested document in secure mode), `preserveAspectRatio`, auto sizing from intrinsic size, `crossorigin` ignored, broken images render nothing (§12.3)
-- [ ] `foreignObject`: geometry, clipping, `switch` fallback; non-SVG content not rendered (§12.4)
+- [x] `image`: PNG, JPEG, SVG (nested document in secure mode), `preserveAspectRatio`, auto sizing from intrinsic size, `crossorigin` ignored, broken images render nothing (§12.3)
+- [x] `foreignObject`: geometry, clipping, `switch` fallback; non-SVG content not rendered (§12.4)
 
 ### 5.9 Clipping, masking, compositing (CSS Masking 1, Compositing 1, §3.9, 1.1 ch. 14)
-- [ ] `clipPath` with `clipPathUnits`, `clip-rule`, nested `clip-path` on the clip path and its children, `use` children, text children, transforms; invalid children ignored
-- [ ] `clip-path` with basic shapes (`inset`, `circle`, `ellipse`, `polygon`, `path()`) and geometry boxes
-- [ ] `mask` element: `maskUnits`, `maskContentUnits`, `mask-type` luminance/alpha, nested masks
+- [x] `clipPath` with `clipPathUnits`, `clip-rule`, nested `clip-path` on the clip path and its children, `use` children, text children, transforms; invalid children ignored
+- [x] `clip-path` with basic shapes (`inset`, `circle`, `ellipse`, `polygon`, `path()`) and geometry boxes
+- [x] `mask` element: `maskUnits`, `maskContentUnits`, `mask-type` luminance/alpha, nested masks
 - [x] CSS `mask` layers as far as they apply to SVG content (`mask-image` with `url()` to SVG masks and to images, `mask-mode`, `mask-repeat`, `mask-position`, `mask-size`, `mask-composite`), `mask-border` only if trivial
-- [ ] 1.1 `clip` property on viewport elements
-- [ ] `mix-blend-mode` (all separable and non-separable modes), `isolation`, Porter-Duff operators
+- [x] 1.1 `clip` property on viewport elements
+- [x] `mix-blend-mode` (all separable and non-separable modes), `isolation`, Porter-Duff operators
 
 ### 5.10 Filters (Filter Effects 1, 1.1 ch. 15)
 - [x] `filter` element: region, `filterUnits`, `primitiveUnits`, subregions, `href`, 1.1 `filterRes`
@@ -524,9 +520,9 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Filter resolution and the "kernelUnitLength" rules, infinite and empty regions, filters on empty groups
 
 ### 5.11 Linking (§16, 1.1 ch. 17)
-- [ ] URL references: same-document, external through the resolver, `data:`, invalid references (each property defines its fallback) (§16.1)
-- [ ] `a` renders its children; `href`/`target` kept, never activated (§16.2)
-- [ ] Fragment identifiers: bare `#id` (render the view/element), `#svgView(viewBox(...);preserveAspectRatio(...);transform(...);zoomAndPan(...);viewTarget(...))`, `view` elements (§16.3, 1.1 §17.2)
+- [x] URL references: same-document, external through the resolver, `data:`, invalid references (each property defines its fallback) (§16.1)
+- [x] `a` renders its children; `href`/`target` kept, never activated (§16.2)
+- [x] Fragment identifiers: bare `#id` (render the view/element), `#svgView(viewBox(...);preserveAspectRatio(...);transform(...);zoomAndPan(...);viewTarget(...))`, `view` elements (§16.3, 1.1 §17.2)
 
 ### 5.12 Colour (1.1 ch. 12)
 - [x] Embedded profiles in PNG/JPEG and PNG `gAMA`/`cHRM` with matrix/TRC and gray TRC profiles (see Source colour management)
@@ -538,7 +534,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Targets: `href`/`xlink:href`, `attributeName` (with an `xlink:` prefix), `attributeType` (CSS/XML/auto)
 - [x] Timing: `begin`/`end` lists with offsets, syncbase (`a.end+1s`, `a.begin`), `repeat(n)` syncbase-style values, indefinite; event, accessKey and wallclock values stay unresolved (no host timeline); `dur`, `min`, `max`, `restart`, `repeatCount`, `repeatDur`, `fill`
 - [x] Values: `from`/`to`/`by`/`values`, `calcMode` discrete/linear/paced/spline with `keyTimes`/`keySplines`, `additive`, `accumulate`, the animation sandwich and priority
-- [ ] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes)
+- [ ] Which attributes and properties are animatable and how: numbers and number lists inside a value skeleton (lengths, path data with matching commands, point lists, viewBox), colours, transform lists and discrete text are done; base values of CSS properties come from the presentation attribute, not the computed value (see notes). Open: an `mpath` target whose path comes from the CSS `d` property is not used (WPT mpath).
 - [x] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t* (see Animation sampling for the approximations)
 
 ### 5.14 Optional, last
@@ -1482,6 +1478,15 @@ Decisions made during the sweep:
 - Regions of filters on an `svg` element with a `viewBox` are measured in the user
   space outside the `viewBox` supplement, the space of the element's `x`, `y`, `width`
   and `height`.
+- Non-separable blend modes (`hue`, `saturation`, `color`, `luminosity`) use the
+  Compositing 1 formulas (#blendingnonseparable) on unpremultiplied colours. Over a
+  translucent source resvg's results differ from them by up to 31, and this renderer
+  matches them, checked numerically at sampled pixels.
+- A `mask` with `color-interpolation: linearRGB` computes luminance from linearized
+  colour values (CSS Masking 1 #MaskValues). resvg uses sRGB values there.
+- Gradient cases that differ from resvg by at most 2 in premultiplied channel values stay
+  `fail`. The reason is rounding along the ramp, and it looks larger only where low alpha
+  amplifies it on unpremultiplying.
 
 ### The WPT suite
 
