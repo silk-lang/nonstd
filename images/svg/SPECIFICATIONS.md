@@ -543,6 +543,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 ### 5.14 Optional, last
 - [x] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts: `hitTest` on a display list. Clip paths cut regions; masks, filters and opacity don't, so an element of opacity 0 is recorded (its layer is skipped when painting). `auto` (SVG 2 editor's draft) is visiblePainted
 - [x] OpenType SVG glyphs ([`SVG ` table](https://learn.microsoft.com/en-us/typography/opentype/spec/svg)): see "SVG glyph documents" under Text layout
+- [x] A wasm32 build (`images/svg/wasm`): renders every fixture exactly as the native build
 
 Mask resources use CSS Masking 1 [mask element coordinates](https://www.w3.org/TR/css-masking-1/#MaskElement)
 and [mask value calculation](https://www.w3.org/TR/css-masking-1/#MaskValues).
