@@ -11,6 +11,7 @@
 //! can be clamped to x = 0 without changing the winding seen by visible pixels; rows outside
 //! the canvas are skipped, because rows do not interact.
 import silk.core.ownership { Copy }
+import silk.core.option { Option }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -170,6 +171,8 @@ struct Bounds {
   y1: f32,
 }
 
+impl Copy for Bounds {}
+
 fn lerpX(line: Line, x: f32) -> f32 {
   return line.y0 + (x - line.x0) * (line.y1 - line.y0) / (line.x1 - line.x0)
 }
@@ -252,6 +255,22 @@ impl Rasterizer {
     ! OutOfMemoryError
     ? &mut Allocator {
     out.clear()
+    if out.canvasWidth == 0 || out.canvasHeight == 0 { return }
+    let widthF = u32.toF32(out.canvasWidth)
+    let heightF = u32.toF32(out.canvasHeight)
+    if let Option<Bounds>.Some { value } = visibleBounds(lines, widthF, heightF) {
+      run rasterize(
+        lines,
+        value,
+        rule,
+        &mut self.area,
+        &mut self.touched,
+        &mut self.bandAlphas,
+        &mut self.columnKinds,
+        &mut out,
+      )
+      return
+    }
     self.lines.clear()
     run self.lines.appendSlice(lines)
     run self.fillLines(rule, &mut out)
@@ -328,87 +347,34 @@ impl Rasterizer {
     if canvasWidth == 0 || canvasHeight == 0 { return }
     let widthF = u32.toF32(canvasWidth)
     let heightF = u32.toF32(canvasHeight)
-    let bounds = run self.clip(widthF, heightF)
-    if self.clipped.length() == 0 { return }
-    let bx0 = f32.toU32(f32.floor(bounds.x0))
-    let bx1 = minU32(f32.toU32(f32.ceil(bounds.x1)), canvasWidth)
-    let by0 = f32.toU32(f32.floor(maxF32(bounds.y0, 0.0)))
-    let by1 = minU32(f32.toU32(f32.ceil(minF32(bounds.y1, heightF))), canvasHeight)
-    if bx0 >= bx1 || by0 >= by1 {
-      return
-    }
-    let firstBand = by0 / BAND
-    let bandCount = (by1 - 1) / BAND - firstBand + 1
 
-    let localWidth = bx1 - bx0
-    let stride = u32.toUsize(localWidth) + 2
-    let top = firstBand * BAND
-    let bandCells = stride * u32.toUsize(BAND)
-
-    // The cells of every band at once. Both buffers are all zero between calls: resolving zeroes
-    // what it reads, so only growth needs filling.
-    let cells = bandCells * u32.toUsize(bandCount)
-    let haveCells = self.area.length()
-    if haveCells < cells {
-      run self.area.appendRepeated(0.0, cells - haveCells)
-    }
-    let flags = stride * u32.toUsize(bandCount)
-    let haveFlags = self.touched.length()
-    if haveFlags < flags {
-      run self.touched.appendRepeated(0, flags - haveFlags)
-    }
-
-    // `resolve` writes every column's kind and every partial column's alphas before
-    // `emitBand` reads them, so these only need to be long enough.
-    let haveAlphas = self.bandAlphas.length()
-    if haveAlphas < u32.toUsize(localWidth * BAND) {
-      run self.bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND) - haveAlphas)
-    }
-    let haveKinds = self.columnKinds.length()
-    if haveKinds < u32.toUsize(localWidth) {
-      run self.columnKinds.appendRepeated(0, u32.toUsize(localWidth) - haveKinds)
-    }
-    let originX = u32.toF32(bx0)
-    let lines = self.clipped.asSlice()
-    let mut k: usize = 0
-    while k < lines.length {
-      accumulate(
-        self.area.asMutSlice(),
-        self.touched.asMutSlice(),
-        stride,
-        lines[k],
-        originX,
-        u32.toF32(localWidth),
-        top,
-        by1,
-      )
-      k = k + 1
-    }
-    let mut band: u32 = 0
-    while band < bandCount {
-      let bandTop = top + band * BAND
-      let rows = minU32(BAND, canvasHeight - bandTop)
-      let at = u32.toUsize(band)
-      resolve(
-        Slice.viewMut(self.area.asMutSlice(), at * bandCells, bandCells),
-        Slice.viewMut(self.touched.asMutSlice(), at * stride, stride),
-        stride,
-        localWidth,
-        rows,
+    // Lines a clipped flatten made are already inside the canvas horizontally, so
+    // they are rasterized in place; the rest are split and clamped first.
+    if let Option<Bounds>.Some { value } = visibleBounds(self.lines.asSlice(), widthF, heightF) {
+      run rasterize(
+        self.lines.asSlice(),
+        value,
         rule,
-        self.bandAlphas.asMutSlice(),
-        self.columnKinds.asMutSlice(),
-      )
-      run emitBand(
-        self.bandAlphas.asSlice(),
-        self.columnKinds.asSlice(),
-        localWidth,
-        bx0,
-        bandTop,
+        &mut self.area,
+        &mut self.touched,
+        &mut self.bandAlphas,
+        &mut self.columnKinds,
         &mut out,
       )
-      band = band + 1
+      return
     }
+    let bounds = run self.clip(widthF, heightF)
+    if self.clipped.length() == 0 { return }
+    run rasterize(
+      self.clipped.asSlice(),
+      bounds,
+      rule,
+      &mut self.area,
+      &mut self.touched,
+      &mut self.bandAlphas,
+      &mut self.columnKinds,
+      &mut out,
+    )
   }
 
   /// Scanline fill at pixel centers. Each row tests every visible line, which is fine for the
@@ -508,6 +474,129 @@ impl Rasterizer {
       }
       n = n + 1
     }
+  }
+}
+
+/// The bounds of `lines` when every one is visible, not horizontal and inside the canvas
+/// horizontally, so clipping would keep each line as it is; otherwise none.
+fn visibleBounds(lines: &[Line], widthF: f32, heightF: f32) -> Option<Bounds> {
+  if lines.length == 0 {
+    return Option<Bounds>.None
+  }
+  let mut bounds = Bounds { x0: widthF, y0: heightF, x1: 0.0, y1: 0.0 }
+  let mut i: usize = 0
+  while i < lines.length {
+    let line = lines[i]
+    let low = minF32(line.y0, line.y1)
+    let high = maxF32(line.y0, line.y1)
+    if !(line.x0 >= 0.0 && line.x0 <= widthF && line.x1 >= 0.0 && line.x1 <= widthF && low < high
+      && high > 0.0
+      && low < heightF) {
+      return Option<Bounds>.None
+    }
+    bounds.x0 = minF32(bounds.x0, minF32(line.x0, line.x1))
+    bounds.x1 = maxF32(bounds.x1, maxF32(line.x0, line.x1))
+    bounds.y0 = minF32(bounds.y0, low)
+    bounds.y1 = maxF32(bounds.y1, high)
+    i = i + 1
+  }
+  return Option<Bounds>.some(bounds)
+}
+
+/// Rasterizes visible, horizontally clamped `lines` with `bounds` into `out`, using the scratch
+/// buffers of a [`Rasterizer`].
+effect fn rasterize(
+  lines: &[Line],
+  bounds: Bounds,
+  rule: u8,
+  area: &mut List<f32>,
+  touched: &mut List<u8>,
+  bandAlphas: &mut List<u8>,
+  columnKinds: &mut List<u8>,
+  out: &mut Coverage,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let canvasWidth = out.canvasWidth
+  let canvasHeight = out.canvasHeight
+  let heightF = u32.toF32(canvasHeight)
+  let bx0 = f32.toU32(f32.floor(bounds.x0))
+  let bx1 = minU32(f32.toU32(f32.ceil(bounds.x1)), canvasWidth)
+  let by0 = f32.toU32(f32.floor(maxF32(bounds.y0, 0.0)))
+  let by1 = minU32(f32.toU32(f32.ceil(minF32(bounds.y1, heightF))), canvasHeight)
+  if bx0 >= bx1 || by0 >= by1 {
+    return
+  }
+  let firstBand = by0 / BAND
+  let bandCount = (by1 - 1) / BAND - firstBand + 1
+
+  let localWidth = bx1 - bx0
+  let stride = u32.toUsize(localWidth) + 2
+  let top = firstBand * BAND
+  let bandCells = stride * u32.toUsize(BAND)
+
+  // The cells of every band at once. Both buffers are all zero between calls: resolving zeroes
+  // what it reads, so only growth needs filling.
+  let cells = bandCells * u32.toUsize(bandCount)
+  let haveCells = area.length()
+  if haveCells < cells {
+    run area.appendRepeated(0.0, cells - haveCells)
+  }
+  let flags = stride * u32.toUsize(bandCount)
+  let haveFlags = touched.length()
+  if haveFlags < flags {
+    run touched.appendRepeated(0, flags - haveFlags)
+  }
+
+  // `resolve` writes every column's kind and every partial column's alphas before
+  // `emitBand` reads them, so these only need to be long enough.
+  let haveAlphas = bandAlphas.length()
+  if haveAlphas < u32.toUsize(localWidth * BAND) {
+    run bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND) - haveAlphas)
+  }
+  let haveKinds = columnKinds.length()
+  if haveKinds < u32.toUsize(localWidth) {
+    run columnKinds.appendRepeated(0, u32.toUsize(localWidth) - haveKinds)
+  }
+  let originX = u32.toF32(bx0)
+  let mut k: usize = 0
+  while k < lines.length {
+    accumulate(
+      area.asMutSlice(),
+      touched.asMutSlice(),
+      stride,
+      lines[k],
+      originX,
+      u32.toF32(localWidth),
+      top,
+      by1,
+    )
+    k = k + 1
+  }
+  let mut band: u32 = 0
+  while band < bandCount {
+    let bandTop = top + band * BAND
+    let rows = minU32(BAND, canvasHeight - bandTop)
+    let at = u32.toUsize(band)
+    resolve(
+      Slice.viewMut(area.asMutSlice(), at * bandCells, bandCells),
+      Slice.viewMut(touched.asMutSlice(), at * stride, stride),
+      stride,
+      localWidth,
+      rows,
+      rule,
+      bandAlphas.asMutSlice(),
+      columnKinds.asMutSlice(),
+    )
+    run emitBand(
+      bandAlphas.asSlice(),
+      columnKinds.asSlice(),
+      localWidth,
+      bx0,
+      bandTop,
+      &mut out,
+    )
+    band = band + 1
   }
 }
 
