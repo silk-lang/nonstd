@@ -26,6 +26,7 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
+import silk.num.usize
 
 // White space that hangs at the end of a line; a preserved segment break is one.
 fn hanging(cp: u32) -> bool {
@@ -324,14 +325,72 @@ pub effect fn wrap(
   run place(&mut characters, &starts, &ends, &xs, &ys)
 }
 
+// The word separators inside the content of `[start, end)`, which justification widens.
+fn separators(characters: &[Character], start: usize, end: usize) -> usize {
+  let last = contentEnd(characters, start, end)
+  let mut count: usize = 0
+  let mut index = start
+  while index < last {
+    if separator(characters[index].cp) {
+      count = count + 1
+    }
+    index = index + 1
+  }
+  return count
+}
+
+// Moves each word after a separator on a justified line by its share of the free space,
+// through dx, which also moves the rest of the line.
+fn justify(
+  characters: &mut List<Character>,
+  starts: &List<usize>,
+  ends: &List<usize>,
+  spreads: &List<f64>,
+) -> () {
+  let mut line: usize = 0
+  while line < List<usize>.length(starts) {
+    let spread = List<f64>.get(spreads, line)
+    if spread != 0.0 {
+      let start = List<usize>.get(starts, line)
+      let last = contentEnd(
+        List<Character>.asSlice(&characters.*),
+        start,
+        List<usize>.get(ends, line),
+      )
+      let all = List<Character>.asMutSlice(&mut characters)
+      let mut index = start
+      while index + 1 < last {
+        if separator(all[index].cp) {
+          all[index + 1].dx = all[index + 1].dx + spread
+        }
+        index = index + 1
+      }
+    }
+    line = line + 1
+  }
+}
+
+/// A line's alignment inside a `shape-inside` area (CSS Text 3 #text-align-property), with
+/// `start` and `end` taken relative to the text element's direction.
+pub enum Align {
+  Start,
+  End,
+  Left,
+  Right,
+  Center,
+  Justify,
+}
+
 /// Text wrapped in `shape-inside` areas less the `shape-subtract` ones (SVG 2
 /// #TextShapeInside, #TextShapeSubtract), horizontal text only. Lines are as tall as the
 /// text element's strut and fill each area from its top. A line takes, left to right, the
 /// spans of its band inside the area; a span that cannot hold the next word is skipped,
 /// and a line that holds nothing moves down a pixel (CSS Shapes 1 treats a shape's edge as
-/// pixel floats). Each part of a line is an anchored chunk at its span's start, middle or
-/// end by `text-anchor`. Text that overflows one area continues in the next; what is left
-/// after the last is not rendered.
+/// pixel floats). Each part of a line is an anchored chunk aligned in its span by
+/// `text-align`, or `last` for a line that ends the text or a forced break; `text-anchor`
+/// does not apply (SVG 2 #TextAnchoringProperties). A justified line spreads its free space
+/// evenly over its word separators (CSS Text 3 #justify-auto). Text that overflows one area
+/// continues in the next; what is left after the last is not rendered.
 pub effect fn wrapInAreas(
   database: &Fonts,
   spans: &[Span],
@@ -339,6 +398,8 @@ pub effect fn wrapInAreas(
   shapes: &[Region],
   holes: &[Region],
   soft: bool,
+  align: Align,
+  last: Align,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -354,6 +415,7 @@ pub effect fn wrapInAreas(
   let mut ends = List<usize>.make()
   let mut xs = List<f64>.make()
   let mut ys = List<f64>.make()
+  let mut spreads = List<f64>.make()
   let mut next: usize = 0
   let mut item: usize = 0
   let mut shape: usize = 0
@@ -395,26 +457,69 @@ pub effect fn wrapInAreas(
         }
         if let Option<usize>.Some { value: chosen } = fit {
           let end = List<usize>.get(&measured.breaks, chosen)
-          let span = &spans[all[next].span]
-          let rtl = span.rtl
-          let x = match span.anchor {
-            Anchor.Start => if rtl {
-              right
-            } else {
-              left
+          forced = List<bool>.get(&measured.forced, chosen)
+          let closing = forced || chosen + 1 == List<usize>.length(&measured.breaks)
+          let mode = if closing {
+            last
+          } else {
+            align
+          }
+          let width = right - left
+          let mut used = extent(spans, all, &measured.advances, next, end)
+          let mut spread = 0.0
+          if mode == Align.Justify && used < width {
+            let gaps = separators(all, next, end)
+            if gaps > 0 {
+              spread = (width - used) / usize.toF64(gaps)
+              used = width
             }
-            Anchor.Middle => (left + right) / 2.0
-            Anchor.End => if rtl {
-              left
+          }
+          let rtl = spans[0].rtl
+          let free = width - used
+          let start = left
+            + match mode {
+              Align.Left => 0.0
+              Align.Right => free
+              Align.Center => free / 2.0
+              Align.End => if rtl {
+                0.0
+              } else {
+                free
+              }
+              _ => if rtl {
+                free
+              } else {
+                0.0
+              }
+            }
+
+          // The chunk anchors at its first character by that span's text-anchor.
+          let span = &spans[all[next].span]
+          let x = match span.anchor {
+            Anchor.Start => if span.rtl {
+              start + used
             } else {
-              right
+              start
+            }
+            Anchor.Middle => start + used / 2.0
+            Anchor.End => if span.rtl {
+              start
+            } else {
+              start + used
             }
           }
           run List<usize>.append(&mut starts, next)
           run List<usize>.append(&mut ends, end)
           run List<f64>.append(&mut xs, x)
           run List<f64>.append(&mut ys, top - strut.top)
-          forced = List<bool>.get(&measured.forced, chosen)
+          run List<f64>.append(
+            &mut spreads,
+            if span.rtl {
+              -spread
+            } else {
+              spread
+            },
+          )
           next = end
           item = chosen + 1
           placed = true
@@ -430,6 +535,7 @@ pub effect fn wrapInAreas(
     shape = shape + 1
   }
   run place(&mut characters, &starts, &ends, &xs, &ys)
+  justify(&mut characters, &starts, &ends, &spreads)
 
   // Text that fits no area hangs: it takes no room and is not drawn.
   let rest = List<Character>.asMutSlice(&mut characters)

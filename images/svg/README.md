@@ -129,7 +129,7 @@ under [tests/expectations](tests/expectations). Each fail or spec difference the
 | --- | ---: | ---: | ---: | ---: | ---: |
 | resvg | 1,751 | 295 | 1,220 | 234 | 2 |
 | W3C SVG 1.1 Second Edition | 525 | 1 | 427 | 8 | 89 |
-| WPT SVG reftests | 2,290 | 311 | 29 | 39 | 1,911 |
+| WPT SVG reftests | 2,290 | 312 | 24 | 43 | 1,911 |
 
 Most resvg failures are antialiasing differences along edges, with the shapes themselves
 matching. The cases that differ in content are colour fonts, `plus-lighter`, letter-spacing in
@@ -137,14 +137,13 @@ cursive scripts, and some complex-script text placement. The W3C references are 
 taken from other renderers, so an exact match is rare there. Each W3C failure records how it
 differs from Chrome, and the skipped cases need scripting. Most WPT cases are skipped because
 they are HTML documents or need script; of the SVG reftests that remain, the failures are mostly
-wrapped and right-to-left text. A spec difference means the
-specification and resvg or the browsers disagree, and this renderer follows the specification.
+tentative features and text that needs fonts the suite does not ship. A spec difference means
+the specification and resvg or the browsers disagree, and this renderer follows the specification.
 [SPECIFICATIONS.md](SPECIFICATIONS.md) lists each of those decisions.
 
 The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
-text features: `shape-padding`, `shape-margin`, `text-align` inside `shape-inside`,
-right-to-left and vertical wrapping, `vkern` and external SVG fonts. One smaller item is
-also open: `paint-order` on text decorations.
+text features: `shape-padding`, vertical text in `shape-inside`, `vkern` and external SVG
+fonts.
 Hit testing is optional and not implemented.
 
 ## Performance

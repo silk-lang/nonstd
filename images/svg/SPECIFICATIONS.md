@@ -491,14 +491,14 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`. Open: bidi control characters around anchored chunks measure chunk extents differently from browsers (WPT text-bidi-controls-anchors-2), and letter-spacing is applied inside cursive scripts.
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
-- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7). Open: `shape-padding` and `shape-margin` are not applied, `text-align` is not applied inside `shape-inside`, and right-to-left and vertical wrapped lines are placed differently from the WPT references.
+- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-margin` (done), `shape-padding`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7). Open: `shape-padding` is not applied, and vertical text is not wrapped in `shape-inside` areas. The other right-to-left and vertical wrapping cases in WPT are spec differences or need fonts the suite does not ship.
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
 - [x] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
-- [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9). Open: `paint-order` on text decorations layers them differently from browsers (WPT paint-order-text-decorations).
+- [x] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9); decorations follow each paint-order layer
 - [ ] 1.1 only (done except `vkern`, `lang` selection, glyph child elements and external SVG fonts): `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
 - [x] `a` inside text (§16.2)
 
@@ -926,10 +926,26 @@ decisions:
   every subtracted shape for the band's whole height (#TextLayoutAutoNotes "broken lines").
   A span that cannot hold the next word is skipped. A band that holds nothing moves down
   a pixel, following CSS Shapes' model of a shape's edge as pixel floats. Each part of a
-  line is an anchored chunk. §11.5 fixes `text-align` at its initial value, so
-  `text-anchor` aligns each part at its span's start, middle or end. Text that overflows
-  one shape continues in the next; what is left after the last is not rendered.
-  Not done yet: `shape-padding`, `shape-margin`, `shape-image-threshold` and image
+  line is an anchored chunk. §11.5 sets the used value of `text-align` to its initial
+  value, but §11.4 lists `text-align`, `text-align-last` and `text-justify` as applying to
+  this text, #TextAnchoringProperties says `text-anchor` does not apply to it, and the
+  #TextShapeInside figure centres its lines with `text-align: center`. The specific rules
+  win: `text-align-all` places each part in its span (start and end follow the `text`
+  element's direction), and `text-align-last` places a part that ends the text or a forced
+  break, with `auto` following `text-align-all` except that `justify` puts that line at the
+  start (CSS Text 4 #text-align-last-property). `text-anchor` is ignored. A justified part
+  spreads its free space evenly over its word separators, as `text-justify: auto` does for
+  Latin text (CSS Text 3 #justify-auto); a part with no separator stays at the start.
+  Trailing white space hangs and takes no part in alignment (CSS Text 3
+  #white-space-phase-2). Text that overflows one shape continues in the next; what is left
+  after the last is not rendered.
+  A shape in `shape-subtract` grows by its `shape-margin` (#TextShapeMargin, CSS Shapes 1
+  #shape-margin-property): a `url()` shape by the referenced element's, a basic shape by
+  the `text` element's. The grown shape is every point within the margin of the shape,
+  built as the shape plus a band along each polygon edge and a disc at each vertex (a
+  64-sided polygon inscribed in it), so beside an edge the margin is exact and at a corner
+  it is rounded. Shapes in `shape-inside` take no margin.
+  Not done yet: `shape-padding`, `shape-image-threshold` and image
   shapes, and vertical text in shapes.
 - `tref` (SVG 1.1 #TRefElement) takes the character data of the same-document element its
   `href` or `xlink:href` names, markup removed, and treats it as its own text with its own
