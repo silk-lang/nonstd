@@ -129,7 +129,7 @@ under [tests/expectations](tests/expectations). Each fail or spec difference the
 | --- | ---: | ---: | ---: | ---: | ---: |
 | resvg | 1,751 | 295 | 1,220 | 234 | 2 |
 | W3C SVG 1.1 Second Edition | 525 | 1 | 427 | 8 | 89 |
-| WPT SVG reftests | 2,290 | 311 | 29 | 39 | 1,911 |
+| WPT SVG reftests | 2,290 | 312 | 28 | 39 | 1,911 |
 
 Most resvg failures are antialiasing differences along edges, with the shapes themselves
 matching. The cases that differ in content are colour fonts, `plus-lighter`, letter-spacing in
@@ -143,8 +143,7 @@ specification and resvg or the browsers disagree, and this renderer follows the 
 
 The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
 text features: `shape-padding`, `shape-margin`, `text-align` inside `shape-inside`,
-right-to-left and vertical wrapping, `vkern` and external SVG fonts. One smaller item is
-also open: `paint-order` on text decorations.
+right-to-left and vertical wrapping, `vkern` and external SVG fonts.
 Hit testing is optional and not implemented.
 
 ## Performance

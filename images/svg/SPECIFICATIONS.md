@@ -498,7 +498,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Vertical text: `writing-mode` (CSS and 1.1 values), `text-orientation`, 1.1 `glyph-orientation-vertical`/`-horizontal`, UAX #50 (§11.10)
 - [x] `letter-spacing`, `word-spacing`, `direction`, `unicode-bidi`
 - [x] Text decoration with SVG fill/stroke of decorations and their painting order (§11.11, §11.9)
-- [ ] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9). Open: `paint-order` on text decorations layers them differently from browsers (WPT paint-order-text-decorations).
+- [x] Text bounding boxes and painting order (fill, stroke, markers not applicable) (§11.9); decorations follow each paint-order layer
 - [ ] 1.1 only (done except `vkern`, `lang` selection, glyph child elements and external SVG fonts): `tref`, `altGlyph` family, SVG fonts (`font`, `glyph`, `missing-glyph`, `hkern`/`vkern`, `font-face` + `font-face-src`/`-uri`/`-name`, arabic-form and `lang` glyph selection, `unicode-range`) (1.1 §10.17, ch. 20)
 - [x] `a` inside text (§16.2)
 
