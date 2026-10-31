@@ -37,7 +37,9 @@ viewport and styles, apply CSS image orientation before sizing, and retain vecto
 geometry through final placement.
 `filter` elements and the CSS filter functions render with their regions, subregions and
 every primitive and input, including `feImage` and the background and paint inputs.
-Text, animation and ICC colour are later phases. [Status](docs/status.md) describes what each phase delivered.
+Text lays out with font matching, bidi, vertical writing, `textPath` and `inline-size` wrapping.
+SMIL animation is sampled at a chosen time, and embedded ICC profiles are applied when images
+decode. [Status](docs/status.md) describes what each phase delivered.
 
 ## Example
 
@@ -116,6 +118,25 @@ known failure is recorded as one and never counted as a pass. It runs in the `im
 workflow, and `images/svg/scripts/check-vector` runs the vector and GPU scene tests in
 `images-svg-vector`. [Testing](docs/testing.md) covers the specification and suite caches,
 expectation files and the reftest runner.
+
+## Conformance
+
+The scheduled `svg-conformance` workflow renders three full external suites. Each case is
+compared exactly with its reference, and its outcome is recorded in a reviewed expectation file
+under [tests/expectations](tests/expectations). Each fail or spec difference there gives a reason.
+
+| Suite | Cases | Pass | Fail | Spec difference | Skip |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| resvg | 1,751 | 295 | 1,224 | 230 | 2 |
+| W3C SVG 1.1 Second Edition | 525 | 1 | 427 | 8 | 89 |
+
+Most resvg failures are antialiasing differences along edges, with the shapes themselves
+matching. The cases that differ in content are colour fonts, `plus-lighter`, letter-spacing in
+cursive scripts, and some complex-script text placement. The W3C references are screenshots
+taken from other renderers, so an exact match is rare there. Each W3C failure records how it
+differs from Chrome, and the skipped cases need scripting. A spec difference means the
+specification and resvg or the browsers disagree, and this renderer follows the specification.
+[SPECIFICATIONS.md](SPECIFICATIONS.md) lists each of those decisions.
 
 ## Performance
 
