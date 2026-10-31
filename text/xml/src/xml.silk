@@ -24,6 +24,7 @@ import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.option { Option }
 import silk.num.u8
+import silk.num.usize
 import silk.num.u32
 
 pub enum XmlErrorKind {
@@ -143,6 +144,8 @@ pub struct Document {
   storage: Bytes,
   arena: List<Node>,
   names: List<Name>,
+  // nameKey of each entry in names, checked before comparing bytes.
+  nameKeys: List<u32>,
   attrs: List<Attribute>,
   rootId: NodeId,
   skippedExternal: bool,
@@ -613,6 +616,10 @@ fn nameChar(c: u32) -> bool {
     || (c >= 8255 && c <= 8256)
 }
 
+fn asciiNameChar(c: u8) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 45 && c <= 58) && c != 47 || c == 95
+}
+
 effect fn name<'a>(r: &mut Reader<'a>) -> Span
   ! XmlError {
   let start = r.pos
@@ -625,6 +632,14 @@ effect fn name<'a>(r: &mut Reader<'a>) -> Span
   }
   r.pos = r.pos + first.length
   while r.pos < r.data.length {
+    let byte = r.data[r.pos]
+    if byte < 128 {
+      if asciiNameChar(byte) {
+        r.pos = r.pos + 1
+        continue
+      }
+      break
+    }
     let cp = run utf8(r.data, r.pos)
     if !nameChar(cp.value) {
       break
@@ -1598,22 +1613,38 @@ effect fn resolve(p: &Parser, qualified: Span, attribute: bool, at: usize) -> Na
   return n
 }
 
+fn nameKey(qualified: &[u8], uri: &[u8]) -> u32 {
+  let mut h: u32 = 2166136261 ^ usize.toU32(uri.length)
+  let mut i: usize = 0
+  while i < qualified.length {
+    h = u32.wrappingMultiply(h ^ u8.toU32(qualified[i]), 16777619)
+    i = i + 1
+  }
+  return h
+}
+
 effect fn intern(doc: &mut Document, n: Name) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
+  let key = nameKey(view(&doc.storage, n.qualified), view(&doc.storage, n.uri))
+  let keys = List<u32>.asSlice(&doc.nameKeys)
   let names = List<Name>.asSlice(&doc.names)
   let mut i: usize = 0
-  while i < names.length {
-    let old = names[i]
-    if same(view(&doc.storage, old.qualified), view(&doc.storage, n.qualified))
-      && same(view(&doc.storage, old.uri), view(&doc.storage, n.uri)) {
-      return i
+  while i < keys.length {
+    if keys[i] == key {
+      let old = names[i]
+      if same(view(&doc.storage, old.qualified), view(&doc.storage, n.qualified))
+        && same(view(&doc.storage, old.uri), view(&doc.storage, n.uri)) {
+        return i
+      }
     }
     i = i + 1
   }
+  drop keys
   drop names
   let id = List<Name>.length(&doc.names)
   run List<Name>.append(&mut doc.names, n)
+  run List<u32>.append(&mut doc.nameKeys, key)
   return id
 }
 
@@ -1734,6 +1765,24 @@ fn attributeType(dtd: &Dtd, element: &[u8], attr: &[u8]) -> AttributeType {
   return AttributeType.Cdata
 }
 
+// True when attribute-value normalization leaves the value unchanged: no
+// references, no markup and no whitespace other than spaces.
+fn plainAttribute(value: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < value.length {
+    let c = value[i]
+    if c < 32 {
+      if c == 9 || c == 10 || c == 13 {
+        return false
+      }
+    } else if c == 38 || c == 60 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
 effect fn rawAttribute(
   p: &mut Parser,
   dtd: &Dtd,
@@ -1757,6 +1806,22 @@ effect fn rawAttribute(
     i = i + 1
   }
   drop existing
+  if kind == AttributeType.Cdata && plainAttribute(value) {
+    // Nothing to normalize: the value is stored as written.
+    if value.length > p.limits.maxStorageBytes {
+      fail XmlError {
+        offset: offset(&Reader { data: value, pos: value.length, origin: at }),
+        kind: XmlErrorKind.Limit,
+      }
+    }
+    let q = run store(&mut p.doc.storage, key, &p.limits, at)
+    let v = run store(&mut p.doc.storage, value, &p.limits, at)
+    run List<RawAttribute>.append(
+      &mut attrs.*,
+      RawAttribute { qualified: q, value: v, isId: false },
+    )
+    return ()
+  }
   let mut normalized = Bytes.make()
   let mut r = Reader { data: value, pos: 0, origin: at }
   run attributeText(&dtd.*, &mut r, &mut normalized, &mut p.expanded, &p.limits, 0)
@@ -1977,6 +2042,18 @@ effect fn content<'a>(
   let parentRef = Option<NodeId>.some(parent)
   while r.pos < r.data.length {
     let start = offset(&r.*)
+    let lead = r.data[r.pos]
+    if lead != 60 && lead != 38 {
+      let begin = r.pos
+      while r.pos < r.data.length && r.data[r.pos] != 60 && r.data[r.pos] != 38 {
+        if r.data[r.pos] == 93 && at(&r.*, b"]]>") {
+          fail XmlError { offset: offset(&r.*), kind: XmlErrorKind.Syntax }
+        }
+        r.pos = r.pos + 1
+      }
+      run textNode(&mut p.*, parentRef, Slice.view<u8>(r.data, begin, r.pos - begin), start)
+      continue
+    }
     if at(&r.*, b"</") {
       if replacement {
         fail XmlError { offset: start, kind: XmlErrorKind.EntityBoundary }
@@ -2036,15 +2113,6 @@ effect fn content<'a>(
           }
         }
       }
-    } else {
-      let begin = r.pos
-      while r.pos < r.data.length && r.data[r.pos] != 60 && r.data[r.pos] != 38 {
-        if at(&r.*, b"]]>") {
-          fail XmlError { offset: offset(&r.*), kind: XmlErrorKind.Syntax }
-        }
-        r.pos = r.pos + 1
-      }
-      run textNode(&mut p.*, parentRef, Slice.view<u8>(r.data, begin, r.pos - begin), start)
     }
   }
   if !replacement {
@@ -2174,12 +2242,14 @@ pub effect fn parseWithLimits(data: &[u8], limits: &Limits) -> Document
     storage: Bytes.make(),
     arena: List<Node>.make(),
     names: List<Name>.make(),
+    nameKeys: List<u32>.make(),
     attrs: List<Attribute>.make(),
     rootId: NodeId { index: 0 },
     skippedExternal: false,
     sourceEncoding: sourceEncoding,
   }
   run List<Name>.append(&mut doc.names, Name { qualified: empty(), local: empty(), uri: empty() })
+  run List<u32>.append(&mut doc.nameKeys, nameKey(b"", b""))
   let xmlUri = run store(&mut doc.storage, b"http://www.w3.org/XML/1998/namespace", limits, 0)
   let xmlnsUri = run store(&mut doc.storage, b"http://www.w3.org/2000/xmlns/", limits, 0)
   let xmlPrefix = run store(&mut doc.storage, b"xml", limits, 0)
