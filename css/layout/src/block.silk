@@ -4,14 +4,15 @@ import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import silk.core.option { Option }
 import geometry { Layout, Measure, OptionalSize, AvailableSpace, AvailableKind, Size, Point, ResolvedEdges, max, min, clamp }
-import style { Style, Direction, Float, Align }
+import style { Style, Direction, Float, Align, WritingMode }
 import tree { NO_NODE }
 import box_tree { BoxTree, BoxKind }
 import axes { Axes }
 import context { Input, ResolvedBox, resolveBox, childrenInput, outOfFlow, establishesContext, selfCollapsingSize, blockContentOffset, blockInlineOffset, blockJustification, blockJustificationSafety, selfStartReversed, alignmentOffset }
-import engine { layoutNode, layoutNodeInPlace, probeRead, layoutInFlow, probeNode }
+import engine { layoutNode, layoutNodeInPlace, probeRead, layoutInFlow, probeNode, blockSizeFree }
 import bfc { BfcState, FloatBox, Checkpoint }
-import layout_pass { LayoutPass, PassCheckpoint }
+import layout_pass { LayoutPass, PassCheckpoint, REUSE_INDEPENDENT }
+import layout_cache { BASE_CHANGED, BASE_BLOCK_SIZE, BASE_UNKNOWN }
 import text { TextMeasure, TextError }
 import fragmentation { FlowCursor, FragmentationError, BoundaryProbe }
 import breaks { BreakBoundary, ForcedBreaks, BreakRelaxation, allowsBoundary }
@@ -137,6 +138,40 @@ fn prepareChildInto(nodes: &BoxTree, id: usize, base: &Input, axes: Axes, box: &
   child.inset = resolved.inset
   child.width = clamp(width, resolved.min.width, resolved.max.width)
   child.parallel = parallel
+}
+
+// A clean independent child of a block whose final pass gives its children
+// what the last one gave them (see BlockBase): its request, margins and
+// width are those it was last laid out with, so its kept layout is reused
+// without preparing them, and `child` is filled from that layout.
+effect fn reuseAsBefore<'pass, 'source>(nodes: &BoxTree<'source>, output: &mut LayoutPass<'pass, 'source>, block: usize, id: usize, base: &Input, axes: Axes, box: &ResolvedBox, availableInline: AvailableSpace, rtl: bool, same: &mut u8, child: &mut Child) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let style = nodes.style(id)
+  if style.float != Float.None { return false }
+  let blockRoot = nodes.node(id).independentRoot || style.writingMode != base.parentWritingMode
+  if !blockRoot && !establishesContext(style, base) && !style.replaced { return false }
+  if same.* == BASE_UNKNOWN { same.* = output.cache.compareBlockBase(block, base, availableInline, box.inset, box.size.width, rtl) }
+  if same.* == BASE_CHANGED { return false }
+  // Only the block's own block size changed: the child must not read it.
+  if same.* == BASE_BLOCK_SIZE && (base.gridContext != 0 || !blockSizeFree(&output, id, base.parentWritingMode == WritingMode.HorizontalTb)) { return false }
+  if !run output.reuseFinalAsBefore(nodes, id, REUSE_INDEPENDENT) { return false }
+  child.id = id
+  child.input = base.*
+  child.input.blockRoot = blockRoot
+  if axes.vertical {
+    child.input.availableWidth = AvailableSpace.maxContent()
+    child.input.availableHeight = AvailableSpace.definite(base.parent.height)
+  } else {
+    child.input.availableWidth = AvailableSpace.definite(base.parent.width)
+    child.input.availableHeight = AvailableSpace.maxContent()
+  }
+  let stored = &output.boxes[id]
+  // Unfragmented, the used block-axis margins are the resolved ones, and so
+  // are the inline ones where the alignment does not place the box.
+  child.margin = axes.edges(stored.usedMargin)
+  child.inset = ResolvedEdges.zero()
+  child.width = axes.size(stored.size).width
+  child.parallel = false
+  return true
 }
 
 pub effect fn layoutBlock<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTree<'source>, output: &mut LayoutPass<'pass, 'source>, measurer: &mut M, id: usize, style: &Style, input: &Input, physicalBox: &ResolvedBox, bfc: &mut BfcState) -> Layout ! OutOfMemoryError | TextError | FragmentationError ? &mut Allocator {
@@ -265,6 +300,16 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
   // Outside fragmentation a definite inline size needs no look-ahead over the children, so
   // each child is prepared as it is placed and the children are never collected in a list.
   let streaming = !fragmented && box.size.widthDefinite
+  // Whether this final pass gives the children what the last one did, which
+  // lets a clean child be reused as it was (see reuseAsBefore), compared
+  // once a child could be. A horizontal streaming pass that places an
+  // independent child records what it gave them for the next; any other
+  // final pass forgets what the last one gave.
+  let rtl = style.usedDirection() == Direction.Rtl
+  let noting = input.performLayout && streaming && !axes.vertical && output.tracking && output.frame == NO_NODE
+  let mut asBefore = BASE_CHANGED
+  if input.performLayout && output.cache.takeBlockBase(id) && noting { asBefore = BASE_UNKNOWN }
+  let mut independentSeen = false
   while childId != NO_NODE && !lazy && !streaming {
     let mut child = prepareChild(nodes, childId, &childBase, axes, &box, availableInline, parallel)
     // A definite inline size needs no whole-subtree measurement pass. Only
@@ -333,9 +378,12 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
   // Whether the child was a size probe read from the cache, which leaves its
   // box unwritten: a probe's placement of its children is never read.
   let mut cachedProbe = false
+  // Whether reuseAsBefore reused the child, which is then not laid out again.
+  let mut reusedAsBefore = false
   while index < children.length() || ((lazy || streaming) && childId != NO_NODE) {
     if streaming {
-      prepareChildInto(nodes, childId, &childBase, axes, &box, availableInline, false, &mut current)
+      reusedAsBefore = asBefore != BASE_CHANGED && bfc.count == 0 && run reuseAsBefore(nodes, &mut output, id, childId, &childBase, axes, &box, availableInline, rtl, &mut asBefore, &mut current)
+      if !reusedAsBefore { prepareChildInto(nodes, childId, &childBase, axes, &box, availableInline, false, &mut current) }
       childId = boxChild(nodes, nodes.node(childId).nextSibling)
     } else {
       if index == children.length() {
@@ -413,6 +461,7 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
       item.width = clamp(item.width, childBox.min.width, childBox.max.width)
     }
     let independent = item.input.blockRoot || establishesContext(childStyle, &item.input) || childStyle.replaced
+    independentSeen = independentSeen || (independent && childStyle.float == Float.None)
     let mut testFloatEnd = fragmented && item.input.fragmentation.marginEnd && !item.input.fragmentation.marginEndChosen
       && formattingRoot && childStyle.float == Float.None && bfc.count != 0
     if testFloatEnd { item.input.fragmentation.marginEnd = false }
@@ -585,7 +634,7 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
             readStored(&mut childLayout, output.probed(item.id, index))
             cachedProbe = index != NO_NODE
           } else if independent {
-            run layoutNodeInPlace(nodes, &mut output, &mut measurer, item.id, &item.input)
+            if !reusedAsBefore { run layoutNodeInPlace(nodes, &mut output, &mut measurer, item.id, &item.input) }
             readStored(&mut childLayout, &output.boxes[item.id])
           } else {
             drop run layoutInFlow(nodes, &mut output, &mut measurer, item.id, &item.input, &mut bfc)
@@ -971,5 +1020,6 @@ effect fn layoutBlockPass<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxT
   result.marginBottomNegative = bottom.negative
   result.collapsesThrough = !formattingRoot && allThrough && !clearanceChain && box.inset.vertical() == 0.0 && box.min.height == 0.0 && height == 0.0
   if result.collapsesThrough { result.collapsesThrough = selfCollapsingSize(style, input.parent, box.size.widthDefinite) }
+  if noting && independentSeen { run output.cache.noteBlockBase(id, &childBase, availableInline, box.inset, box.size.width, rtl) }
   return result
 }
