@@ -4,6 +4,7 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.num.usize
 import context { Input }
+import style { WritingMode }
 import geometry { Layout, OptionalSize, AvailableSpace, AvailableKind, Rect, Point, ResolvedEdges }
 import fragments { FragmentArena, Shift, one }
 import bfc { FloatBox }
@@ -188,6 +189,48 @@ fn shiftedRange(range: FinalRange, shift: Shift) -> FinalRange {
   return result
 }
 
+// What a block's last final pass gave and placed its in-flow children by:
+// their shared request, the available inline size, the block's logical
+// inset and inline size, and its direction. A child's request, resolved
+// margins, width and inline offset follow from these and its own style, so
+// when they stand a child whose final range was kept since has them as
+// before.
+pub struct BlockBase { pub base: Input, pub available: AvailableSpace, pub inset: ResolvedEdges, pub width: f32, pub rtl: bool, pub valid: bool }
+impl Copy for BlockBase {}
+// How a block's children's shared request compares with its last final
+// pass's (see noteBlockBase).
+pub const BASE_CHANGED: u8 = 0
+// Only in what the block's own block size sets, which a child reads only
+// through percentages of it or the viewport limits (see normalizeKey).
+pub const BASE_BLOCK_SIZE: u8 = 1
+pub const BASE_SAME: u8 = 2
+// Not compared yet.
+pub const BASE_UNKNOWN: u8 = 3
+
+// A block's children's shared request, but for the available space each
+// child gets its own of (see prepareChildInto).
+fn childRequest(base: &Input) -> Input {
+  let mut result = base.*
+  result.availableWidth = AvailableSpace.maxContent()
+  result.availableHeight = AvailableSpace.maxContent()
+  return result
+}
+// The parts of a children's request the block's own block size sets.
+fn withoutBlockSize(input: &Input) -> Input {
+  let mut result = input.*
+  if result.parentWritingMode == WritingMode.HorizontalTb {
+    result.parent.height = 0.0
+    result.parent.heightDefinite = false
+    result.parentMaxSize.height = 0.0
+    result.scrollportSize.height = 0.0
+  } else {
+    result.parent.width = 0.0
+    result.parent.widthDefinite = false
+    result.parentMaxSize.width = 0.0
+    result.scrollportSize.width = 0.0
+  }
+  return result
+}
 pub struct LayoutCache {
   heads: List<usize>,
   entries: List<Entry>, inputs: List<Input>, layouts: List<Layout>,
@@ -232,10 +275,12 @@ pub struct LayoutCache {
   pub gridMemos: GridMemos,
   // Immutable inherited-axis descriptors outlive every retained Input.
   pub subgrids: SubgridPool,
+  // Each block's BlockBase slot, or ABSENT; see noteBlockBase.
+  blockSlots: List<usize>, blockBases: List<BlockBase>,
 }
 impl LayoutCache {
   pub fn make() -> LayoutCache {
-    return LayoutCache { heads: List<usize>.make(), entries: List<Entry>.make(), inputs: List<Input>.make(), layouts: List<Layout>.make(), spare: List<Entry>.make(), spareInputs: List<Input>.make(), spareLayouts: List<Layout>.make(), dead: 0, emptyAtStart: true, generation: 0, touched: 0, previouslyTouched: 0, results: List<FinalResult>.make(), ranges: List<BoxRanges>.make(), cleared: List<usize>.make(), clock: 0, clearedAll: 0, rotatedTouched: 0, rotatedFloats: false, stamped: 0, skipping: false, rangesReset: false, floats: List<FloatBox>.make(), floatsCompacted: 0, texts: List<List<KeptText>>.make(), flexMemos: FlexMemos.make(), gridGeometry: GridGeometryStore.make(), gridMemos: GridMemos.make(), subgrids: SubgridPool.make() }
+    return LayoutCache { heads: List<usize>.make(), entries: List<Entry>.make(), inputs: List<Input>.make(), layouts: List<Layout>.make(), spare: List<Entry>.make(), spareInputs: List<Input>.make(), spareLayouts: List<Layout>.make(), dead: 0, emptyAtStart: true, generation: 0, touched: 0, previouslyTouched: 0, results: List<FinalResult>.make(), ranges: List<BoxRanges>.make(), cleared: List<usize>.make(), clock: 0, clearedAll: 0, rotatedTouched: 0, rotatedFloats: false, stamped: 0, skipping: false, rangesReset: false, floats: List<FloatBox>.make(), floatsCompacted: 0, texts: List<List<KeptText>>.make(), flexMemos: FlexMemos.make(), gridGeometry: GridGeometryStore.make(), gridMemos: GridMemos.make(), subgrids: SubgridPool.make(), blockSlots: List<usize>.make(), blockBases: List<BlockBase>.make() }
   }
   pub fn length(self: &Self) -> usize { return self.entries.length() - self.dead }
   pub fn clear(self: &mut Self) {
@@ -259,6 +304,8 @@ impl LayoutCache {
     self.floatsCompacted = 0
     self.texts.clear()
     self.emptyAtStart = true
+    self.blockSlots.clear()
+    self.blockBases.clear()
   }
   // Starts a compute: the previous compute's final layouts become reusable.
   pub effect fn rotateFinals(self: &mut Self) ! OutOfMemoryError ? &mut Allocator {
@@ -495,6 +542,43 @@ impl LayoutCache {
   pub fn sameBase(a: &Input, b: &Input) -> bool {
     return sameInput(a, b) && a.baselines == b.baselines && a.fullSize == b.fullSize
   }
+  // Starts a final pass of block `id`, which forgets its BlockBase until
+  // noteBlockBase records the pass's own, and returns whether the last final
+  // pass recorded one, which compareBlockBase still reads.
+  pub fn takeBlockBase(self: &mut Self, id: usize) -> bool {
+    if id >= self.blockSlots.length() { return false }
+    let slot = self.blockSlots.get(id)
+    if slot == ABSENT { return false }
+    let bases = self.blockBases.asMutSlice()
+    let valid = bases[slot].valid
+    bases[slot].valid = false
+    return valid
+  }
+  // How what block `id`'s final pass gives its children compares with what
+  // its last one gave them (BASE_*), after takeBlockBase found it.
+  pub fn compareBlockBase(self: &Self, id: usize, base: &Input, available: AvailableSpace, inset: ResolvedEdges, width: f32, rtl: bool) -> u8 {
+    let previous = &self.blockBases.asSlice()[self.blockSlots.get(id)]
+    if previous.rtl != rtl || previous.width != width || !sameAvailable(&previous.available, &available)
+      || previous.inset.top != inset.top || previous.inset.right != inset.right || previous.inset.bottom != inset.bottom || previous.inset.left != inset.left { return BASE_CHANGED }
+    let request = childRequest(base)
+    if sameInput(&previous.base, &request) { return BASE_SAME }
+    if sameInput(&withoutBlockSize(&previous.base), &withoutBlockSize(&request)) { return BASE_BLOCK_SIZE }
+    return BASE_CHANGED
+  }
+  // Records what block `id`'s final pass gave its children (see BlockBase).
+  pub effect fn noteBlockBase(self: &mut Self, id: usize, base: &Input, available: AvailableSpace, inset: ResolvedEdges, width: f32, rtl: bool) ! OutOfMemoryError ? &mut Allocator {
+    let have = self.blockSlots.length()
+    if id >= have { run self.blockSlots.appendRepeated(ABSENT, id + 1 - have) }
+    let next = BlockBase { base: childRequest(base), available: available, inset: inset, width: width, rtl: rtl, valid: true }
+    let slot = self.blockSlots.get(id)
+    if slot == ABSENT {
+      self.blockSlots.set(id, self.blockBases.length())
+      run self.blockBases.append(next)
+      return
+    }
+    let bases = self.blockBases.asMutSlice()
+    bases[slot] = next
+  }
   // The clear count now, and when a box's results were last cleared.
   pub fn clearClock(self: &Self) -> usize { return self.clock }
   pub fn clearedAt(self: &Self, id: usize) -> usize {
@@ -642,6 +726,8 @@ impl LayoutCache {
     self.clearedAll = self.clock
     self.flexMemos.clear()
     self.gridMemos.clear()
+    self.blockSlots.clear()
+    self.blockBases.clear()
     // Stored Inputs retain their immutable identities; only owner-indexed
     // lookup buckets become invalid when generated box indices change.
     self.subgrids.resetOwners()
