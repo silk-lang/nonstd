@@ -145,6 +145,7 @@ The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete exc
 text features: `shape-padding`, vertical text in `shape-inside`, `vkern` and external SVG
 fonts.
 `hitTest` finds the element under a point by `pointer-events` (see [docs/api.md](docs/api.md)).
+The renderer also builds for wasm32; see [wasm/README.md](wasm/README.md).
 
 ## Performance
 
