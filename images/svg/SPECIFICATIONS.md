@@ -542,6 +542,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 
 ### 5.14 Optional, last
 - [x] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts: `hitTest` on a display list. Clip paths cut regions; masks, filters and opacity don't, so an element of opacity 0 is recorded (its layer is skipped when painting). `auto` (SVG 2 editor's draft) is visiblePainted
+- [x] OpenType SVG glyphs ([`SVG ` table](https://learn.microsoft.com/en-us/typography/opentype/spec/svg)): see "SVG glyph documents" under Text layout
 
 Mask resources use CSS Masking 1 [mask element coordinates](https://www.w3.org/TR/css-masking-1/#MaskElement)
 and [mask value calculation](https://www.w3.org/TR/css-masking-1/#MaskValues).
@@ -745,6 +746,24 @@ installed family, use the measured default face. Interpretation decisions:
   - An italic or oblique request that ends on an upright face is sheared by the requested
     angle, or by 14deg for italic.
   - A request of 600 or more on a face whose weights all lie below 600 is emboldened.
+
+### SVG glyph documents
+
+A glyph with a document in its font's `SVG ` table is drawn from that document instead of
+its outline (OpenType `SVG ` table). Interpretation decisions:
+
+- The document is an independent SVG image in secure static mode: no external resources,
+  scripts or animation. It renders in an em-square viewport (`unitsPerEm` user units) with
+  its origin at the glyph origin and y down, scaled and rotated with the glyph, and it is
+  not clipped to the em square.
+- Only the element with id `glyph<N>` renders, with its ancestors' transforms and its
+  descendants (#glyph-identifiers); other glyphs of a shared document do not. Without
+  such an element the whole document renders.
+- `context-fill` and `context-stroke` in the document are the text's fill and stroke.
+  Solid colours carry over; a gradient or pattern from the text's document paints none in
+  the glyph document. The text's opacity properties do not apply inside it.
+- gzip-compressed documents are decompressed. Glyph cells, bounding boxes and hit testing
+  stay as for outline glyphs. COLR, CBDT and sbix colour glyphs are not drawn yet.
 
 ### Text layout
 
@@ -1461,7 +1480,7 @@ were reviewed on contact sheets and stay `fail`: tiny-skia flattens curves, rast
 pattern tiles into integer pixmaps and antialiases differently, and no pixel tolerance
 is applied. The remaining differences are `spec-difference` entries, where this renderer
 follows SVG 2, CSS or Filter Effects 1 and resvg does not, or `fail` entries that name
-the missing feature (colour glyph formats, Compositing 2 `plus-lighter`, spacing of
+the missing feature (COLR, CBDT and sbix colour glyphs, Compositing 2 `plus-lighter`, spacing of
 cursive scripts, GIF and WebP images).
 
 Decisions made during the sweep:

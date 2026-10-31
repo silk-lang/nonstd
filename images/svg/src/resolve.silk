@@ -8,18 +8,28 @@ import scene {
   RenderError,
   RenderTree,
   EmbeddedImage,
+  GlyphDocument,
   ResolvedNode,
   ResolvedShape,
   StrokeSpace,
   Style,
   Paint,
+  Color as SceneColor,
   PaintInstance,
   ImageSampling,
   ResolvedPattern,
   FilterProgram
 }
 import document_styles { StyledGraph }
-import structure { Graph, OccurrenceId }
+import structure { Graph, OccurrenceId, DocumentId, SourceId, StructureError }
+import compressed_document
+import image_assets { DocumentSource }
+import resources { Response }
+import read_fonts.lib { FontRef, ReadError, TableProvider, Head }
+import read_fonts.tables.svg { Svg }
+import font_types.lib { GlyphId }
+import silk.core.result { Result }
+import silk.num.u16
 import used_viewports { Metadata, Clip, ElementKind }
 import used_viewports
 import used_clip_shapes
@@ -42,6 +52,7 @@ import used_style { DashCache }
 import used_style
 import used_text
 import used_text { TextPiece }
+import svg_text.paths { ColorGlyph }
 import svg_fonts.database { FontDatabase, Fonts }
 import font_faces { DocumentFace, Candidate }
 import font_elements
@@ -327,7 +338,24 @@ struct Plan {
   /// A text content child other than `a`: an inline box, to which clip-path, mask,
   /// filter, opacity, mix-blend-mode and isolation do not apply.
   inline: bool,
+  /// The element's glyphs drawn from SVG glyph documents, in `Planning.colorGlyphs`.
+  colors: GlyphRange,
 }
+
+struct GlyphRange {
+  start: usize,
+  end: usize,
+}
+
+impl Copy for GlyphRange {}
+
+/// An SVG glyph document taken from a font, as an image document.
+struct GlyphSource {
+  face: usize,
+  source: usize,
+}
+
+impl Copy for GlyphSource {}
 
 impl Copy for Plan {}
 
@@ -496,6 +524,13 @@ struct Planning<'f, 'h> {
   /// Per text content occurrence, the arena index of its glyph outlines; cells and the
   /// early and late decorations follow.
   textPaths: HashMap<usize, usize>,
+  /// Glyphs drawn from SVG glyph documents, by text content occurrence.
+  colorGlyphs: List<ColorGlyph>,
+  textColors: HashMap<usize, GlyphRange>,
+  glyphSources: List<GlyphSource>,
+  /// In a glyph document, the occurrences that render: the glyph element, its ancestors
+  /// and its descendants. Empty renders every occurrence.
+  glyphShown: List<bool>,
   embedded: List<EmbeddedImage>,
   images: ImageStore,
   metadata: MetadataCache,
@@ -1081,8 +1116,21 @@ effect fn prepare(
       run state.paths.append(move piece.early)
       run state.paths.append(move piece.late)
       drop run state.textPaths.insert(piece.occurrence, at)
+      if piece.colors.length() > 0 {
+        let start = state.colorGlyphs.length()
+        let mut g: usize = 0
+        while g < piece.colors.length() {
+          run state.colorGlyphs.append(piece.colors.asSlice()[g])
+          g = g + 1
+        }
+        drop run state.textColors.insert(
+          piece.occurrence,
+          GlyphRange { start: start, end: state.colorGlyphs.length() },
+        )
+      }
     }
   }
+  let mut colors = GlyphRange { start: 0, end: 0 }
   if textElement || textChild {
     let found: Option<usize> = state.textPaths.get(id.index)
     if let Option<usize>.Some { value: at } = found {
@@ -1095,6 +1143,11 @@ effect fn prepare(
         late = Option<usize>.some(at + 3)
       }
       paintable = !state.paths.asSlice()[at].isEmpty() || early.isSome() || late.isSome()
+    }
+    let range: Option<GlyphRange> = state.textColors.get(id.index)
+    if let Option<GlyphRange>.Some { value } = &range {
+      colors = value
+      paintable = true
     }
   }
   let index = state.plans.length()
@@ -1174,6 +1227,7 @@ effect fn prepare(
       pending: Option<usize>.None,
       unfiltered: maskRoot || inline,
       inline: inline,
+      colors: colors,
     },
   )
   if container {
@@ -2531,6 +2585,10 @@ effect fn paint(
     state.referencePeak = references
   }
   let plan = state.plans.asSlice()[id]
+  if state.glyphShown.length() > 0 && direct(&state.*)
+    && !state.glyphShown.asSlice()[plan.occurrence.index] {
+    return
+  }
 
   // Opacity 0 still records the element: it takes pointer events (SVG 2
   // #PointerEventsProperty), and its layer is skipped when painting.
@@ -3169,7 +3227,12 @@ effect fn paintImageLayer(
         }
         if image == state.embedded.length() {
           run state.embedded.append(
-            EmbeddedImage { source: document, viewport: viewport, tree: Option<RenderTree>.None },
+            EmbeddedImage {
+              source: document,
+              viewport: viewport,
+              tree: Option<RenderTree>.None,
+              glyph: Option<GlyphDocument>.None,
+            },
           )
         }
         let local = used_images.orient(orientation, viewport.width, viewport.height)
@@ -4062,7 +4125,12 @@ effect fn paintFilterImage(
         }
         if image == state.embedded.length() {
           run state.embedded.append(
-            EmbeddedImage { source: candidate, viewport: viewport, tree: Option<RenderTree>.None },
+            EmbeddedImage {
+              source: candidate,
+              viewport: viewport,
+              tree: Option<RenderTree>.None,
+              glyph: Option<GlyphDocument>.None,
+            },
           )
         }
         let placement = Transform.translation(rendered.xMin, rendered.yMin)
@@ -4531,6 +4599,7 @@ effect fn paintPrepared(
             source: source,
             viewport: plan.imageViewport,
             tree: Option<RenderTree>.None,
+            glyph: Option<GlyphDocument>.None,
           },
         )
       }
@@ -4663,6 +4732,9 @@ effect fn paintPrepared(
         }
       }
       _ => {}
+    }
+    if plan.colors.end > plan.colors.start {
+      run paintColorGlyphs(graph, plan, &used, &mut state.*, matrix, clip, &mut nodes.*)
     }
   }
   let starts = plan.container && background.isSome()
@@ -4837,6 +4909,7 @@ effect fn resolveStyled(
   initialWidth: f64,
   initialHeight: f64,
   embedded: Option<Size>,
+  glyph: Option<GlyphDocument>,
 ) -> RenderTree
   ! CssError | RenderError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
@@ -4956,6 +5029,10 @@ effect fn resolveStyled(
   let mut state = Planning {
     fonts: &documentFonts,
     textPaths: HashMap<usize, usize>.make(Hash.seed(0)),
+    colorGlyphs: List<ColorGlyph>.make(),
+    textColors: HashMap<usize, GlyphRange>.make(Hash.seed(0)),
+    glyphSources: List<GlyphSource>.make(),
+    glyphShown: run glyphShown(&graph, glyph),
     embedded: List<EmbeddedImage>.make(),
     images: move images,
     metadata: move sourceMetadata,
@@ -5012,7 +5089,8 @@ effect fn resolveStyled(
       run state.layouts.append(
         Layout {
           supplement: value,
-          clip: if embedded.isSome() {
+          // A glyph document is not clipped to its em square (OpenType `SVG ` table).
+          clip: if embedded.isSome() && glyph.isNone() {
             run used_viewports.clipping(&styles.catalog.engine, rootStyle, physical, value)
           } else {
             Option<Clip>.None
@@ -5066,7 +5144,15 @@ effect fn resolveStyled(
           &Frame.root(Mapping.Affine { value: viewport.scale }),
           Option<usize>.None,
           outputBounds,
-          &PaintContext { fill: Paint.None, stroke: Paint.None, root: usize.MAX },
+          &match &glyph {
+            // context-fill and context-stroke in a glyph document are the text's paints.
+            Option<GlyphDocument>.Some { value: text } => PaintContext {
+              fill: text.fill,
+              stroke: text.stroke,
+              root: graph.root.index,
+            }
+            _ => PaintContext { fill: Paint.None, stroke: Paint.None, root: usize.MAX }
+          },
           0,
           0,
           &mut nodes,
@@ -5123,6 +5209,7 @@ effect fn resolveWithViewport(
   initialWidth: f64,
   initialHeight: f64,
   embedded: Option<Size>,
+  glyph: Option<GlyphDocument>,
 ) -> RenderTree
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
@@ -5138,6 +5225,7 @@ effect fn resolveWithViewport(
         initialWidth,
         initialHeight,
         embedded,
+        glyph,
       ),
       cssLimit,
     ),
@@ -5167,6 +5255,7 @@ pub effect fn resolveWithImages(
     initialWidth,
     initialHeight,
     Option<Size>.None,
+    Option<GlyphDocument>.None,
   )
 }
 
@@ -5181,6 +5270,7 @@ pub effect fn resolveEmbedded(
   limits: &Limits,
   fonts: &FontDatabase,
   viewport: Size,
+  glyph: Option<GlyphDocument>,
 ) -> RenderTree
   ! RenderError | OutOfMemoryError
   ? &mut Allocator {
@@ -5194,6 +5284,7 @@ pub effect fn resolveEmbedded(
     viewport.width,
     viewport.height,
     Option<Size>.some(viewport),
+    glyph,
   )
 }
 
@@ -5377,5 +5468,257 @@ pub effect fn finishEmbedded(tree: &mut RenderTree) -> ()
       entries[p].contentBounds = bounds
     }
     p = p + 1
+  }
+}
+
+// Painting directly, not a resource's content (markers, patterns, masks, clip paths,
+// feImage).
+fn direct(state: &Planning) -> bool {
+  return state.activeMarkers.length() == 0 && state.activePatterns.length() == 0
+    && state.activeMasks.length() == 0
+    && state.activeClips.length() == 0
+    && state.activeFilterImages.length() == 0
+}
+
+// OpenType `SVG ` table, glyph identifiers: the element with id `glyph<N>` describes
+// glyph N. It renders with its ancestors' transforms and its descendants; without such
+// an element the whole document renders.
+effect fn glyphShown(graph: &Graph, glyph: Option<GlyphDocument>) -> List<bool>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut shown = List<bool>.make()
+  let value = match &glyph {
+    Option<GlyphDocument>.Some { value } => value
+    _ => {
+      return move shown
+    }
+  }
+  let mut name = List<u8>.make()
+  run name.appendSlice(b"glyph")
+  let mut digits = List<u8>.make()
+  let mut number = value.glyph
+  while true {
+    run digits.append(u32.toU8(48 + number % 10))
+    number = number / 10
+    if number == 0 {
+      break
+    }
+  }
+  while let Option<u8>.Some { value: digit } = digits.pop() {
+    run name.append(digit)
+  }
+  let source = match &graph.findId(DocumentId { index: 0 }, name.asSlice()) {
+    Option<SourceId>.Some { value: found } => found
+    _ => {
+      return move shown
+    }
+  }
+  let occurrences = graph.occurrences.asSlice()
+  let mut target = usize.MAX
+  let mut i: usize = 0
+  while i < occurrences.length {
+    let candidate = occurrences[i].source
+    if candidate.document.index == source.document.index
+      && candidate.node.index == source.node.index {
+      target = i
+      break
+    }
+    i = i + 1
+  }
+  if target == usize.MAX {
+    return move shown
+  }
+  i = 0
+  while i < occurrences.length {
+    let mut current = Option<OccurrenceId>.some(OccurrenceId { index: i })
+    let mut inside = false
+    while let Option<OccurrenceId>.Some { value: at } = &current {
+      if at.index == target {
+        inside = true
+        break
+      }
+      current = occurrences[at.index].parent
+    }
+    run shown.append(inside)
+    i = i + 1
+  }
+  let mut ancestor = occurrences[target].parent
+  while let Option<OccurrenceId>.Some { value: at } = &ancestor {
+    let mut entries = shown.asMutSlice()
+    entries[at.index] = true
+    ancestor = occurrences[at.index].parent
+  }
+  return move shown
+}
+
+// A text paint as context paint inside a glyph document: solid colours carry over;
+// paint servers belong to this document and paint none there.
+fn carried(paint: Paint, color: SceneColor) -> Paint {
+  return match &paint {
+    Paint.Solid { color: solid } => paint
+    Paint.CurrentColor => Paint.Solid { color: color }
+    _ => Paint.None
+  }
+}
+
+fn samePaint(left: &Paint, right: &Paint) -> bool {
+  return match &left.* {
+    Paint.None => match &right.* {
+      Paint.None => true
+      _ => false
+    }
+    Paint.Solid { color: a } => match &right.* {
+      Paint.Solid { color: b } => a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+      _ => false
+    }
+    _ => false
+  }
+}
+
+struct GlyphBytes {
+  bytes: Bytes,
+  unitsPerEm: u16,
+}
+
+// The glyph's SVG document from its face, decompressed when gzip-encoded.
+effect fn glyphBytes(fonts: &Fonts, face: usize, glyph: u32) -> Option<GlyphBytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let font = match move FontRef.fromIndex(fonts.data(face), fonts.face(face).index) {
+    Result<FontRef, ReadError>.Success { value } => value
+    _ => {
+      return Option<GlyphBytes>.None
+    }
+  }
+  let unitsPerEm = match move TableProvider.head(&font) {
+    Result<Head, ReadError>.Success { value } => Head.unitsPerEm(&value)
+    _ => {
+      return Option<GlyphBytes>.None
+    }
+  }
+  if unitsPerEm == 0 {
+    return Option<GlyphBytes>.None
+  }
+  let table = TableProvider.svg(&font)
+  if let Result<Svg, ReadError>.Success { value } = &table {
+    if let Option<&[u8]>.Some { value: raw } = &Svg.glyphData(&value, GlyphId.new(glyph)) {
+      let expanded = run Effect.result(compressed_document.expand(raw, 16777216))
+      let bytes = match move expanded {
+        Result<Option<Bytes>, StructureError | OutOfMemoryError>.Success {
+          value: found
+        } => match move found {
+          Option<Bytes>.Some { value: inflated } => move inflated
+          _ => run Bytes.copy(raw)
+        }
+        Result<Option<Bytes>, StructureError | OutOfMemoryError>.Failure { error } => match &error {
+          OutOfMemoryError problem => {
+            fail OutOfMemoryError {}
+          }
+          StructureError problem => {
+            return Option<GlyphBytes>.None
+          }
+        }
+      }
+      return Option<GlyphBytes>.some(GlyphBytes { bytes: move bytes, unitsPerEm: unitsPerEm })
+    }
+  }
+  return Option<GlyphBytes>.None
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Each glyph drawn from an SVG glyph document is an independent secure static document
+// in the glyph's em square, placed at the glyph (OpenType `SVG ` table).
+effect fn paintColorGlyphs(
+  graph: &Graph,
+  plan: &Plan,
+  used: &Style,
+  state: &mut Planning,
+  matrix: &Mapping,
+  clip: Option<usize>,
+  nodes: &mut List<ResolvedNode>,
+) -> ()
+  ! RenderError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fill = carried(used.fill, used.color)
+  let stroke = carried(used.stroke, used.color)
+  let mut g = plan.colors.start
+  while g < plan.colors.end {
+    let entry = state.colorGlyphs.asSlice()[g]
+    g = g + 1
+    let found = run glyphBytes(state.fonts, entry.face, entry.glyph)
+    let loaded = match move found {
+      Option<GlyphBytes>.Some { value } => move value
+      _ => {
+        continue
+      }
+    }
+    let mut source = usize.MAX
+    let mut k: usize = 0
+    while k < state.glyphSources.length() {
+      let known = state.glyphSources.asSlice()[k]
+      if known.face == entry.face
+        && sameBytes(
+          Bytes.asSlice(&state.images.documents.asSlice()[known.source].response.bytes),
+          Bytes.asSlice(&loaded.bytes),
+        ) {
+        source = known.source
+        break
+      }
+      k = k + 1
+    }
+    let em = u16.toF64(loaded.unitsPerEm)
+    if source == usize.MAX {
+      source = state.images.documents.length()
+      let base = graph.documents.asSlice()[0].base
+      let request = run graph.urls.asSlice()[base].clone()
+      run state.images.documents.append(
+        DocumentSource {
+          response: Response.fromBytes(move loaded.bytes),
+          request: move request,
+          metadata: Option<DocumentMetadata>.None,
+        },
+      )
+      run state.glyphSources.append(GlyphSource { face: entry.face, source: source })
+    }
+    let mut image: usize = 0
+    while image < state.embedded.length() {
+      let known = &state.embedded.asSlice()[image]
+      if known.source == source {
+        if let Option<GlyphDocument>.Some { value: drawn } = &known.glyph {
+          if drawn.glyph == entry.glyph && samePaint(&drawn.fill, &fill)
+            && samePaint(&drawn.stroke, &stroke) {
+            break
+          }
+        }
+      }
+      image = image + 1
+    }
+    if image == state.embedded.length() {
+      run state.embedded.append(
+        EmbeddedImage {
+          source: source,
+          viewport: Size.new(em, em),
+          tree: Option<RenderTree>.None,
+          glyph: Option<GlyphDocument>.some(
+            GlyphDocument { glyph: entry.glyph, fill: fill, stroke: stroke },
+          ),
+        },
+      )
+    }
+    let transform = run matrix.compose(&Mapping.Affine { value: entry.transform })
+    run nodes.append(ResolvedNode.Embedded { image: image, transform: transform, clip: clip })
   }
 }
