@@ -153,6 +153,9 @@ pub struct Catalog {
   // Presentation attribute text (hashed with its property, base and rule set) to the
   // declaration it last compiled to; repeated attribute values reuse its buffer and value.
   presentations: HashMap<u64, usize>,
+  // Inline style text (hashed with its base and rule set) to the buffer and declarations it
+  // last compiled to; repeated style attributes copy those declarations.
+  inlines: HashMap<u64, InlineMemo>,
   // Copies of the host's pretokenized sheets (Initials.prepareSheet), each used once.
   prepared: List<PreparedSheet>,
   // The user-agent sheet is already collected (see Catalog.prepareUserAgent).
@@ -307,6 +310,7 @@ impl PreparedCatalog {
         ruleCount: source.ruleCount,
         declarationCount: source.declarationCount,
         presentations: HashMap<u64, usize>.make(Hash.seed(0)),
+        inlines: HashMap<u64, InlineMemo>.make(Hash.seed(0)),
         prepared: move prepared,
         userAgent: true,
       },
@@ -514,6 +518,7 @@ impl Catalog {
       ruleCount: 0,
       declarationCount: 0,
       presentations: HashMap<u64, usize>.make(Hash.seed(0)),
+      inlines: HashMap<u64, InlineMemo>.make(Hash.seed(0)),
       prepared: move prepared,
       userAgent: false,
     }
@@ -769,13 +774,73 @@ impl Catalog {
     if base >= self.urls.length() || rules.index >= self.sets.length() {
       fail CssError { kind: CssErrorKind.InputLimit, offset: 0 }
     }
+    let key = inlineKey(bytes, base, rules)
+    if let Option<InlineMemo>.Some { value: earlier } = self.inlines.get(key) {
+      if self.sameSource(earlier.buffer, bytes, base, rules)
+        && self.reuseFits(earlier, bytes.length, limits) {
+        // Same text and source: the same tokens and declarations, so the earlier buffer and
+        // values are shared and charged as a fresh tokenization and parse would be. Near a
+        // limit the text is tokenized again, so a limit error keeps its exact offset.
+        let tokens = &self.buffers.asSlice()[earlier.buffer]
+        let storage = Bytes.length(&tokens.data)
+        let count = tokens.tokens.length()
+        self.inputBytes = self.inputBytes + bytes.length
+        self.storageBytes = self.storageBytes + storage
+        self.tokenCount = self.tokenCount + count
+        self.declarationCount = self.declarationCount + earlier.parsed
+        let start = self.declarations.length()
+        run self.declarations.reserve(earlier.end - earlier.start)
+        let mut d = earlier.start
+        while d < earlier.end {
+          let declaration = self.declarations.asSlice()[d]
+          run self.declarations.append(declaration)
+          d = d + 1
+        }
+        return TokenRange { start: start, end: self.declarations.length() }
+      }
+    }
     let buffer = run self.buffer(
       bytes,
       Source { url: base, encoding: Encoding.Utf8, ruleSet: rules },
       limits,
     )
     let range = self.buffers.asSlice()[buffer].all()
-    return run self.declarationsIn(buffer, range, limits)
+    let parsedBefore = self.declarationCount
+    let result = run self.declarationsIn(buffer, range, limits)
+    let memo = InlineMemo {
+      buffer: buffer,
+      start: result.start,
+      end: result.end,
+      parsed: self.declarationCount - parsedBefore,
+    }
+    drop run self.inlines.insert(key, memo)
+    return result
+  }
+
+  // Whether charging a reused inline buffer stays well inside every limit, so tokenizing and
+  // parsing the text again could not have failed.
+  fn reuseFits(self: &Self, earlier: InlineMemo, length: usize, limits: &Limits) -> bool {
+    let tokens = &self.buffers.asSlice()[earlier.buffer]
+    let storage = Bytes.length(&tokens.data)
+    let count = tokens.tokens.length()
+    return self.inputBytes <= limits.maxInputBytes
+      && length <= limits.maxInputBytes - self.inputBytes
+      && self.storageBytes <= limits.maxStorageBytes
+      && storage / 2 + 1024 <= (limits.maxStorageBytes - self.storageBytes) / 4
+      && self.tokenCount <= limits.maxTokens
+      && count / 2 + 16 <= (limits.maxTokens - self.tokenCount) / 4
+      && self.declarationCount <= limits.maxDeclarations
+      && earlier.parsed <= limits.maxDeclarations - self.declarationCount
+  }
+
+  // Whether buffer `buffer` was tokenized from exactly `bytes` for this base and rule set.
+  fn sameSource(self: &Self, buffer: usize, bytes: &[u8], base: usize, rules: RuleSetId) -> bool {
+    let source = self.sources.asSlice()[buffer]
+    if source.url != base || source.ruleSet.index != rules.index {
+      return false
+    }
+    let tokens = &self.buffers.asSlice()[buffer]
+    return tokens.sourceLength == bytes.length && equal(tokens.source(), bytes)
   }
 
   pub effect fn addPresentation(
@@ -1837,6 +1902,27 @@ struct MemoResult {
 impl Copy for MemoResult {}
 
 // FNV-1a over the attribute text, then its property, base and rule set.
+struct InlineMemo {
+  buffer: usize,
+  start: usize,
+  end: usize,
+  // Declarations parsed (and charged), including ones that did not compile.
+  parsed: usize,
+}
+
+impl Copy for InlineMemo {}
+
+fn inlineKey(bytes: &[u8], base: usize, rules: RuleSetId) -> u64 {
+  let mut hash: u64 = 14695981039346656037
+  let mut i: usize = 0
+  while i < bytes.length {
+    hash = u64.wrappingMultiply(hash ^ u8.toU64(bytes[i]), 1099511628211)
+    i = i + 1
+  }
+  hash = u64.wrappingMultiply(hash ^ usize.toU64(base), 1099511628211)
+  return u64.wrappingMultiply(hash ^ usize.toU64(rules.index), 1099511628211)
+}
+
 fn presentationKey(bytes: &[u8], property: Property, base: usize, rules: RuleSetId) -> u64 {
   let mut hash: u64 = 14695981039346656037
   let mut i: usize = 0
