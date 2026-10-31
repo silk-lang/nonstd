@@ -700,8 +700,11 @@ interpretation/conversion remains incomplete; PNG samples are integrated into SV
 
 `images/svg/fonts` holds the faces text layout may use. The host fills it with font
 data. CSS Fonts 4 #font-matching-algorithm leaves the set of installed fonts undefined.
-Generic families resolve to the first configured family that has faces. Interpretation
-decisions:
+Generic families resolve to the first configured family that has faces. The CLI
+configures `serif`, `sans-serif`, `monospace` and their `ui-` forms (and `system-ui`
+as sans-serif) with lists of widely installed families, such as DejaVu, Liberation,
+Noto, Times New Roman, Arial and Courier New. Other generics, and generics with no
+installed family, use the measured default face. Interpretation decisions:
 
 - Family names are the typographic (name ID 16) and legacy (name ID 1) names in every
   language. They are compared with Unicode Default Caseless Matching (#localized-name-matching):
@@ -1369,3 +1372,20 @@ is then unusable. `icc-color()` accepts any input count matching the tag, so CMY
 profiles work there. Images accept one- and three-channel tags only.
 
 There is no black-point compensation and no gamut mapping beyond clipping.
+
+### Host viewport and the W3C suite
+
+CSS Images 3 #default-sizing gives an outermost `svg` with percentage or auto sizes
+the embedding viewport, so `width="100%"` resolves against what the host supplies.
+The CLI's `--viewport-width` and `--viewport-height` set that viewport (default 300 by
+150, the CSS default object size). `--width` and `--height` set output pixels, scaling
+the intrinsic size instead. The W3C SVG 1.1 tests are 480 by 360 documents sized 100%,
+so the conformance sweep renders them in a 480 by 360 viewport. It also passes
+`--resources-dir` with the suite root, since their images live in a sibling `images`
+directory that is outside the input directory the CLI otherwise confines files to.
+
+Projective clipping of an edge that lies on a clip plane within its error takes the
+inside endpoint as the intersection. Interpolating there divides by a near-zero
+distance sum and charges the whole edge length to the vertex error. A filtered image
+whose edges coincide with its filter region failed with a geometry accuracy error this
+way.

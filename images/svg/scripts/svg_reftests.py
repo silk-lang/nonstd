@@ -173,12 +173,14 @@ def outcome(expected, matched):
     raise ValueError("skip cases must not be compared")
 
 
-def renderer_argv(command, input_path, output_path):
+def renderer_argv(command, input_path, output_path, root=Path(".")):
+    """{root} names the suite directory, for renderers that confine resource reads."""
     if not isinstance(command, list) or not command or any(not isinstance(arg, str) for arg in command):
         raise ValueError("--renderer must be a JSON array of argv strings")
     if not any("{input}" in arg for arg in command) or not any("{output}" in arg for arg in command):
         raise ValueError("renderer argv requires {input} and {output} placeholders")
-    return [arg.replace("{input}", str(input_path)).replace("{output}", str(output_path)) for arg in command]
+    return [arg.replace("{input}", str(input_path)).replace("{output}", str(output_path)).replace("{root}", str(root))
+            for arg in command]
 
 
 class Links(HTMLParser):
@@ -267,8 +269,9 @@ def discover_cases(root, suite, lock, full):
     return cases
 
 
-def render(command, source, output, timeout):
-    process = subprocess.run(renderer_argv(command, source.resolve(), output.resolve()), timeout=timeout, capture_output=True, text=True)
+def render(command, source, output, timeout, root=Path(".")):
+    process = subprocess.run(renderer_argv(command, source.resolve(), output.resolve(), root.resolve()), timeout=timeout,
+                             capture_output=True, text=True)
     if process.returncode:
         raise ValueError(f"renderer exited {process.returncode}: {process.stderr[-2000:]}")
     if not output.is_file():
@@ -303,12 +306,12 @@ def run_case(case, expectation, root, command, timeout, diff_dir=None):
         with tempfile.TemporaryDirectory(prefix="svg-reftest-") as temporary:
             tmp = Path(temporary)
             # Per-case options (such as an animation time) apply to the input only; references are static.
-            actual = render(command + case.get("arguments", []), contained(root, case["input"]), tmp / "actual.png", timeout)
+            actual = render(command + case.get("arguments", []), contained(root, case["input"]), tmp / "actual.png", timeout, root)
             result["rendered"] = True
             pairs = []
             for index, ref in enumerate(case["references"]):
                 path = contained(root, ref["path"])
-                reference = read_png(path) if path.suffix == ".png" else render(command, path, tmp / f"reference-{index}.png", timeout)
+                reference = read_png(path) if path.suffix == ".png" else render(command, path, tmp / f"reference-{index}.png", timeout, root)
                 comparison = compare_rgba(actual, reference, tolerance.get("channel", 0),
                                           tolerance.get("pixels", 0), tolerance.get("antialias_channel", 0))
                 comparison.update(reference=ref["path"], relation=ref["relation"])
@@ -343,7 +346,7 @@ def run_malformed_case(case, root, command, timeout, diff_dir=None):
     try:
         with tempfile.TemporaryDirectory(prefix="svg-malformed-") as temporary:
             output = Path(temporary) / "actual.png"
-            process = subprocess.run(renderer_argv(command, contained(root, case["input"]).resolve(), output.resolve()),
+            process = subprocess.run(renderer_argv(command, contained(root, case["input"]).resolve(), output.resolve(), root.resolve()),
                                      timeout=timeout, capture_output=True, text=True)
             result.update(exit_code=process.returncode, output_present=output.exists(), stderr=process.stderr[-2000:])
             result["outcome"] = "pass" if process.returncode == 1 and not output.exists() else "error"
