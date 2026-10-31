@@ -13,8 +13,11 @@ import silk.num.f64
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+import silk.simd.simd
+import silk.simd.u8x16
+import silk.simd.u32x4
 import strips { Coverage, BAND, minU32 }
-import pixmap { Pixmap, Rgba8, div255, over }
+import pixmap { Pixmap, Rgba8, div255, over, overSpan, scalePacked }
 import paint { Shader }
 import color_space as colorSpace
 
@@ -410,6 +413,10 @@ pub fn compositeWithin(
   let level = u8.toU32(opacity)
   let source = layer.data()
   let d = target.dataMut()
+  if mode == BLEND_NORMAL {
+    compositeNormal(&mut d, source, stride, layerStride, level, x0, y0, width, height)
+    return
+  }
   let mut y: u32 = y0
   while y < height {
     let mut x: u32 = x0
@@ -427,6 +434,83 @@ pub fn compositeWithin(
     y = y + 1
   }
 }
+
+/// The `BLEND_NORMAL` case of [`compositeWithin`]: each row is packed (scaled by `level`)
+/// into spans of [`overSpan`], skipping spans with no visible pixel.
+fn compositeNormal(
+  d: &mut [u8],
+  source: &[u8],
+  stride: usize,
+  layerStride: usize,
+  level: u32,
+  x0: u32,
+  y0: u32,
+  width: u32,
+  height: u32,
+) -> () {
+  let mut colors: [u32; SPAN] = [0; SPAN]
+  let none = u32x4.splat(0)
+  let opaqueBit = u32x4.splat(0x01000000)
+  let lanes = u32x4.splat(0x00ff00ff)
+  let scale = u32x4.splat(level)
+  let eight = u32x4.splat(8)
+  let mut y: u32 = y0
+  while y < height {
+    let line = u32.toUsize(y) * layerStride
+    let row = u32.toUsize(y) * stride
+    let mut x: u32 = x0
+    while x < width {
+      let count = u32.toUsize(minU32(width - x, SPAN_U32))
+      let start = line + u32.toUsize(x) * 4
+      let mut seen = u32x4.splat(0)
+      let mut i: usize = 0
+      while i + 4 <= count {
+        let words = u8x16.bitcastToU32x4(u8x16.load(source, start + i * 4))
+        let mut kept = u32x4.select(u32x4.lanesLess(words, opaqueBit), none, words)
+        if level != 255 {
+          let rb = div255Lanes4(u32x4.wrappingMultiply(kept & lanes, scale))
+          let ag = div255Lanes4(u32x4.wrappingMultiply(u32x4.shiftRight(kept, eight) & lanes, scale))
+          kept = rb | u32x4.shiftLeft(ag, eight)
+        }
+        u32x4.store(&mut colors, i, kept)
+        seen = seen | kept
+        i = i + 4
+      }
+      let mut rest: u32 = u32x4.reduceBitOr(seen)
+      while i < count {
+        let j = start + i * 4
+        let a = u8.toU32(source[j + 3])
+        let mut word: u32 = 0
+        if a != 0 {
+          word = u8.toU32(source[j]) | u32.shiftLeft(u8.toU32(source[j + 1]), 8) | u32.shiftLeft(u8.toU32(source[j + 2]), 16) | u32.shiftLeft(a, 24)
+          if level != 255 {
+            word = scalePacked(word, level)
+          }
+        }
+        colors[i] = word
+        rest = rest | word
+        i = i + 1
+      }
+      if rest != 0 {
+        overSpan(&mut d, row + u32.toUsize(x) * 4, &colors, count)
+      }
+      x = x + usize.toU32(count)
+    }
+    y = y + 1
+  }
+}
+
+/// `div255Lanes` of `pixmap` on four words at once.
+@inlineAlways
+fn div255Lanes4(x: simd<u32, 4>) -> simd<u32, 4> {
+  let lanes = u32x4.splat(0x00ff00ff)
+  let eight = u32x4.splat(8)
+  let t = u32x4.wrappingAdd(x, u32x4.splat(0x00800080))
+  return u32x4.shiftRight(u32x4.wrappingAdd(t, u32x4.shiftRight(t, eight) & lanes), eight) & lanes
+}
+
+const SPAN: usize = 128
+const SPAN_U32: u32 = 128
 
 /// Compositing 1 #blending without compositing (FE1 feBlend `no-composite`): each pixel
 /// becomes `layer`'s mixed with the target's B(Cb, Cs), keeping `layer`'s alpha.
