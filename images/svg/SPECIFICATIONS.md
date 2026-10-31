@@ -231,7 +231,7 @@ Not on the skip list, though it's tempting: SVG fonts (1.1 ch. 20), `color-profi
 
 Implement removed SVG 1.1 requirements additively where they do not conflict: SVG fonts and their child elements, `altGlyph` family, `tref`, `color-profile` and `icc-color()`, `enable-background`, `clip`, `kerning`, `glyph-orientation-*`, `filterRes`, `requiredFeatures`, `xml:base`, and `xlink:*`. Check the [SVG 2 changes appendix](https://www.w3.org/TR/2018/CR-SVG2-20181004/changes.html) against the older normative section when each feature is implemented.
 
-For genuine behavior conflicts, default to SVG 2. Do not introduce a speculative profile switch. If that rule cannot resolve a real case, ask Julia before adding a document-level `Profile { svg11, svg2 }`, defaulting to `svg2`. Mesh gradients, hatches, `solidcolor`, and `z-index` are outside the pinned CR scope unless Julia requests them.
+For genuine behavior conflicts, default to SVG 2. Do not introduce a speculative profile switch. If that rule cannot resolve a real case, ask Julia before adding a document-level `Profile { svg11, svg2 }`, defaulting to `svg2`. `solidcolor` and `z-index` are outside the pinned CR scope unless Julia requests them. Julia requested mesh gradients and hatches for phase 15; they follow the [2016 CR](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html), the last to define them (see "Mesh gradients" below).
 
 The table is a register of cases to test, not a claim of complete rendering support. No implemented behavior currently needs a profile switch.
 
@@ -544,6 +544,34 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts: `hitTest` on a display list. Clip paths cut regions; masks, filters and opacity don't, so an element of opacity 0 is recorded (its layer is skipped when painting). `auto` (SVG 2 editor's draft) is visiblePainted
 - [x] OpenType SVG glyphs ([`SVG ` table](https://learn.microsoft.com/en-us/typography/opentype/spec/svg)): see "SVG glyph documents" under Text layout
 - [x] A wasm32 build (`images/svg/wasm`): renders every fixture exactly as the native build
+- [x] Mesh gradients ([2016 CR #MeshGradients](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html#MeshGradients)), bilinear and bicubic: see "Mesh gradients" below
+
+### Mesh gradients
+
+`meshgradient` is a paint server like the other gradients: `href` templates copy `x`, `y`,
+`gradientUnits`, `type` and the `transform` presentation attribute, and children when the
+referencing element has none. Each use rasterizes the Coons patches
+([#MeshPatchPainting](https://www.w3.org/TR/2016/CR-SVG2-20160915/pservers.html#MeshPatchPainting))
+into an image paint with one pixel per device pixel, aligned to the device grid when the
+mesh maps by an axis-aligned scale and translation. A patch is split into a grid of at most
+64 by 64 cells of about four device pixels; each pixel centre a cell's triangles cover takes
+the colour at its interpolated (u, v), so meshes have aliased edges (the painted shape's own
+edge is antialiased). Images are capped at 4 Mi pixels; larger meshes are rendered at a
+lower resolution. Interpretation decisions:
+
+- Corner colours interpolate in straight alpha, like the other SVG gradients, and in sRGB;
+  `color-interpolation` does not apply.
+- Later patches, and later cells within a patch, paint over earlier ones where they fold.
+- A mesh is in error, and paints nothing, when a row has a different number of patches
+  from the first row, a patch has too few `stop` elements, or a stop's `path` is not one
+  `c`, `C`, `l` or `L` command with its points. Extra stops are ignored; the last stop of a
+  patch may repeat the known end point, which is ignored.
+- `type="bicubic"` follows the monotone derivative steps along mesh rows and columns, with
+  derivatives per unit of distance between corners, scaled to the unit square by the chord
+  of the patch edge they run along, and zero cross derivatives. The end-point rule is read
+  as applying whenever a line has two or more segments (the text's "n > 2" and its
+  `δ1 = δn = Δ0` fallback mix one- and zero-based indices); a single segment uses its secant
+  at both ends. Hermite results are clamped to [0, 1].
 
 Mask resources use CSS Masking 1 [mask element coordinates](https://www.w3.org/TR/css-masking-1/#MaskElement)
 and [mask value calculation](https://www.w3.org/TR/css-masking-1/#MaskValues).
