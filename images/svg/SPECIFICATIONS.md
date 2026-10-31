@@ -255,6 +255,8 @@ differences lie within one pixel of a color or alpha edge in both images;
 constant-color interiors away from those edges agree. Missing/negative radii
 correctly suppress the circle. Per-case counts and reasons are retained in
 `images/svg/tests/expectations/resvg.txt`; none is silently skipped.
+The phase 13 sweep of the whole suite supersedes these counts; see
+[The resvg suite](#the-resvg-suite).
 
 Phase 3 changes the shared vector geometry/precision path and therefore these
 edge samples. Compared with phase 2, all six cases have fewer differing pixels
@@ -792,7 +794,9 @@ decisions:
   that a document defines hides installed faces of the same name. `unicode-range`,
   `font-display`, `size-adjust` and the metric overrides are ignored.
 - `font-variation-settings` axis values follow the ones font matching sets, so they win.
-  `font-optical-sizing` is not applied yet (no test font has an `opsz` axis).
+  With `font-optical-sizing: auto`, a face's `opsz` axis takes the used font size in CSS
+  pixels (user units, before transforms), as #font-optical-sizing-def recommends; an
+  explicit `opsz` setting wins over it.
 - `font-size-adjust` takes a number (the ex-height metric). The used size makes the x-height
   of the span's first available font (its first matched face, at default variations) that
   fraction of the computed size. Without an x-height metric the size is unchanged. `em`
@@ -1389,3 +1393,57 @@ inside endpoint as the intersection. Interpolating there divides by a near-zero
 distance sum and charges the whole edge length to the vertex error. A filtered image
 whose edges coincide with its filter region failed with a geometry accuracy error this
 way.
+
+The W3C 1.1 reference PNGs are captures from other renderers of older suite
+revisions, with their fonts and antialiasing, so only `struct-frag-01-t` matches
+exactly. Every other case is recorded in `tests/expectations/w3c-svg11.txt` with the
+difference found when comparing against Chrome: `fail` with that reason, or
+`spec-difference` where this renderer follows SVG 2 or CSS where the capture does not.
+Scripted and interactive cases are skipped.
+
+### The resvg suite
+
+The scheduled conformance run renders the whole resvg suite at its 300-pixel reference
+width with `--font-dir` set to the suite's fonts and `--language en`, as the resvg
+harness does (it maps the generic families to Noto and assumes English). Each case is
+recorded in `tests/expectations/resvg.txt`. Cases whose images agree except along edges
+were reviewed on contact sheets and stay `fail`: tiny-skia flattens curves, rasterizes
+pattern tiles into integer pixmaps and antialiases differently, and no pixel tolerance
+is applied. The remaining differences are `spec-difference` entries, where this renderer
+follows SVG 2, CSS or Filter Effects 1 and resvg does not, or `fail` entries that name
+the missing feature (colour glyph formats, Compositing 2 `plus-lighter`, spacing of
+cursive scripts, GIF and WebP images).
+
+Decisions made during the sweep:
+
+- `systemLanguage` matches the host's languages, which the CLI takes from `--language`.
+  Without it, no language condition is true.
+- Conditional processing attributes affect only direct rendering
+  (#ConditionalProcessing). A `clipPath`, `mask`, `marker` or `pattern` whose own
+  conditions fail still works when referenced; its children's conditions still apply.
+- A `tspan`, `textPath` or `tref` is an inline box, not a container or graphics
+  element, so `clip-path`, `mask`, `filter`, `opacity`, `mix-blend-mode` and
+  `isolation` do not apply to it, and `transform` has no effect on it
+  (#TextLayoutAlgorithm display rules).
+- A `textPath` is correctly parented only in `text` (through `a`). Elsewhere, including
+  inside another `textPath`, its used display is none.
+- An invalid `textPath` reference gives an empty path, so its characters are hidden.
+  An empty path has no end point, so `path_end` keeps its initial (0, 0) and the
+  characters after the element stay where the line layout put them.
+- `context-fill` and `context-stroke` paint servers use the context element's (the
+  `use` element's or the marker-referencing element's) coordinate space and bounding box.
+- Unknown elements in the SVG namespace render as `g` (#UnknownElement), also inside
+  `switch`, where an unknown element without failing conditions is selected.
+- A dash that ends exactly at a corner is not joined to the next dash: each dash is its
+  own open subpath with caps (#StrokeDashing), so `stroke-dasharray="40 0"` on a
+  120-unit square leaves notched corners.
+- `clipPath`'s `transform` lies inside the clipping path coordinate system that
+  `clipPathUnits` establishes (CSS Transforms 1 #svg-transform), unlike browsers and
+  resvg, which apply it in user space.
+- In presentation attributes, filter functions accept unitless lengths and angles
+  (#presentation-attribute-css-value), so `filter="blur(4)"` and `hue-rotate(45)` apply.
+- A `pattern` with a `viewBox` and `objectBoundingBox` units fits the `viewBox` to the
+  tile's user-space size, so `preserveAspectRatio` sees the real aspect ratio.
+- Regions of filters on an `svg` element with a `viewBox` are measured in the user
+  space outside the `viewBox` supplement, the space of the element's `x`, `y`, `width`
+  and `height`.
