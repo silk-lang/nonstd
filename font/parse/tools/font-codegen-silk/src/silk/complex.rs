@@ -29,7 +29,7 @@ impl Context<'_> {
             "ankr" => out.push_str("import generated_aat { LookupU16 }\n"),
             "gvar" => out.push_str("import generated_variations { Tuple, TupleVariationHeader, TupleVariationCount }\n"),
             "base" => out.push_str("import generated_layout { DeviceOrVariationIndex, Device, VariationIndex }\nimport generated_variations { ItemVariationStore, DeltaSetIndex }\n"),
-            "varc" => out.push_str("pub import generated_layout { CoverageTable, Condition }\npub import ps.cff.index { Index2 }\nimport generated_variations { PackedDeltas, DeltaRunIter }\nimport font_data { Cursor }\nimport font_types.lib { Matrix }\n"),
+            "varc" => out.push_str("pub import generated_layout { CoverageTable, Condition }\npub import ps.cff.index { Index2 }\nimport generated_variations { PackedDeltas, DeltaRunIter }\nimport font_data { Cursor }\nimport silk.geometry.affine { Affine2 }\n"),
             "math" => out.push_str("import generated_layout { CoverageTable, DeviceOrVariationIndex, Device }\n"),
             "cvar" => out.push_str("import generated_variations { TupleVariationHeader, TupleVariationCount }\n"),
             "cblc" | "eblc" => out.push_str("pub import generated_bitmap { BitmapSize }\n"),

@@ -15,11 +15,11 @@ It has no dependencies and does not allocate.
   `LongDateTime`, and the offsets `Offset16`, `Offset24` and `Offset32` (with `Nullable`
   for null offsets).
 - **Fixed point.** `Fixed` (16.16), `F2Dot14`, `F4Dot12`, `F6Dot10`, `F26Dot6` and `F48Dot16`,
-  with conversions to and from `f32`/`f64` and fontations' wrapping and rounding rules. Signed and
-  unsigned bit reinterpretation lives in `cast`.
+  with conversions to and from `f32`/`f64` and fontations' wrapping and rounding rules. Each one
+  implements `silk.num.numeric.Zero` and `One`, so it works with the `silk.geometry` types. Signed
+  and unsigned bit reinterpretation lives in `cast`.
 - **Tags and versions.** `Tag` (with validation), `MajorMinor`, `Version16Dot16`, and
   the sfnt version constants.
-- **Geometry.** `Point`, `BoundingBox` and `Matrix`, generic over the coordinate type.
 - **Font units.** `FWord` and `UfWord`.
 
 ## Example
