@@ -491,7 +491,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] `text`, `tspan`, `x`/`y`/`dx`/`dy`/`rotate` lists and their inheritance across tspans (§11.2)
 - [ ] The SVG 2 text layout algorithm (§11.5) step by step: CSS-laid-out "addressable characters", per-character absolute positioning, `textLength`/`lengthAdjust`, anchored chunks and `text-anchor`, bidi reordering (via `ucd`), `rotate`. Open: bidi control characters around anchored chunks measure chunk extents differently from browsers (WPT text-bidi-controls-anchors-2), and letter-spacing is applied inside cursive scripts.
 - [x] White space: SVG 2 `white-space` and 1.1 `xml:space` (§11.10.3, 1.1 §10.15)
-- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-padding`, `shape-margin`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7). Open: `shape-padding` and `shape-margin` are not applied, and right-to-left and vertical wrapped lines are placed differently from the WPT references.
+- [ ] Pre-formatted (§11.6) and auto-wrapped text: `inline-size`, `shape-inside` and `shape-subtract` (done), `shape-margin` (done), `shape-padding`, CSS Text 3 line breaking via `ucd` (§11.4, §11.7). Open: `shape-padding` is not applied, and vertical text is not wrapped in `shape-inside` areas. The other right-to-left and vertical wrapping cases in WPT are spec differences or need fonts the suite does not ship.
 - [x] `textPath`: `href` and the SVG 2 `path` attribute, `startOffset`, `method`, `spacing`, `side`, glyph midpoints off the path end (§11.8)
 - [x] Fonts and glyphs: font matching, synthetic bold/oblique per CSS Fonts 4, fallback per cluster, `font-variant-*`, `font-feature-settings`, `font-kerning`, 1.1 `kerning`, `font-size-adjust`, `font-variation-settings` (§11.1.2)
 - [x] Baselines: `dominant-baseline`, `alignment-baseline`, `baseline-shift` incl. `sub`/`super`, 1.1 values (CSS Inline 3)
@@ -939,7 +939,13 @@ decisions:
   Trailing white space hangs and takes no part in alignment (CSS Text 3
   #white-space-phase-2). Text that overflows one shape continues in the next; what is left
   after the last is not rendered.
-  Not done yet: `shape-padding`, `shape-margin`, `shape-image-threshold` and image
+  A shape in `shape-subtract` grows by its `shape-margin` (#TextShapeMargin, CSS Shapes 1
+  #shape-margin-property): a `url()` shape by the referenced element's, a basic shape by
+  the `text` element's. The grown shape is every point within the margin of the shape,
+  built as the shape plus a band along each polygon edge and a disc at each vertex (a
+  64-sided polygon inscribed in it), so beside an edge the margin is exact and at a corner
+  it is rounded. Shapes in `shape-inside` take no margin.
+  Not done yet: `shape-padding`, `shape-image-threshold` and image
   shapes, and vertical text in shapes.
 - `tref` (SVG 1.1 #TRefElement) takes the character data of the same-document element its
   `href` or `xlink:href` names, markup removed, and treats it as its own text with its own

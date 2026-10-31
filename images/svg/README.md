@@ -142,8 +142,8 @@ the specification and resvg or the browsers disagree, and this renderer follows 
 [SPECIFICATIONS.md](SPECIFICATIONS.md) lists each of those decisions.
 
 The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
-text features: `shape-padding`, `shape-margin`, right-to-left and vertical wrapping, `vkern`
-and external SVG fonts.
+text features: `shape-padding`, vertical text in `shape-inside`, `vkern` and external SVG
+fonts.
 Hit testing is optional and not implemented.
 
 ## Performance
