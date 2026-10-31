@@ -327,8 +327,9 @@ still apply. Separately, a non-scaling stroke on the **marked shape** makes
 its `markerUnits="strokeWidth"` markers use that shape's stroke-host space.
 
 For an exactly antiparallel marker join, choose the incoming tangent rotated
-clockwise by 90 degrees; the bisector is otherwise ambiguous
-([SVGWG issue 333](https://github.com/w3c/svgwg/issues/333)).
+counterclockwise by 90 degrees on screen; the bisector is otherwise ambiguous
+([SVGWG issue 333](https://github.com/w3c/svgwg/issues/333)). Browsers make the
+same choice, which WPT `svg/painting/reftests/markers-orient-002.svg` tests.
 
 For `overflow:visible` patterns, render every overlapping tile permitted by
 the resource limits, left-to-right within top-to-bottom rows. Do not truncate
@@ -362,13 +363,28 @@ inside mixed `calc()` expressions. Dimensionless ratios are not distances.
 Normal strokes measure source geometry; non-scaling strokes measure the chosen
 host centerline, before output zoom. Metrics cover every contour and close
 segment and are cached by path/host mapping. The native measurement reports its
-certified uncertainty; calibration refines it to at most `0.0001` coordinate
-units and one part per million of the certified lower length bound. This keeps
-tiny source paths accurate when magnified without coupling the metric to output
-zoom. A zero estimate with nonzero uncertainty is refined, not treated as empty.
-At most eight metric calls are permitted; unbounded projective length, underflow,
-or unattainable precision (including extremely small returning curves) produces
-`InvalidGeometry` rather than an uncalibrated or incorrectly solid stroke.
+certified uncertainty; calibration starts at one coordinate unit and refines it, by
+at most a factor of 16 per step, to one part per million of the certified lower
+length bound. This keeps tiny source paths accurate when magnified without coupling
+the metric to output zoom. A finer budget can be out of f64 reach on a large curve
+(an arc of radius 100 cannot be certified to `0.0001`); then the best estimate
+certified to ten parts per million is used. A zero estimate with nonzero uncertainty
+is refined, not treated as empty. At most sixteen metric calls are permitted;
+unbounded projective length, underflow, or no estimate within ten parts per million
+(including extremely small returning curves) produces `InvalidGeometry` rather than
+an uncalibrated or incorrectly solid stroke. The anchor discrepancy of an arc whose
+endpoint is kept from the path data is charged once per end, since only the ends
+use it.
+
+Calibrated patterns put dash boundaries exactly on path ends (`pathLength="1"` with
+`stroke-dasharray="1"`). The dasher walks a flattened centerline with its own
+certified uncertainty and refuses a boundary inside it only where the result could
+differ visibly: a corner (join or cap), a round or square cap that may or may not
+appear at an open end, or a seam that may split one cap into two. A dash ending
+within the uncertainty of an open end only moves its end cap, a butt dash beginning
+there is empty either way, and one dash spanning a smooth closed subpath either
+closes into a ring or leaves a gap within the uncertainty between its own caps. These
+three render.
 
 For author length zero, follow the positive-scale limit described by
 [SVGWG issue 81](https://github.com/w3c/svgwg/issues/81) and
@@ -819,7 +835,10 @@ decisions:
   adjustments the algorithm leaves to the UA, and we make none. The path is the `path`
   attribute when it has a segment, else the `path` or basic shape that a same-document
   fragment `href` names. That element's transform applies as a supplemental
-  transformation, and its `pathLength` scales a length `startOffset`. Any other
+  transformation, and its `pathLength` scales a length `startOffset`; `pathLength="0"`
+  scales by infinity, so a zero offset stays at the start and any other length moves
+  every character off the path. A percentage is of the measured length and is never
+  scaled (WPT `textpath-pathlength-zero-offset-percentage`). Any other
   reference renders none of the element's characters.
 - Inside a `textPath`, `y` values are ignored (the algorithm's note on horizontal text on
   a path), and `dy` moves glyphs along the normal. The algorithm's "unset
@@ -864,8 +883,9 @@ decisions:
 - White space follows CSS Text 4 #white-space-phase-1 on one line. With `collapse`,
   segment breaks and tabs become spaces, a space after a collapsible space is removed,
   and spaces at the start and end of the line are removed. The preserving values keep
-  spaces; tabs render as spaces, and so do segment breaks unless `inline-size` wraps the
-  text. `xml:space="preserve"` reaches this as `white-space-collapse: preserve-spaces`
+  spaces; tabs render as spaces. A preserved segment break (`pre`, `pre-line`) is a
+  forced line break that starts a new line box (§11.6.1), also without `inline-size`,
+  and `textLength` then does not apply; inside a `textPath` it renders as a space. `xml:space="preserve"` reaches this as `white-space-collapse: preserve-spaces`
   through the UA stylesheet.
 - Auto-wrapped text (#InlineSize, #TextLayoutAuto): a positive `inline-size` on the `text`
   element wraps it, except when it holds a `textPath`. Percentages refer to the viewport
@@ -1157,6 +1177,21 @@ now uses an invalid alphabet character instead of nonzero discarded bits. This i
 a correction of expected behavior, not a pixel-tolerance change. Existing
 percent-escape and metadata parsing policies are unchanged by this payload fix.
 
+### Data URL headers and percent escapes
+
+The payload correction above left the header and the percent escapes on RFC 2397's
+strict grammar, which Fetch's [`#data-url-processor`](https://fetch.spec.whatwg.org/#data-url-processor)
+replaces. Fetch percent-decodes the body with the URL Standard's
+[`#percent-decode`](https://url.spec.whatwg.org/#percent-decode), which keeps a `%`
+that does not start two hex digits and any other byte, so a literal space or `<`
+in an SVG data URL is payload. Only a missing comma or invalid Base64 fails. The
+header is not percent-decoded. `;base64` must end it, optionally after spaces, and
+the rest goes through MIME Sniffing's
+[`#parse-a-mime-type`](https://mimesniff.spec.whatwg.org/#parse-a-mime-type):
+nameless or invalid parameters such as `;utf8` are skipped, a quoted charset is
+unescaped, and an invalid type becomes `text/plain;charset=US-ASCII`. The WPT
+`image-embedding-svg-*` cases use such URLs.
+
 ### Per-occurrence image orientation
 
 CSS Images 3 [`#the-image-orientation`](https://www.w3.org/TR/css-images-3/#the-image-orientation)
@@ -1447,3 +1482,33 @@ Decisions made during the sweep:
 - Regions of filters on an `svg` element with a `viewBox` are measured in the user
   space outside the `viewBox` supplement, the space of the element's `x`, `y`, `width`
   and `height`.
+
+### The WPT suite
+
+The scheduled run also renders the SVG reftests of web-platform-tests (`svg/` and the
+SVG cases of `css/css-masking` and `css/filter-effects`) in an 800 by 600 viewport, the
+WPT reftest size, over a white canvas, with `--font-dir` set to WPT's `fonts`
+directory plus FreeSans (the text tests use `local("FreeSans")`). Scripted, animated,
+print and HTML cases are skipped with the reason the generator gives. Every other case
+is in `tests/expectations/wpt.txt`: `pass`, `fail` with what is missing, or
+`spec-difference`. A test's own `<meta name=fuzzy>` annotation becomes its per-case
+tolerance, since that is the test's statement of what counts as equal.
+
+Decisions made during the sweep:
+
+- Inside clipping, masking and pattern content in `objectBoundingBox` units,
+  percentages still resolve against the viewport (coords.html#ObjectBoundingBoxUnits:
+  they are "treated according to the processing rules for percentages as defined in
+  Units"), then scale with the bounding box.
+- A `clipPath`'s own `clip-path` is resolved for the element being clipped, in its user
+  space and with its bounding box, as for the referencing `clipPath`.
+- A blank `gradientTransform` or `patternTransform` is no `<transform-list>`, so it
+  does not block the template's transform.
+- At a 180-degree turn the `auto` marker bisector points counterclockwise from the
+  incoming direction (svgwg#333), as browsers and WPT `markers-orient-002` do.
+- Each `textPath` keeps the current text position of the text before it: the layout
+  algorithm adds `startOffset` but does not restart at the path start, unlike browsers
+  (WPT `multiple-textpaths`).
+- The hand-positioned WPT references for wrapped text end each chunk with the space
+  between their `tspan`s. CSS Text hangs the space at a line end, so middle and end
+  anchored lines here are flush with the anchor.

@@ -144,6 +144,15 @@ def read_png(path):
         raise ValueError("PNG exceeds safe decoder dimensions") from error
 
 
+def on_white(image, size=(800, 600)):
+    """A WPT screenshot: the image at the top left of an opaque white 800x600 viewport."""
+    from PIL import Image
+    width, height, data = image
+    canvas = Image.new("RGBA", size, (255, 255, 255, 255))
+    canvas.alpha_composite(Image.frombytes("RGBA", (width, height), bytes(data)).crop((0, 0) + size))
+    return size[0], size[1], canvas.tobytes()
+
+
 def compare_rgba(actual, reference, channel=0, pixels=0, antialias_channel=0):
     aw, ah, a = actual
     bw, bh, b = reference
@@ -225,7 +234,7 @@ def wpt_cases(root):
         links.feed(path.read_text(errors="replace"))
         if not links.references:
             continue
-        case = {"id": name, "input": name, "references": []}
+        case = {"id": name, "input": name, "references": [], "canvas": "white"}
         try:
             if path.suffix != ".svg":
                 raise ValueError("HTML layout required; not a standalone SVG reftest")
@@ -308,10 +317,16 @@ def run_case(case, expectation, root, command, timeout, diff_dir=None):
             # Per-case options (such as an animation time) apply to the input only; references are static.
             actual = render(command + case.get("arguments", []), contained(root, case["input"]), tmp / "actual.png", timeout, root)
             result["rendered"] = True
+            # WPT compares 800x600 screenshots of pages, whose canvas is white.
+            white = case.get("canvas") == "white"
+            if white:
+                actual = on_white(actual)
             pairs = []
             for index, ref in enumerate(case["references"]):
                 path = contained(root, ref["path"])
                 reference = read_png(path) if path.suffix == ".png" else render(command, path, tmp / f"reference-{index}.png", timeout, root)
+                if white:
+                    reference = on_white(reference)
                 comparison = compare_rgba(actual, reference, tolerance.get("channel", 0),
                                           tolerance.get("pixels", 0), tolerance.get("antialias_channel", 0))
                 comparison.update(reference=ref["path"], relation=ref["relation"])

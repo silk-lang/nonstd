@@ -1,5 +1,6 @@
 //! Host-extensible, allocation-bounded resource loading. No network, filesystem, or cache.
-//! Data payloads use Fetch/Infra forgiving Base64; malformed escapes and headers fail.
+//! Data URLs follow Fetch's data URL processor: lenient percent-decoding, forgiving
+//! Base64 and a text/plain fallback for an invalid MIME type.
 import url { Url }
 import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
@@ -137,11 +138,11 @@ pub effect fn fetchWithPolicy(url: &Url, kind: ResourceKind, policy: &Policy) ->
   return move response
 }
 
-/// Borrowed RFC 2397 metadata. `mediaType`, `charset` and `parameters` preserve
-/// percent escapes from the URL; they are not decoded MIME strings. Use the decoded
-/// accessors before interpreting a charset or comparing an escaped media type.
-/// An omitted type defaults to text/plain and US-ASCII; an explicit type has no
-/// implicit charset. For repeated charset parameters, the first wins.
+/// Borrowed data-URL metadata from Fetch's data URL processor. `mediaType` is the
+/// parsed essence's source text (type/subtype, unescaped as Fetch never
+/// percent-decodes the header); `charset` is the charset parameter's raw value,
+/// possibly a quoted string. A header that is not a valid MIME type falls back
+/// to text/plain with US-ASCII. For repeated charset parameters, the first wins.
 pub struct DataMetadata<'a> {
   pub mediaType: &'a [u8],
   pub charset: Option<&'a [u8]>,
@@ -154,22 +155,44 @@ pub struct DataMetadata<'a> {
 
 impl<'a> DataMetadata<'a> {
   pub effect fn decodedMediaType(self: &Self) -> Bytes
-    ! ResourceError | OutOfMemoryError
+    ! OutOfMemoryError
     ? &mut Allocator {
-    return run decodePercent(self.mediaType, self.mediaType.length)
+    let mut result = run Bytes.copy(self.mediaType)
+    let mut bytes = Bytes.asMutSlice(&mut result)
+    let mut index: usize = 0
+    while index < bytes.length {
+      bytes[index] = lower(bytes[index])
+      index = index + 1
+    }
+    drop bytes
+    return move result
   }
 
-  pub effect fn matchesMediaType(self: &Self, expected: &[u8]) -> bool
-    ! ResourceError {
-    return run decodedEqual(self.mediaType, expected)
+  pub fn matchesMediaType(self: &Self, expected: &[u8]) -> bool {
+    return asciiEqual(self.mediaType, expected)
   }
 
+  /// The charset value with a quoted string's quotes and escapes removed.
   pub effect fn decodedCharset(self: &Self) -> Option<Bytes>
-    ! ResourceError | OutOfMemoryError
+    ! OutOfMemoryError
     ? &mut Allocator {
     return match &self.charset {
       Option<&[u8]>.Some { value } => {
-        let bytes = run decodePercent(value, value.length)
+        if value.length == 0 || value[0] != 34 {
+          let bytes = run Bytes.copy(value)
+          return Option<Bytes>.Some { value: move bytes }
+        }
+
+        // https://fetch.spec.whatwg.org/#collect-an-http-quoted-string
+        let mut bytes = Bytes.make()
+        let mut index: usize = 1
+        while index < value.length && value[index] != 34 {
+          if value[index] == 92 && index + 1 < value.length {
+            index = index + 1
+          }
+          run Bytes.append(&mut bytes, Slice.view<u8>(value, index, 1))
+          index = index + 1
+        }
         return Option<Bytes>.Some { value: move bytes }
       }
       Option<&[u8]>.None => Option<Bytes>.None
@@ -177,16 +200,15 @@ impl<'a> DataMetadata<'a> {
   }
 }
 
-/// Validates the data header without allocating or decoding its payload. Parameter
-/// names are ASCII-case-insensitive after percent decoding. Base64 is recognized
-/// only as a final bare ;base64 marker, never as a parameter with an equals sign.
+/// Splits a data URL by https://fetch.spec.whatwg.org/#data-url-processor without
+/// allocating or decoding its payload. Only a missing comma fails; the payload is
+/// percent-decoded leniently, and an invalid MIME type becomes text/plain;charset=US-ASCII
+/// (https://mimesniff.spec.whatwg.org/#parse-a-mime-type).
 pub effect fn inspectData<'a>(url: &'a Url) -> DataMetadata<'a>
   ! ResourceError {
   if !equal(Url.scheme(url), b"data") {
     fail ResourceError.UnsupportedScheme
   }
-
-  // RFC 2397 data is URL serialization, not just Url.path: '?' is payload data.
   let serialized = Url.withoutFragment(url)
   if serialized.length < 5 {
     fail ResourceError.InvalidData
@@ -199,62 +221,153 @@ pub effect fn inspectData<'a>(url: &'a Url) -> DataMetadata<'a>
   if comma == data.length {
     fail ResourceError.InvalidData
   }
-  let header = Slice.view<u8>(data, 0, comma)
-  let mut typeEnd: usize = 0
-  while typeEnd < header.length && header[typeEnd] != 59 {
-    typeEnd = typeEnd + 1
-  }
-  let mut mediaType: &'a [u8] = b"text/plain"
-  let mut charset: Option<&'a [u8]> = Option<&'a [u8]>.None
-  if typeEnd == 0 {
-    charset = Option<&[u8]>.Some { value: b"US-ASCII" }
-  } else {
-    mediaType = Slice.view<u8>(header, 0, typeEnd)
-    run validateMediaType(mediaType)
-  }
-  let mut foundCharset = false
+  let mut header = trim(Slice.view<u8>(data, 0, comma), true)
+  let payload = Slice.view<u8>(data, comma + 1, data.length - comma - 1)
+
+  // A trailing ";", spaces and "base64" select Base64 and leave the header.
   let mut base64 = false
-  let mut parametersEnd = header.length
-  let mut cursor = typeEnd
-  while cursor < header.length {
-    let separator = cursor
-    cursor = cursor + 1
-    let start = cursor
-    while cursor < header.length && header[cursor] != 59 {
-      cursor = cursor + 1
+  if header.length >= 6 && asciiEqual(Slice.view<u8>(header, header.length - 6, 6), b"base64") {
+    let mut before = header.length - 6
+    while before > 0 && header[before - 1] == 32 {
+      before = before - 1
     }
-    let parameter = Slice.view<u8>(header, start, cursor - start)
-    if parameter.length == 0 {
-      fail ResourceError.InvalidData
-    }
-    let mut equals: usize = 0
-    while equals < parameter.length && parameter[equals] != 61 {
-      equals = equals + 1
-    }
-    if equals == parameter.length {
-      if cursor != header.length || !asciiEqual(parameter, b"base64") {
-        fail ResourceError.InvalidData
-      }
+    if before > 0 && header[before - 1] == 59 {
       base64 = true
-      parametersEnd = separator
-    } else {
-      let name = Slice.view<u8>(parameter, 0, equals)
-      let value = Slice.view<u8>(parameter, equals + 1, parameter.length - equals - 1)
-      run validateToken(name)
-      run validateParameterValue(value)
-      if !foundCharset && run decodedEqual(name, b"charset") {
-        charset = Option<&[u8]>.Some { value: value }
-        foundCharset = true
-      }
+      header = Slice.view<u8>(header, 0, before - 1)
     }
   }
-  return DataMetadata<'a> {
-    mediaType: mediaType,
-    charset: move charset,
-    parameters: Slice.view<u8>(header, typeEnd, parametersEnd - typeEnd),
-    payload: Slice.view<u8>(data, comma + 1, data.length - comma - 1),
+  let fallback = DataMetadata<'a> {
+    mediaType: b"text/plain",
+    charset: Option<&[u8]>.Some { value: b"US-ASCII" },
+    parameters: b"",
+    payload: payload,
     base64: base64,
   }
+  if header.length == 0 {
+    return move fallback
+  }
+
+  // A header starting with ";" has the text/plain type prepended.
+  if header[0] == 59 {
+    return DataMetadata<'a> {
+      mediaType: b"text/plain",
+      charset: charsetParameter(header),
+      parameters: header,
+      payload: payload,
+      base64: base64,
+    }
+  }
+  let source = trim(header, false)
+  let mut slash: usize = 0
+  while slash < source.length && source[slash] != 47 {
+    slash = slash + 1
+  }
+  if slash == 0 || slash == source.length || !tokens(Slice.view<u8>(source, 0, slash)) {
+    return move fallback
+  }
+  let mut typeEnd = slash + 1
+  while typeEnd < source.length && source[typeEnd] != 59 {
+    typeEnd = typeEnd + 1
+  }
+  let subtype = trim(Slice.view<u8>(source, slash + 1, typeEnd - slash - 1), false)
+  if subtype.length == 0 || !tokens(subtype) {
+    return move fallback
+  }
+  let parameters = Slice.view<u8>(source, typeEnd, source.length - typeEnd)
+  return DataMetadata<'a> {
+    mediaType: Slice.view<u8>(source, 0, slash + 1 + subtype.length),
+    charset: charsetParameter(parameters),
+    parameters: parameters,
+    payload: payload,
+    base64: base64,
+  }
+}
+
+// https://mimesniff.spec.whatwg.org/#parse-a-mime-type steps 11-12: the first
+// valid charset parameter; nameless, empty or invalid parameters are skipped.
+fn charsetParameter<'a>(parameters: &'a [u8]) -> Option<&'a [u8]> {
+  let mut cursor: usize = 0
+  while cursor < parameters.length {
+    // Skip the ";" and HTTP whitespace before the name.
+    cursor = cursor + 1
+    while cursor < parameters.length && httpWhitespace(parameters[cursor]) {
+      cursor = cursor + 1
+    }
+    let nameStart = cursor
+    while cursor < parameters.length && parameters[cursor] != 59 && parameters[cursor] != 61 {
+      cursor = cursor + 1
+    }
+    let name = Slice.view<u8>(parameters, nameStart, cursor - nameStart)
+    if cursor == parameters.length || parameters[cursor] == 59 {
+      continue
+    }
+    cursor = cursor + 1
+    let valueStart = cursor
+    let mut value: &'a [u8] = b""
+    let mut valid = true
+    if cursor < parameters.length && parameters[cursor] == 34 {
+      cursor = cursor + 1
+      while cursor < parameters.length && parameters[cursor] != 34 {
+        if parameters[cursor] == 92 && cursor + 1 < parameters.length {
+          cursor = cursor + 1
+        }
+        if !quotedByte(parameters[cursor]) {
+          valid = false
+        }
+        cursor = cursor + 1
+      }
+      if cursor < parameters.length {
+        cursor = cursor + 1
+      }
+      value = Slice.view<u8>(parameters, valueStart, cursor - valueStart)
+      while cursor < parameters.length && parameters[cursor] != 59 {
+        cursor = cursor + 1
+      }
+    } else {
+      while cursor < parameters.length && parameters[cursor] != 59 {
+        cursor = cursor + 1
+      }
+      value = trim(Slice.view<u8>(parameters, valueStart, cursor - valueStart), false)
+      valid = value.length > 0 && tokens(value)
+    }
+    if valid && asciiEqual(name, b"charset") && tokens(name) {
+      return Option<&'a [u8]>.Some { value: value }
+    }
+  }
+  return Option<&'a [u8]>.None
+}
+
+// Strips HTTP whitespace (spaces, tabs, CR, LF), plus form feed as ASCII whitespace.
+fn trim<'a>(data: &'a [u8], ascii: bool) -> &'a [u8] {
+  let mut start: usize = 0
+  let mut end = data.length
+  while start < end && (httpWhitespace(data[start]) || (ascii && data[start] == 12)) {
+    start = start + 1
+  }
+  while end > start && (httpWhitespace(data[end - 1]) || (ascii && data[end - 1] == 12)) {
+    end = end - 1
+  }
+  return Slice.view<u8>(data, start, end - start)
+}
+
+fn httpWhitespace(byte: u8) -> bool {
+  return byte == 9 || byte == 10 || byte == 13 || byte == 32
+}
+
+// https://mimesniff.spec.whatwg.org/#http-quoted-string-token-code-point
+fn quotedByte(byte: u8) -> bool {
+  return byte == 9 || byte >= 32
+}
+
+fn tokens(data: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < data.length {
+    if !tokenByte(data[index]) {
+      return false
+    }
+    index = index + 1
+  }
+  return true
 }
 
 fn equal(a: &[u8], b: &[u8]) -> bool {
@@ -305,129 +418,41 @@ fn hex(value: u8) -> u8 {
   return 255
 }
 
-// RFC 2397 imports RFC 2396 urlchar: reserved, unreserved, or a percent triplet.
-fn urlByte(value: u8) -> bool {
-  if (value >= 48 && value <= 57) || (value >= 65 && value <= 90) || (value >= 97 && value <= 122) {
-    return true
-  }
-  return value == 45 || value == 95 || value == 46 || value == 33 || value == 126 || value == 42
-    || value == 39
-    || value == 40
-    || value == 41
-    || value == 59
-    || value == 47
-    || value == 63
-    || value == 58
-    || value == 64
-    || value == 38
-    || value == 61
-    || value == 43
-    || value == 36
-    || value == 44
-}
-
-// No allocation and no unchecked lookahead. Unlike generic URL percent decoding,
-// a malformed percent escape is a resource syntax error, not a literal percent.
+// https://url.spec.whatwg.org/#percent-decode: a "%" that does not start two hex
+// digits is a literal byte. No allocation and no unchecked lookahead.
 effect fn nextPercent(data: &[u8], cursor: &mut usize) -> u8
   ! ResourceError {
   if cursor.* >= data.length {
     fail ResourceError.InvalidData
   }
   let byte = data[cursor.*]
-  if byte != 37 {
-    if !urlByte(byte) {
-      fail ResourceError.InvalidData
+  if byte == 37 && data.length - cursor.* >= 3 {
+    let high = hex(data[cursor.* + 1])
+    let low = hex(data[cursor.* + 2])
+    if high != 255 && low != 255 {
+      cursor.* = cursor.* + 3
+      return high * 16 + low
     }
-    cursor.* = cursor.* + 1
-    return byte
   }
-  if data.length - cursor.* < 3 {
-    fail ResourceError.InvalidData
-  }
-  let high = hex(data[cursor.* + 1])
-  let low = hex(data[cursor.* + 2])
-  if high == 255 || low == 255 {
-    fail ResourceError.InvalidData
-  }
-  cursor.* = cursor.* + 3
-  return high * 16 + low
-}
-
-effect fn decodedEqual(data: &[u8], expected: &[u8]) -> bool
-  ! ResourceError {
-  let mut cursor: usize = 0
-  let mut index: usize = 0
-  while cursor < data.length {
-    let byte = run nextPercent(data, &mut cursor)
-    if index >= expected.length || lower(byte) != lower(expected[index]) {
-      return false
-    }
-    index = index + 1
-  }
-  return index == expected.length
+  cursor.* = cursor.* + 1
+  return byte
 }
 
 fn tokenByte(value: u8) -> bool {
-  if value <= 32 || value >= 127 {
-    return false
+  // https://mimesniff.spec.whatwg.org/#http-token-code-point
+  if (value >= 48 && value <= 57) || (value >= 65 && value <= 90) || (value >= 97 && value <= 122) {
+    return true
   }
-  return value != 40 && value != 41 && value != 60 && value != 62 && value != 64 && value != 44
-    && value != 59
-    && value != 58
-    && value != 92
-    && value != 34
-    && value != 47
-    && value != 91
-    && value != 93
-    && value != 63
-    && value != 61
-}
-
-effect fn validateToken(data: &[u8]) -> ()
-  ! ResourceError {
-  if data.length == 0 {
-    fail ResourceError.InvalidData
-  }
-  let mut cursor: usize = 0
-  while cursor < data.length {
-    if !tokenByte(run nextPercent(data, &mut cursor)) {
-      fail ResourceError.InvalidData
-    }
-  }
-}
-
-effect fn validateMediaType(data: &[u8]) -> ()
-  ! ResourceError {
-  let mut slash: usize = 0
-  while slash < data.length && data[slash] != 47 {
-    slash = slash + 1
-  }
-  if slash == data.length {
-    fail ResourceError.InvalidData
-  }
-  run validateToken(Slice.view<u8>(data, 0, slash))
-  run validateToken(Slice.view<u8>(data, slash + 1, data.length - slash - 1))
-}
-
-effect fn validateParameterValue(data: &[u8]) -> ()
-  ! ResourceError {
-  if data.length == 0 {
-    fail ResourceError.InvalidData
-  }
-  let mut cursor: usize = 0
-  while cursor < data.length {
-    let escaped = data[cursor] == 37
-    let byte = run nextPercent(data, &mut cursor)
-
-    // RFC 2397 replaces quoted-string tspecials with URL escaped encoding.
-    if escaped {
-      if byte < 32 || byte >= 127 {
-        fail ResourceError.InvalidData
-      }
-    } else if !tokenByte(byte) {
-      fail ResourceError.InvalidData
-    }
-  }
+  return value == 33 || value == 35 || value == 36 || value == 37 || value == 38 || value == 39
+    || value == 42
+    || value == 43
+    || value == 45
+    || value == 46
+    || value == 94
+    || value == 95
+    || value == 96
+    || value == 124
+    || value == 126
 }
 
 effect fn percentLength(data: &[u8], maximum: usize) -> usize

@@ -1,4 +1,4 @@
-//! Resource contracts against RFC 2397, URL, Fetch and Infra in specs.lock.json.
+//! Resource contracts against Fetch, URL, MIME Sniffing and Infra in specs.lock.json.
 //! Fetch SHA256 63b0a018753c330adf1e40417524eb70ea02d4d3e123bcb39b6770f23bad911b.
 //! Infra SHA256 8d43350a0a36ebf7682cfe4146dcd7afb8d9f94da0d80677dcc0da16e43590d7.
 import resources { DataOnly, DataMetadata, Limits, Resolver, Response, ResourceError, ResourceKind }
@@ -93,8 +93,8 @@ test effect fn dataPayloadUsesSerializedQueryButNotFragment() -> ()
   run decoded(b"data:,%23%3F%2520", b"#?%20", 5) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-// https://www.rfc-editor.org/rfc/rfc2397.html#section-2
-// https://www.rfc-editor.org/rfc/rfc2397.html#section-3
+// https://fetch.spec.whatwg.org/#data-url-processor
+// https://mimesniff.spec.whatwg.org/#parse-a-mime-type
 test effect fn metadataDefaultsAndEscapedParameters() -> ()
   ! AssertionError<'static> | UrlError | ResourceError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -130,29 +130,36 @@ test effect fn metadataDefaultsAndEscapedParameters() -> ()
     "charset shorthand overrides the default",
   )
   let escaped = run Url.parseAbsolute(
-    b"data:te%78t/css;name=a%3Bb%3Dc;char%73et=UTF%2D8;base64,YQ==",
+    b"data:te%78t/css;name=a%3Bb%3Dc;char%73et=UTF%2D8;CharSet=\"utf\\-8\";charset=x;base64,YQ==",
   )
     |> Effect.provideMut<Allocator>(&mut allocator)
   let metadata = run resources.inspectData(&escaped)
   run Testing.expect(
-    equal(metadata.mediaType, b"te%78t/css") && metadata.base64 && equal(metadata.payload, b"YQ=="),
-    "borrowed metadata preserves URL escapes and separates the payload",
+    equal(metadata.mediaType, b"te%78t/css") && metadata.base64 && equal(metadata.payload, b"YQ==")
+      && !metadata.matchesMediaType(b"text/css"),
+    "Fetch never percent-decodes the header",
   )
-  let mediaType = run DataMetadata.decodedMediaType(&metadata)
-    |> Effect.provideMut<Allocator>(&mut allocator)
   let charset = run DataMetadata.decodedCharset(&metadata)
     |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(
-    equal(Bytes.asSlice(&mediaType), b"text/css")
-      && match &charset {
-        Option<Bytes>.Some { value } => equal(Bytes.asSlice(&value), b"UTF-8")
+    match &charset {
+      Option<Bytes>.Some { value } => equal(Bytes.asSlice(&value), b"utf-8")
+      _ => false
+    },
+    "the first charset parameter wins and a quoted value is unescaped",
+  )
+  let svg = run Url.parseAbsolute(b"data: Image/SVG+xml ;utf8 ; charset = x;charset=utf-8,<svg/>")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let svgMetadata = run resources.inspectData(&svg)
+  let svgCharset = run DataMetadata.decodedCharset(&svgMetadata)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    svgMetadata.matchesMediaType(b"image/svg+xml")
+      && match &svgCharset {
+        Option<Bytes>.Some { value } => equal(Bytes.asSlice(&value), b"utf-8")
         _ => false
       },
-    "CSS consumers can inspect decoded media type and charset",
-  )
-  run Testing.expect(
-    equal(metadata.parameters, b";name=a%3Bb%3Dc;char%73et=UTF%2D8"),
-    "non-charset media parameters remain available without base64 marker",
+    "nameless and spaced parameters are skipped, not errors",
   )
   let named = run Url.parseAbsolute(b"data:text/plain;base64=yes,not-base64")
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -160,40 +167,73 @@ test effect fn metadataDefaultsAndEscapedParameters() -> ()
   run Testing.expect(!namedMetadata.base64, "base64 with equals is a media parameter, not encoding")
 }
 
-// https://www.rfc-editor.org/rfc/rfc2397.html#section-3
-// Strict RFC 2397 syntax, not the URL Standard's forgiving malformed-percent algorithm.
+effect fn fallback(input: &[u8]) -> ()
+  ! AssertionError<'static> | UrlError | ResourceError | OutOfMemoryError
+  ? &mut Allocator {
+  let address = run Url.parseAbsolute(input)
+  let metadata = run resources.inspectData(&address)
+  run Testing.expect(
+    equal(metadata.mediaType, b"text/plain")
+      && match &metadata.charset {
+        Option<&[u8]>.Some { value } => equal(value, b"US-ASCII")
+        _ => false
+      },
+    "an invalid MIME type falls back to text/plain;charset=US-ASCII",
+  )
+}
+
+// https://fetch.spec.whatwg.org/#data-url-processor
 // https://url.spec.whatwg.org/#percent-decode
-test effect fn malformedDataDoesNotTrapOrSilentlyRecover() -> ()
-  ! AssertionError<'static> | UrlError | OutOfMemoryError {
+// Only a missing comma or invalid Base64 fails; malformed escapes stay literal.
+test effect fn forgivingDataUrls() -> ()
+  ! AssertionError<'static> | UrlError | ResourceError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let cases: [string; 25] = [
-    "data:text/plain",
+  let literal: [string; 6] = [
+    "data:,%",
+    "data:,%0",
+    "data:,%GG",
+    "data:,a|b c",
+    "data:,%4%41",
+    "data:,<a>",
+  ]
+  let expected: [string; 6] = ["%", "%0", "%GG", "a|b c", "%4A", "<a>"]
+  let mut index: usize = 0
+  while index < literal.length {
+    let bytes = String.utf8Bytes(expected[index])
+    run decoded(String.utf8Bytes(literal[index]), bytes, bytes.length)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  let invalidTypes: [string; 6] = [
     "data:plain,a",
     "data:/plain,a",
     "data:text/,a",
     "data:text/plain/extra,a",
-    "data:text/plain;,a",
-    "data:text/plain;flag,a",
-    "data:text/plain;charset=,a",
-    "data:text/plain;=utf-8,a",
-    "data:text/plain;char%00set=x,a",
-    "data:text/plain;charset=%GG,a",
-    "data:text/plain;charset=%00,a",
-    "data:text/plain;charset=a=b,a",
-    "data:;base64;charset=utf-8,YQ==",
-    "data:;base64;base64,YQ==",
-    "data:,%",
-    "data:,%0",
-    "data:,%GG",
+    "data:te{xt/plain,a",
+    "data:text/pl ain,a",
+  ]
+  index = 0
+  while index < invalidTypes.length {
+    run fallback(String.utf8Bytes(invalidTypes[index]))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+
+  // ";base64" must end the header; an earlier one is a nameless parameter.
+  run decoded(b"data:;base64;charset=utf-8,YQ==", b"YQ==", 4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run decoded(b"data:;base64;base64,YQ==", b"a", 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  run decoded(b"data:text/plain;  BASE64,YQ==", b"a", 1)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let cases: [string; 6] = [
+    "data:text/plain",
     "data:;base64,%3",
     "data:;base64,Y===",
     "data:;base64,=AAA",
     "data:;base64,YQ==AAAA",
     "data:;base64,AA_A",
-    "data:te{xt/plain,a",
-    "data:,a|b",
   ]
-  let mut index: usize = 0
+  index = 0
   while index < cases.length {
     run rejected(String.utf8Bytes(cases[index]), 100, ResourceError.InvalidData)
       |> Effect.provideMut<Allocator>(&mut allocator)
