@@ -2,8 +2,8 @@ import embedded_budget_tests
 import document_images_tests
 import embedded_viewport_tests
 import view_tests
-import svg_core.structure { Options as StructureOptions }
-import lib { RenderOptions, RenderError, Pixmap as Image }
+import svg_core.structure { Options as StructureOptions, DocumentId, SourceId }
+import lib { RenderOptions, RenderError, HitTarget, Pixmap as Image }
 import lib as renderer
 import environment { Environment, noInitials }
 import svg_fonts.database { FontDatabase }
@@ -15,8 +15,15 @@ import svg_css.colors { Color, Context as ColorContext }
 import svg_css.tokens { Limits }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
+import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.system.host_input { HostInputError }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.collections.bytes { Bytes }
+import silk.text.string { String }
 import silk.num.u32
 import silk.num.f64
 
@@ -637,4 +644,239 @@ test effect fn retainedImagesRespectExecutorBudget() -> ()
     _ => false
   }
   run Testing.expect(limited, "image backend copies obey the retained texture budget")
+}
+
+// Whether the element with `id` is what `hitTest` finds at (`x`, `y`): through its
+// outermost `use` when `host` is set, and nothing at all when `id` is empty.
+effect fn hits(data: &[u8], id: &[u8], host: bool, x: f64, y: f64) -> bool
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = FontDatabase.make()
+  return run hitsWith(&fonts, data, id, host, x, y)
+}
+
+effect fn hitsWith(fonts: &FontDatabase, data: &[u8], id: &[u8], host: bool, x: f64, y: f64) -> bool
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/fixtures/input.svg"), invalidBase)
+  let environment = testEnvironment(&base, fonts)
+  let mut resolver = DataOnly.make(ResourceLimits.defaults())
+  let options = RenderOptions.make()
+  let tree = run renderer.parse(data, &options, &environment)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+  let expected = tree.graph.findId(DocumentId { index: 0 }, id)
+  let list = run renderer.record(move tree)
+  let found = run renderer.hitTest(&list, x, y)
+  return match &found {
+    Option<HitTarget>.None => expected.isNone()
+    Option<HitTarget>.Some { value } => match &expected {
+      Option<SourceId>.None => false
+      Option<SourceId>.Some { value: wanted } => {
+        let source = if host {
+          match &value.host {
+            Option<SourceId>.Some { value: outer } => outer
+            Option<SourceId>.None => {
+              return false
+            }
+          }
+        } else {
+          value.source
+        }
+        source.document.index == wanted.document.index && source.node.index == wanted.node.index
+      }
+    }
+  }
+}
+
+// https://svgwg.org/svg2-draft/interact.html#PointerEventsProperty
+test effect fn hitTestingFollowsPointerEvents() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let ring = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='back' width='100' height='100'/><circle id='c' cx='50' cy='50' r='30' fill='none' stroke='blue' stroke-width='10'/></svg>"
+  run Testing.expect(
+    run hits(ring, b"c", false, 80.0, 50.0) |> Effect.provideMut<Allocator>(&mut allocator),
+    "a painted stroke takes events",
+  )
+  run Testing.expect(
+    run hits(ring, b"back", false, 50.0, 50.0) |> Effect.provideMut<Allocator>(&mut allocator),
+    "an unpainted fill lets events through to the element below",
+  )
+  run Testing.expect(
+    run hits(ring, b"", false, 50.0, 120.0) |> Effect.provideMut<Allocator>(&mut allocator),
+    "a point outside the image hits nothing",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='back' width='100' height='100'/><circle id='c' cx='50' cy='50' r='30' fill='none' pointer-events='fill'/></svg>",
+      b"c",
+      false,
+      50.0,
+      50.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "pointer-events fill hits the interior whatever the fill",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='back' width='100' height='100'/><rect id='r' width='50' height='50' pointer-events='none'/></svg>",
+      b"back",
+      false,
+      10.0,
+      10.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "pointer-events none never takes events",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='r' width='50' height='50' visibility='hidden' pointer-events='painted'/></svg>",
+      b"r",
+      false,
+      10.0,
+      10.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "painted ignores visibility",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='r' width='50' height='50' visibility='hidden'/></svg>",
+      b"",
+      false,
+      10.0,
+      10.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "a hidden element takes no events under auto",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><path id='p' d='M0 0L100 100L0 100Z' pointer-events='bounding-box'/></svg>",
+      b"p",
+      false,
+      90.0,
+      10.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "bounding-box hits the whole box of the shape",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><path id='p' d='M0 0L100 100L0 100Z'/></svg>",
+      b"",
+      false,
+      90.0,
+      10.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "outside the painted triangle nothing is hit",
+  )
+}
+
+// https://svgwg.org/svg2-draft/interact.html#PointerEventsProperty
+test effect fn hitTestingClipsButIgnoresMasksAndOpacity() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let clipped = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><clipPath id='k'><rect width='50' height='100'/></clipPath><rect id='back' width='100' height='100'/><rect id='r' width='100' height='100' clip-path='url(#k)'/></svg>"
+  run Testing.expect(
+    run hits(clipped, b"r", false, 25.0, 50.0) |> Effect.provideMut<Allocator>(&mut allocator),
+    "inside its clip path an element takes events",
+  )
+  run Testing.expect(
+    run hits(clipped, b"back", false, 75.0, 50.0) |> Effect.provideMut<Allocator>(&mut allocator),
+    "a clip path cuts the hit region",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><mask id='m'><rect width='50' height='100' fill='white'/></mask><rect id='r' width='100' height='100' mask='url(#m)' opacity='0'/></svg>",
+      b"r",
+      false,
+      75.0,
+      50.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "masks and opacity do not change the hit region",
+  )
+  run Testing.expect(
+    run hits(
+      b"<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' width='100' height='100'><defs><rect id='shape' width='40' height='40'/></defs><use id='u' xlink:href='#shape' x='50' y='50'/></svg>",
+      b"u",
+      true,
+      60.0,
+      60.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "a hit in a use shadow tree reports the use element as host",
+  )
+}
+
+effect fn testFont(name: string) -> Bytes
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let cwd = run NativeHostInput.workingDirectory()
+  let root = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let mut relative = run String.copy("images/svg/tests/fonts/")
+  run String.append(&mut relative, name)
+  let path = run Path.resolve(&root, String.view(&relative))
+  let mut files = run OsFileSystem.make("/")
+  return run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+// Text takes events anywhere in its character cells, above the glyph ink too
+// (https://svgwg.org/svg2-draft/interact.html#PointerEventsProperty).
+test effect fn hitTestingTextUsesCharacterCells() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError | FileError | HostInputError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut fonts = FontDatabase.make()
+  let face = run testFont("NotoSans-Regular.subset.ttf")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  drop run fonts.add(move face) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    run hitsWith(
+      &fonts,
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='back' width='100' height='100'/><text id='t' x='10' y='50' font-family='Noto Sans' font-size='40'>H</text></svg>",
+      b"t",
+      false,
+      20.0,
+      14.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "a painted character cell takes events above the glyph",
+  )
+  run Testing.expect(
+    run hitsWith(
+      &fonts,
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='back' width='100' height='100'/><text id='t' x='10' y='50' font-family='Noto Sans' font-size='40' fill='none'>H</text></svg>",
+      b"back",
+      false,
+      20.0,
+      14.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "unpainted text takes no events under auto",
+  )
+  run Testing.expect(
+    run hitsWith(
+      &fonts,
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect id='back' width='100' height='100'/><text id='t' x='10' y='50' font-family='Noto Sans' font-size='40' fill='none' pointer-events='all'>H</text></svg>",
+      b"t",
+      false,
+      20.0,
+      14.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "pointer-events all takes events in unpainted cells",
+  )
+  run Testing.expect(
+    run hitsWith(
+      &fonts,
+      b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><text id='t' x='10' y='50' font-family='Noto Sans' font-size='40'>H</text></svg>",
+      b"",
+      false,
+      80.0,
+      14.0,
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    "beyond the last cell nothing is hit",
+  )
 }

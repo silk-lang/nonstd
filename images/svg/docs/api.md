@@ -22,6 +22,16 @@ Import `svg_render.lib`:
 | `record(move tree)` | Moves geometry into a backend-neutral `DisplayList` |
 | `renderDisplayList(&list)` | Reusable retained input → owned `vector.pixmap.Pixmap` |
 | `render(data, &options, &environment)` | Combined path → premultiplied sRGB RGBA8 pixmap |
+| `hitTest(&list, x, y)` | The topmost element whose `pointer-events` region holds the device point, as a `HitTarget`, or None |
+
+`hitTest` follows SVG 2 [#PointerEventsProperty](https://svgwg.org/svg2-draft/interact.html#PointerEventsProperty).
+`x` and `y` are in output pixels from the top-left corner. A shape's region is its fill
+and stroke geometry as `pointer-events` selects them; text takes its character cells,
+an image its rectangle, and `bounding-box` the element's bounding box. Clip paths cut
+regions geometrically; masks, filters and opacity do not change them, and an element of
+opacity 0 still takes events. Content drawn as a resource (markers, patterns, masks, clip
+paths and `feImage`) takes none. `HitTarget.source` is the element in its document;
+`HitTarget.host` is the outermost `use` element when the hit lies in a `use` shadow tree.
 
 All entry points require an allocator; `parse` and `render` also require the
 `svg_core.resources.Resolver` effect. Errors are typed `RenderError` or

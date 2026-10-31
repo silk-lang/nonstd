@@ -144,7 +144,7 @@ the specification and resvg or the browsers disagree, and this renderer follows 
 The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
 text features: `shape-padding`, vertical text in `shape-inside`, `vkern` and external SVG
 fonts.
-Hit testing is optional and not implemented.
+`hitTest` finds the element under a point by `pointer-events` (see [docs/api.md](docs/api.md)).
 
 ## Performance
 

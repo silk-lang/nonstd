@@ -77,6 +77,8 @@ import svg_geometry.geometry { Rect, Point, Path, Transform, Size }
 import svg_geometry.transforms { Matrix, Facing }
 import svg_geometry.transforms
 import svg_geometry.svg
+import svg_geometry.bounds { Result as BoundsResult }
+import svg_geometry.bounds
 import svg_geometry.svg { AspectRatio, Alignment }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
@@ -2529,7 +2531,10 @@ effect fn paint(
     state.referencePeak = references
   }
   let plan = state.plans.asSlice()[id]
-  if plan.style.opacity == 0.0 || plan.suppressed {
+
+  // Opacity 0 still records the element: it takes pointer events (SVG 2
+  // #PointerEventsProperty), and its layer is skipped when painting.
+  if plan.suppressed {
     return
   }
   let matrix = run parent.compose(&plan.local)
@@ -4071,6 +4076,140 @@ effect fn paintFilterImage(
   run nodes.append(ResolvedNode.EndFilterImage)
 }
 
+fn painted(paint: &Paint) -> bool {
+  return match &paint.* {
+    Paint.None => false
+    _ => true
+  }
+}
+
+// Where an element takes pointer events (SVG 2 #PointerEventsProperty), as a `Hit` node
+// in its painting position: its fill and stroke regions, its character cells for text,
+// its rectangle for an image, or its bounding box for `bounding-box`. Content drawn as a
+// resource (markers, patterns, masks, clip paths, feImage) takes none.
+effect fn hitRegion(
+  engine: &Engine,
+  plan: &Plan,
+  state: &mut Planning,
+  used: &Style,
+  matrix: &Mapping,
+  strokeSpace: Option<usize>,
+  clip: Option<usize>,
+  outputBounds: Rect,
+  shapes: &mut List<ResolvedShape>,
+) -> Option<ResolvedNode>
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  if !plan.paintable || plan.foreign || state.activeMarkers.length() > 0
+    || state.activePatterns.length() > 0
+    || state.activeMasks.length() > 0
+    || state.activeClips.length() > 0
+    || state.activeFilterImages.length() > 0 {
+    return Option<ResolvedNode>.None
+  }
+  let mut path = if plan.text {
+    plan.cells
+  } else {
+    plan.path
+  }
+  let index = match &path {
+    Option<usize>.Some { value } => value
+    _ => {
+      return Option<ResolvedNode>.None
+    }
+  }
+  if state.paths.asSlice()[index].isEmpty() {
+    return Option<ResolvedNode>.None
+  }
+  let visible = plan.style.visible
+  let fills = painted(&used.fill)
+  let strokes = painted(&used.stroke) && used.strokeWidth > 0.0
+  let keyword = run used_style.keyword(engine, plan.styleId, Property.PointerEvents)
+  let mut fill = match &keyword {
+    Keyword.None => false
+    Keyword.BoundingBox => true
+    Keyword.VisibleFill => visible
+    Keyword.VisibleStroke => false
+    Keyword.Visible => visible
+    Keyword.Painted => fills
+    Keyword.Fill => true
+    Keyword.Stroke => false
+    Keyword.All => true
+    _ => visible && fills
+  }
+  let mut stroke = match &keyword {
+    Keyword.None => false
+    Keyword.BoundingBox => false
+    Keyword.VisibleFill => false
+    Keyword.VisibleStroke => visible
+    Keyword.Visible => visible
+    Keyword.Painted => strokes
+    Keyword.Fill => false
+    Keyword.Stroke => true
+    Keyword.All => true
+    _ => visible && strokes
+  }
+
+  // Text takes events anywhere in its cells and an image anywhere in its rectangle,
+  // under the same conditions on fill, stroke and visibility (#PointerEventsProperty).
+  if plan.text || plan.image.isSome() || plan.document.isSome() {
+    let any = match &keyword {
+      Keyword.None => false
+      Keyword.BoundingBox => true
+      Keyword.VisibleFill => visible
+      Keyword.VisibleStroke => visible
+      Keyword.Visible => visible
+      Keyword.Painted => fills || strokes || !plan.text
+      Keyword.Fill => true
+      Keyword.Stroke => true
+      Keyword.All => true
+      _ => visible && (fills || strokes || !plan.text)
+    }
+    fill = any
+    stroke = false
+  }
+  if keyword == Keyword.BoundingBox {
+    // The box of the fill geometry, as the object bounding box (#BoundingBoxes).
+    if let BoundsResult.Finite { rect } = bounds.path(&state.paths.asSlice()[index]) {
+      path = Option<usize>.some(state.paths.length())
+      run state.paths.append(
+        run svg.rectangle(rect.xMin, rect.yMin, rect.width(), rect.height(), 0.0, 0.0),
+      )
+    } else {
+      return Option<ResolvedNode>.None
+    }
+  }
+  if !fill && !stroke {
+    return Option<ResolvedNode>.None
+  }
+  let mut style = used.*
+  if keyword == Keyword.BoundingBox || plan.text || plan.image.isSome() || plan.document.isSome() {
+    style.fillRule = FillRule.Nonzero
+  }
+  let shape = shapes.length()
+  run shapes.append(
+    ResolvedShape {
+      path: match &path {
+        Option<usize>.Some { value } => value
+        _ => index
+      },
+      transform: matrix.*,
+      strokeSpace: strokeSpace,
+      clip: clip,
+      bounds: outputBounds,
+      style: style,
+    },
+  )
+  return Option<ResolvedNode>.some(
+    ResolvedNode.Hit {
+      shape: shape,
+      occurrence: plan.occurrence.index,
+      fill: fill,
+      stroke: stroke,
+    },
+  )
+}
+
 /// The shape of one text decoration path, painted by the caller in the element's paint
 /// order without markers.
 effect fn decorationShape(
@@ -4197,6 +4336,17 @@ effect fn paintPrepared(
   } else {
     plan.style
   }
+  let hit = run hitRegion(
+    &styles.catalog.engine,
+    plan,
+    &mut state.*,
+    &used,
+    matrix,
+    strokeSpace,
+    clip,
+    outputBounds,
+    &mut shapes.*,
+  )
   if let Option<usize>.Some { value: image } = &plan.image {
     let placement = Mapping.Affine { value: plan.imageMapping }
     let transform = run matrix.compose(&placement)
@@ -4342,6 +4492,11 @@ effect fn paintPrepared(
       )
       layer = layer + 1
     }
+  }
+
+  // Inside the element's own layer, so that its clip path applies to its region.
+  if let Option<ResolvedNode>.Some { value } = move hit {
+    run nodes.append(move value)
   }
   if plan.paintable && plan.style.visible && plan.document.isSome() {
     if let Option<usize>.Some { value: source } = &plan.document {

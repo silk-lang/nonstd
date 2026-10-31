@@ -541,7 +541,7 @@ Use this as the coverage map. Each line becomes tests before code. ✓ means don
 - [x] CSS Animations (question 4): `@keyframes`, `animation-*` properties, sampled at *t* (see Animation sampling for the approximations)
 
 ### 5.14 Optional, last
-- [ ] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts. Not part of any mode, so only if Julia wants it
+- [x] Hit testing following `pointer-events` (§15.5–15.6) as an API for hosts: `hitTest` on a display list. Clip paths cut regions; masks, filters and opacity don't, so an element of opacity 0 is recorded (its layer is skipped when painting). `auto` (SVG 2 editor's draft) is visiblePainted
 
 Mask resources use CSS Masking 1 [mask element coordinates](https://www.w3.org/TR/css-masking-1/#MaskElement)
 and [mask value calculation](https://www.w3.org/TR/css-masking-1/#MaskValues).
