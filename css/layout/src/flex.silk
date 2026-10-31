@@ -11,7 +11,7 @@ import style { Style, Dimension, DimensionKind, Direction, WritingMode, TextOrie
 import tree { NO_NODE, Measurement }
 import box_tree { BoxTree }
 import context { Input, ResolvedBox, resolveBox, childrenInput, resolve, resolves, outOfFlow, isFlex, scrollable, overflowForAxis, UNBOUNDED }
-import engine { layoutNode, layoutNodeInPlace, probeNode, probeFresh, normalizeKey, constraintFreeProbe, sizeEmptyBox, emptyIntrinsicWidth, shapedBox, ITEM_OUT_OF_FLOW, ITEM_ORDERED }
+import engine { layoutNode, layoutNodeInPlace, layoutEmptyLeafInPlace, probeNode, probeFresh, normalizeKey, constraintFreeProbe, sizeEmptyBox, emptyIntrinsicWidth, shapedBox, ITEM_OUT_OF_FLOW, ITEM_ORDERED }
 import layout_pass { LayoutPass, CacheKind }
 import layout_cache { LayoutCache }
 import text { TextMeasure, TextError }
@@ -772,6 +772,33 @@ impl BaselinePick {
 struct BaselinePicks { first: BaselinePick, last: BaselinePick }
 impl Copy for BaselinePicks {}
 
+// What placeFlexLines saw of a single line's items: with `plain`, no
+// uncollapsed item has a baseline or baseline alignment, and first and last
+// are the startmost and endmost such items, as edgeBaseline's fallbacks.
+struct EdgeSummary { plain: bool, first: BaselinePick, last: BaselinePick }
+
+impl Copy for EdgeSummary {}
+
+impl EdgeSummary {
+  @inlineAlways fn none() -> EdgeSummary { return EdgeSummary { plain: false, first: BaselinePick.none(false), last: BaselinePick.none(true) } }
+
+  // Records an uncollapsed item placed at `position` along the main axis.
+  @inlineAlways fn add(self: &mut Self, item: &Item, child: &Layout, position: f32) {
+    if child.hasFirstBaseline || child.hasLastBaseline || (item.baselineEligible && (item.align == Align.Baseline || item.align == Align.LastBaseline)) {
+      self.plain = false
+      return
+    }
+    if self.first.chosen == NO_NODE || position < self.first.position {
+      self.first.chosen = item.id
+      self.first.position = position
+    }
+    if self.last.chosen == NO_NODE || position > self.last.position {
+      self.last.chosen = item.id
+      self.last.position = position
+    }
+  }
+}
+
 @inlineAlways
 fn considerBaseline(pick: &mut BaselinePick, item: &Item, child: &Layout, compatible: bool, position: f32, axis: &Axes, last: bool) {
   let mut rank: usize = 1
@@ -893,7 +920,7 @@ fn edgeBaseline(nodes: &BoxTree, output: &LayoutPass, items: &[Item], start: usi
   return true
 }
 
-fn containerBaselines<M: Measure>(nodes: &BoxTree, output: &LayoutPass, measurer: &mut M, items: &[Item], lines: &[Line], lineCount: usize, style: &Style, axis: &Axes, fragmented: bool, result: &mut Layout) {
+fn containerBaselines<M: Measure>(nodes: &BoxTree, output: &LayoutPass, measurer: &mut M, items: &[Item], lines: &[Line], lineCount: usize, style: &Style, axis: &Axes, fragmented: bool, summary: &EdgeSummary, result: &mut Layout) {
   if lineCount == 0 { return }
   let mut firstLine: usize = 0
   let mut lastLine = lineCount - 1
@@ -939,7 +966,13 @@ fn containerBaselines<M: Measure>(nodes: &BoxTree, output: &LayoutPass, measurer
   }
   let mut picks = BaselinePicks { first: BaselinePick.none(false), last: BaselinePick.none(true) }
   let shared = firstStart == lastStart && firstEnd == lastEnd
-  let edges = axis.row && !fragmented
+  // A single line without baselines: its fallbacks were found while placing.
+  let summarized = axis.row && !fragmented && shared && summary.plain && summary.first.chosen != NO_NODE
+  if summarized {
+    picks.first = BaselinePick { chosen: summary.first.chosen, rank: 1, useLast: false, position: summary.first.position }
+    picks.last = BaselinePick { chosen: summary.last.chosen, rank: 1, useLast: true, position: summary.last.position }
+  }
+  let edges = summarized || axis.row && !fragmented
     && scanBaselineEdges(nodes, &output, items, firstStart, firstEnd, blockHorizontal, &axis, true, shared, &mut picks)
     && (shared || scanBaselineEdges(nodes, &output, items, lastStart, lastEnd, blockHorizontal, &axis, false, true, &mut picks))
   if !edges {
@@ -1495,6 +1528,8 @@ effect fn placeFlexLines<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTr
   }
   // One request for every item: each item resets the fields it sets.
   let mut finalInput = childInput.*
+  let mut summary = EdgeSummary.none()
+  summary.plain = lines.length == 1 && axis.row
   lineIndex = 0
   while lineIndex < lines.length {
     let line = lines[lineIndex]
@@ -1539,14 +1574,24 @@ effect fn placeFlexLines<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTr
           let mut childLayout = run layoutNode(nodes, &mut output, &mut measurer, item.id, &finalInput)
           childLayout.location = itemLocation(nodes, item, &line, style, &axis, box, childLayout.size, &mut childLayout.usedMargin, autoShare, cursor, crossCursor, main, cross)
           run output.store(item.id, &childLayout, input.performLayout)
+          summary.plain = false
         } else {
           // Unfragmented, layoutNode already stored the child's layout: place
           // it there instead of copying the whole result out.
-          run layoutNodeInPlace(nodes, &mut output, &mut measurer, item.id, &finalInput)
+          if !run layoutEmptyLeafInPlace(nodes, &mut output, item.id, &finalInput) {
+            run layoutNodeInPlace(nodes, &mut output, &mut measurer, item.id, &finalInput)
+          }
           let mut usedMargin = output.boxes[item.id].usedMargin
           let location = itemLocation(nodes, item, &line, style, &axis, box, output.boxes[item.id].size, &mut usedMargin, autoShare, cursor, crossCursor, main, cross)
           let hasClearance = output.boxes[item.id].hasClearance
           run output.place(item.id, location, usedMargin, hasClearance, input.performLayout)
+          if summary.plain && !item.collapsed {
+            let child = &output.boxes[item.id]
+            let mut position = location.y
+            if axis.horizontal { position = location.x }
+            if axis.mainStartReverse { position = -position - axisSize(child.size, axis.horizontal) }
+            summary.add(item, child, position)
+          }
         }
         cursor = cursor + item.marginStart
         if item.autoStart { cursor = cursor + autoShare }
@@ -1558,7 +1603,7 @@ effect fn placeFlexLines<'pass, 'source, M: Measure + TextMeasure>(nodes: &BoxTr
     crossCursor = crossCursor + line.cross + crossGap + lineDistribution.between
     lineIndex = lineIndex + 1
   }
-  containerBaselines(nodes, &output, &mut measurer, items, lines, lines.length, style, &axis, false, &mut result)
+  containerBaselines(nodes, &output, &mut measurer, items, lines, lines.length, style, &axis, false, &summary, &mut result)
   if input.performLayout && input.fragmentation.boundaryProbe == BoundaryProbe.After && nodes.node(id).dynamicAfter {
     let mut state = output.resumes.get(id)
     state.after = FragmentBox.boundary(nodes, id, false, input.fragmentation.kind, input.fragmentation.rectoOnRight)
@@ -1805,7 +1850,7 @@ effect fn layoutFlexFragment<'pass, 'source, M: Measure + TextMeasure>(nodes: &B
   } else {
     run fragmentColumns(nodes, &mut output, &mut measurer, id, &input, &box, &childInput, axis, items, lines, main, cross, mainGap, crossGap, collapsed, blockHorizontal, reverse, &mut result)
   }
-  containerBaselines(nodes, &output, &mut measurer, items, lines, lines.length, style, &axis, true, &mut result)
+  containerBaselines(nodes, &output, &mut measurer, items, lines, lines.length, style, &axis, true, &EdgeSummary.none(), &mut result)
   return result
 }
 
