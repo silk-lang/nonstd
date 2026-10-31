@@ -8,7 +8,7 @@ import svg_geometry.geometry { Path, Rect }
 import svg_geometry.bounds { Result as BoundsResult }
 import svg_geometry.bounds
 import vector.path { Path as VectorPath }
-import vector.stroke { Stroker, Stroke }
+import vector.stroke { Stroker, Stroke, LengthEstimate }
 import vector.stroke
 import vector.projective
 import vector.projective { Homography }
@@ -17,6 +17,8 @@ import vector.geometry { Affine }
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
 import silk.num.f64
 import silk.core.ownership { Copy }
 import silk.collections.hash { Hash, HashKey, HashSeed }
@@ -157,26 +159,50 @@ impl Cache {
       && h.ww == 1.0
 
     // Absolute source units alone lose calibrated dash placement when tiny paths
-    // are magnified. Refine the reported bound, not a guessed coordinate epsilon.
-    let mut tolerance = 0.0001
+    // are magnified. Start coarse and refine to a relative bound; when a finer
+    // budget is out of f64 reach on a large curve, keep the best certified one.
+    let mut tolerance = 1.0
+    let mut best: Option<f64> = Option<f64>.None
     let mut attempts: usize = 0
-    while attempts < 8 {
-      let measured = if identity {
-        run stroke.measureLength(&self.paths.asSlice()[index].path, tolerance)
+    while attempts < 16 {
+      let path = &self.paths.asSlice()[index].path
+      let result = if identity {
+        run Effect.result(stroke.measureLength(path, tolerance))
       } else {
-        run stroke.measureLengthInSpace(&self.paths.asSlice()[index].path, &h, tolerance)
+        run Effect.result(stroke.measureLengthInSpace(path, &h, tolerance))
+      }
+      let measured = match move result {
+        Result<LengthEstimate, GeometryError>.Success { value } => value
+        Result<LengthEstimate, GeometryError>.Failure { error } => {
+          if let Option<f64>.Some { value } = best {
+            drop run self.metrics.insert(key, value)
+            return value
+          }
+          fail move error
+        }
       }
       if measured.error == 0.0 || measured.error <= 0.000001 * (measured.value - measured.error) {
         drop run self.metrics.insert(key, measured.value)
         return measured.value
       }
+      if measured.error <= 0.00001 * (measured.value - measured.error) {
+        best = Option<f64>.some(measured.value)
+      }
 
       // A coarse closed curve can have zero chord length without being empty.
-      tolerance = f64.min(tolerance * 0.5, f64.max(measured.value, measured.error) * 0.00000025)
+      // Step down gradually so a budget just out of reach still leaves a best.
+      tolerance = f64.max(
+        tolerance * 0.0625,
+        f64.min(tolerance * 0.5, f64.max(measured.value, measured.error) * 0.00000025),
+      )
       if !(tolerance > 0.0) {
         fail RenderError.InvalidGeometry
       }
       attempts = attempts + 1
+    }
+    if let Option<f64>.Some { value } = best {
+      drop run self.metrics.insert(key, value)
+      return value
     }
     fail RenderError.InvalidGeometry
   }
