@@ -26,6 +26,7 @@ import silk.simd.f32x4
 import silk.simd.i32x4
 import silk.simd.u8x16
 import silk.simd.u32x4
+import silk.simd.mask16
 import geometry { Affine, Rect }
 import path { Path }
 import flatten { Line, TOLERANCE }
@@ -578,16 +579,29 @@ effect fn rasterize(
     let bandTop = top + band * BAND
     let rows = minU32(BAND, canvasHeight - bandTop)
     let at = u32.toUsize(band)
-    resolve(
-      Slice.viewMut(area.asMutSlice(), at * bandCells, bandCells),
-      Slice.viewMut(touched.asMutSlice(), at * stride, stride),
-      stride,
-      localWidth,
-      rows,
-      rule,
-      bandAlphas.asMutSlice(),
-      columnKinds.asMutSlice(),
-    )
+    if localWidth >= WIDE {
+      resolveWide(
+        Slice.viewMut(area.asMutSlice(), at * bandCells, bandCells),
+        Slice.viewMut(touched.asMutSlice(), at * stride, stride),
+        stride,
+        localWidth,
+        rows,
+        rule,
+        bandAlphas.asMutSlice(),
+        columnKinds.asMutSlice(),
+      )
+    } else {
+      resolve(
+        Slice.viewMut(area.asMutSlice(), at * bandCells, bandCells),
+        Slice.viewMut(touched.asMutSlice(), at * stride, stride),
+        stride,
+        localWidth,
+        rows,
+        rule,
+        bandAlphas.asMutSlice(),
+        columnKinds.asMutSlice(),
+      )
+    }
     run emitBand(
       bandAlphas.asSlice(),
       columnKinds.asSlice(),
@@ -768,6 +782,72 @@ fn resolve(
   }
 }
 
+/// [`resolve`] for wide bands, where long runs of untouched columns are common: it steps over
+/// sixteen of them at a time. Narrow bands keep the plain loop, which the extra test slows.
+fn resolveWide(
+  area: &mut [f32],
+  touched: &mut [u8],
+  stride: usize,
+  localWidth: u32,
+  rows: u32,
+  rule: u8,
+  alphas: &mut [u8],
+  kinds: &mut [u8],
+) -> () {
+  let width = u32.toUsize(localWidth)
+
+  // The packed column word of a fully covered column: 255 in each row inside the canvas.
+  let all: u32 = 0xffffffff
+  let full = if rows >= BAND {
+    all
+  } else {
+    u32.shiftLeft(1, rows * 8) - 1
+  }
+  let zero = f32x4.splat(0.0)
+  let mut sum = zero
+  let mut word: u32 = 0
+  let mut kind = EMPTY
+  let none = u8x16.splat(0)
+  let mut c: usize = 0
+  while c < width {
+    // Sixteen untouched columns repeat a solid or empty column before them.
+    if kind != PARTIAL && c + 16 <= width
+      && mask16.all(u8x16.lanesEqual(u8x16.load(&touched, c), none)) {
+      u8x16.store(&mut kinds, c, u8x16.splat(kind))
+      c = c + 16
+      continue
+    }
+    if touched[c] != 0 {
+      touched[c] = 0
+      sum = sum + f32x4.load(&area, c * 4)
+      f32x4.store(&mut area, c * 4, zero)
+      word = alphaWord(sum, rule)
+      kind = if word == 0 {
+        EMPTY
+      } else if word == full {
+        SOLID
+      } else {
+        PARTIAL
+      }
+    }
+    kinds[c] = kind
+    if kind == PARTIAL {
+      alphas[c * 4] = u32.wrappingToU8(word)
+      alphas[c * 4 + 1] = u32.wrappingToU8(u32.shiftRight(word, 8))
+      alphas[c * 4 + 2] = u32.wrappingToU8(u32.shiftRight(word, 16))
+      alphas[c * 4 + 3] = u32.wrappingToU8(u32.shiftRight(word, 24))
+    }
+    c = c + 1
+  }
+
+  // Cells right of the canvas collect area that no column reads.
+  while c < stride {
+    touched[c] = 0
+    f32x4.store(&mut area, c * 4, zero)
+    c = c + 1
+  }
+}
+
 /// The 0..=255 coverages of four accumulated winding areas, packed one byte per lane (lane 0 in
 /// the low byte). The same values as the scalar `round(min(|coverage|, 1) * 255)` with the
 /// nonzero or even-odd fold.
@@ -794,6 +874,9 @@ fn alphaWord(sum: simd<f32, 4>, rule: u8) -> u32 {
   return u32x4.extract(u8x16.bitcastToU32x4(packed), 0)
 }
 
+// Bands at least this many columns wide skip runs sixteen columns at a time.
+const WIDE: u32 = 64
+
 const EMPTY: u8 = 0
 
 const PARTIAL: u8 = 1
@@ -816,6 +899,13 @@ effect fn emitBand(
   while c < width {
     let kind = kinds[c]
     let mut end = c + 1
+    if localWidth >= WIDE {
+      // Runs in wide bands are often long: compare sixteen kinds at a time first.
+      let same = u8x16.splat(kind)
+      while end + 16 <= width && mask16.all(u8x16.lanesEqual(u8x16.load(kinds, end), same)) {
+        end = end + 16
+      }
+    }
     while end < width && kinds[end] == kind {
       end = end + 1
     }
