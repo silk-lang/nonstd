@@ -130,6 +130,26 @@ The original's CPU passes ran in Node 22 and its models in Chromium's WebGPU. Sw
 emulates the GPU on the CPU, so the GPU dominates end to end; on lavapipe the port takes 26 ms
 (tree) and 72 ms (lite) for the fixtures.
 
+### In the browser
+
+`python3 text/gpu-lexer/scripts/bench-wasm <gpu-lexer checkout>` builds `wasm/` for wasm32 and
+runs `wasm/bench.mjs`, which times it next to the original in the same Chromium page and WebGPU
+device, and checks that its spans match the original's byte for byte (they do, for both models).
+
+| Step | Input | Original (ms) | Port, wasm (ms) | Port speedup |
+|---|---|---:|---:|---:|
+| CPU pass, tree | 18 fixtures, 8 KB | 0.13 | 0.12 | 1.08x |
+| CPU pass, tree | one 127 KB file | 1.97 | 1.83 | 1.08x |
+| CPU pass, lite | 18 fixtures, 8 KB | 0.44 | 0.14 | 3.08x |
+| CPU pass, lite | one 127 KB file | 4.28 | 2.11 | 2.03x |
+| Tree, end to end | 18 fixtures, 8 KB | 462 | 504 | 0.92x |
+| Tree, end to end | one 127 KB file | 4,493 | 4,351 | 1.03x |
+| Lite, end to end | 18 fixtures, 8 KB | 2,396 | 2,490 | 0.96x |
+| Lite, end to end | one 127 KB file | 14,451 | 15,130 | 0.96x |
+
+The port's CPU steps include copying the strings into wasm memory as UTF-8 (0.53 ms of the
+1.83 ms for the large file). End-to-end differences are within SwiftShader's run-to-run noise.
+
 ## Training
 
 `training/` adds Silk to gpu-lexer's training pipeline: `node training/apply.mjs <gpu-lexer

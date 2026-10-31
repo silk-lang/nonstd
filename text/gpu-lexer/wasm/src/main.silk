@@ -1,0 +1,307 @@
+//! The browser build: exports for wasm/bench.mjs, which times the port next to the original in
+//! the same page. The host writes sources into `input_bytes`/`input_lengths`, then calls the
+//! CPU passes directly or submits a model and polls until its spans are ready. The only unsafe
+//! code is the host ABI and the self-rooted state allocation (as in gpu/webgpu/examples).
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import gpu_lexer.lexer { Lexer, LiteLexer, Options, Request, LiteRequest }
+  import gpu_lexer.spans { Span }
+  import gpu_lexer.tree_parts { TreeParts }
+  import gpu_lexer.lite_parts { LiteParts }
+  import webgpu.runtime { Instance, Device, GpuError, RequestAdapterOptions, AdapterRequest, DeviceRequest }
+  import webgpu.descriptors { DeviceDescriptor }
+  import webgpu_sys.generated_webgpu as flags
+  import silk.collections.list { List }
+  import silk.collections.slice { Slice }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.mem.box { Box }
+  import silk.mem.pointer { Pointer }
+  import silk.num.u32
+  import silk.num.usize
+  import generated_webgpu_exports
+
+  const F16: [u32; 1] = [flags.WGPUFeatureName_ShaderF16]
+
+  struct Failed {}
+  struct FindingAdapter { request: AdapterRequest<'static> }
+  struct FindingDevice { request: DeviceRequest }
+  struct Ready { tree: Lexer, lite: LiteLexer }
+
+  struct Unrooted {}
+  struct Root { storage: Box<State> }
+  struct State {
+    stage: Failed | FindingAdapter | FindingDevice | Ready,
+    f16: bool,
+    input: List<u8>,
+    lengths: List<u32>,
+    treeRequest: Option<Request>,
+    liteRequest: Option<LiteRequest>,
+    spans: List<u32>,
+    root: Unrooted | Root,
+  }
+
+  fn pinned(token: ?*mut u8) -> *mut State {
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+    return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(pointer)
+  }
+
+  /// One view per source, cut from the concatenated input.
+  effect fn views<'a>(input: &'a [u8], lengths: &[u32], output: &mut List<&'a [u8]>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at: usize = 0
+    let mut index: usize = 0
+    while index < lengths.length {
+      let length = u32.toUsize(lengths[index])
+      run output.append(Slice.view(input, at, length))
+      at = at + length
+      index = index + 1
+    }
+  }
+
+  /// Flattens spans to [kind, start, end] words for the host.
+  effect fn flatten(spans: &[List<Span>], output: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+    output.clear()
+    let mut source: usize = 0
+    while source < spans.length {
+      let list = spans[source].asSlice()
+      let mut index: usize = 0
+      while index < list.length {
+        run output.append(list[index].kind.label())
+        run output.append(usize.wrappingToU32(list[index].start))
+        run output.append(usize.wrappingToU32(list[index].end))
+        index = index + 1
+      }
+      source = source + 1
+    }
+  }
+
+  effect fn start(f16: bool) -> ?*mut u8 ! GpuError | OutOfMemoryError {
+    let instance = run Instance.create()
+    let request = run instance.requestAdapterStart(&RequestAdapterOptions.default())
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let initial = State {
+      stage: FindingAdapter { request: move request }, f16: f16,
+      input: List<u8>.make(), lengths: List<u32>.make(),
+      treeRequest: Option<Request>.none(), liteRequest: Option<LiteRequest>.none(),
+      spans: List<u32>.make(), root: Unrooted {},
+    }
+    let mut storage = run Box<State>.make(move initial) |> Effect.provideMut<Allocator>(&mut allocator)
+    let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+    let mut anchor = ()
+    let fresh = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    fresh.root = Root { storage: move storage }
+    return unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pinned)
+  }
+
+  /// 1 once both lexers exist, 0 while the adapter or device is pending.
+  effect fn poll(state: &mut State) -> i32 ! GpuError | OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let previous = Intrinsic.replace(state.stage, Failed {})
+    match move previous {
+      Failed failed => { fail GpuError.status(0xffffffff) }
+      FindingAdapter { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let adapter = run pending.finish()
+          // The adapter's own limits, as openDevice requests natively.
+          let limits = run adapter.getLimits()
+          let descriptor = DeviceDescriptor.default().withLabel(b"gpu-lexer").withRequiredLimits(&limits)
+          let next = if state.f16 && adapter.hasFeature(flags.WGPUFeatureName_ShaderF16) {
+            run adapter.requestDeviceStart(&descriptor.withRequiredFeatures(&F16))
+          } else {
+            run adapter.requestDeviceStart(&descriptor)
+          }
+          state.stage = FindingDevice { request: move next }
+        } else { state.stage = FindingAdapter { request: move pending } }
+      }
+      FindingDevice { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let device = run pending.finish()
+          let options = if state.f16 { Options.default() } else { Options.exact() }
+          let tree = run Lexer.make(&device, options) |> Effect.provideMut<Allocator>(&mut allocator)
+          let lite = run LiteLexer.make(&device) |> Effect.provideMut<Allocator>(&mut allocator)
+          state.stage = Ready { tree: move tree, lite: move lite }
+          return 1
+        } else { state.stage = FindingDevice { request: move pending } }
+      }
+      Ready ready => {
+        state.stage = move ready
+        return 1
+      }
+    }
+    return 0
+  }
+
+  /// Runs one CPU pass over every source; returns the number of parts.
+  effect fn cpu(state: &mut State, lite: bool) -> u32 ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut sources = List<&[u8]>.make()
+    run views(state.input.asSlice(), state.lengths.asSlice(), &mut sources) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut count: usize = 0
+    if lite {
+      let mut parts = LiteParts.make()
+      let mut index: usize = 0
+      while index < sources.length() {
+        run parts.append(sources.get(index)) |> Effect.provideMut<Allocator>(&mut allocator)
+        index = index + 1
+      }
+      count = parts.count()
+    } else {
+      let mut parts = TreeParts.make()
+      let mut index: usize = 0
+      while index < sources.length() {
+        run parts.append(sources.get(index)) |> Effect.provideMut<Allocator>(&mut allocator)
+        index = index + 1
+      }
+      count = parts.count()
+    }
+    return usize.wrappingToU32(count)
+  }
+
+  /// Submits every source to one model (the lite model takes at most 64).
+  effect fn submit(state: &mut State, lite: bool) -> i32 ! GpuError | OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut sources = List<&[u8]>.make()
+    run views(state.input.asSlice(), state.lengths.asSlice(), &mut sources) |> Effect.provideMut<Allocator>(&mut allocator)
+    match &mut state.stage {
+      Ready ready => {
+        if lite {
+          state.liteRequest = run ready.lite.submit(sources.asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+        } else {
+          state.treeRequest = run ready.tree.submit(sources.asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        return 1
+      }
+      _ => { fail GpuError.status(0xffffffff) }
+    }
+  }
+
+  /// 1 once the submitted model's spans are in `spans`, 0 while the GPU is busy.
+  effect fn finish(state: &mut State, lite: bool) -> i32 ! GpuError | OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut sources = List<&[u8]>.make()
+    run views(state.input.asSlice(), state.lengths.asSlice(), &mut sources) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut output = List<List<Span>>.make()
+    match &mut state.stage {
+      Ready ready => {
+        if lite {
+          let ready_ = match &mut state.liteRequest {
+            Option<LiteRequest>.Some { value } => value.poll()
+            Option<LiteRequest>.None => true
+          }
+          if !ready_ { return 0 }
+          let request = Intrinsic.replace(state.liteRequest, Option<LiteRequest>.none())
+          run ready.lite.finish(move request, sources.asSlice(), &mut output) |> Effect.provideMut<Allocator>(&mut allocator)
+        } else {
+          let ready_ = match &mut state.treeRequest {
+            Option<Request>.Some { value } => value.poll()
+            Option<Request>.None => true
+          }
+          if !ready_ { return 0 }
+          let request = Intrinsic.replace(state.treeRequest, Option<Request>.none())
+          run ready.tree.finish(move request, sources.asSlice(), &mut output) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+      }
+      _ => { fail GpuError.status(0xffffffff) }
+    }
+    run flatten(output.asSlice(), &mut state.spans) |> Effect.provideMut<Allocator>(&mut allocator)
+    return 1
+  }
+
+  effect fn failedPointer<E>(error: E) -> ?*mut u8 {
+    drop error
+    return Pointer.null<u8>()
+  }
+  effect fn failedStatus<E>(error: E) -> i32 {
+    drop error
+    return -1
+  }
+  effect fn growBytes(list: &mut List<u8>, count: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    run list.appendRepeated(0, count)
+    return true
+  }
+  effect fn growWords(list: &mut List<u32>, count: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    run list.appendRepeated(0, count)
+    return true
+  }
+  effect fn failedUnit<E>(error: E) -> bool {
+    drop error
+    return false
+  }
+  effect fn failedCount<E>(error: E) -> u32 {
+    drop error
+    return 0xffffffff
+  }
+
+  export "C" fn lexerStart(f16: u32) -> ?*mut u8 as "lexer_start" {
+    return run Effect.catchAll(start(f16 != 0), failedPointer)
+  }
+  export "C" fn lexerPoll(token: ?*mut u8) -> i32 as "lexer_poll" {
+    if Pointer.isNull(token) { return -1 }
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    return run Effect.catchAll(poll(&mut target), failedStatus)
+  }
+  /// Resizes the input to `size` bytes and returns where the host writes it.
+  export "C" fn inputBytes(token: ?*mut u8, size: usize) -> ?*mut u8 as "input_bytes" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    target.input.clear()
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let grown = run Effect.catchAll(growBytes(&mut target.input, size) |> Effect.provideMut<Allocator>(&mut allocator), failedUnit)
+    if !grown || size == 0 { return Pointer.null<u8>() }
+    return Pointer.fromMutRef(&mut target.input.asMutSlice()[0])
+  }
+  /// Resizes the source lengths to `count` and returns where the host writes them.
+  export "C" fn inputLengths(token: ?*mut u8, count: usize) -> ?*mut u8 as "input_lengths" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    target.lengths.clear()
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let grown = run Effect.catchAll(growWords(&mut target.lengths, count) |> Effect.provideMut<Allocator>(&mut allocator), failedUnit)
+    if !grown || count == 0 { return Pointer.null<u8>() }
+    let words = Pointer.fromMutRef(&mut target.lengths.asMutSlice()[0])
+    return unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(words)
+  }
+  export "C" fn cpuParts(token: ?*mut u8, lite: u32) -> u32 as "cpu_parts" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    return run Effect.catchAll(cpu(&mut target, lite != 0), failedCount)
+  }
+  export "C" fn lexSubmit(token: ?*mut u8, lite: u32) -> i32 as "lex_submit" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    return run Effect.catchAll(submit(&mut target, lite != 0), failedStatus)
+  }
+  export "C" fn lexFinish(token: ?*mut u8, lite: u32) -> i32 as "lex_finish" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    return run Effect.catchAll(finish(&mut target, lite != 0), failedStatus)
+  }
+  /// [kind, start, end] words of the last finished spans, all sources in order.
+  export "C" fn spanWords(token: ?*mut u8) -> ?*mut u8 as "span_words" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    if target.spans.length() == 0 { return Pointer.null<u8>() }
+    let words = Pointer.fromMutRef(&mut target.spans.asMutSlice()[0])
+    return unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(words)
+  }
+  export "C" fn spanCount(token: ?*mut u8) -> usize as "span_count" {
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    return target.spans.length() / 3
+  }
+  export "C" fn lexerDrop(token: ?*mut u8) -> () as "lexer_drop" {
+    if Pointer.isNull(token) { return () }
+    let mut anchor = ()
+    let target = unsafe Pointer.borrowMut(&mut anchor, pinned(token))
+    let root = Intrinsic.replace(target.root, Unrooted {})
+    match move root {
+      Root { storage } => { drop storage }
+      Unrooted empty => ()
+    }
+  }
+}
+
+pub fn main() -> i32 { return 0 }
