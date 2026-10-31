@@ -322,6 +322,9 @@ struct Plan {
   pending: Option<usize>,
   /// The `filter` property does not apply (a `mask` element).
   unfiltered: bool,
+  /// A text content child other than `a`: an inline box, to which clip-path, mask,
+  /// filter, opacity, mix-blend-mode and isolation do not apply.
+  inline: bool,
 }
 
 impl Copy for Plan {}
@@ -752,7 +755,10 @@ effect fn prepare(
   ! CssError | RenderError | OutOfMemoryError
   ? &mut Allocator {
   let occurrence = graph.occurrences.asSlice()[id.index]
-  if !occurrence.eligible {
+
+  // Conditional processing affects only direct rendering, so a referenced
+  // definition still prepares when its own conditions fail (SVG2 #ConditionalProcessing).
+  if !occurrence.eligible && !(root.definition && id.index == root.occurrence.index) {
     return Option<usize>.None
   }
   let source = occurrence.source
@@ -819,6 +825,15 @@ effect fn prepare(
   let maskRoot = isRoot && root.definition && svgElement && !foreign && equal(name, b"mask")
   if maskRoot {
     style.opacity = 1.0
+  }
+
+  // CSS Masking 1, Filter Effects 1 and Compositing 1 apply these in SVG to container
+  // and graphics elements only; `transform` has no effect on inline elements (#TextLayoutAlgorithm).
+  let inline = textChild && !equal(name, b"a")
+  if inline {
+    style.opacity = 1.0
+    style.isolated = false
+    style.blendMode = BlendMode.Normal
   }
   let fillPresence: u8 = if present(&style.fill, context)
     || styles.resource(id, Property.Fill).isSome() {
@@ -1149,13 +1164,14 @@ effect fn prepare(
       childViewport: childViewport,
       layout: layout,
       local: Mapping.identity(),
-      transformed: !(isRoot && root.externalTransform)
+      transformed: !(isRoot && root.externalTransform) && !textChild
         && used_transforms.transformed(&styles.catalog.engine, styleId),
       perspective: used_transforms.hasPerspective(&styles.catalog.engine, styleId),
       hiddenBackface: used_transforms.hiddenBackface(&styles.catalog.engine, styleId),
       suppressed: false,
       pending: Option<usize>.None,
-      unfiltered: maskRoot,
+      unfiltered: maskRoot || inline,
+      inline: inline,
     },
   )
   if container {
@@ -2611,7 +2627,10 @@ effect fn clipGeometry(
   if plan.suppressed {
     return result
   }
-  if plan.paintable && plan.style.visible {
+
+  // `image` is not in the clipPath content model (CSS Masking 1 #ClipPathElement), so its
+  // placement rectangle never clips.
+  if plan.paintable && plan.style.visible && plan.image.isNone() {
     if let Option<usize>.Some { value: path } = &plan.path {
       let computed = match &styles.catalog.engine.get(plan.styleId, Property.ClipRule) {
         Option<ComputedValue>.Some { value } => value.value
@@ -2684,6 +2703,9 @@ effect fn referencedClip(
   ! CssError | RenderError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
   let plan = state.plans.asSlice()[id]
+  if plan.inline {
+    return Option<usize>.None
+  }
   if let Option<ComputedValue>.Some { value: entry } = &styles.catalog.engine.get(
     plan.styleId,
     Property.ClipPath,
@@ -4176,7 +4198,7 @@ effect fn paintPrepared(
     return
   }
   let clipping = run referencedClip(graph, &mut styles.*, id, &mut state.*, matrix, limits, depth)
-  let masked = used_masks.present(&styles.catalog.engine, plan.styleId)
+  let masked = !plan.inline && used_masks.present(&styles.catalog.engine, plan.styleId)
 
   // FE1 Appendix A: `enable-background: new` starts a background image for descendants;
   // an isolated group gives exactly that backdrop.
@@ -4196,6 +4218,28 @@ effect fn paintPrepared(
     )
   }
 
+  // Filter regions are in the element's own user space, which for a viewport element
+  // is outside its viewBox supplement (gather measures them there), so the filter
+  // surfaces take the matrix without it.
+  let filterMatrix = match &plan.layout {
+    Option<usize>.Some { value } => {
+      let layout = &state.layouts.asSlice()[value]
+      if layout.referenceMapping {
+        match &layout.supplement.inverse() {
+          Option<Transform>.Some { value: inverse } => run matrix.compose(
+            &Mapping.Affine { value: inverse },
+          )
+          _ => {
+            fail RenderError.InvalidGeometry
+          }
+        }
+      } else {
+        matrix.*
+      }
+    }
+    _ => matrix.*
+  }
+
   // Filters apply first, then clipping, masking and opacity (#placement). The first
   // filter of a list is innermost: its result is the next one's SourceGraphic.
   let mut f = filtered.programs.length()
@@ -4204,7 +4248,7 @@ effect fn paintPrepared(
     run nodes.append(
       ResolvedNode.BeginFilter {
         filter: filtered.programs.asSlice()[f],
-        transform: matrix.*,
+        transform: filterMatrix,
         clip: inheritedClip,
         beneath: layer && f == filtered.programs.length() - 1,
         backdrop: if state.backgrounds.length() > 0 {
@@ -4225,7 +4269,7 @@ effect fn paintPrepared(
         &mut state.*,
         &mut paints.*,
         limits,
-        matrix,
+        &filterMatrix,
         outputBounds,
         context,
         depth,

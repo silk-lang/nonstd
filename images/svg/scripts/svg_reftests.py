@@ -394,6 +394,9 @@ def main(argv=None):
         if not cases:
             raise ValueError("no reftest cases discovered")
         ids = {case["id"] for case in cases}
+        if args.suite == "resvg" and not args.full:
+            # One reviewed file covers the full suite; the curated run checks its subset.
+            expectations = {key: value for key, value in expectations.items() if key in ids}
         stale = sorted(set(expectations) - ids)
         if stale:
             raise ValueError(f"expectations name absent cases: {', '.join(stale[:10])}")
