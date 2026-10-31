@@ -13,6 +13,7 @@ import silk.num.f64
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+import silk.simd.f32x4
 import silk.simd.simd
 import silk.simd.u8x16
 import silk.simd.u32x4
@@ -596,6 +597,10 @@ fn blendPixel(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
     d[i + 3] = s.a
     return
   }
+  if mode < BLEND_HUE {
+    blendSeparable(&mut d, i, s, mode)
+    return
+  }
   let sa = u8.toF32(s.a) / 255.0
   let ba = u8.toF32(d[i + 3]) / 255.0
   let sr = u8.toF32(s.r) / 255.0
@@ -638,6 +643,76 @@ fn blendPixel(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
   d[i + 1] = toByte(sg * (1.0 - ba) + bg * (1.0 - sa) + k * rg)
   d[i + 2] = toByte(sb * (1.0 - ba) + bb * (1.0 - sa) + k * rb)
   d[i + 3] = toByte(sa + ba * (1.0 - sa))
+}
+
+// The separable modes on all three channels at once. Every lane runs the scalar formula's
+// operations in the same order (selects stand in for its branches), so bytes match exactly.
+// The backdrop alpha is non-zero here. Lane 3 is zero in both inputs and stays finite.
+fn blendSeparable(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
+  let sa = u8.toF32(s.a) / 255.0
+  let ba = u8.toF32(d[i + 3]) / 255.0
+  let scale = f32x4.splat(255.0)
+  let src = f32x4.fromArray([u8.toF32(s.r), u8.toF32(s.g), u8.toF32(s.b), 0.0]) / scale
+  let dst = f32x4.fromArray([u8.toF32(d[i]), u8.toF32(d[i + 1]), u8.toF32(d[i + 2]), 0.0]) / scale
+  let cs = src / f32x4.splat(sa)
+  let cb = dst / f32x4.splat(ba)
+  let zero = f32x4.splat(0.0)
+  let one = f32x4.splat(1.0)
+  let two = f32x4.splat(2.0)
+  let half = f32x4.splat(0.5)
+  let mut result = cs
+  if mode == BLEND_MULTIPLY {
+    result = cb * cs
+  } else if mode == BLEND_SCREEN {
+    result = cb + cs - cb * cs
+  } else if mode == BLEND_OVERLAY {
+    result = hardLight4(cs, cb)
+  } else if mode == BLEND_DARKEN {
+    result = f32x4.select(f32x4.lanesLess(cb, cs), cb, cs)
+  } else if mode == BLEND_LIGHTEN {
+    result = f32x4.select(f32x4.lanesGreater(cb, cs), cb, cs)
+  } else if mode == BLEND_COLOR_DODGE {
+    let q = cb / (one - cs)
+    let m = f32x4.select(f32x4.lanesLess(one, q), one, q)
+    let r = f32x4.select(f32x4.lanesGreaterOrEqual(cs, one), one, m)
+    result = f32x4.select(f32x4.lanesEqual(cb, zero), zero, r)
+  } else if mode == BLEND_COLOR_BURN {
+    let q = (one - cb) / cs
+    let m = one - f32x4.select(f32x4.lanesLess(one, q), one, q)
+    let r = f32x4.select(f32x4.lanesLessOrEqual(cs, zero), zero, m)
+    result = f32x4.select(f32x4.lanesGreaterOrEqual(cb, one), one, r)
+  } else if mode == BLEND_HARD_LIGHT {
+    result = hardLight4(cb, cs)
+  } else if mode == BLEND_SOFT_LIGHT {
+    let low = cb - (one - two * cs) * cb * (one - cb)
+    let poly = ((f32x4.splat(16.0) * cb - f32x4.splat(12.0)) * cb + f32x4.splat(4.0)) * cb
+    let dd = f32x4.select(f32x4.lanesLessOrEqual(cb, f32x4.splat(0.25)), poly, f32x4.sqrt(cb))
+    let high = cb + (two * cs - one) * (dd - cb)
+    result = f32x4.select(f32x4.lanesLessOrEqual(cs, half), low, high)
+  } else if mode == BLEND_DIFFERENCE {
+    let bits = f32x4.bitcastToU32x4(cb - cs) & u32x4.splat(0x7fffffff)
+    result = u32x4.bitcastToF32x4(bits)
+  } else if mode == BLEND_EXCLUSION {
+    result = cb + cs - two * cb * cs
+  }
+  let mixed = src * f32x4.splat(1.0 - ba) + dst * f32x4.splat(1.0 - sa) + f32x4.splat(sa * ba) * result
+  let low = f32x4.select(f32x4.lanesGreater(mixed, zero), mixed, zero)
+  let clamped = f32x4.select(f32x4.lanesLess(low, one), low, one)
+  let bytes = f32x4.toU32x4(clamped * scale + half)
+  d[i] = u32.wrappingToU8(u32x4.extract(bytes, 0))
+  d[i + 1] = u32.wrappingToU8(u32x4.extract(bytes, 1))
+  d[i + 2] = u32.wrappingToU8(u32x4.extract(bytes, 2))
+  d[i + 3] = toByte(sa + ba * (1.0 - sa))
+}
+
+// hardLight on four lanes: `cb * 2 * cs` when `cs <= 0.5`, else screen with `2 cs - 1`.
+@inlineAlways
+fn hardLight4(cb: simd<f32, 4>, cs: simd<f32, 4>) -> simd<f32, 4> {
+  let two = f32x4.splat(2.0)
+  let low = cb * two * cs
+  let s = two * cs - f32x4.splat(1.0)
+  let high = cb + s - cb * s
+  return f32x4.select(f32x4.lanesLessOrEqual(cs, f32x4.splat(0.5)), low, high)
 }
 
 // Blend results are finite (a NaN would have trapped in f32.toU8), so plain selects clamp
