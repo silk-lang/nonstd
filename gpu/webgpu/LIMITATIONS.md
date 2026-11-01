@@ -36,10 +36,10 @@ All reproductions below use the published **0.1.0-dev.27+323ceb59e7ee** compiler
 ## LIMITATION-5 — Apple linker compact-unwind personality limit
 
 - Report: [silk-lang/silk#2547](https://github.com/silk-lang/silk/issues/2547).
-- Observed: the macOS26 hosted ABI executable link fails with 25 distinct internal `___silk_foreign_personality` routines plus Dawn's C++ personality, exceeding the compact-unwind format's three-personality limit. A two-line standalone `getpid` package retains 25 internal personality symbols; its reduced link succeeds on the older local Apple ld 1167.4.1, so the upstream report distinguishes the reduced duplication evidence from the observed hosted link failure.
-- Workaround: use unmodified LLVM 22 `ld64.lld`, which preserves the Silk DWARF FDEs rather than promoting their personalities into the compact table. No foreign-unwind guards or unwind metadata are disabled. Silk resolves linker symlinks to generic `lld`, so the build helper caches an unchanged executable named `ld64.lld` with the original library-directory layout.
-- Measured: local LLD-linked ABI probe passes all 92 record layouts and 202 linked symbols; the native Metal ownership/mapping/validation/cancellation test passes in 2.05 seconds. Hosted results are recorded separately in CI; no instruction-count overhead claim.
-- Site: `scripts/_build.py:darwin_linker`.
+- Historical observation: the macOS26 hosted ABI executable link failed with 25 distinct internal `___silk_foreign_personality` routines plus Dawn's C++ personality, exceeding the compact-unwind format's three-personality limit. The build helper previously forced LLVM 22 `ld64.lld` to preserve DWARF FDEs.
+- Current build: Silk dev.40 uses the normal Apple linker selected by Clang. The native scenarios, examples, GLFW window, benchmark and SVG GPU-scene executables link successfully with the macOS 27.2 SDK; native lifetime/error scenarios and SVG GPU-scene checks pass locally.
+- Removed workaround: LLVM 22 `ld64.lld` rejects the macOS 27.2 SDK's `arm64e.x1` TAPI targets and crashes. The helper no longer forces or copies it. No SDK files, foreign-unwind guards or unwind metadata are modified.
+- Historical evidence: the earlier LLD-linked ABI probe passed all 92 record layouts and 202 linked symbols; its native Metal ownership/mapping/validation/cancellation test passed in 2.05 seconds. This does not establish results on other current SDKs or hosted runners.
 
 ## LIMITATION-6 — Float-to-integer conversions run a software trunc (fixed in dev.29)
 
