@@ -45,7 +45,7 @@ The blocking `requestAdapter` and `requestDevice` are native conveniences. Each 
 use. `examples/src/session.silk` drives a whole sample that way, on both targets.
 
 Native programs link Dawn's static library and a small callback helper
-(`native/callbacks.c`); `scripts/_build.py` shows the exact link line for macOS and Linux.
+(`native/callbacks.c`); `scripts/_build.py` shows the native link configuration.
 Dependents import the packages as `webgpu` and `webgpu_sys`.
 
 ## Packages
@@ -64,10 +64,17 @@ expected images.
 
 ## Platforms
 
-Dawn's pinned release (`v20261027.184652`) runs natively on macOS arm64 and Linux x86_64 and is
-tested on both: Metal on macOS, and Mesa lavapipe in Linux CI. Browsers are tested with
-Chromium's WebGPU. Windows is blocked until Silk has a native Windows target
-([silk-lang/silk#2542](https://github.com/silk-lang/silk/issues/2542)).
+Dawn's pinned release (`v20261027.184652`) runs natively on macOS arm64, Linux x86_64
+and Windows x86_64. Tests use Metal on macOS, Mesa lavapipe on Linux, and D3D12 on
+Windows. Browsers use Chromium's WebGPU.
+
+Windows builds require LLVM 22 and an x64 Visual Studio 2026 developer shell with
+the Windows SDK and current Visual C++ Redistributable. Invoke helpers as
+`python gpu/webgpu/scripts/check`. The build wraps Dawn's pinned static archive
+in `nonstd_dawn.dll` so Windows initializes its C++ runtime, then copies the DLL
+and checksum-pinned DXC shader compiler beside each executable. The window helper
+also installs pinned GLFW unless `GLFW_PREFIX` supplies its DLL and import library.
+Keep those DLLs beside executables when moving them.
 
 ## Tests
 

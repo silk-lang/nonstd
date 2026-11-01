@@ -45,22 +45,22 @@ All installers require Python 3.12+ and `curl`, install under the repository's i
 The Silk and LLVM installers are shared at the repository root (`scripts/install-silk`,
 `scripts/install-llvm`); Dawn's is `gpu/webgpu/scripts/install-webgpu`.
 
-- `install-silk` pins **0.1.0-dev.40+9ca01cf8311a**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
+- `install-silk` pins **0.1.0-dev.42+870af07163cd**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
 - `install-webgpu` pins Dawn's Release archives and prints the **installation root**. macOS has `lib/libwebgpu_dawn.a`; Linux has `lib64/libwebgpu_dawn.a`; Windows has `lib/webgpu_dawn.lib`.
 - `install-llvm` accepts a working absolute `SILK_CLANG` pointing to LLVM 22, or discovers Homebrew LLVM / `clang-22`; otherwise it downloads checksum-pinned **LLVM 22.1.8**. It prints the **absolute clang executable path**. Published LLVM archives are large (Linux x86_64: 1,938,859,476 bytes); preinstall LLVM 22 for a short cold gate. The full downloaded distribution includes resource headers and `wasm-ld`; a supplied system toolchain must also provide `wasm-ld` for browser builds.
 
-| Native host | Silk dev.40 release | Dawn release | Current prerequisite |
+| Native host | Silk dev.42 release | Dawn release | Current prerequisite |
 | --- | --- | --- | --- |
 | macOS arm64 | Available | Available | macOS 26+, LLVM 22 and Apple SDK |
 | macOS x86_64 | Not published | Available | Published native Silk compiler required |
 | Linux x86_64 | Available | Available | LLVM 22, C++ runtime, Vulkan loader and GPU driver (lavapipe for headless software rendering) |
 | Linux aarch64 | Available | Not published | Matching stable-header Dawn binary required; no implicit switch to wgpu-native |
-| Windows x86_64 | Not published | Available | Published native Silk compiler and supported Windows target required; MSVC/Windows SDK for Dawn |
+| Windows x86_64 | Available | Available | LLVM 22, Visual Studio 2026 x64 C++ tools, Windows SDK and Visual C++ Redistributable |
 | Windows aarch64 | Not published | Not published | Published Silk and Dawn binaries required |
 
 Dawn's archive labels identify upstream build runners, not a guaranteed minimum OS version. The selected arm64 archive's Mach-O objects specify macOS 26.0; native helper compilation uses the same deployment target. Cross-platform runtime support is not inferred merely from an archive being present. `toolchains.lock.json` also records available wgpu-native Linux/macOS/Windows binaries for reproducible comparison, not as an automatic fallback.
 
-Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Link the host C++ runtime as well. Windows uses the MSVC archive and SDK libraries listed in the release's `lib/cmake/Dawn/DawnTargets.cmake`. No unverified cross-platform build or test success is claimed here.
+Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Windows wraps the pinned archive in a DLL linked with `user32`, `onecore_apiset`, `dxguid` and the MSVC runtime so its C++ initializers run. The build stages its import library and copies the DLL and pinned DXC runtime beside each executable. `install-glfw` supplies the Windows window example's pinned DLL and import library.
 
 macOS builds use Apple's linker through LLVM 22 Clang and the active Xcode SDK.
 The former forced-`ld64.lld` workaround is removed: LLVM 22 cannot read the macOS

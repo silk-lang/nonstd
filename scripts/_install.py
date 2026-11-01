@@ -6,6 +6,7 @@ import platform
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,14 +62,26 @@ def extract(asset, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as temporary:
         staging = Path(temporary)
-        with tarfile.open(archive) as source:
-            source.extractall(staging, filter="data")
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive) as source:
+                for entry in source.infolist():
+                    path = Path(entry.filename)
+                    if path.is_absolute() or ".." in path.parts:
+                        fail(f"Unsafe archive member: {entry.filename}")
+                source.extractall(staging)
+        else:
+            with tarfile.open(archive) as source:
+                source.extractall(staging, filter="data")
         entries = list(staging.iterdir())
-        if len(entries) != 1 or not entries[0].is_dir():
-            fail(f"Expected one release directory in {archive.name}")
+        if asset.get("strip_root", True):
+            if len(entries) != 1 or not entries[0].is_dir():
+                fail(f"Expected one release directory in {archive.name}")
+            tree = entries[0]
+        else:
+            tree = staging
         if destination.exists():
             fail(f"Incomplete installation at {destination}; remove it and retry")
-        entries[0].replace(destination)
+        tree.replace(destination)
     return destination
 
 
