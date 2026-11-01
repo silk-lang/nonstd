@@ -60,7 +60,9 @@ the expected outcome. **1899 of 1899** selected cases pass. The skipped cases ar
 - optional errors;
 - not-well-formed cases that depend on fetching external entities.
 
-`text/xml/conformance` is the small runner package it builds.
+`text/xml/conformance` is the small runner package it builds. It is a workspace member,
+so the script runs its release executable from the repository's `build/llvm/<target>/release/`
+directory, not from a package-local build directory.
 
 ## Tests
 

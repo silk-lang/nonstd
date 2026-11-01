@@ -45,11 +45,11 @@ All installers require Python 3.12+ and `curl`, install under the repository's i
 The Silk and LLVM installers are shared at the repository root (`scripts/install-silk`,
 `scripts/install-llvm`); Dawn's is `gpu/webgpu/scripts/install-webgpu`.
 
-- `install-silk` pins **0.1.0-dev.32+ebc526403637**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
+- `install-silk` pins **0.1.0-dev.40+9ca01cf8311a**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
 - `install-webgpu` pins Dawn's Release archives and prints the **installation root**. macOS has `lib/libwebgpu_dawn.a`; Linux has `lib64/libwebgpu_dawn.a`; Windows has `lib/webgpu_dawn.lib`.
 - `install-llvm` accepts a working absolute `SILK_CLANG` pointing to LLVM 22, or discovers Homebrew LLVM / `clang-22`; otherwise it downloads checksum-pinned **LLVM 22.1.8**. It prints the **absolute clang executable path**. Published LLVM archives are large (Linux x86_64: 1,938,859,476 bytes); preinstall LLVM 22 for a short cold gate. The full downloaded distribution includes resource headers and `wasm-ld`; a supplied system toolchain must also provide `wasm-ld` for browser builds.
 
-| Native host | Silk dev.29 release | Dawn release | Current prerequisite |
+| Native host | Silk dev.40 release | Dawn release | Current prerequisite |
 | --- | --- | --- | --- |
 | macOS arm64 | Available | Available | macOS 26+, LLVM 22 and Apple SDK |
 | macOS x86_64 | Not published | Available | Published native Silk compiler required |
@@ -62,11 +62,11 @@ Dawn's archive labels identify upstream build runners, not a guaranteed minimum 
 
 Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Link the host C++ runtime as well. Windows uses the MSVC archive and SDK libraries listed in the release's `lib/cmake/Dawn/DawnTargets.cmake`. No unverified cross-platform build or test success is claimed here.
 
-macOS builds use LLVM 22's `ld64.lld` with the active Apple SDK. Install `lld`
-alongside a supplied Homebrew Clang (`brew install llvm lld`); the pinned full LLVM
-distribution already includes it. The build helper preserves the Mach-O driver's
-executable name and DWARF unwind metadata. This avoids the hosted Apple linker's
-compact-unwind personality limit without disabling foreign-unwind guards; see
+macOS builds use Apple's linker through LLVM 22 Clang and the active Xcode SDK.
+The former forced-`ld64.lld` workaround is removed: LLVM 22 cannot read the macOS
+27.2 SDK's `arm64e.x1` TAPI targets, while the dev.40 executables link with Apple's
+linker. No separate LLD installation is required for native macOS builds, and no
+foreign-unwind guards are disabled; see
 [LIMITATION-5](../LIMITATIONS.md#limitation-5--apple-linker-compact-unwind-personality-limit).
 
 The [cold hosted macOS run](https://github.com/julia-script/silk-gpu/actions/runs/40796358521)

@@ -1,4 +1,5 @@
 SILK ?= silk
+SILK_BUILD_FLAGS ?=
 PYTHON ?= python3
 CLANG ?= xcrun clang
 SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path)
@@ -8,9 +9,9 @@ NATIVE_SOURCES := $(wildcard native/*.m)
 NATIVE_ARCHIVE := native/build/libsilkmetal.a
 NATIVE_OBJECTS := $(patsubst native/%.m,native/build/%.o,$(NATIVE_SOURCES))
 
-.PHONY: all native check smoke compute render coverage
+.PHONY: all native check examples smoke compute render coverage
 all: native
-	$(SILK) build
+	"$(SILK)" build $(SILK_BUILD_FLAGS)
 native: $(NATIVE_ARCHIVE)
 
 native/build/%.o: native/%.m native/types.h
@@ -25,11 +26,14 @@ examples/%/native/libsilkmetal.a: $(NATIVE_ARCHIVE)
 	cp $< $@
 
 check: native
-	$(SILK) check
+	"$(SILK)" check
+examples: examples/compute/native/libsilkmetal.a examples/headless-render/native/libsilkmetal.a
+	"$(SILK)" build $(SILK_BUILD_FLAGS) --manifest-path examples/compute/silk.toml
+	"$(SILK)" build $(SILK_BUILD_FLAGS) --manifest-path examples/headless-render/silk.toml
 compute: examples/compute/native/libsilkmetal.a
-	$(SILK) run --manifest-path examples/compute/silk.toml
+	"$(SILK)" run $(SILK_BUILD_FLAGS) --manifest-path examples/compute/silk.toml
 render: examples/headless-render/native/libsilkmetal.a
-	$(SILK) run --manifest-path examples/headless-render/silk.toml
+	"$(SILK)" run $(SILK_BUILD_FLAGS) --manifest-path examples/headless-render/silk.toml
 
 smoke: compute render
 

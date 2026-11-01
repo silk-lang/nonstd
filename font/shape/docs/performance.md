@@ -143,7 +143,7 @@ A format 3 rule that a context step already checked is not checked again in `con
 Adding text counts scalars with a loop that vectorizes and converts byte offsets to clusters without a check per scalar.
 Clearing a buffer empties its language in place instead of dropping and replacing it.
 The per-glyph feature check, the second-input search and the nested lookup header read are inlined into their callers.
-Moving to Silk dev.24 (dev.25 is current), whose slice and list accesses no longer reload the list's base pointer and whose
+Moving to Silk dev.24 (dev.25 was current for these measurements), whose slice and list accesses no longer reload the list's base pointer and whose
 large struct literals are stored field by field, took the geometric mean from 0.93× to 0.86× with no source
 changes; every workload is now below Rust.
 Inserting copies of a glyph uses the list's own `insertRepeated`, which opens the gap with one block move.

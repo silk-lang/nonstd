@@ -2,7 +2,7 @@
 
 Silk libraries that live outside the standard library: fonts, text, CSS, images and GPUs. They
 are grouped by area, and every package is a member of one workspace that pins Silk
-`0.1.0-dev.32+ebc526403637` (`toolchains.lock.json`). Nothing here is stable yet.
+`0.1.0-dev.40+9ca01cf8311a` (`toolchains.lock.json`). Nothing here is stable yet.
 
 ## Libraries
 
@@ -30,10 +30,36 @@ Programs that use `cli` are in [`examples`](examples).
 
 ## Working in the workspace
 
-The workspace builds into `build/` at the root. Commands run from the root unless a README says
-otherwise:
+To build every workspace package, including the GPU executables and their native prerequisites:
 
 ```sh
+scripts/build
+scripts/build --release
+```
+
+The full build requires Apple Silicon macOS 26+, Xcode/macOS SDK, Python 3.12+, curl,
+make, and GLFW 3.4+ with pkg-config (or `GLFW_PREFIX`). It installs checksum-pinned
+Silk and Dawn binaries into `.cache/` and discovers LLVM 22, or installs the pinned LLVM
+distribution if necessary. Homebrew users can provide prerequisites with
+`brew install llvm glfw pkg-config`. Apple's linker from the active Xcode toolchain links
+the macOS executables; a separate LLD installation is not required.
+
+The command builds all workspace members without running examples or tests. It prepares the
+Metal bridge and example archives, and uses the WebGPU helpers to link Dawn, callbacks, GLFW,
+and benchmark support. C/Rust benchmark comparison programs are built only by their area-specific
+benchmark script. The full build requires macOS because it includes Metal; use area-specific
+commands on other supported platforms.
+
+Ordinary artifacts go into `build/` at the root. WebGPU-linked executables use the existing
+staged builds under `.cache/build/<package>/build/llvm/<target>/<debug|release>/`; their paths
+are printed during the build. No host-specific paths are written into tracked manifests.
+
+Plain `silk build --workspace` does not run native preparation and cannot supply WebGPU's
+link configuration. Use `scripts/build` for the complete workspace, or plain Silk commands
+for individual pure-Silk packages. Commands run from the root unless a README says otherwise:
+
+```sh
+silk build --package images-svg-cli
 silk test --manifest-path packages/cli/silk.toml --root src/tests.silk
 silk run --manifest-path examples/greet/silk.toml -- --name Julia --times 2
 ```

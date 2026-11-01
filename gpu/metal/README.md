@@ -14,16 +14,24 @@ From `gpu/metal`, with:
 
 - Apple Silicon macOS with a Metal device.
 - Xcode/macOS SDK 15.4 or newer for the complete declaration surface.
-- Silk `0.1.0-dev.32+ebc526403637`, as pinned by the workspace.
+- Silk `0.1.0-dev.40+9ca01cf8311a`, as pinned by the workspace.
 - LLVM 22 clang for Silk's LLVM output (`SILK_CLANG`); `xcrun clang` compiles the Objective-C bridge.
 - `make`; Python 3.9+ only for inventory checks or regeneration.
 
 ```sh
 make                 # native bridge and Silk static library
+make all examples    # build library and both examples without running them
 make check           # type-check every exported Silk module
 make smoke           # run the compute and headless-render examples on the GPU
 make coverage        # check upstream declaration inventory
 ```
+
+From the repository root, use `make -C gpu/metal all examples SILK=/path/bin/silkc`.
+The examples reuse the native archive staging used by `make compute` and `make render`;
+those targets, and `make smoke`, still run the GPU checks. Set `SILK_BUILD_FLAGS=--release`
+to build or run the Silk targets in release mode. `SILK_CLANG` is inherited from the
+environment; `CLANG` selects the separate Objective-C compiler. These targets require
+the macOS SDK and fail on unsupported platforms rather than silently skipping Metal.
 
 The native bridge targets macOS 14.0 by default (`make DEPLOYMENT=15.0` overrides it). A deployment target does not make every newer Metal selector available; query device support and, where necessary, `Native.responds_to` before invoking an optional API. Private selectors are not guaranteed to exist on any OS version.
 
