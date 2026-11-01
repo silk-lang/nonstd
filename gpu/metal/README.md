@@ -14,7 +14,7 @@ From `gpu/metal`, with:
 
 - Apple Silicon macOS with a Metal device.
 - Xcode/macOS SDK 15.4 or newer for the complete declaration surface.
-- Silk `0.1.0-dev.40+9ca01cf8311a`, as pinned by the workspace.
+- Silk `0.1.0-dev.42+870af07163cd`, as pinned by the workspace.
 - LLVM 22 clang for Silk's LLVM output (`SILK_CLANG`); `xcrun clang` compiles the Objective-C bridge.
 - `make`; Python 3.9+ only for inventory checks or regeneration.
 

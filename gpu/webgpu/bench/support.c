@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #ifdef BENCH_CALLGRIND
 #include <valgrind/callgrind.h>
 #endif
@@ -33,9 +37,18 @@ uint32_t bench_case(void) { return setting("BENCH_CASE", 0, 4); }
 uint32_t bench_count(void) { uint32_t n = setting("BENCH_N", 10000, 1000000); if (n < 64) die("BENCH_N must be >=64"); return n; }
 uint32_t bench_frames(void) { uint32_t n = setting("BENCH_FRAMES", 10, 10000); if (!n) die("BENCH_FRAMES must be positive"); return n; }
 static uint64_t now(void) {
+#ifdef _WIN32
+    LARGE_INTEGER ticks, frequency;
+    if (!QueryPerformanceCounter(&ticks) || !QueryPerformanceFrequency(&frequency))
+        die("QueryPerformanceCounter failed");
+    uint64_t value = (uint64_t)ticks.QuadPart, hz = (uint64_t)frequency.QuadPart;
+    return (value / hz) * UINT64_C(1000000000)
+        + (value % hz) * UINT64_C(1000000000) / hz;
+#else
     struct timespec t;
     if (clock_gettime(CLOCK_MONOTONIC, &t)) die("clock_gettime failed");
     return (uint64_t)t.tv_sec * UINT64_C(1000000000) + t.tv_nsec;
+#endif
 }
 void bench_begin(void) {
     started = now();
