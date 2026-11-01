@@ -1,0 +1,242 @@
+import glfw
+import presentation
+import webgpu.runtime { Instance, RequestAdapterOptions, GpuError }
+import webgpu.surface { SurfaceTarget, Surface, SurfaceConfiguration }
+import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
+import webgpu.resources { getQueue }
+import webgpu_sys.generated_webgpu as sys
+import svg_render.lib { Pixmap, RenderOptions, RenderError, render }
+import svg_render.native_environment { NativeHost, NativeHostError }
+import svg_core.resources { DataOnly, Limits, Resolver }
+import svg_core.url { Url, UrlError }
+import silk.collections.bytes { Bytes }
+import silk.core.ownership { Drop }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.pointer { Pointer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter, StdoutWriter }
+import silk.num.i32
+
+struct GlfwLifetime {}
+
+impl Drop for GlfwLifetime {
+  fn drop(self: &mut Self) -> () {
+    unsafe glfw.glfwTerminate()
+  }
+}
+
+struct WindowLifetime {
+  handle: glfw.Window
+}
+
+impl Drop for WindowLifetime {
+  fn drop(self: &mut Self) -> () {
+    unsafe glfw.glfwDestroyWindow(self.handle)
+  }
+}
+
+export "C" fn windowKey(
+  window: glfw.Window,
+  key: i32,
+  scan: i32,
+  action: i32,
+  modifiers: i32,
+) -> () as "silk_svg_window_key" {
+  if key == 256 && action == 1 {
+    unsafe glfw.glfwSetWindowShouldClose(window, 1)
+  }
+}
+
+effect fn image() -> Pixmap
+  ! HostInputError | FileError | RenderError | NativeHostError | UrlError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let cwd = run HostInput.workingDirectory()
+  let directory = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let argument = run HostInput.argument(1)
+  let path = match &argument {
+    Option<Bytes>.Some { value } => {
+      let raw = Bytes.asSlice(&value)
+      if raw.length > 0 && raw[0] == 47 {
+        run Path.fromBytes(raw)
+      } else {
+        run Path.joinBytes(&directory, raw)
+      }
+    }
+    _ => run Path.resolve(&directory, "sample.svg")
+  }
+  let mut files = run OsFileSystem.make("/")
+  let source = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  let base = run Url.fromFilePath(Path.rawBytes(&path))
+  let host = run NativeHost.make(800.0, 600.0)
+  let environment = host.environment(&base)
+  let mut resolver = DataOnly.make(Limits.defaults())
+  let mut options = RenderOptions.make()
+
+  // Rasterize at 2x for Retina, once, rather than parse/upload on every redraw.
+  options.zoom = 2.0
+  return run render(Bytes.asSlice(&source), &options, &environment)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+}
+
+effect fn windowLoop(instance: &Instance, pixels: Pixmap) -> ()
+  ! GpuError | WriterError | OutOfMemoryError {
+  if unsafe glfw.glfwInit() == 0 {
+    fail GpuError.status(sys.WGPUStatus_Error)
+  }
+  let glfwLifetime = GlfwLifetime {}
+  unsafe glfw.glfwWindowHint(0x00022001, 0) // GLFW_CLIENT_API = GLFW_NO_API
+  let handle = unsafe glfw.glfwCreateWindow(
+    800,
+    600,
+    Pointer.fromSlice(b"Silk SVG - WebGPU - Escape to close\0"),
+    Pointer.null<u8>(),
+    Pointer.null<u8>(),
+  )
+  if Pointer.isNull(handle) {
+    fail GpuError.status(sys.WGPUStatus_Error)
+  }
+  let window = WindowLifetime { handle: handle }
+  drop unsafe glfw.glfwSetKeyCallback(handle, windowKey)
+  let cocoa = unsafe glfw.glfwGetCocoaWindow(handle)
+  let layer = unsafe glfw.silk_gpu_attach_metal_layer(cocoa)
+  let target = unsafe SurfaceTarget.metalLayer(&window, layer)
+  let surface = run Surface.create(instance, &target, b"SVG window")
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&surface))
+  let capabilities = run surface.getCapabilities(&adapter)
+
+  // Preserve the SVG renderer's encoded sRGB bytes without double encoding.
+  let mut format: u32 = sys.WGPUTextureFormat_Undefined
+  let mut index: usize = 0
+  while index < capabilities.formats().length {
+    let candidate = capabilities.formats()[index]
+    if candidate == sys.WGPUTextureFormat_BGRA8Unorm
+      || candidate == sys.WGPUTextureFormat_RGBA8Unorm {
+      format = candidate
+      break
+    }
+    index = index + 1
+  }
+  if format == sys.WGPUTextureFormat_Undefined {
+    fail GpuError.status(sys.WGPUStatus_Error)
+  }
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run getQueue(&device)
+  let pipeline = run presentation.pipeline(&device, format)
+  let group = run presentation.upload(&device, &queue, &pipeline, &pixels)
+  let imageWidth = pixels.width()
+  let imageHeight = pixels.height()
+  drop pixels
+  let mut configuration = SurfaceConfiguration.make(&device, format, 800, 600)
+  if capabilities.alphaModes().length != 0 {
+    configuration.setAlphaMode(capabilities.alphaModes()[0])
+  }
+  let mut previousWidth: i32 = 0
+  let mut previousHeight: i32 = 0
+  let mut reconfigure = true
+  let mut firstFrame = true
+  while unsafe glfw.glfwWindowShouldClose(handle) == 0 {
+    unsafe glfw.glfwPollEvents()
+    if unsafe glfw.glfwWindowShouldClose(handle) != 0 {
+      break
+    }
+    let mut width: i32 = 0
+    let mut height: i32 = 0
+    unsafe glfw.glfwGetFramebufferSize(
+      handle,
+      Pointer.fromMutRef(&mut width),
+      Pointer.fromMutRef(&mut height),
+    )
+    if width <= 0 || height <= 0 || unsafe glfw.glfwGetWindowAttrib(handle, 0x00020002) != 0 {
+      unsafe glfw.glfwWaitEvents()
+      continue
+    }
+    if width != previousWidth || height != previousHeight || reconfigure {
+      unsafe glfw.silk_gpu_resize_metal_layer(cocoa, width, height)
+      surface.resize(&mut configuration, i32.toU32(width), i32.toU32(height))
+      previousWidth = width
+      previousHeight = height
+      reconfigure = false
+    }
+    let frame = run surface.getCurrentTexture()
+    let view = run frame.texture.createView(&TextureViewDescriptor.default())
+    run presentation.draw(
+      &device,
+      &queue,
+      &view,
+      &pipeline,
+      &group,
+      i32.toU32(width),
+      i32.toU32(height),
+      imageWidth,
+      imageHeight,
+    )
+    run surface.present()
+    reconfigure = frame.suboptimal
+    run device.checkErrors()
+    if firstFrame {
+      let mut writer = StdoutWriter.make()
+      run Writer.writeString("SVG presented in a Metal-backed WebGPU window. Escape closes it.\n")
+        |> Effect.provideMut<Writer>(&mut writer)
+      run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+      firstFrame = false
+    }
+
+    // A static image needs no continuous animation loop. Input/exposure/resize
+    // events wake the main thread; minimized windows never acquire a texture.
+    if !reconfigure {
+      unsafe glfw.glfwWaitEvents()
+    }
+  }
+  surface.unconfigure()
+  run device.checkErrors()
+}
+
+effect fn program() -> i32
+  ! HostInputError
+    | FileError
+    | RenderError
+    | NativeHostError
+    | UrlError
+    | OutOfMemoryError
+    | GpuError
+    | WriterError
+  ? &mut HostInput | &mut Allocator {
+  let pixels = run image()
+  let instance = run Instance.create()
+  let observer = instance.diagnostics()
+  run windowLoop(&instance, move pixels)
+  drop instance
+  if observer.liveHandles() != 0 || observer.failureCount() != 0 {
+    fail GpuError.status(0xfffffffb)
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32
+  ! WriterError {
+  drop error
+  let mut writer = StderrWriter.make()
+  run Writer.writeString(
+    "svg-window: could not read/render the SVG or present it with WebGPU. Check the input path, installed fonts, and GPU diagnostics.\n",
+  )
+    |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+  return 1
+}
+
+effect fn failedDiagnostic<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(Effect.catchAll(program(), failed), failedDiagnostic)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

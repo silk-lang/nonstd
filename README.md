@@ -28,6 +28,31 @@ headed for the standard library.
 
 Programs that use `cli` are in [`examples`](examples).
 
+### SVG in a macOS window
+
+[`examples/svg-window`](examples/svg-window) uses the SVG renderer and WebGPU to
+display the bundled landscape in a native GLFW/Metal window:
+
+```sh
+brew install glfw pkg-config
+examples/svg-window/run
+examples/svg-window/run examples/svg-window/text.svg
+examples/svg-window/run /absolute/path/to/drawing.svg
+examples/svg-window/run --release --build-only
+```
+
+Requires Apple Silicon, macOS 26 or newer, Xcode's macOS SDK, and Python 3.12+
+on `PATH`. The launcher uses the workspace's pinned Silk, LLVM and Dawn installers
+and caches its executable under `.cache/build/svg-window/`.
+
+SVG parsing and rasterization run on the CPU once at twice the intrinsic size
+(up to the renderer's 16-million-pixel limit). WebGPU uploads the premultiplied
+RGBA image once and presents it on Metal. Resizing fits the image without stretching;
+it does not rerasterize. Transparent pixels composite over a dark background.
+The window sleeps between events and waits while minimized. Escape or the close
+button exits. External SVG resources are limited to `data:` URLs; relative files
+and network resources are not loaded.
+
 ## Working in the workspace
 
 To build every package supported by the host, including GPU executables and their native prerequisites:
@@ -77,8 +102,8 @@ the macOS executables; a separate LLD installation is not required.
 The command builds all workspace members without running examples or tests. It prepares the
 Metal bridge and example archives, and uses the WebGPU helpers to link Dawn, callbacks, GLFW,
 and benchmark support. C/Rust benchmark comparison programs are built only by their area-specific
-benchmark script. Metal is included only on macOS; the other packages build on
-supported Windows and Linux hosts as well.
+benchmark script. Metal and the SVG window example are included only on macOS;
+the other packages build on supported Windows and Linux hosts as well.
 
 Ordinary artifacts go into `build/` at the root. WebGPU-linked executables use the existing
 staged builds under `.cache/build/<package>/build/llvm/<target>/<debug|release>/`; their paths

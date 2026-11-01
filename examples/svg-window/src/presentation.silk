@@ -1,0 +1,142 @@
+//! Upload once; reuse the texture, sampler, bind group and pipeline across frames.
+import webgpu.resources as gpu
+import webgpu.resources { RenderPipeline, BindGroup, Queue, TextureView }
+import webgpu.runtime { Device, GpuError }
+import webgpu.descriptors {
+  TextureDescriptor,
+  TextureViewDescriptor,
+  Extent3D,
+  TexelCopyTextureInfo,
+  TexelCopyBufferLayout,
+  SamplerDescriptor,
+  VertexState,
+  FragmentState,
+  ColorTargetState,
+  PrimitiveState,
+  MultisampleState,
+  RenderPipelineDescriptor,
+  BindGroupEntry,
+  BindGroupDescriptor,
+  Color,
+  RenderPassColorAttachment,
+  RenderPassDescriptor,
+}
+import webgpu_sys.generated_webgpu as sys
+import svg_render.lib { Pixmap }
+import silk.num.u32
+
+// SVG pixels are premultiplied sRGB. Composite in that space and write to an
+// unorm (not sRGB) surface to avoid applying a second sRGB transfer function.
+fn shaderCode() -> &'static [u8] {
+  return b"@group(0) @binding(0) var image: texture_2d<f32>;\n@group(0) @binding(1) var filtering: sampler;\nstruct Vertex { @builtin(position) position: vec4f, @location(0) uv: vec2f }\n@vertex fn vs(@builtin(vertex_index) index: u32) -> Vertex {\n  let uv = array<vec2f,3>(vec2f(0,0),vec2f(2,0),vec2f(0,2))[index];\n  return Vertex(vec4f(uv.x*2-1,1-uv.y*2,0,1),uv);\n}\n@fragment fn fs(v: Vertex) -> @location(0) vec4f {\n  let pixel = textureSample(image, filtering, v.uv);\n  return vec4f(pixel.rgb + vec3f(0.06,0.08,0.11)*(1-pixel.a),1);\n}\n"
+}
+
+pub effect fn pipeline(device: &Device, format: u32) -> RenderPipeline
+  ! GpuError {
+  let shader = run gpu.createShaderModule(device, b"SVG presentation", shaderCode())
+  let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs")
+  let mut target = ColorTargetState.default()
+  target.setFormat(format)
+  target.setWriteMask(sys.WGPUColorWriteMask_All)
+  let targets = [target]
+  let fragment = FragmentState.default().withModule(&shader).withEntryPoint(b"fs").withTargets(
+    &targets,
+  )
+  let mut primitive = PrimitiveState.default()
+  primitive.setTopology(sys.WGPUPrimitiveTopology_TriangleList)
+  let mut multisample = MultisampleState.default()
+  multisample.setCount(1)
+  let mut descriptor = RenderPipelineDescriptor.default().withVertex(vertex).withFragment(&fragment)
+  descriptor.setPrimitive(primitive)
+  descriptor.setMultisample(multisample)
+  return run gpu.createRenderPipeline(device, &descriptor)
+}
+
+pub effect fn upload(
+  device: &Device,
+  queue: &Queue,
+  pipeline: &RenderPipeline,
+  pixels: &Pixmap,
+) -> BindGroup
+  ! GpuError {
+  let mut size = Extent3D.default()
+  size.setWidth(pixels.width())
+  size.setHeight(pixels.height())
+  size.setDepthOrArrayLayers(1)
+  let mut descriptor = TextureDescriptor.default().withLabel(b"SVG pixels")
+  descriptor.setSize(size)
+  descriptor.setFormat(sys.WGPUTextureFormat_RGBA8Unorm)
+  descriptor.setDimension(sys.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(sys.WGPUTextureUsage_TextureBinding | sys.WGPUTextureUsage_CopyDst)
+  let texture = run gpu.createTexture(device, &descriptor)
+  let destination = TexelCopyTextureInfo.default().withTexture(&texture)
+  let mut layout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(pixels.width() * 4)
+  layout.setRowsPerImage(pixels.height())
+  queue.writeTexture(&destination, pixels.data(), &layout, &size)
+  let view = run texture.createView(&TextureViewDescriptor.default())
+  let mut sampling = SamplerDescriptor.default()
+  sampling.setMagFilter(sys.WGPUFilterMode_Linear)
+  sampling.setMinFilter(sys.WGPUFilterMode_Linear)
+  let sampler = run gpu.createSampler(device, &sampling)
+  let groupLayout = run pipeline.getBindGroupLayout(0)
+  let mut imageBinding = BindGroupEntry.default().withTextureView(&view)
+  imageBinding.setBinding(0)
+  let mut samplerBinding = BindGroupEntry.default().withSampler(&sampler)
+  samplerBinding.setBinding(1)
+  let entries = [imageBinding, samplerBinding]
+  let group = BindGroupDescriptor.default().withLayout(&groupLayout).withEntries(&entries)
+  return run gpu.createBindGroup(device, &group)
+}
+
+pub effect fn draw(
+  device: &Device,
+  queue: &Queue,
+  view: &TextureView,
+  pipeline: &RenderPipeline,
+  group: &BindGroup,
+  width: u32,
+  height: u32,
+  imageWidth: u32,
+  imageHeight: u32,
+) -> ()
+  ! GpuError {
+  let mut background = Color.default()
+  background.setR(0.06)
+  background.setG(0.08)
+  background.setB(0.11)
+  background.setA(1.0)
+  let mut attachment = RenderPassColorAttachment.default().withView(view)
+  attachment.setClearValue(background)
+  attachment.setLoadOp(sys.WGPULoadOp_Clear)
+  attachment.setStoreOp(sys.WGPUStoreOp_Store)
+  let attachments = [attachment]
+  let descriptor = RenderPassDescriptor.default().withColorAttachments(&attachments)
+  let mut encoder = run gpu.createCommandEncoder(device, b"SVG frame")
+  let mut pass = run encoder.beginRenderPass(&descriptor)
+  let scaleX = u32.toF32(width) / u32.toF32(imageWidth)
+  let scaleY = u32.toF32(height) / u32.toF32(imageHeight)
+  let scale = if scaleX < scaleY {
+    scaleX
+  } else {
+    scaleY
+  }
+  let fittedWidth = u32.toF32(imageWidth) * scale
+  let fittedHeight = u32.toF32(imageHeight) * scale
+  pass.setViewport(
+    (u32.toF32(width) - fittedWidth) * 0.5,
+    (u32.toF32(height) - fittedHeight) * 0.5,
+    fittedWidth,
+    fittedHeight,
+    0.0,
+    1.0,
+  )
+  pass.setPipeline(pipeline)
+  pass.setBindGroup(0, group, &[])
+  pass.draw(3, 1, 0, 0)
+  pass.end()
+  let command = run encoder.finish(b"SVG frame")
+  queue.submit(&[command.reference()])
+}
