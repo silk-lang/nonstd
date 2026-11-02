@@ -699,7 +699,7 @@ static NSPoint top_left(NSWindow *window) {
 }
 - (void)windowDidChangeOcclusionState:(NSNotification *)n {
     BOOL visible = window_visible(self.window);
-    if (visible && self.frameRequested) self.displayLink.paused = NO;
+    if (visible && self.view.frameRequested) self.view.displayLink.paused = NO;
     [self pushFlag:SILK_EVENT_OCCLUDED on:!visible];
 }
 
