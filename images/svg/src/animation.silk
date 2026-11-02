@@ -1,8 +1,9 @@
-//! SMIL animation sampled at one document time (SVG 1.1 ch. 19, SMIL Animation, SVG
-//! Animations 2). `sample` finds each animation element's intervals, computes its value at
-//! the time, combines the animations of one attribute in the sandwich, and writes the
-//! results into the document: XML attributes directly, CSS properties as attributes in
-//! `animated()` that the cascade reads at the animation origin.
+//! SMIL animation sampled at a document time (SVG 1.1 ch. 19, SMIL Animation, SVG
+//! Animations 2). `timeline` finds each animation element's intervals once; its `apply`
+//! computes each value at a time, combines the animations of one attribute in the sandwich,
+//! and writes the results into the document: XML attributes directly, CSS properties as
+//! attributes in `animated()` that the cascade reads at the animation origin. `sample` does
+//! both for one time.
 import svg_css.colors
 import svg_css.colors { Identity, Color as CssColor }
 import svg_css.input { Input }
@@ -2331,24 +2332,40 @@ effect fn motionApply(animation: &Animation, sample: Sample, underlying: &Value)
 pub effect fn sample(document: &mut Document, time: f64, computed: &[MotionPath]) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let count = Document.nodes(&document.*).length
+  let found = run timeline(&document.*, computed)
+  run found.apply(&mut document.*, time)
+}
+
+/// The animations of one document with their intervals resolved, built once by
+/// [`timeline`] and applied at any number of times. Interval resolution reads only the
+/// timing attributes, which animations cannot change, so it holds for every time.
+pub struct Timeline {
+  animations: List<Animation>,
+}
+
+/// Finds the animation elements of `document` and resolves their intervals. `document`
+/// must hold its parsed values, not values written by an earlier [`Timeline.apply`].
+pub effect fn timeline(document: &Document, computed: &[MotionPath]) -> Timeline
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = Document.nodes(document).length
   let mut ids = List<Identified>.make()
   let mut nodes = List<NodeId>.make()
   let mut index: usize = 0
   while index < count {
     let node = NodeId { index: index }
-    if element(&document.*, node) {
-      if let Option<&[u8]>.Some { value } = attribute(&document.*, node, b"id") {
+    if element(document, node) {
+      if let Option<&[u8]>.Some { value } = attribute(document, node, b"id") {
         run ids.append(Identified { id: run Bytes.copy(trim(value)), node: node })
       }
-      if timed(&document.*, node) {
+      if timed(document, node) {
         run nodes.append(node)
       }
     }
     index = index + 1
   }
   if nodes.length() == 0 {
-    return
+    return Timeline { animations: List<Animation>.make() }
   }
 
   // Elements that are not usable animations still occupy their slot, so syncbase
@@ -2357,7 +2374,7 @@ pub effect fn sample(document: &mut Document, time: f64, computed: &[MotionPath]
   let all = nodes.asSlice()
   index = 0
   while index < all.length {
-    let found = run collect(&document.*, all[index], ids.asSlice(), all, computed)
+    let found = run collect(document, all[index], ids.asSlice(), all, computed)
     match move found {
       Option<Animation>.Some { value } => run animations.append(move value)
       _ => {
@@ -2406,175 +2423,197 @@ pub effect fn sample(document: &mut Document, time: f64, computed: &[MotionPath]
     index = index + 1
   }
 
-  // Samples in priority order: by begin time, then document order (#AnimationSandwich).
-  let mut samples = List<Sample>.make()
-  index = 0
-  while index < animations.length() {
-    let animation = &animations.asSlice()[index]
-    if Bytes.length(&animation.name) > 0 {
-      if let Option<Sample>.Some { value } = sampleAt(animation, index, time) {
-        run samples.append(value)
+  return Timeline { animations: move animations }
+}
+
+impl Timeline {
+  /// Whether the document has any animation element.
+  pub fn animated(self: &Timeline) -> bool {
+    return self.animations.length() > 0
+  }
+
+  /// Writes every animated value at `time` seconds after the document begins into
+  /// `document`, which must hold its parsed values: the one `self` was built from, or a
+  /// restored [`svg_xml.xml.Snapshot`] of it.
+  pub effect fn apply(self: &Timeline, document: &mut Document, time: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let animations = &self.animations
+
+    // Samples in priority order: by begin time, then document order (#AnimationSandwich).
+    let mut samples = List<Sample>.make()
+    let mut index: usize = 0
+    while index < animations.length() {
+      let animation = &animations.asSlice()[index]
+      if Bytes.length(&animation.name) > 0 {
+        if let Option<Sample>.Some { value } = sampleAt(animation, index, time) {
+          run samples.append(value)
+        }
       }
+      index = index + 1
     }
-    index = index + 1
-  }
-  let ordered = samples.asMutSlice()
-  let mut k: usize = 1
-  while k < ordered.length {
-    let mut m = k
-    while m > 0 && ordered[m - 1].begin > ordered[m].begin {
-      let swap = ordered[m - 1]
-      ordered[m - 1] = ordered[m]
-      ordered[m] = swap
-      m = m - 1
-    }
-    k = k + 1
-  }
-  let mut done = List<bool>.make()
-  k = 0
-  while k < ordered.length {
-    run done.append(false)
-    k = k + 1
-  }
-  let mut writes = List<Write>.make()
-  let list = samples.asSlice()
-  k = 0
-  while k < list.length {
-    if !done.asSlice()[k] {
-      let first = &animations.asSlice()[list[k].animation]
-      let base = run baseText(&document.*, first)
-      let mut transformed = run Bytes.copy(Bytes.asSlice(&base))
-      let mut underlying = if first.kind == Kind.AnimateMotion {
-        run pair(0.0, 0.0)
-      } else {
-        run parse(first, Bytes.asSlice(&base))
-      }
-      let mut angle: f64 = 0.0
+    let ordered = samples.asMutSlice()
+    let mut k: usize = 1
+    while k < ordered.length {
       let mut m = k
-      while m < list.length {
-        let animation = &animations.asSlice()[list[m].animation]
-        if !done.asSlice()[m] && sameTarget(first, animation) {
-          let marks = done.asMutSlice()
-          marks[m] = true
-          if animation.kind == Kind.AnimateMotion {
-            if let Option<Motion>.Some { value } = run motionApply(
+      while m > 0 && ordered[m - 1].begin > ordered[m].begin {
+        let swap = ordered[m - 1]
+        ordered[m - 1] = ordered[m]
+        ordered[m] = swap
+        m = m - 1
+      }
+      k = k + 1
+    }
+    let mut done = List<bool>.make()
+    k = 0
+    while k < ordered.length {
+      run done.append(false)
+      k = k + 1
+    }
+    let mut writes = List<Write>.make()
+    let list = samples.asSlice()
+    k = 0
+    while k < list.length {
+      if !done.asSlice()[k] {
+        let first = &animations.asSlice()[list[k].animation]
+        let base = run baseText(&document.*, first)
+        let mut transformed = run Bytes.copy(Bytes.asSlice(&base))
+        let mut underlying = if first.kind == Kind.AnimateMotion {
+          run pair(0.0, 0.0)
+        } else {
+          run parse(first, Bytes.asSlice(&base))
+        }
+        let mut angle: f64 = 0.0
+        let mut m = k
+        while m < list.length {
+          let animation = &animations.asSlice()[list[m].animation]
+          if !done.asSlice()[m] && sameTarget(first, animation) {
+            let marks = done.asMutSlice()
+            marks[m] = true
+            if animation.kind == Kind.AnimateMotion {
+              if let Option<Motion>.Some { value } = run motionApply(
+                animation,
+                list[m],
+                &underlying,
+              ) {
+                let motion = move value
+                underlying = move motion.value
+                angle = motion.angle
+              }
+            } else if animation.kind == Kind.AnimateTransform {
+              let zeroed = run transformValue(animation.transform, &[])
+              let start = if animation.transform == TransformType.Scale && animation.by.isNone() {
+                run transformValue(animation.transform, &[1.0])
+              } else {
+                move zeroed
+              }
+              if let Option<Value>.Some { value } = run apply(animation, list[m], &start) {
+                let mut piece = Bytes.make()
+                run transformText(animation.transform, &value, &mut piece)
+                if animation.additive && Bytes.length(&transformed) > 0 {
+                  run transformed.append(b" ")
+                } else {
+                  transformed.clear()
+                }
+                run transformed.append(Bytes.asSlice(&piece))
+              }
+            } else if let Option<Value>.Some { value } = run apply(
               animation,
               list[m],
               &underlying,
             ) {
-              let motion = move value
-              underlying = move motion.value
-              angle = motion.angle
+              underlying = move value
             }
-          } else if animation.kind == Kind.AnimateTransform {
-            let zeroed = run transformValue(animation.transform, &[])
-            let start = if animation.transform == TransformType.Scale && animation.by.isNone() {
-              run transformValue(animation.transform, &[1.0])
-            } else {
-              move zeroed
-            }
-            if let Option<Value>.Some { value } = run apply(animation, list[m], &start) {
-              let mut piece = Bytes.make()
-              run transformText(animation.transform, &value, &mut piece)
-              if animation.additive && Bytes.length(&transformed) > 0 {
-                run transformed.append(b" ")
-              } else {
-                transformed.clear()
-              }
-              run transformed.append(Bytes.asSlice(&piece))
-            }
-          } else if let Option<Value>.Some { value } = run apply(animation, list[m], &underlying) {
-            underlying = move value
           }
+          m = m + 1
         }
-        m = m + 1
-      }
-      let mut out = Bytes.make()
-      if first.kind == Kind.AnimateTransform {
-        out = move transformed
-      } else if first.kind == Kind.AnimateMotion {
-        let offset = coordinates(&underlying)
-        run out.append(b"translate(")
-        run writeNumber(&mut out, offset[0])
-        run out.append(b" ")
-        run writeNumber(&mut out, offset[1])
-        run out.append(b") rotate(")
-        run writeNumber(&mut out, angle)
-        run out.append(b")")
-      } else {
-        run render(&underlying, &mut out)
-      }
-      let mut namespace = Bytes.make()
-      if first.css {
-        run namespace.append(animated())
-      } else {
-        run namespace.append(Bytes.asSlice(&first.namespace))
-      }
-      run writes.append(
-        Write {
-          target: first.target,
-          namespace: move namespace,
-          name: run Bytes.copy(Bytes.asSlice(&first.name)),
-          value: move out,
-        },
-      )
-    }
-    k = k + 1
-  }
-
-  // Motion goes in front of the target's transform, animated or not, so it moves the
-  // element in its parent's user space (SVG Animations 2 #AnimateMotionElement).
-  let entries = writes.asMutSlice()
-  k = 0
-  while k < entries.length {
-    if equal(Bytes.asSlice(&entries[k].name), b"animateMotion")
-      && Bytes.length(&entries[k].namespace) == 0 {
-      let mut transform = run Bytes.copy(Bytes.asSlice(&entries[k].value))
-      let mut found = false
-      let mut m: usize = 0
-      while m < entries.length {
-        if entries[m].target.index == entries[k].target.index
-          && Bytes.length(&entries[m].namespace) == 0
-          && equal(Bytes.asSlice(&entries[m].name), b"transform") {
-          run transform.append(b" ")
-          run transform.append(Bytes.asSlice(&entries[m].value))
-          entries[m].value = run Bytes.copy(Bytes.asSlice(&transform))
-          found = true
+        let mut out = Bytes.make()
+        if first.kind == Kind.AnimateTransform {
+          out = move transformed
+        } else if first.kind == Kind.AnimateMotion {
+          let offset = coordinates(&underlying)
+          run out.append(b"translate(")
+          run writeNumber(&mut out, offset[0])
+          run out.append(b" ")
+          run writeNumber(&mut out, offset[1])
+          run out.append(b") rotate(")
+          run writeNumber(&mut out, angle)
+          run out.append(b")")
+        } else {
+          run render(&underlying, &mut out)
         }
-        m = m + 1
-      }
-      if !found {
-        if let Option<&[u8]>.Some { value } = attribute(
-          &document.*,
-          entries[k].target,
-          b"transform",
-        ) {
-          run transform.append(b" ")
-          run transform.append(value)
+        let mut namespace = Bytes.make()
+        if first.css {
+          run namespace.append(animated())
+        } else {
+          run namespace.append(Bytes.asSlice(&first.namespace))
         }
-        entries[k].name = run Bytes.copy(b"transform")
-        entries[k].value = move transform
-      } else {
-        entries[k].name = Bytes.make()
+        run writes.append(
+          Write {
+            target: first.target,
+            namespace: move namespace,
+            name: run Bytes.copy(Bytes.asSlice(&first.name)),
+            value: move out,
+          },
+        )
       }
-    }
-    k = k + 1
-  }
-  let pending = writes.asSlice()
-  k = 0
-  while k < pending.length {
-    if Bytes.length(&pending[k].name) == 0 {
       k = k + 1
-      continue
     }
-    run Document.setAttribute(
-      &mut document.*,
-      pending[k].target,
-      Bytes.asSlice(&pending[k].namespace),
-      Bytes.asSlice(&pending[k].name),
-      Bytes.asSlice(&pending[k].value),
-    )
-    k = k + 1
+
+    // Motion goes in front of the target's transform, animated or not, so it moves the
+    // element in its parent's user space (SVG Animations 2 #AnimateMotionElement).
+    let entries = writes.asMutSlice()
+    k = 0
+    while k < entries.length {
+      if equal(Bytes.asSlice(&entries[k].name), b"animateMotion")
+        && Bytes.length(&entries[k].namespace) == 0 {
+        let mut transform = run Bytes.copy(Bytes.asSlice(&entries[k].value))
+        let mut found = false
+        let mut m: usize = 0
+        while m < entries.length {
+          if entries[m].target.index == entries[k].target.index
+            && Bytes.length(&entries[m].namespace) == 0
+            && equal(Bytes.asSlice(&entries[m].name), b"transform") {
+            run transform.append(b" ")
+            run transform.append(Bytes.asSlice(&entries[m].value))
+            entries[m].value = run Bytes.copy(Bytes.asSlice(&transform))
+            found = true
+          }
+          m = m + 1
+        }
+        if !found {
+          if let Option<&[u8]>.Some { value } = attribute(
+            &document.*,
+            entries[k].target,
+            b"transform",
+          ) {
+            run transform.append(b" ")
+            run transform.append(value)
+          }
+          entries[k].name = run Bytes.copy(b"transform")
+          entries[k].value = move transform
+        } else {
+          entries[k].name = Bytes.make()
+        }
+      }
+      k = k + 1
+    }
+    let pending = writes.asSlice()
+    k = 0
+    while k < pending.length {
+      if Bytes.length(&pending[k].name) == 0 {
+        k = k + 1
+        continue
+      }
+      run Document.setAttribute(
+        &mut document.*,
+        pending[k].target,
+        Bytes.asSlice(&pending[k].namespace),
+        Bytes.asSlice(&pending[k].name),
+        Bytes.asSlice(&pending[k].value),
+      )
+      k = k + 1
+    }
   }
 }
 
