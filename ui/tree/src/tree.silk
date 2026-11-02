@@ -13,8 +13,11 @@ import mutation {
   CanvasCommand,
   LISTEN_FOCUS,
   LISTEN_BLUR,
+  NOT_FOCUSABLE,
   propertyKey
 }
+import input { Input }
+import interact
 import style { Computed, TextStyle }
 import node {
   NONE,
@@ -62,6 +65,7 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.u32
@@ -175,11 +179,12 @@ pub struct UiTree<'a> {
   /// or before the first frame).
   pub replayable: bool,
   pub seed: HashSeed,
-  stylesDirty: bool,
+  pub stylesDirty: bool,
   pub frameNumber: u64,
   pub input: FrameInput,
   laidOut: FrameInput,
   laidOutRevision: usize,
+  laidOutScrolls: usize,
   pub stats: FrameStats,
   pub events: List<Event>,
   /// The node ids in the order the last frame painted them (replayed subtrees included).
@@ -187,6 +192,33 @@ pub struct UiTree<'a> {
   /// Per fragment of the last layout: the hash of its subtree's paint inputs.
   pub fragmentHashes: List<u64>,
   pub uploads: Pending,
+  /// The first fragment of each css-layout node in the last layout, or NO_INDEX.
+  pub fragmentOf: List<usize>,
+  /// Whether focus should show as focus-visible: the last focus change came from the keyboard.
+  pub focusVisible: bool,
+  /// The hovered nodes as (slot, id) pairs, the target first, then its ancestors.
+  pub hoverChain: List<u64>,
+  /// The nodes in the active state as (slot, id) pairs, and the node holding the pointer
+  /// capture (NONE when no button is down).
+  pub pressChain: List<u64>,
+  pub capture: u32,
+  pub captureId: u32,
+  /// The click count of the press, for its click record.
+  pub pressCount: u32,
+  /// A scrollbar thumb being dragged: the container slot (NONE when none), the axis, and the
+  /// pointer and scroll offset where the drag started.
+  pub thumbSlot: u32,
+  pub thumbVertical: bool,
+  pub thumbStart: f32,
+  pub thumbOffset: f32,
+  /// Where the pointer is, and whether it is in the window.
+  pub pointerX: f32,
+  pub pointerY: f32,
+  pub pointerInside: bool,
+  /// Nodes to scroll into view at the next frame, as (slot, id) pairs.
+  pub reveal: List<u64>,
+  /// Whether a mutation was applied since the last frame.
+  applied: bool,
 }
 
 impl<'a> UiTree<'a> {
@@ -230,11 +262,28 @@ impl<'a> UiTree<'a> {
       input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
       laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       laidOutRevision: usize.MAX,
+      laidOutScrolls: usize.MAX,
       stats: FrameStats.zero(),
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
       fragmentHashes: List<u64>.make(),
       uploads: Pending.make(),
+      fragmentOf: List<usize>.make(),
+      focusVisible: false,
+      hoverChain: List<u64>.make(),
+      pressChain: List<u64>.make(),
+      capture: NONE,
+      captureId: NONE,
+      pressCount: 0,
+      thumbSlot: NONE,
+      thumbVertical: true,
+      thumbStart: 0.0,
+      thumbOffset: 0.0,
+      pointerX: 0.0,
+      pointerY: 0.0,
+      pointerInside: false,
+      reveal: List<u64>.make(),
+      applied: false,
     }
   }
 
@@ -345,6 +394,7 @@ impl<'a> UiTree<'a> {
   pub effect fn applyOne(self: &mut Self, index: usize, mutation: Mutation) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    self.applied = true
     match move mutation {
       Mutation.Create { id, kind } => {
         run self.create(index, id, kind)
@@ -379,6 +429,9 @@ impl<'a> UiTree<'a> {
             StyleState.Focus => {
               run setProperty(&mut node.focus, values[i])
             }
+            StyleState.FocusVisible => {
+              run setProperty(&mut node.focusVisible, values[i])
+            }
           }
           i = i + 1
         }
@@ -399,6 +452,9 @@ impl<'a> UiTree<'a> {
           }
           StyleState.Focus => {
             node.focus.clear()
+          }
+          StyleState.FocusVisible => {
+            node.focusVisible.clear()
           }
         }
         self.stylesDirty = true
@@ -429,6 +485,9 @@ impl<'a> UiTree<'a> {
           Attribute.Disabled { value } => {
             node.disabled = value
           }
+          Attribute.FocusTrap { value } => {
+            node.focusTrap = value
+          }
         }
       }
       Mutation.SetListeners { id, flags } => {
@@ -446,6 +505,14 @@ impl<'a> UiTree<'a> {
       }
       Mutation.Blur => {
         run self.focusSlot(NONE)
+      }
+      Mutation.ScrollTo { id, x, y } => {
+        let slot = run self.require(index, id)
+        run interact.scrollTo(&mut self, slot, x, y)
+      }
+      Mutation.ScrollIntoView { id } => {
+        let slot = run self.require(index, id)
+        run self.reveal.append(interact.pair(slot, id))
       }
       Mutation.SetSource { id, resource } => {
         let slot = run self.require(index, id)
@@ -567,6 +634,7 @@ impl<'a> UiTree<'a> {
       hover: List<Property>.make(),
       active: List<Property>.make(),
       focus: List<Property>.make(),
+      focusVisible: List<Property>.make(),
       computed: computed,
       fontKey: 0,
       layoutHash: 0,
@@ -576,12 +644,19 @@ impl<'a> UiTree<'a> {
       accessRole: Role.None,
       label: String.make(),
       testId: String.make(),
-      tabIndex: -1,
+      tabIndex: if kind == NodeKind.Input {
+        0
+      } else {
+        NOT_FOCUSABLE
+      },
       cursor: Cursor.Default,
       disabled: false,
+      focusTrap: false,
       listeners: 0,
       hovered: false,
       pressed: false,
+      scrollX: 0.0,
+      scrollY: 0.0,
       resource: NONE,
       canvas: List<CanvasCommand>.make(),
       content: 1,
@@ -708,6 +783,7 @@ impl<'a> UiTree<'a> {
       node.hover.clear()
       node.active.clear()
       node.focus.clear()
+      node.focusVisible.clear()
       node.canvas.clear()
       node.text.clear()
       node.label.clear()
@@ -817,17 +893,47 @@ impl<'a> UiTree<'a> {
     let mut path = List<u32>.make()
     run self.pathTo(slot, &mut path)
     let target = self.node(slot).id
-    run self.events.append(
-      Event {
-        kind: kind,
-        target: target,
-        path: move path,
-        x: 0.0,
-        y: 0.0,
-        modifiers: 0,
-        value: String.make(),
-      },
-    )
+    run self.events.append(Event.make(kind, target, move path))
+  }
+
+  /// Queues `event` for the client.
+  pub effect fn queueEvent(self: &mut Self, event: Event) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.events.append(move event)
+  }
+
+  /// Feeds one input record to the tree: hit testing against the last frame, hover and active
+  /// states, pointer capture, focus, tab order, keyboard clicks and scrolling, and the event
+  /// records for listeners. State changes show at the next frame.
+  pub effect fn dispatch(self: &mut Self, input: Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run interact.dispatch(&mut self, move input)
+  }
+
+  /// The id of the node a pointer at (`x`, `y`) would target in the last frame, or NONE.
+  pub fn hitTest(self: &Self, x: f32, y: f32) -> u32 {
+    let slot = interact.hitSlot(self, x, y)
+    if slot == NONE {
+      return NONE
+    }
+    return self.node(slot).id
+  }
+
+  /// The cursor for the hovered node: the nearest cursor attribute other than `Default` on
+  /// its path.
+  pub fn cursor(self: &Self) -> Cursor {
+    return interact.cursorOf(self)
+  }
+
+  /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.
+  pub fn scrollOffset(self: &Self, id: u32) -> Vector2<f32> {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return Vector2<f32> { x: 0.0, y: 0.0 }
+    }
+    return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
   }
 
   /// Moves the queued event records to `out`, oldest first.
@@ -999,6 +1105,9 @@ impl<'a> UiTree<'a> {
       }
       if self.focused == slot {
         applyAll(&mut computed, &node.focus)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          applyAll(&mut computed, &node.focusVisible)
+        }
       }
     }
     let kind = node.kind
@@ -1028,6 +1137,16 @@ impl<'a> UiTree<'a> {
 
   // Frames.
 
+  /// Whether a frame would draw something new: styles, layout or scroll offsets changed, or a
+  /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
+  /// dispatching input.
+  pub fn needsFrame(self: &Self) -> bool {
+    return self.applied || self.stylesDirty || self.layout.revision() != self.laidOutRevision
+      || self.layout.scrollRevision() != self.laidOutScrolls
+      || self.reveal.length() != 0
+      || !self.replayable
+  }
+
   /// The scene of the last frame, finished and ready to draw.
   pub fn scene(self: &Self) -> &Scene {
     if self.flipped {
@@ -1041,11 +1160,24 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
+    self.applied = false
     self.input = input
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run self.resolveStyles()
     run self.layoutFrame()
+    if run interact.settleScrolls(&mut self) {
+      run self.layoutFrame()
+      drop run interact.settleScrolls(&mut self)
+    }
+
+    // Scrolling and relayout move content under a still pointer: hover follows, and a hover
+    // variant that changes layout is laid out in the same frame.
+    if !self.stats.layoutSkipped {
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+    }
     run self.paintFrame()
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()
@@ -1061,7 +1193,9 @@ impl<'a> UiTree<'a> {
       let viewportId = self.layout.root()
       run Effect.catchAll(self.layout.setStyle(viewportId, move viewport), layoutFailed)
     }
-    if self.layout.revision() == self.laidOutRevision && self.input.width == self.laidOut.width
+    if self.layout.revision() == self.laidOutRevision
+      && self.layout.scrollRevision() == self.laidOutScrolls
+      && self.input.width == self.laidOut.width
       && self.input.height == self.laidOut.height {
       return ()
     }
@@ -1077,8 +1211,27 @@ impl<'a> UiTree<'a> {
     self.output.fragments.resolveLocations()
     self.laidOut = self.input
     self.laidOutRevision = self.layout.revision()
+    self.laidOutScrolls = self.layout.scrollRevision()
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
+    run self.indexFragments()
+  }
+
+  /// Fills `fragmentOf` from the last layout.
+  effect fn indexFragments(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.fragmentOf.clear()
+    run self.fragmentOf.appendRepeated(NO_INDEX, self.layout.nodes.length())
+    let values = self.output.fragments.values.asSlice()
+    let mut i = values.length
+    while i > 0 {
+      i = i - 1
+      let source = values[i].source
+      if source < self.fragmentOf.length() && !values[i].positioningShell {
+        self.fragmentOf.set(source, i)
+      }
+    }
   }
 
   /// Loads the raster face of every font key the layout's text fragments use.
