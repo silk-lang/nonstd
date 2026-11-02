@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Build the native demo with this OS's window bridge and Dawn, then run it.
+
+  scripts/app [--build-only] [--release] [-- ARGS...]       the demo in a window
+  scripts/app check [--backend x11|wayland|all] [--release]  draw, read back, compare, exit
+
+`check` runs `graphics-demo-app --check`: three frames at a fixed time, the window's surface read
+back and compared with the CPU reference. On Linux it starts Xvfb and a headless Weston itself,
+like platform/window/scripts/linux, and uses lavapipe when VK_ICD_FILENAMES is not set; on macOS
+and Windows it opens a real window.
+
+Needs what platform/window's scripts need for the bridge (Linux: libx11-dev libxkbcommon-dev
+libwayland-dev wayland-protocols, plus xvfb and weston for `check`; macOS: the Xcode or Command
+Line Tools SDK; Windows: an x64 Visual Studio developer shell) and the WebGPU prerequisites from
+the repository README.
+"""
+import argparse
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+REPO = ROOT.parents[1]
+WINDOW = REPO / "platform/window/scripts"
+sys.path.insert(0, str(REPO / "gpu/webgpu/scripts"))
+from _build import build, windows_import_library  # noqa: E402
+
+LAVAPIPE = Path("/usr/share/vulkan/icd.d/lvp_icd.json")
+
+
+def bridge_links():
+    """Builds the window bridge for this OS and returns the link inputs it needs."""
+    if sys.platform == "darwin":
+        script = runpy.run_path(str(WINDOW / "macos"))
+        links = [{"static-archive": str(script["native"]())}]
+        return links + [{"framework": name} for name in script["FRAMEWORKS"]]
+    if sys.platform.startswith("linux"):
+        script = runpy.run_path(str(WINDOW / "linux"))
+        links = [{"static-archive": str(script["native"]())}]
+        return links + [{"library": name, "mode": "dynamic"}
+                        for name in ("X11", "xkbcommon", "wayland-client", "wayland-cursor")]
+    if os.name == "nt":
+        script = runpy.run_path(str(WINDOW / "windows"))
+        links = [{"static-archive": str(script["native"]())}]
+        links += [{"library": name, "mode": "dynamic"}
+                  for name in ("user32", "gdi32", "imm32", "dwmapi", "shell32", "comdlg32", "ole32",
+                               "uxtheme", "uuid", "advapi32")]
+        return links + [{"static-archive": str(windows_import_library("kernel32"))}]
+    raise SystemExit(f"No window bridge for {sys.platform}")
+
+
+def check(program, backend):
+    env = dict(os.environ)
+    if sys.platform.startswith("linux"):
+        if "VK_ICD_FILENAMES" not in env and LAVAPIPE.exists():
+            env["VK_ICD_FILENAMES"] = str(LAVAPIPE)
+        env["SILK_WINDOW_SCALE"] = env.get("SILK_WINDOW_SCALE", "1")
+        linux = runpy.run_path(str(WINDOW / "linux"))
+        # The runners start the program without arguments; a wrapper adds --check.
+        wrapper = REPO / ".cache/graphics-demo/check"
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(f'#!/bin/sh\nexec "{program}" --check\n')
+        wrapper.chmod(0o755)
+        status = 0
+        for name in (["x11", "wayland"] if backend == "all" else [backend]):
+            print(f"--- {name}", flush=True)
+            runner = linux["run_under_x11"] if name == "x11" else linux["run_under_wayland"]
+            code = runner(wrapper, env)
+            print(f"--- {name}: {'passed' if code == 0 else f'failed ({code})'}", flush=True)
+            status = status or code
+        return status
+    return subprocess.run([str(program), "--check"], env=env, timeout=300).returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("mode", nargs="?", choices=["run", "check"], default="run")
+    parser.add_argument("--backend", choices=["x11", "wayland", "all"], default="all")
+    parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--release", action="store_true")
+    parser.add_argument("arguments", nargs="*")
+    args = parser.parse_args()
+    program = build(ROOT / "app", release=args.release, extra_links=bridge_links())
+    if args.build_only:
+        print(program)
+        return 0
+    if args.mode == "check":
+        return check(program, args.backend)
+    return subprocess.run([str(program), *args.arguments], cwd=REPO).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

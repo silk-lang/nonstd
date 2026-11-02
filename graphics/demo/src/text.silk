@@ -1,0 +1,213 @@
+//! Text through font-raster: lines shaped once by the line cache, glyph tiles from the glyph
+//! cache, one `GlyphSprite` per glyph placed at its quantized pen position.
+import assets
+import font_raster.cache { GlyphCache, RasterGlyph }
+import font_raster.face { FontFace }
+import font_raster.key { GlyphKey, PenPosition }
+import font_raster.lines { LineCache, LineId, ShapedGlyph }
+import harfrust.lib { ShaperData }
+import read_fonts.lib { ReadError }
+import atlas.atlas { Atlas, AtlasError }
+import ui_scene.primitives { ContentMask, GlyphSprite }
+import ui_scene.scene { Scene }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+
+/// The demo's two faces.
+pub union Weight {
+  Regular,
+  Bold,
+}
+
+impl Copy for Weight {}
+
+/// A font file the demo could not read.
+pub struct FontError {}
+
+/// Where a line of text goes: its pen starts at `x` on the baseline `baseline`, both in device
+/// pixels, at `size` logical pixels per em times `scale`.
+pub struct TextRun {
+  pub weight: Weight,
+  pub size: f32,
+  pub scale: f32,
+  pub x: f32,
+  pub baseline: f32,
+  pub color: Rgba<f32>,
+  pub mask: ContentMask,
+}
+
+impl Copy for TextRun {}
+
+pub struct Text {
+  regular: FontFace<'static>,
+  bold: FontFace<'static>,
+  regularShaping: ShaperData<'static>,
+  boldShaping: ShaperData<'static>,
+  glyphs: GlyphCache,
+  lines: LineCache,
+  placed: u64,
+}
+
+effect fn face(id: u32, data: &'static [u8]) -> FontFace<'static>
+  ! FontError | OutOfMemoryError
+  ? &mut Allocator {
+  let loaded: Result<FontFace<'static>, ReadError> = run FontFace<'static>.fromBytes(
+    id,
+    data,
+    0,
+    &[],
+  )
+  return match move loaded {
+    Result<FontFace<'static>, ReadError>.Success { value } => move value
+    Result<FontFace<'static>, ReadError>.Failure { error } => {
+      fail FontError {}
+    }
+  }
+}
+
+impl Text {
+  pub effect fn make() -> Text
+    ! FontError | OutOfMemoryError
+    ? &mut Allocator {
+    let regular = run face(1, assets.regularFont())
+    let bold = run face(2, assets.boldFont())
+    let regularShaping = ShaperData.new(&regular.font)
+    let boldShaping = ShaperData.new(&bold.font)
+    return Text {
+      regular: move regular,
+      bold: move bold,
+      regularShaping: move regularShaping,
+      boldShaping: move boldShaping,
+      glyphs: GlyphCache.make(),
+      lines: LineCache.make(),
+      placed: 0,
+    }
+  }
+
+  /// Starts a frame: lines not used in the last frame are dropped.
+  pub effect fn beginFrame(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.lines.beginFrame()
+  }
+
+  pub fn glyphCache(self: &Self) -> &GlyphCache {
+    return &self.glyphs
+  }
+
+  pub fn mutGlyphCache(self: &mut Self) -> &mut GlyphCache {
+    return &mut self.glyphs
+  }
+
+  pub fn lineCache(self: &Self) -> &LineCache {
+    return &self.lines
+  }
+
+  /// Glyph sprites drawn since the text system was made.
+  pub fn placedGlyphs(self: &Self) -> u64 {
+    return self.placed
+  }
+
+  effect fn line(self: &mut Self, weight: Weight, text: string) -> LineId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &weight {
+      Weight.Regular => {
+        let shaper = self.regularShaping.shaper()
+        run self.lines.shape(&shaper, self.regular.id, text)
+      }
+      Weight.Bold => {
+        let shaper = self.boldShaping.shaper()
+        run self.lines.shape(&shaper, self.bold.id, text)
+      }
+    }
+  }
+
+  fn pixelsPerFontUnit(self: &Self, weight: Weight, size: f32, scale: f32) -> f64 {
+    let ppem = f32.toF64(size) * f32.toF64(scale)
+    return match &weight {
+      Weight.Regular => self.regular.scaleFor(ppem)
+      Weight.Bold => self.bold.scaleFor(ppem)
+    }
+  }
+
+  /// The advance of `text` in device pixels.
+  pub effect fn measure(self: &mut Self, weight: Weight, text: string, size: f32, scale: f32) -> f32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = run self.line(weight, text)
+    let units = self.lines.advance(id)
+    return f64.toF32(i64.toF64(units) * self.pixelsPerFontUnit(weight, size, scale))
+  }
+
+  /// Draws `text` and returns its advance in device pixels.
+  pub effect fn draw(
+    self: &mut Self,
+    scene: &mut Scene,
+    atlas: &mut Atlas,
+    text: string,
+    style: TextRun,
+  ) -> f32
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let id = run self.line(style.weight, text)
+    let perUnit = self.pixelsPerFontUnit(style.weight, style.size, style.scale)
+    let count = self.lines.glyphs(id).length
+    let mut penX = f32.toF64(style.x)
+    let baseline = f32.toF64(style.baseline)
+    let mut i: usize = 0
+    while i < count {
+      let shaped = self.lines.glyphs(id)[i]
+      let pen = PenPosition.of(
+        penX + i32.toF64(shaped.xOffset) * perUnit,
+        baseline - i32.toF64(shaped.yOffset) * perUnit,
+      )
+      let key = GlyphKey {
+        font: match &style.weight {
+          Weight.Regular => self.regular.id
+          Weight.Bold => self.bold.id
+        },
+        glyph: shaped.glyph,
+        size: style.size,
+        scale: style.scale,
+        subpixel: pen.subpixel,
+        color: false,
+      }
+      let found = match &style.weight {
+        Weight.Regular => run self.glyphs.glyph(&mut atlas, &self.regular, key)
+        Weight.Bold => run self.glyphs.glyph(&mut atlas, &self.bold, key)
+      }
+      if let Option<RasterGlyph>.Some { value } = found {
+        let left = i32.toF32(pen.x + value.left)
+        let top = i32.toF32(pen.y + value.top)
+        drop run scene.glyph(
+          GlyphSprite {
+            bounds: Rect<f32>.new(
+              left,
+              top,
+              left + u32.toF32(value.width()),
+              top + u32.toF32(value.height()),
+            ),
+            mask: style.mask,
+            tile: value.tile,
+            color: style.color,
+          },
+        )
+        self.placed = self.placed + 1
+      }
+      penX = penX + i32.toF64(shaped.xAdvance) * perUnit
+      i = i + 1
+    }
+    return f64.toF32(penX) - style.x
+  }
+}
