@@ -81,7 +81,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `hover` | target or `x`, `y`; `modifiers` | `node`, `x`, `y` |
 | `scroll` | target or `x`, `y`; `dx`, `dy` (positive scrolls down); `modifiers` | `node`, `x`, `y` |
 | `press` | `key` (UI Events key), `code` (defaults to the key), `modifiers`, `times` | `key` |
-| `type` | `text`; a target in `query` is clicked first | `typed` (characters) |
+| `type` | `text` (as `TextInput` records to the focused input; newlines and tabs as Enter and Tab); a target in `query` is clicked first | `typed` (characters) |
 | `wait` | target, `gone`, `timeout` (ms) | `node`, or `"pending": true` when it does not hold yet |
 | `stats` | | the last frame's `FrameStats`: nodes, fragments, layout counters, replayed and repainted subtrees, glyphs, primitives |
 
@@ -120,7 +120,7 @@ python3 ui/tree/demo/scripts/demo inspect     # the CLI drives the demo in a win
 
 - One request per connection (see above); `wait` is answered `pending` and the client asks
   again (ui-inspect-cli does, every 50 ms).
-- `type` sends each character as a key press: the tree has no text input records until T5.
+- `type` sends `TextInput` records (Enter and Tab for newlines and tabs); IME preedit is not driven.
 - No event log or session recording over the wire yet; sessions are still in memory
   (ui-inspect's `Session`).
 - Screenshots come from the CPU renderer, not a GPU readback.

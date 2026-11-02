@@ -21,7 +21,7 @@ screenshot FILE                the frame as a PNG; with a target, that node alon
 click | hover                  pointer input on the target (or --x X --y Y); click --count N
 scroll [--dx N] [--dy N]       wheel input over the target (or --x/--y)
 press KEY [--code CODE]        a key press (UI Events key value: Enter, Tab, a, ...)
-type TEXT                      each character as a key press
+type TEXT                      text input to the focused input (click a target first with --node etc.)
 wait [--gone] [--timeout MS]   until the target exists (or is gone); default 5000 ms
 stats                          the last frame's counters
 raw JSON                       send a request as written

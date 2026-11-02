@@ -24,20 +24,22 @@ run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 2.0, time: 0.0 }
 
 - **Mutations** (`mutation.silk`): `Create`, `InsertBefore`, `Remove`, `Destroy`, `SetStyle`
   (per `StyleState`: base, hover, active, focus, focus-visible), `ClearStyle`, `SetText`,
-  `SetAttribute` (role, label, test id, tab index, cursor, disabled, focus trap),
+  `SetAttribute` (role, label, test id, tab index, cursor, disabled, focus trap, and for
+  inputs multiline, read-only and placeholder), `SetSelection`,
   `SetListeners` (a `LISTEN_*` bit set), `SetRoot`, `Focus`, `Blur`, `ScrollTo`,
   `ScrollIntoView`, `SetSource`, `SetCanvas`, and the resource definitions `DefineFontFamily`,
   `DefineImage` (PNG or JPEG bytes) and `DefineIcon` (SVG bytes). `apply` stops at the first
   mutation that fails and returns a `TreeError` naming its index; the ones before it stay
   applied. Destroyed ids can be used again.
 - **Node kinds**: box, text, image, icon (an SVG tinted with the text color, sized to the font
-  size unless styled), input (a box with an inner text run; editing comes with T5) and canvas
-  (fill and stroke path commands in the node's content box).
+  size unless styled), input (an editable text field, see [Text editing](#text-editing)) and
+  canvas (fill and stroke path commands in the node's content box).
 - **Styles** are typed `Property` values. Text properties (family, size, weight, style, line
   height, color, alignment, white space, direction, decoration) inherit; the rest do not. Hover,
   active and focus variants apply over the base style while the node is in that state.
 - **Events** (`node.Event`) carry the kind, the target id, the full root to target id path and a
-  payload (pointer position, modifiers, button, click count, wheel delta, key and code, value).
+  payload (pointer position, modifiers, button, click count, wheel delta, key and code, and for
+  input records the value, the DOM `inputType` and the selection).
   `takeEvents` drains them. See [Interaction](#interaction).
 
 ## Interaction
@@ -82,6 +84,47 @@ input against the last frame's layout, and the changes show at the next frame
 - **Records** for pointer down, up, move, click, wheel and keys are queued when the target or any
   node on its path listens (they bubble, client side). Enter, leave, focus, blur and scroll are
   queued only for a target that listens itself.
+
+## Text editing
+
+Input nodes edit their value themselves and tell the client with `Input` records (DOM-named
+`inputType`, the new value and selection). Everything they draw comes from css-layout's text
+fragments: the caret, the selection rectangles and the composition underline are placed from
+each fragment's `sourceStart`/`sourceEnd` and the advances of the glyph run ui-text shaped
+during layout (interpolated inside ligatures), and a click goes to the nearest grapheme
+boundary on the nearest line by the same positions. Nothing is shaped outside layout.
+
+- **Display text.** What css-layout lays out is the value with the input method's composition
+  spliced in at the caret, or the placeholder when the value is empty, plus a zero width space
+  where a line would have no text (an empty value, or a trailing line break in a multiline
+  input) so the caret has a line box. Inputs default to `white-space: pre` and
+  `overflow: hidden` on one line, `pre-wrap` and `overflow-y: auto` with `Multiline`.
+- **Input.** `Input.TextInput` types or commits, `Input.ImePreedit` shows a composition (its
+  selected clause underlined thicker; empty text cancels), `Input.Paste` answers a clipboard
+  read. [ui-tree-window](window) maps platform/window's `TextInput` and `ImePreedit` to them.
+- **Keys** (Control on Windows and Linux, Command and Option with `Keymap.Mac`, the default on
+  macOS builds): arrows by grapheme, word or line end, Shift to extend; Home and End (visual
+  line in multiline inputs, before the space a soft wrap hangs); Up and Down by visual line
+  keeping the x; Backspace and Delete by grapheme, word or line; Enter in multiline inputs;
+  select all, copy, cut, paste, undo and redo. Typing replaces the selection; single-line
+  inputs turn typed or pasted line breaks into spaces. Keys pass to the input method while it
+  composes.
+- **Pointer.** A press places the caret (Shift extends), a double click selects a word, a
+  triple click the line or the whole single-line value; dragging extends by the same unit. A
+  press commits a composition. Tab into an input selects its text.
+- **Undo.** Consecutive typing, and consecutive deletions, merge into one step, up to 100
+  steps. A `SetText` with a different value puts the caret at the end and forgets the history;
+  the same value changes nothing, so a client can echo every record back (controlled inputs).
+  `ReadOnly` inputs select and copy only.
+- **Host requests.** The tree owns no clipboard: copy and cut queue
+  `HostRequest.WriteClipboard`, paste `HostRequest.ReadClipboard { target }`, drained with
+  `takeRequests`. `imeArea()` gives the caret (the composition's start while composing) for
+  the candidate window. `ui-tree-window`'s `serve` answers both through a `Platform`.
+- **Caret.** It blinks with frame time (0.5 s on, 0.5 s off, on again after each edit or move),
+  repainting only its input; `nextBlink()` says when to draw next. After layout, the focused
+  input scrolls so the caret is in view (a single-line input scrolls back to its start on
+  blur). `CaretColor`, `SelectionColor` and `PlaceholderColor` style it. `caretRect(id)` and
+  `selection(id)` report it, and `describe` writes `selection=`, `preedit=` and the input flags.
 
 ## Frames
 
@@ -142,10 +185,18 @@ python3 ui/tree/demo/scripts/demo [check]
   `ScrollTo` and `ScrollIntoView`, thumb dragging, and scrolled pixels equal to a fresh tree
   scrolled by mutations. `window/tests` sends platform/window events through the headless
   backend and the adapter into the same fixture.
+- The editing tests (`tests/src/editing.silk`) script the editor fixture: typing and undo
+  grouping, grapheme and word movement (combining marks, a ZWJ emoji), both keymaps, the
+  clipboard requests, clicks, drags and double and triple clicks placed from the fragments,
+  multiline vertical movement and wrapped line ends, composition (drawn, committed, cancelled,
+  replacing the selection, ended by blur), controlled values, `SetSelection` clamping, blinking
+  and caret scrolling, and edited pixels equal to a fresh tree with the same value and
+  selection. `window/tests` types, composes, copies and pastes through the adapter.
 - The goldens are the trees in `fixtures/` (a card list with icons, an inline highlight
   across lines, an image, an opacity layer, a canvas chart and a clipped box; a sign-in form
   with a focus ring, a gradient button, a checkbox, an underlined link and a dashed note; an
-  inbox with a toolbar, a scrolling list and a nested scroll box with their thumbs), each
+  inbox with a toolbar, a scrolling list and a nested scroll box with their thumbs; an editor
+  with a selection, a wrapping multiline input, a placeholder and a read-only input), each
   as a PNG (tolerance 2 per channel) and a `describe` text that must match exactly.
 - `scripts/test-browser` builds `browser/` for wasm32 and draws the trees with ui_renderer on
   `navigator.gpu` in the installed Chromium, RGBA8 and BGRA8, against the CPU reference of the
@@ -168,12 +219,20 @@ the wasm build draw the same bytes.
 - Scrollbars are overlays that take no space; the arrow keys, Page Up and Page Down do not
   scroll yet, and the root does not scroll the viewport (give it `overflow: auto`).
 - Hit testing uses rectangles: rounded corners and clip radii are not hit shapes.
-- No style transitions yet, and no text editing (inputs take focus; editing is T5).
+- No style transitions yet.
+- Editing moves logically: in right-to-left text the arrows follow the text order, not the
+  screen, and a caret at a direction boundary is drawn on one side only. No password masking,
+  no drag and drop of text, no maximum length, and text outside inputs is not selectable.
+- A press during a composition commits it in the tree; platforms whose input method keeps
+  composing would need to be told (platform/window has no call for that yet).
+- The end padding of a single-line input is not part of its scroll range, so a caret at the
+  end of a long value sits at the padding edge.
 - Tab is always the tree's: a client cannot cancel it (use `FocusTrap` for dialogs).
 
 ## Window demo
 
-`demo/` is the inbox in a native window (platform/window, ui_renderer on Dawn) and a tiny client:
+`demo/` (`scripts/demo --editor` for the editor fixture, the place to try an input method)
+is the inbox in a native window (platform/window, ui_renderer on Dawn) and a tiny client:
 it reads the records and answers with mutations (New appends a row and scrolls it into view,
 Archive removes the focused row). `scripts/demo check` scripts a hover, a wheel and a Tab, reads
 the surface back and compares it with the CPU reference, on X11 and Wayland under Xvfb and
