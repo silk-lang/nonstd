@@ -1,6 +1,6 @@
 # SVG implementation limitations
 
-Current workspace toolchain: Silk `0.1.0-dev.42+870af07163cd`. No compiler or stdlib patches. Versioned observations below retain the toolchain used for their original reports.
+Current workspace toolchain: Silk `0.1.0-dev.43+3808a7f2e30c`. No compiler or stdlib patches. Versioned observations below retain the toolchain used for their original reports.
 This file records implementation workarounds, not the unimplemented SVG coverage
 listed in [SPECIFICATIONS.md](SPECIFICATIONS.md).
 
@@ -87,7 +87,7 @@ Filed [silk-lang/silk#2578](https://github.com/silk-lang/silk/issues/2578).
 WHATWG normalization/default-port rules. `DomainHost` validates ASCII/Punycode
 but leaves internationalized-name conversion and IDNA mapping/context/bidi checks
 to callers. `src/url*.silk` therefore owns parsing, base resolution, serialization,
-IDNA mapping and Punycode, reusing `ucd` normalization/properties.
+IDNA mapping and Punycode, reusing `silk.text` normalization/properties.
 Replace these parts with a released bounded WHATWG URL/UTS #46 API, not an
 RFC3986-only substitution; SVG resource authorization stays local.
 [Real-API semantic probe](https://github.com/silk-lang/silk/issues/2578).

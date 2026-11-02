@@ -56,17 +56,12 @@ instead of re-parsing it per glyph. Filed as
 
 ## 007 — Unicode normalization data version and missing combining classes
 
-The pinned stdlib reports Unicode 17.0.0, while `ucd` owns Unicode 18.0.0.
-The difference is not solely a version upgrade: 34 nonzero combining classes
-already assigned in Unicode 17 are missing from stdlib data. Another 34 are
-genuine Unicode 18 additions. Full-domain raw canonical pair maps agree;
-all 20,171 Unicode 18 normalization rows expose 134 NFC and 134 NFD mismatches.
-`text/ucd/scripts/check-normalization-gap` reproduces and classifies these differences.
-The minimal CCC/NFC/NFD reproducer is
-[silk-lang/silk#2487](https://github.com/silk-lang/silk/issues/2487),
-reported as [silk-lang/silk#2487](https://github.com/silk-lang/silk/issues/2487).
-Harfrust uses `ucd`'s Unicode 18 classes and raw pairs, not stdlib string
-normalization. No compiler or stdlib data is patched or vendored.
+Resolved in Silk 0.1.0-dev.43. The stdlib now carries the Unicode 18.0.0 data and the
+whole Unicode library that nonstd kept in `text/ucd` (properties, scripts, segmentation, line
+breaking, bidi, itemization and vertical orientation, under `silk.text`), so its combining
+classes and NFC/NFD agree with what shaping uses. font-shape and the SVG packages now read
+those modules, and `text/ucd` was removed. The original report was
+[silk-lang/silk#2487](https://github.com/silk-lang/silk/issues/2487).
 
 ## 008 — SVG floating-point math
 
@@ -118,7 +113,7 @@ conversion to callers. It is not a complete UTS #46 implementation.
 The [real-API probe](https://github.com/silk-lang/silk/issues/2578) distinguishes this
 documented contract from the WHATWG acceptance condition; it is not a claim that
 the RFC 3986 API is broken. `images/svg/src/url*.silk` owns URL parsing/resolution/
-serialization and IDNA mapping/Punycode, reusing `ucd` normalization/properties.
+serialization and IDNA mapping/Punycode, reusing `silk.text` normalization/properties.
 Replace those general-purpose parts together when released URL/IDNA semantics
 and resource bounds match; SVG resource authorization remains local.
 

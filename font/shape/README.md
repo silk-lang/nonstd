@@ -3,7 +3,7 @@
 Text shaping for Silk: it turns a string and a font into positioned glyphs. It is a native
 port of [harfrust](https://github.com/harfbuzz/harfrust) (itself a Rust port of HarfBuzz),
 pinned at [`1503ff0`](https://github.com/harfbuzz/harfrust/tree/1503ff054384cc1d6a701b5ffbdc2f24118a2790),
-built on [font-parse](../parse) and [text-ucd](../../text/ucd). There is no Rust, C, FFI or
+built on [font-parse](../parse) and the standard library's `silk.text` Unicode modules. There is no Rust, C, FFI or
 subprocess anywhere in the library.
 
 ## What it shapes
