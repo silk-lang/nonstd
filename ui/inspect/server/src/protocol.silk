@@ -1,0 +1,846 @@
+//! The inspector protocol without the socket: one JSON request in, one JSON reply out, run
+//! against a tree. The server feeds it lines; tests call it directly.
+//!
+//! Requests are objects with a `cmd` and an optional `id` that the reply echoes. Replies carry
+//! `"ok": true` and the command's members, or `"ok": false` and an `error` message. Commands
+//! that pick a node take a target: `node` (a client id) or the query members `role`, `name`,
+//! `label`, `text`, `testId`, `within`, `exact` and `hidden`, alone or inside a `query` object.
+//! See the README for each command.
+import ui_inspect.query { Query, queryAll, queryFirst, hitPath, pick, accessibleName }
+import ui_inspect.overlay { Highlight, compose }
+import ui_inspect.view { InspectOptions, inspectNode }
+import ui_inspect.synth { pointOf, click, hover, wheel, press, dispatchAll }
+import ui_tree.tree { UiTree }
+import ui_tree.node { NONE }
+import ui_tree.mutation { Role }
+import ui_tree.input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY }
+import ui_tree.inspect {
+  CpuSnapshot,
+  DescribeOptions,
+  NodeInfo,
+  describe,
+  describeNodeById,
+  encodePng,
+  info,
+  kindName,
+  roleName,
+  writeInt,
+  writeNumber
+}
+import reply {
+  begin,
+  finish,
+  putKey,
+  putText,
+  putInt,
+  putNumber,
+  putFlag,
+  putIds,
+  failure,
+  textField,
+  has,
+  flagField,
+  numberField,
+  idField,
+  idsField,
+  stringsField,
+  writeString,
+  writeBase64
+}
+import ui_scene.scene { Scene }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import codec.image { ImageError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.vector { Vector2 }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String, ScalarStep }
+
+/// The protocol version `hello` reports.
+pub const VERSION: u32 = 1
+
+/// How long `wait` waits when the request names no `timeout`, in milliseconds.
+pub const DEFAULT_TIMEOUT: u64 = 5000
+
+const ROLES: [Role; 23] = [
+  Role.None,
+  Role.Generic,
+  Role.Button,
+  Role.Link,
+  Role.Checkbox,
+  Role.Radio,
+  Role.TextBox,
+  Role.Heading,
+  Role.Paragraph,
+  Role.List,
+  Role.ListItem,
+  Role.Image,
+  Role.Dialog,
+  Role.Menu,
+  Role.MenuItem,
+  Role.Tab,
+  Role.TabList,
+  Role.TabPanel,
+  Role.Toolbar,
+  Role.Navigation,
+  Role.Main,
+  Role.Form,
+  Role.Group,
+]
+
+/// The role whose ARIA name (as `describe` writes it) is `name`.
+pub fn roleNamed(name: string) -> Option<Role> {
+  let mut i: usize = 0
+  while i < ROLES.length {
+    if roleName(ROLES[i]) == name {
+      return Option<Role>.Some { value: ROLES[i] }
+    }
+    i = i + 1
+  }
+  return Option<Role>.None
+}
+
+/// What handling a request did.
+pub enum Outcome {
+  /// The reply is written.
+  Done,
+  /// A `wait` whose condition does not hold yet: nothing is written; hand the same request in
+  /// again after the next frame.
+  Pending,
+}
+
+/// The inspector state a connection shares with the app: the highlight, and a CPU copy of the
+/// atlas for screenshots.
+pub struct Protocol {
+  pub highlight: Highlight,
+  snapshot: CpuSnapshot,
+  overlay: Scene,
+  /// Set when a command dispatched input to the tree: the app must take the tree's event
+  /// records and draw a frame before the next command runs.
+  pub dispatched: bool,
+  /// Set when the highlight changed: the app must draw a frame.
+  pub repaint: bool,
+}
+
+impl Protocol {
+  pub fn make() -> Protocol {
+    return Protocol {
+      highlight: Highlight.make(),
+      snapshot: CpuSnapshot.make(),
+      overlay: Scene.make(),
+      dispatched: false,
+      repaint: false,
+    }
+  }
+
+  /// Takes the atlas tiles the last frame uploaded (without clearing the tree's queue) and
+  /// rebuilds the overlay. Call after every `UiTree.frame`, before the uploads are cleared.
+  pub effect fn afterFrame(self: &mut Self, tree: &UiTree) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.snapshot.copyUploads(tree)
+    if self.highlight.nodes.length() != 0 {
+      run compose(tree, &self.highlight, &mut self.overlay)
+    }
+  }
+
+  /// Whether the app should draw [`Protocol.overlayScene`] instead of `tree.scene()`.
+  pub fn highlighting(self: &Self) -> bool {
+    return self.highlight.nodes.length() != 0
+  }
+
+  /// The tree's last frame with the highlight on top (valid after [`Protocol.afterFrame`]
+  /// while [`Protocol.highlighting`]).
+  pub fn overlayScene(self: &Self) -> &Scene {
+    return &self.overlay
+  }
+
+  /// Runs `request` against `tree` and writes the reply line (without the newline) to `out`.
+  /// `waited` is how long, in milliseconds, the request has been waiting (for `wait`).
+  pub effect fn handle(
+    self: &mut Self,
+    tree: &mut UiTree,
+    request: &Value,
+    waited: u64,
+    out: &mut String,
+  ) -> Outcome
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let result = run Effect.result(
+      Protocol.execute(&mut self.*, &mut tree, request, waited, &mut out),
+    )
+    return match move result {
+      Result<Outcome, GeometryError | ImageError | OutOfMemoryError>.Success { value } => value
+      Result<Outcome, GeometryError | ImageError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run failure(&mut out, request, "drawing the screenshot failed")
+        Outcome.Done
+      }
+    }
+  }
+
+  effect fn execute(
+    self: &mut Self,
+    tree: &mut UiTree,
+    request: &Value,
+    waited: u64,
+    out: &mut String,
+  ) -> Outcome
+    ! GeometryError | ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    match &request.* {
+      Value.Object { entries } => {}
+      _ => {
+        run failure(&mut out, request, "a request is a JSON object")
+        return Outcome.Done
+      }
+    }
+    let cmd = textField(request, "cmd")
+    if cmd == "hello" {
+      run self.hello(&tree.*, request, &mut out)
+    } else if cmd == "snapshot" {
+      run snapshot(&tree.*, request, &mut out)
+    } else if cmd == "query" {
+      run self.query(&tree.*, request, &mut out)
+    } else if cmd == "inspect" {
+      run inspect(&tree.*, request, &mut out)
+    } else if cmd == "pick" {
+      run pickAt(&tree.*, request, &mut out)
+    } else if cmd == "highlight" {
+      run self.setHighlight(&tree.*, request, &mut out)
+    } else if cmd == "screenshot" {
+      run self.screenshot(&mut tree, request, &mut out)
+    } else if cmd == "click" || cmd == "hover" || cmd == "scroll" {
+      run self.pointer(&mut tree, cmd, request, &mut out)
+    } else if cmd == "press" {
+      run self.key(&mut tree, request, &mut out)
+    } else if cmd == "type" {
+      run self.typeText(&mut tree, request, &mut out)
+    } else if cmd == "wait" {
+      return run waitFor(&tree.*, request, waited, &mut out)
+    } else if cmd == "stats" {
+      run stats(&tree.*, request, &mut out)
+    } else if cmd == "" {
+      run failure(&mut out, request, "the request has no cmd")
+    } else {
+      run failure(&mut out, request, "unknown cmd")
+    }
+    return Outcome.Done
+  }
+
+  effect fn hello(self: &Self, tree: &UiTree, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run begin(&mut out, request)
+    run putInt(&mut out, "protocol", u32.toU64(VERSION))
+    run putKey(&mut out, "commands")
+    run out.append(
+      "[\"hello\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"type\",\"wait\",\"stats\"]",
+    )
+    run frameMembers(tree, &mut out)
+    run putInt(&mut out, "root", u32.toU64(tree.rootId()))
+    run putInt(&mut out, "nodes", usize.toU64(tree.nodeCount()))
+    run putIds(&mut out, "highlight", &self.highlight.nodes)
+    run finish(&mut out)
+  }
+
+  effect fn query(self: &Self, tree: &UiTree, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let q = match run queryOf(request) {
+      Option<Query>.Some { value } => move value
+      Option<Query>.None => {
+        run failure(&mut out, request, "unknown role")
+        return ()
+      }
+    }
+    let mut found = List<u32>.make()
+    run queryAll(tree, &q, &mut found)
+    let limit = match Json.asU64(Json.field(request, "limit")) {
+      Option<u64>.Some { value } => u64.toUsize(value)
+      Option<u64>.None => found.length()
+    }
+    run begin(&mut out, request)
+    run putInt(&mut out, "count", usize.toU64(found.length()))
+    run putKey(&mut out, "nodes")
+    run out.append("[")
+    let ids = found.asSlice()
+    let mut name = String.make()
+    let mut i: usize = 0
+    while i < ids.length && i < limit {
+      if i > 0 {
+        run out.append(",")
+      }
+      run nodeObject(tree, ids[i], &mut name, &mut out)
+      i = i + 1
+    }
+    run out.append("]")
+    run finish(&mut out)
+  }
+
+  effect fn setHighlight(self: &mut Self, tree: &UiTree, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut ids = List<u32>.make()
+    if has(request, "nodes") {
+      run idsField(request, "nodes", &mut ids)
+    } else if run hasTarget(request) {
+      match run queryOf(request) {
+        Option<Query>.Some { value } => {
+          run queryAll(tree, &value, &mut ids)
+        }
+        Option<Query>.None => {
+          run failure(&mut out, request, "unknown role")
+          return ()
+        }
+      }
+    }
+    self.highlight.nodes.clear()
+    let list = ids.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if tree.contains(list[i]) {
+        run self.highlight.nodes.append(list[i])
+      }
+      i = i + 1
+    }
+    self.repaint = true
+    if self.highlight.nodes.length() != 0 {
+      run compose(tree, &self.highlight, &mut self.overlay)
+    }
+    run begin(&mut out, request)
+    run putIds(&mut out, "nodes", &self.highlight.nodes)
+    run finish(&mut out)
+  }
+
+  effect fn screenshot(self: &mut Self, tree: &mut UiTree, request: &Value, out: &mut String) -> ()
+    ! GeometryError | ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pixels = run Pixmap.make(1, 1)
+    let mut target = NONE
+    if run hasTarget(request) {
+      target = run targetOf(&tree.*, request, &mut out)
+      if target == NONE {
+        return ()
+      }
+      pixels = run self.snapshot.renderNode(&mut tree, target)
+    } else if self.highlighting() && flagField(request, "highlight", true) {
+      run compose(&tree.*, &self.highlight, &mut self.overlay)
+      pixels = run self.snapshot.renderScene(&tree.*, &self.overlay)
+    } else {
+      pixels = run self.snapshot.render(&tree.*)
+    }
+    let png = run encodePng(&pixels)
+    run begin(&mut out, request)
+    if target != NONE {
+      run putInt(&mut out, "node", u32.toU64(target))
+    }
+    run putInt(&mut out, "width", u32.toU64(pixels.width()))
+    run putInt(&mut out, "height", u32.toU64(pixels.height()))
+    run putNumber(&mut out, "scale", tree.input.scale)
+    run putKey(&mut out, "png")
+    run out.append("\"")
+    run writeBase64(&mut out, png.asSlice())
+    run out.append("\"")
+    run finish(&mut out)
+  }
+
+  /// click, hover and scroll: aimed at a target node, or at the point `x`, `y`.
+  effect fn pointer(
+    self: &mut Self,
+    tree: &mut UiTree,
+    cmd: string,
+    request: &Value,
+    out: &mut String,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut point = Vector2<f32> { x: 0.0, y: 0.0 }
+    let mut target = NONE
+    if run hasTarget(request) {
+      target = run targetOf(&tree.*, request, &mut out)
+      if target == NONE {
+        return ()
+      }
+      match run pointOf(&tree.*, target) {
+        Option<Vector2<f32>>.Some { value } => {
+          point = value
+        }
+        Option<Vector2<f32>>.None => {
+          run failure(
+            &mut out,
+            request,
+            "the node cannot be reached by the pointer (hidden, scrolled out of view or covered)",
+          )
+          return ()
+        }
+      }
+    } else if has(request, "x") && has(request, "y") {
+      point = Vector2<f32> { x: numberField(request, "x", 0.0), y: numberField(request, "y", 0.0) }
+    } else {
+      run failure(&mut out, request, "name a target node or give x and y")
+      return ()
+    }
+    let modifiers = run modifiersOf(request)
+    let mut inputs = List<Input>.make()
+    run inputs.append(Input.PointerMove { x: point.x, y: point.y, modifiers: modifiers })
+    if cmd == "click" {
+      let count = match Json.asU64(Json.field(request, "count")) {
+        Option<u64>.Some { value } => u64.toU32(value)
+        Option<u64>.None => 1
+      }
+      let mut n: u32 = 1
+      while n <= count {
+        run inputs.append(
+          Input.PointerDown {
+            x: point.x,
+            y: point.y,
+            button: BUTTON_PRIMARY,
+            modifiers: modifiers,
+            clickCount: n,
+          },
+        )
+        run inputs.append(
+          Input.PointerUp { x: point.x, y: point.y, button: BUTTON_PRIMARY, modifiers: modifiers },
+        )
+        n = n + 1
+      }
+    } else if cmd == "scroll" {
+      run inputs.append(
+        Input.Wheel {
+          x: point.x,
+          y: point.y,
+          deltaX: numberField(request, "dx", 0.0),
+          deltaY: numberField(request, "dy", 0.0),
+          modifiers: modifiers,
+        },
+      )
+    }
+    run dispatchAll(&mut tree, move inputs)
+    self.dispatched = true
+    run begin(&mut out, request)
+    if target != NONE {
+      run putInt(&mut out, "node", u32.toU64(target))
+    }
+    run putNumber(&mut out, "x", point.x)
+    run putNumber(&mut out, "y", point.y)
+    run finish(&mut out)
+  }
+
+  /// press: one key, by UI Events `key` (and `code`, which defaults to the key).
+  effect fn key(self: &mut Self, tree: &mut UiTree, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let name = textField(request, "key")
+    if name == "" {
+      run failure(&mut out, request, "press needs a key")
+      return ()
+    }
+    let code = if has(request, "code") {
+      textField(request, "code")
+    } else {
+      name
+    }
+    let modifiers = run modifiersOf(request)
+    let mut inputs = List<Input>.make()
+    let times = match Json.asU64(Json.field(request, "times")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => 1
+    }
+    let mut n: u64 = 0
+    while n < times {
+      run press(name, code, modifiers, &mut inputs)
+      n = n + 1
+    }
+    run dispatchAll(&mut tree, move inputs)
+    self.dispatched = true
+    run begin(&mut out, request)
+    run putText(&mut out, "key", name)
+    run finish(&mut out)
+  }
+
+  /// type: each character of `text` as a key press (the tree has no text input records yet).
+  /// With a target, the node is clicked first so it takes focus.
+  effect fn typeText(self: &mut Self, tree: &mut UiTree, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut inputs = List<Input>.make()
+    if run hasTarget(request) {
+      let target = run targetOf(&tree.*, request, &mut out)
+      if target == NONE {
+        return ()
+      }
+      if !run click(&tree.*, target, &mut inputs) {
+        run failure(&mut out, request, "the node cannot be reached by the pointer")
+        return ()
+      }
+    }
+    let text = textField(request, "text")
+    let mut cursor = String.scalarCursor()
+    let mut count: u64 = 0
+    while true {
+      let start = String.cursorByteOffset(&cursor)
+      match String.nextScalar(text, move cursor) {
+        Option<ScalarStep>.Some { value } => {
+          cursor = String.nextCursor(move value)
+          let end = String.cursorByteOffset(&cursor)
+          let one = String.slice(text, start, end - start)
+          if one == "\n" {
+            run press("Enter", "Enter", 0, &mut inputs)
+          } else if one == "\t" {
+            run press("Tab", "Tab", 0, &mut inputs)
+          } else {
+            run press(one, "", 0, &mut inputs)
+          }
+          count = count + 1
+        }
+        Option<ScalarStep>.None => {
+          break
+        }
+      }
+    }
+    run dispatchAll(&mut tree, move inputs)
+    self.dispatched = true
+    run begin(&mut out, request)
+    run putInt(&mut out, "typed", count)
+    run finish(&mut out)
+  }
+}
+
+// Commands that only read the tree.
+
+effect fn frameMembers(tree: &UiTree, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run putNumber(&mut out, "width", tree.input.width)
+  run putNumber(&mut out, "height", tree.input.height)
+  run putNumber(&mut out, "scale", tree.input.scale)
+  run putInt(&mut out, "frame", tree.stats.frame)
+}
+
+effect fn snapshot(tree: &UiTree, request: &Value, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let options = if flagField(request, "styles", false) {
+    DescribeOptions.withStyles()
+  } else {
+    DescribeOptions.plain()
+  }
+  let mut text = String.make()
+  if run hasTarget(request) {
+    let target = run targetOf(tree, request, &mut out)
+    if target == NONE {
+      return ()
+    }
+    run describeNodeById(tree, target, options, &mut text)
+  } else {
+    run describe(tree, options, &mut text)
+  }
+  run begin(&mut out, request)
+  run putInt(&mut out, "frame", tree.stats.frame)
+  run putText(&mut out, "text", String.view(&text))
+  run finish(&mut out)
+}
+
+effect fn inspect(tree: &UiTree, request: &Value, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !run hasTarget(request) {
+    run failure(&mut out, request, "inspect needs a target node")
+    return ()
+  }
+  let target = run targetOf(tree, request, &mut out)
+  if target == NONE {
+    return ()
+  }
+  let options = InspectOptions {
+    patches: flagField(request, "patches", true),
+    computed: flagField(request, "computed", true),
+  }
+  let mut text = String.make()
+  run inspectNode(tree, target, move options, &mut text)
+  let mut name = String.make()
+  run begin(&mut out, request)
+  run putKey(&mut out, "node")
+  run nodeObject(tree, target, &mut name, &mut out)
+  run putText(&mut out, "text", String.view(&text))
+  run finish(&mut out)
+}
+
+effect fn pickAt(tree: &UiTree, request: &Value, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !has(request, "x") || !has(request, "y") {
+    run failure(&mut out, request, "pick needs x and y")
+    return ()
+  }
+  let x = numberField(request, "x", 0.0)
+  let y = numberField(request, "y", 0.0)
+  let picked = pick(tree, x, y)
+  let mut path = List<u32>.make()
+  run hitPath(tree, x, y, &mut path)
+  let mut name = String.make()
+  run begin(&mut out, request)
+  run putKey(&mut out, "node")
+  if picked == NONE {
+    run out.append("null")
+  } else {
+    run nodeObject(tree, picked, &mut name, &mut out)
+  }
+  run putIds(&mut out, "path", &path)
+  run finish(&mut out)
+}
+
+effect fn waitFor(tree: &UiTree, request: &Value, waited: u64, out: &mut String) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !run hasTarget(request) {
+    run failure(&mut out, request, "wait needs a target")
+    return Outcome.Done
+  }
+  let q = match run queryOf(request) {
+    Option<Query>.Some { value } => move value
+    Option<Query>.None => {
+      run failure(&mut out, request, "unknown role")
+      return Outcome.Done
+    }
+  }
+  let found = run queryFirst(tree, &q)
+  let gone = flagField(request, "gone", false)
+  if (found == NONE) == gone {
+    let mut name = String.make()
+    run begin(&mut out, request)
+    run putKey(&mut out, "node")
+    if found == NONE {
+      run out.append("null")
+    } else {
+      run nodeObject(tree, found, &mut name, &mut out)
+    }
+    run putInt(&mut out, "waited", waited)
+    run putInt(&mut out, "frame", tree.stats.frame)
+    run finish(&mut out)
+    return Outcome.Done
+  }
+  let timeout = match Json.asU64(Json.field(request, "timeout")) {
+    Option<u64>.Some { value } => value
+    Option<u64>.None => DEFAULT_TIMEOUT
+  }
+  if waited >= timeout {
+    run failure(&mut out, request, "timed out")
+    return Outcome.Done
+  }
+  return Outcome.Pending
+}
+
+effect fn stats(tree: &UiTree, request: &Value, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = tree.stats
+  run begin(&mut out, request)
+  run frameMembers(tree, &mut out)
+  run putInt(&mut out, "nodes", usize.toU64(s.nodes))
+  run putInt(&mut out, "fragments", usize.toU64(s.fragments))
+  run putFlag(&mut out, "layoutSkipped", s.layoutSkipped)
+  run putKey(&mut out, "layout")
+  run out.append("{\"passes\":")
+  run writeIntTo(&mut out, usize.toU64(s.layout.passes))
+  run out.append(",\"fullLayouts\":")
+  run writeIntTo(&mut out, usize.toU64(s.layout.fullLayouts))
+  run out.append(",\"sizeProbes\":")
+  run writeIntTo(&mut out, usize.toU64(s.layout.sizeProbes))
+  run out.append(",\"cacheHits\":")
+  run writeIntTo(&mut out, usize.toU64(s.layout.cacheHits))
+  run out.append(",\"reusedLayouts\":")
+  run writeIntTo(&mut out, usize.toU64(s.layout.reusedLayouts))
+  run out.append("}")
+  run putInt(&mut out, "replayedSubtrees", usize.toU64(s.replayedSubtrees))
+  run putInt(&mut out, "repaintedSubtrees", usize.toU64(s.repaintedSubtrees))
+  run putInt(&mut out, "replayedOperations", usize.toU64(s.replayedOperations))
+  run putInt(&mut out, "paintedFragments", usize.toU64(s.paintedFragments))
+  run putInt(&mut out, "glyphs", usize.toU64(s.glyphs))
+  run putInt(&mut out, "primitives", usize.toU64(s.primitives))
+  run finish(&mut out)
+}
+
+// Targets.
+
+effect fn writeIntTo(out: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run writeInt(&mut out, value)
+}
+
+/// `{"id":…,"kind":…,"role":…,"name":…,"x":…,"y":…,"width":…,"height":…}` for node `id`.
+effect fn nodeObject(tree: &UiTree, id: u32, name: &mut String, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  run out.append("{\"id\":")
+  run writeIntTo(&mut out, u32.toU64(id))
+  if slot == NONE {
+    run out.append("}")
+    return ()
+  }
+  let node = tree.node(slot)
+  run out.append(",\"kind\":")
+  run writeString(&mut out, kindName(node.kind))
+  if node.accessRole != Role.None {
+    run out.append(",\"role\":")
+    run writeString(&mut out, roleName(node.accessRole))
+  }
+  name.clear()
+  run accessibleName(tree, id, &mut name)
+  if name.ownedByteLength() != 0 {
+    run out.append(",\"name\":")
+    run writeString(&mut out, String.view(&name))
+  }
+  if node.testId.ownedByteLength() != 0 {
+    run out.append(",\"testId\":")
+    run writeString(&mut out, String.view(&node.testId))
+  }
+  match run info(tree, id) {
+    Option<NodeInfo>.Some { value } => {
+      let b = value.bounds
+      run out.append(",\"x\":")
+      run writeNumber(&mut out, b.xMin)
+      run out.append(",\"y\":")
+      run writeNumber(&mut out, b.yMin)
+      run out.append(",\"width\":")
+      run writeNumber(&mut out, b.xMax - b.xMin)
+      run out.append(",\"height\":")
+      run writeNumber(&mut out, b.yMax - b.yMin)
+      if value.focused {
+        run out.append(",\"focused\":true")
+      }
+      if value.hovered {
+        run out.append(",\"hovered\":true")
+      }
+    }
+    Option<NodeInfo>.None => {}
+  }
+  run out.append("}")
+}
+
+/// Whether the request keeps its query members in a `query` object.
+fn nested(request: &Value) -> bool {
+  return match Json.field(request, "query") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Object { entries } => true
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+/// The object holding the query members: `query` when the request has one, else the request.
+fn targetObject(request: &Value) -> &Value {
+  return match Json.field(request, "query") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Object { entries } => value
+      _ => request
+    }
+    Option<&Value>.None => request
+  }
+}
+
+/// Whether `text` is a query member: `type` uses a top-level `text` for what it types.
+fn textQueries(request: &Value) -> bool {
+  return nested(request) || textField(request, "cmd") != "type"
+}
+
+/// Whether the request names a target node.
+effect fn hasTarget(request: &Value) -> bool {
+  let t = targetObject(request)
+  return has(t, "node") || has(t, "role") || has(t, "name") || has(t, "label") || has(t, "testId")
+    || has(t, "text") && textQueries(request)
+}
+
+/// The request's query, or None when its role is unknown.
+effect fn queryOf(request: &Value) -> Option<Query>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let t = targetObject(request)
+  let mut q = Query.any()
+  match idField(t, "node") {
+    Option<u32>.Some { value } => {
+      q = Query.byId(value)
+    }
+    Option<u32>.None => {}
+  }
+  if has(t, "role") {
+    match roleNamed(textField(t, "role")) {
+      Option<Role>.Some { value } => {
+        q.roleIs = Option<Role>.Some { value: value }
+      }
+      Option<Role>.None => {
+        return Option<Query>.None
+      }
+    }
+  }
+  q.name = run String.copy(textField(t, "name"))
+  q.label = run String.copy(textField(t, "label"))
+  if textQueries(request) {
+    q.text = run String.copy(textField(t, "text"))
+  }
+  q.testId = run String.copy(textField(t, "testId"))
+  q.exact = flagField(t, "exact", has(t, "testId"))
+  match idField(t, "within") {
+    Option<u32>.Some { value } => {
+      q.within = value
+    }
+    Option<u32>.None => {}
+  }
+  q.includeHidden = flagField(t, "hidden", q.includeHidden)
+  return Option<Query>.Some { value: move q }
+}
+
+/// The first node the request's target matches, or NONE with a failure written to `out`.
+effect fn targetOf(tree: &UiTree, request: &Value, out: &mut String) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let q = match run queryOf(request) {
+    Option<Query>.Some { value } => move value
+    Option<Query>.None => {
+      run failure(&mut out, request, "unknown role")
+      return NONE
+    }
+  }
+  let found = run queryFirst(tree, &q)
+  if found == NONE {
+    run failure(&mut out, request, "no node matches")
+  }
+  return found
+}
+
+/// The `modifiers` member: names out of shift, control (or ctrl), alt and meta.
+effect fn modifiersOf(request: &Value) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut names = List<string>.make()
+  run stringsField(request, "modifiers", &mut names)
+  let list = names.asSlice()
+  let mut bits: u32 = 0
+  let mut i: usize = 0
+  while i < list.length {
+    let n = list[i]
+    if n == "shift" {
+      bits = bits | MOD_SHIFT
+    } else if n == "control" || n == "ctrl" {
+      bits = bits | MOD_CONTROL
+    } else if n == "alt" {
+      bits = bits | MOD_ALT
+    } else if n == "meta" {
+      bits = bits | MOD_META
+    }
+    i = i + 1
+  }
+  return bits
+}

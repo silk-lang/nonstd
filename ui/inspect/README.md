@@ -2,8 +2,9 @@
 
 The inspector core for [ui-tree](../tree): what a person, a test or an agent needs to see what a
 running UI is and to drive it. The tree is plain data (mutations in, records out), so everything
-here reads the tree's public state and never changes how it paints. The socket protocol (I2), the
-MCP server for agents (I3) and the devtools window (I4) build on this package.
+here reads the tree's public state and never changes how it paints. The socket protocol
+([server](server), I2) with its CLI ([cli](cli)), the MCP server for agents (I3) and the devtools
+window (I4) build on this package.
 
 ```silk
 let archive = run queryFirst(&tree, &run Query.byRoleNamed(Role.Button, "archive"))
@@ -94,8 +95,8 @@ build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-tests ui/inspect/tests/gold
 
 ## Limits
 
-- No opt-in switch yet: this is a library with no side effects. The debug build and
-  environment variable gate comes with the socket protocol (I2).
+- This library has no side effects and no switch; the debug build and `SILK_UI_INSPECT` gate
+  lives in [ui-inspect-server](server).
 - The overlay has no name tag over the highlighted node (devtools' tooltip); that needs text
   drawn outside the tree and comes with the devtools window.
 - Sessions live in memory; saving them to a file is a serialization of the same unions and
