@@ -11,7 +11,6 @@ are grouped by area, and every package is a member of one workspace that pins Si
 | [`font/types`](font/types) | `font-types` | The scalar types OpenType tables are built from |
 | [`font/parse`](font/parse) | `font-parse` | Font file parsing and a font model (outlines, metrics, charmaps); a port of read-fonts and skrifa |
 | [`font/shape`](font/shape) | `font-shape` | Text shaping; a port of harfrust |
-| [`text/ucd`](text/ucd) | `text-ucd` | Unicode 18 properties, bidi, line breaking and segmentation |
 | [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser |
 | [`css/style`](css/style) | `css-style` | CSS parsing, selectors and the cascade |
 | [`css/layout`](css/layout) | `css-layout` | Block, inline, flex and grid layout |
@@ -23,8 +22,9 @@ are grouped by area, and every package is a member of one workspace that pins Si
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
 
 Each library's README lists its helper packages (command-line tools, benchmarks, test runners).
-Package names follow their paths, with hyphens. `text/ucd`, `text/xml` and `packages/cli` are
-headed for the standard library.
+Package names follow their paths, with hyphens. `text/xml` and `packages/cli` are
+headed for the standard library. The Unicode library that lived in `text/ucd` is now part of
+the standard library as `silk.text`.
 
 Programs that use `cli` are in [`examples`](examples).
 

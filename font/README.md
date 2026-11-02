@@ -8,7 +8,8 @@ Fonts for Silk, from reading the file to shaping text.
 | [font-parse](parse) | `font/parse` | Parses sfnt/TTC files and their tables, plus a font model for metrics, character maps, names and outlines |
 | [font-shape](shape) | `font/shape` | Text shaping: OpenType, AAT and the complex-script shapers |
 
-Unicode properties and text segmentation live in [text-ucd](../text/ucd), which font-shape uses.
+Unicode properties and text segmentation come from the standard library's `silk.text` modules,
+which font-shape uses.
 
 The three packages started as ports of Google's
 [fontations](https://github.com/googlefonts/fontations) (read-fonts, font-types, parts of
