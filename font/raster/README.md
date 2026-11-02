@@ -23,6 +23,8 @@ for gamma and contrast when they are blended.
 - `lines.LineCache` caches shaped lines from [font-shape](../shape) in font units, keyed by font
   instance and text. A line not used in the previous frame or the current one is dropped at
   `beginFrame`.
+- `color` reads COLR, CPAL, sbix and CBDT once per face (`FontFace.colorTables`) and draws color
+  glyphs, as described below.
 - `gamma.TextGamma` is the CPU reference of the text shader's gamma and contrast correction
   (GPUI's, from Windows Terminal): gamma 1.8 and contrast 1.0 by default.
 
@@ -50,8 +52,12 @@ while i < glyphs.length {
 // Copy cache.uploads() into the atlas textures, then cache.clearUploads().
 ```
 
-Color glyphs (COLR, CBDT, sbix into polychrome tiles) are not drawn yet: a key with `color: true`
-currently gets the outline.
+With `color: true`, `color.colorGlyph` draws the glyph's color rendering into a polychrome tile of
+premultiplied RGBA: COLR version 0 layers in CPAL palette 0 colors (filled by `vector`, so they
+get subpixel positioning; foreground layers take the cache's `withForeground` color, black by
+default), else an `sbix` or `CBDT` PNG from the strike nearest the requested size, decoded by
+[images-codec](../../images/codec) and box-filtered to size with the subpixel offset applied. A
+glyph with none of these gets its outline. COLR version 1 paint graphs are not drawn yet.
 
 ## Tests
 
@@ -63,6 +69,8 @@ The tests use the Noto subsets in `images/svg/tests/fonts`. They check that each
 direct `vector` fill of the same outline at the same position (within 1/255, from f32 rounding at
 different coordinates), that variants move a stem by a quarter pixel, cache hits, empty glyphs,
 eviction and re-rasterization, a full atlas, the line cache against direct shaping, the gamma
-formula against GPUI's values, and two text goldens (`tests/golden/text-1x.pgm` and
+formula against GPUI's values, color glyphs from the three fonts in `tests/fonts` (written by
+`scripts/color-fonts.py`, which needs fontTools) at their strike size, scaled up and down and at a
+half-pixel offset, and two text goldens (`tests/golden/text-1x.pgm` and
 `text-2x.pgm`, raw coverage). Each golden run writes its output to `build/font-raster/`; after a
 deliberate change, inspect it and copy it over the golden.
