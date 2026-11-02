@@ -1,0 +1,356 @@
+//! Renders fixture scenes with the CPU reference (`ui_scene.cpu.CpuRenderer`) and with
+//! `UiRenderer` on the GPU, into RGBA8 and BGRA8 targets, and compares them within a tolerance:
+//! analytic SDF edges, the erf shadow and the arc-length dash approximation differ from exact area
+//! coverage at edges, never in flat areas. Also checks the text gamma and contrast correction
+//! against `TextSettings.correct`, and that a renderer reused across frames and scenes (growing
+//! buffers, pooled layer textures) draws the same pixels again.
+//!
+//! Exits 0 when every check passes, 1 on a mismatch, 2 on an error.
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.resources { Queue, Texture }
+import webgpu.descriptors {
+  BufferDescriptor,
+  DeviceDescriptor,
+  TexelCopyBufferInfo,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureDescriptor,
+  TextureViewDescriptor,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import atlas.atlas { AtlasError, AtlasOptions }
+import ui_scene.color { Color }
+import ui_scene.cpu { AtlasPixels, CpuRenderer }
+import ui_scene.scene { Scene }
+import ui_renderer.atlas_textures { GpuAtlas }
+import ui_renderer.renderer { UiRenderer }
+import ui_renderer.text { TextSettings }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import gpu_scene.renderer { extent }
+import ui_fixtures.cases { COUNT, Fixture, Tolerance, fixture }
+import ui_fixtures.fixtures { WIDTH, HEIGHT }
+
+effect fn renderTarget(device: &Device, format: u32) -> Texture
+  ! GpuError {
+  let mut descriptor = TextureDescriptor.default().withLabel(b"ui test target")
+  descriptor.setSize(extent(WIDTH, HEIGHT))
+  descriptor.setFormat(format)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  return run gpu.createTexture(device, &descriptor)
+}
+
+/// Reads `texture` back as tightly packed RGBA bytes, swapping BGRA8 targets into RGBA order.
+effect fn readBack(device: &Device, queue: &Queue, texture: &Texture, bgra: bool) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  // Buffer rows must be 256-byte aligned.
+  let stride = (WIDTH * 4 + 255) / 256 * 256
+  let size = u32.toUsize(stride * HEIGHT)
+  let readback = run gpu.createBuffer(
+    device,
+    &BufferDescriptor.make(
+      b"ui readback",
+      usize.toU64(size),
+      flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead,
+      false,
+    ),
+  )
+  let mut encoder = run gpu.createCommandEncoder(device, b"ui readback")
+  let source = TexelCopyTextureInfo.default().withTexture(texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(stride)
+  layout.setRowsPerImage(HEIGHT)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(WIDTH, HEIGHT))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"ui readback")
+  queue.submit(&[commands.reference()])
+  run device.checkErrors()
+  let padded = run runtime.mapRead(device, &readback, 0, size)
+  let mut out = List<u8>.make()
+  run out.reserve(u32.toUsize(WIDTH * HEIGHT * 4))
+  let bytes = padded.asSlice()
+  let mut y: u32 = 0
+  while y < HEIGHT {
+    let mut x: u32 = 0
+    while x < WIDTH {
+      let at = u32.toUsize(y * stride + x * 4)
+      if bgra {
+        run out.append(bytes[at + 2])
+        run out.append(bytes[at + 1])
+        run out.append(bytes[at])
+      } else {
+        run out.append(bytes[at])
+        run out.append(bytes[at + 1])
+        run out.append(bytes[at + 2])
+      }
+      run out.append(bytes[at + 3])
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return move out
+}
+
+effect fn renderOnGpu(
+  device: &Device,
+  queue: &Queue,
+  renderer: &mut UiRenderer,
+  fixture: &Fixture,
+  bgra: bool,
+) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = GpuAtlas.make()
+  run atlas.sync(device, &fixture.tiles.atlas)
+  let uploads = fixture.tiles.uploads.asSlice()
+  let mut u: usize = 0
+  while u < uploads.length {
+    atlas.write(queue, uploads[u].tile, uploads[u].pixels.asSlice())
+    u = u + 1
+  }
+  let format = if bgra {
+    flags.WGPUTextureFormat_BGRA8Unorm
+  } else {
+    flags.WGPUTextureFormat_RGBA8Unorm
+  }
+  let texture = run renderTarget(device, format)
+  let view = run texture.createView(&TextureViewDescriptor.default())
+  run renderer.draw(
+    device,
+    queue,
+    &fixture.scene,
+    &atlas,
+    &view,
+    WIDTH,
+    HEIGHT,
+    Color.transparent(),
+  )
+  run device.checkErrors()
+  return run readBack(device, queue, &texture, bgra)
+}
+
+/// Prints how far `gpu` is from `cpu` and returns whether it is within `tolerance`.
+fn compare(
+  name: string<'static>,
+  target: string<'static>,
+  cpu: &[u8],
+  gpu: &[u8],
+  tolerance: Tolerance,
+) -> bool {
+  if cpu.length != gpu.length {
+    StderrWriter.print("{} ({}): size mismatch\n", &(name, target))
+    return false
+  }
+  let mut max: u32 = 0
+  let mut over: u32 = 0
+  let mut sum: f32 = 0.0
+  let mut i: usize = 0
+  while i < cpu.length {
+    let a = u8.toU32(cpu[i])
+    let b = u8.toU32(gpu[i])
+    let d = if a > b {
+      a - b
+    } else {
+      b - a
+    }
+    if d > max {
+      max = d
+    }
+    if d > 8 {
+      over = over + 1
+    }
+    sum = sum + u32.toF32(d)
+    i = i + 1
+  }
+  let mean = sum / usize.toF32(cpu.length)
+  let share = u32.toF32(over) / usize.toF32(cpu.length)
+  let ok = max <= tolerance.max && share <= tolerance.share && mean <= tolerance.mean
+  if !ok {
+    // Where the worst pixels are, for diagnosis.
+    let mut shown: u32 = 0
+    let mut j: usize = 0
+    while j < cpu.length && shown < 6 {
+      let a = u8.toU32(cpu[j])
+      let b = u8.toU32(gpu[j])
+      let d = if a > b {
+        a - b
+      } else {
+        b - a
+      }
+      if d * 2 > max {
+        let pixel = usize.toU32(j / 4)
+        let at = j - j % 4
+        StderrWriter.print(
+          "  at ({}, {}): cpu {} {} {} {}, gpu {} {} {} {}\n",
+          &(
+            pixel % WIDTH,
+            pixel / WIDTH,
+            cpu[at],
+            cpu[at + 1],
+            cpu[at + 2],
+            cpu[at + 3],
+            gpu[at],
+            gpu[at + 1],
+            gpu[at + 2],
+            gpu[at + 3]
+          ),
+        )
+        shown = shown + 1
+        j = at + 4
+      } else {
+        j = j + 1
+      }
+    }
+  }
+  StderrWriter.print(
+    "{} ({}): max delta {}, {} of {} channels over 8, mean {}{}\n",
+    &(
+      name,
+      target,
+      max,
+      over,
+      cpu.length,
+      mean,
+      if ok {
+        ""
+      } else {
+        "  FAIL"
+      }
+    ),
+  )
+  return ok
+}
+
+/// Whether the corrected text ramp matches `TextSettings.correct` within one level.
+fn checkText(name: string<'static>, gpu: &[u8], settings: TextSettings) -> bool {
+  let colors: [[f32; 3]; 4] = [
+    [0.0, 0.0, 0.0],
+    [1.0, 1.0, 1.0],
+    [128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0],
+    [37.0 / 255.0, 99.0 / 255.0, 235.0 / 255.0],
+  ]
+  let mut worst: u32 = 0
+  let mut c: usize = 0
+  while c < 4 {
+    let color = colors[c]
+    let mut level: u32 = 0
+    while level < 256 {
+      let x = 8 + usize.toU32(c) * 24 + level % 16
+      let y = 8 + level / 16
+      let alpha = settings.correct(u32.toF32(level) / 255.0, color[0], color[1], color[2])
+      let expected = f32.toU32(alpha * 255.0 + 0.5)
+      let actual = u8.toU32(gpu[u32.toUsize((y * WIDTH + x) * 4 + 3)])
+      let d = if expected > actual {
+        expected - actual
+      } else {
+        actual - expected
+      }
+      if d > worst {
+        worst = d
+      }
+      level = level + 1
+    }
+    c = c + 1
+  }
+  StderrWriter.print("{}: corrected text alpha within {} of TextSettings.correct\n", &(name, worst))
+  return worst <= 1
+}
+
+effect fn program() -> i32
+  ! GpuError | OutOfMemoryError | GeometryError | AtlasError
+  ? &mut Allocator {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run gpu.getQueue(&device)
+  let mut rgba = run UiRenderer.make(&device, flags.WGPUTextureFormat_RGBA8Unorm)
+  let mut bgra = run UiRenderer.make(&device, flags.WGPUTextureFormat_BGRA8Unorm)
+  rgba.setTextSettings(TextSettings.none())
+  bgra.setTextSettings(TextSettings.none())
+  let mut ok = true
+  let mut index: u32 = 0
+  while index < COUNT {
+    let f = run fixture(index)
+    let first = run renderOnGpu(&device, &queue, &mut rgba, &f, false)
+    ok = compare(f.name, "rgba8", f.cpu.data(), first.asSlice(), f.tolerance) && ok
+    let swapped = run renderOnGpu(&device, &queue, &mut bgra, &f, true)
+    ok = compare(f.name, "bgra8", f.cpu.data(), swapped.asSlice(), f.tolerance) && ok
+    index = index + 1
+  }
+
+  // The renderer keeps its buffers and layer textures; drawing the layered scenes again after
+  // the others must give the same bytes.
+  let mut again: u32 = 3
+  while again < 5 {
+    let f = run fixture(again)
+    let first = run renderOnGpu(&device, &queue, &mut rgba, &f, false)
+    let other = run fixture(0)
+    drop run renderOnGpu(&device, &queue, &mut rgba, &other, false)
+    let second = run renderOnGpu(&device, &queue, &mut rgba, &f, false)
+    ok = compare(
+      f.name,
+      "drawn again",
+      first.asSlice(),
+      second.asSlice(),
+      Tolerance { max: 0, share: 0.0, mean: 0.0 },
+    )
+      && ok
+    again = again + 1
+  }
+
+  // Text correction on, against its CPU formula.
+  let ramp = run fixture(5)
+  let mut corrected = run UiRenderer.make(&device, flags.WGPUTextureFormat_RGBA8Unorm)
+  let defaults = TextSettings.default()
+  corrected.setTextSettings(defaults)
+  let text = run renderOnGpu(&device, &queue, &mut corrected, &ramp, false)
+  ok = checkText("text correction (gamma 1.8, contrast 1)", text.asSlice(), defaults) && ok
+  let strong = TextSettings { gamma: 2.2, contrast: 2.0 }
+  corrected.setTextSettings(strong)
+  let text2 = run renderOnGpu(&device, &queue, &mut corrected, &ramp, false)
+  ok = checkText("text correction (gamma 2.2, contrast 2)", text2.asSlice(), strong) && ok
+  return if ok {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("ui renderer test failed with an allocation, atlas or geometry error\n", &())
+  return 2
+}
+
+effect fn gpuFailed(error: GpuError) -> i32
+  ! never {
+  StderrWriter.print(
+    "ui renderer test failed with GPU error {}: {:?}\n",
+    &(error.code, error.message.asSlice()),
+  )
+  return 2
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(Effect.catch<GpuError>(program(), gpuFailed), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
