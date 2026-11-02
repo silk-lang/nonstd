@@ -90,7 +90,8 @@ writes nothing unless parsing, rendering and encoding all succeed.
 | --- | --- | --- |
 | `images/svg` | `images-svg` | Document styling, structure and geometry resolution (imported as `svg_core`) |
 | `images/svg/render` | `images-svg-render` | Render tree, display list and the rendering entry points (`svg_render`) |
-| `images/svg/raster` | `images-svg-raster` | Executes display lists on the CPU through `vector` |
+| `images/svg/raster` | `images-svg-raster` | Executes display lists on the CPU through `vector`, or lowers them onto a canvas |
+| `images/svg/gpu` | `images-svg-gpu` | Draws display lists through `gpu_scene` ([README](gpu/README.md)) |
 | `images/svg/geometry` | `images-svg-geometry` | f64 geometry, path and points parsing, arcs, transforms |
 | `images/codec` | `images-codec` | PNG/JPEG decoding, orientation, premultiplied RGBA storage and PNG encoding |
 | `images/svg/filters` | `images-svg-filters` | Filter programs and their execution over `vector.filter` |
