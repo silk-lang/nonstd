@@ -1,7 +1,7 @@
 # nonstd
 
-Silk libraries that live outside the standard library: fonts, text, CSS, images and GPUs. They
-are grouped by area, and every package is a member of one workspace that pins Silk
+Silk libraries that live outside the standard library: fonts, text, CSS, images, graphics and
+GPUs. They are grouped by area, and every package is a member of one workspace that pins Silk
 `0.1.0-dev.43+3808a7f2e30c` (`toolchains.lock.json`). Nothing here is stable yet.
 
 ## Libraries
@@ -19,6 +19,7 @@ are grouped by area, and every package is a member of one workspace that pins Si
 | [`images/codec`](images/codec) | `images-codec` | PNG and JPEG decoding, PNG encoding, premultiplied RGBA images |
 | [`graphics/vector`](graphics/vector) | `graphics-vector` | A pure-Silk 2D rasterizer |
 | [`graphics/gpu_scene`](graphics/gpu_scene) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU output |
+| [`graphics/atlas`](graphics/atlas) | `graphics-atlas` | A texture atlas allocator for glyphs, icons and images, with eviction by last use |
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
@@ -59,7 +60,7 @@ python scripts/check-native-tools
 The build installs checksum-pinned Silk, Dawn, GLFW and DXC into `.cache/`, and
 places required GPU DLLs beside the executables. Native Windows artifacts end in
 `.exe`. Use `python scripts/build --no-gpu` for the libraries and CPU tools without
-the Visual Studio/SDK prerequisites. `python scripts/check` runs all 19 package
+the Visual Studio/SDK prerequisites. `python scripts/check` runs all 20 package
 unit-test roots and writes per-package logs to `build/test-results/`.
 
 Fonts, text, CSS, SVG, vector rendering, CLI parsing and WebGPU support Windows.
