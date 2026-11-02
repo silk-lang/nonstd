@@ -12,6 +12,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`font/parse`](font/parse) | `font-parse` | Font file parsing and a font model (outlines, metrics, charmaps); a port of read-fonts and skrifa |
 | [`font/shape`](font/shape) | `font-shape` | Text shaping; a port of harfrust |
 | [`font/outline`](font/outline) | `font-outline` | Glyph outlines as path commands or `vector` paths |
+| [`font/raster`](font/raster) | `font-raster` | The UI glyph cache: unhinted glyphs in atlas tiles, shaped lines, text gamma |
 | [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser |
 | [`css/style`](css/style) | `css-style` | CSS parsing, selectors and the cascade |
 | [`css/layout`](css/layout) | `css-layout` | Block, inline, flex and grid layout |

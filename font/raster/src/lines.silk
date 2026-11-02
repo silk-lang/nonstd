@@ -1,0 +1,251 @@
+//! A cache of shaped lines, so text that does not change is shaped once rather than every frame.
+//!
+//! Lines are kept in font units, so one entry serves every size and scale of a font instance.
+//! Call [`LineCache.beginFrame`] once per frame: a line not looked up during the previous frame or
+//! the current one is dropped, as GPUI's line layout cache does.
+import harfrust.lib {
+  Buffer,
+  ConfiguredShaper,
+  FontFuncs,
+  GlyphInfo,
+  GlyphPosition,
+  ShapeError,
+  ShapeOptions,
+  shape
+}
+import silk.collections.hash { Hash, HashSeed, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// One positioned glyph, in font units. `cluster` is the UTF-8 byte offset of its text.
+pub struct ShapedGlyph {
+  pub glyph: u32,
+  pub cluster: u32,
+  pub xAdvance: i32,
+  pub yAdvance: i32,
+  pub xOffset: i32,
+  pub yOffset: i32,
+}
+
+impl Copy for ShapedGlyph {}
+
+/// The handle of a cached line, valid until the next [`LineCache.beginFrame`].
+pub struct LineId {
+  pub index: u32,
+}
+
+impl Copy for LineId {}
+
+struct Line {
+  glyphs: List<ShapedGlyph>,
+  text: List<u8>,
+  font: u32,
+  hash: u64,
+  lastUsed: u64,
+  live: bool,
+  advance: i64,
+}
+
+/// Lookups that found a cached line, and lookups that shaped one.
+pub struct LineStats {
+  pub hits: u64,
+  pub misses: u64,
+}
+
+impl Copy for LineStats {}
+
+pub struct LineCache {
+  seed: HashSeed,
+  map: HashMap<Word, u32>,
+  lines: List<Line>,
+  free: List<u32>,
+  frameNumber: u64,
+  buffer: Buffer,
+  counters: LineStats,
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+impl LineCache {
+  pub fn make() -> LineCache {
+    let seed = Hash.seed(0x6c696e6573)
+    return LineCache {
+      seed: seed,
+      map: HashMap<Word, u32>.make(seed),
+      lines: List<Line>.make(),
+      free: List<u32>.make(),
+      frameNumber: 0,
+      buffer: Buffer.new(),
+      counters: LineStats { hits: 0, misses: 0 },
+    }
+  }
+
+  /// Starts a frame and drops the lines the previous frame did not use. Returns how many it dropped.
+  pub effect fn beginFrame(self: &mut Self) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.frameNumber = self.frameNumber + 1
+    let mut dropped: usize = 0
+    let mut i: usize = 0
+    while i < self.lines.length() {
+      let line = &mut self.lines.asMutSlice()[i]
+      if line.live && line.lastUsed + 1 < self.frameNumber {
+        line.live = false
+        line.glyphs.clear()
+        line.text.clear()
+        let hash = line.hash
+        drop self.map.remove(Word { value: hash })
+        run self.free.append(usize.toU32(i))
+        dropped = dropped + 1
+      }
+      i = i + 1
+    }
+    return dropped
+  }
+
+  /// The number of cached lines.
+  pub fn length(self: &Self) -> usize {
+    return self.map.length()
+  }
+
+  pub fn stats(self: &Self) -> LineStats {
+    return self.counters
+  }
+
+  fn keyOf(self: &Self, font: u32, text: &[u8]) -> u64 {
+    let mut hashed = Hash.mix(&self.seed, u32.toU64(font))
+    hashed = Hash.combine(hashed, usize.toU64(text.length))
+    let mut i: usize = 0
+    while i < text.length {
+      let mut word: u64 = 0
+      let mut j: usize = 0
+      while j < 8 && i + j < text.length {
+        word = u64.bitOr(word, u64.shiftLeft(u8.toU64(text[i + j]), usize.toU64(j * 8)))
+        j = j + 1
+      }
+      hashed = Hash.combine(hashed, word)
+      i = i + 8
+    }
+    return hashed
+  }
+
+  /// Returns the line for `text` shaped by `shaper`, shaping it on a miss. `font` names the
+  /// shaper's font instance and features, like [`key.GlyphKey.font`]: lines are looked up by
+  /// `font` and `text` only. Segment properties (direction, script, language) are guessed from
+  /// the text. A line that fails to shape is cached with no glyphs.
+  pub effect fn shape<'a, 's, F: FontFuncs>(
+    self: &mut Self,
+    shaper: &ConfiguredShaper<'a, 's, F>,
+    font: u32,
+    text: string,
+  ) -> LineId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = Intrinsic.stringUtf8Bytes(text)
+    let hash = self.keyOf(font, bytes)
+    let mut slot: u32 = 0
+    let mut reuse = false
+    if let Option<u32>.Some { value } = self.map.get(Word { value: hash }) {
+      let line = &mut self.lines.asMutSlice()[u32.toUsize(value)]
+      if line.font == font && sameBytes(line.text.asSlice(), bytes) {
+        line.lastUsed = self.frameNumber
+        self.counters.hits = self.counters.hits + 1
+        return LineId { index: value }
+      }
+
+      // A hash collision: the newer text takes the slot.
+      slot = value
+      reuse = true
+    }
+    self.counters.misses = self.counters.misses + 1
+    if !reuse {
+      if let Option<u32>.Some { value } = self.free.pop() {
+        slot = value
+      } else {
+        slot = usize.toU32(self.lines.length())
+        run self.lines.append(
+          Line {
+            glyphs: List<ShapedGlyph>.make(),
+            text: List<u8>.make(),
+            font: 0,
+            hash: 0,
+            lastUsed: 0,
+            live: false,
+            advance: 0,
+          },
+        )
+      }
+    }
+    self.buffer.clear()
+    run self.buffer.pushStr(text)
+    self.buffer.guessSegmentProperties()
+    let shaped = run shape(shaper, &mut self.buffer, ShapeOptions.new())
+    let line = &mut self.lines.asMutSlice()[u32.toUsize(slot)]
+    line.glyphs.clear()
+    line.text.clear()
+    run line.text.appendSlice(bytes)
+    line.font = font
+    line.hash = hash
+    line.lastUsed = self.frameNumber
+    line.live = true
+    line.advance = 0
+    if let Result<(), ShapeError>.Success { value } = move shaped {
+      let infos = self.buffer.glyphInfos()
+      let positions = self.buffer.glyphPositions()
+      run line.glyphs.reserve(infos.len())
+      let mut i: usize = 0
+      while i < infos.len() {
+        if let Option<GlyphInfo>.Some { value: info } = infos.get(i) {
+          if let Option<GlyphPosition>.Some { value: position } = positions.get(i) {
+            run line.glyphs.append(
+              ShapedGlyph {
+                glyph: info.glyphId,
+                cluster: info.cluster,
+                xAdvance: position.xAdvance,
+                yAdvance: position.yAdvance,
+                xOffset: position.xOffset,
+                yOffset: position.yOffset,
+              },
+            )
+            line.advance = line.advance + i32.toI64(position.xAdvance)
+          }
+        }
+        i = i + 1
+      }
+    }
+    self.buffer.clear()
+    drop run self.map.insert(Word { value: hash }, slot)
+    return LineId { index: slot }
+  }
+
+  /// The glyphs of line `id`, in visual order.
+  pub fn glyphs(self: &Self, id: LineId) -> &[ShapedGlyph] {
+    return self.lines.asSlice()[u32.toUsize(id.index)].glyphs.asSlice()
+  }
+
+  /// The sum of the horizontal advances of line `id`, in font units.
+  pub fn advance(self: &Self, id: LineId) -> i64 {
+    return self.lines.asSlice()[u32.toUsize(id.index)].advance
+  }
+}
