@@ -22,6 +22,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`graphics/atlas`](graphics/atlas) | `graphics-atlas` | A texture atlas allocator for glyphs, icons and images, with eviction by last use |
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
+| [`platform/window`](platform/window) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames (macOS first) |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
 
 Each library's README lists its helper packages (command-line tools, benchmarks, test runners).
