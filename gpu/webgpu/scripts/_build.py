@@ -106,16 +106,7 @@ def silk_command(subcommand, manifest, release=False, target=None):
         command += ["--target", target]
     if release:
         command.append("--release")
-    return command, silk_environment(clang)
-
-
-def silk_environment(clang):
-    """The environment for silkc. The pinned Clang finds the macOS SDK, which Objective-C sources
-    need for Foundation and AppKit, only through SDKROOT."""
-    env = dict(os.environ, SILK_CLANG=str(clang))
-    if sys.platform == "darwin" and not env.get("SDKROOT"):
-        env["SDKROOT"] = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
-    return env
+    return command, dict(os.environ, SILK_CLANG=str(clang))
 
 
 def build(package_path, release=False, target=None):
