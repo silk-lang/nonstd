@@ -20,6 +20,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`graphics/vector`](graphics/vector) | `graphics-vector` | A pure-Silk 2D rasterizer |
 | [`graphics/gpu_scene`](graphics/gpu_scene) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU output |
 | [`graphics/atlas`](graphics/atlas) | `graphics-atlas` | A texture atlas allocator for glyphs, icons and images, with eviction by last use |
+| [`graphics/sprites`](graphics/sprites) | `graphics-sprites` | SVG icons and decoded images as atlas tiles for the UI renderer |
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
 | [`platform/window`](platform/window) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames (macOS first) |

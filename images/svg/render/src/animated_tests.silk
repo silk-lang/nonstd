@@ -4,7 +4,17 @@ import lib { RenderOptions, RenderError, Animated, Pixmap as Image }
 import lib as renderer
 import environment { Environment, noHostStyles }
 import svg_core.structure { Options as StructureOptions }
-import svg_core.resources { Resolver, DataOnly, Limits as ResourceLimits, ProcessingMode }
+import svg_core.resources {
+  Resolver,
+  DataOnly,
+  Limits as ResourceLimits,
+  ProcessingMode,
+  ResourceKind,
+  ResourceError,
+  Response
+}
+import silk.collections.bytes { Bytes }
+import silk.core.ownership { Copy }
 import svg_core.url { Url, UrlError }
 import svg_css.media_features { Environment as MediaEnvironment }
 import svg_css.colors { Color, Context as ColorContext }
@@ -178,4 +188,126 @@ test effect fn framesDoNotAccumulateWrites() -> ()
   }
   counts[1] = animated.retainedBytes()
   run Testing.expect(counts[0] == counts[1], "document storage is the same after 40 frames")
+}
+
+// 4 x 4 PNGs: opaque red, and blue at half alpha.
+fn redPng() -> &'static [u8] {
+  return b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x04\x00\x00\x00\x04\x08\x06\x00\x00\x00\xa9\xf1\x9e\x7e\x00\x00\x00\x12\x49\x44\x41\x54\x78\x9c\x63\xf8\xcf\xc0\xf0\x1f\x19\x33\x90\x2e\x00\x00\x3c\x40\x1f\xe1\xe0\x81\x77\xb4\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82"
+}
+
+fn bluePng() -> &'static [u8] {
+  return b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x04\x00\x00\x00\x04\x08\x06\x00\x00\x00\xa9\xf1\x9e\x7e\x00\x00\x00\x11\x49\x44\x41\x54\x78\x9c\x63\x60\x60\xf8\xdf\x80\x8a\x49\x16\x00\x00\x1a\x59\x17\xf1\x55\xf1\xb6\xdc\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82"
+}
+
+fn endsWith(text: &[u8], suffix: &[u8]) -> bool {
+  if text.length < suffix.length {
+    return false
+  }
+  let start = text.length - suffix.length
+  let mut i: usize = 0
+  while i < suffix.length {
+    if text[start + i] != suffix[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Serves red.png, blue.png and missing.png (a failure), counting every fetch.
+struct Counting {
+  fetches: usize,
+}
+
+impl Counting {
+  effect fn fetch(self: &mut Self, url: &Url, kind: ResourceKind) -> Response
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    drop kind
+    self.fetches = self.fetches + 1
+    let text = url.bytes()
+    if endsWith(text, b"/red.png") {
+      return Response.fromBytes(run Bytes.copy(redPng()))
+    }
+    if endsWith(text, b"/blue.png") {
+      return Response.fromBytes(run Bytes.copy(bluePng()))
+    }
+    fail ResourceError.Io
+  }
+}
+
+impl Resolver for Counting {
+  fetch: Counting.fetch
+}
+
+struct Fetched {
+  // 0 when every frame matched its fresh render, else 1 + the first mismatching frame.
+  mismatch: usize,
+  // Fetches made by the frames of the document parsed once.
+  fetches: usize,
+  kept: usize,
+}
+
+impl Copy for Fetched {}
+
+effect fn imageFrames(data: &[u8], times: &[f64]) -> Fetched
+  ! RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/fixtures/input.svg"), invalidBase)
+  let fonts = FontDatabase.make()
+  let environment = animatedEnvironment(&base, &fonts)
+  let mut retained = Counting { fetches: 0 }
+  let mut fresh = Counting { fetches: 0 }
+  let mut animated = run renderer.parseAnimated(data, &environment)
+    |> Effect.provideMut<Resolver>(&mut retained)
+  let mut options = RenderOptions.make()
+  let mut result = Fetched { mismatch: 0, fetches: 0, kept: 0 }
+  let mut i: usize = 0
+  while i < times.length {
+    options.time = times[i]
+    let list = run animated.frame(&options, &environment)
+      |> Effect.provideMut<Resolver>(&mut retained)
+    let frame = run renderer.renderDisplayList(&list)
+    let expected = run renderer.render(data, &options, &environment)
+      |> Effect.provideMut<Resolver>(&mut fresh)
+    if result.mismatch == 0 && !same(&frame, &expected) {
+      result.mismatch = i + 1
+    }
+    i = i + 1
+  }
+  result.fetches = retained.fetches
+  result.kept = animated.keptImages()
+  return result
+}
+
+// Images are fetched and decoded once, not once per frame, and frames still match fresh parses.
+test effect fn framesKeepDecodedImages() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let moving = b"<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><image href='http://example.test/red.png' width='20' height='20'><animate attributeName='x' from='0' to='20' dur='2s'/></image><image href='http://example.test/missing.png' width='20' height='20'/></svg>"
+  let result = run imageFrames(moving, &TIMES) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(result.mismatch == 0, "frames with images match fresh parses")
+  run Testing.expect(
+    result.fetches == 2,
+    "each URL is fetched once over ten frames, failures included",
+  )
+  run Testing.expect(result.kept == 2, "both URLs stay kept while frames use them")
+}
+
+// An animated href switches between kept images; an image unused for two frames is dropped.
+test effect fn framesDropImagesNoLongerUsed() -> ()
+  ! AssertionError<'static> | RenderError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let switching = b"<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><image href='http://example.test/red.png' width='20' height='20'><set attributeName='href' to='http://example.test/blue.png' begin='1s' dur='1s'/></image></svg>"
+  let alternating: [f64; 5] = [0.0, 1.5, 0.5, 1.25, 0.25]
+  let result = run imageFrames(switching, &alternating)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(result.mismatch == 0, "frames with an animated href match fresh parses")
+  run Testing.expect(result.fetches == 2, "red and blue are each fetched once")
+  run Testing.expect(result.kept == 2, "an image skipped by one frame stays kept")
+  let gap: [f64; 4] = [1.5, 3.0, 3.0, 1.5]
+  let after = run imageFrames(switching, &gap) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(after.mismatch == 0, "frames after the set ends match fresh parses")
+  run Testing.expect(after.fetches == 3, "blue is fetched again after two frames without it")
+  run Testing.expect(after.kept == 2, "blue was used last frame and red the one before")
 }
