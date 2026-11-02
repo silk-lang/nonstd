@@ -7,11 +7,12 @@ Fonts for Silk, from reading the file to shaping text.
 | [font-types](types) | `font/types` | OpenType scalars: big-endian codecs, fixed point, tags, glyph IDs |
 | [font-parse](parse) | `font/parse` | Parses sfnt/TTC files and their tables, plus a font model for metrics, character maps, names and outlines |
 | [font-shape](shape) | `font/shape` | Text shaping: OpenType, AAT and the complex-script shapers |
+| [font-outline](outline) | `font/outline` | Glyph outlines (`glyf`/`gvar`, `CFF`, `CFF2`) drawn as flat commands or into a [graphics-vector](../graphics/vector) path |
 
 Unicode properties and text segmentation come from the standard library's `silk.text` modules,
 which font-shape uses.
 
-The three packages started as ports of Google's
+font-types, font-parse and font-shape started as ports of Google's
 [fontations](https://github.com/googlefonts/fontations) (read-fonts, font-types, parts of
 skrifa) and of [harfrust](https://github.com/harfbuzz/harfrust). Those projects are now
 baselines rather than targets. Weekly CI still compares against them, and today Silk is at or

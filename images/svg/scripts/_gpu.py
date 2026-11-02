@@ -4,5 +4,6 @@ import sys
 
 SVG = Path(__file__).resolve().parents[1]
 REPO = SVG.parents[1]
+GRAPHICS = REPO / "graphics"
 sys.path.insert(0, str(REPO / "gpu" / "webgpu" / "scripts"))
 from _build import build, command_path  # noqa: E402

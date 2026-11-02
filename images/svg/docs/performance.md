@@ -265,7 +265,7 @@ reference timing to compare against. They are a reproducible initial measurement
 not proof of the phase-14 resvg target or JPEG pixel conformance. Reproduce with:
 
 ```sh
-python3 images/svg/image/tests/jpeg_benchmark_fixtures.py build/svg/jpeg-inputs
+python3 images/codec/tests/jpeg_benchmark_fixtures.py build/svg/jpeg-inputs
 SILK_CLANG=/absolute/path/to/clang images/svg/scripts/bench-jpeg \
   build/svg/jpeg-inputs/*.jpg --callgrind --output build/svg/jpeg-codec.json
 ```
