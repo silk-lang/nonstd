@@ -108,7 +108,7 @@ matches and four strict non-passes covering gradient luminance/alpha and the mas
 root transform. The latter retain measured differences without tolerance; they
 remain open conformance work alongside the exact own fixtures.
 
-Phase 7 has a standalone PNG decoder in `images/svg/image`: all standard color
+Phase 7 has a standalone PNG decoder in `images/codec`: all standard color
 and sample-depth combinations, palette and sample transparency, five scanline
 filters, Adam7, and APNG's first animation frame. The decoder retains gAMA, cHRM,
 sRGB intent and bounded decompressed iCCP data for the color-management consumer;

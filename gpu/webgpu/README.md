@@ -104,4 +104,4 @@ has the tables, the instruction-count method and the Rust/wgpu comparison.
 - [Reference](docs/reference.md): implementation selection, header compatibility, toolchain
   prerequisites, CI, callback ownership, surfaces, samples, the browser ABI and benchmarks.
 - [LIMITATIONS.md](LIMITATIONS.md): workarounds for compiler and standard-library gaps.
-- [GPU scene renderer](../../images/svg/gpu_scene): 2D vector drawing on top of this package.
+- [GPU scene renderer](../../graphics/gpu_scene): 2D vector drawing on top of this package.

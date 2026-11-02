@@ -74,7 +74,7 @@ finite-input geometry helpers; no libc shim, compiler or stdlib patch is used.
 ## 009 — checked DEFLATE output bound
 
 `Deflate.encode` takes caller-owned storage without exposing a capacity bound.
-`images/svg/image/src/png.silk` derives the zlib bound from the pinned fixed-Huffman
+`images/codec/src/png.silk` derives the zlib bound from the pinned fixed-Huffman
 algorithm and validates dimensions before allocation. Filed with a self-contained
 reproducer as [silk-lang/silk#2565](https://github.com/silk-lang/silk/issues/2565).
 

@@ -11,12 +11,14 @@ are grouped by area, and every package is a member of one workspace that pins Si
 | [`font/types`](font/types) | `font-types` | The scalar types OpenType tables are built from |
 | [`font/parse`](font/parse) | `font-parse` | Font file parsing and a font model (outlines, metrics, charmaps); a port of read-fonts and skrifa |
 | [`font/shape`](font/shape) | `font-shape` | Text shaping; a port of harfrust |
+| [`font/outline`](font/outline) | `font-outline` | Glyph outlines as path commands or `vector` paths |
 | [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser |
 | [`css/style`](css/style) | `css-style` | CSS parsing, selectors and the cascade |
 | [`css/layout`](css/layout) | `css-layout` | Block, inline, flex and grid layout |
 | [`images/svg`](images/svg) | `images-svg` | An SVG renderer written from the specifications |
-| [`images/svg/vector`](images/svg/vector) | `images-svg-vector` | A pure-Silk 2D rasterizer |
-| [`images/svg/gpu_scene`](images/svg/gpu_scene) | `images-svg-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU output |
+| [`images/codec`](images/codec) | `images-codec` | PNG and JPEG decoding, PNG encoding, premultiplied RGBA images |
+| [`graphics/vector`](graphics/vector) | `graphics-vector` | A pure-Silk 2D rasterizer |
+| [`graphics/gpu_scene`](graphics/gpu_scene) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU output |
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |

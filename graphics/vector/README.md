@@ -1,7 +1,7 @@
-# images-svg-vector
+# graphics-vector
 
 A 2D vector rasterizer in pure Silk. It has no GPU and no C, and depends only on the standard
-library. It is the drawing core under the [SVG renderer](..). It follows the sparse-strips design
+library. It is the drawing core under the [SVG renderer](../../images/svg). It follows the sparse-strips design
 of [vello_cpu](https://github.com/linebender/vello/tree/main/sparse_strips): coverage is computed
 once as strips, and paints are composited through them. The [GPU scene renderer](../gpu_scene)
 consumes the same coverage and produces byte-identical images.
@@ -60,9 +60,9 @@ import the package as `vector`.
 
 | Path | Package | What it is |
 | --- | --- | --- |
-| `images/svg/vector` | `images-svg-vector` | The library |
-| `images/svg/vector/bench` | `images-svg-vector-bench` | Scenes timed against tiny-skia ([workloads](bench/WORKLOADS.md)) |
-| `images/svg/vector/filter-bench` | `images-svg-vector-filter-bench` | Filters timed against resvg ([workloads](filter-bench/WORKLOADS.md)) |
+| `graphics/vector` | `graphics-vector` | The library |
+| `graphics/vector/bench` | `graphics-vector-bench` | Scenes timed against tiny-skia ([workloads](bench/WORKLOADS.md)) |
+| `graphics/vector/filter-bench` | `graphics-vector-filter-bench` | Filters timed against resvg ([workloads](filter-bench/WORKLOADS.md)) |
 
 ## Tests
 
@@ -74,7 +74,7 @@ images/svg/scripts/check-vector
 
 This runs the 170 unit tests, checks the packages, and renders every GPU scene test on both the
 CPU and Dawn (lavapipe in CI), requiring identical bytes. Use `--skip-native` to leave out the GPU
-part. It runs in the `images-svg-vector` CI workflow.
+part. It runs in the `graphics-vector` CI workflow.
 
 ## Performance
 

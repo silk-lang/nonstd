@@ -70,7 +70,7 @@ def rgb_profile(colorants, curves):
                              (b'rTRC', curves[0]), (b'gTRC', curves[1]), (b'bTRC', curves[2])])
 
 
-# ---- Independent evaluation (mirrors images/svg/image/src/icc.silk) --------
+# ---- Independent evaluation (mirrors images/codec/src/icc.silk) --------
 
 def read16(d, o):
     return d[o] * 256 + d[o + 1]
