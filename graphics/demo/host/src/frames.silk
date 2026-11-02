@@ -1,0 +1,206 @@
+//! The demo on WebGPU: paint a frame, copy the tiles it added into the GPU atlas, draw it with
+//! `UiRenderer`, and optionally copy the result back for comparison with the CPU reference. The
+//! same code runs natively (Dawn) and in the browser (`navigator.gpu`).
+import demo.demo { Demo, Frame }
+import atlas.atlas { AtlasError }
+import ui_scene.color as color
+import ui_scene.scene { Scene }
+import ui_renderer.atlas_textures { GpuAtlas }
+import ui_renderer.renderer { UiRenderer }
+import ui_renderer.text { TextSettings }
+import vector.geometry_error { GeometryError }
+import gpu_scene.renderer { extent }
+import webgpu.runtime { Device, GpuError }
+import webgpu.resources as gpu
+import webgpu.resources { Buffer, Queue, Texture, TextureView }
+import webgpu.descriptors {
+  BufferDescriptor,
+  TexelCopyBufferInfo,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+/// The surface formats the renderer draws into, best first. Returns the first of `formats` that
+/// `UiRenderer` supports (BGRA8 or RGBA8 unorm), or `None`-like `0` when there is none.
+pub fn pickFormat(formats: &[u32]) -> u32 {
+  let mut i: usize = 0
+  while i < formats.length {
+    if formats[i] == flags.WGPUTextureFormat_BGRA8Unorm {
+      return formats[i]
+    }
+    i = i + 1
+  }
+  let mut j: usize = 0
+  while j < formats.length {
+    if formats[j] == flags.WGPUTextureFormat_RGBA8Unorm {
+      return formats[j]
+    }
+    j = j + 1
+  }
+  return 0
+}
+
+pub fn isBgra(format: u32) -> bool {
+  return format == flags.WGPUTextureFormat_BGRA8Unorm
+}
+
+/// Keeps a scene, the renderer and the GPU copies of the atlas textures across frames.
+pub struct GpuFrames {
+  scene: Scene,
+  renderer: UiRenderer,
+  textures: GpuAtlas,
+  format: u32,
+}
+
+impl GpuFrames {
+  pub effect fn make(device: &Device, format: u32) -> GpuFrames
+    ! GpuError {
+    return GpuFrames {
+      scene: Scene.make(),
+      renderer: run UiRenderer.make(device, format),
+      textures: GpuAtlas.make(),
+      format: format,
+    }
+  }
+
+  /// Turns the text gamma and contrast correction off, so glyphs blend exactly as the CPU
+  /// reference blends them. For comparisons only: windows keep the correction.
+  pub fn useReferenceText(self: &mut Self) -> () {
+    self.renderer.setTextSettings(TextSettings.none())
+  }
+
+  pub fn surfaceFormat(self: &Self) -> u32 {
+    return self.format
+  }
+
+  pub fn lastScene(self: &Self) -> &Scene {
+    return &self.scene
+  }
+
+  /// Paints `frame` and uploads the tiles it added: new atlas textures first, then each tile.
+  pub effect fn prepare(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    app: &mut Demo,
+    frame: Frame,
+  ) -> ()
+    ! AtlasError | GeometryError | GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    run app.paint(&mut self.scene, frame)
+    run self.textures.sync(device, app.currentAtlas())
+    let pending = app.pendingUploads()
+    let list = pending.uploads()
+    let mut i: usize = 0
+    while i < list.length {
+      self.textures.write(queue, list[i].tile, pending.pixels(list[i]))
+      i = i + 1
+    }
+    app.clearPending()
+  }
+
+  /// Draws the prepared frame into `target`, `width` x `height` device pixels, and submits.
+  pub effect fn draw(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    target: &TextureView,
+    width: u32,
+    height: u32,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.renderer.draw(
+      device,
+      queue,
+      &self.scene,
+      &self.textures,
+      target,
+      width,
+      height,
+      color.white(),
+    )
+  }
+}
+
+/// Bytes per row of a readback buffer: `width * 4` rounded up to 256, as WebGPU requires.
+pub fn readbackStride(width: u32) -> u32 {
+  return (width * 4 + 255) / 256 * 256
+}
+
+/// Copies `texture` (`width` x `height`, 4 bytes per texel, with `CopySrc` usage) into a new
+/// mappable buffer and submits the copy. Map it with `runtime.mapRead` or `mapReadStart`, then
+/// [`unpack`] it.
+pub effect fn copyOut(
+  device: &Device,
+  queue: &Queue,
+  texture: &Texture,
+  width: u32,
+  height: u32,
+) -> Buffer
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let stride = readbackStride(width)
+  let size = u32.toUsize(stride * height)
+  let readback = run gpu.createBuffer(
+    device,
+    &BufferDescriptor.make(
+      b"demo readback",
+      usize.toU64(size),
+      flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead,
+      false,
+    ),
+  )
+  let mut encoder = run gpu.createCommandEncoder(device, b"demo readback")
+  let source = TexelCopyTextureInfo.default().withTexture(texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(stride)
+  layout.setRowsPerImage(height)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(width, height))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"demo readback")
+  queue.submit(&[commands.reference()])
+  return move readback
+}
+
+/// The size in bytes to map from a buffer made by [`copyOut`].
+pub fn readbackSize(width: u32, height: u32) -> usize {
+  return u32.toUsize(readbackStride(width) * height)
+}
+
+/// Mapped readback rows as tightly packed RGBA, swapping BGRA into RGBA order.
+pub effect fn unpack(padded: &[u8], width: u32, height: u32, bgra: bool) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let stride = readbackStride(width)
+  let mut out = List<u8>.make()
+  run out.reserve(u32.toUsize(width * height * 4))
+  let mut y: u32 = 0
+  while y < height {
+    let mut x: u32 = 0
+    while x < width {
+      let at = u32.toUsize(y * stride + x * 4)
+      if bgra {
+        run out.append(padded[at + 2])
+        run out.append(padded[at + 1])
+        run out.append(padded[at])
+      } else {
+        run out.append(padded[at])
+        run out.append(padded[at + 1])
+        run out.append(padded[at + 2])
+      }
+      run out.append(padded[at + 3])
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return move out
+}

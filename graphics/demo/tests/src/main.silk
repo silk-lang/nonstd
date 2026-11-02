@@ -1,0 +1,462 @@
+//! The demo's tests, headless:
+//!
+//! 1. Goldens: frames drawn by the CPU reference match `tests/goldens/*.png` within 2 levels per
+//!    channel (`--update` rewrites them).
+//! 2. GPU against CPU: the same frames drawn by `UiRenderer` into RGBA8 and BGRA8 targets are
+//!    within `compare.Tolerance.frame()` of the CPU reference.
+//! 3. Many frames: 150 animated frames on one `Demo`, drawn by both renderers, keep matching
+//!    (tiles evicted and reallocated land in the same place in both atlases), photos are uploaded
+//!    once, and the glyph cache stops missing once the text is laid out.
+//!
+//!   graphics-demo-tests GOLDENS_DIRECTORY [--update] [--skip-gpu]
+//!
+//! Exits 0 when every check passes, 1 on a mismatch, 2 on an error.
+import demo.demo { Demo, DemoError, Frame }
+import demo.cpu { CpuFrames, deviceHeight, deviceWidth }
+import demo.compare { Comparison, Tolerance, compare }
+import demo_host.frames { GpuFrames, copyOut, readbackSize, unpack }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import gpu_scene.renderer { extent }
+import codec.png
+import codec.png { PngError }
+import codec.image { ImageError }
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.resources { Queue, Texture }
+import webgpu.descriptors { DeviceDescriptor, TextureDescriptor, TextureViewDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+
+/// A frame the goldens and the GPU comparison draw, with the input that leads to it.
+struct Case {
+  name: string<'static>,
+  frame: Frame,
+  /// A pointer position (logical) applied after a first frame lays the window out, or none.
+  pointer: bool,
+  x: f32,
+  y: f32,
+  favorite: bool,
+  grayscale: bool,
+  scroll: f32,
+}
+
+const CASES: u32 = 3
+
+fn caseOf(index: u32) -> Case {
+  return match index {
+    0 => Case {
+      name: "desktop",
+      frame: Frame { width: 1024.0, height: 720.0, scale: 1.0, time: 0.5 },
+      pointer: false,
+      x: 0.0,
+      y: 0.0,
+      favorite: false,
+      grayscale: false,
+      scroll: 0.0,
+    }
+    1 => Case {
+      name: "retina",
+      frame: Frame { width: 720.0, height: 560.0, scale: 2.0, time: 1.25 },
+      pointer: true,
+      x: 450.0,
+      y: 220.0,
+      favorite: true,
+      grayscale: false,
+      scroll: 0.0,
+    }
+    _ => Case {
+      name: "scrolled",
+      frame: Frame { width: 900.0, height: 640.0, scale: 1.5, time: 2.0 },
+      pointer: true,
+      x: 40.0,
+      y: 120.0,
+      favorite: false,
+      grayscale: true,
+      scroll: 140.0,
+    }
+  }
+}
+
+fn goldenName(index: u32) -> string<'static> {
+  return match index {
+    0 => "desktop.png"
+    1 => "retina.png"
+    _ => "scrolled.png"
+  }
+}
+
+/// Puts `app` in the case's state, before its first frame.
+fn setUp(app: &mut Demo, case: &Case) -> () {
+  app.setScroll(case.scroll)
+  if case.grayscale {
+    app.toggleGrayscale()
+  }
+  app.setFavorite(1, case.favorite)
+}
+
+/// After the first frame laid the window out, the pointer can hover something.
+fn hover(app: &mut Demo, case: &Case) -> () {
+  if case.pointer {
+    drop app.pointerMoved(case.x, case.y)
+  }
+}
+
+fn report(
+  name: string<'static>,
+  target: string<'static>,
+  result: Comparison,
+  tolerance: Tolerance,
+) -> bool {
+  let ok = result.within(tolerance)
+  StderrWriter.print(
+    "{} ({}): max delta {} at ({}, {}), {} of {} channels over 8, mean {}{}\n",
+    &(
+      name,
+      target,
+      result.max,
+      result.worstX,
+      result.worstY,
+      result.over,
+      result.channels,
+      result.mean,
+      if ok {
+        ""
+      } else {
+        "  FAIL"
+      }
+    ),
+  )
+  return ok
+}
+
+/// The number of channels differing by more than 2.
+fn mismatches(actual: &[u8], expected: &[u8]) -> u32 {
+  if actual.length != expected.length {
+    return 4294967295
+  }
+  let mut count: u32 = 0
+  let mut i: usize = 0
+  while i < actual.length {
+    let a = u8.toU32(actual[i])
+    let b = u8.toU32(expected[i])
+    let d = if a > b {
+      a - b
+    } else {
+      b - a
+    }
+    if d > 2 {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+struct Gpu {
+  device: Device,
+  queue: Queue,
+}
+
+effect fn renderTarget(device: &Device, format: u32, width: u32, height: u32) -> Texture
+  ! GpuError {
+  let mut descriptor = TextureDescriptor.default().withLabel(b"demo test target")
+  descriptor.setSize(extent(width, height))
+  descriptor.setFormat(format)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  return run gpu.createTexture(device, &descriptor)
+}
+
+/// Draws the prepared frame of `frames` and reads it back as RGBA.
+effect fn drawAndRead(context: &Gpu, frames: &mut GpuFrames, width: u32, height: u32) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let texture = run renderTarget(&context.device, frames.surfaceFormat(), width, height)
+  let view = run texture.createView(&TextureViewDescriptor.default())
+  run frames.draw(&context.device, &context.queue, &view, width, height)
+  let buffer = run copyOut(&context.device, &context.queue, &texture, width, height)
+  run context.device.checkErrors()
+  let padded = run runtime.mapRead(&context.device, &buffer, 0, readbackSize(width, height))
+  return run unpack(
+    padded.asSlice(),
+    width,
+    height,
+    frames.surfaceFormat() == flags.WGPUTextureFormat_BGRA8Unorm,
+  )
+}
+
+/// Goldens, and each case on the GPU in both formats. Returns the number of failures.
+effect fn checkCases(directory: &Path, update: bool, context: &Option<Gpu>) -> u32
+  ! DemoError
+    | AtlasError
+    | GeometryError
+    | GpuError
+    | OutOfMemoryError
+    | FileError
+    | ImageError
+    | PngError
+  ? &mut FileSystem | &mut Allocator {
+  let mut failures: u32 = 0
+  let mut index: u32 = 0
+  while index < CASES {
+    let case = caseOf(index)
+    let width = deviceWidth(case.frame)
+    let height = deviceHeight(case.frame)
+    let mut app = run Demo.make()
+    let mut cpu = CpuFrames.make()
+    setUp(&mut app, &case)
+    run cpu.prepare(&mut app, case.frame)
+    hover(&mut app, &case)
+    let image = run cpu.draw(&mut app, case.frame)
+    let file = run Path.join(directory, goldenName(index))
+    let encoded = run png.encodePixels(width, height, image.data())
+    if update {
+      run FileSystem.writeFile(&file, Bytes.asSlice(&encoded))
+      StderrWriter.print("wrote {}\n", &(goldenName(index),))
+    } else {
+      let data = run FileSystem.readFile(&file)
+      let golden = run png.decode(Bytes.asSlice(&data))
+
+      // Compare through the same PNG round trip, so only rendering differences count.
+      let actual = run png.decode(Bytes.asSlice(&encoded))
+      let bad = mismatches(actual.data(), golden.data())
+      if bad == 0 {
+        StderrWriter.print("golden {}: ok\n", &(goldenName(index),))
+      } else {
+        StderrWriter.print(
+          "golden {}: {} channels differ by more than 2  FAIL\n",
+          &(goldenName(index), bad),
+        )
+        failures = failures + 1
+      }
+    }
+    if let Option<Gpu>.Some { value } = &context.* {
+      let formats: [u32; 2] = [
+        flags.WGPUTextureFormat_RGBA8Unorm,
+        flags.WGPUTextureFormat_BGRA8Unorm,
+      ]
+      let mut f: usize = 0
+      while f < 2 {
+        // A fresh app in the same state, so both renderers see the same uploads.
+        let mut gpuApp = run Demo.make()
+        let mut frames = run GpuFrames.make(&value.device, formats[f])
+        frames.useReferenceText()
+        setUp(&mut gpuApp, &case)
+        run frames.prepare(&value.device, &value.queue, &mut gpuApp, case.frame)
+        hover(&mut gpuApp, &case)
+        run frames.prepare(&value.device, &value.queue, &mut gpuApp, case.frame)
+        let pixels = run drawAndRead(&value, &mut frames, width, height)
+        let target = if f == 0 {
+          "rgba8"
+        } else {
+          "bgra8"
+        }
+        if !report(
+          case.name,
+          target,
+          compare(image.data(), pixels.asSlice(), width),
+          Tolerance.frame(),
+        ) {
+          failures = failures + 1
+        }
+        f = f + 1
+      }
+    }
+    index = index + 1
+  }
+  return failures
+}
+
+/// Many frames on one app through both renderers. Returns the number of failures.
+effect fn checkFrames(context: &Gpu) -> u32
+  ! DemoError | AtlasError | GeometryError | GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut failures: u32 = 0
+  let mut cpuApp = run Demo.make()
+  let mut gpuApp = run Demo.make()
+  let mut cpu = CpuFrames.make()
+  let mut frames = run GpuFrames.make(&context.device, flags.WGPUTextureFormat_BGRA8Unorm)
+  frames.useReferenceText()
+  let base = Frame { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  let width = deviceWidth(base)
+  let height = deviceHeight(base)
+  let count: u32 = 150
+  let mut glyphMissesAt10: u64 = 0
+  let mut i: u32 = 0
+  while i < count {
+    let frame = Frame {
+      width: base.width,
+      height: base.height,
+      scale: base.scale,
+      time: u32.toF64(i) / 60.0,
+    }
+    run cpu.prepare(&mut cpuApp, frame)
+    run frames.prepare(&context.device, &context.queue, &mut gpuApp, frame)
+    if i == 10 {
+      glyphMissesAt10 = gpuApp.stats().glyphMisses
+    }
+    if i % 30 == 29 {
+      let reference = run cpu.render(frame)
+      let pixels = run drawAndRead(context, &mut frames, width, height)
+      if !report(
+        "animated",
+        "frame",
+        compare(reference.data(), pixels.asSlice(), width),
+        Tolerance.frame(),
+      ) {
+        failures = failures + 1
+      }
+    }
+    i = i + 1
+  }
+  let stats = gpuApp.stats()
+  StderrWriter.print(
+    "{} frames: {} image uploads, {} glyph misses ({} by frame 10), {} icon tiles, {} atlas textures\n",
+    &(
+      stats.frames,
+      stats.imageUploads,
+      stats.glyphMisses,
+      glyphMissesAt10,
+      stats.iconMisses,
+      stats.atlasTextures
+    ),
+  )
+
+  // Only the photos in view are uploaded, each once.
+  if stats.imageUploads > 12 {
+    StderrWriter.print("photos were uploaded again  FAIL\n", &())
+    failures = failures + 1
+  }
+
+  // After the first frames only the status line's changing digits can miss, and digits repeat.
+  if stats.glyphMisses > glyphMissesAt10 + 20 {
+    StderrWriter.print("the glyph cache kept missing  FAIL\n", &())
+    failures = failures + 1
+  }
+  return failures
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn hasFlag(flag: &[u8]) -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  let mut i: usize = 2
+  while i < count {
+    if let Option<Bytes>.Some { value } = run HostInput.argument(i) {
+      if same(Bytes.asSlice(&value), flag) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn process() -> i32
+  ! DemoError
+    | AtlasError
+    | GeometryError
+    | GpuError
+    | OutOfMemoryError
+    | FileError
+    | HostInputError
+    | ImageError
+    | PngError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  if count < 2 {
+    StderrWriter.print(
+      "usage: graphics-demo-tests GOLDENS_DIRECTORY [--update] [--skip-gpu]\n",
+      &(),
+    )
+    return 2
+  }
+  let update = run hasFlag(b"--update")
+  let skipFlag = run hasFlag(b"--skip-gpu")
+  let skipGpu = skipFlag || update
+  let raw = match run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => Bytes.make()
+  }
+  let cwd = run HostInput.workingDirectory()
+  let base = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let directory = run Path.resolveBytes(&base, Bytes.asSlice(&raw))
+  let mut context = Option<Gpu>.None
+  if !skipGpu {
+    let instance = run Instance.create()
+    let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+    let device = run adapter.requestDevice(&DeviceDescriptor.default())
+    let queue = run gpu.getQueue(&device)
+    context = Option<Gpu>.some(Gpu { device: move device, queue: move queue })
+  }
+  let mut files = run MachineFileSystem.make()
+  let mut failures = run checkCases(&directory, update, &context)
+    |> Effect.provideMut<FileSystem>(&mut files)
+  if let Option<Gpu>.Some { value } = &context {
+    failures = failures + run checkFrames(&value)
+  }
+  return if failures == 0 {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn gpuFailed(error: GpuError) -> i32
+  ! never {
+  StderrWriter.print("graphics-demo-tests: GPU error {}\n", &(error.code,))
+  return 2
+}
+
+effect fn demoFailed(error: DemoError) -> i32 {
+  drop error
+  StderrWriter.print("graphics-demo-tests: an embedded font, icon or photo did not load\n", &())
+  return 2
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("graphics-demo-tests: atlas, geometry, allocation, file or PNG error\n", &())
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    Effect.catch<DemoError>(Effect.catch<GpuError>(process(), gpuFailed), demoFailed),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
