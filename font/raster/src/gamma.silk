@@ -1,0 +1,121 @@
+//! Gamma and contrast correction for grayscale text coverage, as a CPU reference.
+//!
+//! Unhinted glyph coverage blended linearly into an sRGB target looks thin and uneven, dark text
+//! on light most of all. This is the correction GPUI borrows from Windows Terminal (itself
+//! DirectWrite's): boost contrast for light-on-dark text, then bend coverage by a cubic fitted to
+//! the target gamma. The GPU text shader applies the same formula per sample, so the CPU reference
+//! renderer and the WebGPU renderer agree within rounding.
+import silk.core.ownership { Copy }
+import silk.num.f32
+import silk.num.f64
+import silk.num.usize
+import silk.num.u8
+
+// DirectWrite's fit of a gamma-incorrect blend to the target gamma, for gamma 1.0 to 2.2 in steps
+// of 0.1 (Windows Terminal's `dwrite.cpp`, as GPUI's `get_gamma_correction_ratios` copies it).
+const RATIOS: [[f32; 4]; 13] = [
+  [0.0000, 0.0000, 0.0000, 0.0000],
+  [0.0166, -0.0807, 0.2227, -0.0751],
+  [0.0350, -0.1760, 0.4325, -0.1370],
+  [0.0543, -0.2821, 0.6302, -0.1876],
+  [0.0739, -0.3963, 0.8167, -0.2287],
+  [0.0933, -0.5161, 0.9926, -0.2616],
+  [0.1121, -0.6395, 1.1588, -0.2877],
+  [0.1300, -0.7649, 1.3159, -0.3080],
+  [0.1469, -0.8911, 1.4644, -0.3234],
+  [0.1627, -1.0170, 1.6051, -0.3347],
+  [0.1773, -1.1420, 1.7385, -0.3426],
+  [0.1908, -1.2652, 1.8650, -0.3476],
+  [0.2031, -1.3864, 1.9851, -0.3501],
+]
+
+/// The parameters the text shader needs, computed once per gamma setting.
+pub struct TextGamma {
+  /// The four gamma ratios, already normalized (`gamma_ratios` in the shader).
+  pub ratios: [f32; 4],
+  /// The contrast boost for grayscale text (`grayscale_enhanced_contrast` in the shader).
+  pub contrast: f32,
+}
+
+impl Copy for TextGamma {}
+
+fn clamp01(value: f32) -> f32 {
+  if value < 0.0 {
+    return 0.0
+  }
+  if value > 1.0 {
+    return 1.0
+  }
+  return value
+}
+
+impl TextGamma {
+  /// Ratios for `gamma` (clamped to 1.0 ..= 2.2, rounded to a tenth) and a contrast boost of
+  /// `contrast` (0 disables it).
+  pub fn make(gamma: f32, contrast: f32) -> TextGamma {
+    let mut tenth = f32.toF64(gamma) * 10.0
+    if !(tenth >= 10.0) {
+      tenth = 10.0
+    }
+    if tenth > 22.0 {
+      tenth = 22.0
+    }
+    let index = f64.toUsize(f64.floor(tenth + 0.5)) - 10
+    let row = RATIOS[index]
+
+    // Upstream stores each ratio divided by four and multiplies by four again here; the rest
+    // rescales from DirectWrite's 8-bit fixed point.
+    let norm13 = f64.toF32(65536.0 / (255.0 * 255.0))
+    let norm24 = f64.toF32(256.0 / 255.0)
+    return TextGamma {
+      ratios: [row[0] * norm13, row[1] * norm24, row[2] * norm13, row[3] * norm24],
+      contrast: if contrast > 0.0 {
+        contrast
+      } else {
+        0.0
+      },
+    }
+  }
+
+  /// GPUI's defaults: gamma 1.8, contrast 1.0.
+  pub fn default() -> TextGamma {
+    return TextGamma.make(1.8, 1.0)
+  }
+
+  /// No correction: coverage passes through unchanged.
+  pub fn none() -> TextGamma {
+    return TextGamma { ratios: [0.0, 0.0, 0.0, 0.0], contrast: 0.0 }
+  }
+
+  /// The corrected coverage of a `sample` in `0 ..= 1` drawn in straight sRGB `r, g, b` (each in
+  /// `0 ..= 1`).
+  pub fn apply(self: &Self, sample: f32, r: f32, g: f32, b: f32) -> f32 {
+    let brightness = brightnessOf(r, g, b)
+
+    // The contrast boost is full for dark text and fades out as brightness reaches 0.75.
+    let k = self.contrast * clamp01(4.0 * (0.75 - brightness))
+    let contrasted = sample * (k + 1.0) / (sample * k + 1.0)
+    let g0 = self.ratios[0]
+    let g1 = self.ratios[1]
+    let g2 = self.ratios[2]
+    let g3 = self.ratios[3]
+    let correction = (g0 * brightness + g1) * contrasted + (g2 * brightness + g3)
+    return clamp01(contrasted + contrasted * (1.0 - contrasted) * correction)
+  }
+
+  /// [`TextGamma.apply`] for an 8-bit coverage sample and an 8-bit color, rounded back to 8 bits.
+  pub fn apply8(self: &Self, sample: u8, r: u8, g: u8, b: u8) -> u8 {
+    let corrected = self.apply(
+      u8.toF32(sample) / 255.0,
+      u8.toF32(r) / 255.0,
+      u8.toF32(g) / 255.0,
+      u8.toF32(b) / 255.0,
+    )
+    return f32.toU8(f32.floor(corrected * 255.0 + 0.5))
+  }
+}
+
+/// Perceived brightness of straight sRGB `r, g, b`.
+pub fn brightnessOf(r: f32, g: f32, b: f32) -> f32 {
+  return r * 0.30 + g * 0.59 + b * 0.11
+}
