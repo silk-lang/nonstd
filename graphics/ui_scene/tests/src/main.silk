@@ -1,0 +1,536 @@
+//! Golden images from the CPU reference renderer.
+//!
+//! `graphics-ui-scene-tests <goldens directory> [--update]` renders each fixture scene with
+//! `CpuRenderer` and compares it with `<name>.png` in the directory, allowing each channel to
+//! differ by 2 (libm differences between platforms). With `--update` it writes the images instead.
+//! Exits 0 when every fixture matches, 1 on a mismatch, 2 on an error.
+import atlas.atlas { Atlas, AtlasError, AtlasOptions, AtlasTile, Kind }
+import codec.png
+import codec.png { PngError }
+import codec.image { ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.core.option { Option }
+import ui_scene.color as color
+import silk.color.color { ColorSpace, Interpolation }
+import silk.color.rgba { Rgba }
+import ui_scene.cpu { AtlasPixels, CpuRenderer }
+import ui_scene.path_cache { PathCache }
+import ui_scene.primitives {
+  Background,
+  BorderStyle,
+  ColorStop,
+  ContentMask,
+  GlyphSprite,
+  ImageSprite,
+  Isolation,
+  LinearGradient,
+  Quad,
+  Shadow,
+  Underline,
+}
+import ui_scene.scene { Scene }
+import vector.geometry { Affine }
+import vector.geometry_error { GeometryError }
+import vector.layer { BLEND_MULTIPLY }
+import vector.path { Path as VectorPath }
+import vector.pixmap { Pixmap }
+import vector.strips { EVENODD, NONZERO }
+import vector.stroke { CAP_ROUND, JOIN_ROUND, Stroke }
+
+const WIDTH: u32 = 240
+
+const HEIGHT: u32 = 180
+
+const TOLERANCE: u32 = 2
+
+effect fn say(text: string) -> ()
+  ! WriterError {
+  let mut writer = StderrWriter.make()
+  run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+}
+
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect<f32> {
+  return Rect<f32>.new(x, y, x + w, y + h)
+}
+
+fn window() -> ContentMask {
+  return ContentMask.new(rect(0.0, 0.0, u32.toF32(WIDTH), u32.toF32(HEIGHT)))
+}
+
+fn rounded(bounds: Rect<f32>, radius: f32, background: Background) -> Quad {
+  let mut q = Quad.fill(bounds, window(), background)
+  q.cornerRadii = Corners<f32>.uniform(radius)
+  return q
+}
+
+fn shadow(
+  bounds: Rect<f32>,
+  radius: f32,
+  blur: f32,
+  dy: f32,
+  spread: f32,
+  shade: Rgba<f32>,
+  inset: bool,
+) -> Shadow {
+  return Shadow {
+    bounds: bounds,
+    mask: window(),
+    cornerRadii: Corners<f32>.uniform(radius),
+    color: shade,
+    blurRadius: blur,
+    offset: Vector2<f32>.new(0.0, dy),
+    spread: spread,
+    inset: inset,
+  }
+}
+
+/// A 7 x 9 glyph-like coverage pattern: a ring with soft edges.
+effect fn glyphTile(atlas: &mut Atlas, pixels: &mut AtlasPixels) -> AtlasTile
+  ! AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let tile = run atlas.allocate(Kind.Monochrome, 7, 9)
+  run pixels.sync(&atlas.*)
+  let mut coverage = List<u8>.make()
+  let mut y: u32 = 0
+  while y < 9 {
+    let mut x: u32 = 0
+    while x < 7 {
+      let dx = u32.toF32(x) - 3.0
+      let dy = u32.toF32(y) - 4.0
+      let d = f32.sqrt(dx * dx + dy * dy * 0.6)
+      let ring = 1.0 - f32.min(f32.abs(d - 2.5), 1.0)
+      run coverage.append(f32.toU8(ring * 255.0 + 0.5))
+      x = x + 1
+    }
+    y = y + 1
+  }
+  pixels.write(tile, coverage.asSlice())
+  return tile
+}
+
+/// A 16 x 16 premultiplied checker image with a transparent quarter.
+effect fn imageTile(atlas: &mut Atlas, pixels: &mut AtlasPixels) -> AtlasTile
+  ! AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let tile = run atlas.allocate(Kind.Polychrome, 16, 16)
+  run pixels.sync(&atlas.*)
+  let mut texels = List<u8>.make()
+  let mut y: u32 = 0
+  while y < 16 {
+    let mut x: u32 = 0
+    while x < 16 {
+      let texel: [u8; 4] = if x >= 8 && y >= 8 {
+        [0, 0, 0, 0]
+      } else if (x / 4 + y / 4) % 2 == 0 {
+        [230, 120, 20, 255]
+      } else {
+        [20, 60, 120, 160]
+      }
+      run texels.appendSlice(&texel)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  pixels.write(tile, texels.asSlice())
+  return tile
+}
+
+/// Cards with shadows, borders, gradient headers, text-like glyphs, an image, underlines and
+/// vector icons.
+effect fn cards(scene: &mut Scene, pixels: &mut AtlasPixels) -> ()
+  ! AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(
+    AtlasOptions { textureSize: 64, maxTextureSize: 64, maxTextures: 1, padding: 1 },
+  )
+  let glyph = run glyphTile(&mut atlas, &mut pixels)
+  let picture = run imageTile(&mut atlas, &mut pixels)
+  let mut cache = PathCache.make()
+  run cache.beginFrame()
+  drop run scene.quad(
+    Quad.fill(rect(0.0, 0.0, 240.0, 180.0), window(), Background.solid(color.rgb(0xf2f3f5))),
+  )
+  let mut i: u32 = 0
+  while i < 2 {
+    let x = 12.0 + u32.toF32(i) * 114.0
+    let card = rect(x, 14.0, 102.0, 150.0)
+    drop run scene.shadow(shadow(card, 10.0, 12.0, 4.0, 0.0, color.rgba(0x10203050), false))
+    let mut body = rounded(card, 10.0, Background.solid(color.white()))
+    body.borderWidths = Insets<f32>.uniform(1.0)
+    body.borderColor = color.rgba(0x0000001f)
+    drop run scene.quad(body)
+    let mut header = rounded(
+      rect(x, 14.0, 102.0, 34.0),
+      0.0,
+      Background.linear(90.0 + u32.toF32(i) * 45.0, color.rgb(0x4f46e5), color.rgb(0x06b6d4)),
+    )
+    header.cornerRadii = Corners<f32>.new(10.0, 10.0, 0.0, 0.0)
+    drop run scene.quad(header)
+    let mut g: u32 = 0
+    while g < 9 {
+      drop run scene.glyph(
+        GlyphSprite {
+          bounds: rect(x + 8.0 + u32.toF32(g) * 8.0, 58.0, 7.0, 9.0),
+          mask: window(),
+          tile: glyph,
+          color: color.rgb(0x111827),
+        },
+      )
+      g = g + 1
+    }
+    drop run scene.underline(
+      Underline {
+        bounds: rect(x + 8.0, 68.0, 70.0, 4.0),
+        mask: window(),
+        color: color.rgb(0xdc2626),
+        thickness: 1.0,
+        wavy: i == 1,
+      },
+    )
+    drop run scene.image(
+      ImageSprite {
+        bounds: rect(x + 8.0, 80.0, 32.0 + u32.toF32(i) * 8.0, 32.0),
+        mask: window(),
+        tile: picture,
+        opacity: 1.0,
+        cornerRadii: Corners<f32>.uniform(6.0),
+        grayscale: i == 1,
+      },
+    )
+
+    // A check-mark icon, stroked, and a filled star.
+    let mut check = VectorPath.make()
+    run check.moveTo(0.0, 6.0)
+    run check.lineTo(5.0, 11.0)
+    run check.lineTo(14.0, 1.0)
+    let mut style = Stroke.make(2.5)
+    style.cap = CAP_ROUND
+    style.join = JOIN_ROUND
+    let at = Affine.new(1.0, 0.0, 0.0, 1.0, f32.toF64(x) + 60.0, 86.25)
+    drop run cache.stroke(
+      &mut scene,
+      1,
+      &check,
+      &style,
+      &at,
+      Background.solid(color.rgb(0x16a34a)),
+      window(),
+    )
+    let mut star = VectorPath.make()
+    let mut k: u32 = 0
+    while k < 5 {
+      let angle = f64.toF64(
+        u32.toF64(k * 2 % 5) * 2.0 * 3.141592653589793 / 5.0 - 1.5707963267948966,
+      )
+      let px = 12.0 * f64.cos(angle)
+      let py = 12.0 * f64.sin(angle)
+      if k == 0 {
+        run star.moveTo(px, py)
+      } else {
+        run star.lineTo(px, py)
+      }
+      k = k + 1
+    }
+    run star.close()
+    let rule = if i == 0 {
+      NONZERO
+    } else {
+      EVENODD
+    }
+    let place = Affine.new(1.0, 0.0, 0.0, 1.0, f32.toF64(x) + 70.0, 135.5)
+    drop run cache.fill(
+      &mut scene,
+      2,
+      &star,
+      &place,
+      rule,
+      Background.linear(180.0, color.rgb(0xf59e0b), color.rgb(0xef4444)),
+      window(),
+    )
+    i = i + 1
+  }
+}
+
+/// Corner radii, uneven and dashed borders, and a translucent border over its background.
+effect fn borders(scene: &mut Scene) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run scene.quad(
+    Quad.fill(rect(0.0, 0.0, 240.0, 180.0), window(), Background.solid(color.white())),
+  )
+  let mut a = rounded(rect(10.0, 10.0, 60.0, 60.0), 0.0, Background.solid(color.rgb(0xfde68a)))
+  a.cornerRadii = Corners<f32>.new(0.0, 12.0, 30.0, 4.0)
+  a.borderWidths = Insets<f32>.new(2.0, 6.0, 10.0, 1.0)
+  a.borderColor = color.rgb(0x92400e)
+  drop run scene.quad(a)
+  let mut b = rounded(rect(90.0, 10.0, 60.0, 60.0), 30.0, Background.solid(color.rgb(0xbfdbfe)))
+  b.borderWidths = Insets<f32>.uniform(3.0)
+  b.borderColor = color.rgb(0x1e3a8a)
+  b.borderStyle = BorderStyle.Dashed
+  drop run scene.quad(b)
+  let mut c = rounded(rect(170.0, 10.0, 60.0, 60.0), 8.0, Background.solid(color.rgb(0x22c55e)))
+  c.borderWidths = Insets<f32>.uniform(8.0)
+  c.borderColor = color.rgba(0x00000060)
+  drop run scene.quad(c)
+  let mut d = rounded(rect(10.5, 90.25, 100.0, 70.0), 14.0, Background.solid(color.transparent()))
+  d.borderWidths = Insets<f32>.uniform(2.0)
+  d.borderColor = color.rgb(0xdb2777)
+  d.borderStyle = BorderStyle.Dashed
+  drop run scene.quad(d)
+  let oklab = Background.Linear {
+    gradient: LinearGradient {
+      angle: 135.0,
+      from: ColorStop { color: color.rgb(0xff0000), offset: 0.1 },
+      to: ColorStop { color: color.rgba(0x0000ff40), offset: 0.9 },
+      interpolation: Interpolation.new(ColorSpace.Oklab),
+    },
+  }
+  drop run scene.quad(rounded(rect(130.0, 90.0, 100.0, 70.0), 20.0, oklab))
+}
+
+/// Drop shadows with offsets and spread, an inset shadow, and a shadow clipped by its mask.
+effect fn shadows(scene: &mut Scene) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run scene.quad(
+    Quad.fill(rect(0.0, 0.0, 240.0, 180.0), window(), Background.solid(color.rgb(0xe5e7eb))),
+  )
+  let a = rect(20.0, 20.0, 60.0, 50.0)
+  drop run scene.shadow(shadow(a, 8.0, 16.0, 8.0, 2.0, color.rgba(0x00000080), false))
+  drop run scene.quad(rounded(a, 8.0, Background.solid(color.white())))
+  let b = rect(110.0, 20.0, 100.0, 50.0)
+  drop run scene.shadow(shadow(b, 25.0, 4.0, 0.0, 6.0, color.rgba(0x7c3aedc0), false))
+  drop run scene.quad(rounded(b, 25.0, Background.solid(color.white())))
+  let c = rect(20.0, 100.0, 90.0, 60.0)
+  drop run scene.quad(rounded(c, 12.0, Background.solid(color.white())))
+  drop run scene.shadow(shadow(c, 12.0, 10.0, 3.0, 2.0, color.rgba(0x000000a0), true))
+  let mut clipped = shadow(
+    rect(140.0, 100.0, 70.0, 60.0),
+    0.0,
+    20.0,
+    0.0,
+    0.0,
+    color.rgb(0x0f766e),
+    false,
+  )
+  clipped.mask = ContentMask.new(rect(130.0, 90.0, 60.0, 80.0))
+  drop run scene.shadow(clipped)
+}
+
+/// Isolated layers with opacity and multiply, a pinned layer, and nested content masks.
+effect fn layers(scene: &mut Scene) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run scene.quad(
+    Quad.fill(
+      rect(0.0, 0.0, 240.0, 180.0),
+      window(),
+      Background.linear(90.0, color.rgb(0xfef3c7), color.rgb(0xdbeafe)),
+    ),
+  )
+  drop run scene.pushIsolatedLayer(
+    rect(10.0, 10.0, 100.0, 80.0),
+    window(),
+    Isolation { opacity: 0.6, blend: 0 },
+  )
+  drop run scene.quad(
+    rounded(rect(15.0, 15.0, 60.0, 60.0), 30.0, Background.solid(color.rgb(0xef4444))),
+  )
+  drop run scene.quad(
+    rounded(rect(45.0, 25.0, 60.0, 60.0), 30.0, Background.solid(color.rgb(0x3b82f6))),
+  )
+  run scene.popLayer()
+  drop run scene.pushIsolatedLayer(
+    rect(130.0, 10.0, 100.0, 80.0),
+    window(),
+    Isolation { opacity: 1.0, blend: BLEND_MULTIPLY },
+  )
+  drop run scene.quad(
+    rounded(rect(135.0, 15.0, 60.0, 60.0), 30.0, Background.solid(color.rgb(0xf97316))),
+  )
+  drop run scene.quad(
+    rounded(rect(165.0, 25.0, 60.0, 60.0), 30.0, Background.solid(color.rgb(0x14b8a6))),
+  )
+  run scene.popLayer()
+  run scene.pushLayer(rect(10.0, 100.0, 220.0, 70.0))
+  let outer = ContentMask.new(rect(20.5, 105.0, 150.0, 60.0))
+  let inner = outer.intersect(ContentMask.new(rect(60.0, 120.0, 200.0, 30.0)))
+  let mut i: u32 = 0
+  while i < 6 {
+    let mut q = rounded(
+      rect(10.0 + u32.toF32(i) * 36.0, 110.0, 32.0, 50.0),
+      6.0,
+      Background.solid(color.rgb(0x6366f1)),
+    )
+    q.mask = if i % 2 == 0 {
+      outer
+    } else {
+      inner
+    }
+    drop run scene.quad(q)
+    i = i + 1
+  }
+  run scene.popLayer()
+}
+
+/// Renders fixture `index`, or returns false past the last one.
+effect fn renderFixture(index: u32, target: &mut Pixmap) -> bool
+  ! AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut scene = Scene.make()
+  let mut pixels = AtlasPixels.make()
+  if index == 0 {
+    run cards(&mut scene, &mut pixels)
+  } else if index == 1 {
+    run borders(&mut scene)
+  } else if index == 2 {
+    run shadows(&mut scene)
+  } else if index == 3 {
+    run layers(&mut scene)
+  } else {
+    return false
+  }
+  run scene.finish()
+  let mut renderer = CpuRenderer.make()
+  run renderer.draw(&scene, &pixels, &mut target)
+  return true
+}
+
+fn fixtureFile(index: u32) -> string<'static> {
+  return match index {
+    0 => "cards.png"
+    1 => "borders.png"
+    2 => "shadows.png"
+    _ => "layers.png"
+  }
+}
+
+/// The number of channels that differ by more than [`TOLERANCE`].
+fn mismatches(actual: &[u8], expected: &[u8]) -> u32 {
+  if actual.length != expected.length {
+    return 4294967295
+  }
+  let mut count: u32 = 0
+  let mut i: usize = 0
+  while i < actual.length {
+    let a = u8.toU32(actual[i])
+    let b = u8.toU32(expected[i])
+    let d = if a > b {
+      a - b
+    } else {
+      b - a
+    }
+    if d > TOLERANCE {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+/// Renders every fixture and compares it with (or, with `update`, writes) its golden image.
+/// Returns the number of fixtures that do not match.
+effect fn check(directory: &Path, update: bool) -> u32
+  ! AtlasError | GeometryError | OutOfMemoryError | WriterError | FileError | ImageError | PngError
+  ? &mut FileSystem | &mut Allocator {
+  let mut failures: u32 = 0
+  let mut index: u32 = 0
+  while index < 4 {
+    let mut target = run Pixmap.make(WIDTH, HEIGHT)
+    drop run renderFixture(index, &mut target)
+    let file = run Path.join(directory, fixtureFile(index))
+    if update {
+      let encoded = run png.encodePixels(WIDTH, HEIGHT, target.data())
+      run FileSystem.writeFile(&file, Bytes.asSlice(&encoded))
+      run say("wrote ")
+    } else {
+      let data = run FileSystem.readFile(&file)
+      let golden = run png.decode(Bytes.asSlice(&data))
+
+      // Compare through the same PNG round trip (straight alpha, rounded), so only rendering
+      // differences count.
+      let encoded = run png.encodePixels(WIDTH, HEIGHT, target.data())
+      let actual = run png.decode(Bytes.asSlice(&encoded))
+      let bad = mismatches(actual.data(), golden.data())
+      if bad == 0 {
+        run say("ok ")
+      } else {
+        failures = failures + 1
+        run say("MISMATCH ")
+      }
+    }
+    run say(fixtureFile(index))
+    run say("\n")
+    index = index + 1
+  }
+  return failures
+}
+
+effect fn process() -> i32
+  ! AtlasError
+    | GeometryError
+    | OutOfMemoryError
+    | WriterError
+    | FileError
+    | HostInputError
+    | ImageError
+    | PngError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  if count < 2 {
+    run say("usage: graphics-ui-scene-tests <goldens directory> [--update]\n")
+    return 2
+  }
+  let update = count > 2
+  let raw = match run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => Bytes.make()
+  }
+  let cwd = run HostInput.workingDirectory()
+  let base = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let directory = run Path.resolveBytes(&base, Bytes.asSlice(&raw))
+  let mut files = run MachineFileSystem.make()
+  let failures = run check(&directory, update) |> Effect.provideMut<FileSystem>(&mut files)
+  return if failures == 0 {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn failed<E>(error: E) -> i32
+  ! WriterError {
+  drop error
+  run say("graphics-ui-scene-tests: rendering, file access or PNG coding failed\n")
+  return 2
+}
+
+effect fn failedQuietly<E>(error: E) -> i32 {
+  drop error
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(Effect.catchAll(process(), failed), failedQuietly)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

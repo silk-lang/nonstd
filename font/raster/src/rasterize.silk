@@ -1,0 +1,311 @@
+//! Glyph outlines through `vector` coverage into tightly cropped A8 images.
+//!
+//! The outline is scaled to device pixels with the pen at `(subpixelOffset, 0)` on the baseline
+//! (y down), filled with the nonzero rule by [`vector.strips.Rasterizer`], expanded to one byte
+//! per pixel and cropped to the pixels with nonzero coverage. Nothing is hinted.
+import face { FontFace }
+import font_outline.vector_path { PathRecorder }
+import font_types.lib { GlyphId }
+import vector.path { Path }
+import vector.geometry { Affine, Point }
+import vector.geometry_error { GeometryError }
+import vector.strips { Rasterizer, Coverage, Strip, Fill, BAND, NONZERO }
+import silk.geometry.affine { Affine2 }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+
+/// Pixels for one glyph, placed relative to the pen.
+///
+/// The image's top-left pixel sits `left` pixels right of the pen's whole pixel and `top` rows
+/// below the baseline (negative above it). `pixels` holds `width * height * bytesPerPixel`
+/// bytes, row major: one coverage byte per pixel for an outline glyph, premultiplied RGBA for a
+/// color glyph.
+pub struct GlyphImage {
+  pub left: i32,
+  pub top: i32,
+  pub width: u32,
+  pub height: u32,
+  pub bytesPerPixel: u32,
+  pub pixels: List<u8>,
+}
+
+impl GlyphImage {
+  pub fn make() -> GlyphImage {
+    return GlyphImage {
+      left: 0,
+      top: 0,
+      width: 0,
+      height: 0,
+      bytesPerPixel: 1,
+      pixels: List<u8>.make(),
+    }
+  }
+
+  /// True when nothing is drawn (a space, or an outline with no area).
+  pub fn isEmpty(self: &Self) -> bool {
+    return self.width == 0 || self.height == 0
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.left = 0
+    self.top = 0
+    self.width = 0
+    self.height = 0
+    self.bytesPerPixel = 1
+    self.pixels.clear()
+  }
+
+  /// The coverage (or alpha, for a color image) of pixel `(x, y)`, or 0 outside the image.
+  pub fn alphaAt(self: &Self, x: i32, y: i32) -> u8 {
+    if x < 0 || y < 0 || x >= u32.toI32(self.width) || y >= u32.toI32(self.height) {
+      return 0
+    }
+    let index = i32.toUsize(y) * u32.toUsize(self.width) + i32.toUsize(x)
+    let bpp = u32.toUsize(self.bytesPerPixel)
+    return self.pixels.asSlice()[index * bpp + bpp - 1]
+  }
+}
+
+/// Reusable scratch for rasterizing glyphs. Keep one per thread.
+pub struct GlyphRasterizer {
+  path: Path,
+  rasterizer: Rasterizer,
+  dense: List<u8>,
+}
+
+/// The outcome of [`GlyphRasterizer.outline`].
+pub union Outcome {
+  /// The image holds the glyph (possibly empty, for a space).
+  Drawn,
+  /// The font has no outline for this glyph, or the outline is malformed.
+  Missing,
+}
+
+impl GlyphRasterizer {
+  pub fn make() -> GlyphRasterizer {
+    return GlyphRasterizer {
+      path: Path.make(),
+      rasterizer: Rasterizer.make(),
+      dense: List<u8>.make(),
+    }
+  }
+
+  /// Draws `glyph` of `face` into `self.path` in device pixels, with the pen at
+  /// `(penX, penY)`. Returns false when the face has no outline for it.
+  pub effect fn outlinePath(
+    self: &mut Self,
+    face: &FontFace,
+    glyph: u32,
+    pixelsPerEm: f64,
+    penX: f64,
+    penY: f64,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.path.clear()
+    let mut recorder = PathRecorder.new(&mut self.path, face.scaleFor(pixelsPerEm), penX, penY)
+    let drawn = run face.outlineReader().draw(
+      GlyphId.new(glyph),
+      face.variationCoords(),
+      &mut recorder,
+    )
+    if recorder.failed {
+      fail OutOfMemoryError {}
+    }
+    return drawn
+  }
+
+  /// Replaces `out` with the coverage of the last drawn path under `transform` (nonzero rule).
+  pub effect fn fillPath(self: &mut Self, transform: &Affine, out: &mut Coverage) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    run self.rasterizer.fill(&self.path, transform, NONZERO, &mut out)
+  }
+
+  /// The path [`GlyphRasterizer.outlinePath`] last drew.
+  pub fn lastPath(self: &Self) -> &Path {
+    return &self.path
+  }
+
+  /// Replaces `out` with `glyph` of `face` at `pixelsPerEm` device pixels per em, with the pen
+  /// `subpixelOffset` pixels (in `0 ..< 1`) right of the pixel the image is placed from.
+  pub effect fn outline(
+    self: &mut Self,
+    face: &FontFace,
+    glyph: u32,
+    pixelsPerEm: f64,
+    subpixelOffset: f64,
+    out: &mut GlyphImage,
+  ) -> Outcome
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    if !(pixelsPerEm > 0.0) {
+      return Outcome.Drawn
+    }
+    let drawn = run self.outlinePath(face, glyph, pixelsPerEm, subpixelOffset, 0.0)
+    if !drawn {
+      return Outcome.Missing
+    }
+    let points = self.path.pointList()
+    if points.length == 0 {
+      return Outcome.Drawn
+    }
+
+    // Control points bound the curves, so this box holds every covered pixel.
+    let mut x0 = points[0].x
+    let mut y0 = points[0].y
+    let mut x1 = x0
+    let mut y1 = y0
+    let mut i: usize = 1
+    while i < points.length {
+      let p = points[i]
+      x0 = f64.min(x0, p.x)
+      y0 = f64.min(y0, p.y)
+      x1 = f64.max(x1, p.x)
+      y1 = f64.max(y1, p.y)
+      i = i + 1
+    }
+    if !f64.isFinite(x0) || !f64.isFinite(y0) || !f64.isFinite(x1) || !f64.isFinite(y1) {
+      return Outcome.Missing
+    }
+    let left = f64.floor(x0)
+    let top = f64.floor(y0)
+    let width = f64.ceil(x1) - left
+    let height = f64.ceil(y1) - top
+
+    // 8192 is the largest texture side the atlas allows.
+    if !(width > 0.0 && height > 0.0) || width > 8192.0 || height > 8192.0 {
+      return Outcome.Drawn
+    }
+    let w = f64.toU32(width)
+    let h = f64.toU32(height)
+    let mut coverage = Coverage.make(w, h)
+    let transform = Affine2<f64>.new(1.0, 0.0, 0.0, 1.0, -left, -top)
+    let filled = run Effect.result(
+      self.rasterizer.fill(&self.path, &transform, NONZERO, &mut coverage),
+    )
+    if let Result<(), OutOfMemoryError | GeometryError>.Failure { error } = move filled {
+      match move error {
+        OutOfMemoryError problem => {
+          fail move problem
+        }
+        GeometryError problem => {
+          return Outcome.Missing
+        }
+      }
+    }
+    run densify(&coverage, &mut self.dense)
+    run crop(self.dense.asSlice(), w, h, f64.toI32(left), f64.toI32(top), &mut out)
+    return Outcome.Drawn
+  }
+}
+
+/// Writes `coverage` as `width * height` row-major bytes into `out`.
+pub effect fn densify(coverage: &Coverage, out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let width = u32.toUsize(coverage.width())
+  let height = u32.toUsize(coverage.height())
+  out.clear()
+  run out.appendRepeated(0, width * height)
+  let bytes = out.asMutSlice()
+  let alphas = coverage.alphas()
+  let band = u32.toUsize(BAND)
+  let strips = coverage.strips()
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let y = u32.toUsize(strip.y)
+    let x = u32.toUsize(strip.x)
+    let mut column: usize = 0
+    while column < u32.toUsize(strip.width) {
+      let mut row: usize = 0
+      while row < band && y + row < height {
+        bytes[(y + row) * width + x + column] = alphas[u32.toUsize(strip.alphaOffset)
+          + column * band
+          + row]
+        row = row + 1
+      }
+      column = column + 1
+    }
+    s = s + 1
+  }
+  let fills = coverage.fills()
+  let mut f: usize = 0
+  while f < fills.length {
+    let fill = fills[f]
+    let y = u32.toUsize(fill.y)
+    let mut row: usize = 0
+    while row < band && y + row < height {
+      let start = (y + row) * width + u32.toUsize(fill.x)
+      let mut column: usize = 0
+      while column < u32.toUsize(fill.width) {
+        bytes[start + column] = 255
+        column = column + 1
+      }
+      row = row + 1
+    }
+    f = f + 1
+  }
+}
+
+/// Copies the smallest rectangle of `dense` (a `width` x `height` image placed at `(left, top)`)
+/// that holds every nonzero byte into `out`. Leaves `out` empty when every byte is zero.
+effect fn crop(
+  dense: &[u8],
+  width: u32,
+  height: u32,
+  left: i32,
+  top: i32,
+  out: &mut GlyphImage,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let w = u32.toUsize(width)
+  let h = u32.toUsize(height)
+  let mut minX = w
+  let mut minY = h
+  let mut maxX: usize = 0
+  let mut maxY: usize = 0
+  let mut y: usize = 0
+  while y < h {
+    let mut x: usize = 0
+    while x < w {
+      if dense[y * w + x] != 0 {
+        if x < minX {
+          minX = x
+        }
+        if x + 1 > maxX {
+          maxX = x + 1
+        }
+        if y < minY {
+          minY = y
+        }
+        maxY = y + 1
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  if maxX <= minX || maxY <= minY {
+    return
+  }
+  out.left = left + usize.toI32(minX)
+  out.top = top + usize.toI32(minY)
+  out.width = usize.toU32(maxX - minX)
+  out.height = usize.toU32(maxY - minY)
+  run out.pixels.reserve((maxX - minX) * (maxY - minY))
+  let mut row = minY
+  while row < maxY {
+    run out.pixels.appendSlice(Slice.view<u8>(dense, row * w + minX, maxX - minX))
+    row = row + 1
+  }
+}

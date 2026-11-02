@@ -31,8 +31,8 @@ def windows_dawn(clang, dawn):
     Silk's native entry point deliberately does not initialize the C runtime.
     The pinned Dawn archive uses the dynamic MSVC CRT. Link it into a DLL with
     its public C exports; Silk links the resulting import library. Returns a
-    directory shaped like the Dawn archive (include/, lib/nonstd_dawn.lib,
-    bin/nonstd_dawn.dll) that scripts/prepare-windows names as the override of
+    directory shaped like the Dawn archive (include/, lib/nonstd_dawn.lib and the
+    CRT import libraries, bin/nonstd_dawn.dll) that scripts/prepare-windows names as the override of
     gpu/webgpu/sys's `dawn` archive.
     Run from an x64 Visual Studio developer shell with the Windows SDK installed.
     """
@@ -43,7 +43,7 @@ def windows_dawn(clang, dawn):
     stage = CACHE / "native-dawn" / key
     library = stage / "lib" / "nonstd_dawn.lib"
     dll = stage / "bin" / "nonstd_dawn.dll"
-    if not library.exists() or not dll.exists() or not (stage / "include").is_dir():
+    if not library.exists() or not dll.exists() or not (stage / "lib" / "vcruntime.lib").is_file():
         for directory in (stage / "lib", stage / "bin"):
             directory.mkdir(parents=True, exist_ok=True)
         exports = stage / "exports.def"
@@ -56,6 +56,8 @@ def windows_dawn(clang, dawn):
                         "-luser32", "-lonecore_apiset", "-ldxguid"], check=True)
         if not (stage / "include").is_dir():
             shutil.copytree(dawn / "include", stage / "include")
+        for name in ("ucrt", "vcruntime"):
+            shutil.copy2(windows_import_library(name), stage / "lib" / f"{name}.lib")
     return stage
 
 

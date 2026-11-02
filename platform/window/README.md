@@ -8,13 +8,13 @@ from. It draws nothing itself.
 | Backend | Module | State |
 | --- | --- | --- |
 | macOS (AppKit, `CAMetalLayer`, `CADisplayLink`, `NSTextInputClient`) | `macos` | First backend |
+| Windows (Win32, IMM32, DwmFlush pacing) | `bridge` | Complete |
+| Linux (Wayland with text-input-v3, else X11 with XIM) | `bridge` | Complete |
+| Browser canvas (hidden textarea for input methods) | `bridge` | Complete |
 | Headless, for tests | `headless` | Complete |
-| Windows (Win32, IMM or TSF) | | Next, same interface |
-| Linux (Wayland with text-input-v3, then X11) | | Next, same interface |
-| Browser canvas | | Next, same interface |
 
-`native.NativePlatform` names the backend for the compilation target. Until a target has
-its own backend it is `HeadlessPlatform`.
+`native.NativePlatform` names the backend for the compilation target: `MacPlatform` on
+macOS, `BridgePlatform` on Windows, Linux and wasm32, and `HeadlessPlatform` elsewhere.
 
 ## The model
 
@@ -89,6 +89,45 @@ Frames are paced by the view's `CADisplayLink` (macOS 14+), which runs on the ma
 in every mode, including during a live resize, and is paused while no frame is requested.
 `CVDisplayLink`, which the design doc names, is deprecated and calls back on another thread.
 
+## How the Windows, Linux and browser backends work
+
+They share one C ABI, `native/bridge.h`, and one Silk side, `src/bridge.silk`
+(`BridgePlatform`), which decodes the same event record as the macOS bridge. The Silk
+declarations (`src/bridge_sys.silk`) and the browser's import list (`browser/imports.js`) are
+generated from one table by `scripts/generate-bridge`. `BridgePlatform.backend()` says which
+window system is in use, and its `simulate*` methods feed input through the backend for
+tests.
+
+**Windows** (`native/windows/bridge.c`). Windows has modal loops of its own like AppKit:
+live resize, window moves, menus. The message pump runs on a fiber, and the window procedure
+switches back to Silk as soon as an event is queued, so frames keep coming during a resize. A
+timer keeps the pump waking inside those loops. A helper thread waits on `DwmFlush` and
+signals each composition while a window wants a frame. Per-monitor DPI v2, dark title bars,
+`HMENU` menu bars (the client size is kept when a menu is added), IMM32 composition with the
+candidate window at the caret, `IFileDialog` run from the pump so `nextEvent` keeps
+returning, and the Unicode clipboard. `SILK_WINDOW_FIBER=0` pumps on the caller's stack.
+
+**Linux** (`native/linux/`). Wayland when `WAYLAND_DISPLAY` is set and the compositor has
+xdg-shell, else X11; `SILK_WINDOW_BACKEND=x11|wayland` forces one. Wayland: xdg-decoration,
+or a drawn title bar where the compositor wants client-side decorations; fractional scale
+with viewporter; frame callbacks for pacing (with a timer until the first one arrives, since
+hidden surfaces get none); xkbcommon with compose and key repeat; text-input-v3;
+`wl_data_device` for the clipboard; cursor-shape when offered. X11: XIM with preedit
+callbacks, the `CLIPBOARD` selection, `_NET_WM` hints. File dialogs run `zenity` or
+`kdialog` as a child process (`SILK_WINDOW_DIALOG` names another command).
+
+**Browser** (`browser/window-host.js`). A window is a canvas; `RawSurface.Canvas` carries its
+handle and the canvas has the id `silk-window-<handle>` for `SurfaceTarget.canvasId`. Keys,
+text and composition go through one hidden textarea placed at the caret, so input methods
+work and place their candidate window by the text. `requestAnimationFrame` paces frames. A
+browser cannot block: `nextEvent` returns what is queued, unless the page calls the module
+through JSPI (`host.suspendingImports` and `host.promising`), in which case a wait suspends
+the wasm stack until an event arrives. Without JSPI, drive the app from `requestAnimationFrame`
+and `host.onWake` with `Wait.Poll`.
+
+Menus outside macOS and Windows have no visible bar, but their shortcuts work and system
+items (Quit, Close Window, Toggle Full Screen) get the usual ones.
+
 ## Build and test
 
 Unit tests run anywhere, on the headless backend:
@@ -104,9 +143,19 @@ python3 platform/window/scripts/macos smoke   # real window: frames, resize, IME
 python3 platform/window/scripts/macos demo    # WebGPU demo for the checks below
 ```
 
+Smoke tests for the other backends, all running the shared checks in `tests/smoke`:
+
+```sh
+python3 platform/window/scripts/linux smoke     # under Xvfb and a headless Weston
+python3 platform/window/scripts/windows smoke   # from an x64 Visual Studio developer shell
+python3 platform/window/scripts/browser smoke   # in the installed Playwright Chromium
+```
+
 `silk.toml` compiles the AppKit bridge (`native/macos/bridge.m`) and links the `Cocoa`,
 `QuartzCore` and `UniformTypeIdentifiers` frameworks on macOS. Both reach every program that
-depends on the package, so a program using the macOS backend needs no `[native]` section.
+depends on the package, so a program using the macOS backend needs no `[native]` section. The
+Linux and Windows bridges are still built and staged by `scripts/linux` and `scripts/windows`,
+so `tests/linux` and `tests/windows` are not workspace members.
 
 The demo is the manual part of the exit test: drag a window edge and watch frames keep
 coming; move the window between a Retina and a non-Retina display; leave it idle and see that
@@ -121,5 +170,13 @@ The key tables in `src/keys.silk` and `native/macos/keys.h` are generated by
 - A cross-thread waker for `nextEvent`.
 - File drag and drop, context menus, accessibility, and custom title bar hit testing beyond
   `startWindowDrag`.
+- X11: frames are paced at 60 Hz (or `SILK_WINDOW_REFRESH_HZ`) rather than read from
+  XRandR, and clipboard transfers do not use INCR, so very large texts are refused.
+- Wayland: `focus` cannot raise a window (the protocol leaves that to the compositor), and
+  the drawn title bar has no resize edges.
+- Windows: Text Services Framework; IMM32 covers the input methods people use, and TSF would
+  add reconversion.
+- Browser: save dialogs, and clipboard reads beyond what the app wrote or the user pasted
+  (the async clipboard API needs a permission and cannot answer synchronously).
 - Surrounding-text queries for the input method (reconversion); the input method sees the
   composition only.

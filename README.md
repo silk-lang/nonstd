@@ -12,6 +12,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`font/parse`](font/parse) | `font-parse` | Font file parsing and a font model (outlines, metrics, charmaps); a port of read-fonts and skrifa |
 | [`font/shape`](font/shape) | `font-shape` | Text shaping; a port of harfrust |
 | [`font/outline`](font/outline) | `font-outline` | Glyph outlines as path commands or `vector` paths |
+| [`font/raster`](font/raster) | `font-raster` | The UI glyph cache: unhinted glyphs in atlas tiles, shaped lines, text gamma |
 | [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser |
 | [`css/style`](css/style) | `css-style` | CSS parsing, selectors and the cascade |
 | [`css/layout`](css/layout) | `css-layout` | Block, inline, flex and grid layout |
@@ -20,6 +21,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`graphics/vector`](graphics/vector) | `graphics-vector` | A pure-Silk 2D rasterizer |
 | [`graphics/gpu_scene`](graphics/gpu_scene) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU output |
 | [`graphics/atlas`](graphics/atlas) | `graphics-atlas` | A texture atlas allocator for glyphs, icons and images, with eviction by last use |
+| [`graphics/ui_scene`](graphics/ui_scene) | `graphics-ui-scene` | UI frame primitives (quads, shadows, sprites, paths) ordered and batched for a GPU, with a CPU reference renderer |
 | [`graphics/sprites`](graphics/sprites) | `graphics-sprites` | SVG icons and decoded images as atlas tiles for the UI renderer |
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
