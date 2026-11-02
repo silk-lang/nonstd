@@ -1,0 +1,216 @@
+//! The fonts an application can draw with: faces from font files, CSS font matching over a
+//! family list, and the fallback families tried when no listed family has a character.
+//!
+//! Face reading and CSS Fonts 4 matching (#font-style-matching) come from the SVG font
+//! database; this module adds family lists with generic names and the fallback order.
+import svg_fonts.database { FontDatabase, Fonts, Face, Generic }
+import svg_fonts.matching { Request, Selection, select }
+import read_fonts.lib { FontRef, ReadError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.unicode_script { Script }
+
+/// One entry of a CSS `font-family` list.
+pub union Family {
+  /// A family name, matched case-insensitively against the faces' family names.
+  Named { pub name: Bytes },
+  /// A generic family, resolved through [`FontCollection.addGeneric`].
+  Generic { pub generic: Generic },
+}
+
+impl Family {
+  /// A family entry naming `name`.
+  pub effect fn named(name: &[u8]) -> Family
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = Bytes.make()
+    run Bytes.append(&mut copy, name)
+    return Family.Named { name: move copy }
+  }
+
+  pub fn generic(generic: Generic) -> Family {
+    return Family.Generic { generic: generic }
+  }
+
+  pub effect fn copy(self: &Self) -> Family
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &self.* {
+      Family.Named { name } => run Family.named(Bytes.asSlice(&name))
+      Family.Generic { generic } => Family.Generic { generic: generic }
+    }
+  }
+}
+
+struct ScriptFamily {
+  script: Script,
+  name: Bytes,
+}
+
+/// Fonts and the order to fall back through them.
+///
+/// Fallback for a character tries, in order: the families the text asks for, the families
+/// registered for the character's script with [`FontCollection.addScriptFallback`], the
+/// families registered with [`FontCollection.addFallback`], and then every face in the order
+/// it was added. A face is used when its `cmap` maps the character.
+pub struct FontCollection {
+  pub database: FontDatabase,
+  fallbacks: List<Bytes>,
+  scriptFallbacks: List<ScriptFamily>,
+}
+
+impl FontCollection {
+  pub fn make() -> FontCollection {
+    return FontCollection {
+      database: FontDatabase.make(),
+      fallbacks: List<Bytes>.make(),
+      scriptFallbacks: List<ScriptFamily>.make(),
+    }
+  }
+
+  /// Adds every usable face of an sfnt font or collection and returns how many were added.
+  pub effect fn add(self: &mut Self, data: Bytes) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.database.add(move data)
+  }
+
+  /// Appends a family to the list a generic family name resolves to.
+  pub effect fn addGeneric(self: &mut Self, generic: Generic, name: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.database.addGeneric(generic, name)
+  }
+
+  /// Appends a family tried for any character no requested family has.
+  pub effect fn addFallback(self: &mut Self, name: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = Bytes.make()
+    run Bytes.append(&mut copy, name)
+    run self.fallbacks.append(move copy)
+  }
+
+  /// Appends a family tried before the general fallbacks for characters of `script`.
+  pub effect fn addScriptFallback(self: &mut Self, script: Script, name: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = Bytes.make()
+    run Bytes.append(&mut copy, name)
+    run self.scriptFallbacks.append(ScriptFamily { script: script, name: move copy })
+  }
+
+  pub fn faceCount(self: &Self) -> usize {
+    return self.database.faceCount()
+  }
+
+  pub fn face(self: &Self, index: usize) -> &Face {
+    return self.database.face(index)
+  }
+
+  /// The font file holding face `index`.
+  pub fn data(self: &Self, index: usize) -> &[u8] {
+    return self.database.data(index)
+  }
+
+  /// Face `index` as a font, or None when its data no longer reads.
+  pub fn font<'a>(self: &'a Self, index: usize) -> Option<FontRef<'a>> {
+    let face = self.database.face(index)
+    return match move FontRef.fromIndex(self.database.data(index), face.index) {
+      Result<FontRef<'a>, ReadError>.Success { value } => Option<FontRef<'a>>.Some { value: value }
+      Result<FontRef<'a>, ReadError>.Failure { error: _ } => Option<FontRef<'a>>.None
+    }
+  }
+
+  /// The faces of one family entry, in the order they were added.
+  pub effect fn familyFaces(self: &Self, family: &Family, out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &family.* {
+      Family.Named { name } => run self.database.family(Bytes.asSlice(&name), &mut out)
+      Family.Generic { generic } => run self.database.generic(generic, &mut out)
+    }
+  }
+
+  /// CSS font matching of `request` within the family named `name`, or None when no face has
+  /// that family.
+  pub effect fn matchFamily(self: &Self, family: &Family, request: Request) -> Option<Selection>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut faces = List<usize>.make()
+    run self.familyFaces(family, &mut faces)
+    let view = Fonts.make(&self.database)
+    return run select(&view, faces.asSlice(), request)
+  }
+
+  effect fn matchName(self: &Self, name: &[u8], request: Request, out: &mut List<Selection>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut faces = List<usize>.make()
+    run self.database.family(name, &mut faces)
+    let view = Fonts.make(&self.database)
+    if let Option<Selection>.Some { value } = run select(&view, faces.asSlice(), request) {
+      run appendUnique(&mut out, value)
+    }
+  }
+
+  /// The faces to try for text asking for `families`: one CSS-matched face per family that
+  /// has faces, without repeats. The first is the primary font.
+  pub effect fn chain(
+    self: &Self,
+    families: &[Family],
+    request: Request,
+    out: &mut List<Selection>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < families.length {
+      if let Option<Selection>.Some { value } = run self.matchFamily(&families[index], request) {
+        run appendUnique(&mut out, value)
+      }
+      index = index + 1
+    }
+  }
+
+  /// The fallback faces for characters of `script`: the script's fallback families, then the
+  /// general ones, each CSS-matched against `request`.
+  pub effect fn fallbackChain(
+    self: &Self,
+    script: Script,
+    request: Request,
+    out: &mut List<Selection>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < self.scriptFallbacks.length() {
+      let entry = &self.scriptFallbacks.asSlice()[index]
+      if entry.script.value == script.value {
+        run self.matchName(Bytes.asSlice(&entry.name), request, &mut out)
+      }
+      index = index + 1
+    }
+    index = 0
+    while index < self.fallbacks.length() {
+      run self.matchName(Bytes.asSlice(&self.fallbacks.asSlice()[index]), request, &mut out)
+      index = index + 1
+    }
+  }
+}
+
+effect fn appendUnique(out: &mut List<Selection>, value: Selection) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: usize = 0
+  while index < out.length() {
+    if out.asSlice()[index].face == value.face {
+      return
+    }
+    index = index + 1
+  }
+  run out.append(value)
+}

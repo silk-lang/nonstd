@@ -1,0 +1,179 @@
+//! Per-character font fallback by glyph coverage (CSS Fonts 4 #cluster-matching).
+//!
+//! A [`FontMatcher`] borrows a [`FontCollection`] and keeps each face's character map and
+//! each script's fallback chain, so a lookup costs a few `cmap` probes.
+import collection { FontCollection }
+import svg_fonts.matching { Request, Selection, Style }
+import read_fonts.model.charmap { Charmap }
+import read_fonts.lib { FontRef }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.unicode { Unicode }
+import silk.text.unicode_script { Script }
+
+struct ScriptChain {
+  script: Script,
+  request: Request,
+  faces: List<Selection>,
+}
+
+/// Characters that belong to the cluster of the character before them and keep its face:
+/// combining marks, joiners, variation selectors and emoji modifiers.
+pub fn continuesCluster(cp: u32) -> bool {
+  return Unicode.isMark(cp) || cp == 0x200C || cp == 0x200D || Unicode.isVariationSelector(cp)
+    || Unicode.isEmojiModifier(cp)
+    || (cp >= 0xE0020 && cp <= 0xE007F)
+}
+
+/// Characters every face is assumed to render, so they never cause a fallback on their own:
+/// default ignorables (joiners, bidi controls, soft hyphens) and the line-breaking controls.
+pub fn ignoredForFallback(cp: u32) -> bool {
+  return Unicode.isDefaultIgnorable(cp) || cp == 0x09 || cp == 0x0A || cp == 0x0D
+}
+
+fn sameStyle(left: Style, right: Style) -> bool {
+  return match left {
+    Style.Normal => match right {
+      Style.Normal => true
+      _ => false
+    }
+    Style.Italic => match right {
+      Style.Italic => true
+      _ => false
+    }
+    Style.Oblique { degrees: a } => match right {
+      Style.Oblique { degrees: b } => a == b
+      _ => false
+    }
+  }
+}
+
+fn sameRequest(left: Request, right: Request) -> bool {
+  return left.weight == right.weight && left.width == right.width
+    && sameStyle(left.style, right.style)
+}
+
+pub struct FontMatcher<'a> {
+  collection: &'a FontCollection,
+  charmaps: List<Option<Charmap<'a>>>,
+  loaded: List<bool>,
+  chains: List<ScriptChain>,
+}
+
+impl<'a> FontMatcher<'a> {
+  pub fn make(collection: &'a FontCollection) -> FontMatcher<'a> {
+    return FontMatcher {
+      collection: collection,
+      charmaps: List<Option<Charmap<'a>>>.make(),
+      loaded: List<bool>.make(),
+      chains: List<ScriptChain>.make(),
+    }
+  }
+
+  pub fn fonts(self: &Self) -> &'a FontCollection {
+    return self.collection
+  }
+
+  effect fn load(self: &mut Self, face: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.loaded.length() <= face {
+      run self.loaded.append(false)
+      run self.charmaps.append(Option<Charmap<'a>>.None)
+    }
+    if self.loaded.get(face) {
+      return
+    }
+    self.loaded.set(face, true)
+    if let Option<FontRef<'a>>.Some { value: font } = self.collection.font(face) {
+      self.charmaps.set(face, Option<Charmap<'a>>.Some { value: Charmap.new(&font) })
+    }
+  }
+
+  /// Whether face `face` maps `cp` to a glyph.
+  pub effect fn supports(self: &mut Self, face: usize, cp: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.load(face)
+    if let Option<Charmap<'a>>.Some { value } = &self.charmaps.asSlice()[face] {
+      return value.mapUnicode(cp).isSome()
+    }
+    return false
+  }
+
+  effect fn scriptChain(self: &mut Self, script: Script, request: Request) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < self.chains.length() {
+      let chain = &self.chains.asSlice()[index]
+      if chain.script.value == script.value && sameRequest(chain.request, request) {
+        return index
+      }
+      index = index + 1
+    }
+    let mut faces = List<Selection>.make()
+    run self.collection.fallbackChain(script, request, &mut faces)
+    run self.chains.append(ScriptChain { script: script, request: request, faces: move faces })
+    return self.chains.length() - 1
+  }
+
+  /// The face for a cluster that starts with `cp`: the first face of `chain` (the text's
+  /// requested families) that has it, then the fallbacks for `script`, then any face of the
+  /// collection, matched by `request` where a family gives a choice. Returns the primary face
+  /// (`chain[0]`) when no face has the character, so it draws as that face's `.notdef`, and
+  /// None only when `chain` is empty and no face has it.
+  pub effect fn select(
+    self: &mut Self,
+    chain: &[Selection],
+    request: Request,
+    cp: u32,
+    script: Script,
+  ) -> Option<Selection>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    if ignoredForFallback(cp) && chain.length > 0 {
+      return Option<Selection>.Some { value: chain[0] }
+    }
+    while index < chain.length {
+      if run self.supports(chain[index].face, cp) {
+        return Option<Selection>.Some { value: chain[index] }
+      }
+      index = index + 1
+    }
+    let fallback = run self.scriptChain(script, request)
+    let count = self.chains.asSlice()[fallback].faces.length()
+    index = 0
+    while index < count {
+      let candidate = self.chains.asSlice()[fallback].faces.get(index)
+      if run self.supports(candidate.face, cp) {
+        return Option<Selection>.Some { value: candidate }
+      }
+      index = index + 1
+    }
+    let faces = self.collection.faceCount()
+    index = 0
+    while index < faces {
+      if run self.supports(index, cp) {
+        return Option<Selection>.Some {
+          value: Selection {
+            face: index,
+            weight: request.weight,
+            width: request.width,
+            italic: Option<f64>.None,
+            oblique: Option<f64>.None,
+            syntheticOblique: 0.0,
+            syntheticBold: false,
+          },
+        }
+      }
+      index = index + 1
+    }
+    if chain.length > 0 {
+      return Option<Selection>.Some { value: chain[0] }
+    }
+    return Option<Selection>.None
+  }
+}
