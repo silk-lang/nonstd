@@ -43,13 +43,15 @@ Dawn therefore satisfies the stable-header preference without a large source bui
 All installers require Python 3.12+ and `curl`, install under the repository's ignored `.cache/`, print a single absolute result path on stdout, and fail explicitly for missing platform assets or checksum mismatches. They never modify `~/.silk` and never silently use an older compiler.
 
 The Silk and LLVM installers are shared at the repository root (`scripts/install-silk`,
-`scripts/install-llvm`); Dawn's is `gpu/webgpu/scripts/install-webgpu`.
+`scripts/install-llvm`). Builds take Dawn from `sys/silk.toml`'s pinned `dawn` archive, which
+Silk fetches into `~/.silk/archives`; `gpu/webgpu/scripts/install-webgpu` installs the same
+release for the C benchmark baseline and the Windows DLL wrapper (`scripts/prepare-windows`).
 
-- `install-silk` pins **0.1.0-dev.43+3808a7f2e30c**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
+- `install-silk` pins **0.1.0-dev.44+8052ef3352b5**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
 - `install-webgpu` pins Dawn's Release archives and prints the **installation root**. macOS has `lib/libwebgpu_dawn.a`; Linux has `lib64/libwebgpu_dawn.a`; Windows has `lib/webgpu_dawn.lib`.
 - `install-llvm` accepts a working absolute `SILK_CLANG` pointing to LLVM 22, or discovers Homebrew LLVM / `clang-22`; otherwise it downloads checksum-pinned **LLVM 22.1.8**. It prints the **absolute clang executable path**. Published LLVM archives are large (Linux x86_64: 1,938,859,476 bytes); preinstall LLVM 22 for a short cold gate. The full downloaded distribution includes resource headers and `wasm-ld`; a supplied system toolchain must also provide `wasm-ld` for browser builds.
 
-| Native host | Silk dev.43 release | Dawn release | Current prerequisite |
+| Native host | Silk dev.44 release | Dawn release | Current prerequisite |
 | --- | --- | --- | --- |
 | macOS arm64 | Available | Available | macOS 26+, LLVM 22 and Apple SDK |
 | macOS x86_64 | Not published | Available | Published native Silk compiler required |
@@ -171,10 +173,10 @@ Device errors and loss share a synchronized mailbox. Releasing the last native
 device reference only *readies* its loss callback: mailbox destruction waits for
 delivery before freeing userdata, including failed device creation. The native
 regression exercises that failure followed by event pumping under `MallocScribble=1`.
-The two small C helpers in `native/callbacks.c` expose the descriptor's
+The two small C helpers in `sys/native/callbacks.c` expose the descriptor's
 otherwise pointer-hidden callbacks: uncaptured errors use `threadCallbacks`,
-loss and request completion use `deferredCallbacks`. `scripts/_build.py` compiles
-and links their cached archive; external build integrations must link it too.
+loss and request completion use `deferredCallbacks`. `sys/silk.toml` compiles
+them as `[native].sources`, so every dependent program links them.
 See [the mixed-mode compiler limitation](../LIMITATIONS.md#limitation-4--mixed-callback-invocation-modes).
 
 Failures use `GpuError` with an operation-specific native status/type and an owned

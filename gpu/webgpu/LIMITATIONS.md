@@ -31,7 +31,7 @@ All reproductions below use the published **0.1.0-dev.27+323ceb59e7ee** compiler
 - Observed: one foreign declaration cannot combine `deferredCallbacks` and `threadCallbacks`; even disjoint direct callback parameters fail with SEM0187. This is the published dev.27 rule, not an undocumented compiler behavior.
 - Workaround: two typed C boundaries. The first writes the spontaneous error callback into the device descriptor under `threadCallbacks`; the second installs the lost callback and requests the device under `deferredCallbacks`. Raw-pointer descriptor traversal remains the binding author's responsibility. No callback is falsely declared immediate or weakened to an untyped address.
 - Measured bridge cost: LLVM 22.1.8 `-O2`, macOS arm64, emits 2 instructions for the error setter and 13 for the request bridge including its Dawn call. The latter uses 64 stack bytes and copies the 40-byte completion-info argument; neither helper allocates. These are bridge-body disassembly counts, not caller-inclusive Ir or wall-time overhead. Both run once per device request, outside frame hot loops.
-- Sites: `webgpu/src/runtime.silk`, `webgpu/native/callbacks.c`, `scripts/_build.py`.
+- Sites: `webgpu/src/runtime.silk`, `webgpu/sys/native/callbacks.c`, `webgpu/sys/silk.toml`.
 
 ## LIMITATION-5 — Apple linker compact-unwind personality limit
 

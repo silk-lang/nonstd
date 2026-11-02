@@ -1,5 +1,4 @@
 import importlib.util
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -46,19 +45,21 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(_build.command_path("install-silk"), ROOT)
         self.assertEqual(run.call_args.args[0], [sys.executable, str(ROOT / "scripts/install-silk")])
 
-    @unittest.skipUnless(os.name == "nt", "Windows copies sources without symlink privileges")
-    def test_staging_refresh_removes_deleted_modules(self):
-        with tempfile.TemporaryDirectory(dir=ROOT / ".cache") as directory:
-            root = Path(directory)
-            source, destination = root / "input", root / "src"
-            source.mkdir()
-            (source / "old.silk").write_text("old")
-            _build.stage_path(source, destination)
-            (source / "old.silk").unlink()
-            (source / "new.silk").write_text("new")
-            _build.stage_path(source, destination)
-            self.assertFalse((destination / "old.silk").exists())
-            self.assertEqual((destination / "new.silk").read_text(), "new")
+
+
+class NativePinTests(unittest.TestCase):
+    def test_manifest_dawn_archives_match_the_lock(self):
+        """Every manifest that pins Dawn pins the release toolchains.lock.json installs."""
+        import json
+        import tomllib
+        lock = json.loads((ROOT / "toolchains.lock.json").read_text())["webgpu"]["platforms"]
+        manifests = {"gpu/webgpu/sys/silk.toml": "dawn", "gpu/webgpu/sys/abi/silk.toml": "dawn-headers",
+                     "gpu/webgpu/bench/silk.toml": "dawn-headers"}
+        for path, name in manifests.items():
+            targets = tomllib.loads((ROOT / path).read_text())["native"]["archive"][name]["targets"]
+            self.assertEqual(set(targets), set(lock), path)
+            for target, pin in targets.items():
+                self.assertEqual((pin["url"], pin["sha256"]), (lock[target]["url"], lock[target]["sha256"]), f"{path} {target}")
 
 
 if __name__ == "__main__":

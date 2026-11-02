@@ -104,11 +104,9 @@ python3 platform/window/scripts/macos smoke   # real window: frames, resize, IME
 python3 platform/window/scripts/macos demo    # WebGPU demo for the checks below
 ```
 
-Silk does not yet pass native link inputs on from dependencies
-([silk-lang/silk#2595](https://github.com/silk-lang/silk/issues/2595)). A program using the
-macOS backend links `.cache/platform-window/libsilkwindow.a` (made by `scripts/macos native`)
-and the `Cocoa`, `QuartzCore` and `UniformTypeIdentifiers` frameworks in its own `[native]`
-section; `tests/macos/silk.toml` shows the list.
+`silk.toml` compiles the AppKit bridge (`native/macos/bridge.m`) and links the `Cocoa`,
+`QuartzCore` and `UniformTypeIdentifiers` frameworks on macOS. Both reach every program that
+depends on the package, so a program using the macOS backend needs no `[native]` section.
 
 The demo is the manual part of the exit test: drag a window edge and watch frames keep
 coming; move the window between a Retina and a non-Retina display; leave it idle and see that

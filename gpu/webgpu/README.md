@@ -45,7 +45,8 @@ The blocking `requestAdapter` and `requestDevice` are native conveniences. Each 
 use. `examples/src/session.silk` drives a whole sample that way, on both targets.
 
 Native programs link Dawn's static library and a small callback helper
-(`native/callbacks.c`); `scripts/_build.py` shows the native link configuration.
+(`sys/native/callbacks.c`); `sys/silk.toml` pins Dawn and declares the native link
+configuration, which reaches every program that depends on the packages.
 Dependents import the packages as `webgpu` and `webgpu_sys`.
 
 ## Packages
