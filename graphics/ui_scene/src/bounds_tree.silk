@@ -1,0 +1,302 @@
+//! Draw orders from overlap, as GPUI's `BoundsTree`.
+//!
+//! [`BoundsTree.insert`] gives a new rectangle one more than the highest order of any rectangle
+//! already inserted that overlaps it, or 1 when none does. So a primitive always draws after
+//! everything it covers, while primitives that do not overlap can share an order, which is what
+//! lets the scene batch them together.
+//!
+//! The tree is a binary bounding-volume hierarchy, kept balanced by rotations. Every node keeps the highest order below it, so
+//! the overlap query skips subtrees that cannot raise the answer. New leaves go next to the sibling
+//! that grows the tree's total perimeter least (the Box2D dynamic tree heuristic).
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+
+const NONE: u32 = 4294967295
+
+struct Node {
+  bounds: Rect<f32>,
+  /// The leaf's order, or the highest order of the subtree.
+  maxOrder: u32,
+  parent: u32,
+  first: u32,
+  second: u32,
+  /// 0 for a leaf.
+  height: u32,
+}
+
+impl Copy for Node {}
+
+/// Whether `a` and `b` share interior area; rectangles that only touch do not overlap.
+pub fn overlaps(a: Rect<f32>, b: Rect<f32>) -> bool {
+  return a.xMin < b.xMax && b.xMin < a.xMax && a.yMin < b.yMax && b.yMin < a.yMax
+}
+
+fn merge(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+fn maxU32(a: u32, b: u32) -> u32 {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn perimeter(r: Rect<f32>) -> f32 {
+  return 2.0 * ((r.xMax - r.xMin) + (r.yMax - r.yMin))
+}
+
+/// Overlap-ordered rectangles. Reuse one across frames with [`BoundsTree.clear`].
+pub struct BoundsTree {
+  nodes: List<Node>,
+  root: u32,
+  stack: List<u32>,
+}
+
+impl BoundsTree {
+  pub fn make() -> BoundsTree {
+    return BoundsTree { nodes: List<Node>.make(), root: NONE, stack: List<u32>.make() }
+  }
+
+  /// Forgets every rectangle and keeps the storage.
+  pub fn clear(self: &mut Self) -> () {
+    self.nodes.clear()
+    self.root = NONE
+  }
+
+  /// The number of rectangles inserted.
+  pub fn length(self: &Self) -> usize {
+    return (self.nodes.length() + 1) / 2
+  }
+
+  /// The highest order among inserted rectangles that overlap `bounds`, or 0 when none does.
+  pub effect fn maxOverlapping(self: &mut Self, bounds: Rect<f32>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut best: u32 = 0
+    if self.root == NONE {
+      return 0
+    }
+    self.stack.clear()
+    run self.stack.append(self.root)
+    while self.stack.length() > 0 {
+      let index = self.stack.get(self.stack.length() - 1)
+      drop self.stack.pop()
+      let node = self.nodes.get(u32.toUsize(index))
+      if node.maxOrder > best && overlaps(node.bounds, bounds) {
+        if node.first == NONE {
+          best = node.maxOrder
+        } else {
+          run self.stack.append(node.first)
+          run self.stack.append(node.second)
+        }
+      }
+    }
+    return best
+  }
+
+  /// Inserts `bounds` and returns its order: one more than [`BoundsTree.maxOverlapping`].
+  pub effect fn insert(self: &mut Self, bounds: Rect<f32>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let found = run self.maxOverlapping(bounds)
+    let order = found + 1
+    run self.insertWithOrder(bounds, order)
+    return order
+  }
+
+  /// Inserts `bounds` with a given `order`, which must not be lower than the order of anything it
+  /// overlaps (the scene uses it for primitives pinned to a layer's order).
+  pub effect fn insertWithOrder(self: &mut Self, bounds: Rect<f32>, order: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.nodes.reserve(2)
+    let leaf = usize.toU32(self.nodes.length())
+    run self.nodes.append(
+      Node { bounds: bounds, maxOrder: order, parent: NONE, first: NONE, second: NONE, height: 0 },
+    )
+    if self.root == NONE {
+      self.root = leaf
+      return
+    }
+
+    // Find the sibling whose pairing grows the total perimeter least.
+    let mut index = self.root
+    while true {
+      let node = self.nodes.get(u32.toUsize(index))
+      if node.first == NONE {
+        break
+      }
+      let combined = perimeter(merge(node.bounds, bounds))
+      let here = 2.0 * combined
+      let inherited = 2.0 * (combined - perimeter(node.bounds))
+      let first = self.descendCost(node.first, bounds) + inherited
+      let second = self.descendCost(node.second, bounds) + inherited
+      if here <= first && here <= second {
+        break
+      }
+      index = if first <= second {
+        node.first
+      } else {
+        node.second
+      }
+    }
+
+    let sibling = index
+    let old = self.nodes.get(u32.toUsize(sibling))
+    let parent = usize.toU32(self.nodes.length())
+    run self.nodes.append(
+      Node {
+        bounds: merge(old.bounds, bounds),
+        maxOrder: maxU32(old.maxOrder, order),
+        parent: old.parent,
+        first: sibling,
+        second: leaf,
+        height: 1,
+      },
+    )
+    let nodes = self.nodes.asMutSlice()
+    if old.parent == NONE {
+      self.root = parent
+    } else {
+      let grand = u32.toUsize(old.parent)
+      if nodes[grand].first == sibling {
+        nodes[grand].first = parent
+      } else {
+        nodes[grand].second = parent
+      }
+    }
+    nodes[u32.toUsize(sibling)].parent = parent
+    nodes[u32.toUsize(leaf)].parent = parent
+    drop nodes
+
+    // Refit and rebalance every ancestor.
+    let mut up = parent
+    while up != NONE {
+      up = self.balance(up)
+      self.refit(up)
+      up = self.nodes.get(u32.toUsize(up)).parent
+    }
+  }
+
+  /// Recomputes an internal node's bounds, height and highest order from its children.
+  fn refit(self: &mut Self, index: u32) -> () {
+    let nodes = self.nodes.asMutSlice()
+    let at = u32.toUsize(index)
+    let first = nodes[u32.toUsize(nodes[at].first)]
+    let second = nodes[u32.toUsize(nodes[at].second)]
+    nodes[at].bounds = merge(first.bounds, second.bounds)
+    nodes[at].maxOrder = maxU32(first.maxOrder, second.maxOrder)
+    nodes[at].height = 1 + maxU32(first.height, second.height)
+  }
+
+  /// Replaces `index`'s place in its parent (or the root) with `other`.
+  fn relink(self: &mut Self, index: u32, other: u32) -> () {
+    let nodes = self.nodes.asMutSlice()
+    let parent = nodes[u32.toUsize(index)].parent
+    nodes[u32.toUsize(other)].parent = parent
+    if parent == NONE {
+      self.root = other
+    } else if nodes[u32.toUsize(parent)].first == index {
+      nodes[u32.toUsize(parent)].first = other
+    } else {
+      nodes[u32.toUsize(parent)].second = other
+    }
+  }
+
+  /// The Box2D dynamic tree rotation: when one child of `a` is more than one level taller than the
+  /// other, lift it into `a`'s place. Returns the node now in `a`'s place.
+  fn balance(self: &mut Self, a: u32) -> u32 {
+    let node = self.nodes.get(u32.toUsize(a))
+    if node.first == NONE || node.height < 2 {
+      return a
+    }
+    let b = node.first
+    let c = node.second
+    let hb = self.nodes.get(u32.toUsize(b)).height
+    let hc = self.nodes.get(u32.toUsize(c)).height
+    if hc > hb + 1 {
+      return self.lift(a, c, true)
+    }
+    if hb > hc + 1 {
+      return self.lift(a, b, false)
+    }
+    return a
+  }
+
+  /// Lifts `child` (the second child of `a` when `second`, else the first) above `a`; `a` keeps
+  /// the lower grandchild and `child` keeps the taller one.
+  fn lift(self: &mut Self, a: u32, child: u32, second: bool) -> u32 {
+    self.relink(a, child)
+    let lifted = self.nodes.get(u32.toUsize(child))
+    let f = lifted.first
+    let g = lifted.second
+    let hf = self.nodes.get(u32.toUsize(f)).height
+    let hg = self.nodes.get(u32.toUsize(g)).height
+    let keep = if hf > hg {
+      f
+    } else {
+      g
+    }
+    let give = if hf > hg {
+      g
+    } else {
+      f
+    }
+    let nodes = self.nodes.asMutSlice()
+    nodes[u32.toUsize(child)].first = a
+    nodes[u32.toUsize(child)].second = keep
+    nodes[u32.toUsize(a)].parent = child
+    if second {
+      nodes[u32.toUsize(a)].second = give
+    } else {
+      nodes[u32.toUsize(a)].first = give
+    }
+    nodes[u32.toUsize(give)].parent = a
+    self.refit(a)
+    self.refit(child)
+    return child
+  }
+
+  fn descendCost(self: &Self, index: u32, bounds: Rect<f32>) -> f32 {
+    let node = self.nodes.get(u32.toUsize(index))
+    let grown = perimeter(merge(node.bounds, bounds))
+    if node.first == NONE {
+      return grown
+    }
+    return grown - perimeter(node.bounds)
+  }
+
+  /// The depth of the deepest leaf (1 for a single rectangle), for tests.
+  pub effect fn depth(self: &mut Self) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut deepest: u32 = 0
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = self.nodes.get(i)
+      if node.first == NONE {
+        let mut d: u32 = 1
+        let mut up = node.parent
+        while up != NONE {
+          d = d + 1
+          up = self.nodes.get(u32.toUsize(up)).parent
+        }
+        deepest = maxU32(deepest, d)
+      }
+      i = i + 1
+    }
+    return deepest
+  }
+}

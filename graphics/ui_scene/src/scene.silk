@@ -1,0 +1,913 @@
+//! A frame's primitives, ordered by overlap and merged into batches, as GPUI's `Scene`.
+//!
+//! Painting appends primitives with [`Scene.quad`], [`Scene.shadow`] and the others. Each one gets
+//! a draw order from a [`BoundsTree`]: one more than the highest order of anything it overlaps, so
+//! disjoint primitives share orders. [`Scene.finish`] sorts every kind by order (sprites also by
+//! texture) and merges the kinds back into a list of [`Batch`] runs per layer, so a renderer issues
+//! one draw per run instead of one per primitive.
+//!
+//! # Layers
+//!
+//! [`Scene.pushLayer`] pins everything until the matching [`Scene.popLayer`] to one order, as GPUI's
+//! `push_layer`: the layer's bounds are ordered once, and its primitives are not inserted in the
+//! tree. Inside a pinned layer, primitives of one kind draw in the order they were added, and
+//! overlapping primitives of different kinds draw in kind order (shadows, quads, paths, underlines,
+//! glyphs, images, layers), so pin only content that does not care.
+//!
+//! [`Scene.pushIsolatedLayer`] opens an offscreen group instead: its primitives get their own
+//! orders and batches (layer `n`, read with [`Scene.batches`]), and the parent gets one
+//! [`LayerSprite`] that composites the group with an opacity and a blend mode. Primitives inside
+//! keep window coordinates. Layer 0 is the window.
+//!
+//! # Replay
+//!
+//! Every paint call is logged as an operation. A view whose output did not change can copy its
+//! operations from the previous frame's scene with [`Scene.replay`] instead of painting again:
+//! keep two scenes, read [`Scene.operationCount`] before and after a view paints to know its
+//! range, and swap the scenes after each frame. Replay copies path coverage too, so a replayed path
+//! is not rasterized again. A replayed range must hold as many pops as pushes.
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.equal { Equal }
+import silk.core.option { Option }
+import silk.core.order { Order, Ordering }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import vector.strips { Fill, Strip }
+import bounds_tree { BoundsTree }
+import color
+import primitives {
+  Background,
+  ContentMask,
+  GlyphSprite,
+  ImageSprite,
+  Isolation,
+  LayerSprite,
+  PathSprite,
+  Quad,
+  Shadow,
+  Underline,
+}
+
+const NONE: u32 = 4294967295
+
+/// The primitive kinds, in the order that breaks ties between equal draw orders.
+pub union PrimitiveKind {
+  Shadow,
+  Quad,
+  Path,
+  Underline,
+  Glyph,
+  Image,
+  /// An isolated layer, composited as one item.
+  Layer,
+}
+
+impl Copy for PrimitiveKind {}
+
+impl Equal for PrimitiveKind {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return left.index() == right.index()
+  }
+}
+
+/// The number of primitive kinds.
+pub const KIND_COUNT: usize = 7
+
+impl PrimitiveKind {
+  /// The kind's position in [`PrimitiveKind`], from 0 for shadows to 6 for layers.
+  pub fn index(self: &Self) -> u32 {
+    return match &self.* {
+      PrimitiveKind.Shadow => 0
+      PrimitiveKind.Quad => 1
+      PrimitiveKind.Path => 2
+      PrimitiveKind.Underline => 3
+      PrimitiveKind.Glyph => 4
+      PrimitiveKind.Image => 5
+      PrimitiveKind.Layer => 6
+    }
+  }
+
+  /// The kind at `index`; out-of-range indices give layers.
+  pub fn fromIndex(index: u32) -> PrimitiveKind {
+    return match index {
+      0 => PrimitiveKind.Shadow
+      1 => PrimitiveKind.Quad
+      2 => PrimitiveKind.Path
+      3 => PrimitiveKind.Underline
+      4 => PrimitiveKind.Glyph
+      5 => PrimitiveKind.Image
+      _ => PrimitiveKind.Layer
+    }
+  }
+}
+
+/// A run of one kind of primitive that a renderer draws with one call: items `start .. end` of
+/// that kind's sorted list in the layer (for example [`Scene.quads`]).
+pub struct Batch {
+  pub kind: PrimitiveKind,
+  pub start: u32,
+  pub end: u32,
+  /// The atlas texture index (`AtlasTile.texture.index`) every sprite of the run samples, for
+  /// glyphs and images; otherwise `0xFFFFFFFF`.
+  pub texture: u32,
+}
+
+impl Copy for Batch {}
+
+struct SortKey {
+  order: u32,
+  texture: u32,
+  index: u32,
+}
+
+impl Copy for SortKey {}
+
+fn compareKeys(left: &SortKey, right: &SortKey) -> Ordering {
+  if left.order != right.order {
+    return if left.order < right.order {
+      Ordering.Less
+    } else {
+      Ordering.Greater
+    }
+  }
+  if left.texture != right.texture {
+    return if left.texture < right.texture {
+      Ordering.Less
+    } else {
+      Ordering.Greater
+    }
+  }
+  if left.index != right.index {
+    return if left.index < right.index {
+      Ordering.Less
+    } else {
+      Ordering.Greater
+    }
+  }
+  return Ordering.Equal
+}
+
+impl Order for SortKey {
+  compare: SortKey.compareKeys
+}
+
+/// One kind's primitives in one layer: as added (for replay) and sorted (for drawing).
+struct Items<T> {
+  added: List<T>,
+  orders: List<u32>,
+  textures: List<u32>,
+  sorted: List<T>,
+  sortedOrders: List<u32>,
+  sortedTextures: List<u32>,
+  keys: List<SortKey>,
+}
+
+impl<T: Copy> Items<T> {
+  fn make() -> Items<T> {
+    return Items<T> {
+      added: List<T>.make(),
+      orders: List<u32>.make(),
+      textures: List<u32>.make(),
+      sorted: List<T>.make(),
+      sortedOrders: List<u32>.make(),
+      sortedTextures: List<u32>.make(),
+      keys: List<SortKey>.make(),
+    }
+  }
+
+  fn clear(self: &mut Self) -> () {
+    self.added.clear()
+    self.orders.clear()
+    self.textures.clear()
+    self.sorted.clear()
+    self.sortedOrders.clear()
+    self.sortedTextures.clear()
+  }
+
+  fn length(self: &Self) -> usize {
+    return self.added.length()
+  }
+
+  effect fn push(self: &mut Self, item: T, order: u32, texture: u32) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.added.reserve(1)
+    run self.orders.reserve(1)
+    run self.textures.reserve(1)
+    let index = usize.toU32(self.added.length())
+    run self.added.append(item)
+    run self.orders.append(order)
+    run self.textures.append(texture)
+    return index
+  }
+
+  effect fn sort(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.keys.clear()
+    self.sorted.clear()
+    self.sortedOrders.clear()
+    self.sortedTextures.clear()
+    let count = self.added.length()
+    run self.keys.reserve(count)
+    run self.sorted.reserve(count)
+    run self.sortedOrders.reserve(count)
+    run self.sortedTextures.reserve(count)
+    let mut i: usize = 0
+    while i < count {
+      run self.keys.append(
+        SortKey { order: self.orders.get(i), texture: self.textures.get(i), index: usize.toU32(i) },
+      )
+      i = i + 1
+    }
+    run self.keys.sort()
+    let mut j: usize = 0
+    while j < count {
+      let at = u32.toUsize(self.keys.get(j).index)
+      run self.sorted.append(self.added.get(at))
+      run self.sortedOrders.append(self.orders.get(at))
+      run self.sortedTextures.append(self.textures.get(at))
+      j = j + 1
+    }
+  }
+}
+
+struct LayerData {
+  tree: BoundsTree,
+  shadows: Items<Shadow>,
+  quads: Items<Quad>,
+  paths: Items<PathSprite>,
+  underlines: Items<Underline>,
+  glyphs: Items<GlyphSprite>,
+  images: Items<ImageSprite>,
+  layers: Items<LayerSprite>,
+  batches: List<Batch>,
+}
+
+impl LayerData {
+  fn make() -> LayerData {
+    return LayerData {
+      tree: BoundsTree.make(),
+      shadows: Items<Shadow>.make(),
+      quads: Items<Quad>.make(),
+      paths: Items<PathSprite>.make(),
+      underlines: Items<Underline>.make(),
+      glyphs: Items<GlyphSprite>.make(),
+      images: Items<ImageSprite>.make(),
+      layers: Items<LayerSprite>.make(),
+      batches: List<Batch>.make(),
+    }
+  }
+
+  fn clear(self: &mut Self) -> () {
+    self.tree.clear()
+    self.shadows.clear()
+    self.quads.clear()
+    self.paths.clear()
+    self.underlines.clear()
+    self.glyphs.clear()
+    self.images.clear()
+    self.layers.clear()
+    self.batches.clear()
+  }
+
+  effect fn sort(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.shadows.sort()
+    run self.quads.sort()
+    run self.paths.sort()
+    run self.underlines.sort()
+    run self.glyphs.sort()
+    run self.images.sort()
+    run self.layers.sort()
+  }
+
+  fn sortedOrders(self: &Self, kind: u32) -> &[u32] {
+    return match kind {
+      0 => self.shadows.sortedOrders.asSlice()
+      1 => self.quads.sortedOrders.asSlice()
+      2 => self.paths.sortedOrders.asSlice()
+      3 => self.underlines.sortedOrders.asSlice()
+      4 => self.glyphs.sortedOrders.asSlice()
+      5 => self.images.sortedOrders.asSlice()
+      _ => self.layers.sortedOrders.asSlice()
+    }
+  }
+
+  fn sortedTextures(self: &Self, kind: u32) -> &[u32] {
+    return match kind {
+      4 => self.glyphs.sortedTextures.asSlice()
+      _ => self.images.sortedTextures.asSlice()
+    }
+  }
+
+  /// GPUI's merge: take the kind whose next item has the lowest order, and extend its run while
+  /// its orders do not pass the next order of any other kind (equal orders never overlap).
+  effect fn buildBatches(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.batches.clear()
+    let mut cursors: [usize; 7] = [0, 0, 0, 0, 0, 0, 0]
+    while true {
+      let mut pick: u32 = NONE
+      let mut lowest: u32 = NONE
+      let mut k: u32 = 0
+      while k < 7 {
+        let orders = self.sortedOrders(k)
+        let at = cursors[u32.toUsize(k)]
+        if at < orders.length && (pick == NONE || orders[at] < lowest) {
+          pick = k
+          lowest = orders[at]
+        }
+        k = k + 1
+      }
+      if pick == NONE {
+        return
+      }
+      let mut limit: u32 = NONE
+      let mut other: u32 = 0
+      while other < 7 {
+        if other != pick {
+          let orders = self.sortedOrders(other)
+          let at = cursors[u32.toUsize(other)]
+          if at < orders.length && orders[at] < limit {
+            limit = orders[at]
+          }
+        }
+        other = other + 1
+      }
+      let sprite = pick == 4 || pick == 5
+      let orders = self.sortedOrders(pick)
+      let start = cursors[u32.toUsize(pick)]
+      let texture = if sprite {
+        self.sortedTextures(pick)[start]
+      } else {
+        NONE
+      }
+      let mut end = start
+      while end < orders.length && orders[end] <= limit
+        && (!sprite || self.sortedTextures(pick)[end] == texture) {
+        end = end + 1
+      }
+      cursors[u32.toUsize(pick)] = end
+      run self.batches.append(
+        Batch {
+          kind: PrimitiveKind.fromIndex(pick),
+          start: usize.toU32(start),
+          end: usize.toU32(end),
+          texture: texture,
+        },
+      )
+    }
+  }
+}
+
+const OP_PUSH_PINNED: u32 = 7
+
+const OP_PUSH_ISOLATED: u32 = 8
+
+const OP_POP: u32 = 9
+
+/// One logged paint call, for [`Scene.replay`].
+struct Operation {
+  kind: u32,
+  layer: u32,
+  index: u32,
+}
+
+impl Copy for Operation {}
+
+struct Push {
+  bounds: Rect<f32>,
+  mask: ContentMask,
+  isolation: Isolation,
+}
+
+impl Copy for Push {}
+
+struct Context {
+  layer: u32,
+  /// The pinned order, or 0 when primitives are ordered by the tree.
+  pinned: u32,
+}
+
+impl Copy for Context {}
+
+/// One frame's primitives. Reuse two scenes across frames with [`Scene.clear`].
+pub struct Scene {
+  layerData: List<LayerData>,
+  layersUsed: u32,
+  stack: List<Context>,
+  operations: List<Operation>,
+  pushes: List<Push>,
+  strips: List<Strip>,
+  fills: List<Fill>,
+  alphas: List<u8>,
+}
+
+fn clipped(bounds: Rect<f32>, mask: ContentMask) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.max(bounds.xMin, mask.bounds.xMin),
+    f32.max(bounds.yMin, mask.bounds.yMin),
+    f32.min(bounds.xMax, mask.bounds.xMax),
+    f32.min(bounds.yMax, mask.bounds.yMax),
+  )
+}
+
+fn isVisible(bounds: Rect<f32>) -> bool {
+  return bounds.xMin < bounds.xMax && bounds.yMin < bounds.yMax
+}
+
+impl Scene {
+  pub fn make() -> Scene {
+    return Scene {
+      layerData: List<LayerData>.make(),
+      layersUsed: 0,
+      stack: List<Context>.make(),
+      operations: List<Operation>.make(),
+      pushes: List<Push>.make(),
+      strips: List<Strip>.make(),
+      fills: List<Fill>.make(),
+      alphas: List<u8>.make(),
+    }
+  }
+
+  /// Empties the scene for the next frame and keeps its storage.
+  pub fn clear(self: &mut Self) -> () {
+    let data = self.layerData.asMutSlice()
+    let mut i: usize = 0
+    while i < data.length {
+      data[i].clear()
+      i = i + 1
+    }
+    self.layersUsed = 0
+    self.stack.clear()
+    self.operations.clear()
+    self.pushes.clear()
+    self.strips.clear()
+    self.fills.clear()
+    self.alphas.clear()
+  }
+
+  effect fn ensureRoot(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.layersUsed == 0 {
+      drop run self.newLayer()
+    }
+  }
+
+  effect fn newLayer(self: &mut Self) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let index = self.layersUsed
+    if u32.toUsize(index) == self.layerData.length() {
+      run self.layerData.append(LayerData.make())
+    }
+    self.layersUsed = index + 1
+    return index
+  }
+
+  fn context(self: &Self) -> Context {
+    if self.stack.length() == 0 {
+      return Context { layer: 0, pinned: 0 }
+    }
+    return self.stack.get(self.stack.length() - 1)
+  }
+
+  /// The order for a primitive drawing `bounds` under `mask` in the current layer, or 0 when it is
+  /// clipped away entirely.
+  effect fn place(self: &mut Self, bounds: Rect<f32>, mask: ContentMask) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureRoot()
+    let visible = clipped(bounds, mask)
+    if !isVisible(visible) {
+      return 0
+    }
+    let context = self.context()
+    if context.pinned != 0 {
+      return context.pinned
+    }
+    return run self.layerData.asMutSlice()[u32.toUsize(context.layer)].tree.insert(visible)
+  }
+
+  effect fn log(self: &mut Self, kind: u32, index: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let layer = self.context().layer
+    run self.operations.append(Operation { kind: kind, layer: layer, index: index })
+  }
+
+  fn current(self: &mut Self) -> &mut LayerData {
+    let layer = self.context().layer
+    return &mut self.layerData.asMutSlice()[u32.toUsize(layer)]
+  }
+
+  /// Adds a quad and returns its draw order, or 0 when its content mask hides it.
+  pub effect fn quad(self: &mut Self, quad: Quad) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let order = run self.place(quad.bounds, quad.mask)
+    if order == 0 {
+      return 0
+    }
+    if quad.background.isTransparent() && !quad.hasBorder() {
+      return 0
+    }
+    let index = run self.current().quads.push(quad, order, 0)
+    run self.log(1, index)
+    return order
+  }
+
+  /// Adds a shadow and returns its draw order, or 0 when it is hidden.
+  pub effect fn shadow(self: &mut Self, shadow: Shadow) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if color.isTransparent(shadow.color) {
+      return 0
+    }
+    let order = run self.place(shadow.paintBounds(), shadow.mask)
+    if order == 0 {
+      return 0
+    }
+    let index = run self.current().shadows.push(shadow, order, 0)
+    run self.log(0, index)
+    return order
+  }
+
+  /// Adds an underline and returns its draw order, or 0 when it is hidden.
+  pub effect fn underline(self: &mut Self, underline: Underline) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if color.isTransparent(underline.color) || !(underline.thickness > 0.0) {
+      return 0
+    }
+    let order = run self.place(underline.bounds, underline.mask)
+    if order == 0 {
+      return 0
+    }
+    let index = run self.current().underlines.push(underline, order, 0)
+    run self.log(3, index)
+    return order
+  }
+
+  /// Adds a glyph or monochrome icon sprite and returns its draw order, or 0 when it is hidden.
+  pub effect fn glyph(self: &mut Self, sprite: GlyphSprite) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if color.isTransparent(sprite.color) {
+      return 0
+    }
+    let order = run self.place(sprite.bounds, sprite.mask)
+    if order == 0 {
+      return 0
+    }
+    let index = run self.current().glyphs.push(sprite, order, sprite.tile.texture.index)
+    run self.log(4, index)
+    return order
+  }
+
+  /// Adds an image sprite and returns its draw order, or 0 when it is hidden.
+  pub effect fn image(self: &mut Self, sprite: ImageSprite) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !(sprite.opacity > 0.0) {
+      return 0
+    }
+    let order = run self.place(sprite.bounds, sprite.mask)
+    if order == 0 {
+      return 0
+    }
+    let index = run self.current().images.push(sprite, order, sprite.tile.texture.index)
+    run self.log(5, index)
+    return order
+  }
+
+  /// Adds path coverage already rasterized at pixel origin `(x, y)`: `strips` and `fills` relative
+  /// to the origin, and the `alphas` the strips index. Returns the draw order, or 0 when hidden.
+  /// `PathCache.fill` and `PathCache.stroke` call this; it is public for coverage made elsewhere.
+  pub effect fn pathCoverage(
+    self: &mut Self,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    mask: ContentMask,
+    paint: Background,
+    paintBounds: Rect<f32>,
+    strips: &[Strip],
+    fills: &[Fill],
+    alphas: &[u8],
+  ) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if paint.isTransparent() || (strips.length == 0 && fills.length == 0) {
+      return 0
+    }
+    let fx = i32.toF32(x)
+    let fy = i32.toF32(y)
+    let bounds = Rect<f32>.new(fx, fy, fx + u32.toF32(width), fy + u32.toF32(height))
+    let order = run self.place(bounds, mask)
+    if order == 0 {
+      return 0
+    }
+    let stripStart = usize.toU32(self.strips.length())
+    let fillStart = usize.toU32(self.fills.length())
+    let alphaBase = usize.toU32(self.alphas.length())
+    run self.strips.reserve(strips.length)
+    run self.fills.reserve(fills.length)
+    run self.alphas.appendSlice(alphas)
+    let mut i: usize = 0
+    while i < strips.length {
+      let s = strips[i]
+      run self.strips.append(
+        Strip { x: s.x, y: s.y, width: s.width, alphaOffset: s.alphaOffset + alphaBase },
+      )
+      i = i + 1
+    }
+    run self.fills.appendSlice(fills)
+    let sprite = PathSprite {
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      mask: mask,
+      paint: paint,
+      paintBounds: paintBounds,
+      stripStart: stripStart,
+      stripCount: usize.toU32(strips.length),
+      fillStart: fillStart,
+      fillCount: usize.toU32(fills.length),
+    }
+    let index = run self.current().paths.push(sprite, order, 0)
+    run self.log(2, index)
+    return order
+  }
+
+  /// Pins every primitive until the matching [`Scene.popLayer`] to one draw order, the order of
+  /// `bounds` (or the enclosing pinned layer's order).
+  pub effect fn pushLayer(self: &mut Self, bounds: Rect<f32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureRoot()
+    let context = self.context()
+    let pinned = if context.pinned != 0 {
+      context.pinned
+    } else {
+      run self.layerData.asMutSlice()[u32.toUsize(context.layer)].tree.insert(bounds)
+    }
+    let index = usize.toU32(self.pushes.length())
+    run self.pushes.append(
+      Push {
+        bounds: bounds,
+        mask: ContentMask.new(bounds),
+        isolation: Isolation { opacity: 1.0, blend: 0 },
+      },
+    )
+    run self.log(OP_PUSH_PINNED, index)
+    run self.stack.append(Context { layer: context.layer, pinned: pinned })
+  }
+
+  /// Opens an isolated layer: primitives until the matching [`Scene.popLayer`] are ordered and
+  /// batched on their own, rendered offscreen over `bounds` clipped to `mask` (rounded out to whole
+  /// pixels), and composited onto the current layer with `isolation`. Returns the new layer's index.
+  pub effect fn pushIsolatedLayer(
+    self: &mut Self,
+    bounds: Rect<f32>,
+    mask: ContentMask,
+    isolation: Isolation,
+  ) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureRoot()
+    let pushIndex = usize.toU32(self.pushes.length())
+    run self.pushes.append(Push { bounds: bounds, mask: mask, isolation: isolation })
+    run self.log(OP_PUSH_ISOLATED, pushIndex)
+    let visible = clipped(bounds, mask)
+    let target = Rect<f32>.new(
+      f32.floor(visible.xMin),
+      f32.floor(visible.yMin),
+      f32.ceil(visible.xMax),
+      f32.ceil(visible.yMax),
+    )
+    let order = run self.place(target, mask)
+    let parent = self.context().layer
+    let layer = run self.newLayer()
+    if order != 0 && isolation.opacity > 0.0 {
+      drop run self.layerData.asMutSlice()[u32.toUsize(parent)].layers.push(
+        LayerSprite { layer: layer, bounds: target, isolation: isolation },
+        order,
+        0,
+      )
+    }
+    run self.stack.append(Context { layer: layer, pinned: 0 })
+    return layer
+  }
+
+  /// Closes the layer opened last. Does nothing when no layer is open.
+  pub effect fn popLayer(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.stack.length() == 0 {
+      return
+    }
+    run self.log(OP_POP, 0)
+    drop self.stack.pop()
+  }
+
+  /// The number of operations logged so far: the start or end of a range for [`Scene.replay`].
+  pub fn operationCount(self: &Self) -> usize {
+    return self.operations.length()
+  }
+
+  /// Repeats operations `start .. end` of `previous` (a scene from an earlier frame, not yet
+  /// cleared) in this scene: the same primitives and layers, ordered again against what this scene
+  /// already holds.
+  pub effect fn replay(self: &mut Self, previous: &Scene, start: usize, end: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let last = if end < previous.operations.length() {
+      end
+    } else {
+      previous.operations.length()
+    }
+    let mut i = start
+    while i < last {
+      let op = previous.operations.get(i)
+      let at = u32.toUsize(op.index)
+      let data = &previous.layerData.asSlice()[u32.toUsize(op.layer)]
+      if op.kind == 0 {
+        drop run self.shadow(data.shadows.added.get(at))
+      } else if op.kind == 1 {
+        drop run self.quad(data.quads.added.get(at))
+      } else if op.kind == 2 {
+        let p = data.paths.added.get(at)
+        let s0 = u32.toUsize(p.stripStart)
+        let f0 = u32.toUsize(p.fillStart)
+        let strips = Slice.view<Strip>(previous.strips.asSlice(), s0, u32.toUsize(p.stripCount))
+        let fills = Slice.view<Fill>(previous.fills.asSlice(), f0, u32.toUsize(p.fillCount))
+        run self.replayPath(p, strips, fills, previous.alphas.asSlice())
+      } else if op.kind == 3 {
+        drop run self.underline(data.underlines.added.get(at))
+      } else if op.kind == 4 {
+        drop run self.glyph(data.glyphs.added.get(at))
+      } else if op.kind == 5 {
+        drop run self.image(data.images.added.get(at))
+      } else if op.kind == OP_PUSH_PINNED {
+        run self.pushLayer(previous.pushes.get(at).bounds)
+      } else if op.kind == OP_PUSH_ISOLATED {
+        let push = previous.pushes.get(at)
+        drop run self.pushIsolatedLayer(push.bounds, push.mask, push.isolation)
+      } else if op.kind == OP_POP {
+        run self.popLayer()
+      }
+      i = i + 1
+    }
+  }
+
+  /// Copies one path's strips, whose alphas index `alphas`, as one contiguous alpha run.
+  effect fn replayPath(
+    self: &mut Self,
+    path: PathSprite,
+    strips: &[Strip],
+    fills: &[Fill],
+    alphas: &[u8],
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut local = List<Strip>.make()
+    let mut localAlphas = List<u8>.make()
+    run local.reserve(strips.length)
+    let mut i: usize = 0
+    while i < strips.length {
+      let s = strips[i]
+      let from = u32.toUsize(s.alphaOffset)
+      let count = u32.toUsize(s.width) * 4
+      run local.append(
+        Strip { x: s.x, y: s.y, width: s.width, alphaOffset: usize.toU32(localAlphas.length()) },
+      )
+      run localAlphas.appendSlice(Slice.view<u8>(alphas, from, count))
+      i = i + 1
+    }
+    drop run self.pathCoverage(
+      path.x,
+      path.y,
+      path.width,
+      path.height,
+      path.mask,
+      path.paint,
+      path.paintBounds,
+      local.asSlice(),
+      fills,
+      localAlphas.asSlice(),
+    )
+  }
+
+  /// Closes any layer left open, sorts every kind by order and builds each layer's batches.
+  pub effect fn finish(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.ensureRoot()
+    self.stack.clear()
+    let data = self.layerData.asMutSlice()
+    let mut i: usize = 0
+    while i < u32.toUsize(self.layersUsed) {
+      run data[i].sort()
+      run data[i].buildBatches()
+      i = i + 1
+    }
+  }
+
+  /// The number of layers: 1 for the window plus one per isolated layer (0 for an unused scene).
+  pub fn layerCount(self: &Self) -> u32 {
+    return self.layersUsed
+  }
+
+  fn layerAt(self: &Self, layer: u32) -> &LayerData {
+    return &self.layerData.asSlice()[u32.toUsize(layer)]
+  }
+
+  /// Layer `layer`'s batches in drawing order, after [`Scene.finish`].
+  pub fn batches(self: &Self, layer: u32) -> &[Batch] {
+    return self.layerAt(layer).batches.asSlice()
+  }
+
+  /// Layer `layer`'s shadows sorted by order, after [`Scene.finish`].
+  pub fn shadows(self: &Self, layer: u32) -> &[Shadow] {
+    return self.layerAt(layer).shadows.sorted.asSlice()
+  }
+
+  /// Layer `layer`'s quads sorted by order, after [`Scene.finish`].
+  pub fn quads(self: &Self, layer: u32) -> &[Quad] {
+    return self.layerAt(layer).quads.sorted.asSlice()
+  }
+
+  /// Layer `layer`'s paths sorted by order, after [`Scene.finish`].
+  pub fn paths(self: &Self, layer: u32) -> &[PathSprite] {
+    return self.layerAt(layer).paths.sorted.asSlice()
+  }
+
+  /// Layer `layer`'s underlines sorted by order, after [`Scene.finish`].
+  pub fn underlines(self: &Self, layer: u32) -> &[Underline] {
+    return self.layerAt(layer).underlines.sorted.asSlice()
+  }
+
+  /// Layer `layer`'s glyph sprites sorted by order and texture, after [`Scene.finish`].
+  pub fn glyphs(self: &Self, layer: u32) -> &[GlyphSprite] {
+    return self.layerAt(layer).glyphs.sorted.asSlice()
+  }
+
+  /// Layer `layer`'s image sprites sorted by order and texture, after [`Scene.finish`].
+  pub fn images(self: &Self, layer: u32) -> &[ImageSprite] {
+    return self.layerAt(layer).images.sorted.asSlice()
+  }
+
+  /// The isolated layers drawn in layer `layer`, sorted by order, after [`Scene.finish`].
+  pub fn layers(self: &Self, layer: u32) -> &[LayerSprite] {
+    return self.layerAt(layer).layers.sorted.asSlice()
+  }
+
+  /// The draw orders of `kind` in layer `layer`, parallel to its sorted list.
+  pub fn orders(self: &Self, layer: u32, kind: PrimitiveKind) -> &[u32] {
+    return self.layerAt(layer).sortedOrders(kind.index())
+  }
+
+  /// The number of primitives of every kind in every layer, isolated layer sprites included.
+  pub fn primitiveCount(self: &Self) -> usize {
+    let mut total: usize = 0
+    let mut i: usize = 0
+    while i < u32.toUsize(self.layersUsed) {
+      let d = &self.layerData.asSlice()[i]
+      total = total + d.shadows.length() + d.quads.length() + d.paths.length()
+        + d.underlines.length()
+        + d.glyphs.length()
+        + d.images.length()
+        + d.layers.length()
+      i = i + 1
+    }
+    return total
+  }
+
+  /// Every path's strips; a [`PathSprite`] holds its range.
+  pub fn pathStrips(self: &Self) -> &[Strip] {
+    return self.strips.asSlice()
+  }
+
+  /// Every path's fully covered runs; a [`PathSprite`] holds its range.
+  pub fn pathFills(self: &Self) -> &[Fill] {
+    return self.fills.asSlice()
+  }
+
+  /// The coverage bytes the strips index, 4 per strip column.
+  pub fn pathAlphas(self: &Self) -> &[u8] {
+    return self.alphas.asSlice()
+  }
+}

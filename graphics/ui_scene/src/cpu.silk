@@ -1,0 +1,999 @@
+//! The CPU reference renderer: draws a finished [`Scene`] into a `vector` [`Pixmap`].
+//!
+//! Every primitive is lowered to `vector`: quads, shadows and underlines become paths filled with
+//! exact area coverage, shadow blur is `vector.filter.gaussianBlur`, dashed borders are `vector`
+//! strokes, and isolated layers are composited with `vector.layer`. It needs no GPU, so it gives
+//! headless screenshots in tests, and it is the reference a GPU renderer is compared against
+//! within a small tolerance (analytic SDF edges and an erf blur differ from it by a few levels at
+//! edges, never in flat areas).
+//!
+//! Content masks clip by pixel area. Gradients are evaluated at pixel centers from a 256-entry
+//! ramp. Sprites sample their atlas tile bilinearly at pixel centers, clamped to the tile.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.corners { Corners }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import atlas.atlas { Atlas, AtlasTile, Kind }
+import vector.filter { BlurPlan, Region }
+import vector.filter as filtering
+import vector.flatten { TOLERANCE }
+import vector.geometry { Affine, Point }
+import vector.geometry_error { GeometryError }
+import vector.layer as layering
+import vector.path { Path }
+import vector.pixmap { Pixmap, Rgba8, overPacked, pack, scalePacked }
+import vector.strips { Coverage, EVENODD, NONZERO, Rasterizer }
+import vector.stroke { CAP_BUTT, JOIN_ROUND, Stroke, Stroker }
+import color
+import silk.color.rgba { Rgba }
+import primitives {
+  Background,
+  BorderStyle,
+  ContentMask,
+  GlyphSprite,
+  ImageSprite,
+  LayerSprite,
+  LinearGradient,
+  PathSprite,
+  Quad,
+  Shadow,
+  Underline,
+}
+import scene { Batch, PrimitiveKind, Scene }
+
+const PI: f64 = 3.141592653589793
+
+/// CPU copies of atlas textures, for sprites drawn by [`CpuRenderer`].
+///
+/// Call [`AtlasPixels.sync`] after allocating tiles so every atlas texture has storage, then
+/// [`AtlasPixels.write`] each new tile's pixels: one byte per pixel for monochrome tiles, four
+/// premultiplied RGBA bytes for the others.
+pub struct AtlasPixels {
+  textures: List<TexturePixels>,
+}
+
+struct TexturePixels {
+  width: u32,
+  height: u32,
+  channels: u32,
+  bytes: List<u8>,
+}
+
+impl AtlasPixels {
+  pub fn make() -> AtlasPixels {
+    return AtlasPixels { textures: List<TexturePixels>.make() }
+  }
+
+  /// Creates zeroed storage for every texture `atlas` has added since the last call.
+  pub effect fn sync(self: &mut Self, atlas: &Atlas) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.textures.length() < atlas.textureCount() {
+      let info = atlas.texture(self.textures.length())
+      let channels = info.id.kind.bytesPerPixel()
+      let mut bytes = List<u8>.make()
+      run bytes.appendRepeated(
+        0,
+        u32.toUsize(info.width) * u32.toUsize(info.height) * u32.toUsize(channels),
+      )
+      run self.textures.append(
+        TexturePixels {
+          width: info.width,
+          height: info.height,
+          channels: channels,
+          bytes: move bytes,
+        },
+      )
+    }
+  }
+
+  /// Copies `pixels` (tightly packed rows of the tile's size) into `tile`'s place. Does nothing for
+  /// a texture [`AtlasPixels.sync`] has not created.
+  pub fn write(self: &mut Self, tile: AtlasTile, pixels: &[u8]) -> () {
+    let t = u32.toUsize(tile.texture.index)
+    if t >= self.textures.length() {
+      return
+    }
+    let texture = &mut self.textures.asMutSlice()[t]
+    let channels = u32.toUsize(texture.channels)
+    let width = u32.toUsize(tile.bounds.xMax - tile.bounds.xMin)
+    let height = u32.toUsize(tile.bounds.yMax - tile.bounds.yMin)
+    let stride = u32.toUsize(texture.width) * channels
+    let bytes = texture.bytes.asMutSlice()
+    let mut y: usize = 0
+    while y < height {
+      let mut x: usize = 0
+      while x < width * channels {
+        let from = y * width * channels + x
+        if from < pixels.length {
+          bytes[(u32.toUsize(tile.bounds.yMin) + y) * stride
+            + u32.toUsize(tile.bounds.xMin) * channels
+            + x] = pixels[from]
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+  }
+
+  /// Texel `(x, y)` channel `c` of texture `t`.
+  fn texel(self: &Self, t: usize, x: u32, y: u32, c: u32) -> u32 {
+    let texture = &self.textures.asSlice()[t]
+    let at = (u32.toUsize(y) * u32.toUsize(texture.width) + u32.toUsize(x))
+      * u32.toUsize(texture.channels)
+      + u32.toUsize(c)
+    return u8.toU32(texture.bytes.get(at))
+  }
+
+  /// Bilinear sample of channel `c` of `tile` at tile-space position `(u, v)` (texel centers at
+  /// `.5`), clamped to the tile; 0..=255 as f32.
+  fn sample(self: &Self, tile: AtlasTile, u: f32, v: f32, c: u32) -> f32 {
+    let t = u32.toUsize(tile.texture.index)
+    if t >= self.textures.length() {
+      return 0.0
+    }
+    let w = tile.bounds.xMax - tile.bounds.xMin
+    let h = tile.bounds.yMax - tile.bounds.yMin
+    let fx = clampF(u - 0.5, 0.0, u32.toF32(w - 1))
+    let fy = clampF(v - 0.5, 0.0, u32.toF32(h - 1))
+    let x0 = f32.toU32(fx)
+    let y0 = f32.toU32(fy)
+    let x1 = if x0 + 1 < w {
+      x0 + 1
+    } else {
+      x0
+    }
+    let y1 = if y0 + 1 < h {
+      y0 + 1
+    } else {
+      y0
+    }
+    let ax = fx - u32.toF32(x0)
+    let ay = fy - u32.toF32(y0)
+    let bx = tile.bounds.xMin
+    let by = tile.bounds.yMin
+    let top = u32.toF32(self.texel(t, bx + x0, by + y0, c)) * (1.0 - ax)
+      + u32.toF32(self.texel(t, bx + x1, by + y0, c)) * ax
+    let bottom = u32.toF32(self.texel(t, bx + x0, by + y1, c)) * (1.0 - ax)
+      + u32.toF32(self.texel(t, bx + x1, by + y1, c)) * ax
+    return top * (1.0 - ay) + bottom * ay
+  }
+}
+
+fn clampF(value: f32, low: f32, high: f32) -> f32 {
+  if !(value > low) {
+    return low
+  }
+  if value > high {
+    return high
+  }
+  return value
+}
+
+fn toByte(value: f32) -> u32 {
+  return f32.toU32(clampF(value, 0.0, 255.0) + 0.5)
+}
+
+/// How much of the pixel square at `(x, y)` lies in `rect`, from 0 to 1.
+fn areaIn(rect: Rect<f32>, x: i32, y: i32) -> f32 {
+  let px = i32.toF32(x)
+  let py = i32.toF32(y)
+  let w = clampF(f32.min(px + 1.0, rect.xMax) - f32.max(px, rect.xMin), 0.0, 1.0)
+  let h = clampF(f32.min(py + 1.0, rect.yMax) - f32.max(py, rect.yMin), 0.0, 1.0)
+  return w * h
+}
+
+/// A rectangle of target pixels, `x0 .. x0 + width` by `y0 .. y0 + height`.
+struct Area {
+  x0: i32,
+  y0: i32,
+  width: u32,
+  height: u32,
+}
+
+impl Copy for Area {}
+
+/// The target pixels `bounds` touches, clipped to `clip` and the target; empty when none.
+fn areaOf(bounds: Rect<f32>, clip: Rect<f32>, targetWidth: u32, targetHeight: u32) -> Area {
+  let x0 = f32.max(f32.floor(f32.max(bounds.xMin, clip.xMin)), 0.0)
+  let y0 = f32.max(f32.floor(f32.max(bounds.yMin, clip.yMin)), 0.0)
+  let x1 = f32.min(f32.ceil(f32.min(bounds.xMax, clip.xMax)), u32.toF32(targetWidth))
+  let y1 = f32.min(f32.ceil(f32.min(bounds.yMax, clip.yMax)), u32.toF32(targetHeight))
+  if !(x0 < x1 && y0 < y1) {
+    return Area { x0: 0, y0: 0, width: 0, height: 0 }
+  }
+  return Area {
+    x0: f32.toI32(x0),
+    y0: f32.toI32(y0),
+    width: f32.toU32(x1 - x0),
+    height: f32.toU32(y1 - y0),
+  }
+}
+
+/// Where a pixel's color comes from: one premultiplied color, or a CSS linear gradient ramp.
+struct Painter {
+  solid: bool,
+  color: u32,
+  ramp: List<u32>,
+  cx: f32,
+  cy: f32,
+  dx: f32,
+  dy: f32,
+  half: f32,
+  from: f32,
+  to: f32,
+}
+
+impl Painter {
+  fn make() -> Painter {
+    return Painter {
+      solid: true,
+      color: 0,
+      ramp: List<u32>.make(),
+      cx: 0.0,
+      cy: 0.0,
+      dx: 0.0,
+      dy: 0.0,
+      half: 1.0,
+      from: 0.0,
+      to: 1.0,
+    }
+  }
+
+  fn setColor(self: &mut Self, fill: Rgba<f32>) -> () {
+    self.solid = true
+    self.color = pack(color.toPremultipliedRgba8(fill))
+  }
+
+  /// Paints `background` over `box`, the gradient's box.
+  effect fn set(self: &mut Self, background: Background, box: Rect<f32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match background {
+      Background.Solid { color: fill } => self.setColor(fill)
+      Background.Linear { gradient } => run self.setGradient(gradient, box)
+    }
+  }
+
+  effect fn setGradient(self: &mut Self, g: LinearGradient, box: Rect<f32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.solid = false
+    self.ramp.clear()
+    let mut i: u32 = 0
+    while i < 256 {
+      let t = u32.toF32(i) / 255.0
+      let c = color.mix(g.from.color, g.to.color, t, g.interpolation)
+      run self.ramp.append(pack(color.toPremultipliedRgba8(c)))
+      i = i + 1
+    }
+
+    // CSS: the gradient line runs through the center at `angle` clockwise from up, long enough
+    // that the corners reach 0 and 1.
+    let radians = f32.toF64(g.angle) * PI / 180.0
+    let dx = f64.toF32(f64.sin(radians))
+    let dy = f64.toF32(-f64.cos(radians))
+    let w = box.xMax - box.xMin
+    let h = box.yMax - box.yMin
+    self.cx = (box.xMin + box.xMax) * 0.5
+    self.cy = (box.yMin + box.yMax) * 0.5
+    self.dx = dx
+    self.dy = dy
+    self.half = f32.max((f32.abs(w * dx) + f32.abs(h * dy)) * 0.5, 0.000001)
+    self.from = g.from.offset
+    self.to = g.to.offset
+  }
+
+  /// The packed premultiplied color at the center of pixel `(x, y)`.
+  fn at(self: &Self, x: i32, y: i32) -> u32 {
+    if self.solid {
+      return self.color
+    }
+    let px = i32.toF32(x) + 0.5 - self.cx
+    let py = i32.toF32(y) + 0.5 - self.cy
+    let along = (px * self.dx + py * self.dy) / self.half * 0.5 + 0.5
+    let span = self.to - self.from
+    let t: f32 = if span > 0.0 {
+      (along - self.from) / span
+    } else if along < self.from {
+      0.0
+    } else {
+      1.0
+    }
+    return self.ramp.get(u32.toUsize(toByte(t * 255.0)))
+  }
+}
+
+/// Draws scenes into pixmaps. Keep one and reuse its scratch buffers.
+pub struct CpuRenderer {
+  rasterizer: Rasterizer,
+  stroker: Stroker,
+  coverage: Coverage,
+  path: Path,
+  outline: Path,
+  first: List<u8>,
+  second: List<u8>,
+  painter: Painter,
+}
+
+/// `[rx, ry]` of each corner, top-left first, clockwise.
+struct Radii {
+  values: [f32; 8],
+}
+
+impl Copy for Radii {}
+
+fn circular(radii: Corners<f32>, rect: Rect<f32>) -> Radii {
+  let limit = f32.max(f32.min(rect.xMax - rect.xMin, rect.yMax - rect.yMin) * 0.5, 0.0)
+  let tl = clampF(radii.topLeft, 0.0, limit)
+  let tr = clampF(radii.topRight, 0.0, limit)
+  let br = clampF(radii.bottomRight, 0.0, limit)
+  let bl = clampF(radii.bottomLeft, 0.0, limit)
+  return Radii { values: [tl, tl, tr, tr, br, br, bl, bl] }
+}
+
+/// Appends the outline of `rect` with elliptical corners `radii`, clockwise in y-down space.
+effect fn roundedRect(path: &mut Path, rect: Rect<f32>, radii: Radii) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let x0 = f32.toF64(rect.xMin)
+  let y0 = f32.toF64(rect.yMin)
+  let x1 = f32.toF64(rect.xMax)
+  let y1 = f32.toF64(rect.yMax)
+  let r = radii.values
+  let tlx = f32.toF64(r[0])
+  let tly = f32.toF64(r[1])
+  let trx = f32.toF64(r[2])
+  let try = f32.toF64(r[3])
+  let brx = f32.toF64(r[4])
+  let bry = f32.toF64(r[5])
+  let blx = f32.toF64(r[6])
+  let bly = f32.toF64(r[7])
+  run path.moveTo(x0, y0 + tly)
+  if tlx > 0.0 && tly > 0.0 {
+    run path.ellipseArc(
+      Point.new(x0 + tlx, y0 + tly),
+      Point.new(tlx, 0.0),
+      Point.new(0.0, tly),
+      PI,
+      PI * 0.5,
+    )
+  } else if tly > 0.0 {
+    run path.lineTo(x0, y0)
+  }
+  run path.lineTo(x1 - trx, y0)
+  if trx > 0.0 && try > 0.0 {
+    run path.ellipseArc(
+      Point.new(x1 - trx, y0 + try),
+      Point.new(trx, 0.0),
+      Point.new(0.0, try),
+      PI * 1.5,
+      PI * 0.5,
+    )
+  } else {
+    run path.lineTo(x1, y0)
+  }
+  run path.lineTo(x1, y1 - bry)
+  if brx > 0.0 && bry > 0.0 {
+    run path.ellipseArc(
+      Point.new(x1 - brx, y1 - bry),
+      Point.new(brx, 0.0),
+      Point.new(0.0, bry),
+      0.0,
+      PI * 0.5,
+    )
+  } else {
+    run path.lineTo(x1, y1)
+  }
+  run path.lineTo(x0 + blx, y1)
+  if blx > 0.0 && bly > 0.0 {
+    run path.ellipseArc(
+      Point.new(x0 + blx, y1 - bly),
+      Point.new(blx, 0.0),
+      Point.new(0.0, bly),
+      PI * 0.5,
+      PI * 0.5,
+    )
+  } else {
+    run path.lineTo(x0, y1)
+  }
+  run path.close()
+}
+
+impl CpuRenderer {
+  pub fn make() -> CpuRenderer {
+    return CpuRenderer {
+      rasterizer: Rasterizer.make(),
+      stroker: Stroker.make(),
+      coverage: Coverage.make(0, 0),
+      path: Path.make(),
+      outline: Path.make(),
+      first: List<u8>.make(),
+      second: List<u8>.make(),
+      painter: Painter.make(),
+    }
+  }
+
+  /// Draws layer 0 of `scene` (which must be finished) source-over onto `target`, with sprite
+  /// pixels from `pixels`. Isolated layers are drawn offscreen and composited where they appear.
+  pub effect fn draw(
+    self: &mut Self,
+    scene: &Scene,
+    pixels: &AtlasPixels,
+    target: &mut Pixmap,
+  ) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    if scene.layerCount() == 0 {
+      return
+    }
+    run self.drawLayer(scene, 0, pixels, &mut target)
+  }
+
+  effect fn drawLayer(
+    self: &mut Self,
+    scene: &Scene,
+    layer: u32,
+    pixels: &AtlasPixels,
+    target: &mut Pixmap,
+  ) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let batches = scene.batches(layer)
+    let mut b: usize = 0
+    while b < batches.length {
+      let batch = batches[b]
+      let mut i = u32.toUsize(batch.start)
+      while i < u32.toUsize(batch.end) {
+        match batch.kind {
+          PrimitiveKind.Shadow => run self.shadow(scene.shadows(layer)[i], &mut target)
+          PrimitiveKind.Quad => run self.quad(scene.quads(layer)[i], &mut target)
+          PrimitiveKind.Path => run self.pathSprite(scene, scene.paths(layer)[i], &mut target)
+          PrimitiveKind.Underline => run self.underline(scene.underlines(layer)[i], &mut target)
+          PrimitiveKind.Glyph => self.glyph(scene.glyphs(layer)[i], pixels, &mut target)
+          PrimitiveKind.Image => run self.image(scene.images(layer)[i], pixels, &mut target)
+          PrimitiveKind.Layer => run self.isolated(
+            scene,
+            scene.layers(layer)[i],
+            pixels,
+            &mut target,
+          )
+        }
+        i = i + 1
+      }
+      b = b + 1
+    }
+  }
+
+  effect fn isolated(
+    self: &mut Self,
+    scene: &Scene,
+    sprite: LayerSprite,
+    pixels: &AtlasPixels,
+    target: &mut Pixmap,
+  ) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut offscreen = run Pixmap.make(target.width(), target.height())
+    run self.drawLayer(scene, sprite.layer, pixels, &mut offscreen)
+    let area = areaOf(sprite.bounds, sprite.bounds, target.width(), target.height())
+    if area.width == 0 {
+      return
+    }
+    let x0 = i32.toU32(area.x0)
+    let y0 = i32.toU32(area.y0)
+    layering.compositeWithin(
+      &mut target,
+      &offscreen,
+      sprite.isolation.blend,
+      u32.toU8(toByte(sprite.isolation.opacity * 255.0)),
+      x0,
+      y0,
+      x0 + area.width,
+      y0 + area.height,
+    )
+  }
+
+  /// Rasterizes `self.path` (target coordinates) with `rule` over `area` into `out`, one byte per
+  /// pixel of the area.
+  effect fn rasterize(self: &mut Self, area: Area, rule: u8, out: &mut List<u8>) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    run out.appendRepeated(0, u32.toUsize(area.width) * u32.toUsize(area.height))
+    if self.path.isEmpty() {
+      return
+    }
+    let shift = Affine.new(1.0, 0.0, 0.0, 1.0, -i32.toF64(area.x0), -i32.toF64(area.y0))
+    self.coverage = Coverage.make(area.width, area.height)
+    run self.rasterizer.fill(&self.path, &shift, rule, &mut self.coverage)
+    expand(&self.coverage, out.asMutSlice())
+  }
+
+  /// Composites the painter's colors through `mask` (times the content mask's pixel area) onto
+  /// `area` of `target`.
+  fn composite(self: &Self, area: Area, mask: &[u8], clip: Rect<f32>, target: &mut Pixmap) -> () {
+    let stride = u32.toUsize(target.width()) * 4
+    let data = target.dataMut()
+    let mut y: u32 = 0
+    while y < area.height {
+      let py = area.y0 + u32.toI32(y)
+      let mut x: u32 = 0
+      while x < area.width {
+        let m = u8.toU32(mask[u32.toUsize(y * area.width + x)])
+        if m > 0 {
+          let px = area.x0 + u32.toI32(x)
+          let alpha = toByte(u32.toF32(m) * areaIn(clip, px, py))
+          if alpha > 0 {
+            let source = scalePacked(self.painter.at(px, py), alpha)
+            overPacked(
+              &mut data,
+              u32.toUsize(i32.toU32(py)) * stride + u32.toUsize(i32.toU32(px)) * 4,
+              source,
+            )
+          }
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+  }
+
+  effect fn quad(self: &mut Self, quad: Quad, target: &mut Pixmap) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let area = areaOf(quad.bounds, quad.mask.bounds, target.width(), target.height())
+    if area.width == 0 {
+      return
+    }
+    let outer = circular(quad.cornerRadii, quad.bounds)
+    self.path.clear()
+    run roundedRect(&mut self.path, quad.bounds, outer)
+    if !quad.background.isTransparent() {
+      let mut mask = List<u8>.make()
+      run self.rasterize(area, NONZERO, &mut mask)
+      run self.painter.set(quad.background, quad.bounds)
+      self.composite(area, mask.asSlice(), quad.mask.bounds, &mut target)
+    }
+    if !quad.hasBorder() {
+      return
+    }
+
+    // The border band: the outer outline and the inner one, even-odd.
+    let w = quad.borderWidths
+    let inner = Rect<f32>.new(
+      quad.bounds.xMin + w.left,
+      quad.bounds.yMin + w.top,
+      quad.bounds.xMax - w.right,
+      quad.bounds.yMax - w.bottom,
+    )
+    if inner.xMin < inner.xMax && inner.yMin < inner.yMax {
+      let r = outer.values
+      let innerRadii = Radii {
+        values: [
+          f32.max(r[0] - w.left, 0.0),
+          f32.max(r[1] - w.top, 0.0),
+          f32.max(r[2] - w.right, 0.0),
+          f32.max(r[3] - w.top, 0.0),
+          f32.max(r[4] - w.right, 0.0),
+          f32.max(r[5] - w.bottom, 0.0),
+          f32.max(r[6] - w.left, 0.0),
+          f32.max(r[7] - w.bottom, 0.0),
+        ],
+      }
+      run roundedRect(&mut self.path, inner, innerRadii)
+    }
+    let mut band = List<u8>.make()
+    run self.rasterize(area, EVENODD, &mut band)
+    let dashed = match quad.borderStyle {
+      BorderStyle.Solid => false
+      BorderStyle.Dashed => true
+    }
+    if dashed {
+      // Dashes along the center line of the band, clipped to the band.
+      let widest = f32.max(f32.max(w.top, w.bottom), f32.max(w.left, w.right))
+      let middle = Rect<f32>.new(
+        quad.bounds.xMin + w.left * 0.5,
+        quad.bounds.yMin + w.top * 0.5,
+        quad.bounds.xMax - w.right * 0.5,
+        quad.bounds.yMax - w.bottom * 0.5,
+      )
+      let r = outer.values
+      let middleRadii = Radii {
+        values: [
+          f32.max(r[0] - w.left * 0.5, 0.0),
+          f32.max(r[1] - w.top * 0.5, 0.0),
+          f32.max(r[2] - w.right * 0.5, 0.0),
+          f32.max(r[3] - w.top * 0.5, 0.0),
+          f32.max(r[4] - w.right * 0.5, 0.0),
+          f32.max(r[5] - w.bottom * 0.5, 0.0),
+          f32.max(r[6] - w.left * 0.5, 0.0),
+          f32.max(r[7] - w.bottom * 0.5, 0.0),
+        ],
+      }
+      self.outline.clear()
+      run roundedRect(&mut self.outline, middle, middleRadii)
+      let mut style = Stroke.make(f32.toF64(widest) + 2.0)
+      let dash = f32.toF64(widest)
+      run style.setDashes(&[dash * 2.0, dash])
+      self.path.clear()
+      run self.stroker.stroke(&self.outline, &style, &Affine.identity(), TOLERANCE, &mut self.path)
+      let mut dashes = List<u8>.make()
+      run self.rasterize(area, NONZERO, &mut dashes)
+      multiply(band.asMutSlice(), dashes.asSlice())
+    }
+    self.painter.setColor(quad.borderColor)
+    self.composite(area, band.asSlice(), quad.mask.bounds, &mut target)
+  }
+
+  effect fn shadow(self: &mut Self, shadow: Shadow, target: &mut Pixmap) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let visible = areaOf(shadow.paintBounds(), shadow.mask.bounds, target.width(), target.height())
+    if visible.width == 0 {
+      return
+    }
+    let sigma = f32.toF64(shadow.sigma())
+    let reach = f32.ceil(f64.toF32(sigma) * 3.0) + 1.0
+
+    // Blur over the visible area grown by the blur's reach, so no source pixel is missing.
+    let wide = Area {
+      x0: visible.x0 - f32.toI32(reach),
+      y0: visible.y0 - f32.toI32(reach),
+      width: visible.width + 2 * f32.toU32(reach),
+      height: visible.height + 2 * f32.toU32(reach),
+    }
+    let shape = shadow.shape()
+    self.path.clear()
+    let hasShape = shape.xMin < shape.xMax && shape.yMin < shape.yMax
+    if hasShape {
+      run roundedRect(&mut self.path, shape, circular(shadow.shapeRadii(), shape))
+    }
+    let mut blurred = List<u8>.make()
+    run self.rasterize(wide, NONZERO, &mut blurred)
+    if shadow.inset {
+      invert(blurred.asMutSlice())
+    }
+    if sigma > 0.0 {
+      run blur(blurred.asMutSlice(), wide.width, wide.height, sigma)
+    }
+
+    // Back to the visible area.
+    let mut mask = List<u8>.make()
+    run mask.appendRepeated(0, u32.toUsize(visible.width) * u32.toUsize(visible.height))
+    let dx = u32.toUsize(i32.toU32(visible.x0 - wide.x0))
+    let dy = u32.toUsize(i32.toU32(visible.y0 - wide.y0))
+    let m = mask.asMutSlice()
+    let src = blurred.asSlice()
+    let mut y: usize = 0
+    while y < u32.toUsize(visible.height) {
+      let mut x: usize = 0
+      while x < u32.toUsize(visible.width) {
+        m[y * u32.toUsize(visible.width) + x] = src[(y + dy) * u32.toUsize(wide.width) + x + dx]
+        x = x + 1
+      }
+      y = y + 1
+    }
+    if shadow.inset {
+      // Only inside the box.
+      self.path.clear()
+      run roundedRect(&mut self.path, shadow.bounds, circular(shadow.cornerRadii, shadow.bounds))
+      let mut box = List<u8>.make()
+      run self.rasterize(visible, NONZERO, &mut box)
+      multiply(mask.asMutSlice(), box.asSlice())
+    }
+    self.painter.setColor(shadow.color)
+    self.composite(visible, mask.asSlice(), shadow.mask.bounds, &mut target)
+  }
+
+  effect fn underline(self: &mut Self, line: Underline, target: &mut Pixmap) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let area = areaOf(line.bounds, line.mask.bounds, target.width(), target.height())
+    if area.width == 0 {
+      return
+    }
+    self.path.clear()
+    let b = line.bounds
+    if !line.wavy {
+      let bottom = f32.min(b.yMin + line.thickness, b.yMax)
+      run roundedRect(
+        &mut self.path,
+        Rect<f32>.new(b.xMin, b.yMin, b.xMax, bottom),
+        Radii { values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] },
+      )
+    } else {
+      let thickness = f32.toF64(line.thickness)
+      let amplitude = f64.max((f32.toF64(b.yMax - b.yMin) - thickness) * 0.5, 0.0)
+      let middle = f32.toF64(b.yMin + b.yMax) * 0.5
+      let wavelength = 8.0 * thickness
+      let x0 = f32.toF64(b.xMin)
+      let x1 = f32.toF64(b.xMax)
+      self.outline.clear()
+      run self.outline.moveTo(x0, middle)
+      let mut x = x0
+      while x < x1 {
+        x = f64.min(x + 0.5, x1)
+        run self.outline.lineTo(x, middle + amplitude * f64.sin(2.0 * PI * (x - x0) / wavelength))
+      }
+      let mut style = Stroke.make(thickness)
+      style.cap = CAP_BUTT
+      style.join = JOIN_ROUND
+      run self.stroker.stroke(&self.outline, &style, &Affine.identity(), TOLERANCE, &mut self.path)
+    }
+    let mut mask = List<u8>.make()
+    run self.rasterize(area, NONZERO, &mut mask)
+    self.painter.setColor(line.color)
+    let clip = maskWithin(line.mask.bounds, line.bounds)
+    self.composite(area, mask.asSlice(), clip, &mut target)
+  }
+
+  fn glyph(self: &mut Self, sprite: GlyphSprite, pixels: &AtlasPixels, target: &mut Pixmap) -> () {
+    let area = areaOf(sprite.bounds, sprite.mask.bounds, target.width(), target.height())
+    if area.width == 0 {
+      return
+    }
+    self.painter.setColor(sprite.color)
+    let color = self.painter.color
+    let clip = maskWithin(sprite.mask.bounds, sprite.bounds)
+    let b = sprite.bounds
+    let tw = u32.toF32(sprite.tile.bounds.xMax - sprite.tile.bounds.xMin)
+    let th = u32.toF32(sprite.tile.bounds.yMax - sprite.tile.bounds.yMin)
+    let sx = tw / (b.xMax - b.xMin)
+    let sy = th / (b.yMax - b.yMin)
+    let stride = u32.toUsize(target.width()) * 4
+    let data = target.dataMut()
+    let mut y: u32 = 0
+    while y < area.height {
+      let py = area.y0 + u32.toI32(y)
+      let mut x: u32 = 0
+      while x < area.width {
+        let px = area.x0 + u32.toI32(x)
+        let u = (i32.toF32(px) + 0.5 - b.xMin) * sx
+        let v = (i32.toF32(py) + 0.5 - b.yMin) * sy
+        let coverage = pixels.sample(sprite.tile, u, v, 0) * areaIn(clip, px, py)
+        let alpha = toByte(coverage)
+        if alpha > 0 {
+          overPacked(
+            &mut data,
+            u32.toUsize(i32.toU32(py)) * stride + u32.toUsize(i32.toU32(px)) * 4,
+            scalePacked(color, alpha),
+          )
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+  }
+
+  effect fn image(
+    self: &mut Self,
+    sprite: ImageSprite,
+    pixels: &AtlasPixels,
+    target: &mut Pixmap,
+  ) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let area = areaOf(sprite.bounds, sprite.mask.bounds, target.width(), target.height())
+    if area.width == 0 {
+      return
+    }
+    self.path.clear()
+    run roundedRect(&mut self.path, sprite.bounds, circular(sprite.cornerRadii, sprite.bounds))
+    let mut shape = List<u8>.make()
+    run self.rasterize(area, NONZERO, &mut shape)
+    let b = sprite.bounds
+    let sx = u32.toF32(sprite.tile.bounds.xMax - sprite.tile.bounds.xMin) / (b.xMax - b.xMin)
+    let sy = u32.toF32(sprite.tile.bounds.yMax - sprite.tile.bounds.yMin) / (b.yMax - b.yMin)
+    let opacity = clampF(sprite.opacity, 0.0, 1.0)
+    let stride = u32.toUsize(target.width()) * 4
+    let data = target.dataMut()
+    let mut y: u32 = 0
+    while y < area.height {
+      let py = area.y0 + u32.toI32(y)
+      let mut x: u32 = 0
+      while x < area.width {
+        let px = area.x0 + u32.toI32(x)
+        let m = u8.toU32(shape.get(u32.toUsize(y * area.width + x)))
+        let weight = u32.toF32(m) / 255.0 * opacity * areaIn(sprite.mask.bounds, px, py)
+        if weight > 0.0 {
+          let u = (i32.toF32(px) + 0.5 - b.xMin) * sx
+          let v = (i32.toF32(py) + 0.5 - b.yMin) * sy
+          let mut r = pixels.sample(sprite.tile, u, v, 0)
+          let mut g = pixels.sample(sprite.tile, u, v, 1)
+          let mut bl = pixels.sample(sprite.tile, u, v, 2)
+          let a = pixels.sample(sprite.tile, u, v, 3)
+          if sprite.grayscale {
+            let l = 0.2126 * r + 0.7152 * g + 0.0722 * bl
+            r = l
+            g = l
+            bl = l
+          }
+          let source = pack(
+            Rgba8.make(
+              u32.toU8(toByte(r * weight)),
+              u32.toU8(toByte(g * weight)),
+              u32.toU8(toByte(bl * weight)),
+              u32.toU8(toByte(a * weight)),
+            ),
+          )
+          overPacked(
+            &mut data,
+            u32.toUsize(i32.toU32(py)) * stride + u32.toUsize(i32.toU32(px)) * 4,
+            source,
+          )
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+  }
+
+  effect fn pathSprite(
+    self: &mut Self,
+    scene: &Scene,
+    sprite: PathSprite,
+    target: &mut Pixmap,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let area = areaOf(sprite.bounds(), sprite.mask.bounds, target.width(), target.height())
+    if area.width == 0 {
+      return
+    }
+
+    // Spread the strips and fills over a dense mask of the sprite's area.
+    let mut mask = List<u8>.make()
+    run mask.appendRepeated(0, u32.toUsize(area.width) * u32.toUsize(area.height))
+    let m = mask.asMutSlice()
+    let alphas = scene.pathAlphas()
+    let strips = scene.pathStrips()
+    let mut s = u32.toUsize(sprite.stripStart)
+    while s < u32.toUsize(sprite.stripStart + sprite.stripCount) {
+      let strip = strips[s]
+      let mut column: u32 = 0
+      while column < strip.width {
+        let mut row: u32 = 0
+        while row < 4 {
+          let value = alphas[u32.toUsize(strip.alphaOffset + column * 4 + row)]
+          put(
+            &mut m,
+            area,
+            sprite.x + u32.toI32(strip.x + column),
+            sprite.y + u32.toI32(strip.y + row),
+            value,
+          )
+          row = row + 1
+        }
+        column = column + 1
+      }
+      s = s + 1
+    }
+    let fills = scene.pathFills()
+    let mut f = u32.toUsize(sprite.fillStart)
+    while f < u32.toUsize(sprite.fillStart + sprite.fillCount) {
+      let fill = fills[f]
+      let mut column: u32 = 0
+      while column < fill.width {
+        let mut row: u32 = 0
+        while row < 4 && fill.y + row < sprite.height {
+          put(
+            &mut m,
+            area,
+            sprite.x + u32.toI32(fill.x + column),
+            sprite.y + u32.toI32(fill.y + row),
+            255,
+          )
+          row = row + 1
+        }
+        column = column + 1
+      }
+      f = f + 1
+    }
+    run self.painter.set(sprite.paint, sprite.paintBounds)
+    self.composite(area, mask.asSlice(), sprite.mask.bounds, &mut target)
+  }
+}
+
+/// The content mask narrowed to `bounds`, for primitives whose bounds also clip.
+fn maskWithin(mask: Rect<f32>, bounds: Rect<f32>) -> Rect<f32> {
+  return ContentMask.new(mask).intersect(ContentMask.new(bounds)).bounds
+}
+
+/// Writes `value` at target pixel `(x, y)` of a dense `area` mask, if inside.
+fn put(mask: &mut [u8], area: Area, x: i32, y: i32, value: u8) -> () {
+  let lx = x - area.x0
+  let ly = y - area.y0
+  if lx < 0 || ly < 0 || lx >= u32.toI32(area.width) || ly >= u32.toI32(area.height) {
+    return
+  }
+  mask[u32.toUsize(i32.toU32(ly) * area.width + i32.toU32(lx))] = value
+}
+
+/// Spreads sparse coverage into a dense `width` x `height` mask.
+fn expand(coverage: &Coverage, out: &mut [u8]) -> () {
+  let width = coverage.width()
+  let height = coverage.height()
+  let alphas = coverage.alphas()
+  let strips = coverage.strips()
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let mut column: u32 = 0
+    while column < strip.width {
+      let mut row: u32 = 0
+      while row < 4 && strip.y + row < height {
+        out[u32.toUsize((strip.y + row) * width + strip.x + column)] = alphas[u32.toUsize(
+          strip.alphaOffset + column * 4 + row,
+        )]
+        row = row + 1
+      }
+      column = column + 1
+    }
+    s = s + 1
+  }
+  let fills = coverage.fills()
+  let mut f: usize = 0
+  while f < fills.length {
+    let fill = fills[f]
+    let mut column: u32 = 0
+    while column < fill.width {
+      let mut row: u32 = 0
+      while row < 4 && fill.y + row < height {
+        out[u32.toUsize((fill.y + row) * width + fill.x + column)] = 255
+        row = row + 1
+      }
+      column = column + 1
+    }
+    f = f + 1
+  }
+}
+
+/// `a = a * b / 255`, rounded.
+fn multiply(a: &mut [u8], b: &[u8]) -> () {
+  let mut i: usize = 0
+  while i < a.length {
+    let p = u8.toU32(a[i]) * u8.toU32(b[i]) + 128
+    a[i] = u32.toU8((p + u32.shiftRight(p, 8)) / 256)
+    i = i + 1
+  }
+}
+
+fn invert(a: &mut [u8]) -> () {
+  let mut i: usize = 0
+  while i < a.length {
+    a[i] = 255 - a[i]
+    i = i + 1
+  }
+}
+
+/// Gaussian blur of a one-byte mask with `vector.filter.gaussianBlur`. Pixels past the mask read
+/// as 0, as in SVG filters.
+effect fn blur(mask: &mut [u8], width: u32, height: u32, sigma: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut source = run Pixmap.make(width, height)
+  let d = source.dataMut()
+  let mut i: usize = 0
+  while i < mask.length {
+    d[i * 4 + 3] = mask[i]
+    i = i + 1
+  }
+  let mut out = run Pixmap.make(width, height)
+  let plan = run BlurPlan.make(sigma)
+  run filtering.gaussianBlur(&mut out, &source, &plan, &plan, Region.make(0, 0, width, height))
+  let o = out.data()
+  let mut j: usize = 0
+  while j < mask.length {
+    mask[j] = o[j * 4 + 3]
+    j = j + 1
+  }
+}
