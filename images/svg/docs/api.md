@@ -48,8 +48,17 @@ operating system's appearance. Linux CI installs `fonts-dejavu-core`.
 The CLI permits `data:` resources and files confined to the input directory;
 it does not fetch network resources. `--mode` accepts `static` (default),
 `animated`, `secure-static` and `secure-animated`. Secure modes block external
-requests before invoking a host resolver. Animation sampling is a later phase;
-the current mode selection governs resource access, not a running timeline.
+requests before invoking a host resolver. Animated modes sample SMIL and CSS
+animations at `RenderOptions.time` (`--time` on the CLI).
+
+To render many frames, `parseAnimated(data, host)` parses the XML, builds the
+document graph and resolves SMIL intervals once. `Animated.frame(options, host)`
+then restores the parsed attribute values (`Document.snapshot` and `restore` in
+`text/xml`), writes the animated values at `options.time`, and styles, resolves
+and records again; its display list equals a fresh `parse` and `record` at that
+time, in any time order, and document storage does not grow with the frame count.
+Images are still loaded, and nested SVG images parsed, for every frame. A failed
+frame drops the retained graph, and the next frame parses the data again.
 `--fragment` accepts encoded text with one optional leading `#`.
 The 300×150 embedding viewport is independent of output-resolution overrides.
 Portable hosts can provide measured font bytes through `NativeHost.fromFontBytes`,

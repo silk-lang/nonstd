@@ -70,7 +70,9 @@ pub effect fn svgToPng(svg: &[u8]) -> Bytes
 
 External resources go through the `Resolver` service, so the host decides what may be
 fetched. `render` is the one-step entry point. `parse`, `record` and `renderDisplayList` expose
-the render tree with its computed styles, and a reusable display list. The [API notes](docs/api.md)
+the render tree with its computed styles, and a reusable display list. For animation,
+`parseAnimated` parses once and `Animated.frame` records the display list at each frame's
+`RenderOptions.time` without parsing again. The [API notes](docs/api.md)
 cover the environment, processing modes, resource policy and the geometry API.
 
 ## Command line
