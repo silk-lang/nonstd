@@ -1,0 +1,608 @@
+//! Color glyphs into premultiplied RGBA images: COLR version 0 layers with CPAL colors, and PNG
+//! bitmaps from `sbix` and `CBDT`.
+//!
+//! COLR layers are filled by `vector` like outline glyphs, so they get the same subpixel
+//! positioning. Bitmaps are decoded once per key and box-filtered from their strike to the
+//! requested size, with the pen's subpixel offset applied while resampling. COLR version 1 paint
+//! graphs are not drawn yet; such a glyph falls back to a bitmap or its outline.
+import face { FontFace }
+import rasterize { GlyphImage, GlyphRasterizer, Outcome }
+import read_fonts.lib {
+  ReadError,
+  FontData,
+  ComputedArray,
+  ScalarArray,
+  ArrayOfOffsets,
+  TableProvider,
+  ByteRange
+}
+import read_fonts.tables.colr { Colr, ColorLayer }
+import read_fonts.tables.cpal { Cpal, ColorRecord }
+import read_fonts.tables.sbix { Sbix, Strike, GlyphData }
+import read_fonts.tables.cbdt { Cbdt }
+import read_fonts.tables.cblc { Cblc }
+import read_fonts.tables.bitmap {
+  BitmapSize,
+  BitmapLocation,
+  BitmapData,
+  BitmapMetrics,
+  BitmapContent,
+  BitmapDataFormat,
+  SmallGlyphMetrics,
+  BigGlyphMetrics
+}
+import font_types.lib { GlyphId, GlyphId16, Offset32, Tag }
+import codec.png { decode, PngError }
+import codec.image { Image, ImageError }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.strips { Coverage, NONZERO }
+import vector.geometry_error { GeometryError }
+import silk.geometry.affine { Affine2 }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i8
+import silk.num.i16
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+/// The color tables of one font, read once.
+pub struct ColorTables<'a> {
+  colr: Option<Colr<'a>>,
+  cpal: Option<Cpal<'a>>,
+  sbix: Option<Sbix<'a>>,
+  cblc: Option<Cblc<'a>>,
+  cbdt: Option<Cbdt<'a>>,
+}
+
+impl<'a> Copy for ColorTables<'a> {}
+
+fn some<T: Copy>(result: Result<T, ReadError>) -> Option<T> {
+  return match move result {
+    Result<T, ReadError>.Success { value } => Option<T>.some(value)
+    _ => Option<T>.None
+  }
+}
+
+impl<'a> ColorTables<'a> {
+  pub fn read<P: TableProvider<'a>>(provider: &P) -> ColorTables<'a> {
+    return ColorTables<'a> {
+      colr: some(TableProvider.colr(provider)),
+      cpal: some(TableProvider.cpal(provider)),
+      sbix: some(TableProvider.sbix(provider)),
+      cblc: some(TableProvider.cblc(provider)),
+      cbdt: some(TableProvider.cbdt(provider)),
+    }
+  }
+
+  /// True when the font has any color table this module draws.
+  pub fn any(self: &Self) -> bool {
+    return Option<Colr<'a>>.isSome(&self.colr) || Option<Sbix<'a>>.isSome(&self.sbix)
+      || (Option<Cblc<'a>>.isSome(&self.cblc) && Option<Cbdt<'a>>.isSome(&self.cbdt))
+  }
+
+  /// Palette 0 entry `index` as straight RGBA, or `None` when the palette has no such entry.
+  pub fn paletteColor(self: &Self, index: u16) -> Option<Rgba8> {
+    let cpal = match self.cpal {
+      Option<Cpal<'a>>.Some { value } => value
+      _ => {
+        return Option<Rgba8>.None
+      }
+    }
+    if index >= Cpal.numPaletteEntries(&cpal) {
+      return Option<Rgba8>.None
+    }
+    let starts = Cpal.colorRecordIndices(&cpal)
+    let first = match ScalarArray<'a, u16>.get(&starts, 0) {
+      Option<u16>.Some { value } => value
+      _ => {
+        return Option<Rgba8>.None
+      }
+    }
+    let records = match Cpal.colorRecordsArray(&cpal) {
+      Option<Result<ComputedArray<'a, (), ColorRecord<'a>>, ReadError>>.Some {
+        value: Result<ComputedArray<'a, (), ColorRecord<'a>>, ReadError>.Success { value }
+      } => value
+      _ => {
+        return Option<Rgba8>.None
+      }
+    }
+    return match ComputedArray<'a, (), ColorRecord<'a>>.get(
+      &records,
+      u16.toUsize(first) + u16.toUsize(index),
+    ) {
+      Result<ColorRecord<'a>, ReadError>.Success { value: record } => Option<Rgba8>.some(
+        Rgba8.make(
+          ColorRecord.red(&record),
+          ColorRecord.green(&record),
+          ColorRecord.blue(&record),
+          ColorRecord.alpha(&record),
+        ),
+      )
+      _ => Option<Rgba8>.None
+    }
+  }
+}
+
+/// A PNG found for a glyph, and where its top-left corner sits relative to the pen, in strike
+/// pixels (y down).
+struct Bitmap<'a> {
+  png: &'a [u8],
+  left: f64,
+  top: f64,
+  ppem: f64,
+}
+
+impl<'a> Copy for Bitmap<'a> {}
+
+const SBIX_DUPE: u32 = 1685418085
+
+const SBIX_PNG: u32 = 1886283552
+
+fn closer(requested: f64, candidate: u16, best: u16) -> bool {
+  let c = u16.toF64(candidate)
+  let b = u16.toF64(best)
+
+  // The smallest strike at least as large as requested, else the largest.
+  return (requested <= c && c < b) || (requested > b && c > b)
+}
+
+fn sbixBitmap<'a>(table: &Sbix<'a>, glyph: u32, ppem: f64) -> Option<Bitmap<'a>> {
+  let strikes = Sbix.strikes(table)
+  let count = ArrayOfOffsets<'a, u32, Strike<'a>, Offset32>.len(&strikes)
+  let mut best = Option<Strike<'a>>.None
+  let mut i: usize = 0
+  while i < count {
+    if let Result<Strike<'a>, ReadError>.Success { value: strike } = ArrayOfOffsets<
+      'a,
+      u32,
+      Strike<'a>,
+      Offset32
+    >.get(&strikes, i) {
+      let mut replace = true
+      if let Option<Strike<'a>>.Some { value } = best {
+        replace = closer(ppem, Strike.ppem(&strike), Strike.ppem(&value))
+      }
+      if replace && Strike.ppem(&strike) != 0 {
+        best = Option<Strike<'a>>.some(strike)
+      }
+    }
+    i = i + 1
+  }
+  let strike = match best {
+    Option<Strike<'a>>.Some { value } => value
+    _ => {
+      return Option<Bitmap<'a>>.None
+    }
+  }
+  let mut gid = glyph
+  let mut depth: usize = 0
+  while depth <= 8 {
+    let entry = match Strike.glyphData(&strike, GlyphId.new(gid)) {
+      Result<Option<GlyphData<'a>>, ReadError>.Success {
+        value: Option<GlyphData<'a>>.Some { value }
+      } => value
+      _ => {
+        return Option<Bitmap<'a>>.None
+      }
+    }
+    let tag = Tag.toU32(GlyphData.graphicType(&entry))
+    let bytes = ScalarArray<'a, u8>.offsetData(&GlyphData.data(&entry))
+    if tag == SBIX_DUPE {
+      gid = match FontData<'a>.readAt<u16>(&bytes, 0) {
+        Result<u16, ReadError>.Success { value } => u16.toU32(value)
+        _ => {
+          return Option<Bitmap<'a>>.None
+        }
+      }
+    } else if tag == SBIX_PNG {
+      let raw = FontData.asBytes(&bytes)
+      let height = match FontData<'a>.readAt<u32>(&bytes, 20) {
+        Result<u32, ReadError>.Success { value } => value
+        _ => {
+          return Option<Bitmap<'a>>.None
+        }
+      }
+
+      // The origin offset places the image's bottom-left corner, y up.
+      return Option<Bitmap<'a>>.some(
+        Bitmap<'a> {
+          png: raw,
+          left: i16.toF64(GlyphData.originOffsetX(&entry)),
+          top: -(i16.toF64(GlyphData.originOffsetY(&entry)) + u32.toF64(height)),
+          ppem: u16.toF64(Strike.ppem(&strike)),
+        },
+      )
+    } else {
+      return Option<Bitmap<'a>>.None
+    }
+    depth = depth + 1
+  }
+  return Option<Bitmap<'a>>.None
+}
+
+fn sizePpem(size: &BitmapSize) -> u16 {
+  let x = BitmapSize.ppemX(size)
+  let y = BitmapSize.ppemY(size)
+  if x > y {
+    return u8.toU16(x)
+  }
+  return u8.toU16(y)
+}
+
+fn cbdtBitmap<'a>(locations: &Cblc<'a>, images: &Cbdt<'a>, glyph: u32, ppem: f64) -> Option<
+  Bitmap<'a>
+> {
+  let sizes = Cblc.bitmapSizes(locations)
+  let count = ComputedArray<'a, (), BitmapSize<'a>>.len(&sizes)
+  let mut best = Option<BitmapSize<'a>>.None
+  let mut i: usize = 0
+  while i < count {
+    if let Result<BitmapSize<'a>, ReadError>.Success { value: size } = ComputedArray<
+      'a,
+      (),
+      BitmapSize<'a>
+    >.get(&sizes, i) {
+      let mut replace = true
+      if let Option<BitmapSize<'a>>.Some { value } = best {
+        replace = closer(ppem, sizePpem(&size), sizePpem(&value))
+      }
+      if replace && sizePpem(&size) != 0 && BitmapSize.bitDepth(&size) == 32 {
+        best = Option<BitmapSize<'a>>.some(size)
+      }
+    }
+    i = i + 1
+  }
+  let size = match best {
+    Option<BitmapSize<'a>>.Some { value } => value
+    _ => {
+      return Option<Bitmap<'a>>.None
+    }
+  }
+  let location = match move BitmapSize.location(
+    &size,
+    Cblc.offsetData(&locations),
+    GlyphId.new(glyph),
+  ) {
+    Result<BitmapLocation<'a>, ReadError>.Success { value } => move value
+    _ => {
+      return Option<Bitmap<'a>>.None
+    }
+  }
+  let data = match move Cbdt.data(images, &location) {
+    Result<BitmapData<'a>, ReadError>.Success { value } => value
+    _ => {
+      return Option<Bitmap<'a>>.None
+    }
+  }
+  let mut x: i32 = 0
+  let mut y: i32 = 0
+  match data.metrics {
+    BitmapMetrics<'a>.Small { value } => {
+      x = i8.toI32(SmallGlyphMetrics.bearingX(&value))
+      y = i8.toI32(SmallGlyphMetrics.bearingY(&value))
+    }
+    BitmapMetrics<'a>.Big { value } => {
+      x = i8.toI32(BigGlyphMetrics.horiBearingX(&value))
+      y = i8.toI32(BigGlyphMetrics.horiBearingY(&value))
+    }
+  }
+  return match data.content {
+    BitmapContent<'a>.Data { format, bytes } => {
+      if format != BitmapDataFormat.Png {
+        return Option<Bitmap<'a>>.None
+      }
+      return Option<Bitmap<'a>>.some(
+        Bitmap<'a> {
+          png: bytes,
+          left: i32.toF64(x),
+          top: -i32.toF64(y),
+          ppem: u16.toF64(sizePpem(&size)),
+        },
+      )
+    }
+    _ => Option<Bitmap<'a>>.None
+  }
+}
+
+/// Replaces `out` with the color rendering of `glyph` as premultiplied RGBA (4 bytes per
+/// pixel), or returns `Missing` when the font has no color rendering for it. Foreground-colored
+/// COLR layers (palette index 0xFFFF) use `foreground`.
+pub effect fn colorGlyph<'a>(
+  self: &mut GlyphRasterizer,
+  face: &FontFace<'a>,
+  glyph: u32,
+  pixelsPerEm: f64,
+  subpixelOffset: f64,
+  foreground: Rgba8,
+  out: &mut GlyphImage,
+) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  out.bytesPerPixel = 4
+  if !(pixelsPerEm > 0.0) {
+    return Outcome.Missing
+  }
+  let tables = face.colorTables()
+  if let Option<Colr<'a>>.Some { value: colr } = tables.colr {
+    if let Option<ByteRange>.Some { value: range } = Colr.v0BaseGlyph(&colr, GlyphId.new(glyph)) {
+      return run colrLayers(
+        &mut self,
+        face,
+        &colr,
+        range.start,
+        range.end,
+        pixelsPerEm,
+        subpixelOffset,
+        foreground,
+        &mut out,
+      )
+    }
+  }
+  let mut found = Option<Bitmap<'a>>.None
+  if let Option<Sbix<'a>>.Some { value } = tables.sbix {
+    found = sbixBitmap(&value, glyph, pixelsPerEm)
+  }
+  if let Option<Bitmap<'a>>.None = found {
+    if let Option<Cblc<'a>>.Some { value: locations } = tables.cblc {
+      if let Option<Cbdt<'a>>.Some { value: images } = tables.cbdt {
+        found = cbdtBitmap(&locations, &images, glyph, pixelsPerEm)
+      }
+    }
+  }
+  if let Option<Bitmap<'a>>.Some { value: bitmap } = found {
+    return run resampleBitmap(bitmap, pixelsPerEm, subpixelOffset, &mut out)
+  }
+  return Outcome.Missing
+}
+
+effect fn colrLayers(
+  self: &mut GlyphRasterizer,
+  face: &FontFace,
+  colr: &Colr,
+  start: usize,
+  end: usize,
+  pixelsPerEm: f64,
+  subpixelOffset: f64,
+  foreground: Rgba8,
+  out: &mut GlyphImage,
+) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // The union of the layers' control boxes.
+  let mut x0 = f64.INFINITY
+  let mut y0 = f64.INFINITY
+  let mut x1 = -f64.INFINITY
+  let mut y1 = -f64.INFINITY
+  let mut layer = start
+  while layer < end {
+    if let Option<ColorLayer>.Some { value } = Colr.v0Layer(colr, layer) {
+      if run self.outlinePath(
+        face,
+        GlyphId16.toU32(value.glyphId),
+        pixelsPerEm,
+        subpixelOffset,
+        0.0,
+      ) {
+        let points = self.lastPath().pointList()
+        let mut i: usize = 0
+        while i < points.length {
+          x0 = f64.min(x0, points[i].x)
+          y0 = f64.min(y0, points[i].y)
+          x1 = f64.max(x1, points[i].x)
+          y1 = f64.max(y1, points[i].y)
+          i = i + 1
+        }
+      }
+    }
+    layer = layer + 1
+  }
+  if !(x0 < x1 && y0 < y1) || !f64.isFinite(x0) || !f64.isFinite(y0) || !f64.isFinite(x1)
+    || !f64.isFinite(y1) {
+    return Outcome.Drawn
+  }
+  let left = f64.floor(x0)
+  let top = f64.floor(y0)
+  let width = f64.ceil(x1) - left
+  let height = f64.ceil(y1) - top
+  if width > 8192.0 || height > 8192.0 {
+    return Outcome.Drawn
+  }
+  let w = f64.toU32(width)
+  let h = f64.toU32(height)
+  let mut pixmap = run Pixmap.make(w, h)
+  let transform = Affine2<f64>.new(1.0, 0.0, 0.0, 1.0, -left, -top)
+  let tables = face.colorTables()
+  layer = start
+  while layer < end {
+    if let Option<ColorLayer>.Some { value } = Colr.v0Layer(colr, layer) {
+      let color = if value.paletteIndex == 65535 {
+        foreground
+      } else {
+        tables.paletteColor(value.paletteIndex) |> Option<Rgba8>.unwrapOr(foreground)
+      }
+      if run self.outlinePath(
+        face,
+        GlyphId16.toU32(value.glyphId),
+        pixelsPerEm,
+        subpixelOffset,
+        0.0,
+      ) {
+        let mut coverage = Coverage.make(w, h)
+        let filled = run Effect.result(self.fillPath(&transform, &mut coverage))
+        if let Result<(), OutOfMemoryError | GeometryError>.Failure { error } = move filled {
+          match move error {
+            OutOfMemoryError problem => {
+              fail move problem
+            }
+            GeometryError problem => {
+              return Outcome.Missing
+            }
+          }
+        }
+        pixmap.fillCoverage(&coverage, color)
+      }
+    }
+    layer = layer + 1
+  }
+  run cropRgba(pixmap.data(), w, h, f64.toI32(left), f64.toI32(top), &mut out)
+  return Outcome.Drawn
+}
+
+/// Copies the smallest rectangle of premultiplied `pixels` holding every pixel with nonzero
+/// alpha into `out`.
+effect fn cropRgba(
+  pixels: &[u8],
+  width: u32,
+  height: u32,
+  left: i32,
+  top: i32,
+  out: &mut GlyphImage,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let w = u32.toUsize(width)
+  let h = u32.toUsize(height)
+  let mut minX = w
+  let mut minY = h
+  let mut maxX: usize = 0
+  let mut maxY: usize = 0
+  let mut y: usize = 0
+  while y < h {
+    let mut x: usize = 0
+    while x < w {
+      if pixels[(y * w + x) * 4 + 3] != 0 {
+        if x < minX {
+          minX = x
+        }
+        if x + 1 > maxX {
+          maxX = x + 1
+        }
+        if y < minY {
+          minY = y
+        }
+        maxY = y + 1
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  out.bytesPerPixel = 4
+  if maxX <= minX || maxY <= minY {
+    return
+  }
+  out.left = left + usize.toI32(minX)
+  out.top = top + usize.toI32(minY)
+  out.width = usize.toU32(maxX - minX)
+  out.height = usize.toU32(maxY - minY)
+  run out.pixels.reserve((maxX - minX) * (maxY - minY) * 4)
+  let mut row = minY
+  while row < maxY {
+    run out.pixels.appendSlice(Slice.view<u8>(pixels, (row * w + minX) * 4, (maxX - minX) * 4))
+    row = row + 1
+  }
+}
+
+fn overlap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+  let low = f64.max(a0, b0)
+  let high = f64.min(a1, b1)
+  return if high > low {
+    high - low
+  } else {
+    0.0
+  }
+}
+
+/// Decodes `bitmap` and box-filters it to `pixelsPerEm`, with the pen `subpixelOffset` pixels
+/// right of its whole pixel.
+effect fn resampleBitmap(
+  bitmap: Bitmap,
+  pixelsPerEm: f64,
+  subpixelOffset: f64,
+  out: &mut GlyphImage,
+) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let decoded = run Effect.result(decode(bitmap.png))
+  let image = match move decoded {
+    Result<Image, PngError | ImageError | OutOfMemoryError>.Success { value } => move value
+    Result<Image, PngError | ImageError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError problem => {
+        fail move problem
+      }
+      _ => {
+        return Outcome.Missing
+      }
+    }
+  }
+  let scale = pixelsPerEm / bitmap.ppem
+  let sw = image.width()
+  let sh = image.height()
+
+  // Device-space rectangle of the image.
+  let ox = subpixelOffset + bitmap.left * scale
+  let oy = bitmap.top * scale
+  let ex = ox + u32.toF64(sw) * scale
+  let ey = oy + u32.toF64(sh) * scale
+  let left = f64.floor(ox)
+  let top = f64.floor(oy)
+  let width = f64.ceil(ex) - left
+  let height = f64.ceil(ey) - top
+  if !(width > 0.0 && height > 0.0) || width > 8192.0 || height > 8192.0 {
+    return Outcome.Drawn
+  }
+  let w = f64.toU32(width)
+  let h = f64.toU32(height)
+  let source = image.data()
+  let mut pixels = List<u8>.make()
+  run pixels.appendRepeated(0, u32.toUsize(w) * u32.toUsize(h) * 4)
+  let target = pixels.asMutSlice()
+  let area = 1.0 / (scale * scale)
+  let mut dy: u32 = 0
+  while dy < h {
+    // The destination row in source pixels.
+    let sy0 = (top + u32.toF64(dy) - oy) / scale
+    let sy1 = sy0 + 1.0 / scale
+    let mut dx: u32 = 0
+    while dx < w {
+      let sx0 = (left + u32.toF64(dx) - ox) / scale
+      let sx1 = sx0 + 1.0 / scale
+      let mut sums = [0.0, 0.0, 0.0, 0.0]
+      let mut y = f64.max(0.0, f64.floor(sy0))
+      while y < f64.min(u32.toF64(sh), sy1) {
+        let wy = overlap(sy0, sy1, y, y + 1.0)
+        let mut x = f64.max(0.0, f64.floor(sx0))
+        while x < f64.min(u32.toF64(sw), sx1) {
+          let weight = wy * overlap(sx0, sx1, x, x + 1.0)
+          let i = (f64.toUsize(y) * u32.toUsize(sw) + f64.toUsize(x)) * 4
+          let mut c: usize = 0
+          while c < 4 {
+            sums[c] = sums[c] + u8.toF64(source[i + c]) * weight
+            c = c + 1
+          }
+          x = x + 1.0
+        }
+        y = y + 1.0
+      }
+      let o = (u32.toUsize(dy) * u32.toUsize(w) + u32.toUsize(dx)) * 4
+      let mut c: usize = 0
+      while c < 4 {
+        target[o + c] = f64.toU8(f64.min(255.0, f64.floor(sums[c] / area + 0.5)))
+        c = c + 1
+      }
+      dx = dx + 1
+    }
+    dy = dy + 1
+  }
+  run cropRgba(pixels.asSlice(), w, h, f64.toI32(left), f64.toI32(top), &mut out)
+  return Outcome.Drawn
+}
