@@ -1,0 +1,450 @@
+//! Path coverage for the scene, rasterized by `vector` and cached across frames.
+//!
+//! [`PathCache.fill`] and [`PathCache.stroke`] turn a `vector.path.Path` into strip coverage and
+//! add it to a [`Scene`] as one [`PathSprite`]. When the caller names the path with a nonzero
+//! `id`, the coverage is kept and reused while the path is drawn again with the same id, the same
+//! 2x2 part of the transform, the same subpixel offset (rounded to 1/4 px on each axis), fill rule
+//! and stroke. Coverage is stored relative to the path's pixel origin, so moving a path by whole
+//! pixels, as scrolling does, reuses it. An entry not drawn for two frames is evicted by
+//! [`PathCache.beginFrame`].
+//!
+//! The id is the caller's promise that the geometry is unchanged: give a path a new id when it
+//! changes. Id 0 never caches and rasterizes at the exact transform, clipped to the content mask.
+//! Cached paths snap their translation to the 1/4 px grid (an error of at most 1/8 px).
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import vector.flatten { Line, TOLERANCE }
+import vector.flatten as flattening
+import vector.geometry { Affine }
+import vector.geometry_error { GeometryError }
+import vector.path { Path }
+import vector.strips { Coverage, Fill, NONZERO, Rasterizer, Strip }
+import vector.stroke { Stroke, Stroker }
+import primitives { Background, ContentMask }
+import scene { Scene }
+
+/// Coverage larger than this many pixels is not cached; it is rasterized clipped to its mask.
+const MAX_CACHED_AREA: f64 = 16777216.0
+
+/// The farthest a cached path reaches from its origin, so its lines stay exact in f32.
+const CACHE_LIMIT: f64 = 1048576.0
+
+struct Key {
+  id: u64,
+  m0: u64,
+  m1: u64,
+  m2: u64,
+  m3: u64,
+  subpixel: u32,
+  rule: u32,
+  stroke: u64,
+}
+
+impl Copy for Key {}
+
+fn keyEquals(left: &Key, right: &Key) -> bool {
+  return left.id == right.id && left.m0 == right.m0 && left.m1 == right.m1 && left.m2 == right.m2
+    && left.m3 == right.m3
+    && left.subpixel == right.subpixel
+    && left.rule == right.rule
+    && left.stroke == right.stroke
+}
+
+fn keyHash(value: &Key, seed: &HashSeed) -> u64 {
+  let mut h = Hash.mix(seed, value.id)
+  h = Hash.combine(h, value.m0)
+  h = Hash.combine(h, value.m1)
+  h = Hash.combine(h, value.m2)
+  h = Hash.combine(h, value.m3)
+  h = Hash.combine(h, u32.toU64(value.subpixel) * 16 + u32.toU64(value.rule))
+  return Hash.combine(h, value.stroke)
+}
+
+impl HashKey for Key {
+  equals: Key.keyEquals
+
+  hash: Key.keyHash
+}
+
+struct Entry {
+  key: Key,
+  live: bool,
+  lastUsed: u64,
+  /// The coverage origin relative to the integer part of the translation.
+  dx: i32,
+  dy: i32,
+  width: u32,
+  height: u32,
+  strips: List<Strip>,
+  fills: List<Fill>,
+  alphas: List<u8>,
+}
+
+/// A hash of everything in a stroke style that changes its outline.
+pub fn strokeHash(style: &Stroke) -> u64 {
+  let mut h = Hash.combine(f64.toBits(style.width), f64.toBits(style.miterLimit))
+  h = Hash.combine(h, u32.toU64(u8.toU32(style.join)) * 256 + u32.toU64(u8.toU32(style.cap)))
+  h = Hash.combine(h, f64.toBits(style.dashOffset))
+  let dashes = style.dashArray()
+  let mut i: usize = 0
+  while i < dashes.length {
+    h = Hash.combine(h, f64.toBits(dashes[i]))
+    i = i + 1
+  }
+
+  // Distinct from every fill (stroke 0).
+  return h | 1
+}
+
+/// Rasterizes paths into scenes and keeps their coverage across frames. Keep one per window.
+pub struct PathCache {
+  index: HashMap<Key, u32>,
+  entries: List<Entry>,
+  free: List<u32>,
+  frameNumber: u64,
+  rasterizer: Rasterizer,
+  stroker: Stroker,
+  lines: List<Line>,
+  coverage: Coverage,
+  hitCount: u64,
+  missCount: u64,
+}
+
+fn rounded(value: f64) -> f64 {
+  return f64.floor(value * 4.0 + 0.5) / 4.0
+}
+
+impl PathCache {
+  pub fn make() -> PathCache {
+    return PathCache {
+      index: HashMap<Key, u32>.make(Hash.seed(0x5eed)),
+      entries: List<Entry>.make(),
+      free: List<u32>.make(),
+      frameNumber: 0,
+      rasterizer: Rasterizer.make(),
+      stroker: Stroker.make(),
+      lines: List<Line>.make(),
+      coverage: Coverage.make(0, 0),
+      hitCount: 0,
+      missCount: 0,
+    }
+  }
+
+  /// Starts a frame and evicts every entry not drawn in either of the last two frames.
+  pub effect fn beginFrame(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.frameNumber = self.frameNumber + 1
+    let entries = self.entries.asMutSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].live && self.frameNumber - entries[i].lastUsed > 2 {
+        drop self.index.remove(entries[i].key)
+        entries[i].live = false
+        entries[i].strips.clear()
+        entries[i].fills.clear()
+        entries[i].alphas.clear()
+        run self.free.append(usize.toU32(i))
+      }
+      i = i + 1
+    }
+  }
+
+  /// The current frame number, from 0 before the first [`PathCache.beginFrame`].
+  pub fn frame(self: &Self) -> u64 {
+    return self.frameNumber
+  }
+
+  /// The number of cached paths.
+  pub fn length(self: &Self) -> usize {
+    return self.index.length()
+  }
+
+  /// Draws that reused cached coverage.
+  pub fn hits(self: &Self) -> u64 {
+    return self.hitCount
+  }
+
+  /// Draws that rasterized (cached or not).
+  pub fn misses(self: &Self) -> u64 {
+    return self.missCount
+  }
+
+  /// Fills `path` under `transform` with fill `rule` (`vector.strips.NONZERO` or `EVENODD`) and
+  /// adds it to `scene` painted with `paint`. Returns the draw order, or 0 when nothing is drawn.
+  pub effect fn fill(
+    self: &mut Self,
+    scene: &mut Scene,
+    id: u64,
+    path: &Path,
+    transform: &Affine,
+    rule: u8,
+    paint: Background,
+    mask: ContentMask,
+  ) -> u32
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.draw(&mut scene, id, path, transform, rule, 0, paint, mask)
+  }
+
+  /// Strokes `path` with `style` under `transform` and adds it to `scene` painted with `paint`.
+  /// Returns the draw order, or 0 when nothing is drawn.
+  pub effect fn stroke(
+    self: &mut Self,
+    scene: &mut Scene,
+    id: u64,
+    path: &Path,
+    style: &Stroke,
+    transform: &Affine,
+    paint: Background,
+    mask: ContentMask,
+  ) -> u32
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let hash = strokeHash(style)
+    if id != 0 {
+      let key = self.keyFor(id, transform, NONZERO, hash)
+      if let Option<u32>.Some { value } = self.index.get(key) {
+        self.hitCount = self.hitCount + 1
+        return run self.emit(&mut scene, value, transform, paint, mask)
+      }
+    }
+    let mut outline = Path.make()
+    run self.stroker.stroke(path, style, transform, TOLERANCE, &mut outline)
+    let order = run self.draw(&mut scene, id, &outline, transform, NONZERO, hash, paint, mask)
+    return order
+  }
+
+  fn keyFor(self: &Self, id: u64, transform: &Affine, rule: u8, stroke: u64) -> Key {
+    let fx = rounded(transform.dx - f64.floor(transform.dx))
+    let fy = rounded(transform.dy - f64.floor(transform.dy))
+
+    // 1.0 rounds into the next whole pixel.
+    let sx = f64.toU32(fx * 4.0) % 4
+    let sy = f64.toU32(fy * 4.0) % 4
+    return Key {
+      id: id,
+      m0: f64.toBits(transform.xx),
+      m1: f64.toBits(transform.yx),
+      m2: f64.toBits(transform.xy),
+      m3: f64.toBits(transform.yy),
+      subpixel: sx * 4 + sy,
+      rule: u8.toU32(rule),
+      stroke: stroke,
+    }
+  }
+
+  effect fn draw(
+    self: &mut Self,
+    scene: &mut Scene,
+    id: u64,
+    path: &Path,
+    transform: &Affine,
+    rule: u8,
+    stroke: u64,
+    paint: Background,
+    mask: ContentMask,
+  ) -> u32
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    if id != 0 {
+      let key = self.keyFor(id, transform, rule, stroke)
+      if let Option<u32>.Some { value } = self.index.get(key) {
+        self.hitCount = self.hitCount + 1
+        return run self.emit(&mut scene, value, transform, paint, mask)
+      }
+
+      // Cache: rasterize at the snapped fractional offset, unclipped.
+      let ix = f64.floor(transform.dx)
+      let iy = f64.floor(transform.dy)
+      let sx = u32.toF64(key.subpixel / 4) / 4.0
+      let sy = u32.toF64(key.subpixel % 4) / 4.0
+      let local = Affine.new(transform.xx, transform.yx, transform.xy, transform.yy, sx, sy)
+      let limit = Rect<f64>.new(-CACHE_LIMIT, -CACHE_LIMIT, CACHE_LIMIT, CACHE_LIMIT)
+      self.lines.clear()
+      run flattening.fillClipped(path, &local, &limit, TOLERANCE, &mut self.lines)
+      let box = linesBounds(self.lines.asSlice())
+      let area = (box.xMax - box.xMin) * (box.yMax - box.yMin)
+      if area <= MAX_CACHED_AREA && box.xMax - box.xMin < CACHE_LIMIT
+        && box.yMax - box.yMin < CACHE_LIMIT {
+        self.missCount = self.missCount + 1
+        let slot = run self.store(key, box)
+        return run self.emit(&mut scene, slot, transform, paint, mask)
+      }
+    }
+    self.missCount = self.missCount + 1
+
+    // Uncached: rasterize at the exact transform, clipped to the mask.
+    let m = mask.bounds
+    let clip = Rect<f64>.new(
+      f32.toF64(f32.floor(m.xMin)),
+      f32.toF64(f32.floor(m.yMin)),
+      f32.toF64(f32.ceil(m.xMax)),
+      f32.toF64(f32.ceil(m.yMax)),
+    )
+    if !(clip.xMin < clip.xMax && clip.yMin < clip.yMax) {
+      return 0
+    }
+    self.lines.clear()
+    run flattening.fillClipped(path, transform, &clip, TOLERANCE, &mut self.lines)
+    let box = linesBounds(self.lines.asSlice())
+    if !(box.xMin < box.xMax && box.yMin < box.yMax) {
+      return 0
+    }
+    shiftLines(self.lines.asMutSlice(), -box.xMin, -box.yMin)
+    let width = f64.toU32(box.xMax - box.xMin)
+    let height = f64.toU32(box.yMax - box.yMin)
+    self.coverage = Coverage.make(width, height)
+    run self.rasterizer.fillPolylines(self.lines.asSlice(), rule, &mut self.coverage)
+    let pathBox = Rect<f32>.new(
+      f64.toF32(box.xMin),
+      f64.toF32(box.yMin),
+      f64.toF32(box.xMax),
+      f64.toF32(box.yMax),
+    )
+    return run scene.pathCoverage(
+      f64.toI32(box.xMin),
+      f64.toI32(box.yMin),
+      width,
+      height,
+      mask,
+      paint,
+      pathBox,
+      self.coverage.strips(),
+      self.coverage.fills(),
+      self.coverage.alphas(),
+    )
+  }
+
+  /// Rasterizes `self.lines` (bounded by `box`) into a new entry for `key`.
+  effect fn store(self: &mut Self, key: Key, box: Rect<f64>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let width = f64.toU32(box.xMax - box.xMin)
+    let height = f64.toU32(box.yMax - box.yMin)
+    shiftLines(self.lines.asMutSlice(), -box.xMin, -box.yMin)
+    self.coverage = Coverage.make(width, height)
+    run self.rasterizer.fillPolylines(self.lines.asSlice(), u32.toU8(key.rule), &mut self.coverage)
+    let slot = if self.free.length() > 0 {
+      let reused = self.free.get(self.free.length() - 1)
+      drop self.free.pop()
+      reused
+    } else {
+      run self.entries.append(
+        Entry {
+          key: key,
+          live: false,
+          lastUsed: 0,
+          dx: 0,
+          dy: 0,
+          width: 0,
+          height: 0,
+          strips: List<Strip>.make(),
+          fills: List<Fill>.make(),
+          alphas: List<u8>.make(),
+        },
+      )
+      usize.toU32(self.entries.length() - 1)
+    }
+    let entry = &mut self.entries.asMutSlice()[u32.toUsize(slot)]
+    entry.key = key
+    entry.live = true
+    entry.lastUsed = self.frameNumber
+    entry.dx = f64.toI32(box.xMin)
+    entry.dy = f64.toI32(box.yMin)
+    entry.width = width
+    entry.height = height
+    entry.strips.clear()
+    entry.fills.clear()
+    entry.alphas.clear()
+    run entry.strips.appendSlice(self.coverage.strips())
+    run entry.fills.appendSlice(self.coverage.fills())
+    run entry.alphas.appendSlice(self.coverage.alphas())
+    drop run self.index.insert(key, slot)
+    return slot
+  }
+
+  /// Adds entry `slot` to `scene`, placed by the integer part of `transform`'s translation.
+  effect fn emit(
+    self: &mut Self,
+    scene: &mut Scene,
+    slot: u32,
+    transform: &Affine,
+    paint: Background,
+    mask: ContentMask,
+  ) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let entry = &mut self.entries.asMutSlice()[u32.toUsize(slot)]
+    entry.lastUsed = self.frameNumber
+    let x = f64.toI32(f64.floor(transform.dx)) + entry.dx
+    let y = f64.toI32(f64.floor(transform.dy)) + entry.dy
+    let fx = i32.toF32(x)
+    let fy = i32.toF32(y)
+    let box = Rect<f32>.new(fx, fy, fx + u32.toF32(entry.width), fy + u32.toF32(entry.height))
+    return run scene.pathCoverage(
+      x,
+      y,
+      entry.width,
+      entry.height,
+      mask,
+      paint,
+      box,
+      entry.strips.asSlice(),
+      entry.fills.asSlice(),
+      entry.alphas.asSlice(),
+    )
+  }
+}
+
+/// The bounds of `lines` rounded out to whole pixels; empty (all zero) for no lines.
+fn linesBounds(lines: &[Line]) -> Rect<f64> {
+  if lines.length == 0 {
+    return Rect<f64>.new(0.0, 0.0, 0.0, 0.0)
+  }
+  let mut x0 = f32.min(lines[0].x0, lines[0].x1)
+  let mut y0 = f32.min(lines[0].y0, lines[0].y1)
+  let mut x1 = f32.max(lines[0].x0, lines[0].x1)
+  let mut y1 = f32.max(lines[0].y0, lines[0].y1)
+  let mut i: usize = 1
+  while i < lines.length {
+    let l = lines[i]
+    x0 = f32.min(x0, f32.min(l.x0, l.x1))
+    y0 = f32.min(y0, f32.min(l.y0, l.y1))
+    x1 = f32.max(x1, f32.max(l.x0, l.x1))
+    y1 = f32.max(y1, f32.max(l.y0, l.y1))
+    i = i + 1
+  }
+  return Rect<f64>.new(
+    f64.floor(f32.toF64(x0)),
+    f64.floor(f32.toF64(y0)),
+    f64.ceil(f32.toF64(x1)),
+    f64.ceil(f32.toF64(y1)),
+  )
+}
+
+/// Moves every line by whole pixels, which is exact in f32 for the coordinates the cache allows.
+fn shiftLines(lines: &mut [Line], dx: f64, dy: f64) -> () {
+  let x = f64.toF32(dx)
+  let y = f64.toF32(dy)
+  let mut i: usize = 0
+  while i < lines.length {
+    lines[i].x0 = lines[i].x0 + x
+    lines[i].x1 = lines[i].x1 + x
+    lines[i].y0 = lines[i].y0 + y
+    lines[i].y1 = lines[i].y1 + y
+    i = i + 1
+  }
+}
