@@ -58,7 +58,35 @@ def windows_dawn(clang, dawn):
             shutil.copytree(dawn / "include", stage / "include")
         for name in ("ucrt", "vcruntime"):
             shutil.copy2(windows_import_library(name), stage / "lib" / f"{name}.lib")
+    windows_c_libraries(clang, stage)
     return stage
+
+
+# The C sources that manifests compile on macOS and Linux. On Windows Silk passes include
+# directories to Clang as \\?\ paths, where `#include <webgpu/webgpu.h>` is not found, so these are
+# compiled here into the Dawn stage and the manifests link them from it.
+WINDOWS_C_LIBRARIES = {
+    "nonstd_callbacks": (ROOT / "sys/native/callbacks.c", ["-O2"], []),
+    "nonstd_abi_layout": (ROOT / "sys/abi/generated_layout.c", ["-DSILK_GPU_ABI_LIBRARY"], ["include/dawn"]),
+    "nonstd_bench_support": (ROOT / "bench/support.c", ["-O3", "-g", "-I", str(ROOT / "bench")], []),
+}
+
+
+def windows_c_libraries(clang, stage):
+    for name, (source, flags, includes) in WINDOWS_C_LIBRARIES.items():
+        library = stage / "lib" / f"{name}.lib"
+        command = [str(clang), "-std=c11", "-fms-runtime-lib=dll", "-fms-omit-default-lib", *flags,
+                   "-I", str(stage / "include"), *(arg for path in includes for arg in ("-I", str(stage / path)))]
+        key = hashlib.sha256(source.read_bytes() + repr(command).encode()).hexdigest()
+        stamp = library.with_suffix(".key")
+        if library.is_file() and stamp.is_file() and stamp.read_text() == key:
+            continue
+        object_path = stage / f"{name}.o"
+        subprocess.run([*command, "-c", str(source), "-o", str(object_path)], check=True)
+        library.unlink(missing_ok=True)
+        subprocess.run([str(clang.parent / executable("llvm-ar")), "rcs", str(library), str(object_path)], check=True)
+        object_path.unlink()
+        stamp.write_text(key)
 
 
 def windows_import_library(name):
