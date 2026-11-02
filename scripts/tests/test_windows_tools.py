@@ -56,7 +56,11 @@ class NativePinTests(unittest.TestCase):
         manifests = {"gpu/webgpu/sys/silk.toml": "dawn", "gpu/webgpu/sys/abi/silk.toml": "dawn-headers",
                      "gpu/webgpu/bench/silk.toml": "dawn-headers"}
         for path, name in manifests.items():
-            targets = tomllib.loads((ROOT / path).read_text())["native"]["archive"][name]["targets"]
+            targets = dict(tomllib.loads((ROOT / path).read_text())["native"]["archive"][name]["targets"])
+            # wasm32 builds never fetch Dawn; its entry only satisfies Silk's reference check.
+            placeholder = targets.pop("wasm32-unknown-unknown", None)
+            if placeholder is not None:
+                self.assertEqual(placeholder["sha256"], lock["x86_64-unknown-linux-gnu"]["sha256"], path)
             self.assertEqual(set(targets), set(lock), path)
             for target, pin in targets.items():
                 self.assertEqual((pin["url"], pin["sha256"]), (lock[target]["url"], lock[target]["sha256"]), f"{path} {target}")
