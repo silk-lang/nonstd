@@ -377,8 +377,14 @@ static void push_resize(SilkView *view) {
     }
 }
 
+static BOOL window_visible(NSWindow *window) {
+    return window && (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+}
+
 - (void)displayLinkFired:(CADisplayLink *)link {
-    if (!self.frameRequested) {
+    // A covered or off-screen window keeps its request and draws when it shows again
+    // (windowDidChangeOcclusionState: resumes the link).
+    if (!self.frameRequested || !window_visible(self.window)) {
         link.paused = YES;
         return;
     }
@@ -465,7 +471,15 @@ static uint32_t other_button(NSEvent *event) {
 - (void)otherMouseUp:(NSEvent *)e {
     [self pushMouse:SILK_EVENT_MOUSE_UP event:e button:other_button(e)];
 }
-- (void)mouseMoved:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_MOVED event:e button:0]; }
+- (void)mouseMoved:(NSEvent *)e {
+    // The tracking area is active even while another app is in front, so a window shows
+    // hover like other Mac windows do. AppKit also sends the moves while another app's
+    // window covers this one; those are dropped unless this window is the one under the
+    // pointer.
+    NSInteger top = [NSWindow windowNumberAtPoint:[NSEvent mouseLocation] belowWindowWithWindowNumber:0];
+    if (top != self.window.windowNumber) return;
+    [self pushMouse:SILK_EVENT_MOUSE_MOVED event:e button:0];
+}
 - (void)mouseDragged:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_MOVED event:e button:0]; }
 - (void)rightMouseDragged:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_MOVED event:e button:0]; }
 - (void)otherMouseDragged:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_MOVED event:e button:0]; }
@@ -684,7 +698,8 @@ static NSPoint top_left(NSWindow *window) {
     [self pushFlag:SILK_EVENT_FULL_SCREEN_CHANGED on:NO];
 }
 - (void)windowDidChangeOcclusionState:(NSNotification *)n {
-    BOOL visible = (self.window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+    BOOL visible = window_visible(self.window);
+    if (visible && self.frameRequested) self.displayLink.paused = NO;
     [self pushFlag:SILK_EVENT_OCCLUDED on:!visible];
 }
 
