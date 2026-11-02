@@ -8,7 +8,7 @@ listed in [SPECIFICATIONS.md](SPECIFICATIONS.md).
 
 - Status: filed [silk-lang/silk#2558](https://github.com/silk-lang/silk/issues/2558).
 - `vector` used to be a pinned git submodule. Since the move into nonstd it is a
-  sibling package (`images/svg/vector`) reached by an ordinary path dependency, so
+  sibling package (`graphics/vector`) reached by an ordinary path dependency, so
   no workaround remains.
 
 ## Local geometry types
@@ -151,7 +151,7 @@ Required backend changes stay upstream; there is no second local rasterizer.
 
 No JPEG codec was present in the dev.32 stdlib inspected for the original report. The baseline/progressive
 codec request is tracked in [silk-lang/silk#2617](https://github.com/silk-lang/silk/issues/2617).
-The general-purpose `images/svg/image` package is implementing bounded marker,
+The general-purpose `images/codec` package is implementing bounded marker,
 metadata and entropy decoding locally; its API contains no SVG types.
 
 ## LIMITATION-10 — native NaN constant reference

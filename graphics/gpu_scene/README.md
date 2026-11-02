@@ -1,6 +1,6 @@
-# images-svg-gpu-scene
+# graphics-gpu-scene
 
-Draws [images-svg-vector](../vector) scenes on the GPU through [gpu-webgpu](../../../gpu/webgpu),
+Draws [graphics-vector](../vector) scenes on the GPU through [gpu-webgpu](../../gpu/webgpu),
 producing the same bytes as the CPU renderer. Geometry and coverage are still computed on the
 CPU. The GPU packs strips, alphas and paints into storage buffers and paints and composites them
 in instanced render passes, as in [vello_hybrid](https://github.com/linebender/vello/tree/main/sparse_strips).
@@ -16,8 +16,8 @@ exactness is kept between CPU and GPU.
 
 | Path | Package | What it is |
 | --- | --- | --- |
-| `images/svg/gpu_scene` | `images-svg-gpu-scene` | The renderer |
-| `images/svg/gpu_scene/tests` | `images-svg-gpu-scene-tests` | Renders each scene on the CPU and the GPU and compares bytes |
+| `graphics/gpu_scene` | `graphics-gpu-scene` | The renderer |
+| `graphics/gpu_scene/tests` | `graphics-gpu-scene-tests` | Renders each scene on the CPU and the GPU and compares bytes |
 
 The WGSL shaders live in `shaders/`, and `gpu/webgpu/scripts/embed-shaders` embeds them in
 `src/generated_shaders.silk`. Edit the `.wgsl` files, never the generated module.
@@ -31,6 +31,6 @@ images/svg/scripts/check-vector
 ```
 
 Every scene comparison requires identical bytes. The one exception is a single specular lighting
-case, which allows a channel delta of 1. The check runs in the `images-svg-vector` CI workflow.
+case, which allows a channel delta of 1. The check runs in the `graphics-vector` CI workflow.
 
 Dependents import the package as `gpu_scene`.

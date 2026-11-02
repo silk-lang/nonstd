@@ -3,7 +3,7 @@
 An SVG renderer for Silk, written from the specifications (SVG 1.1 Second Edition and SVG 2)
 rather than ported from another engine. It parses a document and computes CSS over it. It then
 resolves geometry, records a backend-neutral display list, and rasterizes that list to
-premultiplied RGBA through [images-svg-vector](vector). Browsers and resvg are used as
+premultiplied RGBA through [graphics-vector](../../graphics/vector). Browsers and resvg are used as
 diagnostic references; [SPECIFICATIONS.md](SPECIFICATIONS.md) records the authority, scope and
 coverage.
 
@@ -92,13 +92,13 @@ writes nothing unless parsing, rendering and encoding all succeed.
 | `images/svg/render` | `images-svg-render` | Render tree, display list and the rendering entry points (`svg_render`) |
 | `images/svg/raster` | `images-svg-raster` | Executes display lists on the CPU through `vector` |
 | `images/svg/geometry` | `images-svg-geometry` | f64 geometry, path and points parsing, arcs, transforms |
-| `images/svg/image` | `images-svg-image` | PNG/JPEG decoding, orientation, premultiplied RGBA storage and PNG encoding |
+| `images/codec` | `images-codec` | PNG/JPEG decoding, orientation, premultiplied RGBA storage and PNG encoding |
 | `images/svg/filters` | `images-svg-filters` | Filter programs and their execution over `vector.filter` |
 | `images/svg/cli` | `images-svg-cli` | The command-line renderer |
 | `images/svg/tests` | `images-svg-tests` | Test inputs, suite pins and reviewed expectations |
 | `images/svg/bench` | `images-svg-bench` | Renderer workloads and the resvg comparison |
-| `images/svg/vector` | `images-svg-vector` | The pure-Silk 2D rasterizer ([README](vector/README.md)) |
-| `images/svg/gpu_scene` | `images-svg-gpu-scene` | Draws `vector` scenes on WebGPU, byte-identical to the CPU ([README](gpu_scene/README.md)) |
+| `graphics/vector` | `graphics-vector` | The pure-Silk 2D rasterizer ([README](../../graphics/vector/README.md)) |
+| `graphics/gpu_scene` | `graphics-gpu-scene` | Draws `vector` scenes on WebGPU, byte-identical to the CPU ([README](../../graphics/gpu_scene/README.md)) |
 
 XML parsing is [text-xml](../../text/xml) and CSS is [css-style](../../css/style). Text measurement
 uses [font-parse](../../font/parse).
@@ -116,7 +116,7 @@ project's own reference tests (including 53 exact-RGBA painting tests), malforme
 curated subset of the resvg suite. Every result is compared with a reviewed expectation, so a
 known failure is recorded as one and never counted as a pass. It runs in the `images-svg` CI
 workflow, and `images/svg/scripts/check-vector` runs the vector and GPU scene tests in
-`images-svg-vector`. [Testing](docs/testing.md) covers the specification and suite caches,
+`graphics-vector`. [Testing](docs/testing.md) covers the specification and suite caches,
 expectation files and the reftest runner.
 
 ## Conformance
