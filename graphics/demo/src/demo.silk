@@ -1,0 +1,1377 @@
+//! The demo: one frame of a small app painted into a `ui_scene.Scene`. Everything a window or a
+//! test needs goes through [`Demo`]: input in logical points, [`Demo.paint`] for a frame, and
+//! [`Demo.pendingUploads`] for the tile pixels the frame added to the atlas.
+//!
+//! What it shows: rounded cards with borders and drop shadows, text in two weights through the
+//! glyph cache, straight and wavy underlines, tinted SVG icons, an animated SVG (SMIL and CSS)
+//! rendered per frame into the atlas, a path chart through the path cache, and a scrolling grid of
+//! decoded PNG and JPEG photos clipped by a content mask.
+import assets
+import text { FontError, Text, TextRun, Weight }
+import uploads { Pending }
+import atlas.atlas { Atlas, AtlasError, AtlasOptions, AtlasTile }
+import sprites.icons { IconCache, IconId, IconOptions, IconStyle }
+import sprites.images { ImageId, ImageStore }
+import svg_render.lib { Environment, RenderError }
+import svg_render.environment { noHostStyles }
+import svg_core.structure { Options as StructureOptions }
+import svg_core.resources { DataOnly, Limits as ResourceLimits, ProcessingMode, Resolver }
+import svg_core.url { Url, UrlError }
+import svg_css.colors { Color as CssColor, Context as ColorContext }
+import svg_css.media_features { Environment as MediaEnvironment }
+import svg_css.tokens { Limits }
+import svg_fonts.database { FontDatabase }
+import codec.image { ImageError }
+import codec.png { PngError }
+import codec.jpeg { JpegError }
+import ui_scene.color as color
+import ui_scene.path_cache { PathCache }
+import ui_scene.primitives {
+  Background,
+  BorderStyle,
+  ColorStop,
+  ContentMask,
+  GlyphSprite,
+  ImageSprite,
+  LinearGradient,
+  Quad,
+  Shadow,
+  Underline,
+}
+import ui_scene.scene { Scene }
+import vector.geometry { Affine }
+import vector.geometry_error { GeometryError }
+import vector.path { Path as VectorPath }
+import vector.strips { NONZERO }
+import vector.stroke { CAP_ROUND, JOIN_ROUND, Stroke }
+import silk.collections.list { List }
+import silk.color.color { ColorSpace, Interpolation }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// Why the demo could not start: a font, icon or photo it embeds did not load.
+pub union DemoError {
+  Font,
+  Icon,
+  Photo,
+}
+
+impl Copy for DemoError {}
+
+/// The size and time of a frame: the window's content size in logical points, its scale factor,
+/// and the animation time in seconds.
+pub struct Frame {
+  pub width: f32,
+  pub height: f32,
+  pub scale: f32,
+  pub time: f64,
+}
+
+impl Copy for Frame {}
+
+/// Counters for the status line and the tests.
+pub struct Stats {
+  pub frames: u64,
+  pub glyphHits: u64,
+  pub glyphMisses: u64,
+  pub iconHits: u64,
+  pub iconMisses: u64,
+  pub imageUploads: u64,
+  pub atlasTextures: usize,
+  pub primitives: usize,
+}
+
+impl Copy for Stats {}
+
+const PAD: f32 = 24.0
+
+const BAR: f32 = 56.0
+
+const STATUS: f32 = 30.0
+
+const COLUMN: f32 = 300.0
+
+const GAP: f32 = 12.0
+
+const CELL_MIN: f32 = 150.0
+
+/// Toolbar buttons, from the right edge: search, notifications, settings.
+const BUTTONS: u32 = 3
+
+const BUTTON: f32 = 34.0
+
+/// What the pointer is over.
+union Target {
+  Nothing,
+  Button { index: u32 },
+  Card { index: u32 },
+  Photo { index: u32 },
+}
+
+impl Copy for Target {}
+
+struct IconHost {
+  base: Url,
+  fonts: FontDatabase,
+}
+
+fn hostOf<'a>(host: &'a IconHost) -> Environment<'a> {
+  let black = CssColor.srgb(0.0, 0.0, 0.0, 1.0)
+  let mut structure = StructureOptions.defaults()
+  structure.policy.mode = ProcessingMode.Animated
+  return Environment<'a> {
+    base: &host.base,
+    media: MediaEnvironment.headless(300.0, 150.0),
+    colors: ColorContext.make(black, [black; 19]),
+    fontFamily: b"sans-serif",
+    systemFonts: [b"16px sans-serif"; 6],
+    cssLimits: Limits.make(),
+    structure: move structure,
+    fonts: &host.fonts,
+    styles: noHostStyles(),
+  }
+}
+
+effect fn invalidBase(error: UrlError) -> never
+  ! DemoError {
+  drop error
+  fail DemoError.Icon
+}
+
+effect fn fontFailed(error: FontError) -> never
+  ! DemoError {
+  drop error
+  fail DemoError.Font
+}
+
+effect fn iconFailed(error: RenderError) -> never
+  ! DemoError {
+  drop error
+  fail DemoError.Icon
+}
+
+effect fn photoFailed<E>(error: E) -> never
+  ! DemoError {
+  drop error
+  fail DemoError.Photo
+}
+
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect<f32> {
+  return Rect<f32>.new(x, y, x + w, y + h)
+}
+
+fn inside(r: Rect<f32>, x: f32, y: f32) -> bool {
+  return x >= r.xMin && x < r.xMax && y >= r.yMin && y < r.yMax
+}
+
+/// `r` (logical) in device pixels.
+fn device(r: Rect<f32>, s: f32) -> Rect<f32> {
+  return Rect<f32>.new(r.xMin * s, r.yMin * s, r.xMax * s, r.yMax * s)
+}
+
+/// `r` (logical) in device pixels, snapped to whole pixels, for sprites sampled one texel per
+/// pixel.
+fn snapped(r: Rect<f32>, s: f32) -> Rect<f32> {
+  let x = f32.floor(r.xMin * s + 0.5)
+  let y = f32.floor(r.yMin * s + 0.5)
+  return Rect<f32>.new(
+    x,
+    y,
+    x + f32.floor((r.xMax - r.xMin) * s + 0.5),
+    y + f32.floor((r.yMax - r.yMin) * s + 0.5),
+  )
+}
+
+fn pixels(length: f32, s: f32) -> u32 {
+  return f32.toU32(f32.max(f32.floor(length * s + 0.5), 1.0))
+}
+
+/// Chart values, 0 to 1.
+fn sample(i: u32) -> f64 {
+  let x = u32.toF64(i)
+  return 0.5 + 0.28 * f64.sin(x * 0.55) + 0.14 * f64.sin(x * 1.7 + 0.4)
+}
+
+const SAMPLES: u32 = 25
+
+effect fn appendNumber(out: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendNumber(&mut out, value / 10)
+  }
+  let digits = "0123456789"
+  let d = u64.toUsize(value % 10)
+  run out.append(String.slice(digits, d, 1))
+}
+
+pub struct Demo {
+  atlas: Atlas,
+  text: Text,
+  icons: IconCache,
+  iconHost: IconHost,
+  resolver: DataOnly,
+  iconIds: List<IconId>,
+  orbit: IconId,
+  images: ImageStore,
+  photos: List<ImageId>,
+  paths: PathCache,
+  pending: Pending,
+  // State.
+  pointerX: f32,
+  pointerY: f32,
+  pointerIn: bool,
+  hover: Target,
+  favorites: u32,
+  scroll: f32,
+  maxScroll: f32,
+  grayscale: bool,
+  animating: bool,
+  frames: u64,
+  lastPrimitives: usize,
+  // Where the last frame put things, in logical points, for hit testing.
+  buttonRects: List<Rect<f32>>,
+  cardRects: List<Rect<f32>>,
+  photoRects: List<Rect<f32>>,
+  gridClip: Rect<f32>,
+}
+
+impl Demo {
+  /// Loads the fonts, icons and photos. Photos are decoded here, once; their tiles are uploaded
+  /// on the first frame that draws them.
+  pub effect fn make() -> Demo
+    ! DemoError | OutOfMemoryError
+    ? &mut Allocator {
+    let text = run Effect.catch<FontError>(Text.make(), fontFailed)
+    let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/demo/icons/icon.svg"), invalidBase)
+    let iconHost = IconHost { base: move base, fonts: FontDatabase.make() }
+    let mut resolver = DataOnly.make(ResourceLimits.defaults())
+    let mut icons = IconCache.make(IconOptions.default())
+    let mut iconIds = List<IconId>.make()
+    let host = hostOf(&iconHost)
+    let mut i: u32 = 0
+    while i < assets.ICON_COUNT {
+      let id = run Effect.catch<RenderError>(icons.register(assets.icon(i), &host), iconFailed)
+        |> Effect.provideMut<Resolver>(&mut resolver)
+      run iconIds.append(id)
+      i = i + 1
+    }
+    let orbit = run Effect.catch<RenderError>(icons.register(assets.orbit(), &host), iconFailed)
+      |> Effect.provideMut<Resolver>(&mut resolver)
+    drop host
+    let mut images = ImageStore.make()
+    let mut photos = List<ImageId>.make()
+    let mut p: u32 = 0
+    while p < assets.PHOTO_COUNT {
+      let id = run Effect.catchAll(images.decode(assets.photo(p)), photoFailed)
+      run photos.append(id)
+      p = p + 1
+    }
+    return Demo {
+      atlas: Atlas.make(AtlasOptions.default()),
+      text: move text,
+      icons: move icons,
+      iconHost: move iconHost,
+      resolver: move resolver,
+      iconIds: move iconIds,
+      orbit: orbit,
+      images: move images,
+      photos: move photos,
+      paths: PathCache.make(),
+      pending: Pending.make(),
+      pointerX: 0.0,
+      pointerY: 0.0,
+      pointerIn: false,
+      hover: Target.Nothing,
+      favorites: 0,
+      scroll: 0.0,
+      maxScroll: 0.0,
+      grayscale: false,
+      animating: true,
+      frames: 0,
+      lastPrimitives: 0,
+      buttonRects: List<Rect<f32>>.make(),
+      cardRects: List<Rect<f32>>.make(),
+      photoRects: List<Rect<f32>>.make(),
+      gridClip: rect(0.0, 0.0, 0.0, 0.0),
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Input. Each returns whether the window should draw again.
+
+  /// The pointer moved to `(x, y)` logical points.
+  pub fn pointerMoved(self: &mut Self, x: f32, y: f32) -> bool {
+    self.pointerX = x
+    self.pointerY = y
+    self.pointerIn = true
+    let before = self.hover
+    self.hover = self.hitTest()
+    return !sameTarget(before, self.hover)
+  }
+
+  pub fn pointerLeft(self: &mut Self) -> bool {
+    self.pointerIn = false
+    let before = self.hover
+    self.hover = Target.Nothing
+    return !sameTarget(before, self.hover)
+  }
+
+  /// A click: a photo toggles its heart.
+  pub fn pointerPressed(self: &mut Self) -> bool {
+    return match self.hover {
+      Target.Photo { index } => {
+        self.favorites = u32.bitXor(self.favorites, u32.shiftLeft(1, index))
+        true
+      }
+      _ => false
+    }
+  }
+
+  /// Scrolls the photo grid by `dy` logical points (positive moves the content up), when the
+  /// pointer is over it.
+  pub fn scrolled(self: &mut Self, dy: f32) -> bool {
+    if !inside(self.gridClip, self.pointerX, self.pointerY) {
+      return false
+    }
+    let next = f32.min(f32.max(self.scroll + dy, 0.0), self.maxScroll)
+    if next == self.scroll {
+      return false
+    }
+    self.scroll = next
+    self.hover = self.hitTest()
+    return true
+  }
+
+  /// Pauses or resumes the animation.
+  pub fn toggleAnimation(self: &mut Self) -> () {
+    self.animating = !self.animating
+  }
+
+  /// Draws the photos in grayscale or in color.
+  pub fn toggleGrayscale(self: &mut Self) -> () {
+    self.grayscale = !self.grayscale
+  }
+
+  pub fn setScroll(self: &mut Self, scroll: f32) -> () {
+    self.scroll = f32.max(scroll, 0.0)
+  }
+
+  /// Marks photo `index` as a favorite (for tests and screenshots).
+  pub fn setFavorite(self: &mut Self, index: u32, on: bool) -> () {
+    let bit = u32.shiftLeft(1, index)
+    self.favorites = if on {
+      u32.bitOr(self.favorites, bit)
+    } else {
+      u32.bitAnd(self.favorites, u32.bitNot(bit))
+    }
+  }
+
+  /// Whether the window should keep requesting frames.
+  pub fn isAnimating(self: &Self) -> bool {
+    return self.animating
+  }
+
+  fn hitTest(self: &Self) -> Target {
+    if !self.pointerIn {
+      return Target.Nothing
+    }
+    let x = self.pointerX
+    let y = self.pointerY
+    let buttons = self.buttonRects.asSlice()
+    let mut i: usize = 0
+    while i < buttons.length {
+      if inside(buttons[i], x, y) {
+        return Target.Button { index: usize.toU32(i) }
+      }
+      i = i + 1
+    }
+    if inside(self.gridClip, x, y) {
+      let photos = self.photoRects.asSlice()
+      let mut p: usize = 0
+      while p < photos.length {
+        if inside(photos[p], x, y) {
+          return Target.Photo { index: usize.toU32(p) }
+        }
+        p = p + 1
+      }
+    }
+    let cards = self.cardRects.asSlice()
+    let mut c: usize = 0
+    while c < cards.length {
+      if inside(cards[c], x, y) {
+        return Target.Card { index: usize.toU32(c) }
+      }
+      c = c + 1
+    }
+    return Target.Nothing
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Output.
+
+  pub fn currentAtlas(self: &Self) -> &Atlas {
+    return &self.atlas
+  }
+
+  /// The tiles the last [`Demo.paint`] allocated, with their pixels. Copy them into the
+  /// renderer's textures (after creating any new atlas texture), then call
+  /// [`Demo.clearPending`].
+  pub fn pendingUploads(self: &Self) -> &Pending {
+    return &self.pending
+  }
+
+  pub fn clearPending(self: &mut Self) -> () {
+    self.pending.clear()
+  }
+
+  pub fn stats(self: &Self) -> Stats {
+    let glyphs = self.text.glyphCache().stats()
+    let icons = self.icons.stats()
+    return Stats {
+      frames: self.frames,
+      glyphHits: glyphs.hits,
+      glyphMisses: glyphs.misses + glyphs.rerasterized,
+      iconHits: icons.hits,
+      iconMisses: icons.misses + icons.rerendered,
+      imageUploads: self.images.uploadCount(),
+      atlasTextures: self.atlas.textureCount(),
+      primitives: self.lastPrimitives,
+    }
+  }
+
+  /// Paints a frame into `scene` (cleared first) and finishes it.
+  pub effect fn paint(self: &mut Self, scene: &mut Scene, frame: Frame) -> ()
+    ! AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    scene.clear()
+    drop self.atlas.beginFrame()
+    run self.text.beginFrame()
+    run self.paths.beginFrame()
+    self.frames = self.frames + 1
+    let s = frame.scale
+    let w = frame.width
+    let h = frame.height
+    let window = ContentMask.new(device(rect(0.0, 0.0, w, h), s))
+
+    // Background: a soft diagonal gradient, mixed in Oklab.
+    let mut background = Quad.fill(
+      window.bounds,
+      window,
+      Background.Linear {
+        gradient: LinearGradient {
+          angle: 135.0,
+          from: ColorStop { color: color.rgb(0xeef2f8), offset: 0.0 },
+          to: ColorStop { color: color.rgb(0xf7efe9), offset: 1.0 },
+          interpolation: Interpolation.new(ColorSpace.Oklab),
+        },
+      },
+    )
+    drop run scene.quad(background)
+
+    run self.paintBar(&mut scene, frame, window)
+    self.cardRects.clear()
+    run self.paintTextCard(&mut scene, frame, window, rect(PAD, BAR + PAD, COLUMN, 164.0))
+    run self.paintOrbitCard(&mut scene, frame, window, rect(PAD, BAR + PAD + 180.0, COLUMN, 196.0))
+    run self.paintChartCard(&mut scene, frame, window, rect(PAD, BAR + PAD + 392.0, COLUMN, 150.0))
+    let gridX = PAD + COLUMN + PAD
+    run self.paintPhotos(
+      &mut scene,
+      frame,
+      window,
+      rect(gridX, BAR + PAD, w - gridX - PAD, h - BAR - PAD - STATUS - 12.0),
+    )
+    run self.paintStatus(&mut scene, frame, window)
+    run self.collect()
+    if self.frames % 120 == 0 {
+      drop run self.text.mutGlyphCache().prune(&self.atlas)
+      drop run self.icons.prune(&self.atlas)
+    }
+    run scene.finish()
+    self.lastPrimitives = scene.primitiveCount()
+  }
+
+  /// Moves every tile the caches queued this frame into [`Demo.pendingUploads`].
+  effect fn collect(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let glyphs = self.text.glyphCache().uploads()
+    let glyphBytes = self.text.glyphCache().uploadBytes()
+    let mut i: usize = 0
+    while i < glyphs.length {
+      run self.pending.push(glyphs[i].tile, glyphBytes, glyphs[i].offset, glyphs[i].bytesPerRow)
+      i = i + 1
+    }
+    self.text.mutGlyphCache().clearUploads()
+    let icons = self.icons.uploads()
+    let iconBytes = self.icons.uploadBytes()
+    let mut j: usize = 0
+    while j < icons.length {
+      run self.pending.push(icons[j].tile, iconBytes, icons[j].offset, icons[j].bytesPerRow)
+      j = j + 1
+    }
+    self.icons.clearUploads()
+    let images = self.images.uploads()
+    let imageBytes = self.images.uploadBytes()
+    let mut k: usize = 0
+    while k < images.length {
+      run self.pending.push(images[k].tile, imageBytes, images[k].offset, images[k].bytesPerRow)
+      k = k + 1
+    }
+    self.images.clearUploads()
+  }
+
+  effect fn label(
+    self: &mut Self,
+    scene: &mut Scene,
+    words: string,
+    weight: Weight,
+    size: f32,
+    x: f32,
+    baseline: f32,
+    s: f32,
+    tint: Rgba<f32>,
+    mask: ContentMask,
+  ) -> f32
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let advance = run self.text.draw(
+      &mut scene,
+      &mut self.atlas,
+      words,
+      TextRun {
+        weight: weight,
+        size: size,
+        scale: s,
+        x: x * s,
+        baseline: baseline * s,
+        color: tint,
+        mask: mask,
+      },
+    )
+    return advance / s
+  }
+
+  /// A tinted monochrome icon over `bounds` (logical).
+  effect fn icon(
+    self: &mut Self,
+    scene: &mut Scene,
+    index: u32,
+    bounds: Rect<f32>,
+    s: f32,
+    tint: Rgba<f32>,
+    mask: ContentMask,
+  ) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let place = snapped(bounds, s)
+    let id = self.iconIds.get(u32.toUsize(index))
+    let host = hostOf(&self.iconHost)
+    let tile = run Effect.catch<RenderError>(
+      tryIcon(
+        &mut self.icons,
+        &mut self.atlas,
+        &host,
+        id,
+        f32.toU32(place.xMax - place.xMin),
+        f32.toU32(place.yMax - place.yMin),
+        IconStyle.Mask,
+        0.0,
+      ),
+      skipIcon,
+    )
+      |> Effect.provideMut<Resolver>(&mut self.resolver)
+    if let Option<AtlasTile>.Some { value } = tile {
+      drop run scene.glyph(GlyphSprite { bounds: place, mask: mask, tile: value, color: tint })
+    }
+  }
+
+  effect fn card(
+    self: &mut Self,
+    scene: &mut Scene,
+    bounds: Rect<f32>,
+    s: f32,
+    mask: ContentMask,
+    raised: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let box = device(bounds, s)
+    let lift: f32 = if raised {
+      1.0
+    } else {
+      0.0
+    }
+    drop run scene.shadow(
+      Shadow {
+        bounds: box,
+        mask: mask,
+        cornerRadii: Corners<f32>.uniform(14.0 * s),
+        color: color.rgba(0x1a2b4c22 + f32.toU32(lift) * 0x10),
+        blurRadius: (16.0 + 10.0 * lift) * s,
+        offset: Vector2<f32>.new(0.0, (5.0 + 4.0 * lift) * s),
+        spread: 0.0,
+        inset: false,
+      },
+    )
+    let mut q = Quad.fill(box, mask, Background.solid(color.white()))
+    q.cornerRadii = Corners<f32>.uniform(14.0 * s)
+    q.borderWidths = Insets<f32>.uniform(1.0 * s)
+    q.borderColor = if raised {
+      color.rgba(0x4f7cff66)
+    } else {
+      color.rgba(0x1a2b4c1a)
+    }
+    drop run scene.quad(q)
+  }
+
+  effect fn paintBar(self: &mut Self, scene: &mut Scene, frame: Frame, window: ContentMask) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let s = frame.scale
+    let mut bar = Quad.fill(
+      device(rect(0.0, 0.0, frame.width, BAR), s),
+      window,
+      Background.solid(color.white()),
+    )
+    bar.borderWidths = Insets<f32>.new(0.0, 0.0, 1.0 * s, 0.0)
+    bar.borderColor = color.rgba(0x1a2b4c1f)
+    drop run scene.quad(bar)
+
+    // The logo: a gradient tile with a star.
+    let logo = rect(PAD, 12.0, 32.0, 32.0)
+    let mut tile = Quad.fill(
+      device(logo, s),
+      window,
+      Background.Linear {
+        gradient: LinearGradient {
+          angle: 135.0,
+          from: ColorStop { color: color.rgb(0x6a5cff), offset: 0.0 },
+          to: ColorStop { color: color.rgb(0xff6b9a), offset: 1.0 },
+          interpolation: Interpolation.new(ColorSpace.Oklch),
+        },
+      },
+    )
+    tile.cornerRadii = Corners<f32>.uniform(9.0 * s)
+    drop run scene.quad(tile)
+    run self.icon(
+      &mut scene,
+      assets.STAR,
+      rect(PAD + 7.0, 19.0, 18.0, 18.0),
+      s,
+      color.white(),
+      window,
+    )
+    let title = run self.label(
+      &mut scene,
+      "Silk drawing layer",
+      Weight.Bold,
+      17.0,
+      PAD + 44.0,
+      34.0,
+      s,
+      color.rgb(0x1a2238),
+      window,
+    )
+    drop run self.label(
+      &mut scene,
+      "ui_scene + ui_renderer",
+      Weight.Regular,
+      13.0,
+      PAD + 44.0 + title + 10.0,
+      34.0,
+      s,
+      color.rgb(0x7a8399),
+      window,
+    )
+
+    // Toolbar buttons, right-aligned.
+    self.buttonRects.clear()
+    let icons: [u32; 3] = [assets.SEARCH, assets.BELL, assets.GEAR]
+    let mut i: u32 = 0
+    while i < BUTTONS {
+      let x = frame.width - PAD - BUTTON - u32.toF32(BUTTONS - 1 - i) * (BUTTON + 8.0)
+      let button = rect(x, (BAR - BUTTON) * 0.5, BUTTON, BUTTON)
+      run self.buttonRects.append(button)
+      let hovered = match self.hover {
+        Target.Button { index } => index == i
+        _ => false
+      }
+      if hovered {
+        let mut back = Quad.fill(
+          device(button, s),
+          window,
+          Background.solid(color.rgba(0x4f7cff1f)),
+        )
+        back.cornerRadii = Corners<f32>.uniform(9.0 * s)
+        drop run scene.quad(back)
+      }
+      let tint = if hovered {
+        color.rgb(0x2f5cff)
+      } else {
+        color.rgb(0x5a6378)
+      }
+      run self.icon(
+        &mut scene,
+        icons[u32.toUsize(i)],
+        rect(x + 7.0, button.yMin + 7.0, 20.0, 20.0),
+        s,
+        tint,
+        window,
+      )
+      i = i + 1
+    }
+
+    // A notification dot on the bell.
+    let bell = self.buttonRects.get(1)
+    let mut dot = Quad.fill(
+      device(rect(bell.xMax - 12.0, bell.yMin + 6.0, 8.0, 8.0), s),
+      window,
+      Background.solid(color.rgb(0xff4d6a)),
+    )
+    dot.cornerRadii = Corners<f32>.uniform(4.0 * s)
+    dot.borderWidths = Insets<f32>.uniform(1.5 * s)
+    dot.borderColor = color.white()
+    drop run scene.quad(dot)
+  }
+
+  effect fn paintTextCard(
+    self: &mut Self,
+    scene: &mut Scene,
+    frame: Frame,
+    window: ContentMask,
+    bounds: Rect<f32>,
+  ) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let s = frame.scale
+    run self.cardRects.append(bounds)
+    let raised = self.isCard(0)
+    run self.card(&mut scene, bounds, s, window, raised)
+    let inner = ContentMask.new(device(bounds, s)).intersect(window)
+    let x = bounds.xMin + 20.0
+    let y = bounds.yMin
+
+    // A badge with the folder icon.
+    let mut badge = Quad.fill(
+      device(rect(x, y + 18.0, 30.0, 30.0), s),
+      inner,
+      Background.solid(color.rgb(0xfff1d6)),
+    )
+    badge.cornerRadii = Corners<f32>.uniform(8.0 * s)
+    drop run scene.quad(badge)
+    run self.icon(
+      &mut scene,
+      assets.FOLDER,
+      rect(x + 6.0, y + 24.0, 18.0, 18.0),
+      s,
+      color.rgb(0xe08a00),
+      inner,
+    )
+    drop run self.label(
+      &mut scene,
+      "Rounded cards",
+      Weight.Bold,
+      15.0,
+      x + 42.0,
+      y + 38.0,
+      s,
+      color.rgb(0x1a2238),
+      inner,
+    )
+    let body = color.rgb(0x4a5268)
+    drop run self.label(
+      &mut scene,
+      "Quads with per-corner radii, borders",
+      Weight.Regular,
+      13.0,
+      x,
+      y + 74.0,
+      s,
+      body,
+      inner,
+    )
+    drop run self.label(
+      &mut scene,
+      "and blurred shadows, drawn as SDFs",
+      Weight.Regular,
+      13.0,
+      x,
+      y + 93.0,
+      s,
+      body,
+      inner,
+    )
+    let before = run self.label(
+      &mut scene,
+      "on the GPU. Text is ",
+      Weight.Regular,
+      13.0,
+      x,
+      y + 112.0,
+      s,
+      body,
+      inner,
+    )
+    let word = run self.label(
+      &mut scene,
+      "unhinted",
+      Weight.Regular,
+      13.0,
+      x + before,
+      y + 112.0,
+      s,
+      body,
+      inner,
+    )
+    drop run scene.underline(
+      Underline {
+        bounds: device(rect(x + before, y + 114.0, word, 4.0), s),
+        mask: inner,
+        color: color.rgb(0xff4d6a),
+        thickness: 1.0 * s,
+        wavy: true,
+      },
+    )
+    drop run self.label(
+      &mut scene,
+      ".",
+      Weight.Regular,
+      13.0,
+      x + before + word,
+      y + 112.0,
+      s,
+      body,
+      inner,
+    )
+    let link = color.rgb(0x2f5cff)
+    let more = run self.label(
+      &mut scene,
+      "Read the design doc",
+      Weight.Bold,
+      13.0,
+      x,
+      y + 142.0,
+      s,
+      link,
+      inner,
+    )
+    drop run scene.underline(
+      Underline {
+        bounds: device(rect(x, y + 144.0, more, 1.0), s),
+        mask: inner,
+        color: link,
+        thickness: 1.0 * s,
+        wavy: false,
+      },
+    )
+  }
+
+  effect fn paintOrbitCard(
+    self: &mut Self,
+    scene: &mut Scene,
+    frame: Frame,
+    window: ContentMask,
+    bounds: Rect<f32>,
+  ) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let s = frame.scale
+    run self.cardRects.append(bounds)
+    let raised = self.isCard(1)
+    run self.card(&mut scene, bounds, s, window, raised)
+    let inner = ContentMask.new(device(bounds, s)).intersect(window)
+    let x = bounds.xMin + 20.0
+    let y = bounds.yMin
+    drop run self.label(
+      &mut scene,
+      "Animated SVG",
+      Weight.Bold,
+      15.0,
+      x,
+      y + 32.0,
+      s,
+      color.rgb(0x1a2238),
+      inner,
+    )
+    let state = if self.animating {
+      "SMIL and CSS, one atlas tile per frame"
+    } else {
+      "Paused (press Space)"
+    }
+    drop run self.label(
+      &mut scene,
+      state,
+      Weight.Regular,
+      12.0,
+      x,
+      y + 52.0,
+      s,
+      color.rgb(0x7a8399),
+      inner,
+    )
+
+    // The orbit, rendered by svg_render at its device size for this frame's time.
+    let place = snapped(rect(bounds.xMin + (COLUMN - 120.0) * 0.5, y + 64.0, 120.0, 120.0), s)
+    let host = hostOf(&self.iconHost)
+    let tile = run Effect.catch<RenderError>(
+      tryIcon(
+        &mut self.icons,
+        &mut self.atlas,
+        &host,
+        self.orbit,
+        f32.toU32(place.xMax - place.xMin),
+        f32.toU32(place.yMax - place.yMin),
+        IconStyle.Color,
+        frame.time,
+      ),
+      skipIcon,
+    )
+      |> Effect.provideMut<Resolver>(&mut self.resolver)
+    if let Option<AtlasTile>.Some { value } = tile {
+      drop run scene.image(
+        ImageSprite {
+          bounds: place,
+          mask: inner,
+          tile: value,
+          opacity: 1.0,
+          cornerRadii: Corners<f32>.uniform(0.0),
+          grayscale: false,
+        },
+      )
+    }
+  }
+
+  effect fn paintChartCard(
+    self: &mut Self,
+    scene: &mut Scene,
+    frame: Frame,
+    window: ContentMask,
+    bounds: Rect<f32>,
+  ) -> ()
+    ! AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let s = frame.scale
+    run self.cardRects.append(bounds)
+    let raised = self.isCard(2)
+    run self.card(&mut scene, bounds, s, window, raised)
+    let inner = ContentMask.new(device(bounds, s)).intersect(window)
+    let x = bounds.xMin + 20.0
+    let y = bounds.yMin
+    drop run self.label(
+      &mut scene,
+      "Paths",
+      Weight.Bold,
+      15.0,
+      x,
+      y + 32.0,
+      s,
+      color.rgb(0x1a2238),
+      inner,
+    )
+    drop run self.label(
+      &mut scene,
+      "vector coverage, cached per transform",
+      Weight.Regular,
+      12.0,
+      x,
+      y + 52.0,
+      s,
+      color.rgb(0x7a8399),
+      inner,
+    )
+    let chartW = f32.toF64(COLUMN - 40.0)
+    let chartH: f64 = 70.0
+    let step = chartW / u32.toF64(SAMPLES - 1)
+    let mut line = VectorPath.make()
+    let mut area = VectorPath.make()
+    run area.moveTo(0.0, chartH)
+    let mut i: u32 = 0
+    while i < SAMPLES {
+      let px = u32.toF64(i) * step
+      let py = chartH * (1.0 - sample(i))
+      if i == 0 {
+        run line.moveTo(px, py)
+      } else {
+        run line.lineTo(px, py)
+      }
+      run area.lineTo(px, py)
+      i = i + 1
+    }
+    run area.lineTo(chartW, chartH)
+    run area.close()
+    let originX = f32.toF64(x * s)
+    let originY = f32.toF64((y + 66.0) * s)
+    let sd = f32.toF64(s)
+    let transform = Affine.new(sd, 0.0, 0.0, sd, originX, originY)
+    let fade = Background.Linear {
+      gradient: LinearGradient {
+        angle: 180.0,
+        from: ColorStop { color: color.rgba(0x4f7cff55), offset: 0.0 },
+        to: ColorStop { color: color.rgba(0x4f7cff00), offset: 1.0 },
+        interpolation: Interpolation.new(ColorSpace.Oklab),
+      },
+    }
+    drop run self.paths.fill(&mut scene, 2, &area, &transform, NONZERO, fade, inner)
+    let mut stroke = Stroke.make(2.0)
+    stroke.join = JOIN_ROUND
+    stroke.cap = CAP_ROUND
+    drop run self.paths.stroke(
+      &mut scene,
+      1,
+      &line,
+      &stroke,
+      &transform,
+      Background.solid(color.rgb(0x2f5cff)),
+      inner,
+    )
+
+    // A marker that walks along the line with the animation time.
+    let span = u32.toF64(SAMPLES - 1)
+    let travelled = frame.time * 4.0
+    let along = travelled - f64.floor(travelled / span) * span
+    let k = f64.toU32(f64.floor(along))
+    let t = along - f64.floor(along)
+    let mx = (u32.toF64(k) + t) * step
+    let my = chartH * (1.0 - (sample(k) * (1.0 - t) + sample(k + 1) * t))
+    let cx = x + f64.toF32(mx)
+    let cy = y + 66.0 + f64.toF32(my)
+    let mut marker = Quad.fill(
+      device(rect(cx - 5.0, cy - 5.0, 10.0, 10.0), s),
+      inner,
+      Background.solid(color.white()),
+    )
+    marker.cornerRadii = Corners<f32>.uniform(5.0 * s)
+    marker.borderWidths = Insets<f32>.uniform(2.5 * s)
+    marker.borderColor = color.rgb(0x2f5cff)
+    drop run scene.quad(marker)
+  }
+
+  effect fn paintPhotos(
+    self: &mut Self,
+    scene: &mut Scene,
+    frame: Frame,
+    window: ContentMask,
+    bounds: Rect<f32>,
+  ) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    self.photoRects.clear()
+    let s = frame.scale
+    if bounds.xMax - bounds.xMin < 120.0 || bounds.yMax - bounds.yMin < 120.0 {
+      self.gridClip = rect(0.0, 0.0, 0.0, 0.0)
+      return
+    }
+    run self.card(&mut scene, bounds, s, window, false)
+    let panel = ContentMask.new(device(bounds, s)).intersect(window)
+    let x = bounds.xMin + 20.0
+    let title = run self.label(
+      &mut scene,
+      "Photos",
+      Weight.Bold,
+      15.0,
+      x,
+      bounds.yMin + 32.0,
+      s,
+      color.rgb(0x1a2238),
+      panel,
+    )
+    drop run self.label(
+      &mut scene,
+      "PNG and JPEG through images/codec, uploaded once",
+      Weight.Regular,
+      12.0,
+      x + title + 10.0,
+      bounds.yMin + 32.0,
+      s,
+      color.rgb(0x7a8399),
+      panel,
+    )
+
+    // The grid scrolls inside this clip.
+    let clip = rect(
+      bounds.xMin + 1.0,
+      bounds.yMin + 48.0,
+      bounds.xMax - bounds.xMin - 2.0,
+      bounds.yMax - bounds.yMin - 49.0,
+    )
+    self.gridClip = clip
+    let gridMask = ContentMask.new(device(clip, s)).intersect(panel)
+    let innerW = clip.xMax - clip.xMin - 32.0
+    let mut columns = f32.toU32(f32.floor((innerW + GAP) / (CELL_MIN + GAP)))
+    if columns < 1 {
+      columns = 1
+    }
+    if columns > 4 {
+      columns = 4
+    }
+    let cellW = (innerW - GAP * u32.toF32(columns - 1)) / u32.toF32(columns)
+    let photoH = f32.floor(cellW * 0.75)
+    let cellH = photoH + 26.0
+    let rows = (assets.PHOTO_COUNT + columns - 1) / columns
+    let contentH = u32.toF32(rows) * (cellH + GAP) - GAP + 24.0
+    self.maxScroll = f32.max(contentH - (clip.yMax - clip.yMin), 0.0)
+    self.scroll = f32.min(self.scroll, self.maxScroll)
+    let top = clip.yMin + 8.0 - self.scroll
+    let photos = self.photos.length()
+    let mut i: usize = 0
+    while i < photos {
+      let index = usize.toU32(i)
+      let column = index % columns
+      let row = index / columns
+      let cell = rect(
+        clip.xMin + 16.0 + u32.toF32(column) * (cellW + GAP),
+        top + u32.toF32(row) * (cellH + GAP),
+        cellW,
+        photoH,
+      )
+      run self.photoRects.append(cell)
+      let visible = cell.yMax + 26.0 > clip.yMin && cell.yMin < clip.yMax
+      if visible {
+        let hovered = match self.hover {
+          Target.Photo { index: h } => h == index
+          _ => false
+        }
+        let favorite = u32.bitAnd(self.favorites, u32.shiftLeft(1, index)) != 0
+        run self.paintPhoto(&mut scene, index, cell, s, gridMask, hovered, favorite)
+      }
+      i = i + 1
+    }
+
+    // Fades at the clip edges when there is more to scroll to.
+    if self.scroll > 0.0 {
+      let fade = Quad.fill(
+        device(rect(clip.xMin, clip.yMin, clip.xMax - clip.xMin, 18.0), s),
+        gridMask,
+        Background.linear(180.0, color.rgba(0xffffffff), color.rgba(0xffffff00)),
+      )
+      drop run scene.quad(fade)
+    }
+    if self.scroll < self.maxScroll {
+      let mut fade = Quad.fill(
+        device(rect(clip.xMin, clip.yMax - 18.0, clip.xMax - clip.xMin, 18.0), s),
+        gridMask,
+        Background.linear(0.0, color.rgba(0xffffffff), color.rgba(0xffffff00)),
+      )
+      fade.cornerRadii = Corners<f32>.new(0.0, 0.0, 13.0 * s, 13.0 * s)
+      drop run scene.quad(fade)
+    }
+  }
+
+  effect fn paintPhoto(
+    self: &mut Self,
+    scene: &mut Scene,
+    index: u32,
+    cell: Rect<f32>,
+    s: f32,
+    mask: ContentMask,
+    hovered: bool,
+    favorite: bool,
+  ) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let box = snapped(cell, s)
+    let radius = 10.0 * s
+    drop run scene.shadow(
+      Shadow {
+        bounds: box,
+        mask: mask,
+        cornerRadii: Corners<f32>.uniform(radius),
+        color: if hovered {
+          color.rgba(0x1a2b4c40)
+        } else {
+          color.rgba(0x1a2b4c24)
+        },
+        blurRadius: if hovered {
+          18.0 * s
+        } else {
+          8.0 * s
+        },
+        offset: Vector2<f32>.new(
+          0.0,
+          if hovered {
+            6.0 * s
+          } else {
+            2.0 * s
+          },
+        ),
+        spread: 0.0,
+        inset: false,
+      },
+    )
+    let id = self.photos.get(u32.toUsize(index))
+    if let Option<AtlasTile>.Some { value } = run self.images.tile(&mut self.atlas, id) {
+      drop run scene.image(
+        ImageSprite {
+          bounds: box,
+          mask: mask,
+          tile: value,
+          opacity: 1.0,
+          cornerRadii: Corners<f32>.uniform(radius),
+          grayscale: self.grayscale && !hovered,
+        },
+      )
+    }
+    if hovered {
+      let mut ring = Quad.fill(box, mask, Background.solid(color.transparent()))
+      ring.cornerRadii = Corners<f32>.uniform(radius)
+      ring.borderWidths = Insets<f32>.uniform(3.0 * s)
+      ring.borderColor = color.rgb(0x2f5cff)
+      drop run scene.quad(ring)
+    }
+    if favorite || hovered {
+      let badge = rect(cell.xMax - 34.0, cell.yMin + 8.0, 26.0, 26.0)
+      let mut back = Quad.fill(
+        device(badge, s),
+        mask,
+        Background.solid(
+          if favorite {
+            color.rgb(0xff4d6a)
+          } else {
+            color.rgba(0x00000066)
+          },
+        ),
+      )
+      back.cornerRadii = Corners<f32>.uniform(13.0 * s)
+      drop run scene.quad(back)
+      run self.icon(
+        &mut scene,
+        assets.HEART,
+        rect(badge.xMin + 6.0, badge.yMin + 7.0, 14.0, 14.0),
+        s,
+        color.white(),
+        mask,
+      )
+    }
+    drop run self.label(
+      &mut scene,
+      assets.photoName(index),
+      Weight.Regular,
+      11.0,
+      cell.xMin + 2.0,
+      cell.yMax + 17.0,
+      s,
+      color.rgb(0x5a6378),
+      mask,
+    )
+  }
+
+  effect fn paintStatus(self: &mut Self, scene: &mut Scene, frame: Frame, window: ContentMask) -> ()
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    let s = frame.scale
+    let y = frame.height - STATUS
+    let stats = self.stats()
+    let mut status = String.make()
+    run status.append("frame ")
+    run appendNumber(&mut status, stats.frames)
+    run status.append("   glyph tiles: ")
+    run appendNumber(&mut status, stats.glyphMisses)
+    run status.append(" rasterized, ")
+    run appendNumber(&mut status, stats.glyphHits)
+    run status.append(" hits   icon tiles: ")
+    run appendNumber(&mut status, stats.iconMisses)
+    run status.append("   image uploads: ")
+    run appendNumber(&mut status, stats.imageUploads)
+    run status.append("   atlas textures: ")
+    run appendNumber(&mut status, usize.toU64(stats.atlasTextures))
+    let mut bar = Quad.fill(
+      device(rect(0.0, y, frame.width, STATUS), s),
+      window,
+      Background.solid(color.rgba(0xffffffb3)),
+    )
+    bar.borderWidths = Insets<f32>.new(1.0 * s, 0.0, 0.0, 0.0)
+    bar.borderColor = color.rgba(0x1a2b4c14)
+    drop run scene.quad(bar)
+    let used = run self.label(
+      &mut scene,
+      status.view(),
+      Weight.Regular,
+      11.0,
+      PAD,
+      y + 19.0,
+      s,
+      color.rgb(0x7a8399),
+      window,
+    )
+    let hint = "Space: pause   G: grayscale   click: favorite   wheel: scroll"
+    let hintDevice = run self.text.measure(Weight.Regular, hint, 11.0, s)
+    let hintWidth = hintDevice / s
+    let hintX = frame.width - PAD - hintWidth
+    if hintX > PAD + used + 24.0 {
+      drop run self.label(
+        &mut scene,
+        hint,
+        Weight.Regular,
+        11.0,
+        hintX,
+        y + 19.0,
+        s,
+        color.rgb(0x9aa2b5),
+        window,
+      )
+    }
+  }
+
+  fn isCard(self: &Self, index: u32) -> bool {
+    return match self.hover {
+      Target.Card { index: c } => c == index
+      _ => false
+    }
+  }
+}
+
+fn sameTarget(a: Target, b: Target) -> bool {
+  return match a {
+    Target.Nothing => match b {
+      Target.Nothing => true
+      _ => false
+    }
+    Target.Button { index } => match b {
+      Target.Button { index: other } => index == other
+      _ => false
+    }
+    Target.Card { index } => match b {
+      Target.Card { index: other } => index == other
+      _ => false
+    }
+    Target.Photo { index } => match b {
+      Target.Photo { index: other } => index == other
+      _ => false
+    }
+  }
+}
+
+/// An icon that fails to render is left out of the frame rather than failing it.
+effect fn skipIcon(error: RenderError) -> Option<AtlasTile> {
+  drop error
+  return Option<AtlasTile>.None
+}
+
+effect fn tryIcon(
+  icons: &mut IconCache,
+  atlas: &mut Atlas,
+  host: &Environment,
+  icon: IconId,
+  width: u32,
+  height: u32,
+  style: IconStyle,
+  time: f64,
+) -> Option<AtlasTile>
+  ! RenderError | AtlasError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  return Option<AtlasTile>.some(run icons.icon(&mut atlas, host, icon, width, height, style, time))
+}
