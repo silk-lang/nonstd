@@ -23,6 +23,7 @@ catch (error) { throw new Error('An existing Playwright installation is required
 const fixtures = [
   { name: 'card-list', max: 96, share: 0.002, mean: 0.25 },
   { name: 'form', max: 96, share: 0.002, mean: 0.25 },
+  { name: 'inbox', max: 96, share: 0.002, mean: 0.25 },
 ];
 
 const page = `<!doctype html><title>Silk UI tree test</title><script type="module">
