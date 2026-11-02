@@ -57,7 +57,11 @@ then restores the parsed attribute values (`Document.snapshot` and `restore` in
 `text/xml`), writes the animated values at `options.time`, and styles, resolves
 and records again; its display list equals a fresh `parse` and `record` at that
 time, in any time order, and document storage does not grow with the frame count.
-Images are still loaded, and nested SVG images parsed, for every frame. A failed
+Each image URL is fetched and decoded once and kept while frames use it
+(`image_assets.ImageCache`, dropped after two frames without it); a frame copies
+the kept samples and converts their colours, so this assumes the host's resolver
+answers a URL the same way every time. Nested SVG images are still parsed for
+every frame. A failed
 frame drops the retained graph, and the next frame parses the data again.
 `--fragment` accepts encoded text with one optional leading `#`.
 The 300×150 embedding viewport is independent of output-resolution overrides.
