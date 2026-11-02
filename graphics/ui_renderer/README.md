@@ -39,7 +39,11 @@ Every batch of the scene is one instanced draw of six vertices per instance, as 
 | Path | `shaders/path.wgsl` | `vector` coverage strips in gpu_scene's run layout (4-row bands, a word of coverage per column), placed at the sprite's integer origin; bands start at the sprite's own `y`. |
 | Layer | `shaders/layer.wgsl` | Isolated layers drawn into pooled RGBA8 textures and composited with gpu_scene's `blend.wgsl` (all `vector.layer` blend modes) and the group opacity. |
 
-Gradients (two stops, sRGB or Oklab) are evaluated per pixel the way the CPU reference's ramp is.
+Gradients have two stops and any `silk.color` interpolation. sRGB gradients are mixed in the
+shader; every other interpolation (linear sRGB, Oklab, Oklch and the other polar spaces with their
+hue arcs, wide gamut spaces) gets a 256-entry ramp of premultiplied RGBA8 words, sampled on the
+CPU with the same `color.mix` the CPU reference uses, in a storage buffer the quad and path
+shaders read. Either way the parameter steps in 1/255, as the CPU reference's ramp does.
 Content masks clip by pixel area. `shaders/common.wgsl` holds what the pipelines share; edit the
 `.wgsl` files and run `gpu/webgpu/scripts/embed-shaders`, never the generated module.
 
@@ -48,8 +52,8 @@ order), uploaded with `queue.writeBuffer`. The buffers persist across frames and
 only when a frame outgrows them. A scene without isolated layers draws straight onto the target;
 with them, the frame is drawn into an RGBA8 texture and copied to the target at the end.
 
-Paths do not go through `gpu_scene.SceneRenderer` itself: UI paths need content masks and Oklab
-gradients, which its paint records lack. They reuse its band layout, its buffer helpers and its
+Paths do not go through `gpu_scene.SceneRenderer` itself: UI paths need content masks and gradient
+ramps, which its paint records lack. They reuse its band layout, its buffer helpers and its
 blend modes.
 
 ### Text correction
@@ -75,6 +79,7 @@ too. Flat areas match exactly.
 | shadows | 13 | 0.05% | 0.35 |
 | layers | 25 | 0.20% | 0.06 |
 | nested | 24 | 0.10% | 0.04 |
+| gradients | 28 | 0.37% | 0.13 |
 | text ramp | 0 | 0 | 0 |
 
 These are lavapipe's numbers. Chromium's WebGPU (SwiftShader) gives the same within a level.
@@ -100,10 +105,11 @@ python3 graphics/ui_renderer/scripts/test-browser   # the comparison in installe
 python3 graphics/ui_renderer/scripts/bench          # dense scene against bench/budget.json
 ```
 
-The comparison renders six fixtures (the four `ui_scene` golden scenes, nested isolated layers
-with clipped sprites and paths, and a text coverage ramp) into RGBA8 and BGRA8 targets, checks the
-text correction against `TextSettings.correct` within one level, and draws layered scenes again
-after another scene to check that pooled buffers and textures carry nothing over.
+The comparison renders seven fixtures (the four `ui_scene` golden scenes, nested isolated layers
+with clipped sprites and paths, gradients in eight interpolations on quads and paths, and a text
+coverage ramp) into RGBA8 and BGRA8 targets, checks the
+text correction against `TextSettings.correct` within one level, and draws the layered and gradient
+scenes again after another scene to check that pooled buffers and textures carry nothing over.
 
 The benchmark draws 320 cards (shadow, bordered rounded quad, a line of glyphs; 3,521 primitives)
 at 1280 x 800 and reports the median build, encode and frame times. On lavapipe in a 4-core

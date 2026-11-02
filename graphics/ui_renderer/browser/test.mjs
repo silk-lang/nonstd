@@ -25,6 +25,7 @@ const fixtures = [
   { name: 'shadows', max: 48, share: 0.006, mean: 0.5 },
   { name: 'layers', max: 48, share: 0.006, mean: 0.5 },
   { name: 'nested', max: 48, share: 0.006, mean: 0.5 },
+  { name: 'gradients', max: 48, share: 0.006, mean: 0.5 },
   { name: 'text ramp', max: 1, share: 0, mean: 0.1 },
 ];
 

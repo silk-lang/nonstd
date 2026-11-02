@@ -11,6 +11,9 @@ struct Globals {
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 
+// Gradient ramps, 256 premultiplied RGBA8 words each. Only quads and paths read it.
+@group(0) @binding(7) var<storage, read> ramps: array<u32>;
+
 const CORNERS = array<vec2f, 6>(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0));
 
 // Clip space for corner `index` of the pixel rectangle `r` (xMin, yMin, xMax, yMax).
@@ -77,34 +80,11 @@ fn coverage(distance: f32) -> f32 {
   return clamp(0.5 - distance, 0.0, 1.0);
 }
 
-fn srgbToLinear(c: vec3f) -> vec3f {
-  let a = abs(c);
-  return sign(c) * select(pow((a + 0.055) / 1.055, vec3f(2.4)), a / 12.92, a <= vec3f(0.04045));
-}
-
-fn linearToSrgb(c: vec3f) -> vec3f {
-  let a = abs(c);
-  return sign(c) * select(1.055 * pow(a, vec3f(1.0 / 2.4)) - 0.055, a * 12.92, a <= vec3f(0.0031308));
-}
-
-fn oklabToSrgb(c: vec3f) -> vec3f {
-  let l1 = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;
-  let m1 = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;
-  let s1 = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;
-  let l = l1 * l1 * l1;
-  let m = m1 * m1 * m1;
-  let s = s1 * s1 * s1;
-  return linearToSrgb(vec3f(
-    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
-    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
-  ));
-}
-
-// A background: a solid color or a two-stop CSS linear gradient. `kind.x` is 0 for solid, 1 for
-// linear; `kind.y` is the interpolation space (0 sRGB, 1 Oklab). `first` and `last` hold the stops in
-// that space with straight alpha (`first` is the solid color, straight sRGB). `line` is the
-// gradient's center and direction, `stops` its half length and the two stop offsets.
+// A background: a solid color or a two-stop CSS linear gradient. `kind.x` is 0 for solid, 1 for a
+// gradient mixed here in sRGB, 2 for a gradient read from ramp `kind.y` of `ramps` (any other
+// interpolation, sampled on the CPU with silk.color). `first` and `last` hold the stops, straight
+// sRGB (`first` is the solid color). `line` is the gradient's center and direction, `stops` its half
+// length and the two stop offsets.
 struct Paint {
   kind: vec4u,
   first: vec4f,
@@ -126,12 +106,13 @@ fn shade(paint: Paint, p: vec2f) -> vec4f {
   let span = paint.stops.z - paint.stops.y;
   var t = select(0.0, 1.0, along >= paint.stops.y);
   if span > 0.0 { t = (along - paint.stops.y) / span; }
-  t = floor(clamp(t, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+  let step = floor(clamp(t, 0.0, 1.0) * 255.0 + 0.5);
+  if paint.kind.x == 2u { return unpack4x8unorm(ramps[paint.kind.y * 256u + u32(step)]); }
+  t = step / 255.0;
   let a = clamp(paint.first.a, 0.0, 1.0);
   let b = clamp(paint.last.a, 0.0, 1.0);
   let alpha = a + (b - a) * t;
   if !(alpha > 0.0) { return vec4f(0.0); }
   var c = (paint.first.rgb * a + (paint.last.rgb * b - paint.first.rgb * a) * t) / alpha;
-  if paint.kind.y == 1u { c = oklabToSrgb(c); }
   return premultiply(vec4f(c, alpha));
 }
