@@ -15,27 +15,26 @@ From `gpu/metal`, with:
 - Apple Silicon macOS with a Metal device.
 - Xcode/macOS SDK 15.4 or newer for the complete declaration surface.
 - Silk `0.1.0-dev.44+8052ef3352b5`, as pinned by the workspace.
-- LLVM 22 clang for Silk's LLVM output (`SILK_CLANG`); `xcrun clang` compiles the Objective-C bridge.
-- `make`; Python 3.9+ only for inventory checks or regeneration.
+- LLVM 22 clang (`SILK_CLANG`). The build compiles the Objective-C bridge in `native/` with it,
+  as `[native].sources` in `silk.toml`.
+- Python 3.9+ only for inventory checks or regeneration.
 
 ```sh
-make                 # native bridge and Silk static library
-make all examples    # build library and both examples without running them
-make check           # type-check every exported Silk module
-make smoke           # run the compute and headless-render examples on the GPU
-make coverage        # check upstream declaration inventory
+silk build                                               # bridge and Silk static library
+silk check                                               # type-check every exported Silk module
+silk run --manifest-path examples/compute/silk.toml          # GPU compute example
+silk run --manifest-path examples/headless-render/silk.toml  # GPU render example
+python3 tools/coverage.py                                # check upstream declaration inventory
 ```
 
-From the repository root, use `make -C gpu/metal all examples SILK=/path/bin/silkc`.
-The examples reuse the native archive staging used by `make compute` and `make render`;
-those targets, and `make smoke`, still run the GPU checks. Set `SILK_BUILD_FLAGS=--release`
-to build or run the Silk targets in release mode. `SILK_CLANG` is inherited from the
-environment; `CLANG` selects the separate Objective-C compiler. These targets require
-the macOS SDK and fail on unsupported platforms rather than silently skipping Metal.
+Add `--release` to build or run in release mode. The bridge's objects are cached and recompile
+only when a `.m` file or `types.h` changes. On other hosts the package builds without its bridge,
+and the two examples build as programs that report that they need macOS and Metal, so
+`silk build --workspace` covers them everywhere.
 
-The native bridge targets macOS 14.0 by default (`make DEPLOYMENT=15.0` overrides it). A deployment target does not make every newer Metal selector available; query device support and, where necessary, `Native.responds_to` before invoking an optional API. Private selectors are not guaranteed to exist on any OS version.
+The bridge targets macOS 14.0 (the `-mmacosx-version-min` flag in `silk.toml`). A deployment target does not make every newer Metal selector available; query device support and, where necessary, `Native.responds_to` before invoking an optional API. Private selectors are not guaranteed to exist on any OS version.
 
-`make smoke` runs:
+The two examples check:
 
 - `examples/compute`: compiles a shader, transforms 257 integers, blits and checks every result, verifies a completion callback, round-trips a UTF-8 label, and checks malformed-source/missing-function errors.
 - `examples/headless-render`: compiles vertex/fragment shaders, renders a triangle into a 32×32 texture, and checks the clear pixels, fragment color, coverage, and stored alpha after readback. It exercises by-value viewport/scissor inputs, nested `MTLRegion` arguments, and a four-double `MTLClearColor` argument/return. No window server, PNG dependency, or precompiled metallib is required.
@@ -69,11 +68,9 @@ pub fn main() -> i32 {
 }
 ```
 
-Silk does not yet pass native link inputs on from dependencies
-([silk-lang/silk#2595](https://github.com/silk-lang/silk/issues/2595)). A program using this
-package must therefore link `libsilkmetal.a` (built by `make native`) and the Foundation, Metal,
-QuartzCore and MetalPerformanceShaders frameworks in its own `[native]` section. The manifests
-in `examples/` show the exact list.
+A program that depends on this package needs no `[native]` section of its own: the bridge's
+objects and the Foundation, Metal, QuartzCore and MetalPerformanceShaders frameworks reach it
+through the dependency.
 
 ## Modules
 
@@ -139,7 +136,7 @@ git clone https://github.com/gfx-rs/metal-rs.git /path/to/metal-rs
 git -C /path/to/metal-rs checkout e47bc888d3837f85ea8b01c9e66ccf73236293b9
 python3 tools/generate.py /path/to/metal-rs
 python3 tools/coverage.py --upstream /path/to/metal-rs
-make check smoke coverage
+silk check && silk run --manifest-path examples/compute/silk.toml && silk run --manifest-path examples/headless-render/silk.toml
 ```
 
 Edit `tools/core.py`, `device.py`, `encoder.py`, `library.py`, or `pipeline.py` for generated code. The resource, raytracing, runtime, and value-type files are maintained directly. Generated files are checked in, so normal builds require neither Python nor the upstream checkout.

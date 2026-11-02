@@ -151,11 +151,18 @@ python3 platform/window/scripts/windows smoke   # from an x64 Visual Studio deve
 python3 platform/window/scripts/browser smoke   # in the installed Playwright Chromium
 ```
 
-Silk does not yet pass native link inputs on from dependencies
-([silk-lang/silk#2595](https://github.com/silk-lang/silk/issues/2595)). A program using the
-macOS backend links `.cache/platform-window/libsilkwindow.a` (made by `scripts/macos native`)
-and the `Cocoa`, `QuartzCore` and `UniformTypeIdentifiers` frameworks in its own `[native]`
-section; `tests/macos/silk.toml` shows the list.
+`silk.toml` declares each bridge, and its libraries reach every program that depends on the
+package, so a program using the window needs no `[native]` section:
+
+- macOS compiles `native/macos/bridge.m` and links `Cocoa`, `QuartzCore` and
+  `UniformTypeIdentifiers`.
+- Linux compiles `native/common` and `native/linux` and links libX11, libxkbcommon and
+  libwayland, so it needs their development packages. The Wayland protocol glue in
+  `native/linux/protocols` is committed; `silk generate` rewrites it with `wayland-scanner`.
+- Windows needs the SDK headers, which Silk does not pass to Clang, so `scripts/prepare-windows`
+  builds the bridge once and names it as the `win32-bridge` archive's override.
+
+`tests/linux` and `tests/windows` are not workspace members, since each links only on its own OS.
 
 The demo is the manual part of the exit test: drag a window edge and watch frames keep
 coming; move the window between a Retina and a non-Retina display; leave it idle and see that

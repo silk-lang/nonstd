@@ -10,6 +10,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
+/* Callgrind markers compile in wherever Valgrind's header is installed. Outside Callgrind they
+   are no-op client requests, so the C and Silk programs always carry the same markers. */
+#if !defined(BENCH_CALLGRIND) && defined(__has_include)
+#if __has_include(<valgrind/callgrind.h>)
+#define BENCH_CALLGRIND 1
+#endif
+#endif
 #ifdef BENCH_CALLGRIND
 #include <valgrind/callgrind.h>
 #endif
