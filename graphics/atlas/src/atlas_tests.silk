@@ -1,0 +1,321 @@
+//! Atlas tests: kinds, texture growth, padding, errors and eviction by last-used frame.
+import atlas { Atlas, AtlasError, AtlasOptions, AtlasTile, Kind, TileId }
+import shelf_tests { Random, disjointInside }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+
+fn small(maxTextures: u32) -> AtlasOptions {
+  return AtlasOptions { textureSize: 64, maxTextureSize: 256, maxTextures: maxTextures, padding: 0 }
+}
+
+fn isLive(atlas: &Atlas, id: TileId) -> bool {
+  return match atlas.get(id) {
+    Option<AtlasTile>.Some { value } => true
+    Option<AtlasTile>.None => false
+  }
+}
+
+fn width(rect: Rect<u32>) -> u32 {
+  return rect.xMax - rect.xMin
+}
+
+fn height(rect: Rect<u32>) -> u32 {
+  return rect.yMax - rect.yMin
+}
+
+/// 0 on success, otherwise 1 for `EmptyTile`, 2 for `TooLarge`, 3 for `Full`.
+effect fn attempt(atlas: &mut Atlas, kind: Kind, w: u32, h: u32) -> u32
+  ! AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run atlas.allocate(kind, w, h)
+  return 0
+}
+
+effect fn code(error: AtlasError) -> u32 {
+  return match error {
+    AtlasError.EmptyTile => 1
+    AtlasError.TooLarge { width, height } => 2
+    AtlasError.Full => 3
+  }
+}
+
+effect fn outcome(atlas: &mut Atlas, kind: Kind, w: u32, h: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<AtlasError>(attempt(&mut atlas, kind, w, h), code)
+}
+
+effect fn kindsUseSeparateTextures() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(small(4))
+  let mono = run atlas.allocate(Kind.Monochrome, 10, 10)
+  let color = run atlas.allocate(Kind.Polychrome, 10, 10)
+  let mono2 = run atlas.allocate(Kind.Monochrome, 10, 10)
+  run Testing.expect(atlas.textureCount() == 2, "one texture per kind so far")
+  run Testing.expect(&mono.texture == &mono2.texture, "monochrome tiles share a texture")
+  run Testing.expect(&mono.texture != &color.texture, "kinds never share a texture")
+  run Testing.expect(
+    &atlas.texture(u32.toUsize(color.texture.index)).id.kind == &Kind.Polychrome,
+    "the texture records its kind",
+  )
+  run Testing.expect(
+    Kind.Monochrome.bytesPerPixel() == 1 && Kind.Polychrome.bytesPerPixel() == 4,
+    "bytes per pixel",
+  )
+  let info = atlas.texture(u32.toUsize(mono.texture.index))
+  run Testing.expect(
+    info.width == 64 && info.height == 64 && info.tileCount == 2 && info.allocatedArea == 200,
+    "texture info",
+  )
+}
+
+test effect fn tilesOfDifferentKindsUseDifferentTextures() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run kindsUseSeparateTextures() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn growth() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(small(4))
+  let big = run atlas.allocate(Kind.Polychrome, 100, 30)
+  let info = atlas.texture(u32.toUsize(big.texture.index))
+  run Testing.expect(
+    info.width == 128 && info.height == 128,
+    "a tile larger than textureSize gets a power-of-two texture",
+  )
+  run Testing.expect(width(big.bounds) == 100 && height(big.bounds) == 30, "the tile has its size")
+  let result1 = run outcome(&mut atlas, Kind.Polychrome, 257, 1)
+  run Testing.expect(result1 == 2, "wider than maxTextureSize is TooLarge")
+  let result2 = run outcome(&mut atlas, Kind.Polychrome, 0, 5)
+  run Testing.expect(result2 == 1, "zero width is EmptyTile")
+  let result3 = run outcome(&mut atlas, Kind.Polychrome, 256, 256)
+  run Testing.expect(result3 == 0, "maxTextureSize itself fits")
+}
+
+test effect fn largeTilesGetLargerTexturesUpToTheMaximum() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run growth() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn padded() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let options = AtlasOptions { textureSize: 64, maxTextureSize: 64, maxTextures: 1, padding: 1 }
+  let mut atlas = Atlas.make(options)
+  let mut outer = List<Rect<u32>>.make()
+  let mut i: u32 = 0
+  while i < 16 {
+    // 14 + 2 padding = 16, so exactly 16 tiles fit.
+    let tile = run atlas.allocate(Kind.Monochrome, 14, 14)
+    run Testing.expect(
+      width(tile.bounds) == 14 && height(tile.bounds) == 14,
+      "bounds exclude padding",
+    )
+    let b = tile.bounds
+    run Testing.expect(b.xMin >= 1 && b.yMin >= 1, "padding before the tile")
+    run outer.append(Rect<u32>.new(b.xMin - 1, b.yMin - 1, b.xMax + 1, b.yMax + 1))
+    i = i + 1
+  }
+  run Testing.expect(disjointInside(outer.asSlice(), 64, 64), "padded tiles do not touch")
+  let result4 = run outcome(&mut atlas, Kind.Monochrome, 1, 1)
+  run Testing.expect(result4 == 3, "the single texture is full")
+}
+
+test effect fn paddingSeparatesTiles() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run padded() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// One 64x64 texture of 16x16 tiles holds 16 tiles; the 17th evicts the least recently used one.
+effect fn lru() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(small(1))
+  let mut ids = List<TileId>.make()
+  let mut i: u32 = 0
+  while i < 16 {
+    // Tile i is allocated in frame i.
+    let tile = run atlas.allocate(Kind.Monochrome, 16, 16)
+    run ids.append(tile.id)
+    drop atlas.beginFrame()
+    i = i + 1
+  }
+
+  // Frame 16: touch the three oldest tiles, so tile 3 is now the least recently used.
+  run Testing.expect(
+    atlas.touch(ids.get(0)) && atlas.touch(ids.get(1)) && atlas.touch(ids.get(2)),
+    "live tiles touch",
+  )
+  let fresh = run atlas.allocate(Kind.Monochrome, 16, 16)
+  run Testing.expect(atlas.evicted().length == 1, "exactly one tile was evicted")
+  run Testing.expect(&atlas.evicted()[0] == &ids.get(3), "the least recently used tile went first")
+  run Testing.expect(
+    !isLive(&atlas, ids.get(3)) && !atlas.touch(ids.get(3)),
+    "the evicted id is stale",
+  )
+  run Testing.expect(
+    isLive(&atlas, ids.get(0)) && isLive(&atlas, fresh.id),
+    "touched and new tiles stay",
+  )
+  run Testing.expect(atlas.textureCount() == 1 && atlas.tileCount() == 16, "no new texture")
+  atlas.clearEvicted()
+  run Testing.expect(atlas.evicted().length == 0, "the eviction list clears")
+}
+
+test effect fn fullAtlasEvictsTheLeastRecentlyUsedTile() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run lru() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Tiles used in the current frame are never evicted: the scene being built still refers to them.
+effect fn currentFrameIsPinned() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(small(1))
+  let mut i: u32 = 0
+  while i < 16 {
+    drop run atlas.allocate(Kind.Monochrome, 16, 16)
+    i = i + 1
+  }
+  let result5 = run outcome(&mut atlas, Kind.Monochrome, 16, 16)
+  run Testing.expect(result5 == 3, "a full frame is Full")
+  run Testing.expect(atlas.tileCount() == 16 && atlas.evicted().length == 0, "nothing was evicted")
+
+  // Next frame, the same request evicts one tile. Other kinds are unaffected.
+  drop atlas.beginFrame()
+  let result6 = run outcome(&mut atlas, Kind.Monochrome, 16, 16)
+  run Testing.expect(result6 == 0, "next frame it fits")
+  run Testing.expect(atlas.evicted().length == 1, "by evicting one tile")
+  let result7 = run outcome(&mut atlas, Kind.Polychrome, 16, 16)
+  run Testing.expect(result7 == 0, "another kind has its own texture")
+}
+
+test effect fn tilesUsedThisFrameAreNeverEvicted() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run currentFrameIsPinned() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A large request evicts several small neighbours until a whole shelf frees up.
+effect fn evictsUntilItFits() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(small(1))
+  let mut i: u32 = 0
+  while i < 16 {
+    drop run atlas.allocate(Kind.Monochrome, 16, 16)
+    i = i + 1
+  }
+  drop atlas.beginFrame()
+  let wide = run atlas.allocate(Kind.Monochrome, 64, 16)
+  run Testing.expect(width(wide.bounds) == 64, "a full-width tile")
+  run Testing.expect(
+    atlas.evicted().length >= 4 && atlas.tileCount() == 17 - usize.toU32(atlas.evicted().length),
+    "small tiles were evicted to make room",
+  )
+}
+
+test effect fn evictionContinuesUntilTheRequestFits() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run evictsUntilItFits() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sweep() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(small(2))
+  let old = run atlas.allocate(Kind.Monochrome, 8, 8)
+  let kept = run atlas.allocate(Kind.Subpixel, 8, 8)
+  drop atlas.beginFrame()
+  drop atlas.beginFrame()
+  run Testing.expect(atlas.touch(kept.id), "kept is used in frame 2")
+  let recent = run atlas.allocate(Kind.Monochrome, 8, 8)
+  drop atlas.beginFrame()
+
+  // Frame 3: drop everything the last two frames (1 and 2) did not draw.
+  let cutoff = atlas.frame() - 2
+  let count = run atlas.evictUnusedSince(cutoff)
+  run Testing.expect(count == 1 && &atlas.evicted()[0] == &old.id, "only the frame-0 tile goes")
+  run Testing.expect(isLive(&atlas, kept.id) && isLive(&atlas, recent.id), "recent tiles stay")
+  run Testing.expect(atlas.free(recent.id) && !atlas.free(recent.id), "explicit free, once")
+  run Testing.expect(atlas.evicted().length == 1, "explicit frees are not listed as evicted")
+  run Testing.expect(atlas.tileCount() == 1, "one tile left")
+}
+
+test effect fn evictUnusedSinceDropsOldTiles() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sweep() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Many frames of a glyph cache: each frame draws a random working set; every live tile of a texture
+/// stays disjoint from the others.
+effect fn simulate(seed: u32) -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(
+    AtlasOptions { textureSize: 128, maxTextureSize: 128, maxTextures: 2, padding: 1 },
+  )
+  let mut random = Random.make(seed)
+  let mut ids = List<TileId>.make()
+  let mut frame: u32 = 0
+  while frame < 60 {
+    drop atlas.beginFrame()
+    let mut n: u32 = 0
+    while n < 40 {
+      if ids.length() > 0 && random.range(0, 1) == 0 {
+        drop atlas.touch(ids.get(u32.toUsize(random.range(0, usize.toU32(ids.length() - 1)))))
+      } else {
+        let tile = run atlas.allocate(Kind.Monochrome, random.range(3, 20), random.range(6, 24))
+        run ids.append(tile.id)
+      }
+      n = n + 1
+    }
+    frame = frame + 1
+  }
+  run Testing.expect(atlas.textureCount() == 2, "the kind stopped at maxTextures")
+  run Testing.expect(atlas.evicted().length > 0, "the working set forced evictions")
+  let mut t: usize = 0
+  while t < atlas.textureCount() {
+    let mut rects = List<Rect<u32>>.make()
+    let mut i: usize = 0
+    while i < ids.length() {
+      if let Option<AtlasTile>.Some { value } = atlas.get(ids.get(i)) {
+        if u32.toUsize(value.texture.index) == t {
+          let b = value.bounds
+          run rects.append(Rect<u32>.new(b.xMin - 1, b.yMin - 1, b.xMax + 1, b.yMax + 1))
+        }
+      }
+      i = i + 1
+    }
+    run Testing.expect(
+      rects.length() == u32.toUsize(atlas.texture(t).tileCount),
+      "every live tile is accounted for",
+    )
+    run Testing.expect(
+      disjointInside(rects.asSlice(), 128, 128),
+      "live tiles stay disjoint across evictions",
+    )
+    t = t + 1
+  }
+}
+
+test effect fn longRunningCacheStaysConsistent() -> ()
+  ! AssertionError<'static> | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run simulate(11) |> Effect.provideMut<Allocator>(&mut allocator)
+  run simulate(908) |> Effect.provideMut<Allocator>(&mut allocator)
+}
