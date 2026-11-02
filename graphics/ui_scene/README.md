@@ -12,7 +12,8 @@ depends on a GPU, so it builds for wasm32 too.
 
 - `primitives`: the records a frame is made of, all `Copy`:
   - `Quad`: per-corner radii (`silk.geometry.corners.Corners`), per-edge border widths, a solid or
-    dashed border, and a solid or two-stop linear gradient `Background` (sRGB or Oklab).
+    dashed border, and a solid or two-stop linear gradient `Background` interpolated in any
+    `silk.color` space (sRGB, Oklab, Oklch, ...).
   - `Shadow`: a blurred rounded rectangle with an offset and spread, drop or inset, as CSS
     `box-shadow` (the blur radius is twice the Gaussian's sigma).
   - `Underline`: straight or wavy.
@@ -20,9 +21,9 @@ depends on a GPU, so it builds for wasm32 too.
   - `ImageSprite`: a premultiplied color tile, with opacity, corner radii and grayscale.
   - `PathSprite`: `vector` strip coverage at an integer origin (made by `path_cache`).
   - Every primitive has a `ContentMask`, the rectangle it is clipped to.
-- `color`: `Color`, straight-alpha sRGB in `f32`, shaped like `silk.color.rgba.Rgba<f32>` so the
-  scene can move to `silk.color` once a silk release with it is pinned. Oklab interpolation for
-  gradients.
+- `color`: helpers over `silk.color`. Primitives store `silk.color.rgba.Rgba<f32>`, straight-alpha
+  sRGB ready for an instance buffer: `color.rgb(0x3366cc)`, `color.rgba(...)`, or
+  `color.fromColor(c)` to gamut-map any `silk.color.color.Color`. `color.mix` interpolates stops.
 - `bounds_tree`: `BoundsTree`, a balanced bounding-volume tree that gives a rectangle one more than
   the highest order of anything it overlaps, as GPUI's `BoundsTree`.
 - `scene`: `Scene` with `quad`, `shadow`, `underline`, `glyph`, `image`, `pathCoverage`,
@@ -34,7 +35,7 @@ depends on a GPU, so it builds for wasm32 too.
 ## A frame
 
 ```silk
-import ui_scene.color { Color }
+import ui_scene.color
 import ui_scene.primitives { Background, ContentMask, Quad }
 import ui_scene.scene { Scene }
 import silk.geometry.corners { Corners }
@@ -44,7 +45,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 pub effect fn paint(scene: &mut Scene) -> () ! OutOfMemoryError ? &mut Allocator {
   scene.clear()
   let window = ContentMask.new(Rect<f32>.new(0.0, 0.0, 800.0, 600.0))
-  let mut card = Quad.fill(Rect<f32>.new(20.0, 20.0, 220.0, 120.0), window, Background.solid(Color.white()))
+  let mut card = Quad.fill(Rect<f32>.new(20.0, 20.0, 220.0, 120.0), window, Background.solid(color.white()))
   card.cornerRadii = Corners<f32>.uniform(8.0)
   drop run scene.quad(card)
   run scene.finish()
