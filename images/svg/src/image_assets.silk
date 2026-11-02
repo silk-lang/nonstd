@@ -116,6 +116,8 @@ pub struct Store {
   budget: Option<Budget>,
   // Per-occurrence assets converted for a non-auto `color-profile`.
   variants: HashMap<usize, usize>,
+  // Fetch results kept from earlier loads; see [`ImageCache`].
+  kept: ImageCache,
 }
 
 impl Store {
@@ -130,7 +132,13 @@ impl Store {
       cache: List<Cached>.make(),
       budget: Option<Budget>.None,
       variants: HashMap<usize, usize>.make(Hash.seed(0)),
+      kept: ImageCache.disabled(),
     }
+  }
+
+  /// Takes back the cache given to [`loadWith`], with what this store's loads added to it.
+  pub fn takeCache(self: &mut Self) -> ImageCache {
+    return Intrinsic.replace(self.kept, ImageCache.disabled())
   }
 
   pub fn findLayer(self: &Self, occurrence: usize, layer: usize) -> Option<LayerSource> {
@@ -268,12 +276,227 @@ effect fn fetched(url: &Url, policy: &Policy, remaining: &mut usize) -> Loaded
   }
 }
 
+/// Fetched images kept from one load to the next, so that an animated document does not
+/// fetch and decode its images again for every frame.
+///
+/// An entry is what one fetch of a URL under one policy produced: the decoded raster asset
+/// before colour conversion, the response of an SVG document image, or nothing when the fetch
+/// or the decode failed. A load that finds an entry copies it into its store and charges the
+/// same byte budgets a fetch would, so its output equals a load with no cache, as long as the
+/// host's resolver answers a URL the same way every time. Call [`ImageCache.sweep`] after each
+/// frame: an entry no load used in the last two frames is dropped.
+pub struct ImageCache {
+  enabled: bool,
+  entries: List<Kept>,
+}
+
+struct Kept {
+  url: Url,
+  policy: Policy,
+  // Response bytes the fetch charged against the source byte budget; zero when it failed
+  // before a response.
+  bytes: usize,
+  loaded: Option<Loaded>,
+  used: bool,
+  // Sweeps since a load last used the entry.
+  idle: u32,
+}
+
+impl ImageCache {
+  /// An empty cache that keeps what loads fetch.
+  pub fn make() -> ImageCache {
+    return ImageCache { enabled: true, entries: List<Kept>.make() }
+  }
+
+  /// A cache that keeps nothing: every load fetches again.
+  pub fn disabled() -> ImageCache {
+    return ImageCache { enabled: false, entries: List<Kept>.make() }
+  }
+
+  /// The number of URLs kept.
+  pub fn length(self: &Self) -> usize {
+    return self.entries.length()
+  }
+
+  /// Ends a frame: drops the entries no load used in this frame or the one before.
+  pub fn sweep(self: &mut Self) -> () {
+    let mut i: usize = 0
+    while i < self.entries.length() {
+      let entries = self.entries.asMutSlice()
+      if entries[i].used {
+        entries[i].used = false
+        entries[i].idle = 0
+      } else {
+        entries[i].idle = entries[i].idle + 1
+      }
+      let idle = entries[i].idle
+      drop entries
+      if idle >= 2 {
+        drop self.entries.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+}
+
+fn samePolicy(a: Policy, b: Policy) -> bool {
+  return a.mode == b.mode && a.limits.maxResourceBytes == b.limits.maxResourceBytes
+}
+
+effect fn optionalBytes(value: &Option<Bytes>) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &value.* {
+    Option<Bytes>.Some { value: bytes } => Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&bytes)))
+    _ => Option<Bytes>.None
+  }
+}
+
+effect fn colorCopy(color: &ColorMetadata) -> ColorMetadata
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &color.* {
+    ColorMetadata.Png { value } => ColorMetadata.Png {
+      value: PngMetadata {
+        gamma: value.gamma,
+        chromaticities: value.chromaticities,
+        srgbIntent: value.srgbIntent,
+        iccProfile: run Bytes.copy(Bytes.asSlice(&value.iccProfile)),
+      },
+    }
+    ColorMetadata.Jpeg { value } => ColorMetadata.Jpeg {
+      value: JpegMetadata {
+        orientation: value.orientation,
+        iccProfile: run Bytes.copy(Bytes.asSlice(&value.iccProfile)),
+      },
+    }
+  }
+}
+
+effect fn loadedCopy(loaded: &Loaded) -> Loaded
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &loaded.* {
+    Loaded.Raster { asset } => Loaded.Raster {
+      asset: Asset { image: run asset.image.copy(), color: run colorCopy(&asset.color) },
+    }
+    Loaded.Document { source } => {
+      let finalUrl = match &source.response.finalUrl {
+        Option<Url>.Some { value } => Option<Url>.some(run value.clone())
+        _ => Option<Url>.None
+      }
+      Loaded.Document {
+        source: DocumentSource {
+          response: Response {
+            bytes: run Bytes.copy(Bytes.asSlice(&source.response.bytes)),
+            finalUrl: move finalUrl,
+            mediaType: run optionalBytes(&source.response.mediaType),
+            charset: run optionalBytes(&source.response.charset),
+          },
+          request: run source.request.clone(),
+          // A fetch never sets it; document_images.prepare fills the store's copy.
+          metadata: Option<DocumentMetadata>.None,
+        },
+      }
+    }
+  }
+}
+
+/// A fetch and decode of `url`, or None when the image is unavailable or undecodable.
+effect fn available(url: &Url, policy: &Policy, remaining: &mut usize) -> Option<Loaded>
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let decoded = run Effect.result(fetched(url, policy, &mut remaining.*))
+  return match move decoded {
+    Result<
+      Loaded,
+      RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+    >.Success {
+      value
+    } => Option<Loaded>.some(move value)
+    Result<
+      Loaded,
+      RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
+    >.Failure {
+      error
+    } => {
+      match &error {
+        RenderError value => {
+          fail value
+        }
+        OutOfMemoryError value => {
+          fail OutOfMemoryError {}
+        }
+        _ => {}
+      }
+      Option<Loaded>.None
+    }
+  }
+}
+
+/// [`available`], answered from the store's cache when it holds `url` under `policy`.
+effect fn availableKept(
+  store: &mut Store,
+  url: &Url,
+  policy: &Policy,
+  remaining: &mut usize,
+) -> Option<Loaded>
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  if !store.kept.enabled {
+    return run available(url, policy, &mut remaining.*)
+  }
+  let mut i: usize = 0
+  while i < store.kept.entries.length() {
+    let entry = &mut store.kept.entries.asMutSlice()[i]
+    if equal(entry.url.bytes(), url.bytes()) && samePolicy(entry.policy, policy.*) {
+      if entry.bytes > remaining.* {
+        fail RenderError.TooLarge
+      }
+      remaining.* = remaining.* - entry.bytes
+      entry.used = true
+      return match &entry.loaded {
+        Option<Loaded>.Some { value } => Option<Loaded>.some(run loadedCopy(&value))
+        _ => Option<Loaded>.None
+      }
+    }
+    i = i + 1
+  }
+  let before = remaining.*
+  let found = run available(url, policy, &mut remaining.*)
+  let kept = match &found {
+    Option<Loaded>.Some { value } => Option<Loaded>.some(run loadedCopy(&value))
+    _ => Option<Loaded>.None
+  }
+  run store.kept.entries.append(
+    Kept {
+      url: run url.clone(),
+      policy: policy.*,
+      bytes: before - remaining.*,
+      loaded: move kept,
+      used: true,
+      idle: 0,
+    },
+  )
+  return move found
+}
+
 /// Resource errors and unsupported/malformed images paint nothing. Allocator
 /// failure is never swallowed. Source bytes and retained pixels have separate caps.
 pub effect fn load(graph: &Graph, maxPixels: usize) -> Store
   ! RenderError | OutOfMemoryError
   ? &mut Resolver | &mut Allocator {
+  return run loadWith(graph, maxPixels, ImageCache.disabled())
+}
+
+/// [`load`], reusing and adding to the images `cache` kept from earlier loads. Take the cache
+/// back with [`Store.takeCache`] after the last [`loadLayers`].
+pub effect fn loadWith(graph: &Graph, maxPixels: usize, cache: ImageCache) -> Store
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
   let mut store = Store.empty()
+  store.kept = move cache
   store.budget = Option<Budget>.some(
     Budget {
       pixels: 0,
@@ -433,16 +656,11 @@ effect fn fetchInto(
     fail RenderError.TooLarge
   }
   budget.urls = budget.urls - url.bytes().length
-  let decoded = run Effect.result(fetched(&url, policy, &mut budget.remaining))
+  let decoded = run availableKept(&mut store.*, &url, policy, &mut budget.remaining)
   let mut index = usize.MAX
   let mut documentIndex = usize.MAX
   match move decoded {
-    Result<
-      Loaded,
-      RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
-    >.Success {
-      value: loaded
-    } => {
+    Option<Loaded>.Some { value: loaded } => {
       match move loaded {
         Loaded.Raster { asset: value } => {
           let count = u32.toUsize(value.image.width()) * u32.toUsize(value.image.height())
@@ -505,22 +723,7 @@ effect fn fetchInto(
         }
       }
     }
-    Result<
-      Loaded,
-      RenderError | ResourceError | PngError | JpegError | ImageError | OutOfMemoryError
-    >.Failure {
-      error
-    } => {
-      match &error {
-        RenderError value => {
-          fail value
-        }
-        OutOfMemoryError value => {
-          fail OutOfMemoryError {}
-        }
-        _ => {}
-      }
-    }
+    Option<Loaded>.None => {}
   }
   run store.cache.append(Cached { url: move url, asset: index, document: documentIndex })
   return Found { asset: index, document: documentIndex }
