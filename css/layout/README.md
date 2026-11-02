@@ -51,8 +51,9 @@ shaping of text. Dependents import the package as `layout`.
   it and writes boxes and fragments into a reusable `LayoutTree`. Elements, generated boxes and
   physical fragments have separate identities, so one element can produce several boxes (for
   example an inline split across lines) or none.
-- **Incremental by default.** Calling `compute` again after `setStyle`, `setText` or
-  `setMeasurement` lays out only what the change can affect. Size results are cached per box
+- **Incremental by default.** Calling `compute` again after `setStyle`, `setText`,
+  `setMeasurement` or a structural edit (`insertBefore`, `remove`, `destroy`) lays out only what
+  the change can affect. Size results are cached per box
   and constraint, and unchanged formatting contexts reuse their previous fragments.
   `LayoutTree.stats` reports what each compute did.
 - **Logical axes throughout.** Every algorithm works in the box's own writing mode, including

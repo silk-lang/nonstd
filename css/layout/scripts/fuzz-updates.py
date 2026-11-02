@@ -13,6 +13,11 @@ compute takes for them:
   text    text edits, some of them one letter in a word, under inline boxes
   grid    a separate stream with grid templates, placement and flow changes
   subgrid a separate stream with inherited axes, local names and gap transitions
+  structure  inserts, moves, removals, reinsertions and destroys (Tree.insertBefore,
+          remove, destroy) mixed with restyles; destroyed ids are reused, so the
+          script tracks the tree's slots and compares each attached node's
+          geometry with a fresh layout of the final tree in tree order
+  gridstructure  the same over grid containers and items
 
   python3 scripts/fuzz-updates.py --cli build/.../css-layout-cli [--seeds 200] [--mode inner,text]
 """
@@ -30,6 +35,8 @@ MODES = {
     "text": {"relative": 0.0, "text": 1.0, "inline": 0.2, "typo": True, "kind": "any", "repeat": 2},
     "grid": {"relative": 0.1, "text": 0.3, "inline": 0.1, "typo": True, "kind": "grid", "repeat": 3},
     "subgrid": {"relative": 0.1, "text": 0.3, "inline": 0.1, "typo": True, "kind": "grid", "repeat": 3, "subgrid": True},
+    "structure": {"relative": 0.1, "text": 0.2, "inline": 0.1, "typo": False, "kind": "any", "repeat": 1, "structure": True},
+    "gridstructure": {"relative": 0.1, "text": 0.2, "inline": 0.1, "typo": False, "kind": "grid", "repeat": 1, "structure": True},
 }
 WORDS = ["ab", "word", "x", "longer", "q"]
 
@@ -225,6 +232,156 @@ def final(document, cycle):
     return result
 
 
+class Slots:
+    """Mirrors Tree's node slots: ids are slot indices, destroy frees a
+    subtree in tree order and create takes the last freed slot."""
+
+    def __init__(self, nodes):
+        self.nodes = []
+        self.free = []
+        for index, node in enumerate(nodes):
+            entry = {"parent": node["parent"], "children": [], "live": True}
+            if "text" in node: entry["text"] = node["text"]
+            else: entry["style"] = node["style"]
+            self.nodes.append(entry)
+            if node["parent"] is not None: self.nodes[node["parent"]]["children"].append(index)
+
+    def create(self, content):
+        entry = dict(content, parent=None, children=[], live=True)
+        if self.free:
+            index = self.free.pop()
+            self.nodes[index] = entry
+        else:
+            index = len(self.nodes)
+            self.nodes.append(entry)
+        return index
+
+    def unlink(self, index):
+        parent = self.nodes[index]["parent"]
+        if parent is not None:
+            self.nodes[parent]["children"].remove(index)
+            self.nodes[index]["parent"] = None
+
+    def insert(self, parent, child, before):
+        if before == child:
+            siblings = self.nodes[parent]["children"]
+            at = siblings.index(child) + 1
+            before = siblings[at] if at < len(siblings) else None
+        self.unlink(child)
+        siblings = self.nodes[parent]["children"]
+        siblings.insert(len(siblings) if before is None else siblings.index(before), child)
+        self.nodes[child]["parent"] = parent
+
+    def subtree(self, index):
+        result = [index]
+        for child in self.nodes[index]["children"]:
+            result.extend(self.subtree(child))
+        return result
+
+    def destroy(self, index):
+        self.unlink(index)
+        for node in self.subtree(index):
+            self.nodes[node]["live"] = False
+            self.free.append(node)
+
+    def attached(self):
+        return self.subtree(0)
+
+    def detached(self):
+        return [index for index, node in enumerate(self.nodes)
+                if index and node["live"] and node["parent"] is None]
+
+    def document(self, viewport):
+        """The attached tree in tree order, and each slot's index in it."""
+        order = self.attached()
+        position = {slot: at for at, slot in enumerate(order)}
+        nodes = []
+        for slot in order:
+            node = self.nodes[slot]
+            parent = None if node["parent"] is None else position[node["parent"]]
+            nodes.append({"parent": parent, "text": node["text"]} if "text" in node else {"parent": parent, "style": node["style"]})
+        return {"viewport": viewport, "nodes": nodes}, order
+
+
+def structure_op(r, mode, slots):
+    attached = slots.attached()
+    elements = [index for index in attached if "style" in slots.nodes[index]]
+    movable = attached[1:]
+    detached = slots.detached()
+    kind = r.choice(["insert", "insert", "move", "move", "remove", "destroy"] + (["reinsert"] * 2 if detached else []))
+    if kind in ("move", "remove", "destroy") and not movable: kind = "insert"
+    if kind == "destroy" and detached and r.random() < .3:
+        node = r.choice(detached)
+        slots.destroy(node)
+        return {"op": "destroy", "node": node}
+    if kind in ("remove", "destroy"):
+        node = r.choice(movable)
+        if kind == "remove": slots.unlink(node)
+        else: slots.destroy(node)
+        return {"op": kind, "node": node}
+    if kind == "insert":
+        if r.random() < mode["text"]:
+            content = {"text": " ".join(r.choice(WORDS[:4]) for _ in range(r.randint(1, 6)))}
+        else:
+            content = {"style": random_style(r, mode)}
+        op = dict({"op": "insert"}, **content)
+        node = slots.create(content)
+        if r.random() < .1:
+            return op  # left outside the tree for a later reinsert
+    else:
+        node = r.choice(movable if kind == "move" else detached)
+        op = {"op": "move", "node": node}
+    inside = set(slots.subtree(node))
+    parent = r.choice([index for index in elements if index not in inside])
+    children = slots.nodes[parent]["children"]
+    before = r.choice(children + [None, None]) if children else None
+    slots.insert(parent, node, before)
+    op.update(parent=parent, before=before)
+    return op
+
+
+def structure_case(seed, mode):
+    """A random document, a cycle of structural steps and the final tree."""
+    document, _ = case(seed, mode)
+    r = random.Random(seed * 7919 + 1)
+    slots = Slots(document["nodes"])
+    viewport = document["viewport"]
+    cycle = []
+    for _ in range(r.randint(1, 6)):
+        step = {"ops": [structure_op(r, mode, slots) for _ in range(r.randint(1, 3))]}
+        live = [index for index in slots.attached() if index > 0]
+        changes = []
+        for _ in range(r.randint(0, 2)):
+            if not live: break
+            node = r.choice(live)
+            if "text" in slots.nodes[node]:
+                change = text_edit(r, mode, slots.nodes, node)
+                slots.nodes[node]["text"] = change["text"]
+            else:
+                change = style_edit(r, mode, slots.nodes, node)
+                slots.nodes[node]["style"] = change["style"]
+            changes.append(change)
+        if changes: step["set"] = changes
+        if r.random() < .2:
+            viewport = {"width": r.randint(500, 900), "height": 600}
+            step["viewport"] = viewport
+        cycle.append(step)
+    fresh, order = slots.document(viewport)
+    return document, cycle, fresh, order
+
+
+def structure_matches(kept, fresh, order):
+    """Whether each attached slot's source and every box match the fresh layout."""
+    kept, fresh = json.loads(kept), json.loads(fresh)
+    # Boxes name their sources by id, which differ between the two trees.
+    position = {slot: at for at, slot in enumerate(order)}
+    for box in kept["boxes"]:
+        for key in ("source", "styleOwner"):
+            if box.get(key) is not None: box[key] = position.get(box[key], -1)
+    if kept["boxes"] != fresh["boxes"]: return False
+    return all(kept["sources"][slot] == fresh["sources"][at] for at, slot in enumerate(order))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cli", required=True)
@@ -237,6 +394,15 @@ def main():
     for name in args.mode.split(","):
         mode = MODES[name]
         for seed in range(args.first, args.first + args.seeds):
+            if mode.get("structure"):
+                total += 1
+                document, cycle, final_document, order = structure_case(seed, mode)
+                fresh_code, fresh = run(args.cli, final_document)
+                code, kept = run(args.cli, dict(document, updates={"iterations": len(cycle), "cycle": cycle}))
+                if fresh_code != 0 or code != 0 or not structure_matches(kept, fresh, order):
+                    failures += 1
+                    print(f"differs from a fresh layout: mode {name} seed {seed} (exit {code}, fresh {fresh_code})", file=sys.stderr)
+                continue
             document, cycle = case(seed, mode)
             total += 1
             fresh_code, fresh = run(args.cli, final(document, cycle))

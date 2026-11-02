@@ -5,7 +5,7 @@ import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
 import silk.text.string { String }
 import silk.core.option { Option }
-import silk.json.value { Json, Value }
+import silk.json.value { Json, Value, JsonChild }
 import silk.json.scanner { JsonError }
 import silk.json.codec { Serialize }
 import silk.json.output { JsonOptions }
@@ -438,13 +438,63 @@ fn resetCounters(fixtures: &mut Fixtures) {
   fixtures.shapeCalls = 0
 }
 
-// One step of an update benchmark: `viewport` replaces the viewport, and each
-// `set` entry replaces a node's whole style, a text node's text, or an
-// element's scroll offset.
+effect fn nodeField(value: &Value, key: string) -> NodeId ! ProtocolError {
+  let index = run P.integer(run P.required(value, key))
+  if index < 0 { fail P.invalidField("must be a node index", key) }
+  return NodeId { index: i32.toUsize(index) }
+}
+effect fn beforeField(value: &Value) -> Option<NodeId> ! ProtocolError {
+  if !P.has(value, "before") || P.isNull(run P.required(value, "before")) { return Option<NodeId>.None }
+  return Option<NodeId>.Some { value: run nodeField(value, "before") }
+}
+
+// Structural edits, applied in order: `insert` creates an element (`style`)
+// or text node (`text`) and attaches it under `parent` before `before` (last
+// when null), or leaves it outside the tree without `parent`; `move`
+// attaches an existing `node` the same way; `remove` detaches `node`, which
+// a later `move` may attach again; `destroy` frees `node` with its subtree.
+effect fn applyOps(ops: &[JsonChild], tree: &mut Tree, fonts: usize)
+  ! ProtocolError | GridError | OutOfMemoryError | InvalidNode ? &mut Allocator {
+  let mut index: usize = 0
+  while index < ops.length {
+    let op = run P.item(&ops[index])
+    let kind = run P.text(run P.required(op, "op"))
+    if kind == "insert" {
+      run P.fields(op, &["op", "parent", "before", "style", "text"])
+      let mut id = NodeId { index: 0 }
+      if P.has(op, "text") {
+        id = run tree.createText(run String.copy(run P.text(run P.required(op, "text"))))
+      } else {
+        let style = run Styles.parse(run P.required(op, "style"))
+        if style.fontKey >= fonts { fail P.invalid("fontKey does not identify a supplied font") }
+        id = run tree.create(move style)
+        run GridStyles.apply(run P.required(op, "style"), &mut tree, id)
+      }
+      if P.has(op, "parent") { run tree.insertBefore(run nodeField(op, "parent"), id, run beforeField(op)) }
+    } else if kind == "move" {
+      run P.fields(op, &["op", "node", "parent", "before"])
+      run tree.insertBefore(run nodeField(op, "parent"), run nodeField(op, "node"), run beforeField(op))
+    } else if kind == "remove" {
+      run P.fields(op, &["op", "node"])
+      run tree.remove(run nodeField(op, "node"))
+    } else if kind == "destroy" {
+      run P.fields(op, &["op", "node"])
+      run tree.destroy(run nodeField(op, "node"))
+    } else {
+      fail P.invalid("ops[].op must be insert, move, remove or destroy")
+    }
+    index = index + 1
+  }
+}
+
+// One step of an update benchmark: `viewport` replaces the viewport, `ops`
+// edits the tree's structure (see applyOps), and each `set` entry replaces
+// a node's whole style, a text node's text, or an element's scroll offset.
 effect fn applyStep(step: &Value, tree: &mut Tree, current: OptionalSize, fonts: usize) -> OptionalSize
   ! ProtocolError | GridError | OutOfMemoryError | InvalidNode ? &mut Allocator {
   let mut viewport = current
-  run P.fields(step, &["viewport", "set"])
+  run P.fields(step, &["viewport", "ops", "set"])
+  if P.has(step, "ops") { run applyOps(run P.array(run P.required(step, "ops")), &mut tree, fonts) }
   if P.has(step, "viewport") {
     let value = run P.required(step, "viewport")
     run P.fields(value, &["width", "height"])

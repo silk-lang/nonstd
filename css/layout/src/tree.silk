@@ -38,7 +38,7 @@ pub enum Measurement { None, Content, Natural }
 pub union SourceContent { Element, Text { pub value: String } }
 pub struct Node {
   pub styleIndex: usize, pub content: SourceContent,
-  pub parent: usize, pub firstChild: usize, pub lastChild: usize, pub nextSibling: usize,
+  pub parent: usize, pub firstChild: usize, pub lastChild: usize, pub nextSibling: usize, pub previousSibling: usize,
   pub measureKey: usize, pub measurement: Measurement,
   pub scrollOffset: Point,
 }
@@ -157,6 +157,10 @@ pub struct Tree {
   // Scroll offset changes, which move fragments without a revision: the
   // count so far and the last SCROLL_LOG nodes changed.
   scrolls: usize, scrollNodes: List<usize>,
+  // Whether each slot of `nodes` holds a node; destroy frees a slot and
+  // create takes the last freed one. Freed element style slots and grid
+  // slots are reused the same way.
+  live: List<bool>, freeNodes: List<usize>, freeStyles: List<usize>, freeGrids: List<usize>,
 }
 const CHANGE_LOG: usize = 256
 const SCROLL_LOG: usize = 64
@@ -177,7 +181,7 @@ impl Tree {
     run styles.append(move value)
     let mut changed = List<usize>.make()
     run changed.reserve(1)
-    run nodes.append(Node { styleIndex: 0, content: SourceContent.Element, parent: NO_NODE, firstChild: NO_NODE, lastChild: NO_NODE, nextSibling: NO_NODE, measureKey: 0, measurement: Measurement.None, scrollOffset: Point { x: 0.0, y: 0.0 } })
+    run nodes.append(Node { styleIndex: 0, content: SourceContent.Element, parent: NO_NODE, firstChild: NO_NODE, lastChild: NO_NODE, nextSibling: NO_NODE, previousSibling: NO_NODE, measureKey: 0, measurement: Measurement.None, scrollOffset: Point { x: 0.0, y: 0.0 } })
     run changed.append(1)
     let mut outer = List<usize>.make()
     run outer.append(1)
@@ -191,7 +195,9 @@ impl Tree {
     run logRevisions.appendRepeated(0, CHANGE_LOG)
     let mut scrollNodes = List<usize>.make()
     run scrollNodes.appendRepeated(NO_NODE, SCROLL_LOG)
-    return Tree { nodes: move nodes, styles: move styles, grids: move grids, gridNames: move gridNames, gridRevisions: move gridRevisions, viewportScrollOffset: Point { x: 0.0, y: 0.0 }, current: 1, structure: 1, generated: 1, changed: move changed, outer: move outer, insets: move insets, placed: move placed, logNodes: move logNodes, logRevisions: move logRevisions, logged: 0, logLost: 0, scrolls: 0, scrollNodes: move scrollNodes }
+    let mut live = List<bool>.make()
+    run live.append(true)
+    return Tree { nodes: move nodes, styles: move styles, grids: move grids, gridNames: move gridNames, gridRevisions: move gridRevisions, viewportScrollOffset: Point { x: 0.0, y: 0.0 }, current: 1, structure: 1, generated: 1, changed: move changed, outer: move outer, insets: move insets, placed: move placed, logNodes: move logNodes, logRevisions: move logRevisions, logged: 0, logLost: 0, scrolls: 0, scrollNodes: move scrollNodes, live: move live, freeNodes: List<usize>.make(), freeStyles: List<usize>.make(), freeGrids: List<usize>.make() }
   }
   // The current revision; it advances on every change.
   pub fn revision(self: &Self) -> usize { return self.current }
@@ -265,7 +271,7 @@ impl Tree {
   // `styles`, or new content behind a node's measurement key. Layout results
   // that depend on the node are recomputed by the next compute.
   pub effect fn markDirty(self: &mut Self, id: NodeId) ! InvalidNode {
-    if id.index >= self.nodes.length() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) { fail InvalidNode { index: id.index } }
     self.touch(id.index)
     self.generated = self.current
   }
@@ -289,7 +295,7 @@ impl Tree {
   // Empty lists mean the initial auto tracks/none template. Replacing a slot
   // drops all its old owned lists without growing the table on each restyle.
   pub effect fn setGrid(self: &mut Self, id: NodeId, template: GridTemplate) ! InvalidNode | GridError | OutOfMemoryError ? &mut Allocator {
-    if id.index >= self.nodes.length() || self.nodes.asSlice()[id.index].isText() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) || self.nodes.asSlice()[id.index].isText() { fail InvalidNode { index: id.index } }
     if !template.valid(self.gridNames.length()) { fail GridError {} }
     let styleIndex = self.nodes.asSlice()[id.index].styleIndex
     let handle = self.styles.asSlice()[styleIndex].grid
@@ -304,7 +310,15 @@ impl Tree {
       || old.rows.subgrid || old.columns.subgrid
       || template.rows.subgrid || template.columns.subgrid
     let same = old.same(&template)
-    if handle == 0 {
+    if handle == 0 && self.freeGrids.length() != 0 {
+      let slot = self.freeGrids.get(self.freeGrids.length() - 1)
+      let remaining = self.freeGrids.length() - 1
+      self.freeGrids.truncate(remaining)
+      let grids = self.grids.asMutSlice()
+      grids[slot] = move template
+      let styles = self.styles.asMutSlice()
+      styles[styleIndex].grid = slot
+    } else if handle == 0 {
       let slot = self.grids.length()
       run self.gridRevisions.reserve(1)
       run self.grids.append(move template)
@@ -319,56 +333,228 @@ impl Tree {
     if !same { self.gridRevisions.set(self.styles.asSlice()[styleIndex].grid, self.current) }
   }
   pub fn root(self: &Self) -> NodeId { return NodeId { index: 0 } }
+  // Whether `id` names a node: one in range that destroy has not freed.
+  pub fn contains(self: &Self, id: NodeId) -> bool {
+    return id.index < self.nodes.length() && self.live.get(id.index)
+  }
+  // Whether `id` is the root or a node with a parent chain up to it.
+  pub fn attached(self: &Self, id: NodeId) -> bool {
+    if !self.contains(id) { return false }
+    let nodes = self.nodes.asSlice()
+    let mut at = id.index
+    while nodes[at].parent != NO_NODE { at = nodes[at].parent }
+    return at == 0
+  }
+  // Appends an element as the parent's last child.
   pub effect fn append(self: &mut Self, parent: NodeId, style: Style) -> NodeId ! OutOfMemoryError | InvalidNode ? &mut Allocator {
-    if parent.index >= self.nodes.length() { fail InvalidNode { index: parent.index } }
-    if self.nodes.asSlice()[parent.index].isText() || self.nodes.asSlice()[parent.index].measurement != Measurement.None { fail InvalidNode { index: parent.index } }
-    let index = self.nodes.length()
-    let last = self.nodes.asSlice()[parent.index].lastChild
-    let styleIndex = self.styles.length()
-    // Reserve every arena before publishing any entry or sibling link.
-    run self.nodes.reserve(1)
-    run self.styles.reserve(1)
-    run self.changed.reserve(1)
+    if !self.canParent(parent) { fail InvalidNode { index: parent.index } }
+    let id = run self.create(move style)
+    run self.insertBefore(parent, id, Option<NodeId>.None)
+    return id
+  }
+  // Appends a text node as the parent's last child.
+  pub effect fn appendText(self: &mut Self, parent: NodeId, value: String) -> NodeId ! OutOfMemoryError | InvalidNode ? &mut Allocator {
+    if !self.canParent(parent) { fail InvalidNode { index: parent.index } }
+    let id = run self.createText(move value)
+    run self.insertBefore(parent, id, Option<NodeId>.None)
+    return id
+  }
+  fn canParent(self: &Self, parent: NodeId) -> bool {
+    if !self.contains(parent) { return false }
+    let node = &self.nodes.asSlice()[parent.index]
+    return !node.isText() && node.measurement == Measurement.None
+  }
+  // Makes an element outside the tree, for insertBefore to attach. Its id is
+  // the slot destroy freed last, if any.
+  pub effect fn create(self: &mut Self, style: Style) -> NodeId ! OutOfMemoryError ? &mut Allocator {
     let mut value = move style
     value.grid = 0
-    run self.styles.append(move value)
-    run self.nodes.append(Node { styleIndex: styleIndex, content: SourceContent.Element, parent: parent.index, firstChild: NO_NODE, lastChild: NO_NODE, nextSibling: NO_NODE, measureKey: 0, measurement: Measurement.None, scrollOffset: Point { x: 0.0, y: 0.0 } })
-    self.current = self.current + 1
-    self.structure = self.current
-    self.generated = self.current
-    run self.changed.append(self.current)
-    run self.outer.append(self.current)
-    run self.insets.append(0)
-    run self.placed.append(self.current)
-    let nodes = self.nodes.asMutSlice()
-    if last == NO_NODE { nodes[parent.index].firstChild = index } else { nodes[last].nextSibling = index }
-    nodes[parent.index].lastChild = index
+    // Reserve every arena before publishing any entry.
+    run self.reserveSlot()
+    if self.freeStyles.length() == 0 { run self.styles.reserve(1) }
+    let mut styleIndex = self.styles.length()
+    if self.freeStyles.length() != 0 {
+      styleIndex = self.freeStyles.get(self.freeStyles.length() - 1)
+      let remaining = self.freeStyles.length() - 1
+      self.freeStyles.truncate(remaining)
+      let styles = self.styles.asMutSlice()
+      styles[styleIndex] = move value
+    } else {
+      run self.styles.append(move value)
+    }
+    let index = run self.publish(Node { styleIndex: styleIndex, content: SourceContent.Element, parent: NO_NODE, firstChild: NO_NODE, lastChild: NO_NODE, nextSibling: NO_NODE, previousSibling: NO_NODE, measureKey: 0, measurement: Measurement.None, scrollOffset: Point { x: 0.0, y: 0.0 } })
     return NodeId { index: index }
   }
-  pub effect fn appendText(self: &mut Self, parent: NodeId, value: String) -> NodeId ! OutOfMemoryError | InvalidNode ? &mut Allocator {
-    if parent.index >= self.nodes.length() { fail InvalidNode { index: parent.index } }
-    if self.nodes.asSlice()[parent.index].isText() || self.nodes.asSlice()[parent.index].measurement != Measurement.None { fail InvalidNode { index: parent.index } }
-    let index = self.nodes.length()
-    let last = self.nodes.asSlice()[parent.index].lastChild
-    let styleIndex = self.nodes.asSlice()[parent.index].styleIndex
+  // Makes a text node outside the tree. It takes its parent's style once
+  // attached.
+  pub effect fn createText(self: &mut Self, value: String) -> NodeId ! OutOfMemoryError ? &mut Allocator {
+    run self.reserveSlot()
+    let index = run self.publish(Node { styleIndex: 0, content: SourceContent.Text { value: move value }, parent: NO_NODE, firstChild: NO_NODE, lastChild: NO_NODE, nextSibling: NO_NODE, previousSibling: NO_NODE, measureKey: 0, measurement: Measurement.None, scrollOffset: Point { x: 0.0, y: 0.0 } })
+    return NodeId { index: index }
+  }
+  effect fn reserveSlot(self: &mut Self) ! OutOfMemoryError ? &mut Allocator {
+    if self.freeNodes.length() != 0 { return }
     run self.nodes.reserve(1)
+    run self.live.reserve(1)
     run self.changed.reserve(1)
-    run self.nodes.append(Node { styleIndex: styleIndex, content: SourceContent.Text { value: move value }, parent: parent.index, firstChild: NO_NODE, lastChild: NO_NODE, nextSibling: NO_NODE, measureKey: 0, measurement: Measurement.None, scrollOffset: Point { x: 0.0, y: 0.0 } })
+    run self.outer.reserve(1)
+    run self.insets.reserve(1)
+    run self.placed.reserve(1)
+  }
+  // Stores a node in the last freed slot or a new one; reserveSlot made room.
+  // A new node, even outside the tree, changes which nodes generated boxes
+  // and kept per-source lists cover.
+  effect fn publish(self: &mut Self, node: Node) -> usize ! OutOfMemoryError ? &mut Allocator {
     self.current = self.current + 1
     self.structure = self.current
     self.generated = self.current
+    if self.freeNodes.length() != 0 {
+      let index = self.freeNodes.get(self.freeNodes.length() - 1)
+      let remaining = self.freeNodes.length() - 1
+      self.freeNodes.truncate(remaining)
+      let nodes = self.nodes.asMutSlice()
+      nodes[index] = move node
+      self.live.set(index, true)
+      self.changed.set(index, self.current)
+      self.outer.set(index, self.current)
+      self.insets.set(index, 0)
+      self.placed.set(index, self.current)
+      return index
+    }
+    let index = self.nodes.length()
+    run self.nodes.append(move node)
+    run self.live.append(true)
     run self.changed.append(self.current)
     run self.outer.append(self.current)
     run self.insets.append(0)
     run self.placed.append(self.current)
+    return index
+  }
+  // Inserts `child` among `parent`'s children before `before`, or last
+  // without it. A child already in a tree moves, as in the DOM: its subtree
+  // keeps its nodes and their styles. The root cannot move, and a node
+  // cannot go inside itself.
+  pub effect fn insertBefore(self: &mut Self, parent: NodeId, child: NodeId, before: Option<NodeId>) ! InvalidNode {
+    if !self.canParent(parent) { fail InvalidNode { index: parent.index } }
+    if !self.contains(child) || child.index == 0 { fail InvalidNode { index: child.index } }
+    let mut ancestor = parent.index
+    while ancestor != NO_NODE {
+      if ancestor == child.index { fail InvalidNode { index: child.index } }
+      ancestor = self.nodes.asSlice()[ancestor].parent
+    }
+    let mut next = NO_NODE
+    match before {
+      Option<NodeId>.Some { value } => {
+        if !self.contains(value) || self.nodes.asSlice()[value.index].parent != parent.index { fail InvalidNode { index: value.index } }
+        next = value.index
+      }
+      Option<NodeId>.None => {}
+    }
+    if next == child.index { next = self.nodes.asSlice()[child.index].nextSibling }
+    if self.nodes.asSlice()[child.index].parent != NO_NODE { self.unlink(child.index) }
+    let styleIndex = self.nodes.asSlice()[parent.index].styleIndex
     let nodes = self.nodes.asMutSlice()
-    if last == NO_NODE { nodes[parent.index].firstChild = index } else { nodes[last].nextSibling = index }
-    nodes[parent.index].lastChild = index
-    return NodeId { index: index }
+    let mut previous = nodes[parent.index].lastChild
+    if next != NO_NODE { previous = nodes[next].previousSibling }
+    nodes[child.index].parent = parent.index
+    nodes[child.index].previousSibling = previous
+    nodes[child.index].nextSibling = next
+    if previous == NO_NODE { nodes[parent.index].firstChild = child.index } else { nodes[previous].nextSibling = child.index }
+    if next == NO_NODE { nodes[parent.index].lastChild = child.index } else { nodes[next].previousSibling = child.index }
+    if nodes[child.index].isText() { nodes[child.index].styleIndex = styleIndex }
+    self.touchInner(parent.index)
+    self.touch(child.index)
+    self.structure = self.current
+    self.generated = self.current
+  }
+  // Takes a node and its subtree out of the tree, keeping them for a later
+  // insertBefore. A node outside the tree stays as it is.
+  pub effect fn remove(self: &mut Self, id: NodeId) ! InvalidNode {
+    if !self.contains(id) || id.index == 0 { fail InvalidNode { index: id.index } }
+    if self.nodes.asSlice()[id.index].parent == NO_NODE { return }
+    self.unlink(id.index)
+    self.touch(id.index)
+    self.structure = self.current
+    self.generated = self.current
+  }
+  // Unlinks a node from its parent's children, recording the parent's change.
+  fn unlink(self: &mut Self, id: usize) {
+    let nodes = self.nodes.asMutSlice()
+    let parent = nodes[id].parent
+    let previous = nodes[id].previousSibling
+    let next = nodes[id].nextSibling
+    if previous == NO_NODE { nodes[parent].firstChild = next } else { nodes[previous].nextSibling = next }
+    if next == NO_NODE { nodes[parent].lastChild = previous } else { nodes[next].previousSibling = previous }
+    nodes[id].parent = NO_NODE
+    nodes[id].previousSibling = NO_NODE
+    nodes[id].nextSibling = NO_NODE
+    self.touchInner(parent)
+  }
+  // Removes a node and frees it and its subtree. Their ids, element style
+  // slots and grid slots go to later creates, last freed first; nodes are
+  // freed in tree order, so the next create takes the subtree's last node.
+  pub effect fn destroy(self: &mut Self, id: NodeId) ! InvalidNode | OutOfMemoryError ? &mut Allocator {
+    if !self.contains(id) || id.index == 0 { fail InvalidNode { index: id.index } }
+    let mut count: usize = 0
+    let mut elements: usize = 0
+    let mut grids: usize = 0
+    let mut at = id.index
+    while at != NO_NODE {
+      count = count + 1
+      if !self.nodes.asSlice()[at].isText() {
+        elements = elements + 1
+        if self.styles.asSlice()[self.nodes.asSlice()[at].styleIndex].grid != 0 { grids = grids + 1 }
+      }
+      at = self.following(id.index, at)
+    }
+    run self.freeNodes.reserve(count)
+    run self.freeStyles.reserve(elements)
+    run self.freeGrids.reserve(grids)
+    if self.nodes.asSlice()[id.index].parent != NO_NODE { self.unlink(id.index) }
+    else { self.current = self.current + 1 }
+    at = id.index
+    while at != NO_NODE {
+      let next = self.following(id.index, at)
+      run self.freeNodes.append(at)
+      self.live.set(at, false)
+      self.changed.set(at, self.current)
+      self.outer.set(at, self.current)
+      self.placed.set(at, self.current)
+      if !self.nodes.asSlice()[at].isText() {
+        let styleIndex = self.nodes.asSlice()[at].styleIndex
+        let handle = self.styles.asSlice()[styleIndex].grid
+        if handle != 0 {
+          let templates = self.grids.asMutSlice()
+          templates[handle] = GridTemplate.make()
+          self.gridRevisions.set(handle, self.current)
+          run self.freeGrids.append(handle)
+        }
+        let styles = self.styles.asMutSlice()
+        styles[styleIndex] = Style.make()
+        run self.freeStyles.append(styleIndex)
+      }
+      let nodes = self.nodes.asMutSlice()
+      nodes[at].content = SourceContent.Element
+      at = next
+    }
+    // Freed slots keep their links until reused; following walks them above.
+    self.structure = self.current
+    self.generated = self.current
+  }
+  // The node after `at` in tree order within `root`'s subtree, or NO_NODE.
+  fn following(self: &Self, root: usize, at: usize) -> usize {
+    let nodes = self.nodes.asSlice()
+    if nodes[at].firstChild != NO_NODE { return nodes[at].firstChild }
+    let mut node = at
+    while node != root {
+      if nodes[node].nextSibling != NO_NODE { return nodes[node].nextSibling }
+      node = nodes[node].parent
+    }
+    return NO_NODE
   }
   // Replaces an element's own style. Text nodes share their parent's slot.
   pub effect fn setStyle(self: &mut Self, id: NodeId, style: Style) ! InvalidNode {
-    if id.index >= self.nodes.length() || self.nodes.asSlice()[id.index].isText() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) || self.nodes.asSlice()[id.index].isText() { fail InvalidNode { index: id.index } }
     let styleIndex = self.nodes.asSlice()[id.index].styleIndex
     let mut value = move style
     value.grid = self.styles.asSlice()[styleIndex].grid
@@ -407,7 +593,7 @@ impl Tree {
     if generates { self.generated = self.current }
   }
   pub effect fn setText(self: &mut Self, id: NodeId, value: String) ! InvalidNode {
-    if id.index >= self.nodes.length() || !self.nodes.asSlice()[id.index].isText() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) || !self.nodes.asSlice()[id.index].isText() { fail InvalidNode { index: id.index } }
     let blank = whitespace(String.view(&value))
     let mut wasBlank = false
     match self.nodes.asSlice()[id.index].text() {
@@ -420,7 +606,7 @@ impl Tree {
     if blank != wasBlank { self.generated = self.current }
   }
   pub effect fn setScrollOffset(self: &mut Self, id: NodeId, offset: Point) ! InvalidNode {
-    if id.index >= self.nodes.length() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) { fail InvalidNode { index: id.index } }
     let nodes = self.nodes.asMutSlice()
     if nodes[id.index].isText() { fail InvalidNode { index: id.index } }
     if nodes[id.index].scrollOffset.x == offset.x && nodes[id.index].scrollOffset.y == offset.y { return }
@@ -429,7 +615,7 @@ impl Tree {
     self.scrolls = self.scrolls + 1
   }
   pub effect fn setMeasurement(self: &mut Self, id: NodeId, key: usize) ! InvalidNode {
-    if id.index >= self.nodes.length() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) { fail InvalidNode { index: id.index } }
     let nodes = self.nodes.asMutSlice()
     if nodes[id.index].isText() || nodes[id.index].firstChild != NO_NODE { fail InvalidNode { index: id.index } }
     nodes[id.index].measureKey = key
@@ -438,7 +624,7 @@ impl Tree {
     self.generated = self.current
   }
   pub effect fn setNaturalMeasurement(self: &mut Self, id: NodeId, key: usize) ! InvalidNode {
-    if id.index >= self.nodes.length() { fail InvalidNode { index: id.index } }
+    if !self.contains(id) { fail InvalidNode { index: id.index } }
     let nodes = self.nodes.asMutSlice()
     if nodes[id.index].isText() || nodes[id.index].firstChild != NO_NODE { fail InvalidNode { index: id.index } }
     nodes[id.index].measureKey = key
