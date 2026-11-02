@@ -1585,6 +1585,11 @@ uint8_t silk_window_test_mouse(uint32_t id, uint32_t kind, uint32_t button, doub
     if (!window) return 0;
     int px = (int)lround(x * window->scale), py = (int)lround(y * window->scale);
     LPARAM position = MAKELPARAM(px, py);
+    // Put the real cursor there too: Windows synthesizes moves at the cursor's position
+    // (after tracking starts, after clicks), which would otherwise report somewhere else.
+    POINT cursor = {px, py};
+    ClientToScreen(window->hwnd, &cursor);
+    SetCursorPos(cursor.x, cursor.y);
     if (kind == 0) {
         PostMessageW(window->hwnd, WM_MOUSEMOVE, 0, position);
     } else if (kind == 1 || kind == 2) {
