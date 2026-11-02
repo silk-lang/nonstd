@@ -10,6 +10,8 @@ import mutation {
   Cursor,
   Display,
   FontStyle,
+  Overflow,
+  WhiteSpace,
   CanvasCommand,
   LISTEN_FOCUS,
   LISTEN_BLUR,
@@ -18,6 +20,8 @@ import mutation {
 }
 import input { Input }
 import interact
+import edit
+import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import style { Computed, TextStyle }
 import node {
   NONE,
@@ -219,6 +223,12 @@ pub struct UiTree<'a> {
   pub reveal: List<u64>,
   /// Whether a mutation was applied since the last frame.
   applied: bool,
+  /// Whether something only paint shows changed since the last frame (a caret moved).
+  pub paintDirty: bool,
+  /// Requests for the host (clipboard), oldest first.
+  pub requests: List<HostRequest>,
+  /// The modifier keys editing shortcuts use; the compilation target's by default.
+  pub keymap: Keymap,
 }
 
 impl<'a> UiTree<'a> {
@@ -284,6 +294,9 @@ impl<'a> UiTree<'a> {
       pointerInside: false,
       reveal: List<u64>.make(),
       applied: false,
+      paintDirty: false,
+      requests: List<HostRequest>.make(),
+      keymap: NATIVE_KEYMAP,
     }
   }
 
@@ -488,7 +501,34 @@ impl<'a> UiTree<'a> {
           Attribute.FocusTrap { value } => {
             node.focusTrap = value
           }
+          Attribute.Multiline { value } => {
+            node.edit.multiline = value
+            let isInput = node.kind == NodeKind.Input
+            self.stylesDirty = true
+            if isInput {
+              run edit.syncDisplay(&mut self, slot)
+            }
+          }
+          Attribute.ReadOnly { value } => {
+            node.edit.readOnly = value
+            node.content = node.content + 1
+            self.paintDirty = true
+          }
+          Attribute.Placeholder { value } => {
+            node.edit.placeholder = move value
+            let isInput = node.kind == NodeKind.Input
+            if isInput {
+              run edit.syncDisplay(&mut self, slot)
+            }
+          }
         }
+      }
+      Mutation.SetSelection { id, anchor, focus } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Input {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        run edit.setSelection(&mut self, slot, anchor, focus)
       }
       Mutation.SetListeners { id, flags } => {
         let slot = run self.require(index, id)
@@ -660,6 +700,7 @@ impl<'a> UiTree<'a> {
       resource: NONE,
       canvas: List<CanvasCommand>.make(),
       content: 1,
+      edit: EditState.make(),
       cache: PaintCache.empty(),
     }
     let mut slot: u32 = 0
@@ -680,6 +721,9 @@ impl<'a> UiTree<'a> {
         self.layout.setNaturalMeasurement(NodeId { index: css }, u32.toUsize(slot)),
         layoutFailed,
       )
+    }
+    if kind == NodeKind.Input {
+      run edit.syncDisplay(&mut self, slot)
     }
     self.stylesDirty = true
   }
@@ -835,7 +879,8 @@ impl<'a> UiTree<'a> {
     if kind == NodeKind.Text {
       target = self.node(slot).css
     } else if kind == NodeKind.Input {
-      target = self.node(slot).inner
+      run edit.setValue(&mut self, slot, move value)
+      return ()
     } else {
       fail TreeError.WrongKind { index: index, id: self.node(slot).id }
     }
@@ -855,6 +900,7 @@ impl<'a> UiTree<'a> {
     }
     let previous = self.focused
     self.focused = slot
+    run edit.focusChanged(&mut self, previous, slot)
     if previous != NONE && self.node(previous).live
       && u32.bitAnd(self.node(previous).listeners, LISTEN_BLUR) != 0 {
       run self.queue(EventKind.Blur, previous)
@@ -934,6 +980,69 @@ impl<'a> UiTree<'a> {
       return Vector2<f32> { x: 0.0, y: 0.0 }
     }
     return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
+  }
+
+  /// Moves the queued host requests (clipboard reads and writes) to `out`, oldest first.
+  pub effect fn takeRequests(self: &mut Self, out: &mut List<HostRequest>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut reversed = List<HostRequest>.make()
+    while true {
+      match self.requests.pop() {
+        Option<HostRequest>.Some { value } => {
+          run reversed.append(move value)
+        }
+        Option<HostRequest>.None => {
+          break
+        }
+      }
+    }
+    while true {
+      match reversed.pop() {
+        Option<HostRequest>.Some { value } => {
+          run out.append(move value)
+        }
+        Option<HostRequest>.None => {
+          break
+        }
+      }
+    }
+  }
+
+  /// What the platform input method needs after the last frame: whether a text field has
+  /// focus, and the caret rectangle in CSS pixels to place the candidate window by.
+  pub effect fn imeArea(self: &Self) -> ImeArea
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run edit.imeArea(self)
+  }
+
+  /// The time the focused caret blinks next, or -1 when no caret shows. Hosts that draw only
+  /// on demand ask for a frame at that time.
+  pub fn nextBlink(self: &Self) -> f64 {
+    return edit.nextBlink(self)
+  }
+
+  /// The selection of input `id` as (anchor, focus) UTF-8 byte offsets into its value, or
+  /// (0, 0) when it is not an input.
+  pub fn selection(self: &Self, id: u32) -> Vector2<usize> {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return Vector2<usize> { x: 0, y: 0 }
+    }
+    let e = &self.node(slot).edit
+    return Vector2<usize> { x: e.anchor, y: e.focus }
+  }
+
+  /// The caret rectangle of input `id` in CSS pixels of the viewport, from the last layout.
+  pub effect fn caretRect(self: &Self, id: u32) -> Rect<f32>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE || self.node(slot).kind != NodeKind.Input {
+      return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    return run edit.caretRectOf(self, slot)
   }
 
   /// Moves the queued event records to `out`, oldest first.
@@ -1095,6 +1204,18 @@ impl<'a> UiTree<'a> {
     let node = self.node(slot)
     let mut computed = Computed.inheriting(inherited)
     computed.display = defaultDisplay(node.kind)
+    if node.kind == NodeKind.Input {
+      // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
+      if node.edit.multiline {
+        computed.text.whiteSpace = WhiteSpace.PreWrap
+        computed.overflowX = Overflow.Hidden
+        computed.overflowY = Overflow.Auto
+      } else {
+        computed.text.whiteSpace = WhiteSpace.Pre
+        computed.overflowX = Overflow.Hidden
+        computed.overflowY = Overflow.Hidden
+      }
+    }
     if node.kind != NodeKind.Text {
       applyAll(&mut computed, &node.base)
       if node.hovered {
@@ -1141,7 +1262,8 @@ impl<'a> UiTree<'a> {
   /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
-    return self.applied || self.stylesDirty || self.layout.revision() != self.laidOutRevision
+    return self.applied || self.stylesDirty || self.paintDirty
+      || self.layout.revision() != self.laidOutRevision
       || self.layout.scrollRevision() != self.laidOutScrolls
       || self.reveal.length() != 0
       || !self.replayable
@@ -1170,6 +1292,9 @@ impl<'a> UiTree<'a> {
       run self.layoutFrame()
       drop run interact.settleScrolls(&mut self)
     }
+    if run edit.revealCaret(&mut self) {
+      run self.layoutFrame()
+    }
 
     // Scrolling and relayout move content under a still pointer: hover follows, and a hover
     // variant that changes layout is laid out in the same frame.
@@ -1178,9 +1303,25 @@ impl<'a> UiTree<'a> {
       run self.resolveStyles()
       run self.layoutFrame()
     }
+    edit.beginPaint(&mut self)
     run self.paintFrame()
+    self.paintDirty = false
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()
+  }
+
+  /// Whether a mutation or an edit changed styles or layout inputs since the last layout.
+  pub fn layoutPending(self: &Self) -> bool {
+    return self.stylesDirty || self.layout.revision() != self.laidOutRevision
+  }
+
+  /// Resolves styles and lays out now, at the last frame's size, so geometry queries between
+  /// frames see the current text. The next frame paints as usual.
+  pub effect fn layoutNow(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.resolveStyles()
+    run self.layoutFrame()
   }
 
   effect fn layoutFrame(self: &mut Self) -> ()
