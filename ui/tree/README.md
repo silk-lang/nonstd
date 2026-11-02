@@ -114,6 +114,10 @@ For people and agents looking at a running UI (`inspect.silk`):
   that differ from the defaults or the parent. `describeNodeById` does one subtree.
 - `CpuSnapshot` renders the whole frame, or one node's subtree cropped to its box
   (`renderNode`), with the CPU reference; `encodePng` turns either into PNG bytes.
+  `renderScene` draws another scene over the tree's atlas, such as an inspector overlay.
+- [ui-inspect](../inspect) builds on these: queries by role, name and text, hit paths and an
+  element picker, the devtools highlight overlay, a node view, synthetic input, and session
+  record and replay.
 
 ## Tests
 
