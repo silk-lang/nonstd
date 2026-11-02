@@ -2,7 +2,7 @@
 
 Silk libraries that live outside the standard library: fonts, text, CSS, images, graphics and
 GPUs. They are grouped by area, and every package is a member of one workspace that pins Silk
-`0.1.0-dev.43+3808a7f2e30c` (`toolchains.lock.json`). Nothing here is stable yet.
+`0.1.0-dev.44+8052ef3352b5` (`toolchains.lock.json`). Nothing here is stable yet.
 
 ## Libraries
 
