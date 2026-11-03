@@ -5,6 +5,12 @@ from the manifests.
   ui/tree/demo/scripts/demo [--build-only] [--release]           the demo in a window
   ui/tree/demo/scripts/demo --editor [--release]                   text fields in a window
   ui/tree/demo/scripts/demo check [--backend x11|wayland|all] [--release]
+  ui/tree/demo/scripts/demo inspect
+
+`inspect` is the inspector's exit test: it builds the demo (debug, as the inspector needs) and
+ui-inspect-cli, starts the demo with SILK_UI_INSPECT set (under Xvfb on Linux), and drives it
+with the CLI: snapshot, click New, wait for the new row, highlight Archive, inspect a button,
+screenshot. The PNG is left in .cache/ui-tree-demo/inspect.png.
 
 `check` runs `ui-tree-demo --check`: a scripted hover, wheel and Tab go into the tree, then the
 window's surface is read back and compared with the CPU reference of the same frame. On Linux it
@@ -18,8 +24,10 @@ import argparse
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = ROOT.parents[2]
@@ -53,14 +61,112 @@ def check(program, backend):
     return subprocess.run([str(program), "--check"], cwd=REPO, env=env, timeout=300).returncode
 
 
+def inspect():
+    program = build(ROOT, release=False)
+    cli = build(REPO / "ui/inspect/cli", release=False)
+    work = REPO / ".cache/ui-tree-demo"
+    work.mkdir(parents=True, exist_ok=True)
+    socket = work / "inspect.sock"
+    shot = work / "inspect.png"
+    shot.unlink(missing_ok=True)
+    env = dict(os.environ, SILK_UI_INSPECT=str(socket))
+    env.pop("SILK_WINDOW_FIBER", None)
+    server = None
+    if sys.platform.startswith("linux"):
+        if "VK_ICD_FILENAMES" not in env and LAVAPIPE.exists():
+            env["VK_ICD_FILENAMES"] = str(LAVAPIPE)
+        env["SILK_WINDOW_SCALE"] = env.get("SILK_WINDOW_SCALE", "1")
+        xvfb = shutil.which("Xvfb")
+        if xvfb and not env.get("DISPLAY"):
+            number = next(n for n in range(90, 140) if not Path(f"/tmp/.X11-unix/X{n}").exists()
+                          and not Path(f"/tmp/.X{n}-lock").exists())
+            server = subprocess.Popen([xvfb, f":{number}", "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            env["DISPLAY"] = f":{number}"
+            env["SILK_WINDOW_BACKEND"] = "x11"
+            env.pop("WAYLAND_DISPLAY", None)
+    app = None
+    failures = []
+
+    def run(*args, timeout=60):
+        result = subprocess.run([str(cli), *args], cwd=REPO, env=env, capture_output=True, text=True,
+                                timeout=timeout)
+        print(f"$ ui-inspect-cli {' '.join(args)}  -> {result.returncode}", flush=True)
+        if result.stderr.strip():
+            print(result.stderr.strip(), flush=True)
+        return result
+
+    def expect(condition, what):
+        print(("ok   " if condition else "FAIL ") + what, flush=True)
+        if not condition:
+            failures.append(what)
+
+    try:
+        if server:
+            deadline = time.monotonic() + 10
+            while not Path(f"/tmp/.X11-unix/{env['DISPLAY'].replace(':', 'X')}").exists():
+                if time.monotonic() > deadline:
+                    raise SystemExit("Xvfb did not start")
+                time.sleep(0.05)
+        app = subprocess.Popen([str(program)], cwd=REPO, env=env)
+        deadline = time.monotonic() + 120
+        while True:
+            hello = subprocess.run([str(cli), "hello"], cwd=REPO, env=env, capture_output=True, text=True)
+            if hello.returncode == 0:
+                break
+            if app.poll() is not None or time.monotonic() > deadline:
+                print(hello.stderr, flush=True)
+                raise SystemExit(f"the demo did not start serving the inspector (exit {app.poll()})")
+            time.sleep(0.2)
+        print(hello.stdout.strip(), flush=True)
+
+        snap = run("snapshot")
+        expect(snap.returncode == 0 and 'role=button label="New"' in snap.stdout, "snapshot lists the New button")
+        expect("A new message" not in snap.stdout, "no new row yet")
+        click = run("click", "--role", "button", "--name", "New")
+        expect(click.returncode == 0 and '"node":10' in click.stdout, "click New by role and name")
+        wait = run("wait", "--text", "A new message", "--timeout", "10000")
+        expect(wait.returncode == 0, "the app answered the click with a new row")
+        after = run("snapshot")
+        expect('"A new message"' in after.stdout, "the snapshot shows the new row")
+        lit = run("highlight", "--role", "button", "--name", "Archive")
+        expect(lit.returncode == 0 and '"nodes":[20]' in lit.stdout, "highlight Archive")
+        view = run("inspect", "--role", "button", "--name", "Archive")
+        expect(view.returncode == 0 and view.stdout.startswith("box #20"), "inspect Archive")
+        shot_run = run("screenshot", str(shot))
+        data = shot.read_bytes() if shot.exists() else b""
+        expect(shot_run.returncode == 0 and data[:8] == b"\x89PNG\r\n\x1a\n", "screenshot is a PNG")
+        stats = run("stats")
+        expect(stats.returncode == 0 and '"nodes":' in stats.stdout, "stats")
+        missing = run("click", "--name", "no such button")
+        expect(missing.returncode == 1 and "no node matches" in missing.stderr, "a missing node is an error")
+    finally:
+        if app and app.poll() is None:
+            app.terminate()
+            try:
+                app.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                app.kill()
+        if server:
+            server.terminate()
+            server.wait()
+    if failures:
+        print(f"{len(failures)} inspector check(s) failed", flush=True)
+        return 1
+    print(f"inspector checks passed; screenshot in {shot}", flush=True)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", nargs="?", choices=["run", "check"], default="run")
+    parser.add_argument("mode", nargs="?", choices=["run", "check", "inspect"], default="run")
     parser.add_argument("--backend", choices=["x11", "wayland", "all"], default="all")
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--editor", action="store_true", help="show the text fields instead of the inbox")
     args = parser.parse_args()
+    if args.mode == "inspect":
+        return inspect()
     program = build(ROOT, release=args.release)
     if args.build_only:
         print(program)
