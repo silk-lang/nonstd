@@ -1,0 +1,492 @@
+//! The WebKit backend (macOS): each view is a `WKWebView`, a native child view of the
+//! platform-window window it opens in, drawn over the Silk UI at its hosted node and clipped to
+//! the node's visible part. The Objective-C side is native/macos/bridge.m.
+//!
+//! Start platform-window's `MacPlatform` and open the window first; views live in its windows
+//! and run on its main thread. Every event the bridge queues wakes the window's `nextEvent`
+//! (which may then return `None`), so drain `takeEvents` after each turn of the loop.
+//!
+//! Agent commands evaluate agent.silk's calls in a script world of their own, which pages
+//! cannot see, then click and type with synthesized `NSEvent`s, so pages get trusted input.
+//! `OpenDevTools` is `Unsupported` (WebKit has no API to open Web Inspector; with
+//! `inspectable` on, Safari's Develop menu attaches to the view).
+import agent { agentScriptBytes, snapshotCall, locateCall, focusForFillCall }
+import command { Command, commandName }
+import event { WebViewEvent, EventKind }
+import host { WebViewHost }
+import macos_sys as sys
+import macos_sys { RawEvent }
+import types { WebViewOptions, WebViewError, Placement, Backend, Capabilities, ConsoleLevel }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.text.string { String, InvalidUtf8 }
+
+const LEVELS: [ConsoleLevel; 5] = [
+  ConsoleLevel.Debug,
+  ConsoleLevel.Log,
+  ConsoleLevel.Info,
+  ConsoleLevel.Warning,
+  ConsoleLevel.Error,
+]
+
+/// The WKWebView backend. One per process; views are named by the ids the client opens them
+/// with.
+pub struct MacWebViews {
+  opened: u32,
+}
+
+/// Where a view is, as `MacWebViews.frame` reports it.
+pub struct ViewFrame {
+  /// The web view's frame, in points from the top left of the window's content area.
+  pub bounds: Rect<f32>,
+  /// Whether it shows (placed visible with something left after clipping).
+  pub visible: bool,
+}
+
+impl Copy for ViewFrame {}
+
+fn text(value: string) -> ?[*]const u8 {
+  return Pointer.fromSlice(String.utf8Bytes(value))
+}
+
+fn flag(raw: &RawEvent, bit: u32) -> bool {
+  return (raw.flags & bit) != 0
+}
+
+impl MacWebViews {
+  pub fn make() -> MacWebViews {
+    return MacWebViews { opened: 0 }
+  }
+
+  /// Where view `view` is now, or None when it is not open. For tests.
+  pub fn frame(self: &Self, view: u32) -> Option<ViewFrame> {
+    if unsafe sys.silk_webview_exists(view) == 0 {
+      return Option<ViewFrame>.None
+    }
+    let mut x: f64 = 0.0
+    let mut y: f64 = 0.0
+    let mut width: f64 = 0.0
+    let mut height: f64 = 0.0
+    let mut visible: u8 = 0
+    unsafe sys.silk_webview_test_frame(
+      view,
+      Pointer.fromMutRef(&mut x),
+      Pointer.fromMutRef(&mut y),
+      Pointer.fromMutRef(&mut width),
+      Pointer.fromMutRef(&mut height),
+      Pointer.fromMutRef(&mut visible),
+    )
+    let bounds = Rect<f32>.new(
+      f64.toF32(x),
+      f64.toF32(y),
+      f64.toF32(x + width),
+      f64.toF32(y + height),
+    )
+    return Option<ViewFrame>.some(ViewFrame { bounds: bounds, visible: visible != 0 })
+  }
+
+  /// Queues an event made here rather than by WebKit, in order with WebKit's.
+  fn queue(self: &mut Self, view: u32, kind: u32, request: u32, ok: bool, message: string) -> () {
+    let flags = if ok {
+      sys.FLAG_OK
+    } else {
+      0
+    }
+    unsafe sys.silk_webview_queue(
+      view,
+      kind,
+      request,
+      flags,
+      text(message),
+      String.byteLength(message),
+    )
+  }
+
+  fn unsupported(self: &mut Self, view: u32, request: u32, command: &Command) -> () {
+    self.queue(view, sys.UNSUPPORTED, request, false, commandName(command))
+  }
+
+  fn notRef(self: &mut Self, view: u32, request: u32, element: string) -> () {
+    self.queue(view, sys.ACTION_RESULT, request, false, "not a snapshot ref")
+  }
+
+  effect fn bytes(self: &Self, index: usize) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut length: usize = 0
+    let start = unsafe sys.silk_webview_event_text(index, Pointer.fromMutRef(&mut length))
+    match Pointer.nonNullMany(start) {
+      Option<[*]const u8>.Some { value } => {
+        let view = unsafe Pointer.borrowMany(self, value, length)
+        return run Bytes.copy(view)
+      }
+      _ => {
+        return Bytes.make()
+      }
+    }
+  }
+
+  /// The `index`th string of the event last taken from the bridge.
+  effect fn string(self: &Self, index: usize) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut length: usize = 0
+    let start = unsafe sys.silk_webview_event_text(index, Pointer.fromMutRef(&mut length))
+    match Pointer.nonNullMany(start) {
+      Option<[*]const u8>.Some { value } => {
+        let view = unsafe Pointer.borrowMany(self, value, length)
+        match move run String.copyUtf8(view) {
+          Result<String, InvalidUtf8>.Success { value: copied } => {
+            return move copied
+          }
+          _ => {
+            return String.make()
+          }
+        }
+      }
+      _ => {
+        return String.make()
+      }
+    }
+  }
+
+  effect fn decode(self: &Self, raw: &RawEvent) -> Option<EventKind>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let kind = raw.kind
+    let ok = flag(raw, sys.FLAG_OK)
+    if kind == sys.CREATED {
+      return Option<EventKind>.some(EventKind.Created)
+    }
+    if kind == sys.CLOSED {
+      return Option<EventKind>.some(EventKind.Closed)
+    }
+    if kind == sys.LOAD_STARTED {
+      return Option<EventKind>.some(EventKind.LoadStarted { url: run self.string(0) })
+    }
+    if kind == sys.LOAD_PROGRESS {
+      return Option<EventKind>.some(EventKind.LoadProgress { fraction: f64.toF32(raw.value) })
+    }
+    if kind == sys.LOAD_FINISHED {
+      let url = run self.string(0)
+      let error = run self.string(1)
+      return Option<EventKind>.some(
+        EventKind.LoadFinished { url: move url, ok: ok, error: move error },
+      )
+    }
+    if kind == sys.URL_CHANGED {
+      return Option<EventKind>.some(EventKind.UrlChanged { url: run self.string(0) })
+    }
+    if kind == sys.TITLE_CHANGED {
+      return Option<EventKind>.some(EventKind.TitleChanged { title: run self.string(0) })
+    }
+    if kind == sys.HISTORY_CHANGED {
+      return Option<EventKind>.some(
+        EventKind.HistoryChanged { canGoBack: ok, canGoForward: flag(raw, sys.FLAG_SECOND) },
+      )
+    }
+    if kind == sys.NAVIGATION_REQUESTED {
+      return Option<EventKind>.some(
+        EventKind.NavigationRequested {
+          request: raw.request,
+          url: run self.string(0),
+          userInitiated: ok,
+        },
+      )
+    }
+    if kind == sys.NEW_WINDOW_REQUESTED {
+      return Option<EventKind>.some(EventKind.NewWindowRequested { url: run self.string(0) })
+    }
+    if kind == sys.FOCUS_CHANGED {
+      return Option<EventKind>.some(EventKind.FocusChanged { focused: ok })
+    }
+    if kind == sys.SCRIPT_RESULT {
+      return Option<EventKind>.some(
+        EventKind.ScriptResult { request: raw.request, ok: ok, value: run self.string(0) },
+      )
+    }
+    if kind == sys.SNAPSHOT {
+      return Option<EventKind>.some(
+        EventKind.Snapshot { request: raw.request, text: run self.string(0) },
+      )
+    }
+    if kind == sys.SCREENSHOT {
+      return Option<EventKind>.some(
+        EventKind.Screenshot {
+          request: raw.request,
+          width: raw.width,
+          height: raw.height,
+          pixels: run self.bytes(0),
+        },
+      )
+    }
+    if kind == sys.ACTION_RESULT {
+      return Option<EventKind>.some(
+        EventKind.ActionResult { request: raw.request, ok: ok, error: run self.string(0) },
+      )
+    }
+    if kind == sys.CONSOLE {
+      let level = if raw.level < 5 {
+        LEVELS[u32.toUsize(raw.level)]
+      } else {
+        ConsoleLevel.Log
+      }
+      return Option<EventKind>.some(EventKind.Console { level: level, message: run self.string(0) })
+    }
+    if kind == sys.UNSUPPORTED {
+      return Option<EventKind>.some(
+        EventKind.Unsupported { request: raw.request, command: run self.string(0) },
+      )
+    }
+    if kind == sys.CRASHED {
+      return Option<EventKind>.some(EventKind.Crashed { reason: run self.string(0) })
+    }
+    return Option<EventKind>.None
+  }
+}
+
+impl WebViewHost for MacWebViews {
+  effect fn open(self: &mut Self, view: u32, options: &WebViewOptions) -> ()
+    ! WebViewError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut flags: u32 = 0
+    if options.inspectable {
+      flags = flags | sys.OPTION_INSPECTABLE
+    }
+    if options.askBeforeNavigating {
+      flags = flags | sys.OPTION_ASK_BEFORE_NAVIGATING
+    }
+    if options.transparent {
+      flags = flags | sys.OPTION_TRANSPARENT
+    }
+    let url = String.view(&options.url)
+    let profile = String.view(&options.profile)
+    let script = agentScriptBytes()
+    let status = unsafe sys.silk_webview_open(
+      view,
+      options.window,
+      text(url),
+      String.byteLength(url),
+      text(profile),
+      String.byteLength(profile),
+      flags,
+      Pointer.fromSlice(script),
+      script.length,
+    )
+    if status == sys.ID_IN_USE {
+      fail WebViewError.IdInUse
+    }
+    if status == sys.NOT_STARTED {
+      fail WebViewError.Unsupported
+    }
+    if status != sys.OPENED {
+      fail WebViewError.CreationFailed
+    }
+    self.opened = self.opened + 1
+  }
+
+  effect fn close(self: &mut Self, view: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    unsafe sys.silk_webview_close(view)
+  }
+
+  fn place(self: &mut Self, view: u32, placement: Placement) -> () {
+    let b = placement.bounds
+    let c = placement.clip
+    let visible: u8 = if placement.visible {
+      1
+    } else {
+      0
+    }
+    unsafe sys.silk_webview_place(
+      view,
+      f32.toF64(b.xMin),
+      f32.toF64(b.yMin),
+      f32.toF64(b.xMax),
+      f32.toF64(b.yMax),
+      f32.toF64(c.xMin),
+      f32.toF64(c.yMin),
+      f32.toF64(c.xMax),
+      f32.toF64(c.yMax),
+      visible,
+    )
+  }
+
+  effect fn send(self: &mut Self, view: u32, command: Command) -> ()
+    ! WebViewError | OutOfMemoryError
+    ? &mut Allocator {
+    if unsafe sys.silk_webview_exists(view) == 0 {
+      fail WebViewError.InvalidView
+    }
+    match &command {
+      Command.Navigate { url } => {
+        let value = String.view(&url)
+        unsafe sys.silk_webview_navigate(view, text(value), String.byteLength(value))
+      }
+      Command.LoadHtml { html, baseUrl } => {
+        let page = String.view(&html)
+        let base = String.view(&baseUrl)
+        unsafe sys.silk_webview_load_html(
+          view,
+          text(page),
+          String.byteLength(page),
+          text(base),
+          String.byteLength(base),
+        )
+      }
+      Command.Back => {
+        unsafe sys.silk_webview_go(view, sys.BACK)
+      }
+      Command.Forward => {
+        unsafe sys.silk_webview_go(view, sys.FORWARD)
+      }
+      Command.Reload => {
+        unsafe sys.silk_webview_go(view, sys.RELOAD)
+      }
+      Command.Stop => {
+        unsafe sys.silk_webview_go(view, sys.STOP)
+      }
+      Command.SetZoom { factor } => {
+        unsafe sys.silk_webview_set_zoom(view, f32.toF64(factor))
+      }
+      Command.Focus => {
+        unsafe sys.silk_webview_focus(view)
+      }
+      Command.Evaluate { request, script } => {
+        let value = String.view(&script)
+        unsafe sys.silk_webview_evaluate(view, request, text(value), String.byteLength(value))
+      }
+      Command.Snapshot { request } => {
+        let call = snapshotCall()
+        unsafe sys.silk_webview_agent(
+          view,
+          request,
+          sys.AGENT_SNAPSHOT,
+          text(call),
+          String.byteLength(call),
+          text(""),
+          0,
+        )
+      }
+      Command.Screenshot { request } => {
+        unsafe sys.silk_webview_screenshot(view, request)
+      }
+      Command.ClickElement { request, element } => {
+        match run locateCall(String.view(&element)) {
+          Option<String>.Some { value: call } => {
+            let source = String.view(&call)
+            unsafe sys.silk_webview_agent(
+              view,
+              request,
+              sys.AGENT_CLICK,
+              text(source),
+              String.byteLength(source),
+              text(""),
+              0,
+            )
+          }
+          Option<String>.None => {
+            self.notRef(view, request, String.view(&element))
+          }
+        }
+      }
+      Command.FillElement { request, element, text: typed } => {
+        match run focusForFillCall(String.view(&element)) {
+          Option<String>.Some { value: call } => {
+            let source = String.view(&call)
+            let value = String.view(&typed)
+            unsafe sys.silk_webview_agent(
+              view,
+              request,
+              sys.AGENT_FILL,
+              text(source),
+              String.byteLength(source),
+              text(value),
+              String.byteLength(value),
+            )
+          }
+          Option<String>.None => {
+            self.notRef(view, request, String.view(&element))
+          }
+        }
+      }
+      Command.ClickAt { x, y, button, clickCount, modifiers } => {
+        unsafe sys.silk_webview_click(
+          view,
+          f32.toF64(x),
+          f32.toF64(y),
+          button,
+          clickCount,
+          modifiers,
+        )
+      }
+      Command.MovePointer { x, y, modifiers } => {
+        unsafe sys.silk_webview_move_pointer(view, f32.toF64(x), f32.toF64(y), modifiers)
+      }
+      Command.Scroll { x, y, deltaX, deltaY, modifiers } => {
+        unsafe sys.silk_webview_scroll(
+          view,
+          f32.toF64(x),
+          f32.toF64(y),
+          f32.toF64(deltaX),
+          f32.toF64(deltaY),
+          modifiers,
+        )
+      }
+      Command.TypeText { text: typed } => {
+        let value = String.view(&typed)
+        unsafe sys.silk_webview_type_text(view, text(value), String.byteLength(value))
+      }
+      Command.PressKey { key, modifiers } => {
+        let name = String.view(&key)
+        if unsafe sys.silk_webview_press_key(view, text(name), String.byteLength(name), modifiers)
+          == 0 {
+          self.unsupported(view, 0, &command)
+        }
+      }
+      Command.AnswerNavigation { request, allow } => {
+        let value: u8 = if allow {
+          1
+        } else {
+          0
+        }
+        unsafe sys.silk_webview_answer_navigation(view, request, value)
+      }
+      Command.OpenDevTools => {
+        self.unsupported(view, 0, &command)
+      }
+    }
+  }
+
+  effect fn takeEvents(self: &mut Self, out: &mut List<WebViewEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while true {
+      let mut raw = RawEvent.zero()
+      if unsafe sys.silk_webview_next_event(Pointer.fromMutRef(&mut raw)) == 0 {
+        return ()
+      }
+      if let Option<EventKind>.Some { value } = run self.decode(&raw) {
+        run out.append(WebViewEvent { view: raw.view, kind: move value })
+      }
+    }
+  }
+
+  fn backend(self: &Self) -> Backend {
+    return Backend.WebKit
+  }
+
+  fn capabilities(self: &Self) -> Capabilities {
+    return Capabilities { overlays: false, networkInterception: false, devToolsProtocol: false }
+  }
+}

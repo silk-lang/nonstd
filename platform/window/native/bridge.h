@@ -118,6 +118,10 @@ uint32_t silk_window_open(const uint8_t *title, size_t titleLength, double width
 void silk_window_close(uint32_t window);
 // timeout < 0 waits forever, 0 polls. Returns 1 and fills `event` when one is ready.
 uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event);
+// For native code with its own events, such as a web view, not for Silk: makes the current
+// or next silk_window_next_event return (with 0 when nothing is queued). Unlike the rest of
+// this file it may be called from any thread. The browser backend has `host.wake()` instead.
+void silk_window_wake(void);
 // Copies up to `capacity` bytes of the `index`th string of the event last returned and
 // returns its whole length. Valid until the next silk_window_next_event.
 size_t silk_window_event_text(size_t index, uint8_t *destination, size_t capacity);

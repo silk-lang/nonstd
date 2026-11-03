@@ -165,6 +165,7 @@ static BOOL inFiber;
 static BOOL topLevelWait;
 static BOOL pollWait;
 static BOOL timedOut;
+static BOOL woken;
 static void *userStack;
 static void *appStack;
 static NSMutableArray<SilkQueued *> *queue;
@@ -461,11 +462,23 @@ static uint32_t other_button(NSEvent *event) {
     }
 }
 
-- (void)mouseDown:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_DOWN event:e button:0]; }
+// A click on the Silk UI takes keyboard focus back from a child view (a web view).
+- (void)takeFocus {
+    if (self.window && self.window.firstResponder != self) [self.window makeFirstResponder:self];
+}
+
+- (void)mouseDown:(NSEvent *)e {
+    [self takeFocus];
+    [self pushMouse:SILK_EVENT_MOUSE_DOWN event:e button:0];
+}
 - (void)mouseUp:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_UP event:e button:0]; }
-- (void)rightMouseDown:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_DOWN event:e button:1]; }
+- (void)rightMouseDown:(NSEvent *)e {
+    [self takeFocus];
+    [self pushMouse:SILK_EVENT_MOUSE_DOWN event:e button:1];
+}
 - (void)rightMouseUp:(NSEvent *)e { [self pushMouse:SILK_EVENT_MOUSE_UP event:e button:1]; }
 - (void)otherMouseDown:(NSEvent *)e {
+    [self takeFocus];
     [self pushMouse:SILK_EVENT_MOUSE_DOWN event:e button:other_button(e)];
 }
 - (void)otherMouseUp:(NSEvent *)e {
@@ -794,7 +807,7 @@ static void appkit_main(void *unused) {
                 BOOL got = pump_one(wait_until());
                 BOOL expired = !got && (pollWait || timedOut ||
                                         CFAbsoluteTimeGetCurrent() >= deadline);
-                if (queue.count > 0 || expired) {
+                if (queue.count > 0 || expired || woken) {
                     inFiber = NO;
                     silk_macos_switch(&appStack, userStack);
                     inFiber = YES;
@@ -810,8 +823,9 @@ static void appkit_main(void *unused) {
 static void pump_on_caller(void) {
     @autoreleasepool {
         NSDate *until = wait_until();
-        while (queue.count == 0) {
+        while (queue.count == 0 && !woken) {
             if (!pump_one(until)) break;
+            if (woken) break;
             until = [NSDate distantPast];
             if (queue.count == 0 && !pollWait && !isinf(deadline) &&
                 CFAbsoluteTimeGetCurrent() >= deadline) {
@@ -950,7 +964,7 @@ int32_t silk_macos_start(void) {
 
 uint8_t silk_macos_next_event(double timeout, SilkWindowEvent *out) {
     if (!started) return 0;
-    if (queue.count == 0) {
+    if (queue.count == 0 && !woken) {
         arm_deadline(timeout);
         if (fiberMode) {
             inFiber = YES;
@@ -961,6 +975,7 @@ uint8_t silk_macos_next_event(double timeout, SilkWindowEvent *out) {
         }
         CFRunLoopTimerSetNextFireDate(deadlineTimer, CFAbsoluteTimeGetCurrent() + 1.0e10);
     }
+    woken = NO;
     if (queue.count == 0) {
         currentTexts = @[];
         return 0;
@@ -970,6 +985,41 @@ uint8_t silk_macos_next_event(double timeout, SilkWindowEvent *out) {
     *out = queued->event;
     currentTexts = queued.texts;
     return 1;
+}
+
+void silk_macos_wake(void) {
+    if (!pthread_main_np()) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          silk_macos_wake();
+        });
+        return;
+    }
+    if (!started || woken) return;
+    woken = YES;
+    if (fiberMode && inFiber) {
+        // Wherever AppKit is, as flush() does for queued events.
+        inFiber = NO;
+        silk_macos_switch(&appStack, userStack);
+        inFiber = YES;
+        return;
+    }
+    // On the caller's stack AppKit may be waiting in nextEventMatchingMask, which only
+    // returns for an event: post one that nothing handles.
+    NSEvent *nudge = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                        location:NSZeroPoint
+                                   modifierFlags:0
+                                       timestamp:0
+                                    windowNumber:0
+                                         context:nil
+                                         subtype:0x5357
+                                           data1:0
+                                           data2:0];
+    [NSApp postEvent:nudge atStart:NO];
+}
+
+void *silk_macos_content_view(uint32_t id) {
+    SilkWindow *record = find_window(id);
+    return record ? (__bridge void *)record.view : NULL;
 }
 
 const uint8_t *silk_macos_event_text(size_t index, size_t *length) {

@@ -8,7 +8,7 @@ The engine backends land in steps on the `feature/webview` branch (see [Plan](#p
 | Backend | Engine | How the page shows | State |
 | --- | --- | --- | --- |
 | `HeadlessWebViews` | none | records, for tests | Complete |
-| WebKit (macOS) | WKWebView | native child view over the window | Planned (W2) |
+| `MacWebViews` (macOS) | WKWebView | native child view over the window | W2 (see below) |
 | WebView2 (Windows) | Edge WebView2 | native child window | Planned (W5) |
 | Chromium (Linux; optional on macOS and Windows) | CEF, offscreen | shared GPU texture drawn by ui_renderer | Planned (W3, W4, W6) |
 
@@ -79,6 +79,42 @@ the calls (only for well-formed refs, so a ref can never inject script) and read
 results.
 
 The one known gap: WebKit cannot intercept requests or read every response body.
+
+## The WebKit backend (macOS)
+
+`macos.MacWebViews` (also `native.NativeWebViews` on macOS) runs each view as a `WKWebView` in
+platform-window's `MacPlatform` window: open the window first and pass its `WindowId.value` as
+`WebViewOptions.window`. The bridge is `native/macos/bridge.m`; `silk.toml` compiles it and links
+WebKit, and a program using it also depends on platform-window (which it needs for the window).
+
+- **Placement.** The web view sits in a clip view, both children of the window's content view,
+  so the page draws over the Silk UI. `place` moves the clip view to the visible part of the
+  node (bounds intersected with the clip) and the web view to the node's bounds inside it, so a
+  node scrolled half out of its scroll box shows only its visible half. Hidden or fully clipped
+  views are hidden and give up keyboard focus.
+- **Waking the loop.** Every event the bridge queues wakes platform-window's `nextEvent`
+  (`silk_macos_wake`, from the main queue), which may return `None`; drain `takeEvents` after
+  every turn.
+- **Focus.** The page reports `FocusChanged` when the web view becomes or stops being AppKit's
+  first responder; a click on the Silk UI takes focus back to the window's view.
+- **Agent commands.** The agent script runs in a content world of its own (`silk-agent`), which
+  pages cannot see or change. Clicks, typing and keys are synthesized `NSEvent`s sent to the web
+  view, as WebKit's test runner does, so pages get trusted input. `ActionResult` follows once the
+  input has reached the page.
+- **Evaluate** runs the script with indirect `eval` in the page's world (its completion value,
+  awaited when a promise, as JSON). A page whose Content Security Policy forbids `eval` answers
+  `ok` false.
+- **Console** messages come from a script that wraps `console.*` and reports errors and unhandled
+  rejections.
+- **Profiles.** An empty `profile` is a non-persistent data store; a name maps to a persistent
+  `WKWebsiteDataStore` identifier derived from it (macOS 14).
+- **Not available**: `OpenDevTools` is `Unsupported` (WebKit has no API to open Web Inspector;
+  with `inspectable` on, Safari's Develop menu attaches), and WebKit cannot intercept requests.
+
+`python3 platform/webview/scripts/macos smoke` drives it in a real window (CI job `macos`).
+Manual checks on a Mac: scroll a page with the trackpad, type with the Japanese input method in a
+page field, click between the page and the Silk UI and watch focus move, open the view in
+Safari's Develop menu.
 
 ## Build and test
 

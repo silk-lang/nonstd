@@ -74,6 +74,13 @@ uint32_t silk_macos_open_window(const uint8_t *title, size_t titleLength, double
 void silk_macos_close_window(uint32_t window);
 // timeout < 0 waits forever, 0 polls. Returns 1 and fills `event` when one is ready.
 uint8_t silk_macos_next_event(double timeout, SilkWindowEvent *event);
+// Makes the current or next silk_macos_next_event return (with 0 when nothing is queued), so
+// native code with its own events, such as a web view, can wake a loop waiting for window
+// events. Callable from any thread, and from inside AppKit's handlers.
+void silk_macos_wake(void);
+// The window's content view (a SilkView, flipped: y grows down), for native code that adds
+// child views such as web views. NULL when the window is not open.
+void *silk_macos_content_view(uint32_t window);
 // The `index`th string of the event last returned, valid until the next call to
 // silk_macos_next_event. NULL past the last one.
 const uint8_t *silk_macos_event_text(size_t index, size_t *length);

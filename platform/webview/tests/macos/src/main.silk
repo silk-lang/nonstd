@@ -1,0 +1,458 @@
+//! Drives the WebKit backend in a real window: a data: page loads and reports its title, the
+//! view sits where `place` puts it and follows a resize, the agent snapshot has refs, and
+//! ClickElement and FillElement change the page through synthesized input. Needs a logged-in
+//! macOS session. Exit code 0 when every check passed.
+import webview.command { Command }
+import webview.event { WebViewEvent, EventKind }
+import webview.host { WebViewHost }
+import webview.macos { MacWebViews, ViewFrame }
+import webview.types { WebViewOptions, WebViewError, Placement }
+import window.event { Event }
+import window.macos { MacPlatform }
+import window.platform { Platform }
+import window.types { WindowOptions, WindowError, Wait }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.geometry.size { Size2 }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.text.string { String }
+
+const VIEW: u32 = 1
+
+const MARGIN: f32 = 20.0
+
+const TOP: f32 = 48.0
+
+/// A page with a button that retitles it and a text field.
+const PAGE: string<
+  'static
+> = "data:text/html,%3C!doctype%20html%3E%3Ctitle%3ESilk%20smoke%3C/title%3E%3Cbody%20style=%22margin:0%22%3E%3Cbutton%20onclick=%22document.title='clicked'%22%3EPress%3C/button%3E%3Cinput%20id=%22name%22%20aria-label=%22Name%22%3E%3Cscript%3Econsole.log('page%20ready')%3C/script%3E%3C/body%3E"
+
+/// What arrived from the web view, latest values.
+struct Seen {
+  created: bool,
+  closed: bool,
+  title: String,
+  loaded: bool,
+  console: String,
+  snapshot: String,
+  snapshots: u32,
+  actionOk: u32,
+  actionFailed: u32,
+  actionError: String,
+  script: String,
+  scriptOk: bool,
+  scripts: u32,
+  screenshotWidth: u32,
+  screenshotBytes: usize,
+  unsupported: String,
+  resizedWidth: f64,
+  resizedHeight: f64,
+  resizes: u32,
+}
+
+impl Seen {
+  fn make() -> Seen {
+    return Seen {
+      created: false,
+      closed: false,
+      title: String.make(),
+      loaded: false,
+      console: String.make(),
+      snapshot: String.make(),
+      snapshots: 0,
+      actionOk: 0,
+      actionFailed: 0,
+      actionError: String.make(),
+      script: String.make(),
+      scriptOk: false,
+      scripts: 0,
+      screenshotWidth: 0,
+      screenshotBytes: 0,
+      unsupported: String.make(),
+      resizedWidth: 0.0,
+      resizedHeight: 0.0,
+      resizes: 0,
+    }
+  }
+}
+
+struct Checks {
+  failed: u32,
+}
+
+impl Checks {
+  fn check(self: &mut Self, ok: bool, what: string<'static>) -> () {
+    if ok {
+      StderrWriter.print("ok    {}\n", &(what,))
+    } else {
+      StderrWriter.print("FAIL  {}\n", &(what,))
+      self.failed = self.failed + 1
+    }
+  }
+}
+
+/// The node's placement for a content area of `size`: inset, below a pretend toolbar.
+fn placementFor(width: f64, height: f64) -> Placement {
+  let bounds = Rect<f32>.new(MARGIN, TOP, f64.toF32(width) - MARGIN, f64.toF32(height) - MARGIN)
+  return Placement { bounds: bounds, clip: bounds, visible: true, scale: 2.0 }
+}
+
+fn near(a: f32, b: f32) -> bool {
+  return f32.abs(a - b) < 0.5
+}
+
+fn sameFrame(frame: Option<ViewFrame>, placement: Placement) -> bool {
+  match frame {
+    Option<ViewFrame>.Some { value } => {
+      let b = placement.bounds
+      return value.visible && near(value.bounds.xMin, b.xMin) && near(value.bounds.yMin, b.yMin)
+        && near(value.bounds.xMax, b.xMax)
+        && near(value.bounds.yMax, b.yMax)
+    }
+    Option<ViewFrame>.None => {
+      return false
+    }
+  }
+}
+
+/// The `[ref=...]` on the first outline line containing `needle`, or empty.
+effect fn refOn(outline: string, needle: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = String.split(outline, "\n")
+  while let Option<string>.Some { value: line } = lines.next() {
+    if String.contains(line, needle) {
+      if let Option<usize>.Some { value: at } = String.find(line, "[ref=") {
+        let start = at + 5
+        let rest = String.slice(line, start, String.byteLength(line) - start)
+        if let Option<usize>.Some { value: end } = String.find(rest, "]") {
+          return run String.copy(String.slice(rest, 0, end))
+        }
+      }
+    }
+  }
+  return String.make()
+}
+
+/// Pumps the window and the web view for up to `seconds`, or until `done` says the wait is over.
+effect fn pump(
+  platform: &mut MacPlatform,
+  views: &mut MacWebViews,
+  seen: &mut Seen,
+  seconds: f64,
+  until: fn(&Seen) -> bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut waited: f64 = 0.0
+  let mut events = List<WebViewEvent>.make()
+  while waited < seconds {
+    match move run platform.nextEvent(Wait.Seconds { seconds: 0.02 }) {
+      Option<Event>.Some { value } => {
+        match &value {
+          Event.Resized { size, .. } => {
+            seen.resizedWidth = size.width
+            seen.resizedHeight = size.height
+            seen.resizes = seen.resizes + 1
+
+            // What an app does after each tree frame: put the view on its node.
+            views.place(VIEW, placementFor(size.width, size.height))
+          }
+          _ => {}
+        }
+      }
+      Option<Event>.None => {
+        waited = waited + 0.02
+      }
+    }
+    run views.takeEvents(&mut events)
+    while events.length() != 0 {
+      let event = events.remove(0)
+      match &event.kind {
+        EventKind.Created => {
+          seen.created = true
+        }
+        EventKind.Closed => {
+          seen.closed = true
+        }
+        EventKind.TitleChanged { title } => {
+          seen.title.clear()
+          run seen.title.append(title.view())
+          StderrWriter.print("info  title \"{}\"\n", &(title.view(),))
+        }
+        EventKind.LoadFinished { ok, error, .. } => {
+          if ok {
+            seen.loaded = true
+          } else {
+            StderrWriter.print("info  load failed: {}\n", &(error.view(),))
+          }
+        }
+        EventKind.Console { message, .. } => {
+          seen.console.clear()
+          run seen.console.append(message.view())
+        }
+        EventKind.Snapshot { text, .. } => {
+          seen.snapshot.clear()
+          run seen.snapshot.append(text.view())
+          seen.snapshots = seen.snapshots + 1
+        }
+        EventKind.ActionResult { ok, error, .. } => {
+          if ok {
+            seen.actionOk = seen.actionOk + 1
+          } else {
+            seen.actionFailed = seen.actionFailed + 1
+            seen.actionError.clear()
+            run seen.actionError.append(error.view())
+            StderrWriter.print("info  action failed: {}\n", &(error.view(),))
+          }
+        }
+        EventKind.ScriptResult { ok, value, .. } => {
+          seen.script.clear()
+          run seen.script.append(value.view())
+          seen.scriptOk = ok
+          seen.scripts = seen.scripts + 1
+        }
+        EventKind.Screenshot { width, pixels, .. } => {
+          seen.screenshotWidth = width
+          seen.screenshotBytes = pixels.length()
+        }
+        EventKind.Unsupported { command, .. } => {
+          seen.unsupported.clear()
+          run seen.unsupported.append(command.view())
+        }
+        _ => {}
+      }
+    }
+    if until(&seen) {
+      return ()
+    }
+  }
+}
+
+fn titled(seen: &Seen) -> bool {
+  return seen.title.view() == "Silk smoke" && seen.loaded
+}
+
+fn clicked(seen: &Seen) -> bool {
+  return seen.title.view() == "clicked"
+}
+
+fn snapshotted(seen: &Seen) -> bool {
+  return seen.snapshots > 0
+}
+
+fn acted(seen: &Seen) -> bool {
+  return seen.actionOk + seen.actionFailed > 0
+}
+
+fn answered(seen: &Seen) -> bool {
+  return seen.scripts > 0
+}
+
+fn screenshotted(seen: &Seen) -> bool {
+  return seen.screenshotWidth > 0
+}
+
+fn resized(seen: &Seen) -> bool {
+  return seen.resizes > 0
+}
+
+fn closed(seen: &Seen) -> bool {
+  return seen.closed
+}
+
+fn never(seen: &Seen) -> bool {
+  return false
+}
+
+/// Evaluates `script` until its JSON value is `expected` or about `seconds` pass: input reaches
+/// the page asynchronously.
+effect fn waitForValue(
+  platform: &mut MacPlatform,
+  views: &mut MacWebViews,
+  seen: &mut Seen,
+  script: string,
+  expected: string,
+  seconds: f64,
+) -> bool
+  ! WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tries: u32 = 0
+  let limit = f64.toU32(seconds / 0.1)
+  while tries < limit {
+    seen.scripts = 0
+    run views.send(VIEW, Command.Evaluate { request: 100 + tries, script: run String.copy(script) })
+    run pump(&mut platform, &mut views, &mut seen, 1.0, answered)
+    if seen.scriptOk && seen.script.view() == expected {
+      return true
+    }
+    run pump(&mut platform, &mut views, &mut seen, 0.1, never)
+    tries = tries + 1
+  }
+  StderrWriter.print("info  {} is {}\n", &(script, seen.script.view()))
+  return false
+}
+
+effect fn smoke(checks: &mut Checks) -> ()
+  ! WindowError | WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut platform = run MacPlatform.start()
+  if platform.usesFiber() {
+    StderrWriter.print("info  AppKit runs on its own stack\n", &())
+  } else {
+    StderrWriter.print("info  AppKit runs on the caller's stack\n", &())
+  }
+  let options = WindowOptions.make("platform-webview smoke test", 640.0, 480.0)
+  let window = run platform.openWindow(&options)
+  platform.focus(window)
+
+  let mut views = MacWebViews.make()
+  let mut seen = Seen.make()
+  let viewOptions = run WebViewOptions.make(window.value, PAGE)
+  run views.open(VIEW, &viewOptions)
+  let size = platform.contentSize(window)
+  let first = placementFor(size.width, size.height)
+  views.place(VIEW, first)
+
+  run pump(&mut platform, &mut views, &mut seen, 10.0, titled)
+  checks.check(seen.created, "Created")
+  checks.check(seen.loaded, "the data: page loads")
+  checks.check(seen.title.view() == "Silk smoke", "TitleChanged has the page title")
+  checks.check(sameFrame(views.frame(VIEW), first), "the view sits on its placement")
+  run pump(&mut platform, &mut views, &mut seen, 0.5, never)
+  checks.check(seen.console.view() == "page ready", "console.log reaches Console")
+
+  run views.send(VIEW, Command.Evaluate { request: 1, script: run String.copy("6 * 7") })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, answered)
+  checks.check(seen.scriptOk && seen.script.view() == "42", "Evaluate answers with JSON")
+  seen.scripts = 0
+  run views.send(
+    VIEW,
+    Command.Evaluate {
+      request: 2,
+      script: run String.copy("new Promise(done => setTimeout(() => done({ a: [1, 'b'] }), 10))"),
+    },
+  )
+  run pump(&mut platform, &mut views, &mut seen, 5.0, answered)
+  checks.check(
+    seen.scriptOk && seen.script.view() == "{\"a\":[1,\"b\"]}",
+    "Evaluate awaits a promise",
+  )
+
+  run views.send(VIEW, Command.Snapshot { request: 3 })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, snapshotted)
+  StderrWriter.print("info  snapshot:\n{}\n", &(seen.snapshot.view(),))
+  let button = run refOn(seen.snapshot.view(), "button \"Press\"")
+  let field = run refOn(seen.snapshot.view(), "textbox \"Name\"")
+  checks.check(
+    String.byteLength(button.view()) != 0 && String.byteLength(field.view()) != 0,
+    "the snapshot has refs for the button and the field",
+  )
+
+  run views.send(VIEW, Command.ClickElement { request: 4, element: move button })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, acted)
+  checks.check(seen.actionOk == 1, "ClickElement answers ok")
+  run pump(&mut platform, &mut views, &mut seen, 3.0, clicked)
+  checks.check(seen.title.view() == "clicked", "ClickElement clicks the button (its handler ran)")
+
+  seen.actionOk = 0
+  seen.actionFailed = 0
+  run views.send(
+    VIEW,
+    Command.FillElement { request: 5, element: move field, text: run String.copy("hello") },
+  )
+  run pump(&mut platform, &mut views, &mut seen, 5.0, acted)
+  checks.check(seen.actionOk == 1, "FillElement answers ok")
+  let filled = run waitForValue(
+    &mut platform,
+    &mut views,
+    &mut seen,
+    "document.getElementById('name').value",
+    "\"hello\"",
+    3.0,
+  )
+  checks.check(filled, "FillElement types into the field")
+
+  seen.actionOk = 0
+  seen.actionFailed = 0
+  run views.send(VIEW, Command.ClickElement { request: 6, element: run String.copy("x); alert(1") })
+  run pump(&mut platform, &mut views, &mut seen, 2.0, acted)
+  checks.check(seen.actionFailed == 1, "a malformed ref is refused")
+
+  run views.send(VIEW, Command.Screenshot { request: 7 })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, screenshotted)
+  checks.check(
+    seen.screenshotWidth >= 600 && seen.screenshotBytes != 0,
+    "Screenshot has the view's device pixels",
+  )
+
+  run views.send(VIEW, Command.OpenDevTools)
+  run pump(&mut platform, &mut views, &mut seen, 1.0, never)
+  checks.check(seen.unsupported.view() == "OpenDevTools", "OpenDevTools is Unsupported")
+
+  seen.resizes = 0
+  platform.simulateResize(window, Size2<f64>.new(800.0, 600.0))
+  run pump(&mut platform, &mut views, &mut seen, 2.0, resized)
+  run pump(&mut platform, &mut views, &mut seen, 0.2, never)
+  checks.check(seen.resizedWidth == 800.0, "the window resized")
+  checks.check(
+    sameFrame(views.frame(VIEW), placementFor(800.0, 600.0)),
+    "after a resize the view follows its placement",
+  )
+
+  let scrolled = Rect<f32>.new(MARGIN, TOP - 100.0, 780.0, 580.0)
+  let clip = Rect<f32>.new(MARGIN, TOP, 780.0, 580.0)
+  views.place(VIEW, Placement { bounds: scrolled, clip: clip, visible: true, scale: 2.0 })
+  match views.frame(VIEW) {
+    Option<ViewFrame>.Some { value } => {
+      checks.check(
+        near(value.bounds.yMin, TOP - 100.0) && value.visible,
+        "a scrolled placement keeps the page under its clip",
+      )
+    }
+    Option<ViewFrame>.None => {
+      checks.check(false, "a scrolled placement keeps the page under its clip")
+    }
+  }
+  views.place(VIEW, Placement.hidden())
+  match views.frame(VIEW) {
+    Option<ViewFrame>.Some { value } => {
+      checks.check(!value.visible, "a hidden placement hides the view")
+    }
+    Option<ViewFrame>.None => {
+      checks.check(false, "a hidden placement hides the view")
+    }
+  }
+
+  run views.close(VIEW)
+  run pump(&mut platform, &mut views, &mut seen, 2.0, closed)
+  checks.check(seen.closed && Option<ViewFrame>.isNone(&views.frame(VIEW)), "Closed")
+  platform.closeWindow(window)
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
+}
+
+effect fn program() -> i32
+  ! WindowError | WebViewError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut checks = Checks { failed: 0 }
+  run smoke(&mut checks) |> Effect.provideMut<Allocator>(&mut allocator)
+  if checks.failed != 0 {
+    return 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("FAIL  the platform did not start, or a window or view was refused\n", &())
+  return 2
+}
