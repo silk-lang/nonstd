@@ -1,0 +1,163 @@
+//! The browser tools the agent offers Claude, and how each call becomes a web view command.
+//!
+//! Every tool maps onto platform-webview's agent commands, the same on every backend: the page is
+//! read as a snapshot outline whose refs (`[ref=e12]`) the click and type tools take, and input
+//! is real input. A call waits for its answer event (`Snapshot`, `ActionResult`, `ScriptResult`,
+//! the load finishing), or answers at once when the command has none.
+import json { quote }
+import webview.command { Command }
+import silk.core.option { Option }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// The `tools` array of the request.
+pub const TOOLS: string<'static> = r"""[
+{"name":"browser_snapshot","description":"Read the page the user and you share: a text outline of what it shows (roles, names, values, states), with a [ref=eN] on every element you can act on. Take a fresh snapshot after anything that changes the page, since refs from an old snapshot may no longer exist.","input_schema":{"type":"object","properties":{},"additionalProperties":false}},
+{"name":"browser_navigate","description":"Load a URL in the shared browser and wait until it finishes loading.","input_schema":{"type":"object","properties":{"url":{"type":"string","description":"An absolute URL, such as https://example.com/"}},"required":["url"],"additionalProperties":false}},
+{"name":"browser_click","description":"Scroll an element into view and click its center with a real mouse click.","input_schema":{"type":"object","properties":{"ref":{"type":"string","description":"The element's ref from the latest snapshot, such as e12"}},"required":["ref"],"additionalProperties":false}},
+{"name":"browser_type","description":"Focus a text field, select its value and type text over it with real key input. Set submit to press Enter afterwards.","input_schema":{"type":"object","properties":{"ref":{"type":"string","description":"The field's ref from the latest snapshot"},"text":{"type":"string"},"submit":{"type":"boolean"}},"required":["ref","text"],"additionalProperties":false}},
+{"name":"browser_press_key","description":"Press and release one key in whatever has focus, named by its DOM key value (Enter, Tab, Escape, ArrowDown, a).","input_schema":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}},
+{"name":"browser_scroll","description":"Scroll the page with the mouse wheel, by about one screen.","input_schema":{"type":"object","properties":{"direction":{"type":"string","enum":["up","down"]}},"required":["direction"],"additionalProperties":false}},
+{"name":"browser_back","description":"Go back one page in the browser's history.","input_schema":{"type":"object","properties":{},"additionalProperties":false}},
+{"name":"browser_evaluate","description":"Run a JavaScript expression in the page and return its value as JSON (promises are awaited). Prefer snapshots and real input; use this to read what a snapshot does not show.","input_schema":{"type":"object","properties":{"script":{"type":"string"}},"required":["script"],"additionalProperties":false}}
+]"""
+
+/// What a tool call waits for.
+pub enum Wait {
+  /// The answer event carrying the command's request number.
+  Answer,
+  /// The page's next `LoadFinished`.
+  Load,
+  /// Nothing: the result is known when the command is sent.
+  None,
+}
+
+/// A tool call turned into commands for the page.
+pub struct Mapped {
+  /// The command that answers (or the only one), and then one more (Enter after typing).
+  pub command: Option<Command>,
+  pub then: Option<Command>,
+  pub wait: Wait,
+  /// The result when `wait` is `None`, or why the call was refused (`refused` true).
+  pub result: String,
+  pub refused: bool,
+}
+
+fn text<'a>(input: &'a Value, key: string) -> string<'a> {
+  return Json.field(input, key)
+    |> Json.asString
+    |> Option<string>.unwrapOr("")
+}
+
+fn flag(input: &Value, key: string) -> bool {
+  if let Option<&Value>.Some { value } = Json.field(input, key) {
+    if let Value.Bool { value: on } = &value.* {
+      return on
+    }
+  }
+  return false
+}
+
+effect fn refuse(message: string) -> Mapped
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Mapped {
+    command: Option<Command>.None,
+    then: Option<Command>.None,
+    wait: Wait.None,
+    result: run String.copy(message),
+    refused: true,
+  }
+}
+
+effect fn answer(command: Command) -> Mapped
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Mapped {
+    command: Option<Command>.some(move command),
+    then: Option<Command>.None,
+    wait: Wait.Answer,
+    result: String.make(),
+    refused: false,
+  }
+}
+
+effect fn atOnce(command: Command, result: string) -> Mapped
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Mapped {
+    command: Option<Command>.some(move command),
+    then: Option<Command>.None,
+    wait: Wait.None,
+    result: run String.copy(result),
+    refused: false,
+  }
+}
+
+/// Turns tool `name` with `input` into commands; `request` is the number answering commands carry.
+pub effect fn map(name: string, input: &Value, request: u32) -> Mapped
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if name == "browser_snapshot" {
+    return run answer(Command.Snapshot { request: request })
+  }
+  if name == "browser_navigate" {
+    let url = text(input, "url")
+    if String.byteLength(url) == 0 {
+      return run refuse("browser_navigate needs a url")
+    }
+    let mut mapped = run answer(Command.Navigate { url: run String.copy(url) })
+    mapped.wait = Wait.Load
+    return move mapped
+  }
+  if name == "browser_click" {
+    let element = text(input, "ref")
+    return run answer(Command.ClickElement { request: request, element: run String.copy(element) })
+  }
+  if name == "browser_type" {
+    let element = text(input, "ref")
+    let typed = text(input, "text")
+    let mut mapped = run answer(
+      Command.FillElement {
+        request: request,
+        element: run String.copy(element),
+        text: run String.copy(typed),
+      },
+    )
+    if flag(input, "submit") {
+      mapped.then = Option<Command>.some(
+        Command.PressKey { key: run String.copy("Enter"), modifiers: 0 },
+      )
+    }
+    return move mapped
+  }
+  if name == "browser_press_key" {
+    let key = text(input, "key")
+    if String.byteLength(key) == 0 {
+      return run refuse("browser_press_key needs a key")
+    }
+    return run atOnce(Command.PressKey { key: run String.copy(key), modifiers: 0 }, "Pressed.")
+  }
+  if name == "browser_scroll" {
+    let delta: f32 = if text(input, "direction") == "up" {
+      -600.0
+    } else {
+      600.0
+    }
+    return run atOnce(
+      Command.Scroll { x: 200.0, y: 200.0, deltaX: 0.0, deltaY: delta, modifiers: 0 },
+      "Scrolled. Take a snapshot to see what shows now.",
+    )
+  }
+  if name == "browser_back" {
+    return run atOnce(Command.Back, "Went back. Take a snapshot to see the page.")
+  }
+  if name == "browser_evaluate" {
+    let script = text(input, "script")
+    return run answer(Command.Evaluate { request: request, script: run String.copy(script) })
+  }
+  let mut message = run String.copy("There is no tool named ")
+  run quote(&mut message, name)
+  return run refuse(message.view())
+}

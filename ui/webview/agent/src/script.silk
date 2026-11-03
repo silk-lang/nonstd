@@ -1,0 +1,177 @@
+//! The scripted brain: answers Messages API requests the way Claude would for one task, signing a
+//! guest book form, without a network. CI and machines without an API key run the agent on it, so
+//! the whole path (request bodies, tool calls, the page's answers, tool results) is exercised.
+//!
+//! It reads the request body, and from the last message decides: a user's words, take a snapshot;
+//! that snapshot, type the name into the "Name" field and click "Sign"; their results, snapshot
+//! again; that snapshot, say what the page shows now.
+import json { quote, count, item }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// The `[ref=...]` on the first outline line containing `needle`, or empty.
+pub effect fn refOn(outline: string, needle: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = String.split(outline, "\n")
+  while let Option<string>.Some { value: line } = lines.next() {
+    if String.contains(line, needle) {
+      if let Option<usize>.Some { value: at } = String.find(line, "[ref=") {
+        let start = at + 5
+        let rest = String.slice(line, start, String.byteLength(line) - start)
+        if let Option<usize>.Some { value: end } = String.find(rest, "]") {
+          return run String.copy(String.slice(rest, 0, end))
+        }
+      }
+    }
+  }
+  return String.make()
+}
+
+/// The first outline line containing `needle`, trimmed, or empty.
+fn lineWith<'a>(outline: string<'a>, needle: string) -> string<'a> {
+  let mut lines = String.split(outline, "\n")
+  while let Option<string>.Some { value: line } = lines.next() {
+    if String.contains(line, needle) {
+      return String.trim(line)
+    }
+  }
+  return ""
+}
+
+fn textOf<'a>(value: Option<&'a Value>, key: string) -> string<'a> {
+  return value
+    |> Json.fieldAt(key)
+    |> Json.asString
+    |> Option<string>.unwrapOr("")
+}
+
+/// The name the user asked to sign as: the words after " as ", or "Silk agent".
+fn nameIn(request: string) -> string {
+  if let Option<usize>.Some { value: at } = String.find(request, " as ") {
+    let start = at + 4
+    let name = String.trim(String.slice(request, start, String.byteLength(request) - start))
+    if String.byteLength(name) != 0 {
+      return name
+    }
+  }
+  return "Silk agent"
+}
+
+effect fn toolUse(out: &mut String, id: string, name: string, input: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("{\"type\":\"tool_use\",\"id\":")
+  run quote(&mut out, id)
+  run out.append(",\"name\":")
+  run quote(&mut out, name)
+  run out.append(",\"input\":")
+  run out.append(input)
+  run out.append("}")
+}
+
+effect fn message(content: String, stop: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run String.copy(
+    "{\"id\":\"msg_scripted\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"scripted\",\"content\":[",
+  )
+  run out.append(content.view())
+  run out.append("],\"stop_reason\":")
+  run quote(&mut out, stop)
+  run out.append(",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}")
+  return move out
+}
+
+effect fn say(text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut content = run String.copy("{\"type\":\"text\",\"text\":")
+  run quote(&mut content, text)
+  run content.append("}")
+  return run message(move content, "end_turn")
+}
+
+/// The scripted answer to request `body`, as the API's JSON response text.
+pub effect fn respond(body: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = run Effect.result(Json.parse(String.utf8Bytes(body)))
+  let document = match move parsed {
+    Result.Success { value } => move value
+    Result.Failure { error } => {
+      drop error
+      return run String.copy(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"the body is not JSON\"}}",
+      )
+    }
+  }
+  let messages = Json.field(&document, "messages")
+  let total = count(messages)
+  if total == 0 {
+    return run say("There is nothing to answer.")
+  }
+  let last = item(messages, total - 1) |> Json.fieldAt("content")
+  let blocks = count(last)
+  if blocks == 0 {
+    return run say("There is nothing to answer.")
+  }
+
+  // The first user words of the conversation say what to sign as.
+  let first = item(messages, 0) |> Json.fieldAt("content")
+  let asked = textOf(item(first, 0), "text")
+  let lastBlock = item(last, blocks - 1)
+  let kind = textOf(lastBlock, "type")
+  if kind != "tool_result" {
+    let mut content = String.make()
+    run toolUse(&mut content, "toolu_look", "browser_snapshot", "{}")
+    return run message(move content, "tool_use")
+  }
+  let id = textOf(lastBlock, "tool_use_id")
+  let result = textOf(lastBlock, "content")
+  if id == "toolu_look" {
+    let field = run refOn(result, "textbox \"Name\"")
+    let sign = run refOn(result, "button \"Sign\"")
+    if String.byteLength(field.view()) == 0 || String.byteLength(sign.view()) == 0 {
+      return run say(
+        "I can't see the guest book on this page. Open it with the Guest book button and ask me again.",
+      )
+    }
+    let mut input = run String.copy("{\"ref\":")
+    run quote(&mut input, field.view())
+    run input.append(",\"text\":")
+    run quote(&mut input, nameIn(asked))
+    run input.append("}")
+    let mut click = run String.copy("{\"ref\":")
+    run quote(&mut click, sign.view())
+    run click.append("}")
+    let mut content = run String.copy(
+      "{\"type\":\"text\",\"text\":\"I found the guest book. Signing it now.\"},",
+    )
+    run toolUse(&mut content, "toolu_type", "browser_type", input.view())
+    run content.append(",")
+    run toolUse(&mut content, "toolu_click", "browser_click", click.view())
+    return run message(move content, "tool_use")
+  }
+  if id == "toolu_click" {
+    let mut content = String.make()
+    run toolUse(&mut content, "toolu_check", "browser_snapshot", "{}")
+    return run message(move content, "tool_use")
+  }
+  if id == "toolu_check" {
+    let greeting = lineWith(result, "Hello")
+    let mut text = run String.copy("Done: I signed the guest book. The page now shows ")
+    if String.byteLength(greeting) == 0 {
+      run text.append("no greeting, so the click may not have worked.")
+    } else {
+      run text.append(greeting)
+      run text.append(".")
+    }
+    return run say(text.view())
+  }
+  return run say("I'm not sure what happened there.")
+}
