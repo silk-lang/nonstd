@@ -133,3 +133,42 @@ whole canvas units. Cloud, collaboration, and font discovery are outside this po
 The stress image's 400×250 grayscale samples in `src/pixels.silk` are the same
 user-supplied image data used by the browser demo. Text tile caches are invalidated
 when replacing documents. Scene geometry is retained across selection-only frames.
+
+## 100k image and text experiment
+
+Open **Commands → Add 100k image + text cards**. Repeating the command returns to
+that page without replacing edits. It contains 100,000 groups, each with an editable
+image and text child, plus four heading/reference layers: 300,004 layers in total.
+Each image is a distinct integer crop of the supplied tweet screenshot. This is
+one shared source image, not 100,000 unrelated photos. Labels use 196 word pairs
+from the tweet in Arial, Georgia and Courier New, with the normal native fallbacks.
+
+The screenshot is embedded unchanged in the executable and SVG exports. Its ICC
+profile is converted to sRGB for the native atlas. `scripts/embed-tweet` regenerates
+the embedded asset from `assets/tweet-challenge.png`. Native `.silkdesign` files
+preserve the browser's `image` and normalized `imageCrop` fields, including crop
+coordinates precise enough to survive a round trip to the same source pixels.
+
+Repeated labels share measurements and raster tiles by text, font, weight, color
+and dimensions. Small labels start with a bounded 4× density cache; larger zooms
+refresh visible text. Spatial blocks restrict quality checks to visible text,
+and camera changes reuse document geometry when the existing rasters suffice.
+The desktop atlas allocates up to eight 2048-pixel base pages per kind lazily;
+high-resolution tiles can request larger pages. Unused canvas text tiles are
+reclaimed under atlas pressure without evicting cached UI sprites. Shared renderer changes
+batch compatible image crops and reuse image texture bindings within each pass.
+
+Run the release contracts and the real-event inspector checks without a recording:
+
+```sh
+python3 graphics/editor/native/scripts/test --release
+python3 graphics/editor/native/scripts/studio --release --build-only
+python3 graphics/editor/native/scripts/challenge-check --leave-open
+```
+
+The headless workload reports input, model, UI layout and scene composition CPU
+time, excluding GPU work. The inspector test reports request-to-composed-frame
+latency, including IPC and host scheduling. Neither measurement is presentation
+FPS. It exercises fit-all through roughly 180% zoom and back twice, panning,
+marquee redraw, direct canvas text editing and undo. Its isolated design, log and
+JSON report live in `/tmp/silk-native-tweet`; the default user document is untouched.

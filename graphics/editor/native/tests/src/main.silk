@@ -1,5 +1,8 @@
 //! Native editing contracts and a 100k-element selection workload.
 import studio.view as view
+import codec.png { PngError }
+import codec.jpeg { JpegError }
+import codec.image { ImageError }
 import studio.model { Studio, Message, Pointer }
 import studio.editing as editing
 import studio.samples as samples
@@ -12,7 +15,7 @@ import ui_app.harness { click, clickRole, drag, typeText, press }
 import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, Role }
 import ui_tree.input { Input, MOD_CONTROL, MOD_META }
 import ui_fixtures.fixtures as fixtures
-import atlas.atlas { AtlasError }
+import atlas.atlas { Atlas, AtlasError }
 import vector.geometry_error { GeometryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -481,6 +484,9 @@ effect fn program() -> i32
     | JsonError
     | format.InvalidDocument
     | exports.UnsupportedBackdrop
+    | JpegError
+    | PngError
+    | ImageError
   ? &mut Allocator {
   run contracts()
   run snapping()
@@ -489,6 +495,7 @@ effect fn program() -> i32
   run marqueeRepaint()
   run rendering()
   run stress()
+  run challenge()
   return 0
 }
 
@@ -499,5 +506,146 @@ effect fn failed<E>(error: E) -> i32 {
 
 pub effect fn main() -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  return run Effect.catchAll(Effect.catch<AtlasError>(program(), atlasFailure), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// This fixture catches accidental per-element raster/measurement caching and crop loss.
+effect fn challenge() -> ()
+  ! Failed
+    | TreeError
+    | AtlasError
+    | GeometryError
+    | OutOfMemoryError
+    | JpegError
+    | PngError
+    | ImageError
+    | JsonError
+    | format.InvalidDocument
+    | exports.UnsupportedBackdrop
+  ? &mut Allocator {
+  let mut m = Studio.make()
+  samples.challenge(&mut m)
+  run expect(
+    m.elements.length() == 300004,
+    "100k card groups, images, texts and four reference layers",
+  )
+  let count = m.elements.length()
+  samples.challenge(&mut m)
+  run expect(m.elements.length() == count, "reopening challenge preserves existing page")
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.atlas = Atlas.make(Canvas.atlasOptions())
+  let mut textTree = run UiTree.make(&fonts)
+  run textResources(&mut textTree)
+  let mut batch = Batch.make()
+  run view.resources(&mut batch)
+  run tree.apply(run batch.take())
+  let mut canvas = Canvas.make()
+  run canvas.loadAssets(&mut tree)
+  drop run canvas.normalize(&mut m, &mut textTree)
+  m.fit(false)
+  let mut snapshot = CpuSnapshot.make()
+  let mut app = Runtime<Studio, Message, NoCommand>.make(move m)
+  run app.start(&mut tree, 0.0)
+  let viewport = FrameInput { width: 1440.0, height: 960.0, scale: 2.0, time: 0.0 }
+  run tree.frame(viewport)
+  run canvas.frame(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+  let tiles = canvas.textTileCount()
+  run expect(tiles <= 591, "100k labels share at most 588 text/font rasters and three headings")
+  let mut clock = OsMonotonicClock.make()
+  let started = run now(&mut clock)
+  let mut i: usize = 0
+  while i < 120 {
+    // 60 steps of 1.07x, then its inverse: fit-all through ~180% and back.
+    run tree.dispatch(
+      Input.Wheel {
+        x: 740.0,
+        y: 550.0,
+        deltaX: 0.0,
+        deltaY: if i < 60 {
+          -17.5
+        } else {
+          16.35514
+        },
+        modifiers: MOD_CONTROL,
+      },
+    )
+    drop run pump(&mut app, &mut tree)
+    drop run canvas.normalize(&mut app.model, &mut textTree)
+    run tree.frame(viewport)
+    run canvas.frame(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+    i = i + 1
+  }
+  let elapsed = (run now(&mut clock)) - started
+  run expect(canvas.textTileCount() == tiles, "wide zoom reuses raster identities")
+  run expect(canvas.textPixelCount() < 24000000, "zoom text memory stays bounded")
+  StderrWriter.print(
+    "100k image/text zoom CPU (real input + UI + scene; excludes GPU): {} ms average; {} shared rasters; {} pixels\n",
+    &(elapsed / 120.0, tiles, canvas.textPixelCount()),
+  )
+
+  // Move among unrelated labels at extreme zoom, then return to the overview.
+  // Evicted tiles must be refreshed and offscreen labels must not all grow huge.
+  let mut magnify: usize = 0
+  while magnify < 6 {
+    app.model.zoom = 64.0
+    app.model.cameraX = usize.toF32(magnify) * 80.0
+    app.model.cameraY = 20.0
+    app.model.paintRevision = app.model.paintRevision + 1
+    run tree.frame(viewport)
+    run canvas.frame(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+    magnify = magnify + 1
+  }
+  app.model.fit(false)
+  run tree.frame(viewport)
+  run canvas.frame(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+  let last = app.model.elements.get(count - 1)
+  app.model.select(last.id, false)
+  editing.field(&mut app.model, 14, "Native text edit")
+  run expect(
+    app.model.string(app.model.elements.get(count - 1).text) == "Native text edit",
+    "last text remains independently editable",
+  )
+  editing.undo(&mut app.model, false)
+  run expect(app.model.elements.get(count - 1).text == last.text, "undo restores text")
+
+  // A small portable document exercises the exact same crop encoder/decoder and SVG export.
+  let mut portable = Studio.make()
+  samples.page(&mut portable, "Crop round trip")
+  drop portable.add(0, "Crop", 0.0, 0.0, 74.0, 20.0, 0xffffffff)
+  let mut image = portable.elements.get(0)
+  image.image = 1
+  image.shape.source = app.model.elements.get(count - 2).shape.source
+  portable.elements.set(0, image)
+  let encoded = run format.encode(&portable)
+  let decoded = run format.decode(String.utf8Bytes(String.view(&encoded)))
+  let crop = decoded.elements.get(0)
+  run expect(
+    crop.image == 1 && f32.round(crop.shape.source.xMin * 1224.0) == 399.0
+      && f32.round(crop.shape.source.yMin * 248.0) == 124.0,
+    "last integer crop survives document round trip",
+  )
+  let svg = run exports.svg(&decoded)
+  run expect(
+    String.contains(String.view(&svg), "viewBox=\"399 124 700 120\"")
+      && String.contains(String.view(&svg), "data:image/png;base64,"),
+    "SVG embeds the source image and exact crop",
+  )
+  StderrWriter.print("ok: 100k image/text cache, editing/undo, crop persistence and SVG\n", &())
+}
+
+effect fn atlasFailure(error: AtlasError) -> i32 {
+  match error {
+    AtlasError.EmptyTile => {
+      StderrWriter.print("Silk Studio: empty atlas tile\n", &())
+    }
+    AtlasError.Full => {
+      StderrWriter.print("Silk Studio: atlas exhausted\n", &())
+    }
+    AtlasError.TooLarge { width, height } => {
+      StderrWriter.print("Silk Studio: atlas tile too large: {} x {}\n", &(width, height))
+    }
+  }
+  return 2
 }
