@@ -3,8 +3,8 @@
 The inspector core for [ui-tree](../tree): what a person, a test or an agent needs to see what a
 running UI is and to drive it. The tree is plain data (mutations in, records out), so everything
 here reads the tree's public state and never changes how it paints. The socket protocol
-([server](server), I2) with its CLI ([cli](cli)), the MCP server for agents (I3) and the devtools
-window (I4) build on this package.
+([server](server), I2) with its CLI ([cli](cli)), the MCP server for agents ([mcp](mcp), I3)
+and the devtools window (I4) build on this package.
 
 ```silk
 let archive = run queryFirst(&tree, &run Query.byRoleNamed(Role.Button, "archive"))

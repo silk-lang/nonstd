@@ -3,7 +3,9 @@
 The inspector protocol for [ui-tree](../../tree): a running Silk UI answers JSON requests on a
 local socket, so a person, a script or an agent can snapshot it, look at any node the way
 devtools does, take screenshots and drive it with input. It sits on top of the inspector core
-in [ui-inspect](..). The CLI that talks to it is [ui-inspect-cli](../cli).
+in [ui-inspect](..). The CLI that talks to it is [ui-inspect-cli](../cli), and
+[ui-inspect-mcp](../mcp) serves it to agents as MCP tools. The `client` module (connect, send a
+request, read the reply) and the MCP bridge (`mcp`) live here too, so both share them.
 
 ## Turning it on
 
@@ -113,6 +115,7 @@ python3 ui/tree/demo/scripts/demo inspect     # the CLI drives the demo in a win
   scroll, type, wait (holds, pending, gone, timed out) and the error replies.
 - Over a real Unix socket (not on Windows): hello, a click followed by a query that waits for the app's frame,
   a pending wait, bad JSON, and `close` removing the socket file.
+- The MCP bridge over the same fixture (see [ui-inspect-mcp](../mcp/README.md#tests)).
 - `demo inspect` (CI job `demo` in ui-inspect.yml): snapshot, click New by role and name, wait
   for the new row, highlight Archive, inspect it, screenshot to a PNG.
 

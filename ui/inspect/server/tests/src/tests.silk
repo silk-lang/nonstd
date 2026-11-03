@@ -1,6 +1,7 @@
 //! Inspector protocol tests over the inbox fixture: every command through `Protocol.handle`,
 //! and requests over a real Unix socket through `Inspector.poll`. Run from the repository root
-//! (the fixtures read fonts from there; the socket file is made there and removed).
+//! (the fixtures read fonts from there; the socket file is made there and removed). The MCP
+//! bridge is driven over the same fixture, with `Protocol.handle` in place of the socket.
 import ui_fixtures.fixtures as fixtures
 import ui_inspect_server.lib {
   Protocol,
@@ -9,7 +10,10 @@ import ui_inspect_server.lib {
   Address,
   parseAddress,
   describeAddress,
-  roleNamed
+  roleNamed,
+  Bridge,
+  Action,
+  writeValue
 }
 import ui_inspect.lib { InspectOptions, inspectNode }
 import ui_tree.lib {
@@ -39,7 +43,9 @@ import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
 import silk.io.writer { Writer }
 import silk.io.writer_native { StderrWriter }
 import silk.json.scanner { JsonError }
-import silk.json.value { Json, Value }
+import silk.json.value { Json, JsonChild, Value }
+import silk.mem.box { Box }
+import silk.num.usize
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.net.socket_native { ConnectOptions, Connection, NativeSocketError, connectUnixOwned }
 import silk.num.u64
@@ -484,4 +490,335 @@ test effect fn requestsOverAUnixSocket() -> ()
       |> Effect.provideMut<Allocator>(&mut allocator)
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   }
+}
+
+// The MCP bridge: tool calls become protocol requests, run here with `Protocol.handle`.
+
+/// Runs one JSON-RPC message through `bridge`, answering its requests with `protocol` (a
+/// pending `wait` is retried with 50 ms more each time). Returns the response, or `null` when
+/// there is none.
+effect fn mcp(
+  bridge: &mut Bridge,
+  protocol: &mut Protocol,
+  tree: &mut UiTree,
+  line: string,
+) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut reply = String.make()
+  let mut action = run bridge.handle(String.utf8Bytes(line), &mut out)
+  let mut waited: u64 = 0
+  while action == Action.Ask || action == Action.Retry {
+    if action == Action.Retry {
+      waited = waited + 50
+    }
+    let request = run Json.parse(out.ownedUtf8Bytes())
+    let outcome = run protocol.handle(&mut tree, &request, 0, &mut reply)
+    if outcome == Outcome.Pending {
+      reply.clear()
+      run reply.append("{\"ok\":false,\"pending\":true,\"error\":\"not yet\"}")
+    }
+    action = run bridge.answer(reply.ownedUtf8Bytes(), true, waited, &mut out)
+  }
+  if action == Action.Nothing {
+    return run Json.parse(b"null")
+  }
+  let response = run Json.parse(out.ownedUtf8Bytes())
+  return move response
+}
+
+/// The first content item's member `key` of a tool result.
+fn content<'a>(response: &'a Value, key: string) -> string<'a> {
+  let items = Json.fieldAt(Json.field(response, "result"), "content")
+  let first = match items {
+    Option<&'a Value>.Some { value } => match &value.* {
+      Value.Array { values } => {
+        let boxed = Box<List<JsonChild>>.get(&values)
+        let list = boxed[0].asSlice()
+        if list.length == 0 {
+          return ""
+        }
+        match &list[0] {
+          JsonChild.Item { value: item } => Option<&'a Value>.Some { value: &item }
+          _ => Option<&'a Value>.None
+        }
+      }
+      _ => Option<&'a Value>.None
+    }
+    Option<&'a Value>.None => Option<&'a Value>.None
+  }
+  return match Json.asString(Json.fieldAt(first, key)) {
+    Option<string>.Some { value } => value
+    Option<string>.None => ""
+  }
+}
+
+fn isError(response: &Value) -> bool {
+  return match Json.fieldAt(Json.field(response, "result"), "isError") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn errorCode(response: &Value) -> i64 {
+  return match Json.asI64(Json.fieldAt(Json.field(response, "error"), "code")) {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => 0
+  }
+}
+
+/// The number of tools `tools/list` returns, -1 when the shape is wrong.
+fn toolCount(response: &Value) -> i64 {
+  return match Json.fieldAt(Json.field(response, "result"), "tools") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => {
+        let boxed = Box<List<JsonChild>>.get(&values)
+        return usize.toI64(boxed[0].length())
+      }
+      _ => -1
+    }
+    Option<&Value>.None => -1
+  }
+}
+
+effect fn mcpBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  let mut bridge = run Bridge.make("unix:/tmp/test.sock")
+
+  let init = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}",
+  )
+  let result = Json.field(&init, "result")
+  run Testing.expect(
+    same(
+      Json.asString(Json.fieldAt(result, "protocolVersion")) |> Option<string>.unwrapOr(""),
+      "2025-03-26",
+    ),
+    "initialize answers the client's protocol version",
+  )
+  run Testing.expect(
+    same(
+      Json.asString(Json.fieldAt(Json.fieldAt(result, "serverInfo"), "name"))
+        |> Option<string>.unwrapOr(""),
+      "silk-ui-inspect",
+    ),
+    "and names the server",
+  )
+  let other = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}",
+  )
+  run Testing.expect(
+    same(
+      Json.asString(Json.fieldAt(Json.field(&other, "result"), "protocolVersion"))
+        |> Option<string>.unwrapOr(""),
+      "2025-06-18",
+    ),
+    "an unknown version gets the server's own",
+  )
+  let note = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+  )
+  run Testing.expect(
+    match &note {
+      Value.Null => true
+      _ => false
+    },
+    "notifications get no response",
+  )
+  let tools = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
+  )
+  run Testing.expect(toolCount(&tools) == 14, "fourteen tools")
+  run Testing.expect(same(text(&tools, "id"), "t"), "string ids are echoed")
+
+  // Snapshot is describe; inspect is the node view.
+  let snap = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_snapshot\",\"arguments\":{}}}",
+  )
+  let mut expected = String.make()
+  run describe(&tree, DescribeOptions.plain(), &mut expected)
+  run Testing.expect(
+    same(content(&snap, "text"), String.view(&expected)) && !isError(&snap),
+    "ui_snapshot is describe",
+  )
+  let view = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_inspect\",\"arguments\":{\"role\":\"button\",\"name\":\"New\"}}}",
+  )
+  let mut panel = String.make()
+  run inspectNode(&tree, fixtures.NEW_BUTTON, InspectOptions.all(), &mut panel)
+  run Testing.expect(
+    same(content(&view, "text"), String.view(&panel)),
+    "ui_inspect is the node view",
+  )
+
+  // Find the button by its label and click it: the app sees the click.
+  let found = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_query\",\"arguments\":{\"label\":\"New\",\"exact\":true}}}",
+  )
+  let foundReply = run Json.parse(String.utf8Bytes(content(&found, "text")))
+  run Testing.expect(int(&foundReply, "count") == 1, "ui_query finds the button by its label")
+  let clicked = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_click\",\"arguments\":{\"label\":\"New\",\"modifiers\":[\"shift\"]}}}",
+  )
+  let clickReply = run Json.parse(String.utf8Bytes(content(&clicked, "text")))
+  run Testing.expect(
+    !isError(&clicked) && int(&clickReply, "node") == 10,
+    "ui_click clicks it, arguments passed through",
+  )
+  let mut records = List<Event>.make()
+  run tree.takeEvents(&mut records)
+  let mut sawClick = false
+  let values = records.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == EventKind.Click && values[i].target == fixtures.NEW_BUTTON {
+      sawClick = true
+    }
+    i = i + 1
+  }
+  run Testing.expect(sawClick, "the app sees a click record on New")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrame(&tree)
+
+  // Screenshots come back as image content.
+  let shot = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_screenshot\",\"arguments\":{\"node\":20}}}",
+  )
+  run Testing.expect(
+    same(content(&shot, "type"), "image") && same(content(&shot, "mimeType"), "image/png"),
+    "ui_screenshot returns image content",
+  )
+  let encoded = String.utf8Bytes(content(&shot, "data"))
+  let length = match Base64.decodedLength(encoded) {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => 0
+  }
+  let mut bytes = run Bytes.zeroed(length)
+  drop Base64.decodeInto(bytes.asMutSlice(), encoded)
+  let image = run png.decode(bytes.asSlice())
+  run Testing.expect(image.width() > 0 && image.width() < 720, "a PNG of the node")
+
+  // wait: holds, then times out after retries; errors are tool errors.
+  let there = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_wait\",\"arguments\":{\"role\":\"button\",\"name\":\"Archive\"}}}",
+  )
+  run Testing.expect(!isError(&there), "ui_wait for a node that is there")
+  let late = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_wait\",\"arguments\":{\"name\":\"nothing like it\",\"timeout\":200}}}",
+  )
+  run Testing.expect(
+    isError(&late) && String.startsWith(content(&late, "text"), "Timed out after 200 ms"),
+    "ui_wait retries until its timeout",
+  )
+  let missing = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_click\",\"arguments\":{\"name\":\"no such button\"}}}",
+  )
+  run Testing.expect(
+    isError(&missing) && same(content(&missing, "text"), "no node matches"),
+    "a missing node is a tool error",
+  )
+
+  // Protocol errors.
+  let unknown = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"fly\"}}",
+  )
+  run Testing.expect(errorCode(&unknown) == -32602, "an unknown tool")
+  let method = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"fly\"}",
+  )
+  run Testing.expect(errorCode(&method) == -32601, "an unknown method")
+  let junk = run mcp(&mut bridge, &mut protocol, &mut tree, "not json")
+  run Testing.expect(errorCode(&junk) == -32700, "a parse error")
+
+  // An app that cannot be reached.
+  let mut out = String.make()
+  let asked = run bridge.handle(
+    b"{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_status\"}}",
+    &mut out,
+  )
+  run Testing.expect(
+    asked == Action.Ask && same(String.view(&out), "{\"cmd\":\"hello\"}"),
+    "ui_status asks hello",
+  )
+  let gone = run bridge.answer(b"", false, 0, &mut out)
+  let unreachable = run Json.parse(out.ownedUtf8Bytes())
+  run Testing.expect(
+    gone == Action.Respond && isError(&unreachable)
+      && String.startsWith(
+        content(&unreachable, "text"),
+        "Could not reach the Silk UI at unix:/tmp/test.sock",
+      ),
+    "an unreachable app is a tool error naming the address",
+  )
+
+  // writeValue round-trips JSON.
+  let source = "{\"a\":[1,-2.5e3,true,false,null],\"b\":\"q\\\"\\n\",\"c\":{}}"
+  let value = run Json.parse(String.utf8Bytes(source))
+  let mut written = String.make()
+  run writeValue(&mut written, &value)
+  run Testing.expect(same(String.view(&written), source), "writeValue writes JSON back")
+}
+
+test effect fn mcpToolsDriveTheTree() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | ImageError
+    | PngError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run mcpBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
