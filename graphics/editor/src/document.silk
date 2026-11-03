@@ -155,7 +155,7 @@ pub struct Document {
   tiles: List<AtlasTile>,
   /// Number of elements submitted by the most recent paint. Includes offscreen elements when culling is disabled.
   pub visible: u32,
-  /// Number of element bounds tested in the most recent painted frame.
+  /// Elements visited by the main paint pass; excludes rectangle-run bounds lookahead.
   pub visited: u32,
 }
 
@@ -182,6 +182,11 @@ fn overlaps(a: Rect<f32>, b: Rect<f32>) -> bool {
 // Paths, sprites, and shadows need the scene's mixed-kind overlap ordering instead.
 fn needsMixedOrder(node: Node) -> bool {
   return node.alive && (node.flags & 1) == 0 && (node.kind != 0 || (node.shadow & 255) != 0)
+}
+
+struct QuadRun {
+  end: usize,
+  bounds: Rect<f32>,
 }
 
 impl Document {
@@ -341,6 +346,38 @@ impl Document {
     return 0
   }
 
+  // The first rectangle's shadow has already been emitted. Stop before the next shadow,
+  // path or sprite: only same-kind quads may share an order without changing painter order.
+  // Stop at a culling-block boundary too, so a visible quad never scans distant blocks.
+  fn quadRun(self: &Self, start: usize, camera: Camera, mask: Rect<f32>) -> QuadRun {
+    let mut bounds = emptyBounds()
+    let mut end = start
+    let limit = (start / BLOCK + 1) * BLOCK
+    let s = camera.zoom * camera.scale
+    while end < self.nodes.length() && end < limit {
+      let n = self.nodes.asSlice()[end]
+      if end != start && needsMixedOrder(n) {
+        break
+      }
+      if n.alive && (n.flags & 1) == 0 {
+        // Match paint's f32 arithmetic exactly, then clip before taking the union.
+        let x = (n.x - camera.x) * s
+        let y = (n.y - camera.y) * s
+        let b = Rect<f32>.new(
+          f32.max(x, mask.xMin),
+          f32.max(y, mask.yMin),
+          f32.min(x + n.width * s, mask.xMax),
+          f32.min(y + n.height * s, mask.yMax),
+        )
+        if b.xMin < b.xMax && b.yMin < b.yMax {
+          bounds = unionBounds(bounds, b)
+        }
+      }
+      end = end + 1
+    }
+    return QuadRun { end: end, bounds: bounds }
+  }
+
   /// Paints visible elements in insertion order, then finishes the scene's batches.
   ///
   /// Camera values must be finite, with positive zoom and scale. `cull` disables offscreen
@@ -369,8 +406,14 @@ impl Document {
     if self.mixedCount == 0 {
       run scene.pushLayer(mask.bounds)
     }
+    let mut runEnd: usize = 0
+    let mut pinnedRun = false
     let mut i: usize = 0
     while i < self.nodes.length() {
+      if pinnedRun && i >= runEnd {
+        run scene.popLayer()
+        pinnedRun = false
+      }
       if cull && i % BLOCK == 0 && !overlaps(self.blocks.asSlice()[i / BLOCK], viewport) {
         i = i + BLOCK
         continue
@@ -430,6 +473,15 @@ impl Document {
             },
           )
         }
+        if self.mixedCount != 0 && i > runEnd {
+          let group = self.quadRun(i - 1, camera, mask.bounds)
+          runEnd = group.end
+          if group.end > i && group.bounds.xMin < group.bounds.xMax
+            && group.bounds.yMin < group.bounds.yMax {
+            run scene.pushLayer(group.bounds)
+            pinnedRun = true
+          }
+        }
         let mut quad = Quad.fill(bounds, mask, fill)
         quad.cornerRadii = radius
         quad.borderWidths = Insets<f32>.uniform(n.borderWidth * s)
@@ -437,7 +489,7 @@ impl Document {
         drop run scene.quad(quad)
       }
     }
-    if self.mixedCount == 0 {
+    if self.mixedCount == 0 || pinnedRun {
       run scene.popLayer()
     }
     run scene.finish()

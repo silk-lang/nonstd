@@ -101,7 +101,7 @@ The complete declarations are in [`js/editor.d.ts`](js/editor.d.ts). Useful oper
 | `screenToWorld(x,y)`, `worldToScreen(x,y)` | Convert coordinates relative to the canvas's CSS content box. |
 | `resize(width,height,pixelRatio)` | CSS viewport size and device scale. ResizeObserver tracks layout size; call resize to change device scale. |
 | `render()`, `invalidate()`, `flush()` | Submit immediately, schedule one frame, or wait for submitted GPU work. Normal rendering never waits for GPU completion. |
-| `stats`, `diagnostics` | Last frame's build/encode times, visible/tested elements and draw batches; WASM bytes, live GPU handles and text runs. |
+| `stats`, `diagnostics` | Last frame's build/encode times, visible elements, main-pass visits and draw batches; WASM bytes, live GPU handles and text runs. |
 | `toJSON()`, `load(document)` | Version-one geometry/style document. Loading replaces elements in one undo group and allocates new IDs. The exported camera is informational; load keeps the current camera. |
 
 Positions use world units, positive y down. Sizes must be positive; radius, blur and border widths
@@ -140,8 +140,10 @@ or external side effects performed by a callback.
 
 - [`src/document.silk`](src/document.silk): stable slots, rounded/ellipse hits, conservative
   64-element bounds blocks, and lowering into `ui_scene.Scene`. Dirty block bounds rebuild once
-  before the next hit test or frame, even after many edits to that block. Rectangle-only scenes
-  without shadows preserve insertion order directly, avoiding the mixed-primitive overlap tree.
+  before the next hit test or frame, even after many edits to that block. Consecutive rectangle runs
+  share one conservative ordering bound, even among shadows, paths, and text. Runs stop at
+  mixed primitives and culling-block boundaries. Entire rectangle-only scenes without shadows
+  use one pinned order. The shared scene sorter sorts equal-key runs and copies them in bulk.
 - [`browser/src/bridge.silk`](browser/src/bridge.silk): the owned WASM token, asynchronous GPU
   initialization, surface, and reusable renderer/atlas. The raw C ABI is private and trusted;
   use the validated JS wrapper. Never call it with invented pointers or expired tokens.
@@ -152,8 +154,10 @@ or external side effects performed by a callback.
   persistent GPU buffers, atlas allocation, and browser GPU bindings.
 
 A frame culls world-space paint bounds **including shadow reach**, transforms visible shapes
-once into physical pixels, and lets the existing renderer batch them. The 100,000-rectangle grid
-cropped benchmark draws about 110 visible elements in one instanced draw. The overview benchmark
+once into physical pixels, and lets the existing renderer batch them. Ordering bounds round
+out to covered pixels, so fractional edges keep painter order. `stats.visited` counts main-pass
+element visits; rectangle-run bounds lookahead is additional and limited to the same 64-slot block.
+The cropped 100,000-rectangle grid draws about 110 visible elements in one instanced draw. The overview benchmark
 keeps all 100,000 elements visible across 1,000 synthetic artboards, with no level-of-detail
 removal or artboard raster cache. These artboards are flat background rectangles, and their
 text-like bars are rectangles, not text. Idle editors schedule no frames.

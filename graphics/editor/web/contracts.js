@@ -78,6 +78,26 @@ export async function runContracts() {
     check(pixels(e).every((v, i) => v === reference[i]), 'Adding a shadow restores mixed ordering safely');
     e.remove(sentinel); e.undo(); e.redo();
     check(pixels(e).every((v, i) => v === reference[i]), 'Remove/undo/redo keep ordering eligibility consistent');
+    // Invisible mixed primitives split rectangle runs without contributing any pixels.
+    // Compare against individually ordered quads, with shadows overlapping earlier content.
+    const shadowScene = Array.from({ length: 130 }, (_, i) => ({
+      x: (i * 37 % 230) - 25, y: (i * 23 % 170) - 15,
+      width: 35 + i % 4 * 9, height: 25 + i % 3 * 8, radius: i % 8,
+      fill: ['#cc884440', '#44bb8880', '#8855bb90'][i % 3],
+      border: '#ffffff90', borderWidth: i % 3,
+      shadow: i % 11 === 0 ? '#100530a0' : '#00000000',
+      blur: i % 11 === 0 ? 18 : 0, shadowX: i % 2 ? -9 : 8, shadowY: -5,
+    }));
+    shadowScene.splice(64, 0, { type: 'ellipse', x: 40, y: 30, width: 70, height: 50, fill: '#ffffff80' });
+    shadowScene.splice(100, 0, { type: 'text', text: 'Mixed', x: 60, y: 70, fontSize: 24, fill: '#ffff00c0' });
+    for (const [zoom, scale] of [[1, 1], [.65, 2], [.03, 1]]) {
+      e.resize(256, 192, scale); e.setViewport({ x: -3.25, y: 2.75, zoom });
+      e.load({ version: 1, elements: shadowScene }); const grouped = pixels(e);
+      e.load({ version: 1, elements: shadowScene.flatMap(n => [n,
+        { type: 'ellipse', x: 10000, y: 10000, width: 1, height: 1 }]) });
+      const separate = pixels(e);
+      check(grouped.every((v, i) => v === separate[i]), `Shadow ordering survives run splits at zoom ${zoom}, DPR ${scale}`);
+    }
     e.load({ version: 1, elements: [] }); pixels(e); check(e.stats.visible === 0, 'Empty document renders'); e.setViewport({ x: 0, y: 0, zoom: 1 }); e.resize(256, 192, 1);
     const t = e.text('Silk', { x: 10, y: 10, fill: '#ffffff', fontSize: 32 }); data = pixels(e);
     check(data.some((v, i) => i % 4 === 0 && v > 0), 'Text atlas reaches GPU canvas');

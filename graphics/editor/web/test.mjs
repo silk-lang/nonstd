@@ -30,11 +30,11 @@ try {
   console.log('Environment:', environment);
   if (process.argv.includes('--bench')) {
     const reports = [];
-    await page.evaluate(({workload, shadows}) => { window.benchmarkWorkload = workload; window.benchmarkShadows = shadows; }, { workload: process.env.EDITOR_WORKLOAD || 'pan', shadows: process.env.EDITOR_SHADOWS === '1' });
+    await page.evaluate(({workload, shadows, edits}) => { window.benchmarkWorkload = workload; window.benchmarkShadows = shadows; window.benchmarkEdits = edits; }, { workload: process.env.EDITOR_WORKLOAD || 'pan', shadows: process.env.EDITOR_SHADOWS === '1', edits: Number(process.env.EDITOR_EDITS || 1000) });
     await page.evaluate(({frames, warmup, modes}) => { window.benchmarkFrames = frames; window.benchmarkWarmup = warmup; window.benchmarkModes = modes; },
       { frames: Number(process.env.EDITOR_FRAMES || 90), warmup: Number(process.env.EDITOR_WARMUP || 20), modes: (process.env.EDITOR_MODES || 'silk,dom,dom-culled').split(',') });
     for (const count of (process.env.EDITOR_COUNTS || '1000,10000,100000').split(',').map(Number)) {
-      const report = await page.evaluate(async count => window.runBenchmark({ count, frames: window.benchmarkFrames, warmup: window.benchmarkWarmup, modes: window.benchmarkModes, workload: window.benchmarkWorkload || "pan", shadows: window.benchmarkShadows || false }), count);
+      const report = await page.evaluate(async count => window.runBenchmark({ count, frames: window.benchmarkFrames, warmup: window.benchmarkWarmup, modes: window.benchmarkModes, workload: window.benchmarkWorkload || "pan", shadows: window.benchmarkShadows || false, edits: window.benchmarkEdits }), count);
       report.environment = environment; report.browserVersion = browser.version(); reports.push(report);
       await writeFile(`${output}/benchmark-${count}.json`, JSON.stringify(report, null, 2));
       console.log(JSON.stringify(report.results.map(({ samples, ...r }) => r), null, 2));

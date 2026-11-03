@@ -2,11 +2,71 @@
 
 Recorded 2026-11-03 UTC (2026-11-02 in the user’s local work session), on this development machine.
 
-The all-visible overview changes the result substantially. With 100,000 elements spread across
-1,000 synthetic artboards, optimized Silk reaches about 60 rAF callbacks/sec during zoom and
-zoom plus width edits. DOM with `will-change: transform` reaches 43.9 during zoom and 7.3 during
-edits. **With artboard shadows, the result reverses: Silk 9.7, compositor-hinted DOM 59.3.**
-These are measurements of specific scenes on one machine, not a universal WebGPU/DOM ranking.
+The latest shadow optimization closes the previous gap. At 100,000 visible elements with shadows
+on all 1,000 artboards, Silk now sustains about 60 rAF callbacks/sec. Compositor-hinted DOM is also
+close to the 60 Hz ceiling during unchanged-scene zoom; editing exposes a much larger difference.
+See the latest shadow results below. The earlier measurements are retained as historical evidence.
+
+## Shadow ordering optimization (latest)
+
+The original shadowed overview spent about 97 ms building the scene per frame. Three changes
+remove most of that overhead while preserving painter order:
+
+1. **Order consecutive rectangles as a run.** Each run gets one combined bound in the overlap
+   tree. Shadows, paths, and sprites keep their own ordering entries. Runs stop before the next
+   mixed primitive and at each 64-slot culling-block boundary, keeping lookahead bounded even
+   when almost all the document is offscreen. The first rectangle's shadow is emitted before
+   opening its quad run. Union bounds use the same f32 physical-coordinate arithmetic as drawing.
+2. **Sort and copy equal-key runs in bulk.** Consecutive primitives with the same order and texture
+   are already internally sorted. Sort their run descriptors by order, texture and original index,
+   then copy contiguous ranges. This gives the same final primitive sequence as per-item sorting.
+3. **Order by covered pixels.** A mixed-content regression at 3% zoom exposed a pre-existing
+   geometric-bounds assumption: nonoverlapping fractional shapes can blend into the same pixel.
+   Scene ordering now rounds bounds outward just as GPU raster coverage does. A targeted native
+   test fails before this fix; exact GPU comparisons with overlapping shadows, translucent
+   rectangles, ellipses and text pass after it. The optimization does not trade away these edges.
+
+All measurements below still submit 100,000 elements, including 1,000 artboard shadows. There is
+no small-element removal, blur reduction, shadow disabling, or artboard bitmap cache in Silk.
+The same hardware, viewport, geometry and zoom trajectory described below are used.
+
+Each workload has three runs, each with 20 warmups and 90 measured frames. Values are the median of run-level average rAF rates; brackets give the range across runs.
+
+| Shadowed workload | Silk fps [range] | DOM + compositor hint fps [range] | Interpretation |
+| --- | ---: | ---: | --- |
+| Zoom | 60.0 [60.0–60.0] | 58.7 [57.4–58.7] | Both near the 60 Hz ceiling |
+| Zoom + resize one artboard | 60.0 [60.0–60.0] | 8.1 [8.0–8.1] | Silk has substantially higher cadence |
+| Zoom + 1,000 width edits/frame | 60.0 [58.7–60.0] | 7.5 [7.5–7.6] | Silk has substantially higher cadence |
+
+Visual comparison: [shadow-report.html](shadow-report.html). Frame cadence is not a presentation fence or GPU timestamp.
+
+The earlier 90-frame shadow run used 102.9 ms median synchronous CPU work; the latest static
+runs use about 13.6 ms, roughly **7.6× less CPU time**. Scene build is about 7.2 ms, and encoding/
+submission about 6.3 ms. The final frame has 158 batches, up from 92: conservative pixel ordering
+and bounded runs deliberately preserve more dependencies. Fewer draw calls alone was not the goal.
+
+The raw baseline immediately before this work is [shadow-before.json](shadow-before.json)
+(30 samples after five warmups). The earlier long baseline is [overview-shadows-confirm.json](overview-shadows-confirm.json).
+Latest samples are [shadow-final.json](shadow-final.json), [reversed-order static repeats](shadow-static-reverse.json),
+[batch edits](shadow-edit-final.json), [single edit](shadow-single-edit.json), and [single-edit repeats](shadow-single-repeat.json).
+The first static comparison runs Silk first; the other two run DOM first. The first single-edit
+comparison runs DOM first; the repeats run Silk first. Batch-edit runs use Silk first.
+At 10,000 visible elements the new shadow run is about 60 fps for both renderers.
+A [cropped shadow regression run](shadow-cropped-check.json) also stays near 60 fps with 1.0 ms
+median CPU work and 1,024 main-pass visits out of 100,000 document elements.
+
+The single-edit workload changes the first artboard background's width by ±2 world units while
+zooming. The 1,000-edit workload changes the first ten artboards' primitives. This is a width/layout
+invalidation workload, not a compositor-only transform drag. DOM uses one scene parent with
+`will-change: transform`; it does not isolate each artboard into its own compositing layer. A more
+elaborate DOM layer strategy may improve editing. No general claim about every DOM editor follows.
+These shadows have a 20-world-unit blur radius and become small on screen; large screen-space blur,
+backdrop filters, and a shadow on every primitive are not covered by this workload.
+
+Validation includes 17 native UI-scene tests, 2 native editor suites, 38 browser contracts, real
+pointer/keyboard interaction checks, and 14 GPU/CPU renderer fixture comparisons. The exact-pixel
+shadow contracts cover gradients/borders via earlier tests, translucent overlaps, text and ellipses,
+negative shadow offsets, culling-block boundaries, zoom 1 / 0.65 / 0.03 and DPR 1 / 2.
 
 ## All-visible overview
 
@@ -24,7 +84,7 @@ unhinted parent. The benchmark does not inspect Chromium's layer cache or measur
 during scaling, so this should not be read as proof of a particular caching mechanism or equal
 subpixel rendering between CSS and the Silk shaders.
 
-### Confirmation: 100,000 visible elements / 1,000 artboards
+### Before shadow optimization: 100,000 visible elements / 1,000 artboards
 
 90 measured frames after 20 warmup frames per renderer. Higher cadence is better.
 
@@ -35,7 +95,7 @@ subpixel rendering between CSS and the Silk shaders.
 | Zoom + shadows on all artboards | 9.7 | 59.3 | 102.9 ms | <0.1 ms | DOM |
 
 Raw samples: [zoom](overview-confirm.json), [zoom + edits](overview-edit-confirm.json),
-[zoom + shadows](overview-shadows-confirm.json). Visual comparison: [overview-report.html](overview-report.html).
+[zoom + shadows](overview-shadows-confirm.json). Historical visual comparison: [overview-report.html](overview-report.html).
 The edit workload updates the first 1,000 primitives, covering ten adjacent artboards, by ±2 world
 units. It does not scatter changes across all artboards. The shadow workload adds a 20-world-unit
 blur-radius shadow to each artboard background; this is not a benchmark of large screen-space
@@ -69,10 +129,9 @@ together; these numbers do not isolate the contribution of either change. All 10
 are still visited and submitted in one batch. GPU pixel tests compare fast and mixed ordering
 with translucent overlaps, gradients and borders, including hidden/remove/undo/redo transitions.
 
-**Remaining bottleneck:** shadows disable the rectangle-only ordering shortcut. The longer
-shadow run spends 97.3 ms building the scene and 5.6 ms encoding/submitting 92 batches. Improving
-mixed-primitive ordering or retaining reusable scene data is the next performance target; this
-change does not claim to solve production-scale mixed-content overviews.
+**Bottleneck at commit `c5fb6b2` (addressed above):** shadows disabled the rectangle-only ordering shortcut. The longer
+shadow run spends 97.3 ms building the scene and 5.6 ms encoding/submitting 92 batches. This result motivated the bounded rectangle runs and bulk sorting described above. It remains
+historical evidence rather than a description of the current implementation.
 
 Raw initial runs: [baseline](overview-baseline.json), [optimized Silk](overview-optimized.json),
 [compositor-hinted DOM](overview-composited.json), [edits](overview-edit.json),
@@ -96,7 +155,7 @@ DOM stay near 60 in both workloads.
 - Culled DOM scans the full source list each frame, keeps only visible nodes mounted, reuses detached nodes, and preserves painter order. It is a useful baseline, not the strongest possible virtualized DOM implementation. It does not have Silk’s block index or undo/event machinery.
 - `updateMedianMs` and `updateP95Ms` measure synchronous JS/WASM work and GPU command submission. **They do not include asynchronous browser layout/paint or GPU execution.** This explains the full DOM’s tiny update time despite poor edit cadence.
 - Frame intervals measure successive requestAnimationFrame timestamps. They include missed callbacks, but are **not a compositor presentation fence**. `flush()` waits for submitted GPU work after a run; it is outside the timing loop. GPU timestamp queries and end-to-end input latency are not measured.
-- Timers are quantized around 0.1 ms; displayed `<0.1` does not mean zero work. Each table is one recorded run, without confidence intervals. Warmup, JIT, background load and browser scheduling affect the tails.
+- Timers are quantized around 0.1 ms; displayed `<0.1` does not mean zero work. Earlier tables are individual runs; the latest shadow table reports medians and ranges across repeated runs, without confidence intervals. Warmup, JIT, background load and browser scheduling affect the tails.
 - Setup measures creating the renderer and document. For Silk it includes module/device/pipeline initialization; for DOM it primarily measures synchronous node creation and does not wait for first paint. It is not an equivalent first-interactive latency metric.
 
 ## Cropped-viewport results (before overview optimization)
@@ -174,10 +233,13 @@ EDITOR_RESULTS=build/editor-results/shadows EDITOR_COUNTS=100000 EDITOR_SHADOWS=
 EDITOR_RESULTS=build/editor-results/overview EDITOR_COUNTS=100000 EDITOR_WORKLOAD=overview EDITOR_MODES=silk,dom-composited node graphics/editor/web/test.mjs --bench
 EDITOR_RESULTS=build/editor-results/overview-edit EDITOR_COUNTS=100000 EDITOR_WORKLOAD=overview-edit EDITOR_MODES=silk,dom-composited node graphics/editor/web/test.mjs --bench
 EDITOR_RESULTS=build/editor-results/overview-shadows EDITOR_COUNTS=100000 EDITOR_WORKLOAD=overview EDITOR_SHADOWS=1 EDITOR_MODES=silk,dom-composited node graphics/editor/web/test.mjs --bench
+# Resize one shadowed artboard while zooming.
+EDITOR_RESULTS=build/editor-results/shadow-single EDITOR_COUNTS=100000 EDITOR_WORKLOAD=overview-edit EDITOR_SHADOWS=1 EDITOR_EDITS=1 EDITOR_MODES=dom-composited,silk node graphics/editor/web/test.mjs --bench
 # Short sweep including unhinted DOM and viewport culling.
 EDITOR_WORKLOAD=overview EDITOR_FRAMES=30 EDITOR_WARMUP=5 EDITOR_MODES=silk,dom,dom-culled,dom-composited node graphics/editor/web/test.mjs --bench
 ```
 
 `EDITOR_WORKLOAD` accepts `pan`, `edit`, `overview`, `overview-pan` (fixed overview zoom), and `overview-edit`.
+`EDITOR_EDITS` sets how many leading primitives change width in edit workloads (default `1000`; use `1` for one artboard background).
 `EDITOR_MODES` selects comma-separated renderers. `EDITOR_FRAMES` and `EDITOR_WARMUP` override sample counts.
 `EDITOR_COUNTS` is a comma-separated list (default `1000,10000,100000`). The demo exposes the same comparison harness and downloads a JSON report. No benchmark uses hard timing assertions.

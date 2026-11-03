@@ -76,12 +76,13 @@ function domRenderer(root, nodes, virtual, editCount, editAmplitude, composited 
 }
 /** Runs sequential, visible 960×640, DPR=1 workloads with identical source geometry. */
 export async function runBenchmark({ count = 10000, frames = 90, warmup = 20, shadows = false,
-  modes = ['silk', 'dom', 'dom-culled'], workload = 'pan', onProgress = () => {}, mount = document.body } = {}) {
+  modes = ['silk', 'dom', 'dom-culled'], workload = 'pan', edits = 1000, onProgress = () => {}, mount = document.body } = {}) {
   if (!Number.isInteger(count) || count < 1 || count > 100000) throw new RangeError('count must be in [1, 100000]');
   if (!Number.isInteger(frames) || frames < 1 || frames > 10000 || !Number.isInteger(warmup) || warmup < 0 || warmup > 10000) throw new RangeError('Invalid frame counts');
   if (!Array.isArray(modes) || !modes.length || modes.some(mode => !['silk', 'silk-unculled', 'dom', 'dom-culled', 'dom-composited'].includes(mode))) throw new RangeError('Unknown renderer');
   if (!['pan', 'edit', 'overview', 'overview-pan', 'overview-edit'].includes(workload)) throw new RangeError('Unknown workload');
-  const width = 960, height = 640, editCount = workload.endsWith('edit') ? Math.min(count, 1000) : 0;
+  if (!Number.isInteger(edits) || edits < 1 || edits > 100000) throw new RangeError('edits must be in [1, 100000]');
+  const width = 960, height = 640, editCount = workload.endsWith('edit') ? Math.min(count, edits) : 0;
   const stage = document.createElement('div');
   Object.assign(stage.style, { position: 'fixed', left: '0', top: '0', width: `${width}px`, height: `${height}px`,
     zIndex: '1000', overflow: 'hidden', background: '#17191e', contain: 'strict' });
