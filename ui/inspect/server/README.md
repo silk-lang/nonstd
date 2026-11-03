@@ -24,7 +24,9 @@ is removed when nothing answers on it.
 
 ## In the app's frame loop
 
-The server is pulled, like platform/window: it never blocks and never calls into the app.
+The server is polled from the window loop. It serves at most one waiting request per poll,
+then yields to native input and timers. Screenshot rendering is synchronous; connected socket
+reads/writes have bounded deadlines. Waiting for future clients never blocks the frame loop.
 
 ```silk
 let mut inspector = run Inspector.start(InspectorOptions.make())
@@ -35,9 +37,13 @@ let wait = match inspector.pollInterval() {          // wake up to serve request
 while true {
   let next = run platform.nextEvent(wait)
   if run inspector.poll(&mut tree) {                 // a request dispatched input or highlighted
-    run inspector.observe(&tree)                     // log the records for `events`
-    run tree.takeEvents(&mut records)                // answer the records as for window input
-    ...
+    while true {
+      // Service host requests (clipboard/IME), then react just as for native input.
+      run inspector.observe(&tree)
+      run tree.takeEvents(&mut records)
+      ...
+      if !run inspector.dispatchNext(&mut tree) { break }
+    }
     platform.requestFrame(window)
   }
   ...
@@ -48,6 +54,12 @@ while true {
 }
 run inspector.close()
 ```
+
+A compound click/type/press queues individual `ui_tree.Input` values. `poll` dispatches the
+first through `UiTree.dispatch`, the same entry point used by the native window adapter.
+Drain `dispatchNext` **with the host/application reaction between every event**, so a down
+handler's focus, capture, or view changes apply before up. Protocol-only integrations use
+`Protocol.dispatchNext` with the same contract. No input command calls application actions.
 
 After a request dispatches input, the next request waits until the app has drawn a frame
 (`afterFrame`), so every request sees the app's answer to the one before. Call `inspector.observe(&tree)` before every
@@ -80,10 +92,12 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
 | `pick` | `x`, `y` | `node` (what the element picker selects), `path` (ids hit testing reaches) |
 | `highlight` | `nodes` (ids) or a target (all matches); none clears it | `nodes` highlighted |
-| `screenshot` | target (optional: that node alone, cropped), `highlight` (default true) | `png` (Base64), `width`, `height` (device pixels), `scale`, `node` |
+| `screenshot` | target (optional: that node alone, cropped), `highlight` (default true), `maxWidth` (optional 1–4096, reduce before encoding) | `png` (Base64), `width`, `height` (device pixels), `scale`, `frame`, `node` |
 | `click` | target or `x`, `y`; `count`, `modifiers` | `node`, `x`, `y` |
 | `hover` | target or `x`, `y`; `modifiers` | `node`, `x`, `y` |
 | `scroll` | target or `x`, `y`; `dx`, `dy` (positive scrolls down); `modifiers` | `node`, `x`, `y` |
+| `pointer` | target or `x`, `y`; `phase`: `down`, `move`, `up`; `button` (0 primary, 1 middle, 2 secondary); `count` on down, `modifiers` | `node`, `x`, `y` |
+| `key` | `phase`: `down` or `up`; `key`, `code`, `modifiers`, `repeat` on down | `key` |
 | `press` | `key` (UI Events key), `code` (defaults to the key), `modifiers`, `times` | `key` |
 | `type` | `text` (as `TextInput` records to the focused input; newlines and tabs as Enter and Tab); a target in `query` is clicked first | `typed` (characters) |
 | `wait` | target, `gone`, `timeout` (ms) | `node`, or `"pending": true` when it does not hold yet |
@@ -91,12 +105,27 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
 
+`key` down/up tracks held Shift/Control/Alt/Meta for subsequent commands that omit `modifiers`. Explicit `modifiers` overrides the event snapshot.
+
 `modifiers` is a list of `shift`, `control` (or `ctrl`), `alt`, `meta`. Pointer input goes to
 the point `pointOf` finds (the centre of the node's visible box, or a grid point that hit
 testing reaches); a node that is hidden, scrolled out of view or covered is an error.
 
 Screenshots are the CPU reference rendering of the tree's last frame (the same pixels the GPU
-draws, within tolerance), over a transparent background.
+draws, within tolerance), over a transparent background. An app with its own canvas should call
+`afterFrameScene(&tree, &composedScene)` and draw `sceneWith(&composedScene)` instead. Captures
+then include the canvas; a node target crops the composed viewport to that node's bounds.
+Highlights also appear over the composed scene. Tree-only hosts retain isolated-subtree captures.
+
+Hosts must compose a logical frame while inspected even when an occluded window has no display
+callback. `ui-app/window` and Studio do this without acquiring an invisible GPU surface. The
+frame number identifies composition, not proof of physical screen presentation.
+
+Timed mosaics are a **client operation**, available through MCP `ui_capture` and CLI `capture`.
+The client takes repeated `screenshot` samples, preserving repeated source frame numbers and
+actual elapsed times. It waits outside the app and returns one PNG contact sheet; no sleeps
+are introduced into the app's event loop. CPU capture itself has a cost, so use the sequence
+to diagnose visual state changes, not to measure FPS.
 
 ```text
 $ SILK_UI_INSPECT=1 ui-tree-demo &
