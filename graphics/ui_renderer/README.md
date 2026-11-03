@@ -36,6 +36,7 @@ Every batch of the scene is one instanced draw of six vertices per instance, as 
 | Underline | `shaders/underline.wgsl` | Straight: exact area of the top `thickness` rows. Wavy: distance to the sine wave to first order. |
 | Glyph | `shaders/mono.wgsl` | A8 atlas tile, bilinear at pixel centers clamped to the tile, with DirectWrite's contrast and gamma correction for text (see below). |
 | Image | `shaders/poly.wgsl` | Premultiplied RGBA tile, bilinear, with corner radii, opacity and grayscale. |
+| Surface | `shaders/poly.wgsl` | The image pipeline over a texture registered with `UiRenderer.setSurface(id, view)`, one bind group per surface id. |
 | Path | `shaders/path.wgsl` | `vector` coverage strips in gpu_scene's run layout (4-row bands, a word of coverage per column), placed at the sprite's integer origin; bands start at the sprite's own `y`. |
 | Layer | `shaders/layer.wgsl` | Isolated layers drawn into pooled RGBA8 textures and composited with gpu_scene's `blend.wgsl` (all `vector.layer` blend modes) and the group opacity, with optional layer/backdrop blur and color filters. |
 
@@ -72,6 +73,15 @@ textures now include render-attachment usage, which browser canvas-to-texture co
 monochrome textures keep their previous usage. Instance packing writes whole little-endian
 vectors in bulk rather than appending each byte separately.
 
+### Surfaces
+
+`SurfaceSprite`s draw textures the renderer does not own, such as a web view's page imported with
+`webgpu.shared_texture`. Register a view with `renderer.setSurface(id, &view)` (it keeps a
+reference until `removeSurface(id)` or another `setSurface` for the id) and paint sprites naming
+the id. The view must be float-sampleable, RGBA8 or BGRA8, premultiplied; keep a shared texture's
+access open until the frames that draw it are submitted. Sprites of an unregistered id draw
+nothing.
+
 ### Text correction
 
 Unhinted coverage blended plainly looks thin. `TextSettings` applies Windows Terminal's DirectWrite
@@ -96,6 +106,7 @@ too. Flat areas match exactly.
 | layers | 25 | 0.20% | 0.06 |
 | nested | 24 | 0.10% | 0.04 |
 | gradients | 28 | 0.37% | 0.13 |
+| surfaces | 21 | 0.06% | 0.02 |
 | text ramp | 0 | 0 | 0 |
 
 These are lavapipe's numbers. Chromium's WebGPU (SwiftShader) gives the same within a level.
@@ -110,6 +121,7 @@ The test allows 48, 0.6% and 0.5 (exact for the text ramp).
 | `graphics/ui_renderer/tests` | `graphics-ui-renderer-tests` | Native GPU against CPU comparison |
 | `graphics/ui_renderer/browser` | `graphics-ui-renderer-browser` | The same comparison as a wasm module for Chromium |
 | `graphics/ui_renderer/bench` | `graphics-ui-renderer-bench` | Dense-scene frame time |
+| `graphics/ui_renderer/shared-texture-test` | `graphics-ui-renderer-shared-texture-test` | A texture from another API imported and drawn through surface sprites (Linux, macOS; not a workspace member) |
 
 ## Tests
 
@@ -119,18 +131,27 @@ From the repository root, with a Vulkan, Metal or D3D driver (CI uses lavapipe):
 python3 graphics/ui_renderer/scripts/check          # shaders, packages, wasm32, GPU comparison
 python3 graphics/ui_renderer/scripts/test-browser   # the comparison in installed Chromium
 python3 graphics/ui_renderer/scripts/bench          # dense scene against bench/budget.json
+python3 graphics/ui_renderer/scripts/test-shared-texture  # imported texture through surface sprites
 ```
 
-The comparison renders eight fixtures (the four `ui_scene` golden scenes, nested isolated layers
+The comparison renders nine fixtures (the four `ui_scene` golden scenes, nested isolated layers
 with clipped sprites and paths, gradients in eight interpolations on quads and paths, layer/backdrop
-blur with color adjustments and blending, and a text coverage ramp) into RGBA8 and BGRA8 targets.
+blur with color adjustments and blending, surface sprites from RGBA8 and BGRA8 textures, and a text
+coverage ramp) into RGBA8 and BGRA8 targets.
 It checks text correction against `TextSettings.correct` within one level and redraws the layered,
-gradient, and effects scenes after another scene to check that pooled resources carry nothing over.
+gradient, effects and surfaces scenes after another scene to check that pooled resources carry nothing over.
 
 The benchmark draws 320 cards (shadow, bordered rounded quad, a line of glyphs; 3,521 primitives)
 at 1280 x 800 and reports the median build, encode and frame times. On lavapipe in a 4-core
 container: build 3.9 to 5.1 ms, encode 1.2 to 1.5 ms, frame about 70 ms (software rasterization).
-The `graphics-ui-renderer` workflow runs the check and the browser test on every pull request and
-the benchmark weekly.
+The shared texture test makes a test pattern with another API and imports it: on Linux a second
+Vulkan device exports an image as an opaque file descriptor (needs `libvulkan-dev`); on macOS an
+IOSurface in BGRA. It draws the import through surface sprites (exact, stretched with rounded
+corners, a source rectangle, in a clipped isolated layer) and compares with the CPU reference. On
+lavapipe, which cannot export the semaphore Dawn signals when a submit reads a shared texture, it
+stops after the access begins and ends.
+
+The `graphics-ui-renderer` workflow runs the check, the shared texture test (Linux and macOS) and
+the browser test on every pull request and the benchmark weekly.
 
 Dependents import the package as `ui_renderer`.

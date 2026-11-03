@@ -19,6 +19,8 @@ depends on a GPU, so it builds for wasm32 too.
   - `Underline`: straight or wavy.
   - `GlyphSprite`: a tinted coverage tile from a monochrome `graphics/atlas` texture.
   - `ImageSprite`: a premultiplied color tile, with opacity, corner radii and grayscale.
+  - `SurfaceSprite`: a premultiplied texture from outside the atlas (a web page, a video frame),
+    named by a caller-chosen surface id, with a source rectangle, opacity and corner radii.
   - `PathSprite`: `vector` strip coverage at an integer origin (made by `path_cache`).
   - Every primitive has a `ContentMask`, the rectangle it is clipped to.
 - `effects`: `LayerEffects` for isolated-layer blur, backdrop blur, and color adjustments.
@@ -27,7 +29,7 @@ depends on a GPU, so it builds for wasm32 too.
   `color.fromColor(c)` to gamut-map any `silk.color.color.Color`. `color.mix` interpolates stops.
 - `bounds_tree`: `BoundsTree`, a balanced bounding-volume tree that gives a rectangle one more than
   the highest order of anything it overlaps, as GPUI's `BoundsTree`.
-- `scene`: `Scene` with `quad`, `shadow`, `underline`, `glyph`, `image`, `pathCoverage`,
+- `scene`: `Scene` with `quad`, `shadow`, `underline`, `glyph`, `image`, `surface`, `pathCoverage`,
   `pushLayer`/`pushIsolatedLayer`/`pushEffectLayer`/`popLayer`, `replay`, `finish`, and per-layer `batches`.
 - `path_cache`: `PathCache` rasterizes `vector` paths (fills and strokes) into a scene and keeps
   their coverage across frames.
@@ -66,7 +68,8 @@ however many cards there are.
 
 Equal orders never overlap, except inside a pinned layer: `pushLayer(bounds)` gives everything
 until `popLayer` the order of `bounds`, as GPUI does, so overlapping primitives of different kinds
-there draw in kind order (shadows, quads, paths, underlines, glyphs, images, layers).
+there draw in kind order (shadows, quads, paths, underlines, glyphs, images, surfaces, layers).
+Surface sprites are batched by surface id the way glyphs and images are batched by atlas texture.
 
 `pushIsolatedLayer(bounds, mask, isolation)` opens an offscreen group: its primitives are ordered
 and batched on their own (layer `n`), and the parent draws one `LayerSprite` that composites the
@@ -114,7 +117,8 @@ integer: a GPU renderer offsets the bands rather than aligning them to multiples
 underlines become paths with exact area coverage, dashed borders are `vector` strokes clipped to
 the border band, shadows are filled shapes blurred with `vector.filter.gaussianBlur`, isolated
 layers are composited with `vector.layer`. Layer filters use `vector.filter`; replay retains their settings. Content masks clip by pixel area. Gradients are
-evaluated at pixel centers. Sprites sample their tile bilinearly, clamped to the tile. A GPU
+evaluated at pixel centers. Sprites sample their tile bilinearly, clamped to the tile. Surface
+sprites read the pixels given to `AtlasPixels.setSurface` (none: they draw nothing). A GPU
 renderer with SDF quads and an erf shadow is expected to match it within a small tolerance, not
 byte for byte. Paths match `vector`'s own fill byte for byte.
 
