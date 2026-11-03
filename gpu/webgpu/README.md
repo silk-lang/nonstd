@@ -16,7 +16,8 @@ There are two layers:
   - asynchronous requests that can be polled or awaited;
   - mapped buffers with checked copies;
   - capability snapshots;
-  - host-owned surfaces.
+  - host-owned surfaces;
+  - textures shared with other APIs and processes (`shared_texture`, native only).
 
 ## Example
 
@@ -48,6 +49,23 @@ Native programs link Dawn's static library and a small callback helper
 (`sys/native/callbacks.c`); `sys/silk.toml` pins Dawn and declares the native link
 configuration, which reaches every program that depends on the packages.
 Dependents import the packages as `webgpu` and `webgpu_sys`.
+
+## Shared textures
+
+`webgpu.shared_texture` wraps Dawn's shared texture memory and shared fences, Dawn extensions
+outside the `webgpu.h` schema that the C helper in `sys/native/callbacks.c` calls with flat
+arguments. `SharedTextureMemory` imports a Linux dma-buf, a Vulkan opaque file descriptor, a macOS
+IOSurface or a Windows DXGI shared handle; `createTexture` makes a texture over it, and each use is
+`beginAccess` (optionally after the producer's fences, `beginAccessAfter`), commands that read the
+texture, then `endAccess`, which returns the fences the producer waits on before writing again.
+`SharedFence` imports and exports sync files, Vulkan semaphores, Metal shared events and D3D12
+fence handles. Every kind needs its Dawn feature on the device (`FEATURE_DMA_BUF` and the others).
+On the web every call fails with `SHARED_TEXTURE_UNAVAILABLE`.
+
+Dawn's Vulkan backend signals an exportable semaphore whenever a submit reads a shared texture.
+Mesa lavapipe (the Linux CI driver) imports opaque file descriptors but cannot export semaphores,
+so there an imported texture can be accessed but not drawn; a real Vulkan driver has the fence
+features. `graphics/ui_renderer/scripts/test-shared-texture` checks the path end to end.
 
 ## Packages
 

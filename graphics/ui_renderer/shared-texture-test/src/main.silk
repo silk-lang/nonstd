@@ -1,0 +1,485 @@
+//! The offscreen web view path end to end, on Linux: a second Vulkan device (standing in for a
+//! browser engine) renders a test pattern into memory it exports as a file descriptor, Dawn
+//! imports it with `webgpu.shared_texture`, and `UiRenderer` draws it through surface sprites
+//! (exact size, stretched with rounded corners and opacity, a source rectangle, inside a clipped
+//! isolated layer). The GPU output is compared with `ui_scene.cpu.CpuRenderer` drawing the same
+//! pattern, within the fixtures' tolerance.
+//!
+//! Lavapipe (CI) imports Vulkan opaque file descriptors but cannot export the semaphore Dawn
+//! signals when an access ends; there `endAccess` fails and loses the device, which this test
+//! reports and allows only when the adapter has no shared fence feature.
+//!
+//! Exits 0 when the check passes or the adapter lacks the import feature (unless
+//! `SILK_REQUIRE_SHARED_TEXTURE=1`), 1 on a mismatch, 2 on an error.
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.resources { Queue, Texture, TextureView }
+import webgpu.descriptors {
+  BufferDescriptor,
+  DeviceDescriptor,
+  TexelCopyBufferInfo,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureDescriptor,
+  TextureViewDescriptor,
+}
+import webgpu.shared_texture {
+  BeginAccess,
+  FEATURE_FENCE_MTL_SHARED_EVENT,
+  FEATURE_FENCE_SYNC_FD,
+  FEATURE_FENCE_VK_SEMAPHORE_OPAQUE_FD,
+  FEATURE_IOSURFACE,
+  FEATURE_OPAQUE_FD,
+  OpaqueFdDescriptor,
+  SharedTextureMemory,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.geometry.corners { Corners }
+import silk.geometry.rect { Rect }
+import silk.collections.slice { Slice }
+import silk.io.writer_native { StderrWriter }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import atlas.atlas { AtlasError, AtlasOptions }
+import ui_scene.color as color
+import ui_scene.cpu { AtlasPixels, CpuRenderer }
+import ui_scene.primitives { Background, ContentMask, Isolation, Quad, SurfaceSprite }
+import ui_scene.scene { Scene }
+import ui_renderer.atlas_textures { GpuAtlas }
+import ui_renderer.renderer { UiRenderer }
+import vector.geometry_error { GeometryError }
+import vector.layer { BLEND_MULTIPLY }
+import vector.pixmap { Pixmap }
+import gpu_scene.renderer { extent }
+import ui_fixtures.fixtures { Tiles, rect, surfacePattern, window, WIDTH, HEIGHT }
+
+const SURFACE: u32 = 7
+
+const SURFACE_WIDTH: u32 = 64
+
+const SURFACE_HEIGHT: u32 = 48
+
+static if Intrinsic.targetOperatingSystem() == "linux" {
+  unsafe extern "C" fn producerCreate(
+    width: u32,
+    height: u32,
+    pixels: ?[*]const u8,
+  ) -> i32 as "silkProducerCreate"
+
+  unsafe extern "C" fn producerFd() -> i32 as "silkProducerFd"
+
+  unsafe extern "C" fn producerMemoryTypeIndex() -> u32 as "silkProducerMemoryTypeIndex"
+
+  unsafe extern "C" fn producerAllocationSize() -> u64 as "silkProducerAllocationSize"
+
+  unsafe extern "C" fn producerImageCreateInfo() -> ?*const u8 as "silkProducerImageCreateInfo"
+
+  unsafe extern "C" fn producerResult() -> i32 as "silkProducerResult"
+
+  unsafe extern "C" fn producerLayout() -> i32 as "silkProducerLayout"
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn producerCreateIOSurface(width: u32, height: u32, pixels: ?[*]const u8) ->
+    ?*mut u8 as "silkProducerCreateIOSurface"
+}
+
+effect fn paint(scene: &mut Scene) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run scene.quad(
+    Quad.fill(rect(0.0, 0.0, 240.0, 180.0), window(), Background.solid(color.rgb(0xe2e8f0))),
+  )
+  drop run scene.surface(
+    SurfaceSprite.make(
+      rect(8.0, 8.0, 64.0, 48.0),
+      window(),
+      SURFACE,
+      SURFACE_WIDTH,
+      SURFACE_HEIGHT,
+    ),
+  )
+  let mut stretched = SurfaceSprite.make(
+    rect(80.0, 8.0, 150.0, 100.0),
+    window(),
+    SURFACE,
+    SURFACE_WIDTH,
+    SURFACE_HEIGHT,
+  )
+  stretched.cornerRadii = Corners<f32>.uniform(18.0)
+  stretched.opacity = 0.8
+  drop run scene.surface(stretched)
+  let mut part = SurfaceSprite.make(
+    rect(8.0, 64.0, 60.0, 40.0),
+    window(),
+    SURFACE,
+    SURFACE_WIDTH,
+    SURFACE_HEIGHT,
+  )
+  part.source = Rect<u32>.new(16, 8, 46, 28)
+  drop run scene.surface(part)
+  let clip = ContentMask.new(rect(10.0, 112.0, 200.5, 60.25))
+  drop run scene.pushIsolatedLayer(
+    rect(10.0, 112.0, 220.0, 64.0),
+    clip,
+    Isolation { opacity: 0.9, blend: BLEND_MULTIPLY },
+  )
+  drop run scene.surface(
+    SurfaceSprite.make(
+      rect(10.0, 112.0, 220.0, 64.0),
+      clip,
+      SURFACE,
+      SURFACE_WIDTH,
+      SURFACE_HEIGHT,
+    ),
+  )
+  run scene.popLayer()
+  run scene.finish()
+}
+
+effect fn readBack(device: &Device, queue: &Queue, texture: &Texture) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let stride = (WIDTH * 4 + 255) / 256 * 256
+  let size = u32.toUsize(stride * HEIGHT)
+  let readback = run gpu.createBuffer(
+    device,
+    &BufferDescriptor.make(
+      b"shared readback",
+      usize.toU64(size),
+      flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead,
+      false,
+    ),
+  )
+  let mut encoder = run gpu.createCommandEncoder(device, b"shared readback")
+  let source = TexelCopyTextureInfo.default().withTexture(texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(stride)
+  layout.setRowsPerImage(HEIGHT)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(WIDTH, HEIGHT))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"shared readback")
+  queue.submit(&[commands.reference()])
+  run device.checkErrors()
+  let padded = run runtime.mapRead(device, &readback, 0, size)
+  let mut out = List<u8>.make()
+  let bytes = padded.asSlice()
+  let mut y: u32 = 0
+  while y < HEIGHT {
+    run out.appendSlice(Slice.view<u8>(bytes, u32.toUsize(y * stride), u32.toUsize(WIDTH * 4)))
+    y = y + 1
+  }
+  return move out
+}
+
+/// The largest channel difference, the share over 8 and the mean, as the fixtures measure.
+fn within(cpu: &[u8], gpu: &[u8]) -> bool {
+  if cpu.length != gpu.length {
+    StderrWriter.print("shared texture: size mismatch\n", &())
+    return false
+  }
+  let mut max: u32 = 0
+  let mut over: u32 = 0
+  let mut sum: f32 = 0.0
+  let mut i: usize = 0
+  while i < cpu.length {
+    let a = u8.toU32(cpu[i])
+    let b = u8.toU32(gpu[i])
+    let d = if a > b {
+      a - b
+    } else {
+      b - a
+    }
+    if d > max {
+      max = d
+    }
+    if d > 8 {
+      over = over + 1
+    }
+    sum = sum + u32.toF32(d)
+    i = i + 1
+  }
+  let mean = sum / usize.toF32(cpu.length)
+  let share = u32.toF32(over) / usize.toF32(cpu.length)
+  let ok = max <= 48 && share <= 0.006 && mean <= 0.5
+  StderrWriter.print(
+    "shared texture surfaces: max delta {}, {} of {} channels over 8, mean {}{}\n",
+    &(
+      max,
+      over,
+      cpu.length,
+      mean,
+      if ok {
+        ""
+      } else {
+        "  FAIL"
+      }
+    ),
+  )
+  return ok
+}
+
+effect fn renderTarget(device: &Device) -> Texture
+  ! GpuError {
+  let mut descriptor = TextureDescriptor.default().withLabel(b"shared test target")
+  descriptor.setSize(extent(WIDTH, HEIGHT))
+  descriptor.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  return run gpu.createTexture(device, &descriptor)
+}
+
+/// Draws the scene with `view` as the surface and compares it with the CPU reference.
+effect fn drawAndCompare(device: &Device, view: &TextureView, pattern: &[u8]) -> bool
+  ! GpuError | OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let queue = run gpu.getQueue(device)
+  let mut scene = Scene.make()
+  run paint(&mut scene)
+  let mut renderer = run UiRenderer.make(device, flags.WGPUTextureFormat_RGBA8Unorm)
+  run renderer.setSurface(SURFACE, view)
+  let target = run renderTarget(device)
+  let targetView = run target.createView(&TextureViewDescriptor.default())
+  let atlas = GpuAtlas.make()
+  run renderer.draw(device, &queue, &scene, &atlas, &targetView, WIDTH, HEIGHT, color.transparent())
+  run device.checkErrors()
+  let gpuPixels = run readBack(device, &queue, &target)
+  let mut pixels = AtlasPixels.make()
+  run pixels.setSurface(SURFACE, SURFACE_WIDTH, SURFACE_HEIGHT, pattern)
+  let mut cpu = run Pixmap.make(WIDTH, HEIGHT)
+  let mut reference = CpuRenderer.make()
+  run reference.draw(&scene, &pixels, &mut cpu)
+  return within(cpu.data(), gpuPixels.asSlice())
+}
+
+/// Checks an imported memory's properties against the producer's image.
+effect fn checkProperties(memory: &SharedTextureMemory, format: u32) -> bool
+  ! GpuError {
+  let properties = run memory.properties()
+  StderrWriter.print(
+    "imported {} x {}, format {}, usage {}\n",
+    &(properties.width, properties.height, properties.format, properties.usage),
+  )
+  let ok = properties.width == SURFACE_WIDTH && properties.height == SURFACE_HEIGHT
+    && properties.format == format
+    && (properties.usage & flags.WGPUTextureUsage_TextureBinding) != 0
+  if !ok {
+    StderrWriter.print("shared texture test: unexpected properties  FAIL\n", &())
+  }
+  return ok
+}
+
+fn skipped(required: bool, why: string<'static>) -> i32 {
+  StderrWriter.print("shared texture test: {}\n", &.(why))
+  return if required {
+    1
+  } else {
+    0
+  }
+}
+
+effect fn program(required: bool) -> i32
+  ! GpuError | OutOfMemoryError | GeometryError | AtlasError
+  ? &mut Allocator {
+  // The producer's pattern, also the CPU reference's surface.
+  let mut tiles = Tiles.make(
+    AtlasOptions { textureSize: 64, maxTextureSize: 64, maxTextures: 1, padding: 1 },
+  )
+  run surfacePattern(&mut tiles, SURFACE, SURFACE_WIDTH, SURFACE_HEIGHT, false)
+  let pattern = tiles.surfaces.asSlice()[0].pixels.asSlice()
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    if !adapter.hasFeature(FEATURE_OPAQUE_FD) {
+      return skipped(required, "the adapter cannot import Vulkan opaque file descriptors")
+    }
+
+    // Dawn's Vulkan backend signals an exportable semaphore whenever a submit reads a shared
+    // texture, and when an access ends. Without a shared fence feature (lavapipe) both fail and
+    // lose the device, so there the check stops after the access begins.
+    let fences = adapter.hasFeature(FEATURE_FENCE_VK_SEMAPHORE_OPAQUE_FD)
+      || adapter.hasFeature(FEATURE_FENCE_SYNC_FD)
+    let features: [u32; 3] = [
+      FEATURE_OPAQUE_FD,
+      FEATURE_FENCE_VK_SEMAPHORE_OPAQUE_FD,
+      FEATURE_FENCE_SYNC_FD,
+    ]
+    let featureCount: usize = if !fences {
+      1
+    } else if adapter.hasFeature(FEATURE_FENCE_SYNC_FD)
+      && adapter.hasFeature(FEATURE_FENCE_VK_SEMAPHORE_OPAQUE_FD) {
+      3
+    } else {
+      1
+    }
+    let device = run adapter.requestDevice(
+      &DeviceDescriptor.default().withRequiredFeatures(Slice.view<u32>(&features, 0, featureCount)),
+    )
+    let step = unsafe producerCreate(SURFACE_WIDTH, SURFACE_HEIGHT, Pointer.fromSlice<u8>(pattern))
+    if step != 0 {
+      StderrWriter.print(
+        "shared texture test: the Vulkan producer failed at step {} (VkResult {})\n",
+        &(step, unsafe producerResult()),
+      )
+      return 2
+    }
+    let memory = run SharedTextureMemory.importOpaqueFd(
+      &device,
+      b"producer image",
+      OpaqueFdDescriptor {
+        vkImageCreateInfo: unsafe producerImageCreateInfo(),
+        memoryFd: unsafe producerFd(),
+        memoryTypeIndex: unsafe producerMemoryTypeIndex(),
+        allocationSize: unsafe producerAllocationSize(),
+        dedicatedAllocation: true,
+      },
+    )
+    if !run checkProperties(&memory, flags.WGPUTextureFormat_RGBA8Unorm) {
+      return 1
+    }
+    let texture = run memory.createTexture(b"producer texture")
+    let mut access = BeginAccess.ready()
+    access.useVulkanLayout = true
+    access.vulkanOldLayout = unsafe producerLayout()
+    access.vulkanNewLayout = unsafe producerLayout()
+    run memory.beginAccess(&texture, access)
+    StderrWriter.print("beginAccess: ok\n", &())
+    if !fences {
+      // Ending the access needs no submit, but Dawn still exports a semaphore for it.
+      let ended = run endAccess(&memory, &texture, true)
+      let outcome = if ended {
+        "succeeded"
+      } else {
+        "failed"
+      }
+      StderrWriter.print(
+        "shared texture test: stopped after the access: the adapter has no shared fence feature, so Dawn cannot submit work that reads the texture (expected on lavapipe); endAccess {}\n",
+        &.(outcome),
+      )
+      return 0
+    }
+    let view = run texture.createView(&TextureViewDescriptor.default())
+    let ok = run drawAndCompare(&device, &view, pattern)
+    drop view
+    let ended = run endAccess(&memory, &texture, true)
+    return if ok && ended {
+      0
+    } else {
+      1
+    }
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if !adapter.hasFeature(FEATURE_IOSURFACE) {
+        return skipped(required, "the adapter cannot import IOSurfaces")
+      }
+      let features: [u32; 2] = [FEATURE_IOSURFACE, FEATURE_FENCE_MTL_SHARED_EVENT]
+      let featureCount: usize = if adapter.hasFeature(FEATURE_FENCE_MTL_SHARED_EVENT) {
+        2
+      } else {
+        1
+      }
+      let device = run adapter.requestDevice(
+        &DeviceDescriptor.default().withRequiredFeatures(
+          Slice.view<u32>(&features, 0, featureCount),
+        ),
+      )
+      let surface = unsafe producerCreateIOSurface(
+        SURFACE_WIDTH,
+        SURFACE_HEIGHT,
+        Pointer.fromSlice<u8>(pattern),
+      )
+      if Pointer.isNull(surface) {
+        StderrWriter.print("shared texture test: IOSurfaceCreate failed\n", &())
+        return 2
+      }
+      let memory = run SharedTextureMemory.importIOSurface(&device, b"producer surface", surface)
+      if !run checkProperties(&memory, flags.WGPUTextureFormat_BGRA8Unorm) {
+        return 1
+      }
+      let texture = run memory.createTexture(b"producer texture")
+      run memory.beginAccess(&texture, BeginAccess.ready())
+      StderrWriter.print("beginAccess: ok\n", &())
+      let view = run texture.createView(&TextureViewDescriptor.default())
+      let ok = run drawAndCompare(&device, &view, pattern)
+      drop view
+      let ended = run endAccess(&memory, &texture, false)
+      return if ok && ended {
+        0
+      } else {
+        1
+      }
+    } else {
+      drop adapter
+      return skipped(required, "Linux and macOS only")
+    }
+  }
+}
+
+effect fn endAccessOnce(memory: &SharedTextureMemory, texture: &Texture, vulkanLayout: bool) -> bool
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let end = run memory.endAccess(texture, vulkanLayout)
+  StderrWriter.print(
+    "endAccess: initialized {}, {} fences, layout {} -> {}\n",
+    &(end.initialized, end.fences.length(), end.vulkanOldLayout, end.vulkanNewLayout),
+  )
+  return true
+}
+
+effect fn endFailed(error: GpuError) -> bool {
+  StderrWriter.print("shared texture test: endAccess failed with status {}  FAIL\n", &.(error.code))
+  return false
+}
+
+effect fn endAccess(memory: &SharedTextureMemory, texture: &Texture, vulkanLayout: bool) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<GpuError>(endAccessOnce(memory, texture, vulkanLayout), endFailed)
+}
+
+effect fn process() -> i32
+  ! GpuError | OutOfMemoryError | GeometryError | AtlasError | HostInputError
+  ? &mut Allocator | &mut HostInput {
+  let count = run HostInput.argumentCount()
+  let required = count > 1
+  return run program(required)
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print(
+    "shared texture test failed with an allocation, atlas or geometry error\n",
+    &(),
+  )
+  return 2
+}
+
+effect fn gpuFailed(error: GpuError) -> i32
+  ! never {
+  StderrWriter.print(
+    "shared texture test failed with GPU error {}: {:?}\n",
+    &(error.code, error.message.asSlice()),
+  )
+  return 2
+}
+
+/// Pass any argument (CI passes `--require`) to fail when the import feature is missing.
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(Effect.catch<GpuError>(process(), gpuFailed), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -25,6 +25,25 @@ def executable(name):
     return name + (".exe" if os.name == "nt" else "")
 
 
+# Dawn extensions outside the webgpu.h schema that sys/native/callbacks.c calls (shared texture
+# memory and shared fences), so the Windows DLL exports them too.
+DAWN_EXTENSION_EXPORTS = [
+    "wgpuDeviceImportSharedFence",
+    "wgpuDeviceImportSharedTextureMemory",
+    "wgpuSharedFenceAddRef",
+    "wgpuSharedFenceExportInfo",
+    "wgpuSharedFenceRelease",
+    "wgpuSharedTextureMemoryAddRef",
+    "wgpuSharedTextureMemoryBeginAccess",
+    "wgpuSharedTextureMemoryCreateTexture",
+    "wgpuSharedTextureMemoryEndAccess",
+    "wgpuSharedTextureMemoryEndAccessStateFreeMembers",
+    "wgpuSharedTextureMemoryGetProperties",
+    "wgpuSharedTextureMemoryIsDeviceLost",
+    "wgpuSharedTextureMemoryRelease",
+]
+
+
 def windows_dawn(clang, dawn):
     """Put Dawn's C++ initialization behind the Windows DLL CRT entry point.
 
@@ -37,6 +56,7 @@ def windows_dawn(clang, dawn):
     Run from an x64 Visual Studio developer shell with the Windows SDK installed.
     """
     symbols = re.findall(r'extern "C" fn (wgpu\w+)\(', (ROOT / "sys/src/generated_webgpu.silk").read_text(encoding="utf-8"))
+    symbols += DAWN_EXTENSION_EXPORTS
     definition = "EXPORTS\n" + "\n".join(sorted(set(symbols))) + "\n"
     identity = repr((str(clang), clang.stat().st_mtime_ns, str(dawn), os.environ.get("LIB")))
     key = hashlib.sha256((definition + identity).encode()).hexdigest()[:20]

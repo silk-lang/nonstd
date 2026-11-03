@@ -36,7 +36,9 @@ run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 2.0, time: 0.0 }
   size unless styled), input (an editable text field, see [Text editing](#text-editing)) and
   canvas (fill and stroke path commands in the node's content box) and hosted (a box whose
   content the host draws itself, such as a web view: `hostedPlacements` says where each one is
-  after a frame, clipped by its scrolling ancestors; see `platform/webview`).
+  after a frame, clipped by its scrolling ancestors; see `platform/webview`). A hosted node with
+  a view also paints a surface sprite of that view, so a host can draw it as a texture by
+  registering one with `UiRenderer.setSurface`.
 - **Styles** are typed `Property` values. Text properties (family, size, weight, style, line
   height, color, alignment, white space, direction, decoration) inherit; the rest do not. Hover,
   active and focus variants apply over the base style while the node is in that state.
