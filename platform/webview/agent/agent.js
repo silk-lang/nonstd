@@ -1,8 +1,9 @@
 // The page side of agent control, shared by every web view backend.
 //
 // Backends inject this script into the main frame of every page before the page's own scripts
-// run (WKUserScript at document start, WebView2 AddScriptToExecuteOnDocumentCreated, CEF
-// OnContextCreated), then call the functions on `window.__silkAgent` through their script API:
+// run (WKUserScript at document start, the DevTools protocol's addScriptToEvaluateOnNewDocument
+// for WebView2, CEF OnContextCreated), each in a script world of its own where the engine has one,
+// then call the functions on `window.__silkAgent` through their script API:
 //
 //   snapshot()             a text outline of what the page shows, with refs on elements an
 //                          agent can act on ("[ref=e12]")
