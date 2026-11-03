@@ -10,7 +10,7 @@ Packages:
 
 - `ui/app` (`ui-app`): the builder (`ui.silk`), the diff (`diff.silk`), the app contract
   (`app.silk`), the runtime (`runtime.silk`), headless driving for tests (`harness.silk`) and
-  loop helpers (`seq.silk`).
+  loop helpers (`seq.silk`), and commands on fibers (`tasks.silk`).
 - `ui/app/window` (`ui-app-window`): `runWindow`, the loop that runs an app in a native window
   through [platform/window](../../platform/window) and [ui_renderer](../../graphics/ui_renderer).
 - `ui/app/examples`: a counter and a todo list. `ui/app/demo` runs the todo list in a window.
@@ -52,7 +52,31 @@ run tick(&mut runtime, &mut tree, now, true) // timers and frames due at `now`
 implements `Perform<M, E, ? R>`: `perform` is the only effectful code in an app, and its
 failures `E` and requirements `R` (a store, the network, a clock) are provided once where the app
 runs, so a test swaps them. `examples/src/todo.silk` saves through a `Store` service this way,
-and the tests give it a memory store.
+and the tests give it a memory store. `perform` takes the command by value, so a command can
+move what it carries into the work.
+
+## Commands on fibers
+
+By default a command runs synchronously, right after the update that made it, and its message
+is handled next. A loop that runs inside a scheduler (`LocalScheduler.execute`) can run them on
+fibers instead, so a slow command does not hold up input and frames:
+
+```silk
+runtime.deferCommands()                // drain keeps commands instead of performing them
+let mut tasks = Tasks<Message, E>.make()
+while running {
+  run pump(&mut runtime, &mut tree)
+  run tasks.launch(&mut runtime)       // each waiting command starts on its own fiber
+  run Fiber.yieldNow()
+  if (run tasks.collect(&mut runtime)) != 0 { // finished commands' messages, in finish order
+    run drain(&mut runtime, &mut tree)
+  }
+}
+```
+
+A fiber can only use the Scheduler and the clock, so these commands implement
+`Perform<M, E ? &mut Scheduler | &mut MonotonicClock>` and own what they need (a `Shared<Store>`,
+not a borrowed one). `tasks.collect` raises a command's error, or `Cancelled`.
 
 ## Views
 
@@ -117,9 +141,9 @@ real window on X11 and Wayland, clicks Add and compares a frame.
 
 ## Limits
 
-- Commands run in order, synchronously, right after the update that made them, and their
-  message is handled next. Running them on fibers needs a way to hand a result back to the loop
-  (a channel or poll) that std does not have yet. There is no cancellation by key.
+- `runWindow` performs commands synchronously, so a slow command holds up the window. A loop
+  that runs inside a scheduler can run them on fibers with `Tasks` (above). There is no
+  cancellation by key.
 - There is no `ui.map` for embedding a child app with its own message type, and no custom
   subscription kind.
 - Text editing in `input` comes with ui-tree T5; `onInput` is wired but nothing fires it yet.
@@ -127,8 +151,7 @@ real window on X11 and Wayland, clicks Add and compares a frame.
   reused; open a node inside `lazy` instead.
 - Two items with the same key under one parent: the second gets a new node each render.
 - Running out of memory traps.
-- Compiler limits shape the API (Silk dev.45): effect lambdas cannot nest, and an effect op of a
-  generic interface cannot take an owned value of the type parameter. So `view` and `update` are
-  plain functions that allocate through `ui.alloc` and `cx.alloc`, and `perform` takes
-  `&Self`. Lifting either limit would let `view` and `update` be effect functions and
-  `perform` take the command by value.
+- `view` and `update` are plain functions that allocate through `ui.alloc` and `cx.alloc`, so
+  running out of memory traps instead of failing with a typed error. Effect builders would need
+  `run` on every call (`run ui.row(effect |ui| {...})`, with bodies typed
+  `for<'call> fn(&'call mut Ui<M>) -> mut Effect<'call; ...>`), so plain functions were kept.
