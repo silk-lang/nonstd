@@ -11,8 +11,8 @@ theme, and can be inspected and driven by tests, the devtools window and agents.
 Packages:
 
 - `ui/notes` (`ui-notes`): the app as a library: `notes` (model, messages, `update`, `view`,
-  subscriptions, the `Save` command and the `Store` service), `format` (the notes file as JSON)
-  and `text` (word counts, search matching, previews).
+  subscriptions, the `Save` command and the `Store` service), `look` (palette and icons),
+  `format` (the notes file as JSON) and `text` (word counts, search matching, previews).
 - `ui/notes/app` (`ui-notes-app`): the window. It reads and writes the notes file and serves the
   inspector in debug builds.
 - `ui/notes/tests`: scripted tests through the real tree, and `describe` and PNG goldens.
@@ -37,7 +37,7 @@ that is not a notes file is left alone: the app says so and exits.
 | Ctrl+F, Cmd+F | the search field; Enter opens the first match, Escape clears the search |
 | Ctrl+S, Cmd+S | save now |
 | Up, Down, Home, End | in the list, move the selection |
-| Tab, Shift+Tab | through the toolbar, search, sort, list, title, Note menu and body |
+| Tab, Shift+Tab | through the sidebar (search, New note, Sort, the list, Dark mode), then the Note menu, title and body |
 
 To look inside it while it runs, start it with the devtools window next to it:
 
@@ -59,7 +59,12 @@ which note is selected (by id, so it survives sorting and filtering), the search
 order, the state of the Note menu, the Sort select and the delete dialog, and the save
 bookkeeping: `revision` counts changes, `savedRevision` is the one the store last confirmed.
 
-**View.** A toolbar over two panes. The list shows `visible()`: the notes matching the search,
+**Look.** A document-first design in the spirit of Notion: a warm gray sidebar of flat rows
+with line icons (drawn as canvas nodes), and a borderless page with a breadcrumb bar, a large
+title and the body in a centered column. The palette, for light and dark, is in `look.silk`,
+as a ui-components `Theme` plus a few sidebar colors.
+
+**View.** A sidebar and a page. The list shows `visible()`: the notes matching the search,
 pinned first, then by the sort order. It is computed from the model on every render and never
 stored, so it cannot go stale. Each row is keyed by its note's id, so the tree keeps a row's
 node, hover and scroll state when notes move. The editor's title and body are controlled inputs:
@@ -106,9 +111,10 @@ the devtools exit test in `ui-inspect.yml`.
 
 ## What it found
 
-Building a real app on the stack turned up one gap, fixed here: a menu whose button sits at the
-right edge of the window opened its list past the edge. `MenuState.endAligned()` makes a menu
-whose list lines up with the button's right edge instead (ui-components).
+Building a real app on the stack turned up two gaps in ui-components, fixed here: a menu whose
+button sits at the right edge of the window opened its list past the edge
+(`MenuState.endAligned()` lines the list up with the button's right edge), and a menu button
+could only have the bordered look (`.ghosted()` gives it the quiet ghost look for toolbars).
 
 ## Limits
 

@@ -53,7 +53,8 @@ Components with more state keep it in a small struct the app stores in its model
 
 - [`MenuState`](src/menu.silk) for `menu` and `select`, with a `MenuMessage` union and
   `update`, which returns the chosen item (`MenuState.endAligned()` for a menu at the right edge
-  of the window, whose list lines up with the button's right edge):
+  of the window, whose list lines up with the button's right edge, and `.ghosted()` for a
+  borderless button in a toolbar):
 
   ```silk
   menu(&mut ui, &theme, FILE, &self.fileMenu, "File", &COMMANDS, |m| Message.File { message: m })

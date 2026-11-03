@@ -89,7 +89,7 @@ python3 ui/inspect/devtools/scripts/devtools check
   [notes app](../../notes) (with a fresh notes file) and the devtools window under Xvfb and
   drives the devtools through their own inspector socket with ui-inspect-cli: it waits for the
   New note button's row, clicks it, checks the notes app highlights the button and the styles
-  panel shows `padding-left: 12px`, opens the box model, clicks New note in the notes app, finds
+  panel shows `padding-left: 8px`, opens the box model, clicks New note in the notes app, finds
   the click in the event log and the new count in the element tree, and checks the app saved the
   note to its file. Screenshots of both windows are left in `.cache/ui-devtools/`.
 
