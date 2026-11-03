@@ -184,9 +184,16 @@ pixel readback, per-pixel conversion, or a WASM staging buffer. The browser's in
 webfonts before creating text. `fontFamily`, numeric `fontWeight`, `fontSize`, and `fill` control
 the raster. Width/height changes stretch the line without reflowing it.
 
+Small labels (up to 12 px with compact measured bounds) reserve a four-times-natural-size
+raster while an 8-megapixel warm-cache budget permits. Their larger rasters survive zoom-out
+while total text storage stays below a 16-megapixel trimming threshold. This avoids repeated
+bulk uploads when zooming between an overview and readable cards; it does not cap requested
+zoom-in quality. Other text retains the ordinary shrink hysteresis. Text visibility uses cached
+64-element bounds blocks, invalidated by geometry, visibility, content and history changes.
+
 Before each render, visible text selects raster density from **element width/height × camera zoom
 × device pixel ratio**. The target is at least two raster samples per displayed pixel, rounded up
-to power-of-two density buckets independently on each axis. A fourfold reduction is needed to
+to power-of-two density buckets independently on each axis. For rasters eligible for trimming, a fourfold reduction is needed to
 shrink an axis, which avoids repeated uploads around bucket boundaries. Panning and unchanged
 frames reuse ordinary whole-run rasters. Offscreen/hidden text does not rerasterize until visible again.
 Explicit `resize(width, height, pixelRatio)` updates density when device scale changes.

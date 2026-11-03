@@ -48,3 +48,28 @@ export async function runImageContracts(Editor, wasm) {
     return { comparisons, sourceImages: editor.diagnostics.imageSources, layers: editor.size };
   } finally { editor.destroy(); canvas.remove(); assert(editor.diagnostics.gpuHandles === 0, 'Image rendering releases GPU handles'); }
 }
+
+/** Overlapping images must keep painter order without allocating a binding per batch. */
+export async function runImageBatchContracts(Editor, wasm) {
+  const canvas = document.createElement('canvas');
+  canvas.style.cssText = 'position:fixed;left:-1000px;width:80px;height:60px';
+  document.body.append(canvas);
+  const editor = await Editor.create({ canvas, wasm, autoRender: false, pixelRatio: 1 });
+  const source = document.createElement('canvas'); source.width = source.height = 2046;
+  const paint = source.getContext('2d');
+  const original = GPUDevice.prototype.createBindGroup;
+  let bindings = 0;
+  try {
+    paint.fillStyle = '#ff0000'; paint.fillRect(0, 0, 2046, 2046); editor.registerImage('red', source);
+    paint.fillStyle = '#0000ff'; paint.fillRect(0, 0, 2046, 2046); editor.registerImage('blue', source);
+    editor.batch(() => { for (let i = 0; i < 100; i++) editor.rect({ image: i % 2 ? 'blue' : 'red', x: 0, y: 0, width: 80, height: 60, fill: '#ffffff' }); });
+    GPUDevice.prototype.createBindGroup = function(...args) { bindings++; return original.apply(this, args); };
+    editor.render();
+    const copy = document.createElement('canvas'); copy.width = 80; copy.height = 60;
+    const ctx = copy.getContext('2d'); ctx.drawImage(canvas, 0, 0);
+    const pixel = Array.from(ctx.getImageData(40, 30, 1, 1).data);
+    if (editor.stats.batches !== 100 || bindings > 2 || pixel[2] !== 255 || pixel[0] !== 0)
+      throw new Error(`Image order/binding regression: ${JSON.stringify({ batches: editor.stats.batches, bindings, pixel })}`);
+    return { batches: editor.stats.batches, bindings, pixel };
+  } finally { GPUDevice.prototype.createBindGroup = original; editor.destroy(); canvas.remove(); source.width = source.height = 0; }
+}

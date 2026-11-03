@@ -108,6 +108,17 @@ export async function runTextContracts() {
     editor.update(cachedId, { type: 'rect' }); editor.render(); editor.undo(); editor.render();
     check(editor.get(cachedId).type === 'text' && editor.get(offscreen).type === 'text',
       'Remove and type-conversion undo restore text after preparation caching');
+    editor.load({ version: 1, elements: [] }); editor.setViewport({ x: 0, y: 0, zoom: .03 });
+    const small = editor.text('small label', { x: 2, y: 2, fontSize: 7 }); editor.render();
+    const warm = calls.length;
+    for (const zoom of [.06, .12, .25, .5, 1, .03]) { editor.setViewport({ zoom }); editor.render(); }
+    check(calls.length === warm, 'Small labels retain a useful raster across overview-to-reading zoom');
+    editor.setViewport({ zoom: 8 }); editor.render(); const grown = calls.length;
+    const pixels = editor.diagnostics.textPixels;
+    editor.setViewport({ zoom: .03 }); editor.render(); editor.setViewport({ zoom: 8 }); editor.render();
+    check(calls.length === grown && editor.diagnostics.textPixels === pixels,
+      'A bounded small-label raster is reused when zooming out and back in');
+    editor.update(small, { hidden: true }); editor.render(); editor.remove(small); editor.render(); editor.undo(); editor.render();
     check(readbacks === 0, 'Text uploads never synchronously read pixels back into JavaScript');
     await editor.flush();
     return { passed };

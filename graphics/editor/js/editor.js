@@ -88,7 +88,7 @@ const densityBucket = ratio => 2 ** Math.ceil(Math.log2(Math.max(Number.MIN_VALU
 export class Editor extends EventTarget {
   #host; #token; #lastId = 0; #nodes = new Map(); #selection = new Set(); #frame = 0;
   #dead = false; #transaction = null; #undo = []; #redo = []; #replaying = false;
-  #textCanvas; #uploadCanvas; #textPreparation;
+  #textCanvas; #uploadCanvas; #textPreparation; #textBlocks; #textPixels = 0; #textWarmPixels = 0;
   #images = new Map();
   #textTiles = new Map(); #textNodes = new Map(); #textViews = new Map(); #textViewPool = []; #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
   #observer; #cleanups = []; #camera = { x: 0, y: 0, zoom: 1 }; #autoRender;
@@ -163,7 +163,7 @@ export class Editor extends EventTarget {
     wasmBytes: this.#host?.exports?.memory.buffer.byteLength ?? 0, textRuns: this.#textTiles.size,
     textRasterizations: this.#textRasterizations, imageSources: this.#images.size,
     textAtlasTiles: this.#token && !this.#dead ? this.#call('editor_image_count') : 0,
-    textPixels: [...this.#textTiles.values(), ...this.#textViews.values()].reduce((sum, entry) => sum + entry.width * entry.height, 0),
+    textPixels: this.#textPixels,
     limitedTextRuns: [...this.#textTiles.values(), ...this.#textViews.values()].filter(entry => entry.limited).length, destroyed: this.#dead }); }
   get size() { return this.#nodes.size; }
   get viewport() { return { ...this.#camera, width: this.#width, height: this.#height, pixelRatio: this.#scale }; }
@@ -178,7 +178,7 @@ export class Editor extends EventTarget {
     for (let id = 1; id <= this.#lastId; id++) { const node = this.#nodes.get(id); if (node) yield node; }
   }
   #write(id, n) {
-    this.#textPreparation = null;
+    this.#textPreparation = null; this.#textBlocks = null;
     const text = n.type === 'text' ? this.#textKind(n) : null;
     const image = n.image ? this.#images.get(n.image) : null;
     if (n.image && !image) throw new Error(`Image is not registered: ${n.image}`);
@@ -207,15 +207,22 @@ export class Editor extends EventTarget {
   }
   #textSize(n, entry) {
     const scale = this.#camera.zoom * this.#scale * 2;
-    return { width: Math.max(1, Math.ceil(entry.layout.width * densityBucket(n.width * scale / entry.layout.width))),
-      height: Math.max(1, Math.ceil(entry.layout.height * densityBucket(n.height * scale / entry.layout.height))) };
+    return { width: Math.max(entry.minWidth || 1, Math.ceil(entry.layout.width * densityBucket(n.width * scale / entry.layout.width))),
+      height: Math.max(entry.minHeight || 1, Math.ceil(entry.layout.height * densityBucket(n.height * scale / entry.layout.height))) };
   }
   #textKind(n) {
     const key = JSON.stringify([n.text, n.fontSize, n.fontFamily, n.fontWeight, n.fill]);
     const cached = this.#textTiles.get(key); if (cached) return cached;
     if (this.#textTiles.size >= 4096) throw new RangeError('Text cache limit reached (4096 text styles per editor)');
     const entry = { kind: 0, layout: measureText(n), text: n.text, fill: n.fill, width: 0, height: 0, limited: false, failedSize: '', failedRevision: -1 };
-    const size = this.#textVisible(n) ? this.#textSize(n, entry) : { width: 1, height: 1 };
+    // Reserve a bounded, useful raster floor for small labels. Overview text can
+    // then zoom into normal reading sizes without hundreds of simultaneous uploads.
+    const warmWidth = Math.ceil(entry.layout.width * 4), warmHeight = Math.ceil(entry.layout.height * 4);
+    if (n.fontSize <= 12 && entry.layout.width <= 256 && entry.layout.height <= 32 && this.#textWarmPixels + warmWidth * warmHeight <= 8 * 1024 * 1024) {
+      entry.minWidth = warmWidth; entry.minHeight = warmHeight;
+      this.#textWarmPixels += warmWidth * warmHeight;
+    }
+    const size = this.#textVisible(n) ? this.#textSize(n, entry) : { width: entry.minWidth || 1, height: entry.minHeight || 1 };
     // Keep a modest whole-run fallback; high zoom gets a separate visible-window raster.
     const initial = boundedTextSize(size.width, size.height);
     this.#rasterText(entry, initial.limited ? boundedTextSize(entry.layout.width, entry.layout.height) : initial);
@@ -248,6 +255,7 @@ export class Editor extends EventTarget {
       // A failed replacement leaves the old tile intact. Do not retry this size every frame.
       entry.failedSize = key; entry.failedRevision = this.#textAtlasRevision; entry.limited = true; return false;
     }
+    this.#textPixels += size.width * size.height - entry.width * entry.height;
     entry.kind = kind; entry.width = size.width; entry.height = size.height; entry.failedSize = '';
     if (size.view) this.#call('editor_image_view', kind, view.x, view.y, view.width, view.height);
     entry.view = size.view; entry.radius = size.radius; entry.rasterLimited = size.limited;
@@ -258,6 +266,7 @@ export class Editor extends EventTarget {
     const base = this.#textNodes.get(id);
     if (base) this.#call('editor_image_node', id, base.kind);
     if (entry.width) { this.#call('editor_image_release', entry.kind); this.#textAtlasRevision++; }
+    this.#textPixels -= entry.width * entry.height;
     this.#textViews.delete(id); this.#textViewPool.push(entry.kind);
   }
   #prepareTextView(id, n, base) {
@@ -313,13 +322,33 @@ export class Editor extends EventTarget {
       if (entry.limited || n.x < v.x || n.y < v.y || n.x + n.width > right || n.y + n.height > bottom) return;
       p.left = Math.min(p.left, n.x); p.top = Math.min(p.top, n.y);
       p.right = Math.max(p.right, n.x + n.width); p.bottom = Math.max(p.bottom, n.y + n.height);
-      // The whole scene must remain visible, with 2–8 raster samples per physical pixel.
-      // This conservative interval avoids both undersampling and retaining excessive density.
-      p.minScale = Math.max(p.minScale, entry.width / (n.width * 8), entry.height / (n.height * 8));
+      // The whole scene must remain visible with sufficient density. Small-label
+      // rasters may retain extra samples while the cache stays below its trim threshold.
+      if (!entry.minWidth || this.#textPixels > 16 * 1024 * 1024) p.minScale = Math.max(p.minScale, entry.width / (n.width * 8), entry.height / (n.height * 8));
       p.maxScale = Math.min(p.maxScale, entry.width / (n.width * 2), entry.height / (n.height * 2));
     }
     this.#textPreparation = p;
     if (!this.#preparedTextFits()) this.#textPreparation = null;
+  }
+  *#visibleText() {
+    if (!this.#textBlocks) {
+      const blocks = []; let block;
+      for (const [id, entry] of this.#textNodes) {
+        const n = this.#nodes.get(id); if (!n || n.hidden) continue;
+        if (!block || block.items.length === 64) {
+          block = { items: [], x: Infinity, y: Infinity, right: -Infinity, bottom: -Infinity }; blocks.push(block);
+        }
+        block.items.push([id, entry, n]);
+        block.x = Math.min(block.x, n.x); block.y = Math.min(block.y, n.y);
+        block.right = Math.max(block.right, n.x + n.width); block.bottom = Math.max(block.bottom, n.y + n.height);
+      }
+      this.#textBlocks = blocks;
+    }
+    const v = this.#camera, right = v.x + this.#width / v.zoom, bottom = v.y + this.#height / v.zoom;
+    for (const block of this.#textBlocks) {
+      if (block.right <= v.x || block.bottom <= v.y || block.x >= right || block.y >= bottom) continue;
+      for (const item of block.items) if (this.#textVisible(item[2])) yield item;
+    }
   }
   #prepareText() {
     if (this.#preparedTextFits()) return;
@@ -331,11 +360,10 @@ export class Editor extends EventTarget {
     }
     if (!this.#textNodes.size) return;
     const requests = new Map();
-    for (const [id, entry] of this.#textNodes) {
+    for (const [id, entry, n] of this.#visibleText()) {
       // Identically sized copies share one raster request. Avoid measuring and
       // quantizing all 100k instances once a visible representative requested it.
       if (entry.uniform && requests.has(entry)) continue;
-      const n = this.#nodes.get(id); if (!n || !this.#textVisible(n)) continue;
       const size = this.#textSize(n, entry), prior = requests.get(entry);
       if (boundedTextSize(size.width, size.height).limited) {
         this.#prepareTextView(id, n, entry); continue;
@@ -346,8 +374,9 @@ export class Editor extends EventTarget {
     for (const [entry, requested] of requests) {
       const size = boundedTextSize(requested.width, requested.height);
       // Grow as soon as needed; shrink only after a fourfold drop to avoid bucket oscillation.
-      const width = size.width > entry.width || size.width * 4 <= entry.width ? size.width : entry.width;
-      const height = size.height > entry.height || size.height * 4 <= entry.height ? size.height : entry.height;
+      const trim = !entry.minWidth || this.#textPixels > 16 * 1024 * 1024;
+      const width = size.width > entry.width || (trim && size.width * 4 <= entry.width) ? size.width : entry.width;
+      const height = size.height > entry.height || (trim && size.height * 4 <= entry.height) ? size.height : entry.height;
       const target = boundedTextSize(width, height); target.limited ||= size.limited;
       if (target.width !== entry.width || target.height !== entry.height) this.#rasterText(entry, target);
       else entry.limited = target.limited;
@@ -410,7 +439,7 @@ export class Editor extends EventTarget {
   remove(id) {
     this.#assert(); const before = this.#nodes.get(id);
     if (!before) return false;
-    this.#textPreparation = null; this.#call('editor_remove', id); this.#nodes.delete(id); this.#textNodes.delete(id); this.#record(id, before, undefined);
+    this.#textPreparation = null; this.#textBlocks = null; this.#call('editor_remove', id); this.#nodes.delete(id); this.#textNodes.delete(id); this.#record(id, before, undefined);
     if (this.#selection.has(id)) this.select(this.selection.filter(value => value !== id));
     this.invalidate(); return true;
   }
@@ -445,7 +474,7 @@ export class Editor extends EventTarget {
       for (const change of changes) {
         const value = change[side];
         if (value) { this.#write(change.id, value); this.#nodes.set(change.id, value); }
-        else { this.#textPreparation = null; this.#call('editor_remove', change.id); this.#nodes.delete(change.id); this.#textNodes.delete(change.id); }
+        else { this.#textPreparation = null; this.#textBlocks = null; this.#call('editor_remove', change.id); this.#nodes.delete(change.id); this.#textNodes.delete(change.id); }
       }
     } finally { this.#replaying = false; }
     this.select(this.selection.filter(id => this.#nodes.has(id)));
@@ -535,7 +564,7 @@ export class Editor extends EventTarget {
     this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear(); this.#images.clear();
     this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear(); this.#textViews.clear(); this.#textViewPool.length = 0;
     if (this.#textCanvas) this.#textCanvas.width = this.#textCanvas.height = 0;
-    this.#textCanvas = this.#uploadCanvas = this.#textPreparation = null;
+    this.#textCanvas = this.#uploadCanvas = this.#textPreparation = this.#textBlocks = null; this.#textPixels = this.#textWarmPixels = 0;
     this.emit('destroy', {});
   }
 }
