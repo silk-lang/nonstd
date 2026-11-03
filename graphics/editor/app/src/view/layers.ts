@@ -1,5 +1,6 @@
 import type { Html } from 'foldkit/html'
 import { currentPage, type Node } from '../document'
+import { selectionSet } from '../hierarchy'
 import { icon } from '../icons'
 import { Messages, type Model } from '../model'
 import { empty, label, button, type H } from './common'
@@ -55,15 +56,14 @@ const flagButton = (h: H, n: Node, flag: 'hidden' | 'locked'): Html => {
 }
 const layerRow = (m: Model, h: H, row: LayerRow, index: number): Html => {
   const n = row.node
+  const selected = selectionSet(m.selection).has(n.id)
   return h.div(
     [
       h.Key(n.id),
-      h.Class(
-        `layer-row ${m.selection.includes(n.id) ? 'selected-layer' : ''} ${n.hidden ? 'hidden-layer' : ''}`,
-      ),
+      h.Class(`layer-row ${selected ? 'selected-layer' : ''} ${n.hidden ? 'hidden-layer' : ''}`),
       h.Style({ top: `${index * 32}px`, paddingLeft: `${8 + Math.min(row.depth, 6) * 12}px` }),
       h.Role('treeitem'),
-      h.AriaSelected(m.selection.includes(n.id)),
+      h.AriaSelected(selected),
       h.AriaLevel(row.depth + 1),
     ],
     [

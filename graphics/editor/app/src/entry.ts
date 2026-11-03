@@ -8,6 +8,8 @@ const application = Runtime.makeApplication({
   init,
   update,
   view,
+  // Recording large selection diffs is expensive; opt in when debugging state.
+  devTools: new URLSearchParams(location.search).has('debug') ? { show: 'Always' } : false,
   container: document.querySelector('#root'),
 })
 Runtime.run(application)

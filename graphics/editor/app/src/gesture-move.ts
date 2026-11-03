@@ -1,7 +1,8 @@
 import { resizeBounds } from './resize'
+import { marqueeSelection } from './marquee'
 import { selectionRoots } from './hierarchy'
 import { currentPage, descendants, replaceNodes, type Node } from './document'
-import { boundsOf, effectiveFlag, intersects, round, worldPoint, type Bounds } from './geometry'
+import { boundsOf, effectiveFlag, round, worldPoint, type Bounds } from './geometry'
 import { type Gesture, type Model, type Pointer } from './model'
 import { groupBounds, markChanged } from './state'
 
@@ -55,16 +56,7 @@ const marqueeMove = (m: Model, p: Pointer, g: Gesture, dx: number, dy: number): 
     height: Math.abs(dy),
   }
   const nodes = currentPage(m.document).nodes
-  const found = nodes
-    .filter(
-      (n) =>
-        n.kind !== 'frame' &&
-        !effectiveFlag(n, nodes, 'hidden') &&
-        !effectiveFlag(n, nodes, 'locked') &&
-        intersects(n, area),
-    )
-    .map((n) => n.id)
-  return { ...m, gesture: g, selection: [...new Set([...(p.shift ? g.selection : []), ...found])] }
+  return { ...m, gesture: g, selection: marqueeSelection(nodes, area, p.shift ? g.selection : []) }
 }
 const drawMove = (m: Model, p: Pointer, g: Gesture, dx: number, dy: number): Model => {
   const start = worldPoint(g.start, g.camera)

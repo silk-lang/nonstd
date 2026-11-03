@@ -17,6 +17,8 @@ Open **http://localhost:5173** in a WebGPU-capable browser. The LLVM path above 
 
 `bun run build` produces a static app in `dist/`. Serve it from the root of an HTTPS origin, or localhost. There is no application backend, account, or cloud dependency.
 
+Development dependencies run without their HMR hooks. This avoids Foldkit serializing the entire canvas and undo history over Vite's socket; Studio restores saved documents from IndexedDB after a source reload. Application source still reloads normally. Foldkit's automatic development model freezing is also inactive on this path; strict readonly types and snapshot tests guard immutability. Add `?debug` to opt into Foldkit's state recorder when investigating model changes; recording large selection diffs adds substantial overhead.
+
 ## Use the workspace
 
 Start with the included composition, or choose **File → New document**. Draw rectangles, ellipses, frames, and single-line text. Select layers on the canvas or in the searchable layer tree; Shift-click adds or removes selections. Drag to move, use the eight handles to resize, or enter geometry in the inspector. Shift constrains proportions. Smart guides snap edges and centers; Alt bypasses snapping and duplicates when starting a drag.
@@ -51,7 +53,9 @@ The in-app shortcut reference includes the remaining controls. Clipboard operati
 bun run check        # Oxfmt, strict type-aware Oxlint, Effect diagnostics, TypeScript 7
 bun run test         # Model, undo, hierarchy, import, export, and resize contracts
 bun run test:browser # Real Chrome workflows, persistence, and export recovery
-bun run bench        # 10k / 100k visible text layers, zoom frame intervals
+bun run bench        # Text overview zoom and 100k-rectangle marquee frame intervals
+bun run bench --grep '100k rectangles' # Selection benchmark only
+bun run bench:selection:cpu # Reducer and shared selection calculations, without rendering
 bun run build
 ```
 
@@ -60,6 +64,10 @@ Browser tests use installed Google Chrome with WebGPU enabled. Playwright writes
 The [recorded run](benchmarks/overview.json) reached approximately 16.7 ms median and 16.8 ms p95 frame intervals at both sizes. Cold loading and the warm-up are reported separately as `settledMs`; they took about 3.4 s and 7.0 s in that run. This is a reproducible workload, not a general claim about every design or a new comparison with Figma. Distinct glyphs, large text, effects, hardware, and browsers change the workload substantially.
 
 Layer rows are virtualized. Hierarchy indexes, paint order, and layer-tree rows reuse immutable document references across viewport changes. Camera-only changes preserve the native scene. The interface does not create one DOM element per drawing element.
+
+For selection stress testing, choose **Commands → Add 100k rectangles**. The marquee benchmark keeps all 100,000 rectangles visible, sweeps twice between small and large selections, and verifies live updates reaching over 85,000 selected items. It also holds the gesture idle to catch accidental development reloads. The first ten frame intervals are reported separately from steady state. The dedicated benchmark fails if p95 exceeds 25 ms or 1.5× idle p95, whichever is greater. This is a machine-dependent performance guard, separate from the ordinary browser suite.
+
+The [selection results](benchmarks/selection.json) separate CPU calculations from browser frame intervals and development-tool overhead. Selection queries reuse eligibility by immutable document reference, share membership and root calculations across views, and reuse the nodes found by the marquee scan. Changing geometry, hierarchy, visibility, or lock state creates a new reference and invalidates the corresponding derived data. Shift-selection still unions with the gesture's original selection; cancellation and undo retain their original snapshots.
 
 ## Current boundaries
 
