@@ -4,6 +4,11 @@
 //! (through [`WebViewApp.webViewMessage`], usually wrapping a [`PageMessage`]). After each frame
 //! it places each open view on its hosted node, and hides views whose node is gone.
 //!
+//! It also serves the inspector's `webview_*` host tools (ui-inspect-mcp), so an agent outside
+//! the app reads and drives the same pages: the calls map onto web view commands the way
+//! [`tools.map`] maps the in-app agent's, with request numbers of their own, and their answers
+//! go back to the inspector instead of the app.
+//!
 //! ```silk,ignore
 //! impl WebViewApp<Message> for Browser {
 //!   fn webViewRequests(self: &mut Self) -> &mut WebViewRequests { return &mut self.requests }
@@ -17,11 +22,13 @@
 import backend { WindowBackend }
 import page { PageMessage }
 import requests { WebViewRequests, Request }
+import tools { Wait, Settled, map, settle, answers }
 import webview.command { Command, commandName, requestOf }
 import webview.event { WebViewEvent, EventKind }
 import webview.host { WebViewHost }
 import webview.types { WebViewOptions, WebViewError, Placement }
 import ui_app_window.lib { WindowHost }
+import ui_inspect_server.lib { HostJobs, HostJob }
 import ui_tree.hosted { HostedPlacement, hostedPlacements }
 import ui_tree.lib { UiTree }
 import ui_renderer.renderer { UiRenderer }
@@ -32,8 +39,42 @@ import webgpu.runtime { Device, GpuError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
+import silk.core.ownership { Copy }
+import silk.num.u32
+import silk.num.u64
+
+/// The request numbers of the host's own commands start here (an app's start at 1).
+const HOST_REQUESTS: u32 = 2147483648
+
+/// What the host knows of an open view, for `webview_list`.
+struct ViewState {
+  view: u32,
+  url: String,
+  title: String,
+  loading: bool,
+}
+
+/// A host tool call waiting for its answer event.
+struct HostCall {
+  ticket: u64,
+  view: u32,
+  request: u32,
+  wait: Wait,
+}
+
+impl Copy for HostCall {}
+
+/// A host tool call's result, waiting to go back to the inspector.
+struct Finished {
+  ticket: u64,
+  ok: bool,
+  text: String,
+}
 
 /// What a model that shows web views gives the host.
 pub interface WebViewApp<M> {
@@ -56,6 +97,10 @@ pub struct WebViewsHost<B, A, M> {
   events: List<WebViewEvent>,
   /// Events the host makes itself (a refused open or command), queued for the next poll.
   own: List<WebViewEvent>,
+  states: List<ViewState>,
+  calls: List<HostCall>,
+  finished: List<Finished>,
+  nextRequest: u32,
   /// Names `A` and `M` in the type (the host never stores either).
   model: Option<A>,
   message: Option<M>,
@@ -71,6 +116,10 @@ impl<B, A, M> WebViewsHost<B, A, M> {
       placements: List<HostedPlacement>.make(),
       events: List<WebViewEvent>.make(),
       own: List<WebViewEvent>.make(),
+      states: List<ViewState>.make(),
+      calls: List<HostCall>.make(),
+      finished: List<Finished>.make(),
+      nextRequest: HOST_REQUESTS,
       model: Option<A>.None,
       message: Option<M>.None,
     }
@@ -105,6 +154,14 @@ impl<B: WebViewHost + WindowBackend, A: WebViewApp<M>, M> WebViewsHost<B, A, M> 
         chosen.window = self.window
         if run Effect.catch<WebViewError>(openView(&mut self.views, view, &chosen), refused) {
           run self.open.append(view)
+          run self.states.append(
+            ViewState {
+              view: view,
+              url: run String.copy(String.view(&chosen.url)),
+              title: String.make(),
+              loading: false,
+            },
+          )
         } else {
           let reason = run String.copy("the web view could not be created")
           run self.own.append(
@@ -117,6 +174,7 @@ impl<B: WebViewHost + WindowBackend, A: WebViewApp<M>, M> WebViewsHost<B, A, M> 
         if at < self.open.length() {
           drop self.open.remove(at)
           run self.views.close(view)
+          run self.forget(view)
         }
       }
       Request.Send { view, command } => {
@@ -148,20 +206,229 @@ impl<B: WebViewHost + WindowBackend, A: WebViewApp<M>, M> WebViewsHost<B, A, M> 
     let before = out.length()
     while self.own.length() != 0 {
       let event = self.own.remove(0)
-      run out.append(model.webViewMessage(event.view, PageMessage.Event { event: move event.kind }))
+      run self.route(move event, &mut model, &mut out)
     }
     run self.views.takeEvents(&mut self.events)
     while self.events.length() != 0 {
       let event = self.events.remove(0)
-      if let EventKind.Closed = &event.kind {
-        let at = self.indexOf(event.view)
-        if at < self.open.length() {
-          drop self.open.remove(at)
-        }
-      }
-      run out.append(model.webViewMessage(event.view, PageMessage.Event { event: move event.kind }))
+      run self.route(move event, &mut model, &mut out)
     }
     return out.length() != before
+  }
+
+  /// Notes what `event` says about its view, answers the host calls it settles, and hands it to
+  /// the app unless it answers one of the host's own commands.
+  effect fn route(self: &mut Self, event: WebViewEvent, model: &mut A, out: &mut List<M>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let view = event.view
+    if let EventKind.Closed = &event.kind {
+      let at = self.indexOf(view)
+      if at < self.open.length() {
+        drop self.open.remove(at)
+      }
+      run self.forget(view)
+    }
+    run self.note(view, &event.kind)
+    let mut own = false
+    let mut i: usize = 0
+    while i < self.calls.length() {
+      let call = self.calls.asSlice()[i]
+      if call.view == view {
+        if answers(&event.kind, call.request) {
+          own = true
+        }
+        if let Option<Settled>.Some { value } = run settle(call.wait, call.request, &event.kind) {
+          drop self.calls.remove(i)
+          run self.finished.append(
+            Finished { ticket: call.ticket, ok: !value.error, text: move value.result },
+          )
+          continue
+        }
+      }
+      i = i + 1
+    }
+    if !own {
+      run out.append(model.webViewMessage(view, PageMessage.Event { event: move event.kind }))
+    }
+  }
+
+  /// Keeps the URL, title and loading state of `view` that `webview_list` shows.
+  effect fn note(self: &mut Self, view: u32, kind: &EventKind) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = self.states.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].view == view {
+        match &kind.* {
+          EventKind.LoadStarted { url } => {
+            list[i].loading = true
+            list[i].url = run String.copy(String.view(&url))
+          }
+          EventKind.LoadFinished { url, .. } => {
+            list[i].loading = false
+            list[i].url = run String.copy(String.view(&url))
+          }
+          EventKind.UrlChanged { url } => {
+            list[i].url = run String.copy(String.view(&url))
+          }
+          EventKind.TitleChanged { title } => {
+            list[i].title = run String.copy(String.view(&title))
+          }
+          _ => {}
+        }
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  /// Drops what the host knew of `view`, and fails the host calls waiting on it.
+  effect fn forget(self: &mut Self, view: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.states.length() {
+      if self.states.asSlice()[i].view == view {
+        drop self.states.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    i = 0
+    while i < self.calls.length() {
+      let call = self.calls.asSlice()[i]
+      if call.view == view {
+        drop self.calls.remove(i)
+        run self.finished.append(
+          Finished {
+            ticket: call.ticket,
+            ok: false,
+            text: run String.copy("The web view closed."),
+          },
+        )
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// Answers the finished host calls and takes the inspector's new ones (`WindowHost.serve`;
+  /// tests call it without a window loop).
+  pub effect fn serveJobs(self: &mut Self, jobs: &mut HostJobs) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.finished.length() != 0 {
+      let done = self.finished.remove(0)
+      run jobs.answer(done.ticket, done.ok, String.view(&done.text))
+    }
+    while jobs.waiting() {
+      if let Option<HostJob>.Some { value } = run jobs.take() {
+        run self.start(move value, &mut jobs)
+      }
+    }
+  }
+
+  /// Starts host call `job`: answers it now, or sends its command and waits for the answer.
+  effect fn start(self: &mut Self, job: HostJob, jobs: &mut HostJobs) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let parsed = run Effect.result(Json.parse(String.utf8Bytes(String.view(&job.request))))
+    let request = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run jobs.answer(job.ticket, false, "The host request is not JSON.")
+        return ()
+      }
+    }
+    let tool = Json.field(&request, "tool")
+      |> Json.asString
+      |> Option<string>.unwrapOr("")
+    if tool == "webview_list" {
+      let text = run self.listing()
+      run jobs.answer(job.ticket, true, String.view(&text))
+      return ()
+    }
+    if !String.startsWith(tool, "webview_") {
+      let mut message = run String.copy("This app's web views serve no tool named ")
+      run message.append(tool)
+      run jobs.answer(job.ticket, false, String.view(&message))
+      return ()
+    }
+    if !self.windowOpen || self.open.length() == 0 {
+      run jobs.answer(job.ticket, false, "No web view is open.")
+      return ()
+    }
+    let view = match Json.asU64(Json.field(&request, "view")) {
+      Option<u64>.Some { value } => u64.toU32(value)
+      Option<u64>.None => self.open.asSlice()[0]
+    }
+    if !self.isOpen(view) {
+      run jobs.answer(
+        job.ticket,
+        false,
+        "There is no open web view with this id (see webview_list).",
+      )
+      return ()
+    }
+    let mut name = run String.copy("browser_")
+    run name.append(String.slice(tool, 8, String.byteLength(tool) - 8))
+    let number = self.nextRequest
+    self.nextRequest = if self.nextRequest == 4294967295 {
+      HOST_REQUESTS
+    } else {
+      self.nextRequest + 1
+    }
+    let mapped = run map(String.view(&name), &request, number)
+    if mapped.refused {
+      run jobs.answer(job.ticket, false, String.view(&mapped.result))
+      return ()
+    }
+    if mapped.wait != Wait.None {
+      run self.calls.append(
+        HostCall { ticket: job.ticket, view: view, request: number, wait: mapped.wait },
+      )
+    }
+    if let Option<Command>.Some { value } = move mapped.command {
+      run self.handle(Request.Send { view: view, command: move value })
+    }
+    if let Option<Command>.Some { value } = move mapped.then {
+      run self.handle(Request.Send { view: view, command: move value })
+    }
+    if mapped.wait == Wait.None {
+      run jobs.answer(job.ticket, true, String.view(&mapped.result))
+    }
+  }
+
+  /// `webview_list`'s text: one line per open view.
+  effect fn listing(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = String.make()
+    let list = self.states.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      run text.append("view ")
+      run appendNumber(&mut text, list[i].view)
+      if list[i].loading {
+        run text.append(" (loading)")
+      }
+      run text.append(": ")
+      run text.append(String.view(&list[i].url))
+      if String.byteLength(String.view(&list[i].title)) != 0 {
+        run text.append(" \"")
+        run text.append(String.view(&list[i].title))
+        run text.append("\"")
+      }
+      run text.append("\n")
+      i = i + 1
+    }
+    if list.length == 0 {
+      run text.append("No web view is open.")
+    }
+    return move text
   }
 
   /// Places every open view on its hosted node in `tree`, and hides the ones with no node.
@@ -254,6 +521,23 @@ impl<A: WebViewApp<M>, M, B: WebViewHost + WindowBackend> WindowHost<A, M> for W
   fn exitCode(self: &Self) -> Option<i32> {
     return Option<i32>.None
   }
+
+  effect fn serve(self: &mut Self, jobs: &mut HostJobs) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.serveJobs(&mut jobs)
+  }
+}
+
+effect fn appendNumber(out: &mut String, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendNumber(&mut out, value / 10)
+  }
+  let digits = "0123456789"
+  let at = u32.toUsize(value % 10)
+  run out.append(String.slice(digits, at, 1))
 }
 
 effect fn openView<B: WebViewHost>(views: &mut B, view: u32, options: &WebViewOptions) -> bool

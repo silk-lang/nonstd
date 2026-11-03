@@ -79,6 +79,16 @@ ui-app-window's `WindowHost` has the hooks for that: `input` (a window event bef
 `present` (before each draw), `cursor`, `wantsFrame` and `nextTurn`. Native child views ignore
 them.
 
+## Agents outside the app
+
+`WebViewsHost` also serves the inspector's `webview_*` host tools, so ui-inspect-mcp (or any
+inspector client) reads and drives the app's pages while the app runs with `SILK_UI_INSPECT`
+set: `webview_list`, `webview_snapshot`, `webview_navigate`, `webview_click`, `webview_type`,
+`webview_press_key`, `webview_scroll`, `webview_back` and `webview_evaluate`. They map onto web
+view commands with `tools.map`, the same mapping ui-webview-agent's in-app agent uses. Their
+commands carry request numbers from 2^31 up, and their answers go back to the inspector
+instead of the app; load and title changes still reach the app's `Page`.
+
 ## Build and test
 
 ```sh

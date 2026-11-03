@@ -1,0 +1,184 @@
+//! Host jobs: inspector requests that the app's window host answers instead of the tree, such
+//! as the web view tools (`webview_snapshot`, `webview_click`, ...) a ui-webview host serves.
+//!
+//! A `host` request (`{"cmd":"host","tool":"webview_click","ref":"e3"}`) becomes a job with a
+//! ticket, and the reply says it is pending with that ticket. The host takes the job between
+//! frames ([`HostJobs.take`]), works on it for as long as it needs (a page load, an answer from
+//! a web view) and answers it ([`HostJobs.answer`]). The client asks again with the ticket
+//! (`{"cmd":"host","ticket":7}`) until the answer is in: `{"ok":true,"text":...}`, or `ok`
+//! false and the `error`.
+import mcp { writeValue }
+import reply { begin, finish, putText, putInt, failure, writeId }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// At most this many jobs are kept: a client that gave up leaves its job behind, and the oldest
+/// go first.
+pub const JOB_LIMIT: usize = 64
+
+/// One job the host takes: its ticket and the request, as JSON text.
+pub struct HostJob {
+  pub ticket: u64,
+  pub request: String,
+}
+
+struct Entry {
+  ticket: u64,
+  request: String,
+  taken: bool,
+  answered: bool,
+  ok: bool,
+  text: String,
+}
+
+/// The jobs between the inspector and the host.
+pub struct HostJobs {
+  entries: List<Entry>,
+  nextTicket: u64,
+}
+
+impl HostJobs {
+  pub fn make() -> HostJobs {
+    return HostJobs { entries: List<Entry>.make(), nextTicket: 1 }
+  }
+
+  /// Whether a job waits for the host to take it.
+  pub fn waiting(self: &Self) -> bool {
+    let list = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if !list[i].taken {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The oldest job the host has not taken.
+  pub effect fn take(self: &mut Self) -> Option<HostJob>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = self.entries.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if !list[i].taken {
+        list[i].taken = true
+        return Option<HostJob>.some(
+          HostJob {
+            ticket: list[i].ticket,
+            request: run String.copy(String.view(&list[i].request)),
+          },
+        )
+      }
+      i = i + 1
+    }
+    return Option<HostJob>.None
+  }
+
+  /// Answers job `ticket`: `text` is the result, or the error when `ok` is false. Does nothing
+  /// when the job is gone.
+  pub effect fn answer(self: &mut Self, ticket: u64, ok: bool, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = self.entries.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].ticket == ticket {
+        list[i].taken = true
+        list[i].answered = true
+        list[i].ok = ok
+        list[i].text = run String.copy(text)
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  /// The number of jobs kept, for tests.
+  pub fn length(self: &Self) -> usize {
+    return self.entries.length()
+  }
+
+  /// Serves a `host` request: a new job, or the state of the job its `ticket` names.
+  pub effect fn serve(self: &mut Self, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let ticket = match Json.asU64(Json.field(request, "ticket")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => 0
+    }
+    if ticket == 0 {
+      if !hasText(request, "tool") {
+        run failure(&mut out, request, "a host request names its tool")
+        return ()
+      }
+      let mut text = String.make()
+      run writeValue(&mut text, request)
+      if self.entries.length() >= JOB_LIMIT {
+        drop self.entries.remove(0)
+      }
+      let created = self.nextTicket
+      self.nextTicket = self.nextTicket + 1
+      run self.entries.append(
+        Entry {
+          ticket: created,
+          request: move text,
+          taken: false,
+          answered: false,
+          ok: false,
+          text: String.make(),
+        },
+      )
+      run pendingReply(&mut out, request, created)
+      return ()
+    }
+    let list = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].ticket == ticket {
+        if !list[i].answered {
+          run pendingReply(&mut out, request, ticket)
+          return ()
+        }
+        let entry = self.entries.remove(i)
+        if entry.ok {
+          run begin(&mut out, request)
+          run putText(&mut out, "text", String.view(&entry.text))
+          run finish(&mut out)
+        } else {
+          run failure(&mut out, request, String.view(&entry.text))
+        }
+        return ()
+      }
+      i = i + 1
+    }
+    run failure(
+      &mut out,
+      request,
+      "no host job has this ticket (it finished, or too many jobs came after it)",
+    )
+  }
+}
+
+fn hasText(request: &Value, key: string) -> bool {
+  return match Json.asString(Json.field(request, key)) {
+    Option<string>.Some { value } => true
+    Option<string>.None => false
+  }
+}
+
+/// `{"ok":false,"pending":true,"ticket":N,"error":"not yet"}`: ask again with the ticket.
+effect fn pendingReply(out: &mut String, request: &Value, ticket: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{")
+  run writeId(&mut out, request)
+  run out.append("\"ok\":false,\"pending\":true")
+  run putInt(&mut out, "ticket", ticket)
+  run out.append(",\"error\":\"not yet\"}")
+}

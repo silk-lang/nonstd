@@ -65,6 +65,20 @@ match in tree order wins.
 | `ui_wait` | `wait` | until the target exists (or, with `gone`, does not); `timeout` in ms, default 5000 |
 | `ui_stats` | `stats` | the last frame's counters |
 | `ui_events` | `events` | the event records the app took (click, keydown, input, ...), with `since` and `limit` |
+| `webview_list` | `host` | the app's web views: id, URL, title, whether it is loading |
+| `webview_snapshot` | `host` | the page in a web view as a text outline with `[ref=eN]` refs |
+| `webview_navigate` | `host` | loads `url` and waits for the load |
+| `webview_click` | `host` | a real click on element `ref` |
+| `webview_type` | `host` | types `text` over field `ref`; `submit` presses Enter after |
+| `webview_press_key` | `host` | one key press in the page |
+| `webview_scroll` | `host` | a wheel turn of about one screen, `direction` up or down |
+| `webview_back` | `host` | back in the page's history |
+| `webview_evaluate` | `host` | runs a JavaScript expression and returns its value as JSON |
+
+The `webview_*` tools reach pages inside the app's ui-webview nodes, on any backend (WebKit,
+WebView2, Chromium). Each takes an optional `view` (an id from `webview_list`, default the first
+view) and waits up to `timeout` ms (default 60000). They are the same tools the in-app agent
+(ui-webview-agent) uses, so an outside agent and the app's own agent drive pages the same way.
 
 Results are text: the snapshot or node view text, otherwise the protocol's reply line. A failed
 command (no node matches, a covered node, a timed out wait) is a tool result with `isError`, so
