@@ -30,7 +30,7 @@ export const svgDocument = (page: Page, selection: readonly string[] = []): stri
   )
   if (nodes.some((n) => n.backdropBlur > 0))
     throw new Error(
-      'SVG cannot preserve backdrop blur reliably. Export PNG or a .silk file instead.',
+      'SVG cannot preserve backdrop blur reliably. Export PNG or a .silkdesign file instead.',
     )
   const bounds = boundsOf(nodes.map((n) => paintExtent(n))) ?? {
     x: 0,

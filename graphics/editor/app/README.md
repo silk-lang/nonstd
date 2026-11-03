@@ -27,7 +27,7 @@ Frames move their contents and resize their boundary. Groups scale their content
 
 Double-click text to edit it on the canvas. Changing its text or font uses natural browser font measurements; resizing its bounds deliberately scales the glyphs. Text uses the renderer's existing adaptive atlas/vector path as you zoom.
 
-Documents save automatically to IndexedDB on this browser origin. The header confirms completed saves. **Open local documents** lists the most recently saved documents. Download `.silk` files for portable backups; clearing browser site data also clears local documents. Importing creates an independent document, validates its schema and hierarchy, and preserves the current document when a file is invalid. Files up to 64 MB and 200,000 layers per page are accepted, subject to available device resources.
+Documents save automatically to IndexedDB on this browser origin. The header confirms completed saves. **Open local documents** lists the most recently saved documents. Download `.silkdesign` files for portable backups; clearing browser site data also clears local documents. Importing creates an independent document, validates its schema and hierarchy, and preserves the current document when a file is invalid. Files up to 64 MB and 200,000 layers per page are accepted, subject to available device resources.
 
 Choose **Commands → Add effects playground** for an editable example of frosted glass,
 blurred glows, inset shadows, blend modes, and color adjustments. Select a shape to use the
@@ -37,7 +37,7 @@ with zoom; layer/backdrop blur values are Gaussian sigma in document units, whil
 blur values are twice sigma. Color controls use percentages with 100% as neutral. Existing
 documents decode neutral defaults. Changes participate in undo and local persistence.
 
-SVG and PNG export the selection, including selected containers' descendants, or the whole current page when nothing is selected. PNG uses up to 2× resolution, bounded to 8192 pixels on its longest side for ordinary scenes and 4096 for scenes with effects. Effect PNGs use the GPU renderer. Exports include shadow extents and the text's current scale. SVG text remains text and relies on the recipient having the selected font. SVG preserves layer blur, inner shadows, color adjustments, and blend styles; backdrop blur export reports an error directing you to PNG or `.silk`, since SVG cannot reliably preserve it.
+SVG and PNG export the selection, including selected containers' descendants, or the whole current page when nothing is selected. PNG uses up to 2× resolution, bounded to 8192 pixels on its longest side for ordinary scenes and 4096 for scenes with effects. Effect PNGs use the GPU renderer. Exports include shadow extents and the text's current scale. SVG text remains text and relies on the recipient having the selected font. SVG preserves layer blur, inner shadows, color adjustments, and blend styles; backdrop blur export reports an error directing you to PNG or `.silkdesign`, since SVG cannot reliably preserve it.
 
 | Shortcut                          | Action                                           |
 | --------------------------------- | ------------------------------------------------ |
@@ -50,7 +50,7 @@ SVG and PNG export the selection, including selected containers' descendants, or
 | Ctrl or ⌘ + C / X / V / D         | Copy / cut / paste / duplicate                   |
 | Ctrl or ⌘ + G / Shift + G         | Group / ungroup                                  |
 | Arrows / Shift + arrows           | Nudge 1 / 10 units                               |
-| Ctrl or ⌘ + S                     | Download a `.silk` file                          |
+| Ctrl or ⌘ + S                     | Download a `.silkdesign` file                    |
 | Escape                            | Cancel a gesture or close a dialog               |
 
 The in-app shortcut reference includes the remaining controls. Clipboard operations currently stay inside Studio.
@@ -84,7 +84,7 @@ The [edit measurements](benchmarks/edits.json) cover the 100k mosaic. The browse
 
 Bulk alignment and inspector geometry changes traverse the document once, with ancestor lookup for nested selections. Undo, redo, resize membership, and duplication use indexed membership instead of a full scan per selected node. Renderer synchronization reuses immutable node references, sends only changed properties, and explicitly invalidates descendants when inherited opacity, visibility, or locking changes. Reordering and hierarchy changes rebuild the native scene.
 
-Local storage uses IndexedDB version 2. Small saves journal changed nodes by document and node ID; opening a document overlays that journal onto its snapshot. Initial saves, structural changes, metadata changes, and batches over 512 nodes atomically checkpoint the whole document and clear its journal. The last-saved baseline advances only when the transaction completes. Browser contracts verify migration from version 1, reloads, undo, deletion checkpoints, and rollback/retry after a partially queued write fails. Portable `.silk` files keep their existing format.
+Local storage uses IndexedDB version 2. Small saves journal changed nodes by document and node ID; opening a document overlays that journal onto its snapshot. Initial saves, structural changes, metadata changes, and batches over 512 nodes atomically checkpoint the whole document and clear its journal. The last-saved baseline advances only when the transaction completes. Browser contracts verify migration from version 1, reloads, undo, deletion checkpoints, and rollback/retry after a partially queued write fails. Portable `.silkdesign` files keep their existing format.
 
 The [effects measurements](benchmarks/effects.json) record animation-frame intervals for the
 27-layer playground, plus the existing 100k selection and bulk-edit regressions with the new

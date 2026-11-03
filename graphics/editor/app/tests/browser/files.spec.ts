@@ -12,6 +12,9 @@ const download = async (page: Page, label: string): Promise<Buffer> => {
     .getByRole('button', { name: label })
     .click()
   const result = await pending
+  if (label === 'Download .silkdesign file') {
+    expect(result.suggestedFilename()).toMatch(/\.silkdesign$/u)
+  }
   const path = await result.path()
   if (!path) throw new Error('Download did not complete')
   return readFile(path)
@@ -19,9 +22,9 @@ const download = async (page: Page, label: string): Promise<Buffer> => {
 const importFile = async (page: Page, buffer: Buffer): Promise<void> => {
   await page.getByRole('button', { name: 'File menu', exact: true }).click()
   const pending = page.waitForEvent('filechooser')
-  await page.getByRole('button', { name: 'Import .silk file…' }).click()
+  await page.getByRole('button', { name: 'Import .silkdesign file…' }).click()
   const chooser = await pending
-  await chooser.setFiles({ name: 'roundtrip.silk', mimeType: 'application/json', buffer })
+  await chooser.setFiles({ name: 'roundtrip.silkdesign', mimeType: 'application/json', buffer })
 }
 
 test('JSON round-trip preserves the design and imports as an independent local copy', async ({
@@ -31,7 +34,7 @@ test('JSON round-trip preserves the design and imports as an independent local c
   await newDocument(page)
   await drawRect(page)
   await setField(page, 'Document name', 'Round trip')
-  const bytes = await download(page, 'Download .silk file')
+  const bytes = await download(page, 'Download .silkdesign file')
   const exported = Schema.decodeUnknownSync(DesignDocumentSchema)(JSON.parse(bytes.toString()))
   expect(exported.pages[0]?.nodes).toHaveLength(1)
   await newDocument(page)
@@ -80,7 +83,7 @@ test('storage failures surface an export recovery path', async ({
     }
   })
   await setField(page, 'Document name', 'Keep my work')
-  await expect(page.getByRole('alert')).toContainText('Download a .silk file')
-  const exported = await download(page, 'Download .silk file')
+  await expect(page.getByRole('alert')).toContainText('Download a .silkdesign file')
+  const exported = await download(page, 'Download .silkdesign file')
   expect(exported.toString()).toContain('Keep my work')
 })

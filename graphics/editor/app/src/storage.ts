@@ -5,7 +5,7 @@ import { changesSince, restoreChanges } from './storage-changes'
 export class StorageError extends Data.TaggedError('StorageError')<{ readonly message: string }> {}
 const storageError = (): StorageError =>
   new StorageError({
-    message: 'Local storage is unavailable or full. Download a .silk file to keep your work.',
+    message: 'Local storage is unavailable or full. Download a .silkdesign file to keep your work.',
   })
 // Serialize commits and reads so a slower write cannot replace a more recent edit.
 const access = Semaphore.makeUnsafe(1)

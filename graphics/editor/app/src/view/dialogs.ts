@@ -20,7 +20,7 @@ const commands: readonly (readonly [string, string, string, IconName])[] = [
   ['Add page', 'new-page', '', 'plus'],
   ['Add effects playground', 'effects-page', '', 'rect'],
   ['Add 100k rectangles', 'selection-page', '', 'rect'],
-  ['Download .silk file', 'export-json', '⌘S', 'export'],
+  ['Download .silkdesign file', 'export-json', '⌘S', 'export'],
   ['Import document', 'import', '', 'file'],
   ['New document', 'new', '', 'plus'],
 ]
@@ -31,9 +31,9 @@ const fileMenu = (h: H): Html =>
     [
       item(h, 'New document', 'new', '', 'plus'),
       item(h, 'Open local documents', 'documents'),
-      item(h, 'Import .silk file…', 'import'),
+      item(h, 'Import .silkdesign file…', 'import'),
       h.hr([]),
-      item(h, 'Download .silk file', 'export-json', '⌘S', 'export'),
+      item(h, 'Download .silkdesign file', 'export-json', '⌘S', 'export'),
       item(h, 'Export SVG', 'export-svg', '', 'export'),
       item(h, 'Export PNG', 'export-png', '', 'export'),
       h.hr([]),
@@ -67,7 +67,7 @@ const commandContent = (m: Model, h: H): readonly Html[] => [
 const documentContent = (m: Model, h: H): readonly Html[] => [
   h.p(
     [h.Class('dialog-description')],
-    ['Your local documents. Download a .silk file to move work between devices.'],
+    ['Your local documents. Download a .silkdesign file to move work between devices.'],
   ),
   ...m.recent.map((recent) =>
     h.button(

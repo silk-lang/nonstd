@@ -169,7 +169,7 @@ export const ExportDocument = Command.define('ExportDocument', {
         yield* Effect.sync(() => {
           download(
             new Blob([JSON.stringify(document)], { type: 'application/json' }),
-            `${name}.silk`,
+            `${name}.silkdesign`,
           )
         })
       else {
@@ -192,7 +192,7 @@ export const ImportDocument = Command.define('ImportDocument', {
     const file = yield* Effect.callback<File | null>((resume) => {
       const input = document.createElement('input')
       input.type = 'file'
-      input.accept = '.silk,.json,application/json'
+      input.accept = '.silkdesign,.json,application/json'
       input.addEventListener(
         'change',
         () => {
