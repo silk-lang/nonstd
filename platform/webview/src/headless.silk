@@ -1,0 +1,512 @@
+//! A backend with no engine: pages are records, input is logged, and events follow the same
+//! order a real backend queues them in. Code that is generic over `WebViewHost` is tested on it
+//! anywhere, including CI with no display.
+//!
+//! It understands just enough to be useful in tests: `data:text/html,` URLs and `LoadHtml` give
+//! the page the `<title>` they contain, history works, and the input commands land in
+//! `HeadlessView.log` as lines such as `click 10 20` and `type hello`. It runs no scripts and
+//! has no elements, so `Evaluate`, `ClickElement` and `FillElement` answer with `ok` false.
+import command { Command, commandName }
+import event { WebViewEvent, EventKind }
+import host { WebViewHost }
+import types { WebViewOptions, WebViewError, Placement, Backend, Capabilities }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// What the headless backend remembers about one view.
+pub struct HeadlessView {
+  pub id: u32,
+  pub open: bool,
+  pub window: u32,
+  pub askBeforeNavigating: bool,
+  pub url: String,
+  pub title: String,
+  /// The visited URLs, oldest first, and the index of the current one.
+  pub history: List<String>,
+  pub current: usize,
+  pub placement: Placement,
+  /// How many times `place` changed the placement.
+  pub moves: u32,
+  pub zoom: f32,
+  pub focused: bool,
+  /// The input commands, one line each.
+  pub log: List<String>,
+  /// The URL of a navigation waiting for `AnswerNavigation`, and its request number.
+  pub pendingUrl: String,
+  pub pendingRequest: u32,
+}
+
+pub struct HeadlessWebViews {
+  views: List<HeadlessView>,
+  queue: List<WebViewEvent>,
+  nextRequest: u32,
+}
+
+fn samePlacement(a: Placement, b: Placement) -> bool {
+  return a.visible == b.visible && a.scale == b.scale && a.bounds.xMin == b.bounds.xMin
+    && a.bounds.yMin == b.bounds.yMin
+    && a.bounds.xMax == b.bounds.xMax
+    && a.bounds.yMax == b.bounds.yMax
+    && a.clip.xMin == b.clip.xMin
+    && a.clip.yMin == b.clip.yMin
+    && a.clip.xMax == b.clip.xMax
+    && a.clip.yMax == b.clip.yMax
+}
+
+/// The text between `<title>` and `</title>` in `html`, or empty.
+fn titleIn(html: string) -> string {
+  if let Option<usize>.Some { value: open } = String.find(html, "<title>") {
+    let start = open + 7
+    let rest = String.slice(html, start, String.byteLength(html) - start)
+    if let Option<usize>.Some { value: close } = String.find(rest, "</title>") {
+      return String.trim(String.slice(rest, 0, close))
+    }
+  }
+  return ""
+}
+
+/// The page a URL shows: the HTML after the comma of a `data:text/html,` URL, or nothing.
+fn htmlOf(url: string) -> string {
+  let prefix = "data:text/html,"
+  if String.startsWith(url, prefix) {
+    let start = String.byteLength(prefix)
+    return String.slice(url, start, String.byteLength(url) - start)
+  }
+  return ""
+}
+
+effect fn line(prefix: string, x: f32, y: f32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(prefix)
+  run text.append(" ")
+  run appendNumber(&mut text, x)
+  run text.append(" ")
+  run appendNumber(&mut text, y)
+  return move text
+}
+
+/// Appends `value` rounded to a whole number, as the log writes positions.
+effect fn appendNumber(out: &mut String, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let rounded = f32.floor(f32.abs(value) + 0.5)
+  if value < 0.0 && rounded != 0.0 {
+    run out.append("-")
+  }
+  run digits(&mut out, f32.toU64(rounded))
+}
+
+effect fn digits(out: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run digits(&mut out, value / 10)
+  }
+  let text = match value % 10 {
+    0 => "0"
+    1 => "1"
+    2 => "2"
+    3 => "3"
+    4 => "4"
+    5 => "5"
+    6 => "6"
+    7 => "7"
+    8 => "8"
+    _ => "9"
+  }
+  run out.append(text)
+}
+
+impl HeadlessWebViews {
+  pub fn make() -> HeadlessWebViews {
+    return HeadlessWebViews {
+      views: List<HeadlessView>.make(),
+      queue: List<WebViewEvent>.make(),
+      nextRequest: 1,
+    }
+  }
+
+  /// The view's record, while it is open.
+  pub fn view(self: &Self, view: u32) -> Option<&HeadlessView> {
+    let at = self.find(view)
+    if at < self.views.length() {
+      return Option<&HeadlessView>.some(&self.views.asSlice()[at])
+    }
+    return Option<&HeadlessView>.None
+  }
+
+  /// Events queued and not yet taken.
+  pub fn queued(self: &Self) -> usize {
+    return self.queue.length()
+  }
+
+  /// The page takes or loses keyboard focus as if a person clicked into it or away.
+  pub effect fn simulateFocus(self: &mut Self, view: u32, focused: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.find(view)
+    if at < self.views.length() {
+      run self.setFocused(at, focused)
+    }
+  }
+
+  /// The page asks for a new window, as a `target=_blank` link does.
+  pub effect fn simulateNewWindow(self: &mut Self, view: u32, url: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.find(view) < self.views.length() {
+      run self.push(view, EventKind.NewWindowRequested { url: run String.copy(url) })
+    }
+  }
+
+  /// The open view's index, or the view count when it is not open.
+  fn find(self: &Self, view: u32) -> usize {
+    let views = self.views.asSlice()
+    let mut i: usize = 0
+    while i < views.length {
+      if views[i].id == view && views[i].open {
+        return i
+      }
+      i = i + 1
+    }
+    return views.length
+  }
+
+  effect fn require(self: &Self, view: u32) -> usize
+    ! WebViewError {
+    let at = self.find(view)
+    if at >= self.views.length() {
+      fail WebViewError.InvalidView
+    }
+    return at
+  }
+
+  effect fn push(self: &mut Self, view: u32, kind: EventKind) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.queue.append(WebViewEvent { view: view, kind: move kind })
+  }
+
+  effect fn setFocused(self: &mut Self, at: usize, focused: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let views = self.views.asMutSlice()
+    if views[at].focused == focused {
+      return ()
+    }
+    views[at].focused = focused
+    let id = views[at].id
+    run self.push(id, EventKind.FocusChanged { focused: focused })
+  }
+
+  effect fn log(self: &mut Self, at: usize, entry: String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let views = self.views.asMutSlice()
+    run views[at].log.append(move entry)
+  }
+
+  effect fn history(self: &mut Self, at: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let view = &self.views.asSlice()[at]
+    let id = view.id
+    let back = view.current > 0
+    let forward = view.current + 1 < view.history.length()
+    run self.push(id, EventKind.HistoryChanged { canGoBack: back, canGoForward: forward })
+  }
+
+  /// Shows `url` (and `html`, the page's text) as the current page: the events of a load.
+  effect fn show(self: &mut Self, at: usize, url: string, html: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.views.asSlice()[at].id
+    run self.push(id, EventKind.LoadStarted { url: run String.copy(url) })
+    if String.view(&self.views.asSlice()[at].url) != url {
+      let views = self.views.asMutSlice()
+      views[at].url = run String.copy(url)
+      run self.push(id, EventKind.UrlChanged { url: run String.copy(url) })
+    }
+    let title = titleIn(html)
+    if String.view(&self.views.asSlice()[at].title) != title {
+      let views = self.views.asMutSlice()
+      views[at].title = run String.copy(title)
+      run self.push(id, EventKind.TitleChanged { title: run String.copy(title) })
+    }
+    run self.push(id, EventKind.LoadProgress { fraction: 1.0 })
+    run self.push(
+      id,
+      EventKind.LoadFinished { url: run String.copy(url), ok: true, error: String.make() },
+    )
+  }
+
+  /// Goes to `url` as a new history entry, dropping the entries after the current one.
+  effect fn visit(self: &mut Self, at: usize, url: string, html: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let views = self.views.asMutSlice()
+    let keep = if views[at].history.length() == 0 {
+      0
+    } else {
+      views[at].current + 1
+    }
+    views[at].history.truncate(keep)
+    run views[at].history.append(run String.copy(url))
+    views[at].current = views[at].history.length() - 1
+    run self.show(at, url, html)
+    run self.history(at)
+  }
+
+  /// A main frame navigation to `url`: asked first when the view wants that.
+  effect fn navigate(self: &mut Self, at: usize, url: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.views.asSlice()[at].askBeforeNavigating {
+      let request = self.nextRequest
+      self.nextRequest = self.nextRequest + 1
+      let views = self.views.asMutSlice()
+      views[at].pendingUrl = run String.copy(url)
+      views[at].pendingRequest = request
+      let id = views[at].id
+      run self.push(
+        id,
+        EventKind.NavigationRequested {
+          request: request,
+          url: run String.copy(url),
+          userInitiated: false,
+        },
+      )
+      return ()
+    }
+    run self.visit(at, url, htmlOf(url))
+  }
+
+  /// Moves one entry back or forward through history, when there is one.
+  effect fn travel(self: &mut Self, at: usize, forward: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let view = &self.views.asSlice()[at]
+    if forward && view.current + 1 >= view.history.length() || !forward && view.current == 0 {
+      return ()
+    }
+    let target = if forward {
+      view.current + 1
+    } else {
+      view.current - 1
+    }
+    let url = run String.copy(String.view(&view.history.asSlice()[target]))
+    let views = self.views.asMutSlice()
+    views[at].current = target
+    run self.show(at, String.view(&url), htmlOf(String.view(&url)))
+    run self.history(at)
+  }
+
+  effect fn answer(self: &mut Self, at: usize, request: u32, ok: bool, error: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.views.asSlice()[at].id
+    run self.push(
+      id,
+      EventKind.ActionResult { request: request, ok: ok, error: run String.copy(error) },
+    )
+  }
+}
+
+impl WebViewHost for HeadlessWebViews {
+  effect fn open(self: &mut Self, view: u32, options: &WebViewOptions) -> ()
+    ! WebViewError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.find(view) < self.views.length() {
+      fail WebViewError.IdInUse
+    }
+    run self.views.append(
+      HeadlessView {
+        id: view,
+        open: true,
+        window: options.window,
+        askBeforeNavigating: options.askBeforeNavigating,
+        url: String.make(),
+        title: String.make(),
+        history: List<String>.make(),
+        current: 0,
+        placement: Placement.hidden(),
+        moves: 0,
+        zoom: 1.0,
+        focused: false,
+        log: List<String>.make(),
+        pendingUrl: String.make(),
+        pendingRequest: 0,
+      },
+    )
+    run self.push(view, EventKind.Created)
+    if String.byteLength(String.view(&options.url)) != 0 {
+      let at = self.views.length() - 1
+      run self.navigate(at, String.view(&options.url))
+    }
+  }
+
+  effect fn close(self: &mut Self, view: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.find(view)
+    if at < self.views.length() {
+      let views = self.views.asMutSlice()
+      views[at].open = false
+      run self.push(view, EventKind.Closed)
+    }
+  }
+
+  fn place(self: &mut Self, view: u32, placement: Placement) -> () {
+    let at = self.find(view)
+    if at < self.views.length() {
+      let views = self.views.asMutSlice()
+      if !samePlacement(views[at].placement, placement) {
+        views[at].placement = placement
+        views[at].moves = views[at].moves + 1
+      }
+    }
+  }
+
+  effect fn send(self: &mut Self, view: u32, command: Command) -> ()
+    ! WebViewError | OutOfMemoryError
+    ? &mut Allocator {
+    let at = run self.require(view)
+    match &command {
+      Command.Navigate { url } => {
+        run self.navigate(at, String.view(&url))
+      }
+      Command.LoadHtml { html, baseUrl } => {
+        run self.visit(at, String.view(&baseUrl), String.view(&html))
+      }
+      Command.Back => {
+        run self.travel(at, false)
+      }
+      Command.Forward => {
+        run self.travel(at, true)
+      }
+      Command.Reload => {
+        let url = run String.copy(String.view(&self.views.asSlice()[at].url))
+        run self.show(at, String.view(&url), htmlOf(String.view(&url)))
+      }
+      Command.Stop => {}
+      Command.SetZoom { factor } => {
+        let views = self.views.asMutSlice()
+        views[at].zoom = factor
+      }
+      Command.Focus => {
+        run self.setFocused(at, true)
+      }
+      Command.Evaluate { request, .. } => {
+        run self.push(
+          view,
+          EventKind.ScriptResult {
+            request: request,
+            ok: false,
+            value: run String.copy("the headless backend runs no scripts"),
+          },
+        )
+      }
+      Command.Snapshot { request } => {
+        let mut text = run String.copy("- document \"")
+        run text.append(String.view(&self.views.asSlice()[at].title))
+        run text.append("\" url=")
+        run text.append(String.view(&self.views.asSlice()[at].url))
+        run text.append("\n")
+        run self.push(view, EventKind.Snapshot { request: request, text: move text })
+      }
+      Command.Screenshot { request } => {
+        let p = self.views.asSlice()[at].placement
+        let width = f32.toU32(f32.floor((p.bounds.xMax - p.bounds.xMin) * p.scale + 0.5))
+        let height = f32.toU32(f32.floor((p.bounds.yMax - p.bounds.yMin) * p.scale + 0.5))
+        let mut pixels = run Bytes.zeroed(u32.toUsize(width) * u32.toUsize(height) * 4)
+        let bytes = pixels.asMutSlice()
+        let mut i: usize = 0
+        while i < bytes.length {
+          bytes[i] = 255
+          i = i + 1
+        }
+        run self.push(
+          view,
+          EventKind.Screenshot {
+            request: request,
+            width: width,
+            height: height,
+            pixels: move pixels,
+          },
+        )
+      }
+      Command.ClickElement { request, .. } => {
+        run self.answer(at, request, false, "the headless backend has no page elements")
+      }
+      Command.FillElement { request, .. } => {
+        run self.answer(at, request, false, "the headless backend has no page elements")
+      }
+      Command.ClickAt { x, y, clickCount, .. } => {
+        let entry = if clickCount >= 2 {
+          run line("double-click", x, y)
+        } else {
+          run line("click", x, y)
+        }
+        run self.log(at, move entry)
+        run self.setFocused(at, true)
+      }
+      Command.MovePointer { x, y, .. } => {
+        run self.log(at, run line("move", x, y))
+      }
+      Command.Scroll { deltaX, deltaY, .. } => {
+        run self.log(at, run line("scroll", deltaX, deltaY))
+      }
+      Command.TypeText { text } => {
+        let mut entry = run String.copy("type ")
+        run entry.append(String.view(&text))
+        run self.log(at, move entry)
+      }
+      Command.PressKey { key, .. } => {
+        let mut entry = run String.copy("key ")
+        run entry.append(String.view(&key))
+        run self.log(at, move entry)
+      }
+      Command.AnswerNavigation { request, allow } => {
+        let pending = self.views.asSlice()[at].pendingRequest
+        if pending != 0 && pending == request {
+          let url = run String.copy(String.view(&self.views.asSlice()[at].pendingUrl))
+          let views = self.views.asMutSlice()
+          views[at].pendingRequest = 0
+          views[at].pendingUrl.clear()
+          if allow {
+            run self.visit(at, String.view(&url), htmlOf(String.view(&url)))
+          }
+        }
+      }
+      Command.OpenDevTools => {
+        run self.push(
+          view,
+          EventKind.Unsupported { request: 0, command: run String.copy(commandName(&command)) },
+        )
+      }
+    }
+  }
+
+  effect fn takeEvents(self: &mut Self, out: &mut List<WebViewEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.queue.length() != 0 {
+      run out.append(self.queue.remove(0))
+    }
+  }
+
+  fn backend(self: &Self) -> Backend {
+    return Backend.Headless
+  }
+
+  fn capabilities(self: &Self) -> Capabilities {
+    return Capabilities { overlays: false, networkInterception: false, devToolsProtocol: false }
+  }
+}

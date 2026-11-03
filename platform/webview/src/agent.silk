@@ -1,0 +1,271 @@
+//! Agent control, shared by every backend: the page script, the calls a backend evaluates, and
+//! a reader for what they return.
+//!
+//! A backend injects [`agentScript`] into every page at document start. Then:
+//!
+//! - `Command.Snapshot`: evaluate [`snapshotCall`]; the result is a JSON string of the outline.
+//! - `Command.ClickElement`: evaluate [`locateCall`], read it with [`readLocation`], and click
+//!   natively at its `x`, `y` (a `ClickAt`).
+//! - `Command.FillElement`: evaluate [`focusForFillCall`], read it the same way, then type the
+//!   text natively (a `TypeText`; `PressKey "Delete"` for empty text).
+//!
+//! Every call is wrapped in `JSON.stringify`, so engines that hand results back as native
+//! objects (WKWebView) and ones that hand back JSON (CDP, WebView2) both give JSON text.
+import generated_agent
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.text.string { String, InvalidUtf8 }
+
+/// The page script (agent/agent.js) as UTF-8 bytes.
+pub fn agentScriptBytes() -> &'static [u8] {
+  return generated_agent.agentScriptBytes()
+}
+
+/// The page script as text.
+pub fn agentScript() -> string<'static> {
+  return match String.fromUtf8(generated_agent.agentScriptBytes()) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { .. } => ""
+  }
+}
+
+/// The expression whose value is the snapshot outline, as a JSON string.
+pub fn snapshotCall() -> string<'static> {
+  return "JSON.stringify(window.__silkAgent ? window.__silkAgent.snapshot() : null)"
+}
+
+/// Whether `element` looks like a snapshot ref (`e` and digits). Calls are only built for these,
+/// so a ref can never inject script.
+pub fn isRef(element: string) -> bool {
+  let bytes = String.utf8Bytes(element)
+  if bytes.length < 2 || bytes[0] != 101 {
+    return false
+  }
+  let mut i: usize = 1
+  while i < bytes.length {
+    if bytes[i] < 48 || bytes[i] > 57 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn call(function: string, element: string) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !isRef(element) {
+    return Option<String>.None
+  }
+  let mut text = run String.copy("JSON.stringify(window.__silkAgent ? window.__silkAgent.")
+  run text.append(function)
+  run text.append("(\"")
+  run text.append(element)
+  run text.append("\") : { ok: false, error: \"the agent script is not in this page\" })")
+  return Option<String>.Some { value: move text }
+}
+
+/// The expression that scrolls `element` into view and returns where to click it, or None when
+/// `element` is not a ref.
+pub effect fn locateCall(element: string) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run call("locate", element)
+}
+
+/// The expression that focuses `element` and selects its value for typing over, or None when
+/// `element` is not a ref.
+pub effect fn focusForFillCall(element: string) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run call("focusForFill", element)
+}
+
+/// What `locate` and `focusForFill` returned.
+pub struct Location {
+  pub ok: bool,
+  /// The element's center, CSS pixels from the top left of the page's viewport.
+  pub x: f32,
+  pub y: f32,
+  /// Something else is drawn over the center (a click there reaches that instead).
+  pub covered: bool,
+}
+
+impl Copy for Location {}
+
+/// Where the value of `key` starts in the JSON object text `json`: just after `"key":`.
+fn valueAt(json: string, key: string) -> Option<usize> {
+  let bytes = String.utf8Bytes(json)
+  let name = String.utf8Bytes(key)
+  let mut i: usize = 0
+  while i + name.length + 3 <= bytes.length {
+    if bytes[i] == 34 && bytes[i + name.length + 1] == 34 && bytes[i + name.length + 2] == 58 {
+      let mut same = true
+      let mut j: usize = 0
+      while j < name.length {
+        if bytes[i + 1 + j] != name[j] {
+          same = false
+          break
+        }
+        j = j + 1
+      }
+      if same {
+        return Option<usize>.Some { value: i + name.length + 3 }
+      }
+    }
+    i = i + 1
+  }
+  return Option<usize>.None
+}
+
+fn boolAt(json: string, key: string) -> bool {
+  if let Option<usize>.Some { value: at } = valueAt(json, key) {
+    let rest = String.slice(json, at, String.byteLength(json) - at)
+    return String.startsWith(rest, "true")
+  }
+  return false
+}
+
+/// A JSON number without an exponent (the agent script rounds positions to hundredths).
+fn numberAt(json: string, key: string) -> f32 {
+  let at = match valueAt(json, key) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return 0.0
+    }
+  }
+  let bytes = String.utf8Bytes(json)
+  let mut i = at
+  let mut negative = false
+  if i < bytes.length && bytes[i] == 45 {
+    negative = true
+    i = i + 1
+  }
+  let mut value: f32 = 0.0
+  while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+    value = value * 10.0 + u8.toF32(bytes[i] - 48)
+    i = i + 1
+  }
+  if i < bytes.length && bytes[i] == 46 {
+    i = i + 1
+    let mut scale: f32 = 0.1
+    while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+      value = value + u8.toF32(bytes[i] - 48) * scale
+      scale = scale / 10.0
+      i = i + 1
+    }
+  }
+  return if negative {
+    0.0 - value
+  } else {
+    value
+  }
+}
+
+/// Reads the JSON text `locateCall` or `focusForFillCall` evaluated to.
+pub fn readLocation(json: string) -> Location {
+  return Location {
+    ok: boolAt(json, "ok"),
+    x: numberAt(json, "x"),
+    y: numberAt(json, "y"),
+    covered: boolAt(json, "covered"),
+  }
+}
+
+/// The `error` message of a failed call's JSON text, unescaped for the common escapes, or
+/// empty.
+pub effect fn readError(json: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let at = match valueAt(json, "error") {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      return move out
+    }
+  }
+  let bytes = String.utf8Bytes(json)
+  if at >= bytes.length || bytes[at] != 34 {
+    return move out
+  }
+  let mut start = at + 1
+  let mut i = start
+  while i < bytes.length && bytes[i] != 34 {
+    if bytes[i] == 92 && i + 1 < bytes.length {
+      run out.append(String.slice(json, start, i - start))
+      let escaped = bytes[i + 1]
+      run out.append(
+        if escaped == 110 {
+          "\n"
+        } else if escaped == 116 {
+          "\t"
+        } else if escaped == 34 {
+          "\""
+        } else {
+          "\\"
+        },
+      )
+      i = i + 2
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  run out.append(String.slice(json, start, i - start))
+  return move out
+}
+
+/// The text of a JSON string literal (a snapshot result), unescaped. Unicode escapes other than
+/// those JSON.stringify writes for control characters do not occur: it writes other characters
+/// as UTF-8.
+pub effect fn readJsonString(json: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let bytes = String.utf8Bytes(json)
+  if bytes.length < 2 || bytes[0] != 34 {
+    return move out
+  }
+  let end = bytes.length - 1
+  let mut start: usize = 1
+  let mut i: usize = 1
+  while i < end {
+    if bytes[i] == 92 && i + 1 < end {
+      run out.append(String.slice(json, start, i - start))
+      let escaped = bytes[i + 1]
+      if escaped == 117 {
+        // \u00XX: a control character; written as a space.
+        run out.append(" ")
+        i = i + 6
+      } else {
+        run out.append(
+          if escaped == 110 {
+            "\n"
+          } else if escaped == 116 {
+            "\t"
+          } else if escaped == 114 {
+            "\r"
+          } else if escaped == 34 {
+            "\""
+          } else if escaped == 47 {
+            "/"
+          } else {
+            "\\"
+          },
+        )
+        i = i + 2
+      }
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  if start < end {
+    run out.append(String.slice(json, start, end - start))
+  }
+  return move out
+}

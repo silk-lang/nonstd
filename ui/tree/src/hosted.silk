@@ -1,0 +1,198 @@
+//! Where hosted nodes are: boxes whose content the host draws itself, such as a web view.
+//!
+//! The tree lays out and decorates a [`NodeKind.Hosted`] node like any box (background,
+//! border, shadow) and leaves its content box empty. After each frame the host reads
+//! [`hostedPlacements`] and puts its own view there: a native child view layered over the
+//! window, or a texture it draws into the scene. A placement is plain data, so a host can
+//! compare it with the previous frame's and only move views that moved.
+import tree { UiTree }
+import node { NONE, NO_INDEX }
+import mutation { NodeKind, Mutation }
+import paint { paddingBox, contentBox, styleSlot }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+
+/// Where one hosted node is after the last frame. Rectangles are CSS pixels (logical points)
+/// from the top left of the viewport; multiply by `scale` for device pixels.
+pub struct HostedPlacement {
+  pub id: u32,
+  /// The host view the node shows, from [`Mutation.SetHostedView`], or NONE.
+  pub view: u32,
+  /// The node's content box: where the hosted content goes.
+  pub bounds: Rect<f32>,
+  /// The part of `bounds` that shows: `bounds` clipped by the viewport and by every ancestor
+  /// that clips its children (overflow other than visible). Empty when nothing shows.
+  pub clip: Rect<f32>,
+  /// Whether any of it shows: the node is in the tree under the root, laid out, visible,
+  /// not fully transparent, and `clip` is not empty. A host hides its view when this is false.
+  pub visible: bool,
+  /// The node's position in the last frame's paint order, so a host can stack several views
+  /// as the tree painted them (lower first).
+  pub paintIndex: u32,
+  /// Device pixels per CSS pixel.
+  pub scale: f32,
+}
+
+impl Copy for HostedPlacement {}
+
+impl HostedPlacement {
+  /// Whether a host has to move or show or hide its view: the two placements differ.
+  pub fn differs(self: &Self, other: &HostedPlacement) -> bool {
+    return self.id != other.id || self.view != other.view || !sameRect(self.bounds, other.bounds)
+      || !sameRect(self.clip, other.clip)
+      || self.visible != other.visible
+      || self.paintIndex != other.paintIndex
+      || self.scale != other.scale
+  }
+}
+
+fn sameRect(a: Rect<f32>, b: Rect<f32>) -> bool {
+  return a.xMin == b.xMin && a.yMin == b.yMin && a.xMax == b.xMax && a.yMax == b.yMax
+}
+
+fn emptyRect() -> Rect<f32> {
+  return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+}
+
+fn intersect(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  let xMin = f32.max(a.xMin, b.xMin)
+  let yMin = f32.max(a.yMin, b.yMin)
+  let xMax = f32.min(a.xMax, b.xMax)
+  let yMax = f32.min(a.yMax, b.yMax)
+  if xMax <= xMin || yMax <= yMin {
+    return emptyRect()
+  }
+  return Rect<f32>.new(xMin, yMin, xMax, yMax)
+}
+
+fn isEmpty(r: Rect<f32>) -> bool {
+  return r.xMax <= r.xMin || r.yMax <= r.yMin
+}
+
+/// Whether `slot` hangs under the root.
+fn attached(tree: &UiTree, slot: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if at == tree.root {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+fn paintIndexOf(tree: &UiTree, id: u32) -> u32 {
+  let order = tree.paintOrder.asSlice()
+  let mut i: usize = 0
+  while i < order.length {
+    if order[i] == id {
+      return usize.toU32(i)
+    }
+    i = i + 1
+  }
+  return NONE
+}
+
+/// The placement of node `slot`, a hosted node.
+fn placementOf(tree: &UiTree, slot: u32) -> HostedPlacement {
+  let node = tree.node(slot)
+  let mut placement = HostedPlacement {
+    id: node.id,
+    view: node.resource,
+    bounds: emptyRect(),
+    clip: emptyRect(),
+    visible: false,
+    paintIndex: NONE,
+    scale: tree.input.scale,
+  }
+  if !attached(tree, slot) || node.css >= tree.fragmentOf.length() {
+    return placement
+  }
+  let index = tree.fragmentOf.get(node.css)
+  let fragments = tree.output.fragments.values.asSlice()
+  if index == NO_INDEX || index >= fragments.length {
+    return placement
+  }
+  let own = &fragments[index]
+  placement.bounds = contentBox(own)
+  let mut shown = node.computed.text.visible && node.computed.opacity > 0.0
+  let mut clip = intersect(
+    placement.bounds,
+    Rect<f32>.new(0.0, 0.0, tree.input.width, tree.input.height),
+  )
+
+  // Walk the fragment ancestors as paint does: each box that clips narrows the clip, and a
+  // fully transparent one hides everything inside it.
+  let mut at = own.parent
+  while at != NO_INDEX && at < fragments.length {
+    let f = &fragments[at]
+    let owner = styleSlot(&tree.slotOfCss, &tree.layout, &tree.nodes, f.source)
+    if owner != NONE && !f.positioningShell {
+      let c = &tree.node(owner).computed
+      if c.opacity <= 0.0 {
+        shown = false
+      }
+      if c.clips() {
+        clip = intersect(clip, paddingBox(f))
+      }
+    }
+    at = f.parent
+  }
+  placement.clip = clip
+  placement.visible = shown && !isEmpty(clip)
+  placement.paintIndex = paintIndexOf(tree, node.id)
+  return placement
+}
+
+/// The placements of every hosted node, in paint order (nodes that were not painted last).
+/// Call it after [`UiTree.frame`].
+pub effect fn hostedPlacements(tree: &UiTree, out: &mut List<HostedPlacement>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let count = tree.nodes.length()
+  let mut slot: usize = 0
+  while slot < count {
+    let node = &tree.nodes.asSlice()[slot]
+    if node.live && node.kind == NodeKind.Hosted {
+      run out.append(placementOf(tree, usize.toU32(slot)))
+    }
+    slot = slot + 1
+  }
+
+  // Insertion sort by paint index; hosted nodes are few.
+  let values = out.asMutSlice()
+  let mut i: usize = 1
+  while i < values.length {
+    let item = values[i]
+    let mut j = i
+    while j > 0 && values[j - 1].paintIndex > item.paintIndex {
+      values[j] = values[j - 1]
+      j = j - 1
+    }
+    values[j] = item
+    i = i + 1
+  }
+}
+
+/// The placement of hosted node `id`, or a hidden placement when it is not a hosted node.
+pub fn hostedPlacement(tree: &UiTree, id: u32) -> HostedPlacement {
+  let slot = tree.slotOf(id)
+  if slot == NONE || tree.node(slot).kind != NodeKind.Hosted {
+    return HostedPlacement {
+      id: id,
+      view: NONE,
+      bounds: emptyRect(),
+      clip: emptyRect(),
+      visible: false,
+      paintIndex: NONE,
+      scale: tree.input.scale,
+    }
+  }
+  return placementOf(tree, slot)
+}

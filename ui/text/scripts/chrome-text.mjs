@@ -133,7 +133,9 @@ class Chrome {
     const exited = new Promise(done => this.child.once('exit', done));
     this.child.kill('SIGTERM');
     await exited;
-    await rm(this.profile, { recursive: true, force: true });
+    // Chrome's helper processes can still be writing to the profile for a moment after the
+    // browser exits; rm retries ENOTEMPTY and EBUSY.
+    await rm(this.profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 

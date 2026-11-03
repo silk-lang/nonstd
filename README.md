@@ -27,6 +27,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
 | [`platform/window`](platform/window) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames (macOS first) |
+| [`platform/webview`](platform/webview) | `platform-webview` | Web views in Silk UIs: one contract for every engine, agent control, a headless backend (native backends in progress) |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
 
 Each library's README lists its helper packages (command-line tools, benchmarks, test runners).
