@@ -3,7 +3,8 @@
 import ui_app_examples.counter { Counter, Message as CounterMessage }
 import ui_app_examples.todo { Todo, Message as TodoMessage, Command as TodoCommand, Store }
 import ui_app_examples.look { SANS }
-import ui_app.app { App, Context, NoCommand }
+import ui_app.app { App, Context, NoCommand, Perform }
+import ui_app.tasks { Tasks }
 import ui_app.runtime { Runtime, tick, drain }
 import ui_app.harness { click, press, locate }
 import ui_app.seq as seq
@@ -23,6 +24,11 @@ import font_collection.lib { FontCollection }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.concurrency.fiber { Cancelled, Fiber }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
@@ -411,4 +417,110 @@ test effect fn loopHelpers() -> ()
   ! AssertionError<'static> | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run seqBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Commands on fibers: a slow command does not hold up a fast one, and messages come back as
+// their commands finish.
+
+struct Waits {
+  started: u64,
+  finished: u64,
+  done: List<u64>,
+}
+
+union WaitsMessage {
+  Start { id: u64, nanoseconds: u64 },
+  Done { id: u64 },
+}
+
+struct Wait {
+  id: u64,
+  nanoseconds: u64,
+}
+
+impl Perform<WaitsMessage, never ? &mut Scheduler | &mut MonotonicClock> for Wait {
+  effect fn perform(self: Self) -> WaitsMessage
+    ? &mut Scheduler | &mut MonotonicClock {
+    run Effect.sleep(self.nanoseconds)
+    return WaitsMessage.Done { id: self.id }
+  }
+}
+
+impl App<WaitsMessage, Wait> for Waits {
+  fn view(self: &Self, ui: &mut Ui<WaitsMessage>) -> () {
+    ui.style(&[Property.FontFamily { family: SANS }])
+    ui.number(u64.toI64(self.finished))
+  }
+
+  fn update(self: &mut Self, message: WaitsMessage, cx: &mut Context<Wait>) -> () {
+    match move message {
+      WaitsMessage.Start { id, nanoseconds } => {
+        self.started = self.started + 1
+        cx.command(Wait { id: id, nanoseconds: nanoseconds })
+      }
+      WaitsMessage.Done { id } => {
+        self.finished = self.finished + 1
+        cx.alloc(self.done.append(id))
+      }
+    }
+  }
+}
+
+effect fn tasksBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Waits, WaitsMessage, Wait>.make(
+    Waits { started: 0, finished: 0, done: List<u64>.make() },
+  )
+  app.deferCommands()
+  run app.start(&mut tree, 0.0)
+  app.send(WaitsMessage.Start { id: 1, nanoseconds: 40000000 })
+  app.send(WaitsMessage.Start { id: 2, nanoseconds: 1000000 })
+  run drain(&mut app, &mut tree)
+  run Testing.expect(app.model.started == 2 && app.deferred() == 2, "the commands wait")
+  run Testing.expect(app.model.done.length() == 0, "nothing ran during drain")
+  let mut tasks = Tasks<WaitsMessage, never>.make()
+  run Testing.expect((run tasks.launch(&mut app)) == 2, "both commands start")
+  run Testing.expect(app.deferred() == 0 && tasks.length() == 2, "and run on fibers")
+  let mut frames: u64 = 0
+  while tasks.length() != 0 && frames < 100000000 {
+    run Fiber.yieldNow()
+    if (run tasks.collect(&mut app)) != 0 {
+      run drain(&mut app, &mut tree)
+    }
+    frames = frames + 1
+  }
+  run Testing.expect(app.model.done.length() == 2, "both messages came back")
+  run Testing.expect(
+    app.model.done.get(0) == 2 && app.model.done.get(1) == 1,
+    "the fast command's message comes first",
+  )
+  run Testing.expect(frames > 1, "the loop kept running while the commands waited")
+  run Testing.expect((run idOf(&mut tree, "2")) != 0, "the view shows both")
+}
+
+effect fn tasksRoot() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run tasksBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn commandsOnFibers() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | OutOfMemoryError
+    | TaskIdExhaustedError
+    | Cancelled
+    | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  run scheduler.execute<
+    (),
+    AssertionError<'static> | TreeError | OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  >(tasksRoot())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
 }
