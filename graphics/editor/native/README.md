@@ -33,6 +33,12 @@ libraries/frameworks; it does not depend on a running compiler or this checkout.
 
 ## Editing
 
+The native shell follows the browser Studio's panel dimensions, compact typography,
+sectioned inspector, palette, floating tool dock, zoom controls, and file menu. The
+Design heading stays fixed while its properties scroll. Palette colors are ordinary
+undoable edits; zoom buttons keep the canvas center fixed, and fit uses the same
+artwork margins as the browser. Desktop file operations use native dialogs.
+
 - Select, marquee-select, drag, resize, Shift-constrain, Alt-drag duplicate, and
   use H or hold Space to pan. Cmd/Ctrl + wheel and trackpad pinch zoom at the pointer.
 - Draw rectangles, ellipses, frames, and text with R, O, F, and T. Double-click text
