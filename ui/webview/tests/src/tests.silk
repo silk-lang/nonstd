@@ -1,0 +1,277 @@
+//! ui-webview tests: a small browser app on the headless backend, driven through the real tree
+//! and the host the window loop uses, without a window.
+import ui_webview.lib { Page, PageMessage, WebViewRequests, WebViewsHost, WebViewApp, webView }
+import webview.command { Command }
+import webview.event { EventKind }
+import webview.headless { HeadlessWebViews, HeadlessView }
+import ui_app.app { App, Context, NoCommand }
+import ui_app.runtime { Runtime, drain }
+import ui_app.harness { locate, press, focusedId }
+import ui_app.ui { Ui }
+import ui_app_window.lib { WindowHost }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib { UiTree, TreeError, FrameInput, NodeInfo, Length }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+const VIEW: u32 = 3
+
+struct Browser {
+  page: Page,
+  requests: WebViewRequests,
+  showPage: bool,
+  /// The answers (`Snapshot`, `Unsupported`, ...) the page handed back, one line each.
+  answers: List<String>,
+}
+
+union Message {
+  Page { view: u32, message: PageMessage },
+  Go,
+  Back,
+  Hide,
+  Close,
+  Snapshot,
+  Orphan,
+}
+
+impl App<Message, NoCommand> for Browser {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.row(
+      |ui| {
+        ui.button("Back", || Message.Back)
+        ui.button("Go", || Message.Go)
+        ui.box(
+          |ui| {
+            ui.testId("title")
+            ui.text(self.page.heading())
+          },
+        )
+      },
+    )
+    if self.showPage {
+      webView(
+        &mut ui,
+        &self.page,
+        |message| Message.Page { view: VIEW, message: move message },
+        |ui| {
+          ui.testId("page")
+          ui.width(Length.px(200.0))
+          ui.height(Length.px(120.0))
+        },
+      )
+    }
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Page { view, message: pageMessage } => {
+        if view == VIEW {
+          let answer = cx.alloc(self.page.update(move pageMessage, &mut self.requests))
+          if let Option<EventKind>.Some { value } = move answer {
+            let line = cx.alloc(describe(&value))
+            cx.alloc(self.answers.append(move line))
+          }
+        } else if let PageMessage.Event { event } = move pageMessage {
+          let line = cx.alloc(describe(&event))
+          cx.alloc(self.answers.append(move line))
+        }
+      }
+      Message.Go => {
+        cx.alloc(self.page.navigate(&mut self.requests, "data:text/html,<title>Second</title>"))
+      }
+      Message.Back => {
+        cx.alloc(self.page.back(&mut self.requests))
+      }
+      Message.Hide => {
+        self.showPage = false
+      }
+      Message.Close => {
+        cx.alloc(self.page.close(&mut self.requests))
+      }
+      Message.Snapshot => {
+        let request = self.requests.request()
+        cx.alloc(self.page.send(&mut self.requests, Command.Snapshot { request: request }))
+      }
+      Message.Orphan => {
+        let request = self.requests.request()
+        cx.alloc(self.requests.send(99, Command.Snapshot { request: request }))
+      }
+    }
+  }
+}
+
+impl WebViewApp<Message> for Browser {
+  fn webViewRequests(self: &mut Self) -> &mut WebViewRequests {
+    return &mut self.requests
+  }
+
+  fn webViewMessage(self: &Self, view: u32, message: PageMessage) -> Message {
+    return Message.Page { view: view, message: move message }
+  }
+}
+
+effect fn describe(event: &EventKind) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &event.* {
+    EventKind.Snapshot { text, .. } => {
+      let mut line = run String.copy("snapshot ")
+      run line.append(String.view(&text))
+      move line
+    }
+    EventKind.Unsupported { command, .. } => {
+      let mut line = run String.copy("unsupported ")
+      run line.append(String.view(&command))
+      move line
+    }
+    _ => run String.copy("other")
+  }
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 400.0, height: 300.0, scale: 2.0, time: 0.0 }
+}
+
+type Host = WebViewsHost<HeadlessWebViews, Browser, Message>
+
+/// One turn of the loop: the host takes the model's requests and its events become messages.
+effect fn turn(
+  app: &mut Runtime<Browser, Message, NoCommand>,
+  tree: &mut UiTree,
+  host: &mut Host,
+) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Message>.make()
+  drop run host.poll(&mut app.model, &mut out)
+  while out.length() != 0 {
+    app.send(out.remove(0))
+  }
+  run drain(&mut app, &mut tree)
+  run tree.frame(viewport())
+  run host.framed(&tree.*)
+}
+
+fn headless(host: &Host) -> Option<&HeadlessView> {
+  return host.views.view(VIEW)
+}
+
+effect fn idOf(tree: &mut UiTree, value: string) -> u32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locate(&mut tree, viewport(), value) {
+    Option<NodeInfo>.Some { value: node } => node.id
+    Option<NodeInfo>.None => 0
+  }
+}
+
+effect fn pageBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut model = Browser {
+    page: Page.make(VIEW),
+    requests: WebViewRequests.make(),
+    showPage: true,
+    answers: List<String>.make(),
+  }
+  run model.page.open(&mut model.requests, "data:text/html,<title>Home</title><p>hi")
+  let mut app = Runtime<Browser, Message, NoCommand>.make(move model)
+  run app.start(&mut tree, 0.0)
+  let mut host = Host.make(HeadlessWebViews.make())
+
+  // Nothing opens before the window does.
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(!host.isOpen(VIEW), "requests wait for the window")
+  run host.opened(12)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(host.isOpen(VIEW), "the view opened with the window")
+  run Testing.expect(app.model.page.created, "Created reached the page")
+  run Testing.expect(String.view(&app.model.page.title) == "Home", "and its title")
+  run Testing.expect(!app.model.page.loading, "the load finished")
+  let record = headless(&host)
+  run Testing.expect(Option<&HeadlessView>.isSome(&record), "the backend has the view")
+  if let Option<&HeadlessView>.Some { value } = record {
+    run Testing.expect(value.window == 12, "in the host's window")
+    run Testing.expect(value.placement.visible, "placed after the frame")
+    run Testing.expect(
+      value.placement.bounds.xMax - value.placement.bounds.xMin == 200.0,
+      "on its hosted node",
+    )
+    run Testing.expect(value.placement.scale == 2.0, "at the window's scale")
+  }
+  let shown = run locate(&mut tree, viewport(), "Home")
+  run Testing.expect(Option<NodeInfo>.isSome(&shown), "the title shows")
+
+  // Navigation and history.
+  app.send(Message.Go)
+  run drain(&mut app, &mut tree)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(String.view(&app.model.page.title) == "Second", "it navigated")
+  run Testing.expect(app.model.page.canGoBack, "with history to go back to")
+  app.send(Message.Back)
+  run drain(&mut app, &mut tree)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(String.view(&app.model.page.title) == "Home", "and went back")
+
+  // The page takes focus: the hosted node takes the tree's focus.
+  run host.views.simulateFocus(VIEW, true)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(app.model.page.focused, "the page has focus")
+  let pageNode = run idOf(&mut tree, "page")
+  run Testing.expect(focusedId(&tree) == pageNode, "so does its node in the tree")
+
+  // The page gives focus up, and Tab brings the tree's focus back: the page gets keyboard focus.
+  run host.views.simulateFocus(VIEW, false)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(!app.model.page.focused, "the page let go of focus")
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  run Testing.expect(focusedId(&tree) == pageNode, "Tab reaches the page's node")
+  run turn(&mut app, &mut tree, &mut host)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(app.model.page.focused, "and the page took keyboard focus")
+
+  // Answers go back to the app.
+  app.send(Message.Snapshot)
+  run drain(&mut app, &mut tree)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(app.model.answers.length() == 1, "the snapshot came back")
+  run Testing.expect(
+    String.startsWith(String.view(&app.model.answers.asSlice()[0]), "snapshot - document \"Home\""),
+    "with the page's outline",
+  )
+
+  // A command for no view is answered as unsupported, so nobody waits forever.
+  app.send(Message.Orphan)
+  run drain(&mut app, &mut tree)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(app.model.answers.length() == 2, "the orphan command was answered")
+
+  // The node goes away: the view hides.
+  app.send(Message.Hide)
+  run drain(&mut app, &mut tree)
+  run turn(&mut app, &mut tree, &mut host)
+  if let Option<&HeadlessView>.Some { value } = headless(&host) {
+    run Testing.expect(!value.placement.visible, "a view without its node is hidden")
+  }
+
+  // Closing.
+  app.send(Message.Close)
+  run drain(&mut app, &mut tree)
+  run turn(&mut app, &mut tree, &mut host)
+  run Testing.expect(!host.isOpen(VIEW), "the view closed")
+  run Testing.expect(!app.model.page.created, "and the page knows")
+}
+
+test effect fn pagesFollowTheirViews() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pageBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

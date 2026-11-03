@@ -1,5 +1,6 @@
 //! A small browser: a Silk UI toolbar and status bar around a real web page (WKWebView on
-//! macOS; the headless backend elsewhere, which shows an empty box).
+//! macOS, WebView2 on Windows; the headless backend elsewhere, which shows an empty box), built
+//! on ui-webview's `Page`, `webView` and `WebViewsHost`.
 //!
 //!   platform-webview-browser
 //!
@@ -8,30 +9,26 @@
 //! page, finds the field and the button by their refs, types a name and clicks, with real
 //! input. The status bar shows the page title, loading and the page's last console message.
 import webview.command { Command as WebCommand }
-import webview.event { WebViewEvent, EventKind }
-import webview.host { WebViewHost }
+import webview.event { EventKind }
 import webview.native { NativeWebViews }
-import webview.types { WebViewOptions, WebViewError, Placement }
+import ui_webview.lib { Page, PageMessage, WebViewRequests, WebViewsHost, WebViewApp, webView }
 import ui_app.app { App, Context, NoCommand }
 import ui_app.runtime { Runtime }
 import ui_app.ui { Ui }
 import ui_app_examples.look { SANS, surface, button, rgb }
-import ui_app_window.lib { RunOptions, WindowHost, runWindowHosting }
+import ui_app_window.lib { RunOptions, runWindowHosting }
 import ui_inspect_server.lib { Inspector }
 import ui_fixtures.fixtures as fixtures
-import ui_tree.hosted { HostedPlacement, hostedPlacements }
-import ui_tree.lib { UiTree, TreeError, Batch }
+import ui_tree.lib { TreeError, Batch }
 import ui_tree.mutation { Property, Align }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
 import window.types { WindowError }
 import webgpu.runtime { GpuError }
-import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.num.f32
 import silk.text.string { String }
 
 /// The one web view, by the id its hosted node names.
@@ -53,17 +50,10 @@ const FORM: string<
 > = "<!doctype html><title>Agent demo</title><style>body{font:16px -apple-system,sans-serif;margin:32px;color:#1f2937}input{font:inherit;padding:6px 8px;margin-right:8px}button{font:inherit;padding:6px 14px}#out{margin-top:20px;font-size:22px}</style><h1>Sign the guest book</h1><p>Type a name and press the button, or let the agent do it from the Silk toolbar.</p><input id=name aria-label=Name placeholder=Name><button onclick=\"const n=document.getElementById('name').value;document.getElementById('out').textContent='Hello, '+n+'!';document.title='Signed by '+n;console.log('signed by '+n)\">Sign</button><div id=out></div>"
 
 pub struct Browser {
-  pub title: String,
-  pub url: String,
-  pub progress: f32,
-  pub loading: bool,
-  pub canGoBack: bool,
-  pub canGoForward: bool,
-  pub focused: bool,
+  pub page: Page,
   pub status: String,
-  /// Commands for the web view, taken by the host after each update.
-  pub outbox: List<WebCommand>,
-  nextRequest: u32,
+  /// The web view work `update` queued, which the host takes after each turn.
+  requests: WebViewRequests,
   /// The request of the snapshot the agent demo is waiting for, or 0.
   agentSnapshot: u32,
 }
@@ -75,37 +65,31 @@ pub union Message {
   Open { pub index: usize },
   OpenForm,
   RunAgent,
-  Title { pub title: String },
-  Url { pub url: String },
-  Progress { pub fraction: f32 },
-  Loaded { pub ok: bool, pub error: String },
-  History { pub back: bool, pub forward: bool },
-  Focus { pub focused: bool },
-  Status { pub text: String },
-  Snapshot { pub request: u32, pub text: String },
+  Page { pub message: PageMessage },
 }
 
 impl Browser {
-  pub fn make() -> Browser {
-    return Browser {
-      title: String.make(),
-      url: String.make(),
-      progress: 0.0,
-      loading: false,
-      canGoBack: false,
-      canGoForward: false,
-      focused: false,
+  pub effect fn make() -> Browser
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut browser = Browser {
+      page: Page.make(VIEW),
       status: String.make(),
-      outbox: List<WebCommand>.make(),
-      nextRequest: 1,
+      requests: WebViewRequests.make(),
       agentSnapshot: 0,
     }
+    run browser.page.open(&mut browser.requests, START)
+    return move browser
+  }
+}
+
+impl WebViewApp<Message> for Browser {
+  fn webViewRequests(self: &mut Self) -> &mut WebViewRequests {
+    return &mut self.requests
   }
 
-  fn request(self: &mut Self) -> u32 {
-    let request = self.nextRequest
-    self.nextRequest = self.nextRequest + 1
-    return request
+  fn webViewMessage(self: &Self, view: u32, message: PageMessage) -> Message {
+    return Message.Page { message: move message }
   }
 }
 
@@ -148,13 +132,15 @@ impl App<Message, NoCommand> for Browser {
     ui.box(
       |ui| {
         ui.color(rgb(0x6B7280))
-        ui.text(self.url.view())
+        ui.text(self.page.url.view())
       },
     )
 
-    // The page: a hosted node the web view is placed on after every frame.
-    ui.hosted(
-      VIEW,
+    // The page: ui-webview's node, which the host places the web view on after every frame.
+    webView(
+      &mut ui,
+      &self.page,
+      |message| Message.Page { message: move message },
       |ui| {
         ui.testId("page")
         ui.grow(1.0)
@@ -167,16 +153,16 @@ impl App<Message, NoCommand> for Browser {
         ui.box(
           |ui| {
             ui.fontSize(13.0)
-            ui.text(self.title.view())
+            ui.text(self.page.title.view())
           },
         )
         ui.box(
           |ui| {
             ui.fontSize(13.0)
             ui.color(rgb(0x6B7280))
-            if self.loading {
+            if self.page.loading {
               ui.text("Loading…")
-            } else if self.focused {
+            } else if self.page.focused {
               ui.text("The page has keyboard focus")
             } else {
               ui.text("")
@@ -197,30 +183,48 @@ impl App<Message, NoCommand> for Browser {
   fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
     match move message {
       Message.Back => {
-        cx.alloc(self.outbox.append(WebCommand.Back))
+        cx.alloc(self.page.back(&mut self.requests))
       }
       Message.Forward => {
-        cx.alloc(self.outbox.append(WebCommand.Forward))
+        cx.alloc(self.page.forward(&mut self.requests))
       }
       Message.Reload => {
-        cx.alloc(self.outbox.append(WebCommand.Reload))
+        cx.alloc(self.page.reloadOrStop(&mut self.requests))
       }
       Message.Open { index } => {
-        let url = cx.copy(PAGES[index])
-        cx.alloc(self.outbox.append(WebCommand.Navigate { url: move url }))
+        cx.alloc(self.page.navigate(&mut self.requests, PAGES[index]))
       }
       Message.OpenForm => {
         let html = cx.copy(FORM)
         let base = cx.copy("about:blank")
-        cx.alloc(self.outbox.append(WebCommand.LoadHtml { html: move html, baseUrl: move base }))
+        cx.alloc(
+          self.page.send(
+            &mut self.requests,
+            WebCommand.LoadHtml { html: move html, baseUrl: move base },
+          ),
+        )
       }
       Message.RunAgent => {
-        let request = self.request()
+        let request = self.requests.request()
         self.agentSnapshot = request
         self.status = cx.copy("Agent: taking a snapshot")
-        cx.alloc(self.outbox.append(WebCommand.Snapshot { request: request }))
+        cx.alloc(self.page.send(&mut self.requests, WebCommand.Snapshot { request: request }))
       }
-      Message.Snapshot { request, text } => {
+      Message.Page { message: pageMessage } => {
+        let answer = cx.alloc(self.page.update(move pageMessage, &mut self.requests))
+        if let Option<EventKind>.Some { value } = move answer {
+          self.answered(move value, &mut cx)
+        }
+      }
+    }
+  }
+}
+
+impl Browser {
+  /// What the page answered, or reported beyond its state.
+  fn answered(self: &mut Self, event: EventKind, cx: &mut Context<NoCommand>) -> () {
+    match move event {
+      EventKind.Snapshot { request, text } => {
         if request == self.agentSnapshot {
           self.agentSnapshot = 0
           let field = cx.alloc(refOn(text.view(), "textbox \"Name\""))
@@ -228,169 +232,44 @@ impl App<Message, NoCommand> for Browser {
           if String.byteLength(field.view()) == 0 || String.byteLength(sign.view()) == 0 {
             self.status = cx.copy("Agent: no form here; open Agent demo first")
           } else {
-            let fill = self.request()
-            let click = self.request()
+            let fill = self.requests.request()
+            let click = self.requests.request()
             let name = cx.copy("Silk agent")
             cx.alloc(
-              self.outbox.append(
+              self.page.send(
+                &mut self.requests,
                 WebCommand.FillElement { request: fill, element: move field, text: move name },
               ),
             )
             cx.alloc(
-              self.outbox.append(WebCommand.ClickElement { request: click, element: move sign }),
+              self.page.send(
+                &mut self.requests,
+                WebCommand.ClickElement { request: click, element: move sign },
+              ),
             )
             self.status = cx.copy("Agent: filled the name and clicked Sign")
           }
         }
       }
-      Message.Title { title } => {
-        self.title = move title
-      }
-      Message.Url { url } => {
-        self.url = move url
-      }
-      Message.Progress { fraction } => {
-        self.progress = fraction
-        self.loading = fraction < 1.0
-      }
-      Message.Loaded { ok, error } => {
-        self.loading = false
-        if !ok && String.byteLength(error.view()) != 0 {
-          self.status = move error
-        }
-      }
-      Message.History { back, forward } => {
-        self.canGoBack = back
-        self.canGoForward = forward
-      }
-      Message.Focus { focused } => {
-        self.focused = focused
-      }
-      Message.Status { text } => {
+      EventKind.Console { message, .. } => {
+        let mut text = cx.copy("Console: ")
+        cx.alloc(text.append(message.view()))
         self.status = move text
       }
-    }
-  }
-}
-
-/// The web view next to the tree: opened with the window, placed after each frame, its events
-/// turned into messages.
-struct Host {
-  views: NativeWebViews,
-  placements: List<HostedPlacement>,
-  events: List<WebViewEvent>,
-  open: bool,
-}
-
-impl WindowHost<Browser, Message> for Host {
-  effect fn opened(self: &mut Self, window: u32) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let options = run WebViewOptions.make(window, START)
-    self.open = run Effect.catch<WebViewError>(openView(&mut self.views, &options), refused)
-    if !self.open {
-      StderrWriter.print("browser: the web view could not be created\n", &())
-    }
-  }
-
-  effect fn framed(self: &mut Self, tree: &UiTree) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    run hostedPlacements(tree, &mut self.placements)
-    let list = self.placements.asSlice()
-    let mut i: usize = 0
-    while i < list.length {
-      let p = list[i]
-      if p.view == VIEW {
-        self.views.place(
-          VIEW,
-          Placement { bounds: p.bounds, clip: p.clip, visible: p.visible, scale: p.scale },
-        )
+      EventKind.ActionResult { ok, error, .. } => {
+        if !ok {
+          let mut text = cx.copy("Agent: ")
+          cx.alloc(text.append(error.view()))
+          self.status = move text
+        }
       }
-      i = i + 1
+      EventKind.NewWindowRequested { url } => {
+        // A one-view browser: open the link here.
+        cx.alloc(self.page.navigate(&mut self.requests, url.view()))
+      }
+      _ => {}
     }
   }
-
-  effect fn poll(self: &mut Self, model: &mut Browser, out: &mut List<Message>) -> bool
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    while model.outbox.length() != 0 {
-      let command = model.outbox.remove(0)
-      if self.open {
-        drop run Effect.catch<WebViewError>(sendView(&mut self.views, move command), refused)
-      }
-    }
-    run self.views.takeEvents(&mut self.events)
-    let before = out.length()
-    while self.events.length() != 0 {
-      let event = self.events.remove(0)
-      match move event.kind {
-        EventKind.TitleChanged { title } => {
-          run out.append(Message.Title { title: move title })
-        }
-        EventKind.UrlChanged { url } => {
-          run out.append(Message.Url { url: move url })
-        }
-        EventKind.LoadProgress { fraction } => {
-          run out.append(Message.Progress { fraction: fraction })
-        }
-        EventKind.LoadFinished { ok, error, .. } => {
-          run out.append(Message.Loaded { ok: ok, error: move error })
-        }
-        EventKind.HistoryChanged { canGoBack, canGoForward } => {
-          run out.append(Message.History { back: canGoBack, forward: canGoForward })
-        }
-        EventKind.FocusChanged { focused } => {
-          run out.append(Message.Focus { focused: focused })
-        }
-        EventKind.Console { message, .. } => {
-          let mut text = run String.copy("Console: ")
-          run text.append(message.view())
-          run out.append(Message.Status { text: move text })
-        }
-        EventKind.Snapshot { request, text } => {
-          run out.append(Message.Snapshot { request: request, text: move text })
-        }
-        EventKind.ActionResult { ok, error, .. } => {
-          if !ok {
-            let mut text = run String.copy("Agent: ")
-            run text.append(error.view())
-            run out.append(Message.Status { text: move text })
-          }
-        }
-        EventKind.NewWindowRequested { url } => {
-          // A one-view browser: open the link here.
-          if self.open {
-            drop run Effect.catch<WebViewError>(
-              sendView(&mut self.views, WebCommand.Navigate { url: move url }),
-              refused,
-            )
-          }
-        }
-        _ => {}
-      }
-    }
-    return out.length() != before
-  }
-}
-
-effect fn openView(views: &mut NativeWebViews, options: &WebViewOptions) -> bool
-  ! WebViewError | OutOfMemoryError
-  ? &mut Allocator {
-  run views.open(VIEW, options)
-  return true
-}
-
-effect fn sendView(views: &mut NativeWebViews, command: WebCommand) -> bool
-  ! WebViewError | OutOfMemoryError
-  ? &mut Allocator {
-  run views.send(VIEW, move command)
-  return true
-}
-
-effect fn refused(error: WebViewError) -> bool {
-  drop error
-  return false
 }
 
 effect fn program() -> i32
@@ -399,7 +278,7 @@ effect fn program() -> i32
   let collection = run fixtures.fonts()
   let mut batch = Batch.make()
   run batch.fontFamily(SANS, "Noto Sans, sans-serif")
-  let mut app = Runtime<Browser, Message, NoCommand>.make(Browser.make())
+  let mut app = Runtime<Browser, Message, NoCommand>.make(run Browser.make())
   let options = RunOptions {
     title: "Silk browser",
     width: 1100.0,
@@ -408,12 +287,7 @@ effect fn program() -> i32
     checkClick: "",
     checkExpect: "",
   }
-  let mut host = Host {
-    views: NativeWebViews.make(),
-    placements: List<HostedPlacement>.make(),
-    events: List<WebViewEvent>.make(),
-    open: false,
-  }
+  let mut host = WebViewsHost<NativeWebViews, Browser, Message>.make(NativeWebViews.make())
   return run runWindowHosting(
     &mut app,
     &collection,
