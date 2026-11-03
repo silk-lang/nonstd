@@ -1,0 +1,1201 @@
+//! The Chromium backend (CEF, offscreen) on Linux. Pages render into textures the app's
+//! `UiRenderer` draws at each view's hosted node, so the app's own UI can draw over a page, and
+//! the app forwards the person's input to the view under the pointer.
+//!
+//! The loop belongs to the app, as for every backend, with three additions:
+//!
+//! - `takeEvents` also does CEF's due work (CEF runs an external message pump here); CEF wakes
+//!   platform-window's `nextEvent` whenever it wants work, so drain `takeEvents` after each turn.
+//! - `present` uploads (or, with shared textures, imports) the frames that changed into the
+//!   textures registered with the renderer under each view's id; call it before drawing a frame,
+//!   and request a frame when `hasNewFrames` says one arrived.
+//! - `forward` takes each window event: pointer events over a view, and keys while a view has
+//!   keyboard focus, go to the page (it answers true, and the app should not handle them too).
+//!   `cursor` is the cursor the page wants while the pointer is over it.
+//!
+//! The native side is native/bridge.c. Agent commands, `Evaluate` and `Screenshot` go through
+//! the Chrome DevTools Protocol; `OpenDevTools` opens DevTools in a window of its own.
+import input { modifierBits, buttonNumber, buttonBit, wheelPixels, cursorFromValue }
+import options { ChromiumOptions }
+import sys
+import sys { RawEvent, RawFrame }
+import webview.agent { agentScriptBytes, snapshotCall, locateCall, focusForFillCall }
+import webview.command { Command, commandName }
+import webview.event { WebViewEvent, EventKind }
+import webview.host { WebViewHost }
+import webview.types {
+  WebViewOptions,
+  WebViewError,
+  Placement,
+  Backend,
+  Capabilities,
+  ConsoleLevel
+}
+import window.event { Event, Modifiers }
+import window.keys { KeyCode }
+import window.types { Cursor }
+import webgpu.descriptors {
+  Extent3D,
+  Origin3D,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureDescriptor,
+  TextureViewDescriptor,
+}
+import webgpu.resources as gpu
+import webgpu.resources { Queue, Texture }
+import webgpu.runtime { Device, GpuError }
+import webgpu.shared_texture {
+  BeginAccess,
+  DmaBufDescriptor,
+  DmaBufPlane,
+  FEATURE_DMA_BUF,
+  SharedTextureMemory,
+}
+import webgpu_sys.generated_webgpu as flags
+import ui_renderer.renderer { UiRenderer }
+import images_codec.png as png
+import images_codec.png { PngError }
+import images_codec.image { ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+
+const LEVELS: [ConsoleLevel; 5] = [
+  ConsoleLevel.Debug,
+  ConsoleLevel.Log,
+  ConsoleLevel.Info,
+  ConsoleLevel.Warning,
+  ConsoleLevel.Error,
+]
+
+/// DRM_FORMAT_ABGR8888: bytes R, G, B, A (an RGBA8 texture).
+const DRM_ABGR8888: u32 = 0x34324241
+
+/// What the host keeps per view: its placement and the texture its frames go to.
+struct Surface {
+  view: u32,
+  placement: Placement,
+  placed: bool,
+  texture: Option<Texture>,
+  width: u32,
+  height: u32,
+  format: u32,
+  generation: u64,
+}
+
+/// The CEF backend. One per process: CEF starts once (`start`) and cannot start again after
+/// `shutdown`.
+pub struct ChromiumWebViews {
+  surfaces: List<Surface>,
+  /// The view a pressed button captured, which gets pointer events until all buttons are up.
+  captured: Option<u32>,
+  /// The view under the pointer, which gets a leave event when the pointer moves off it.
+  hovered: Option<u32>,
+  /// The view with keyboard focus, which gets key and text events.
+  focused: Option<u32>,
+  /// The mouse buttons held, as the bridge's modifier bits.
+  buttons: u32,
+  /// An input method composition is open in the focused view.
+  composing: bool,
+  /// A frame arrived that `present` has not uploaded yet.
+  fresh: bool,
+  running: bool,
+}
+
+/// Why `ChromiumWebViews.start` failed, as `startError` explains.
+pub enum StartError {
+  /// libcef.so is not in the runtime directory (run scripts/install-cef).
+  NoLibrary,
+  /// The runtime directory's CEF is not the version this package was built for.
+  WrongVersion,
+  /// CEF refused to start (see `startError`, and SILK_CEF_LOG=<file> for its log).
+  Failed,
+  /// CEF started before in this process; it starts once.
+  AlreadyStarted,
+}
+
+fn text(value: string) -> ?[*]const u8 {
+  return Pointer.fromSlice(String.utf8Bytes(value))
+}
+
+fn flag(raw: &RawEvent, bit: u32) -> bool {
+  return (raw.flags & bit) != 0
+}
+
+fn inside(placement: Placement, x: f64, y: f64) -> bool {
+  let c = placement.clip
+  let b = placement.bounds
+  let x32 = f64.toF32(x)
+  let y32 = f64.toF32(y)
+  return placement.visible && x32 >= c.xMin && x32 < c.xMax && y32 >= c.yMin && y32 < c.yMax
+    && x32 >= b.xMin
+    && x32 < b.xMax
+    && y32 >= b.yMin
+    && y32 < b.yMax
+}
+
+fn sameView(a: Option<u32>, view: u32) -> bool {
+  return match a {
+    Option<u32>.Some { value } => value == view
+    Option<u32>.None => false
+  }
+}
+
+impl ChromiumWebViews {
+  /// Loads CEF from `options.runtimeDir` and starts it, once per process. When it fails,
+  /// `startError` says why.
+  pub effect fn start(options: &ChromiumOptions) -> ChromiumWebViews
+    ! StartError
+    ? &mut Allocator {
+    let mut startFlags: u32 = 0
+    if !options.sandbox {
+      startFlags = startFlags | sys.NO_SANDBOX
+    }
+    if options.sharedTextures {
+      startFlags = startFlags | sys.SHARED_TEXTURES
+    }
+    if !options.gpu {
+      startFlags = startFlags | sys.DISABLE_GPU
+    }
+    let dir = String.view(&options.runtimeDir)
+    let helper = String.view(&options.helperPath)
+    let root = String.view(&options.cacheRoot)
+    let switches = String.view(&options.switches)
+    let script = agentScriptBytes()
+    let status = unsafe sys.silk_cef_start(
+      text(dir),
+      String.byteLength(dir),
+      text(helper),
+      String.byteLength(helper),
+      text(root),
+      String.byteLength(root),
+      text(switches),
+      String.byteLength(switches),
+      startFlags,
+      Pointer.fromSlice(script),
+      script.length,
+    )
+    if status == sys.NO_LIBRARY {
+      fail StartError.NoLibrary
+    }
+    if status == sys.WRONG_VERSION {
+      fail StartError.WrongVersion
+    }
+    if status == sys.ALREADY {
+      fail StartError.AlreadyStarted
+    }
+    if status != sys.STARTED {
+      fail StartError.Failed
+    }
+    return ChromiumWebViews {
+      surfaces: List<Surface>.make(),
+      captured: Option<u32>.None,
+      hovered: Option<u32>.None,
+      focused: Option<u32>.None,
+      buttons: 0,
+      composing: false,
+      fresh: false,
+      running: true,
+    }
+  }
+
+  /// Why the last `start` failed, in words.
+  pub effect fn startError() -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let message = unsafe sys.silk_cef_error()
+    let mut length: usize = 0
+    match Pointer.nonNullMany(message) {
+      Option<[*]const u8>.Some { value } => {
+        while unsafe Pointer.read(unsafe Pointer.at(value, length)) != 0 {
+          length = length + 1
+        }
+        let bytes = unsafe Pointer.borrowMany(&length, value, length)
+        match move run String.copyUtf8(bytes) {
+          Result<String, InvalidUtf8>.Success { value: copied } => {
+            return move copied
+          }
+          _ => {
+            return String.make()
+          }
+        }
+      }
+      _ => {
+        return String.make()
+      }
+    }
+  }
+
+  /// Closes every view and shuts CEF down. It cannot start again in this process.
+  pub fn shutdown(self: &mut Self) -> () {
+    if self.running {
+      unsafe sys.silk_cef_shutdown()
+      self.running = false
+    }
+  }
+
+  /// Does CEF's due work. `takeEvents` does this too; call it when the loop has no events to
+  /// take but wants CEF to run.
+  pub fn pump(self: &mut Self) -> () {
+    drop unsafe sys.silk_cef_pump()
+  }
+
+  /// Seconds until CEF next wants work, for a loop that waits with a timeout.
+  pub fn nextPump(self: &Self) -> f64 {
+    return unsafe sys.silk_cef_next_pump()
+  }
+
+  /// Whether a frame arrived since the last `present`: request a window frame then.
+  pub fn hasNewFrames(self: &mut Self) -> bool {
+    let mut i: usize = 0
+    while i < self.surfaces.length() {
+      let surface = &self.surfaces.asSlice()[i]
+      let mut frame = RawFrame.zero()
+      if unsafe sys.silk_cef_frame(surface.view, 0, Pointer.fromMutRef(&mut frame)) != 0 {
+        if frame.generation != surface.generation {
+          return true
+        }
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The cursor the page under the pointer wants, or None when the pointer is over no view.
+  pub fn cursor(self: &Self) -> Option<Cursor> {
+    let over = match self.captured {
+      Option<u32>.Some { value } => Option<u32>.some(value)
+      Option<u32>.None => self.hovered
+    }
+    return match over {
+      Option<u32>.Some { value } => Option<Cursor>.some(
+        cursorFromValue(unsafe sys.silk_cef_cursor(value)),
+      )
+      Option<u32>.None => Option<Cursor>.None
+    }
+  }
+
+  /// The view with keyboard focus, if any.
+  pub fn focusedView(self: &Self) -> Option<u32> {
+    return self.focused
+  }
+
+  fn find(self: &Self, view: u32) -> usize {
+    let list = self.surfaces.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].view == view {
+        return i
+      }
+      i = i + 1
+    }
+    return list.length
+  }
+
+  /// The visible view at (`x`, `y`) in window points, topmost (last placed) first.
+  fn viewAt(self: &Self, x: f64, y: f64) -> Option<u32> {
+    let list = self.surfaces.asSlice()
+    let mut i = list.length
+    while i > 0 {
+      i = i - 1
+      if list[i].placed && inside(list[i].placement, x, y) {
+        return Option<u32>.some(list[i].view)
+      }
+    }
+    return Option<u32>.None
+  }
+
+  /// The top left of `view`'s page in window points.
+  fn origin(self: &Self, view: u32) -> Option<Placement> {
+    let at = self.find(view)
+    if at >= self.surfaces.length() {
+      return Option<Placement>.None
+    }
+    return Option<Placement>.some(self.surfaces.asSlice()[at].placement)
+  }
+
+  fn movePointer(
+    self: &mut Self,
+    view: u32,
+    x: f64,
+    y: f64,
+    modifiers: Modifiers,
+    leave: bool,
+  ) -> () {
+    if let Option<Placement>.Some { value } = self.origin(view) {
+      let leaving: u8 = if leave {
+        1
+      } else {
+        0
+      }
+      unsafe sys.silk_cef_mouse_move(
+        view,
+        x - f32.toF64(value.bounds.xMin),
+        y - f32.toF64(value.bounds.yMin),
+        modifierBits(modifiers, self.buttons),
+        leaving,
+      )
+    }
+  }
+
+  fn unfocus(self: &mut Self) -> () {
+    if let Option<u32>.Some { value } = self.focused {
+      unsafe sys.silk_cef_focus(value, 0)
+    }
+    self.focused = Option<u32>.None
+    self.composing = false
+  }
+
+  /// Sends a window event to the page it is for. Returns true when a view took it: the pointer
+  /// is over a view (or a button pressed over one is still held), or a view has keyboard focus
+  /// and the event is a key, text or composition. A press outside every view takes keyboard
+  /// focus from the page.
+  pub fn forward(self: &mut Self, event: &Event) -> bool {
+    match &event.* {
+      Event.MouseMoved { position, modifiers, .. } => {
+        let under = self.viewAt(position.x, position.y)
+        let target = match self.captured {
+          Option<u32>.Some { value } => Option<u32>.some(value)
+          Option<u32>.None => under
+        }
+        if let Option<u32>.Some { value: previous } = self.hovered {
+          if !sameView(target, previous) {
+            self.movePointer(previous, position.x, position.y, modifiers, true)
+          }
+        }
+        self.hovered = target
+        if let Option<u32>.Some { value } = target {
+          self.movePointer(value, position.x, position.y, modifiers, false)
+          return true
+        }
+        return false
+      }
+      Event.MouseExited { .. } => {
+        if let Option<u32>.Some { value } = self.hovered {
+          if Option<u32>.isNone(&self.captured) {
+            unsafe sys.silk_cef_mouse_move(value, -1.0, -1.0, 0, 1)
+            self.hovered = Option<u32>.None
+          }
+        }
+        return false
+      }
+      Event.MouseDown { button, position, modifiers, clickCount, .. } => {
+        let target = match self.captured {
+          Option<u32>.Some { value } => Option<u32>.some(value)
+          Option<u32>.None => self.viewAt(position.x, position.y)
+        }
+        match target {
+          Option<u32>.Some { value: view } => {
+            if let Option<u32>.Some { value: number } = buttonNumber(button) {
+              if !sameView(self.focused, view) {
+                self.unfocus()
+                self.focused = Option<u32>.some(view)
+              }
+              if let Option<Placement>.Some { value: placement } = self.origin(view) {
+                unsafe sys.silk_cef_mouse_button(
+                  view,
+                  position.x - f32.toF64(placement.bounds.xMin),
+                  position.y - f32.toF64(placement.bounds.yMin),
+                  number,
+                  0,
+                  clickCount,
+                  modifierBits(modifiers, self.buttons),
+                )
+              }
+              self.buttons = self.buttons | buttonBit(number)
+              self.captured = Option<u32>.some(view)
+            }
+            return true
+          }
+          Option<u32>.None => {
+            self.unfocus()
+            return false
+          }
+        }
+      }
+      Event.MouseUp { button, position, modifiers, .. } => {
+        match self.captured {
+          Option<u32>.Some { value: view } => {
+            if let Option<u32>.Some { value: number } = buttonNumber(button) {
+              self.buttons = self.buttons & ~buttonBit(number)
+              if let Option<Placement>.Some { value: placement } = self.origin(view) {
+                unsafe sys.silk_cef_mouse_button(
+                  view,
+                  position.x - f32.toF64(placement.bounds.xMin),
+                  position.y - f32.toF64(placement.bounds.yMin),
+                  number,
+                  1,
+                  1,
+                  modifierBits(modifiers, self.buttons),
+                )
+              }
+            }
+            if self.buttons == 0 {
+              self.captured = Option<u32>.None
+            }
+            return true
+          }
+          Option<u32>.None => {
+            return false
+          }
+        }
+      }
+      Event.Scroll { position, delta, modifiers, .. } => {
+        if let Option<u32>.Some { value: view } = self.viewAt(position.x, position.y) {
+          if let Option<Placement>.Some { value: placement } = self.origin(view) {
+            let pixels = wheelPixels(delta)
+            unsafe sys.silk_cef_mouse_wheel(
+              view,
+              position.x - f32.toF64(placement.bounds.xMin),
+              position.y - f32.toF64(placement.bounds.yMin),
+              pixels.x,
+              pixels.y,
+              modifierBits(modifiers, self.buttons),
+            )
+          }
+          return true
+        }
+        return false
+      }
+      Event.KeyDown { code, modifiers, imeHandled, .. } => {
+        if let Option<u32>.Some { value: view } = self.focused {
+          if imeHandled {
+            return true
+          }
+          let bits = modifierBits(modifiers, 0)
+          let raw = u16.toU32(KeyCode.value(code))
+          unsafe sys.silk_cef_key(view, sys.KEY_DOWN, raw, 0, bits)
+
+          // Enter types a line break (or submits); its text comes as a character, as from GTK.
+          let enter = code == KeyCode.Enter || code == KeyCode.NumpadEnter
+          if enter && !modifiers.control && !modifiers.meta && !modifiers.alt {
+            unsafe sys.silk_cef_key(view, sys.KEY_CHAR, raw, 13, bits)
+          }
+          return true
+        }
+        return false
+      }
+      Event.KeyUp { code, modifiers, .. } => {
+        if let Option<u32>.Some { value: view } = self.focused {
+          let raw = u16.toU32(KeyCode.value(code))
+          unsafe sys.silk_cef_key(view, sys.KEY_UP, raw, 0, modifierBits(modifiers, 0))
+          return true
+        }
+        return false
+      }
+      Event.TextInput { text: typed, .. } => {
+        if let Option<u32>.Some { value: view } = self.focused {
+          let value = String.view(&typed)
+          if self.composing {
+            unsafe sys.silk_cef_ime_commit(view, text(value), String.byteLength(value))
+            self.composing = false
+          } else {
+            sendCharacters(view, value)
+          }
+          return true
+        }
+        return false
+      }
+      Event.ImePreedit { text: preedit, selectionStart, selectionEnd, .. } => {
+        if let Option<u32>.Some { value: view } = self.focused {
+          let value = String.view(&preedit)
+          if String.byteLength(value) == 0 {
+            unsafe sys.silk_cef_ime_cancel(view)
+            self.composing = false
+          } else {
+            unsafe sys.silk_cef_ime_set(
+              view,
+              text(value),
+              String.byteLength(value),
+              selectionStart,
+              selectionEnd,
+            )
+            self.composing = true
+          }
+          return true
+        }
+        return false
+      }
+      _ => {
+        return false
+      }
+    }
+  }
+
+  /// Uploads (or imports) every view's new frame into its texture, registered with `renderer`
+  /// under the view's id, for the surface sprites of its hosted node. Call before drawing.
+  pub effect fn present(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    renderer: &mut UiRenderer,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.surfaces.length() {
+      run self.presentOne(i, device, queue, &mut renderer)
+      i = i + 1
+    }
+  }
+
+  effect fn presentOne(
+    self: &mut Self,
+    index: usize,
+    device: &Device,
+    queue: &Queue,
+    renderer: &mut UiRenderer,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let view = self.surfaces.asSlice()[index].view
+    let mut frame = RawFrame.zero()
+    if unsafe sys.silk_cef_frame(view, 0, Pointer.fromMutRef(&mut frame)) == 0 {
+      return ()
+    }
+    let surfaces = self.surfaces.asMutSlice()
+    let surface = &mut surfaces[index]
+    if frame.generation == surface.generation {
+      return ()
+    }
+    surface.generation = frame.generation
+    let format = if frame.kind == sys.FRAME_DMABUF && frame.drmFormat == DRM_ABGR8888 {
+      flags.WGPUTextureFormat_RGBA8Unorm
+    } else {
+      flags.WGPUTextureFormat_BGRA8Unorm
+    }
+    let current = Option<Texture>.isSome(&surface.texture) && surface.width == frame.width
+      && surface.height == frame.height
+      && surface.format == format
+    if !current {
+      let texture = run makeTexture(device, frame.width, frame.height, format)
+      let textureView = run texture.createView(&TextureViewDescriptor.default())
+      run renderer.setSurface(view, &textureView)
+      surface.texture = Option<Texture>.some(move texture)
+      surface.width = frame.width
+      surface.height = frame.height
+      surface.format = format
+    }
+    if let Option<Texture>.Some { value: target } = &surface.texture {
+      run copyFrame(device, queue, &frame, &target, 0, 0)
+      let mut popup = RawFrame.zero()
+      if unsafe sys.silk_cef_frame(view, 1, Pointer.fromMutRef(&mut popup)) != 0 {
+        if popup.x >= 0 && popup.y >= 0 {
+          run copyFrame(device, queue, &popup, &target, i32.toU32(popup.x), i32.toU32(popup.y))
+        }
+      }
+    }
+  }
+}
+
+/// Types `value` as character events, one per UTF-16 unit.
+fn sendCharacters(view: u32, value: string) -> () {
+  let bytes = String.utf8Bytes(value)
+  let mut i: usize = 0
+  while i < bytes.length {
+    let lead = u8ToU32(bytes[i])
+    let mut code: u32 = lead
+    let mut step: usize = 1
+    if lead >= 0xF0 && i + 3 < bytes.length {
+      code = u32.shiftLeft(lead & 0x07, 18) | u32.shiftLeft(u8ToU32(bytes[i + 1]) & 0x3F, 12)
+        | u32.shiftLeft(u8ToU32(bytes[i + 2]) & 0x3F, 6)
+        | (u8ToU32(bytes[i + 3]) & 0x3F)
+      step = 4
+    } else if lead >= 0xE0 && i + 2 < bytes.length {
+      code = u32.shiftLeft(lead & 0x0F, 12) | u32.shiftLeft(u8ToU32(bytes[i + 1]) & 0x3F, 6)
+        | (u8ToU32(bytes[i + 2]) & 0x3F)
+      step = 3
+    } else if lead >= 0xC0 && i + 1 < bytes.length {
+      code = u32.shiftLeft(lead & 0x1F, 6) | (u8ToU32(bytes[i + 1]) & 0x3F)
+      step = 2
+    }
+    if code >= 0x10000 {
+      let high = 0xD800 + u32.shiftRight(code - 0x10000, 10)
+      let low = 0xDC00 + ((code - 0x10000) & 0x3FF)
+      unsafe sys.silk_cef_key(view, sys.KEY_CHAR, 0xFFFF, high, 0)
+      unsafe sys.silk_cef_key(view, sys.KEY_CHAR, 0xFFFF, low, 0)
+    } else {
+      unsafe sys.silk_cef_key(view, sys.KEY_CHAR, 0xFFFF, code, 0)
+    }
+    i = i + step
+  }
+}
+
+fn minU32(a: u32, b: u32) -> u32 {
+  if a < b {
+    return a
+  }
+  return b
+}
+
+fn u8ToU32(value: u8) -> u32 {
+  return u8.toU32(value)
+}
+
+effect fn makeTexture(device: &Device, width: u32, height: u32, format: u32) -> Texture
+  ! GpuError {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  let mut descriptor = TextureDescriptor.default().withLabel(b"chromium web view")
+  descriptor.setSize(size)
+  descriptor.setFormat(format)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(
+    flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopyDst
+      | flags.WGPUTextureUsage_CopySrc,
+  )
+  return run gpu.createTexture(device, &descriptor)
+}
+
+/// Writes `frame` into `target` at (`x`, `y`), clipped to the target.
+effect fn copyFrame(
+  device: &Device,
+  queue: &Queue,
+  frame: &RawFrame,
+  target: &Texture,
+  x: u32,
+  y: u32,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let targetWidth = target.getWidth()
+  let targetHeight = target.getHeight()
+  if x >= targetWidth || y >= targetHeight || frame.width == 0 || frame.height == 0 {
+    return ()
+  }
+  let width = minU32(frame.width, targetWidth - x)
+  let height = minU32(frame.height, targetHeight - y)
+  let mut origin = Origin3D.default()
+  origin.setX(x)
+  origin.setY(y)
+  let mut destination = TexelCopyTextureInfo.default().withTexture(target)
+  destination.setOrigin(origin)
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  if frame.kind == sys.FRAME_PIXELS {
+    match Pointer.nonNullMany(frame.pixels) {
+      Option<[*]const u8>.Some { value } => {
+        let length = u32.toUsize(frame.width) * u32.toUsize(frame.height) * 4
+        let pixels = unsafe Pointer.borrowMany(frame, value, length)
+        let mut layout = TexelCopyBufferLayout.default()
+        layout.setBytesPerRow(frame.width * 4)
+        layout.setRowsPerImage(frame.height)
+        queue.writeTexture(&destination, pixels, &layout, &size)
+      }
+      _ => {}
+    }
+    return ()
+  }
+  if frame.kind == sys.FRAME_DMABUF && device.hasFeature(FEATURE_DMA_BUF) {
+    // The frame is Chromium's: copy it into the view's own texture now, before Chromium paints
+    // into that buffer again.
+    let mut planes: [DmaBufPlane; 4] = [DmaBufPlane { fd: -1, offset: 0, stride: 0 }; 4]
+    let count = u32.toUsize(minU32(frame.planeCount, 4))
+    let mut i: usize = 0
+    while i < count {
+      let plane = frame.planes[i]
+      planes[i] = DmaBufPlane { fd: plane.fd, offset: plane.offset, stride: plane.stride }
+      i = i + 1
+    }
+    let memory = run SharedTextureMemory.importDmaBuf(
+      device,
+      b"chromium frame",
+      &DmaBufDescriptor {
+        width: frame.width,
+        height: frame.height,
+        drmFormat: frame.drmFormat,
+        drmModifier: frame.drmModifier,
+        planes: Slice.view<DmaBufPlane>(&planes, 0, count),
+      },
+    )
+    let source = run memory.createTexture(b"chromium frame")
+    let mut access = BeginAccess.ready()
+    access.useVulkanLayout = true
+    run memory.beginAccess(&source, access)
+    let mut encoder = run gpu.createCommandEncoder(device, b"chromium frame")
+    let from = TexelCopyTextureInfo.default().withTexture(&source)
+    encoder.copyTextureToTexture(&from, &destination, &size)
+    drop from
+    let commands = run encoder.finish(b"chromium frame")
+    queue.submit(&[commands.reference()])
+    drop run memory.endAccess(&source, true)
+  }
+}
+
+/// A screenshot's PNG, decoded to straight-alpha RGBA.
+struct Shot {
+  width: u32,
+  height: u32,
+  pixels: Bytes,
+}
+
+effect fn decodeShot(data: &[u8]) -> Shot
+  ! PngError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let image = run png.decode(data)
+  let mut pixels = run Bytes.copy(image.data())
+  let bytes = pixels.asMutSlice()
+  let mut i: usize = 0
+  while i + 3 < bytes.length {
+    let alpha = u8.toU32(bytes[i + 3])
+    if alpha != 0 && alpha != 255 {
+      let mut c: usize = 0
+      while c < 3 {
+        let value = u8.toU32(bytes[i + c]) * 255 / alpha
+        bytes[i + c] = u32.toU8(minU32(value, 255))
+        c = c + 1
+      }
+    }
+    i = i + 4
+  }
+  return Shot { width: image.width(), height: image.height(), pixels: move pixels }
+}
+
+effect fn noShot<E>(error: E) -> Shot {
+  drop error
+  return Shot { width: 0, height: 0, pixels: Bytes.make() }
+}
+
+impl ChromiumWebViews {
+  /// Queues an event made here rather than by CEF, in order with CEF's.
+  fn queue(self: &mut Self, view: u32, kind: u32, request: u32, ok: bool, message: string) -> () {
+    let bits = if ok {
+      sys.FLAG_OK
+    } else {
+      0
+    }
+    unsafe sys.silk_cef_queue(view, kind, request, bits, text(message), String.byteLength(message))
+  }
+
+  fn unsupported(self: &mut Self, view: u32, request: u32, command: &Command) -> () {
+    self.queue(view, sys.UNSUPPORTED, request, false, commandName(command))
+  }
+
+  fn notRef(self: &mut Self, view: u32, request: u32) -> () {
+    self.queue(view, sys.ACTION_RESULT, request, false, "not a snapshot ref")
+  }
+
+  fn rawText(self: &Self, index: usize) -> Option<&[u8]> {
+    let mut length: usize = 0
+    let start = unsafe sys.silk_cef_event_text(index, Pointer.fromMutRef(&mut length))
+    return match Pointer.nonNullMany(start) {
+      Option<[*]const u8>.Some { value } => Option<&[u8]>.some(
+        unsafe Pointer.borrowMany(self, value, length),
+      )
+      _ => Option<&[u8]>.None
+    }
+  }
+
+  /// The `index`th string of the event last taken from the bridge.
+  effect fn string(self: &Self, index: usize) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<&[u8]>.Some { value } = self.rawText(index) {
+      match move run String.copyUtf8(value) {
+        Result<String, InvalidUtf8>.Success { value: copied } => {
+          return move copied
+        }
+        _ => {}
+      }
+    }
+    return String.make()
+  }
+
+  effect fn decode(self: &mut Self, raw: &RawEvent) -> Option<EventKind>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let kind = raw.kind
+    let ok = flag(raw, sys.FLAG_OK)
+    if kind == sys.CREATED {
+      return Option<EventKind>.some(EventKind.Created)
+    }
+    if kind == sys.CLOSED {
+      let at = self.find(raw.view)
+      if at < self.surfaces.length() {
+        drop self.surfaces.remove(at)
+      }
+      if sameView(self.focused, raw.view) {
+        self.focused = Option<u32>.None
+      }
+      if sameView(self.hovered, raw.view) {
+        self.hovered = Option<u32>.None
+      }
+      if sameView(self.captured, raw.view) {
+        self.captured = Option<u32>.None
+        self.buttons = 0
+      }
+      return Option<EventKind>.some(EventKind.Closed)
+    }
+    if kind == sys.LOAD_STARTED {
+      return Option<EventKind>.some(EventKind.LoadStarted { url: run self.string(0) })
+    }
+    if kind == sys.LOAD_PROGRESS {
+      return Option<EventKind>.some(EventKind.LoadProgress { fraction: f64.toF32(raw.value) })
+    }
+    if kind == sys.LOAD_FINISHED {
+      let url = run self.string(0)
+      let error = run self.string(1)
+      return Option<EventKind>.some(
+        EventKind.LoadFinished { url: move url, ok: ok, error: move error },
+      )
+    }
+    if kind == sys.URL_CHANGED {
+      return Option<EventKind>.some(EventKind.UrlChanged { url: run self.string(0) })
+    }
+    if kind == sys.TITLE_CHANGED {
+      return Option<EventKind>.some(EventKind.TitleChanged { title: run self.string(0) })
+    }
+    if kind == sys.HISTORY_CHANGED {
+      return Option<EventKind>.some(
+        EventKind.HistoryChanged { canGoBack: ok, canGoForward: flag(raw, sys.FLAG_SECOND) },
+      )
+    }
+    if kind == sys.NAVIGATION_REQUESTED {
+      return Option<EventKind>.some(
+        EventKind.NavigationRequested {
+          request: raw.request,
+          url: run self.string(0),
+          userInitiated: ok,
+        },
+      )
+    }
+    if kind == sys.NEW_WINDOW_REQUESTED {
+      return Option<EventKind>.some(EventKind.NewWindowRequested { url: run self.string(0) })
+    }
+    if kind == sys.FOCUS_CHANGED {
+      if ok {
+        self.focused = Option<u32>.some(raw.view)
+      } else if sameView(self.focused, raw.view) {
+        self.focused = Option<u32>.None
+        self.composing = false
+      }
+      return Option<EventKind>.some(EventKind.FocusChanged { focused: ok })
+    }
+    if kind == sys.SCRIPT_RESULT {
+      return Option<EventKind>.some(
+        EventKind.ScriptResult { request: raw.request, ok: ok, value: run self.string(0) },
+      )
+    }
+    if kind == sys.SNAPSHOT {
+      return Option<EventKind>.some(
+        EventKind.Snapshot { request: raw.request, text: run self.string(0) },
+      )
+    }
+    if kind == sys.SCREENSHOT {
+      let mut shot = Shot { width: 0, height: 0, pixels: Bytes.make() }
+      if let Option<&[u8]>.Some { value } = self.rawText(0) {
+        if value.length != 0 {
+          shot = run Effect.catchAll(decodeShot(value), noShot)
+        }
+      }
+      return Option<EventKind>.some(
+        EventKind.Screenshot {
+          request: raw.request,
+          width: shot.width,
+          height: shot.height,
+          pixels: move shot.pixels,
+        },
+      )
+    }
+    if kind == sys.ACTION_RESULT {
+      return Option<EventKind>.some(
+        EventKind.ActionResult { request: raw.request, ok: ok, error: run self.string(0) },
+      )
+    }
+    if kind == sys.CONSOLE {
+      let level = if raw.level < 5 {
+        LEVELS[u32.toUsize(raw.level)]
+      } else {
+        ConsoleLevel.Log
+      }
+      return Option<EventKind>.some(EventKind.Console { level: level, message: run self.string(0) })
+    }
+    if kind == sys.UNSUPPORTED {
+      return Option<EventKind>.some(
+        EventKind.Unsupported { request: raw.request, command: run self.string(0) },
+      )
+    }
+    if kind == sys.CRASHED {
+      return Option<EventKind>.some(EventKind.Crashed { reason: run self.string(0) })
+    }
+    return Option<EventKind>.None
+  }
+}
+
+impl WebViewHost for ChromiumWebViews {
+  effect fn open(self: &mut Self, view: u32, options: &WebViewOptions) -> ()
+    ! WebViewError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.running {
+      fail WebViewError.Unsupported
+    }
+    let mut bits: u32 = 0
+    if options.inspectable {
+      bits = bits | sys.INSPECTABLE
+    }
+    if options.askBeforeNavigating {
+      bits = bits | sys.ASK_BEFORE_NAVIGATING
+    }
+    if options.transparent {
+      bits = bits | sys.TRANSPARENT
+    }
+    let url = String.view(&options.url)
+    let profile = String.view(&options.profile)
+    let status = unsafe sys.silk_cef_open(
+      view,
+      text(url),
+      String.byteLength(url),
+      text(profile),
+      String.byteLength(profile),
+      bits,
+    )
+    if status == sys.ID_IN_USE {
+      fail WebViewError.IdInUse
+    }
+    if status == sys.NOT_STARTED {
+      fail WebViewError.Unsupported
+    }
+    if status != sys.OPENED {
+      fail WebViewError.CreationFailed
+    }
+    run self.surfaces.append(
+      Surface {
+        view: view,
+        placement: Placement.hidden(),
+        placed: false,
+        texture: Option<Texture>.None,
+        width: 0,
+        height: 0,
+        format: 0,
+        generation: 0,
+      },
+    )
+  }
+
+  effect fn close(self: &mut Self, view: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    unsafe sys.silk_cef_close(view)
+  }
+
+  fn place(self: &mut Self, view: u32, placement: Placement) -> () {
+    let at = self.find(view)
+    if at < self.surfaces.length() {
+      let surfaces = self.surfaces.asMutSlice()
+      surfaces[at].placement = placement
+      surfaces[at].placed = true
+    }
+    let b = placement.bounds
+    let c = placement.clip
+    let visible: u8 = if placement.visible {
+      1
+    } else {
+      0
+    }
+    unsafe sys.silk_cef_place(
+      view,
+      f32.toF64(b.xMin),
+      f32.toF64(b.yMin),
+      f32.toF64(b.xMax),
+      f32.toF64(b.yMax),
+      f32.toF64(c.xMin),
+      f32.toF64(c.yMin),
+      f32.toF64(c.xMax),
+      f32.toF64(c.yMax),
+      visible,
+      f32.toF64(placement.scale),
+    )
+  }
+
+  effect fn send(self: &mut Self, view: u32, command: Command) -> ()
+    ! WebViewError | OutOfMemoryError
+    ? &mut Allocator {
+    if unsafe sys.silk_cef_exists(view) == 0 {
+      fail WebViewError.InvalidView
+    }
+    match &command {
+      Command.Navigate { url } => {
+        let value = String.view(&url)
+        unsafe sys.silk_cef_navigate(view, text(value), String.byteLength(value))
+      }
+      Command.LoadHtml { html, baseUrl } => {
+        let page = String.view(&html)
+        let base = String.view(&baseUrl)
+        unsafe sys.silk_cef_load_html(
+          view,
+          text(page),
+          String.byteLength(page),
+          text(base),
+          String.byteLength(base),
+        )
+      }
+      Command.Back => {
+        unsafe sys.silk_cef_go(view, sys.BACK)
+      }
+      Command.Forward => {
+        unsafe sys.silk_cef_go(view, sys.FORWARD)
+      }
+      Command.Reload => {
+        unsafe sys.silk_cef_go(view, sys.RELOAD)
+      }
+      Command.Stop => {
+        unsafe sys.silk_cef_go(view, sys.STOP)
+      }
+      Command.SetZoom { factor } => {
+        unsafe sys.silk_cef_set_zoom(view, f32.toF64(factor))
+      }
+      Command.Focus => {
+        if !sameView(self.focused, view) {
+          self.unfocus()
+        }
+        self.focused = Option<u32>.some(view)
+        unsafe sys.silk_cef_focus(view, 1)
+      }
+      Command.Evaluate { request, script } => {
+        let value = String.view(&script)
+        unsafe sys.silk_cef_evaluate(view, request, text(value), String.byteLength(value))
+      }
+      Command.Snapshot { request } => {
+        let call = snapshotCall()
+        unsafe sys.silk_cef_agent(
+          view,
+          request,
+          sys.AGENT_SNAPSHOT,
+          text(call),
+          String.byteLength(call),
+          text(""),
+          0,
+        )
+      }
+      Command.Screenshot { request } => {
+        unsafe sys.silk_cef_screenshot(view, request)
+      }
+      Command.ClickElement { request, element } => {
+        match run locateCall(String.view(&element)) {
+          Option<String>.Some { value: call } => {
+            let source = String.view(&call)
+            unsafe sys.silk_cef_agent(
+              view,
+              request,
+              sys.AGENT_CLICK,
+              text(source),
+              String.byteLength(source),
+              text(""),
+              0,
+            )
+          }
+          Option<String>.None => {
+            self.notRef(view, request)
+          }
+        }
+      }
+      Command.FillElement { request, element, text: typed } => {
+        match run focusForFillCall(String.view(&element)) {
+          Option<String>.Some { value: call } => {
+            let source = String.view(&call)
+            let value = String.view(&typed)
+            unsafe sys.silk_cef_agent(
+              view,
+              request,
+              sys.AGENT_FILL,
+              text(source),
+              String.byteLength(source),
+              text(value),
+              String.byteLength(value),
+            )
+          }
+          Option<String>.None => {
+            self.notRef(view, request)
+          }
+        }
+      }
+      Command.ClickAt { x, y, button, clickCount, modifiers } => {
+        unsafe sys.silk_cef_click(view, f32.toF64(x), f32.toF64(y), button, clickCount, modifiers)
+      }
+      Command.MovePointer { x, y, modifiers } => {
+        unsafe sys.silk_cef_move_pointer(view, f32.toF64(x), f32.toF64(y), modifiers)
+      }
+      Command.Scroll { x, y, deltaX, deltaY, modifiers } => {
+        unsafe sys.silk_cef_scroll(
+          view,
+          f32.toF64(x),
+          f32.toF64(y),
+          f32.toF64(deltaX),
+          f32.toF64(deltaY),
+          modifiers,
+        )
+      }
+      Command.TypeText { text: typed } => {
+        let value = String.view(&typed)
+        unsafe sys.silk_cef_type_text(view, text(value), String.byteLength(value))
+      }
+      Command.PressKey { key, modifiers } => {
+        let name = String.view(&key)
+        if unsafe sys.silk_cef_press_key(view, text(name), String.byteLength(name), modifiers)
+          == 0 {
+          self.unsupported(view, 0, &command)
+        }
+      }
+      Command.AnswerNavigation { request, allow } => {
+        let value: u8 = if allow {
+          1
+        } else {
+          0
+        }
+        unsafe sys.silk_cef_answer_navigation(view, request, value)
+      }
+      Command.OpenDevTools => {
+        // DevTools open in a window of their own, unless `inspectable` is off.
+        if unsafe sys.silk_cef_open_devtools(view) == 0 {
+          self.unsupported(view, 0, &command)
+        }
+      }
+    }
+  }
+
+  effect fn takeEvents(self: &mut Self, out: &mut List<WebViewEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop unsafe sys.silk_cef_pump()
+    while true {
+      let mut raw = RawEvent.zero()
+      if unsafe sys.silk_cef_next_event(Pointer.fromMutRef(&mut raw)) == 0 {
+        return ()
+      }
+      if let Option<EventKind>.Some { value } = run self.decode(&raw) {
+        run out.append(WebViewEvent { view: raw.view, kind: move value })
+      }
+    }
+  }
+
+  fn backend(self: &Self) -> Backend {
+    return Backend.Chromium
+  }
+
+  fn capabilities(self: &Self) -> Capabilities {
+    // Offscreen: the app draws the page, so it can draw over it. Chromium speaks the DevTools
+    // protocol and can intercept requests.
+    return Capabilities { overlays: true, networkInterception: true, devToolsProtocol: true }
+  }
+}

@@ -2211,6 +2211,13 @@ static void set_path(cef_string_t *field, const char *text) {
     *field = make_string(text, strlen(text));
 }
 
+// Forgets a libcef.so that turned out not to fit, so a later start can try another.
+static void unload_library(void) {
+    dlclose(library);
+    library = NULL;
+    memset(&cef, 0, sizeof cef);
+}
+
 uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
                         const uint8_t *helperPath, size_t helperPathLength,
                         const uint8_t *root, size_t rootLength, const uint8_t *switches,
@@ -2230,6 +2237,7 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
     cef.name = (__typeof__(name) *)dlsym(library, #name);                 \
     if (!cef.name) {                                                      \
         set_error("libcef.so has no %s", #name);                          \
+        unload_library();                                                 \
         return SILK_CEF_WRONG_VERSION;                                    \
     }
     CEF_FUNCTIONS(RESOLVE)
@@ -2238,6 +2246,7 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
     const char *hash = cef.cef_api_hash(CEF_API_VERSION, 0);
     if (!hash || strcmp(hash, CEF_API_HASH_PLATFORM) != 0) {
         set_error("libcef.so is not the CEF version this bridge was built for (API hash %s)", hash);
+        unload_library();
         return SILK_CEF_WRONG_VERSION;
     }
 
@@ -2265,7 +2274,9 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
     settings.windowless_rendering_enabled = 1;
     settings.command_line_args_disabled = 1;
     settings.persist_session_cookies = 1;
-    char *helper = copy_bytes(helperPath, helperPathLength);
+    // Without a helper named, CEF's other processes run silk-cef-helper from the runtime directory.
+    char *helper = helperPathLength ? copy_bytes(helperPath, helperPathLength)
+                                    : path_join(dir, runtimeDirLength, "silk-cef-helper");
     char *dirText = copy_bytes(dir, runtimeDirLength);
     char *locales = path_join(dir, runtimeDirLength, "locales");
     set_path(&settings.browser_subprocess_path, helper);
