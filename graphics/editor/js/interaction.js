@@ -86,7 +86,7 @@ export function attachInteractions(editor, { overlay } = {}) {
     e.preventDefault(); if (gesture) return;
     const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? editor.viewport.height : 1;
     const p = point(e);
-    if (e.ctrlKey || e.metaKey) editor.zoomAt(editor.viewport.zoom * Math.exp(-e.deltaY * unit * 0.002), p.x, p.y);
+    if (e.ctrlKey || e.metaKey) editor.zoomAt(editor.viewport.zoom * Math.exp(-e.deltaY * unit * 0.0023), p.x, p.y);
     else editor.setViewport({ x: editor.viewport.x + e.deltaX * unit / editor.viewport.zoom,
       y: editor.viewport.y + e.deltaY * unit / editor.viewport.zoom });
   }, { ...options, passive: false });
