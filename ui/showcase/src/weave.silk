@@ -1,0 +1,319 @@
+//! The woven background as canvas commands: a field of twinkling stars and five silk ribbons,
+//! each a bundle of threads that twist over one another, drift with time and part around the
+//! pointer, and the ripple a press leaves.
+//!
+//! Everything here is plain data for a ui-tree canvas node: paths go through `vector` and the
+//! path cache, dots become rounded quads.
+import palette { RIBBONS, hsv, white }
+import ui_tree.mutation { CanvasCommand }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.color.rgba { Rgba }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// Threads per ribbon.
+pub const THREADS: u32 = 15
+
+/// Stars in the field.
+pub const STARS: u32 = 90
+
+/// Strokes per frame: every thread and two glow passes per ribbon.
+pub const STROKES: u32 = 85
+
+/// Points sampled along a thread at most.
+const MAX_POINTS: usize = 96
+
+/// What one frame of the weave depends on.
+pub struct Frame {
+  pub width: f32,
+  pub height: f32,
+  pub time: f32,
+  /// The (eased) pointer, and how strongly the threads part around it (0 to 1).
+  pub pointerX: f32,
+  pub pointerY: f32,
+  pub pull: f32,
+  /// The ribbons' hues in degrees.
+  pub hues: [f32; 5],
+  /// The last press and its age in seconds (negative for none).
+  pub rippleX: f32,
+  pub rippleY: f32,
+  pub rippleAge: f32,
+}
+
+impl Copy for Frame {}
+
+/// A number in 0..1 from `seed`, the same every frame.
+fn hash(seed: u32) -> f32 {
+  let mut z = u64.wrappingAdd(u32.toU64(seed), 0x9E3779B97F4A7C15)
+  z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 30)), 0xBF58476D1CE4E5B9)
+  z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 27)), 0x94D049BB133111EB)
+  z = u64.bitXor(z, u64.shiftRight(z, 31))
+  return f64.toF32(u64.toF64(u64.shiftRight(z, 11)) / 9007199254740992.0)
+}
+
+effect fn push(out: &mut List<CanvasCommand>, command: CanvasCommand) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(command)
+}
+
+/// The commands of one frame, appended to `out`.
+pub effect fn weave(out: &mut List<CanvasCommand>, frame: Frame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run stars(&mut out, frame)
+  let mut ribbon: u32 = 0
+  while ribbon < RIBBONS {
+    run drawRibbon(&mut out, frame, ribbon)
+    ribbon = ribbon + 1
+  }
+}
+
+/// The ripple of the last press, drawn over everything.
+pub effect fn ripples(out: &mut List<CanvasCommand>, frame: Frame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if frame.rippleAge >= 0.0 && frame.rippleAge < 1.2 {
+    run ripple(&mut out, frame)
+  }
+}
+
+effect fn stars(out: &mut List<CanvasCommand>, frame: Frame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: u32 = 0
+  while i < STARS {
+    let x = hash(i * 4) * frame.width
+    let y = hash(i * 4 + 1) * frame.height
+    let size = 0.8 + 2.2 * hash(i * 4 + 2) * hash(i * 4 + 2)
+    let phase = hash(i * 4 + 3) * 6.2831853
+    let twinkle = 0.5 + 0.5 * f32.sin(frame.time * (0.8 + 1.7 * hash(i * 7 + 5)) + phase)
+    let alpha = 0.08 + 0.5 * twinkle * twinkle
+    run push(
+      &mut out,
+      CanvasCommand.FillRect {
+        x: x - size * 0.5,
+        y: y - size * 0.5,
+        width: size,
+        height: size,
+        radius: size * 0.5,
+        color: white(alpha),
+      },
+    )
+    i = i + 1
+  }
+}
+
+/// The center line of ribbon `ribbon` at `x`, and its half width (signed: the twist).
+fn center(frame: Frame, ribbon: u32, x: f32) -> f32 {
+  let r = u32.toF32(ribbon)
+  let h = frame.height
+  let w = frame.width
+  let base = h * (0.16 + 0.17 * r)
+  let amp = h * (0.09 + 0.025 * f32.sin(r * 1.3 + 0.4))
+  let k1 = 6.2831853 / (w * (0.95 + 0.22 * r))
+  let k2 = 6.2831853 / (w * (0.42 + 0.07 * r))
+  let t = frame.time
+  return base + amp * f32.sin(x * k1 + t * (0.42 + 0.09 * r) + r * 1.7)
+    + amp * 0.42 * f32.sin(x * k2 - t * (0.7 - 0.06 * r) + r * 0.9)
+}
+
+fn twist(frame: Frame, ribbon: u32, x: f32) -> f32 {
+  let r = u32.toF32(ribbon)
+  let k3 = 6.2831853 / (frame.width * (0.55 + 0.1 * r))
+  let breadth = frame.height * (0.05 + 0.012 * f32.cos(r * 2.3))
+  return breadth * f32.cos(x * k3 + frame.time * (0.55 + 0.05 * r) + r * 2.1)
+}
+
+/// How far the pointer pushes a point at (`x`, `y`) up or down.
+fn part(frame: Frame, x: f32, y: f32) -> f32 {
+  if frame.pull <= 0.0 {
+    return 0.0
+  }
+  let dx = x - frame.pointerX
+  let dy = y - frame.pointerY
+  let falloff = f32.exp(0.0 - (dx * dx + dy * dy) / (2.0 * 130.0 * 130.0))
+  let direction: f32 = if dy < 0.0 {
+    -1.0
+  } else {
+    1.0
+  }
+
+  // Strongest just off the pointer, fading to nothing on the pointer's own line.
+  let soft = f32.min(f32.abs(dy) / 24.0, 1.0)
+  return direction * 80.0 * frame.pull * falloff * (0.35 + 0.65 * soft)
+}
+
+/// A smooth path through `count` points: quadratic segments between midpoints.
+effect fn smooth(out: &mut List<CanvasCommand>, xs: &[f32; 96], ys: &[f32; 96], count: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run push(&mut out, CanvasCommand.MoveTo { x: xs[0], y: ys[0] })
+  let mut i: usize = 1
+  while i + 1 < count {
+    run push(
+      &mut out,
+      CanvasCommand.QuadTo {
+        x1: xs[i],
+        y1: ys[i],
+        x: (xs[i] + xs[i + 1]) * 0.5,
+        y: (ys[i] + ys[i + 1]) * 0.5,
+      },
+    )
+    i = i + 1
+  }
+  run push(&mut out, CanvasCommand.LineTo { x: xs[count - 1], y: ys[count - 1] })
+}
+
+effect fn drawRibbon(out: &mut List<CanvasCommand>, frame: Frame, ribbon: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let hue = frame.hues[u32.toUsize(ribbon)]
+  let step: f32 = 28.0
+  let mut count: usize = u32.toUsize(f32.toU32(f32.floor((frame.width + 3.0 * step) / step)))
+  if count > MAX_POINTS {
+    count = MAX_POINTS
+  }
+  let mut xs: [f32; 96] = [0.0; 96]
+  let mut ys: [f32; 96] = [0.0; 96]
+
+  // Glow: two wide, faint passes along the center.
+  let mut i: usize = 0
+  while i < count {
+    let x = usize.toF32(i) * step - step
+    let y = center(frame, ribbon, x)
+    xs[i] = x
+    ys[i] = y + part(frame, x, y)
+    i = i + 1
+  }
+  run smooth(&mut out, &xs, &ys, count)
+  run push(&mut out, CanvasCommand.Stroke { color: hsv(hue, 0.75, 1.0, 0.05), width: 54.0 })
+  run smooth(&mut out, &xs, &ys, count)
+  run push(&mut out, CanvasCommand.Stroke { color: hsv(hue, 0.7, 1.0, 0.07), width: 16.0 })
+
+  // The threads, spread across the ribbon by the twist.
+  let mut j: u32 = 0
+  while j < THREADS {
+    let spread = u32.toF32(j) / u32.toF32(THREADS - 1) * 2.0 - 1.0
+    let mut k: usize = 0
+    while k < count {
+      let x = usize.toF32(k) * step - step
+      let y = center(frame, ribbon, x) + spread * twist(frame, ribbon, x)
+      xs[k] = x
+      ys[k] = y + part(frame, x, y)
+      k = k + 1
+    }
+
+    // Edges a little brighter than the middle, hues fanning out across the ribbon.
+    let edge = f32.abs(spread)
+    let sheen = 0.5 + 0.5 * f32.sin(frame.time * 1.6 + u32.toF32(j) * 0.55 + u32.toF32(ribbon))
+    let color = hsv(hue + spread * 16.0, 0.62 - 0.22 * sheen, 1.0, 0.30 + 0.28 * edge + 0.2 * sheen)
+    run smooth(&mut out, &xs, &ys, count)
+    run push(&mut out, CanvasCommand.Stroke { color: color, width: 1.1 + 0.5 * edge })
+    j = j + 1
+  }
+}
+
+/// A circle of radius `r` around (`cx`, `cy`) from four cubic arcs.
+effect fn circle(out: &mut List<CanvasCommand>, cx: f32, cy: f32, r: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let k = r * 0.5522848
+  run push(&mut out, CanvasCommand.MoveTo { x: cx + r, y: cy })
+  run push(
+    &mut out,
+    CanvasCommand.CubicTo { x1: cx + r, y1: cy + k, x2: cx + k, y2: cy + r, x: cx, y: cy + r },
+  )
+  run push(
+    &mut out,
+    CanvasCommand.CubicTo { x1: cx - k, y1: cy + r, x2: cx - r, y2: cy + k, x: cx - r, y: cy },
+  )
+  run push(
+    &mut out,
+    CanvasCommand.CubicTo { x1: cx - r, y1: cy - k, x2: cx - k, y2: cy - r, x: cx, y: cy - r },
+  )
+  run push(
+    &mut out,
+    CanvasCommand.CubicTo { x1: cx + k, y1: cy - r, x2: cx + r, y2: cy - k, x: cx + r, y: cy },
+  )
+  run push(&mut out, CanvasCommand.Close)
+}
+
+effect fn ripple(out: &mut List<CanvasCommand>, frame: Frame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let age = frame.rippleAge
+  let mut ring: u32 = 0
+  while ring < 3 {
+    let local = age - u32.toF32(ring) * 0.14
+    if local > 0.0 && local < 0.9 {
+      let grow = 1.0 - (1.0 - local / 0.9) * (1.0 - local / 0.9)
+      let fade = 1.0 - local / 0.9
+      run circle(&mut out, frame.rippleX, frame.rippleY, 8.0 + 150.0 * grow)
+      run push(
+        &mut out,
+        CanvasCommand.Stroke {
+          color: hsv(frame.hues[u32.toUsize(ring)], 0.5, 1.0, 0.75 * fade),
+          width: 2.0 * fade + 0.5,
+        },
+      )
+    }
+    ring = ring + 1
+  }
+}
+
+/// The pointer as an arrow, drawn by the recorder where no system cursor shows.
+pub effect fn arrow(out: &mut List<CanvasCommand>, x: f32, y: f32, pressed: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s: f32 = if pressed {
+    0.9
+  } else {
+    1.0
+  }
+  let points: [f32; 14] = [
+    0.0,
+    0.0,
+    0.0,
+    19.0,
+    4.8,
+    14.6,
+    8.2,
+    22.0,
+    11.2,
+    20.7,
+    7.9,
+    13.6,
+    13.8,
+    13.6,
+  ]
+  let mut pass: u32 = 0
+  while pass < 2 {
+    let mut i: usize = 0
+    while i < 7 {
+      let px = x + points[i * 2] * s
+      let py = y + points[i * 2 + 1] * s
+      if i == 0 {
+        run push(&mut out, CanvasCommand.MoveTo { x: px, y: py })
+      } else {
+        run push(&mut out, CanvasCommand.LineTo { x: px, y: py })
+      }
+      i = i + 1
+    }
+    run push(&mut out, CanvasCommand.Close)
+    if pass == 0 {
+      run push(&mut out, CanvasCommand.Fill { color: white(1.0) })
+    } else {
+      run push(
+        &mut out,
+        CanvasCommand.Stroke { color: Rgba<f32> { r: 0.05, g: 0.04, b: 0.1, a: 0.9 }, width: 1.3 },
+      )
+    }
+    pass = pass + 1
+  }
+}

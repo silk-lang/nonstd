@@ -1,0 +1,276 @@
+//! Records Silk Loom without a window: the app runs headless through ui-app's runtime and the
+//! tree's real input path, a scripted pointer glides over the weave, hovers a chip and presses
+//! "Reweave" twice, and every frame is drawn by the CPU reference renderer.
+//!
+//!   ui-showcase-record WIDTH HEIGHT SCALE FPS FRAMES > frames.rgba
+//!
+//! Frames go to standard output as raw RGBA (WIDTH*SCALE x HEIGHT*SCALE pixels each, opaque),
+//! for `ffmpeg -f rawvideo`; `scripts/record` turns them into a video, a GIF and stills.
+//! Progress goes to standard error. Exit code 0 on success, 2 on an error.
+import showcase.loom { Loom, Message }
+import showcase.assets as assets
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime, pump, tick, resize }
+import ui_app.harness { locate }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeInfo }
+import ui_tree.input { Input, BUTTON_PRIMARY }
+import vector.geometry_error { GeometryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.system.host_input { HostInput, HostInputError }
+
+/// The pointer's script: (time, x, y) keyframes, with x and y as fractions of the viewport,
+/// except where `CHIP` and `BUTTON` stand for the centers of the chip and the button.
+const KEYS: usize = 12
+
+const CHIP: f32 = -1.0
+
+const BUTTON: f32 = -2.0
+
+const OFF: f32 = -3.0
+
+fn keyTime(i: usize) -> f32 {
+  let times: [f32; 12] = [1.2, 3.0, 4.3, 5.5, 6.3, 7.1, 7.6, 8.9, 10.0, 10.6, 11.7, 12.7]
+  return times[i]
+}
+
+fn keyX(i: usize) -> f32 {
+  let xs: [f32; 12] = [1.03, 0.24, 0.1, CHIP, CHIP, BUTTON, BUTTON, 0.8, BUTTON, BUTTON, 0.86, OFF]
+  return xs[i]
+}
+
+fn keyY(i: usize) -> f32 {
+  let ys: [f32; 12] = [0.8, 0.3, 0.6, CHIP, CHIP, BUTTON, BUTTON, 0.2, BUTTON, BUTTON, 0.85, OFF]
+  return ys[i]
+}
+
+/// Presses on "Reweave": down and up times.
+fn pressDown(i: usize) -> f32 {
+  let times: [f32; 2] = [7.3, 10.2]
+  return times[i]
+}
+
+fn pressUp(i: usize) -> f32 {
+  let times: [f32; 2] = [7.45, 10.35]
+  return times[i]
+}
+
+struct Targets {
+  chipX: f32,
+  chipY: f32,
+  buttonX: f32,
+  buttonY: f32,
+  width: f32,
+  height: f32,
+}
+
+fn resolveX(targets: &Targets, value: f32) -> f32 {
+  if value == CHIP {
+    return targets.chipX
+  }
+  if value == BUTTON {
+    return targets.buttonX
+  }
+  if value == OFF {
+    return targets.width + 40.0
+  }
+  return value * targets.width
+}
+
+fn resolveY(targets: &Targets, value: f32) -> f32 {
+  if value == CHIP {
+    return targets.chipY
+  }
+  if value == BUTTON {
+    return targets.buttonY
+  }
+  if value == OFF {
+    return targets.height + 40.0
+  }
+  return value * targets.height
+}
+
+fn ease(x: f32) -> f32 {
+  let t = f32.min(f32.max(x, 0.0), 1.0)
+  return t * t * (3.0 - 2.0 * t)
+}
+
+/// Where the pointer is at `time`, with a gentle arc between keyframes.
+fn pointerAt(targets: &Targets, time: f32) -> [f32; 2] {
+  let mut i: usize = 0
+  while i + 1 < KEYS && keyTime(i + 1) <= time {
+    i = i + 1
+  }
+  let x0 = resolveX(targets, keyX(i))
+  let y0 = resolveY(targets, keyY(i))
+  if i + 1 >= KEYS {
+    return [x0, y0]
+  }
+  let x1 = resolveX(targets, keyX(i + 1))
+  let y1 = resolveY(targets, keyY(i + 1))
+  let u = (time - keyTime(i)) / (keyTime(i + 1) - keyTime(i))
+  let e = ease(u)
+  let dx = x1 - x0
+  let dy = y1 - y0
+  let length = f32.sqrt(dx * dx + dy * dy)
+  let bend = f32.sin(3.1415927 * e) * f32.min(length * 0.12, 40.0)
+  let nx: f32 = if length > 0.0 {
+    0.0 - dy / length
+  } else {
+    0.0
+  }
+  let ny: f32 = if length > 0.0 {
+    dx / length
+  } else {
+    0.0
+  }
+  return [x0 + dx * e + nx * bend, y0 + dy * e + ny * bend]
+}
+
+fn center(found: Option<NodeInfo>) -> [f32; 2] {
+  return match found {
+    Option<NodeInfo>.Some { value } => [
+      (value.bounds.xMin + value.bounds.xMax) * 0.5,
+      (value.bounds.yMin + value.bounds.yMax) * 0.5,
+    ]
+    Option<NodeInfo>.None => [0.0, 0.0]
+  }
+}
+
+/// `text` as a number: digits with an optional fraction.
+fn parse(text: &[u8]) -> f64 {
+  let mut value: f64 = 0.0
+  let mut scale: f64 = 0.0
+  let mut i: usize = 0
+  while i < text.length {
+    let c = text[i]
+    if c == 46 {
+      scale = 1.0
+    } else if c >= 48 && c <= 57 {
+      let digit = u8.toF64(c - 48)
+      if scale > 0.0 {
+        scale = scale / 10.0
+        value = value + digit * scale
+      } else {
+        value = value * 10.0 + digit
+      }
+    }
+    i = i + 1
+  }
+  return value
+}
+
+effect fn argument(index: usize) -> f64
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match run HostInput.argument(index) {
+    Option<Bytes>.Some { value } => parse(Bytes.asSlice(&value))
+    Option<Bytes>.None => 0.0
+  }
+}
+
+effect fn record() -> i32
+  ! TreeError | GeometryError | OutOfMemoryError | HostInputError | WriterError
+  ? &mut HostInput | &mut Allocator {
+  if (run HostInput.argumentCount()) < 6 {
+    StderrWriter.print(
+      "usage: ui-showcase-record WIDTH HEIGHT SCALE FPS FRAMES > frames.rgba\n",
+      &(),
+    )
+    return 2
+  }
+  let width = f64.toF32(run argument(1))
+  let height = f64.toF32(run argument(2))
+  let scale = f64.toF32(run argument(3))
+  let fps = run argument(4)
+  let frames = f64.toU64(run argument(5))
+
+  let collection = run assets.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run assets.resources(&mut batch)
+  run tree.apply(run batch.take())
+  let mut app = Runtime<Loom, Message, NoCommand>.make(Loom.make(width, height, true))
+  run app.start(&mut tree, 0.0)
+  run resize(&mut app, &mut tree, width, height)
+  let viewport = FrameInput { width: width, height: height, scale: scale, time: 0.0 }
+  let chip = center(run locate(&mut tree, viewport, "✨ SVG animation"))
+  let button = center(run locate(&mut tree, viewport, "reweave"))
+  let targets = Targets {
+    chipX: chip[0],
+    chipY: chip[1],
+    buttonX: button[0],
+    buttonY: button[1],
+    width: width,
+    height: height,
+  }
+
+  let mut snapshot = CpuSnapshot.make()
+  let mut out = StdoutWriter.make()
+  let mut down = false
+  let mut frame: u64 = 0
+  while frame < frames {
+    let time = u64.toF64(frame) / fps
+    let t = f64.toF32(time)
+    if t >= keyTime(0) {
+      let at = pointerAt(&targets, t)
+      run tree.dispatch(Input.PointerMove { x: at[0], y: at[1], modifiers: 0 })
+      let mut p: usize = 0
+      while p < 2 {
+        if !down && t >= pressDown(p) && t < pressUp(p) {
+          run tree.dispatch(
+            Input.PointerDown {
+              x: at[0],
+              y: at[1],
+              button: BUTTON_PRIMARY,
+              modifiers: 0,
+              clickCount: 1,
+            },
+          )
+          down = true
+        } else if down && t >= pressUp(p) && t < pressUp(p) + 0.5 {
+          run tree.dispatch(
+            Input.PointerUp { x: at[0], y: at[1], button: BUTTON_PRIMARY, modifiers: 0 },
+          )
+          down = false
+        }
+        p = p + 1
+      }
+      drop run pump(&mut app, &mut tree)
+    }
+    run tick(&mut app, &mut tree, time, true)
+    run tree.frame(FrameInput { width: width, height: height, scale: scale, time: time })
+    run snapshot.sync(&mut tree)
+    let pixels = run snapshot.render(&tree)
+    run Writer.writeAll(pixels.data()) |> Effect.provideMut<Writer>(&mut out)
+    if frame % 30 == 0 {
+      StderrWriter.print(
+        "frame {}: {} primitives, {} replayed and {} repainted subtrees\n",
+        &(frame, tree.stats.primitives, tree.stats.replayedSubtrees, tree.stats.repaintedSubtrees),
+      )
+    }
+    frame = frame + 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("ui-showcase-record: running, drawing or writing a frame failed\n", &())
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(record(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
