@@ -153,12 +153,21 @@ pub struct Document {
   mixedCount: usize,
   paths: PathCache,
   circle: Path,
-  tiles: List<AtlasTile>,
+  tiles: List<ImageTile>,
   /// Number of elements submitted by the most recent paint. Includes offscreen elements when culling is disabled.
   pub visible: u32,
   /// Elements visited by the main paint pass; excludes rectangle-run bounds lookahead.
   pub visited: u32,
 }
+
+struct ImageTile {
+  tile: AtlasTile,
+  view: Rect<f32>,
+  cropped: bool,
+  live: bool,
+}
+
+impl Copy for ImageTile {}
 
 const BLOCK: usize = 64
 
@@ -201,7 +210,7 @@ impl Document {
       mixedCount: 0,
       paths: PathCache.make(),
       circle: Path.make(),
-      tiles: List<AtlasTile>.make(),
+      tiles: List<ImageTile>.make(),
       visible: 0,
       visited: 0,
     }
@@ -212,14 +221,16 @@ impl Document {
   pub effect fn addTile(self: &mut Self, tile: AtlasTile) -> u32
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.tiles.append(tile)
+    run self.tiles.append(
+      ImageTile { tile: tile, view: Rect<f32>.new(0.0, 0.0, 1.0, 1.0), cropped: false, live: true },
+    )
     return usize.toU32(self.tiles.length()) + 1
   }
 
   /// Replaces a registered tile for every element that uses its shape kind.
   ///
-  /// Returns the old tile. Release its allocation only if it differs from the replacement's
-  /// allocation. Returns `None` without mutation for an unknown kind. Element geometry and
+  /// Returns the previous tile, possibly already detached by `releaseTile`. Release its allocation
+  /// only if still live and different from the replacement's. Returns `None` for an unknown kind. Element geometry and
   /// identity do not change. The caller must upload and keep the replacement tile allocated.
   pub fn replaceTile(self: &mut Self, kind: u32, tile: AtlasTile) -> Option<AtlasTile> {
     if kind < 2 || u32.toUsize(kind - 2) >= self.tiles.length() {
@@ -227,8 +238,62 @@ impl Document {
     }
     let index = u32.toUsize(kind - 2)
     let previous = self.tiles.get(index)
-    self.tiles.set(index, tile)
-    return Option<AtlasTile>.Some { value: previous }
+    self.tiles.set(
+      index,
+      ImageTile { tile: tile, view: Rect<f32>.new(0.0, 0.0, 1.0, 1.0), cropped: false, live: true },
+    )
+    return Option<AtlasTile>.Some { value: previous.tile }
+  }
+
+  /// Maps a tile onto a normalized subrectangle of every element using its kind.
+  ///
+  /// Supply finite bounds within `[0, 1]` with positive area. Cropped pixels must already
+  /// include any rounded-corner clipping. Hit geometry stays unchanged. Unknown kinds fail.
+  pub fn setTileView(self: &mut Self, kind: u32, view: Rect<f32>) -> bool {
+    if kind < 2 || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return false
+    }
+    let index = u32.toUsize(kind - 2)
+    let mut image = self.tiles.get(index)
+    image.view = view
+    image.cropped = true
+    self.tiles.set(index, image)
+    return image.live
+  }
+
+  /// Detaches a registered tile and returns its allocation for the caller to release.
+  ///
+  /// Consumers draw nothing until `replaceTile` installs another tile in the same kind.
+  /// Repeated release or an unknown kind returns `None`.
+  pub fn releaseTile(self: &mut Self, kind: u32) -> Option<AtlasTile> {
+    if kind < 2 || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return Option<AtlasTile>.None
+    }
+    let index = u32.toUsize(kind - 2)
+    let mut image = self.tiles.get(index)
+    if !image.live {
+      return Option<AtlasTile>.None
+    }
+    image.live = false
+    self.tiles.set(index, image)
+    return Option<AtlasTile>.Some { value: image.tile }
+  }
+
+  /// Switches an image element to a registered tile without changing its hit bounds.
+  /// Returns false for unknown IDs, non-image elements, or unregistered kinds.
+  pub fn setImageKind(self: &mut Self, id: u32, kind: u32) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length() || kind < 2
+      || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return false
+    }
+    let index = u32.toUsize(id - 1)
+    let mut node = self.nodes.get(index)
+    if !node.alive || node.kind < 2 {
+      return false
+    }
+    node.kind = kind
+    self.nodes.set(index, node)
+    return true
   }
 
   /// Appends an element and returns its nonzero ID. IDs are not reused after removal.
@@ -453,13 +518,30 @@ impl Document {
         Background.solid(color.rgba(n.fill))
       }
       if n.kind >= 2 && u32.toUsize(n.kind - 2) < self.tiles.length() {
+        let image = self.tiles.asSlice()[u32.toUsize(n.kind - 2)]
+        if !image.live {
+          continue
+        }
+        let view = image.view
+        let imageBounds = Rect<f32>.new(
+          x + view.xMin * n.width * s,
+          y + view.yMin * n.height * s,
+          x + view.xMax * n.width * s,
+          y + view.yMax * n.height * s,
+        )
         drop run scene.image(
           ImageSprite {
-            bounds: bounds,
+            bounds: imageBounds,
             mask: mask,
-            tile: self.tiles.asSlice()[u32.toUsize(n.kind - 2)],
+            tile: image.tile,
             opacity: color.rgba(n.fill).a,
-            cornerRadii: Corners<f32>.uniform(n.radius * s),
+            cornerRadii: Corners<f32>.uniform(
+              if image.cropped {
+                0.0
+              } else {
+                n.radius * s
+              },
+            ),
             grayscale: false,
           },
         )

@@ -126,25 +126,34 @@ Before each render, visible text selects raster density from **element width/hei
 × device pixel ratio**. The target is at least two raster samples per displayed pixel, rounded up
 to power-of-two density buckets independently on each axis. A fourfold reduction is needed to
 shrink an axis, which avoids repeated uploads around bucket boundaries. Panning and unchanged
-frames reuse the current raster. Offscreen/hidden text does not rerasterize until visible again.
+frames reuse ordinary whole-run rasters. Offscreen/hidden text does not rerasterize until visible again.
 Explicit `resize(width, height, pixelRatio)` updates density when device scale changes.
 
-Identical content/font/color shares one replaceable atlas slot at the largest density needed by
-its visible copies. Updating raster density changes neither world geometry nor undo history.
-Old atlas allocations are released after a replacement upload succeeds. GPU atlas textures retain
-their high-water allocation until destruction; zoom does not add an immutable cache entry for
-every scale. Content/style entries remain cached for undo, up to 4096 entries and eight atlas
-textures per editor.
+Identical content/font/color shares a replaceable whole-run atlas slot. When the requested
+whole-run raster would exceed 4094 pixels per side or 4,194,304 pixels total, each visible
+copy instead gets a **visible-window raster**, including a small overscan margin. Canvas2D
+still shapes the complete line, drawing into a clipped canvas at the displayed scale. This
+keeps kerning, ligatures, and browser font fallback intact while avoiding magnified texels
+from a capped whole-line bitmap. It also preserves the original rounded-corner clipping.
 
-Each raster is capped at 4094 pixels per side and 4,194,304 pixels total. Extreme magnification
-can therefore still look soft. If an atlas replacement cannot allocate space, the old raster
-remains valid; the editor retries after the requested size or atlas allocations change. Creating
-a new style with no available atlas space throws. `diagnostics.limitedTextRuns` counts cached
-runs whose latest requested density hit a raster or allocation limit. `textRasterizations`,
-`textAtlasTiles`, and `textPixels` expose successful raster updates, live atlas tiles, and cached
-raster pixel counts. `stats.textMs` measures the frame's text preparation separately from Silk
-scene construction and GPU encoding. Text bounds are not tight glyph hit regions, and text has
-no native editing/IME API yet.
+Small pans reuse the overscan pixels; crossing the cached window triggers another upload.
+Different visible copies have independent windows. Offscreen, removed, or zoomed-out windows
+release their atlas allocation, and their registered slots are recycled. Updating a raster
+changes neither world geometry nor undo history. A replacement releases its old allocation
+only after the new upload succeeds. GPU atlas textures retain their high-water allocation
+until destruction. Content/style fallbacks remain cached for undo, up to 4096 entries and
+eight atlas textures per editor.
+
+The same per-raster budget applies to visible windows, so very large physical viewports can
+still reduce the two-sample density target. Allocation pressure also limits quality. If a
+window upload fails, the editor uses the whole-run fallback rather than a stale crop; ordinary
+raster replacements retain their previous pixels. Retry occurs when the requested raster or
+atlas allocations change. Creating a new style with no available atlas space throws.
+`diagnostics.limitedTextRuns` counts fallback styles and active windows whose latest requested
+density hit a raster or allocation limit. `textRasterizations`, `textAtlasTiles`, and `textPixels`
+expose successful raster updates, live atlas tiles, and cached raster pixel counts.
+`stats.textMs` measures text preparation separately from Silk scene construction and GPU
+encoding. Text bounds are not tight glyph hit regions, and text has no native editing/IME API yet.
 
 Events are `CustomEvent`s; payloads are in `event.detail`. `on(name, listener)` returns an
 unsubscribe function. `change` reports affected IDs and a source, `selectionchange` reports IDs,

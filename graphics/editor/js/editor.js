@@ -70,7 +70,7 @@ const densityBucket = ratio => 2 ** Math.ceil(Math.log2(Math.max(Number.MIN_VALU
 export class Editor extends EventTarget {
   #host; #token; #lastId = 0; #nodes = new Map(); #selection = new Set(); #frame = 0;
   #dead = false; #transaction = null; #undo = []; #redo = []; #replaying = false;
-  #textTiles = new Map(); #textNodes = new Map(); #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
+  #textTiles = new Map(); #textNodes = new Map(); #textViews = new Map(); #textViewPool = []; #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
   #observer; #cleanups = []; #camera = { x: 0, y: 0, zoom: 1 }; #autoRender;
   #width = 1; #height = 1; #scale = 1;
   stats = Object.freeze({ buildMs: 0, drawMs: 0, textMs: 0, visible: 0, visited: 0, batches: 0, frames: 0 });
@@ -128,8 +128,8 @@ export class Editor extends EventTarget {
     wasmBytes: this.#host?.exports?.memory.buffer.byteLength ?? 0, textRuns: this.#textTiles.size,
     textRasterizations: this.#textRasterizations,
     textAtlasTiles: this.#token && !this.#dead ? this.#call('editor_image_count') : 0,
-    textPixels: [...this.#textTiles.values()].reduce((sum, entry) => sum + entry.width * entry.height, 0),
-    limitedTextRuns: [...this.#textTiles.values()].filter(entry => entry.limited).length, destroyed: this.#dead }); }
+    textPixels: [...this.#textTiles.values(), ...this.#textViews.values()].reduce((sum, entry) => sum + entry.width * entry.height, 0),
+    limitedTextRuns: [...this.#textTiles.values(), ...this.#textViews.values()].filter(entry => entry.limited).length, destroyed: this.#dead }); }
   get size() { return this.#nodes.size; }
   get viewport() { return { ...this.#camera, width: this.#width, height: this.#height, pixelRatio: this.#scale }; }
   get selection() { return [...this.#selection]; }
@@ -168,21 +168,35 @@ export class Editor extends EventTarget {
     if (this.#textTiles.size >= 4096) throw new RangeError('Text cache limit reached (4096 text styles per editor)');
     const entry = { kind: 0, layout: measureText(n), text: n.text, fill: n.fill, width: 0, height: 0, limited: false, failedSize: '', failedRevision: -1 };
     const size = this.#textVisible(n) ? this.#textSize(n, entry) : { width: 1, height: 1 };
-    this.#rasterText(entry, boundedTextSize(size.width, size.height));
+    // Keep a modest whole-run fallback; high zoom gets a separate visible-window raster.
+    const initial = boundedTextSize(size.width, size.height);
+    this.#rasterText(entry, initial.limited ? boundedTextSize(entry.layout.width, entry.layout.height) : initial);
     this.#textTiles.set(key, entry); return entry;
   }
   #rasterText(entry, size) {
-    const key = `${size.width}x${size.height}`;
+    const key = JSON.stringify([size.width, size.height, size.view, size.radius]);
     entry.limited = size.limited;
-    if (entry.failedSize === key && entry.failedRevision === this.#textAtlasRevision) { entry.limited = true; return; }
+    if (!entry.failedSize && entry.width === size.width && entry.height === size.height &&
+      JSON.stringify([entry.view, entry.radius]) === JSON.stringify([size.view, size.radius])) return true;
+    if (entry.failedSize === key && entry.failedRevision === this.#textAtlasRevision) { entry.limited = true; return false; }
     const canvas = document.createElement('canvas'); canvas.width = size.width; canvas.height = size.height;
     const ctx = canvas.getContext('2d'), layout = entry.layout;
-    ctx.scale(size.width / layout.width, size.height / layout.height);
+    const view = size.view ?? { x: 0, y: 0, width: 1, height: 1 };
+    ctx.scale(size.width / (layout.width * view.width), size.height / (layout.height * view.height));
+    ctx.translate(-view.x * layout.width, -view.y * layout.height);
+    if (size.radius) {
+      ctx.beginPath(); ctx.roundRect(0, 0, layout.width, layout.height,
+        [{ x: size.radius.x * layout.width, y: size.radius.y * layout.height }]); ctx.clip();
+    }
     ctx.font = layout.font; ctx.fillStyle = entry.fill; ctx.textBaseline = 'alphabetic';
     ctx.fillText(entry.text, layout.left, layout.baseline);
     const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
     for (let i = 0; i < pixels.length; i += 4) {
-      const alpha = pixels[i + 3] / 255;
+      const coverage = pixels[i + 3];
+      // Canvas readback is transparent black outside the glyphs. Only fractional coverage
+      // needs premultiplication; large zoomed windows are mostly clear or opaque interiors.
+      if (coverage === 0 || coverage === 255) continue;
+      const alpha = coverage / 255;
       pixels[i] = Math.round(pixels[i] * alpha); pixels[i + 1] = Math.round(pixels[i + 1] * alpha); pixels[i + 2] = Math.round(pixels[i + 2] * alpha);
     }
     const pointer = this.#host.call('webgpu_alloc', pixels.length);
@@ -194,21 +208,78 @@ export class Editor extends EventTarget {
         : this.#call('editor_image', canvas.width, canvas.height, pointer);
     } finally { this.#host.call('webgpu_free', pointer, pixels.length); }
     if (!kind) {
-      if (!entry.kind) throw new Error('Text atlas is full');
+      if (!entry.kind && !size.view) throw new Error('Text atlas is full');
       // A failed replacement leaves the old tile intact. Do not retry this size every frame.
-      entry.failedSize = key; entry.failedRevision = this.#textAtlasRevision; entry.limited = true; return;
+      entry.failedSize = key; entry.failedRevision = this.#textAtlasRevision; entry.limited = true; return false;
     }
     entry.kind = kind; entry.width = size.width; entry.height = size.height; entry.failedSize = '';
+    if (size.view) this.#call('editor_image_view', kind, view.x, view.y, view.width, view.height);
+    entry.view = size.view; entry.radius = size.radius; entry.rasterLimited = size.limited;
     this.#textRasterizations++; this.#textAtlasRevision++;
+    return true;
+  }
+  #releaseTextView(id, entry) {
+    const base = this.#textNodes.get(id);
+    if (base) this.#call('editor_image_node', id, base.kind);
+    if (entry.width) { this.#call('editor_image_release', entry.kind); this.#textAtlasRevision++; }
+    this.#textViews.delete(id); this.#textViewPool.push(entry.kind);
+  }
+  #prepareTextView(id, n, base) {
+    let entry = this.#textViews.get(id);
+    if (entry && entry.base !== base) { this.#releaseTextView(id, entry); entry = null; }
+    if (!entry) {
+      entry = { ...base, base, kind: this.#textViewPool.pop() || 0, width: 0, height: 0,
+        view: null, limited: false, failedSize: '', failedRevision: -1 };
+      this.#textViews.set(id, entry);
+    }
+    const scale = this.#camera.zoom * this.#scale;
+    const width = n.width * scale, height = n.height * scale;
+    const left = (this.#camera.x - n.x) * scale, top = (this.#camera.y - n.y) * scale;
+    const right = Math.min(width, left + this.#width * this.#scale);
+    const bottom = Math.min(height, top + this.#height * this.#scale);
+    const radius = { x: Math.min(n.radius, n.width / 2, n.height / 2) / n.width,
+      y: Math.min(n.radius, n.width / 2, n.height / 2) / n.height };
+    const old = entry.view;
+    // Overscan lets small pans reuse pixels. Keep at least two samples per displayed pixel.
+    const reuse = old && old.x * width <= Math.max(0, left) && old.y * height <= Math.max(0, top) &&
+      (old.x + old.width) * width >= right && (old.y + old.height) * height >= bottom &&
+      entry.width >= old.width * width * 2 - .01 && entry.height >= old.height * height * 2 - .01 &&
+      entry.width < old.width * width * 8 && entry.height < old.height * height * 8 &&
+      entry.radius.x === radius.x && entry.radius.y === radius.y;
+    if (!reuse) {
+      const x = Math.max(0, Math.floor(left / 64) * 64 - 64);
+      const y = Math.max(0, Math.floor(top / 64) * 64 - 64);
+      const w = Math.min(width, Math.ceil(right / 64) * 64 + 64) - x;
+      const h = Math.min(height, Math.ceil(bottom / 64) * 64 + 64) - y;
+      const size = boundedTextSize(Math.ceil(w * 2), Math.ceil(h * 2));
+      size.view = { x: x / width, y: y / height, width: w / width, height: h / height };
+      size.radius = radius;
+      if (!this.#rasterText(entry, size)) {
+        // Never place an old crop over a new portion of the line after allocation failure.
+        this.#call('editor_image_node', id, base.kind); return;
+      }
+    }
+    entry.limited = reuse ? false : entry.rasterLimited;
+    this.#call('editor_image_node', id, entry.kind);
   }
   #prepareText() {
+    for (const [id, entry] of this.#textViews) {
+      const n = this.#nodes.get(id), base = this.#textNodes.get(id);
+      const size = n && base ? this.#textSize(n, base) : null;
+      if (!size || !this.#textVisible(n) || !boundedTextSize(size.width, size.height).limited)
+        this.#releaseTextView(id, entry);
+    }
     if (!this.#textNodes.size) return;
     const requests = new Map();
     for (const [id, entry] of this.#textNodes) {
       const n = this.#nodes.get(id); if (!n || !this.#textVisible(n)) continue;
       const size = this.#textSize(n, entry), prior = requests.get(entry);
+      if (boundedTextSize(size.width, size.height).limited) {
+        this.#prepareTextView(id, n, entry); continue;
+      }
       requests.set(entry, prior ? { width: Math.max(prior.width, size.width), height: Math.max(prior.height, size.height) } : size);
     }
+    for (const entry of this.#textTiles.values()) if (!requests.has(entry)) entry.limited = false;
     for (const [entry, requested] of requests) {
       const size = boundedTextSize(requested.width, requested.height);
       // Grow as soon as needed; shrink only after a fourfold drop to avoid bucket oscillation.
@@ -382,7 +453,7 @@ export class Editor extends EventTarget {
     cancelAnimationFrame(this.#frame); this.#frame = 0; this.#transaction = null;
     if (this.#token) this.#host.call('editor_drop', this.#token);
     this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear();
-    this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear();
+    this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear(); this.#textViews.clear(); this.#textViewPool.length = 0;
     this.emit('destroy', {});
   }
 }

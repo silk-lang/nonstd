@@ -1,5 +1,8 @@
 # Adaptive text verification
 
+This records the first adaptive-resolution change (`a24d968`). The later
+[extreme-zoom verification](../text-zoom/README.md) addresses the whole-line cap described below.
+
 The screenshots compare the fixed-resolution JavaScript wrapper from commit `ff42c6d` with
 adaptive text. Both use the current WASM module and the same browser/GPU path. The old wrapper
 uses the unchanged `editor_image` ABI; the new wrapper also uses `editor_image_replace`.

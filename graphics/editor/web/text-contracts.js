@@ -66,8 +66,8 @@ export async function runTextContracts() {
     editor.undo(); editor.render();
     editor.update(id, { width: 1e6, height: 1e6 }); editor.render();
     const capped = calls.at(-1);
-    check(capped.width <= 4094 && capped.height <= 4094 && capped.width * capped.height <= 4 * 1024 * 1024 && editor.diagnostics.limitedTextRuns === 1,
-      'Extreme magnification respects the raster budget and reports its quality limit');
+    check(capped.width <= 4094 && capped.height <= 4094 && capped.width * capped.height <= 4 * 1024 * 1024 && editor.diagnostics.limitedTextRuns === 0,
+      'Extreme magnification uses a bounded visible-window raster without losing density');
     editor.update(id, { width: node.width, height: node.height }); editor.render();
     const beforeFailure = editor.diagnostics;
     const call = WebGPUHost.prototype.call; let replacements = 0;

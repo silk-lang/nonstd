@@ -13,17 +13,17 @@ export type ElementSnapshot = Readonly<Required<ElementProperties> & { id: Eleme
 export interface Camera { x: number; y: number; zoom: number }
 export interface Viewport extends Camera { width: number; height: number; pixelRatio: number }
 export interface RenderStats { buildMs: number; drawMs: number; textMs: number; visible: number; visited: number; batches: number; frames: number }
-/** Resource counters and the latest quality limits of cached text styles. */
+/** Resource counters and quality limits of text styles and active visible windows. */
 export interface EditorDiagnostics {
   gpuHandles: number; wasmBytes: number; destroyed: boolean;
   textRuns: number;
-  /** Successful uploads, including replacements of a shared text raster. */
+  /** Successful uploads of whole-run and visible-window rasters. */
   textRasterizations: number;
   /** Live native atlas allocations; replacing a raster releases its old allocation. */
   textAtlasTiles: number;
   /** Sum of cached raster areas; GPU textures can retain a larger high-water allocation. */
   textPixels: number;
-  /** Cached styles whose latest requested resolution was capped or could not be allocated. */
+  /** Fallback styles and active windows whose requested density was capped or could not be allocated. */
   limitedTextRuns: number;
 }
 export interface EditorDocument { version: 1; elements: ElementProperties[]; viewport?: Camera }
