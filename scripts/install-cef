@@ -3,13 +3,16 @@
 
   scripts/install-cef            install it; print the runtime directory
   scripts/install-cef --latest   print toolchains.lock.json entries for the newest stable CEF
+  scripts/install-cef --pinned   print entries for the pinned version on every platform
 
-The pin is CEF's minimal binary distribution for Linux (cef-builds.spotifycdn.com), checked by
-SHA-256. Installing also:
+The pin is CEF's minimal binary distribution (cef-builds.spotifycdn.com) for Linux, macOS and
+Windows, checked by SHA-256. Installing also:
 
-- puts the runtime directory together (.cache/cef/<version>/<target>/runtime): libcef.so and the
-  files beside it (Release/), its resources and locales (Resources/), and silk-cef-helper, the
-  executable of CEF's other processes, built from platform/webview/chromium/native/helper;
+- puts the runtime directory together (.cache/cef/<version>/<target>/runtime): on Linux and
+  Windows, CEF's library (libcef.so, libcef.dll) and the files beside it (Release/) with its
+  resources and locales (Resources/); on macOS, the Chromium Embedded Framework, which holds its
+  resources. Beside them goes silk-cef-helper, the executable of CEF's other processes, built
+  from platform/webview/chromium/native/helper;
 - copies the distribution's headers to platform/webview/chromium/native/cef/include, which the
   package's bridge compiles against (not committed).
 
@@ -30,7 +33,21 @@ from _install import CACHE, LOCK, ROOT, asset_for, fail, install
 
 PACKAGE = ROOT / "platform/webview/chromium"
 INDEX = "https://cef-builds.spotifycdn.com/index.json"
-PLATFORMS = {"x86_64-unknown-linux-gnu": "linux64", "aarch64-unknown-linux-gnu": "linuxarm64"}
+PLATFORMS = {
+    "x86_64-unknown-linux-gnu": "linux64",
+    "aarch64-unknown-linux-gnu": "linuxarm64",
+    "aarch64-apple-darwin": "macosarm64",
+    "x86_64-apple-darwin": "macosx64",
+    "x86_64-pc-windows-msvc": "windows64",
+}
+FRAMEWORK = "Chromium Embedded Framework.framework"
+# What the distribution's Release/ holds on each OS: the file that says it is complete.
+LIBRARY = {"linux": "libcef.so", "darwin": f"{FRAMEWORK}/Chromium Embedded Framework",
+           "win32": "libcef.dll"}
+
+
+def system():
+    return "linux" if sys.platform.startswith("linux") else sys.platform
 
 
 def clang():
@@ -47,7 +64,7 @@ def api_version():
 
 
 def runtime(home, version):
-    """Release/ and Resources/ in one directory, plus the helper executable."""
+    """CEF's library with what it loads, plus the helper executable, in one directory."""
     directory = home / "runtime"
     marker = directory / ".nonstd-runtime"
     helper = PACKAGE / "native/helper/helper.c"
@@ -56,13 +73,31 @@ def runtime(home, version):
         return directory
     if directory.exists():
         shutil.rmtree(directory)
-    shutil.copytree(home / "Release", directory)
-    shutil.copytree(home / "Resources", directory, dirs_exist_ok=True)
-    for archive in directory.glob("*.a"):
-        archive.unlink()
-    subprocess.run([clang(), "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                    f"-DCEF_API_VERSION={version}", f"-I{home}", str(helper),
-                    "-o", str(directory / "silk-cef-helper"), "-ldl"], check=True)
+    flags = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", f"-DCEF_API_VERSION={version}",
+             f"-I{home}", str(helper)]
+    if system() == "darwin":
+        # The framework keeps its resources and locales inside; its symlinks must stay links.
+        directory.mkdir(parents=True)
+        shutil.copytree(home / "Release" / FRAMEWORK, directory / FRAMEWORK, symlinks=True)
+        subprocess.run([clang(), *flags, "-mmacosx-version-min=14.0", "-o",
+                        str(directory / "silk-cef-helper")], check=True)
+    elif system() == "win32":
+        shutil.copytree(home / "Release", directory)
+        shutil.copytree(home / "Resources", directory, dirs_exist_ok=True)
+        for archive in directory.glob("*.lib"):
+            archive.unlink()
+        # A windowed helper, so CEF's other processes open no console windows.
+        subprocess.run([clang(), "--target=x86_64-pc-windows-msvc", "-fms-runtime-lib=dll",
+                        "-D_CRT_SECURE_NO_WARNINGS", *flags, "-o",
+                        str(directory / "silk-cef-helper.exe"), "-Wl,/subsystem:windows",
+                        "-Wl,/entry:mainCRTStartup"], check=True)
+    else:
+        shutil.copytree(home / "Release", directory)
+        shutil.copytree(home / "Resources", directory, dirs_exist_ok=True)
+        for archive in directory.glob("*.a"):
+            archive.unlink()
+        subprocess.run([clang(), *flags, "-o", str(directory / "silk-cef-helper"), "-ldl"],
+                       check=True)
     marker.write_text(stamp + "\n")
     return directory
 
@@ -79,15 +114,16 @@ def headers(home):
     marker.write_text(version + "\n")
 
 
-def latest():
-    with urllib.request.urlopen(INDEX) as response:
-        index = json.load(response)
-    entries = {}
-    for native, name in PLATFORMS.items():
-        builds = [build for build in index[name]["versions"] if build.get("channel") == "stable"]
-        build = builds[0]
-        minimal = next(file for file in build["files"] if file["type"] == "minimal")
-        url = "https://cef-builds.spotifycdn.com/" + urllib.request.quote(minimal["name"])
+def entry(index, name, pick):
+    """The lock entry of the minimal distribution of the build `pick` chooses for `name`."""
+    builds = [build for build in index[name]["versions"] if pick(build)]
+    if not builds:
+        fail(f"No such CEF build for {name}")
+    build = builds[0]
+    minimal = next(file for file in build["files"] if file["type"] == "minimal")
+    url = "https://cef-builds.spotifycdn.com/" + urllib.request.quote(minimal["name"])
+    # The CDN sometimes ends a transfer early; a digest that differs from the index's is retried.
+    for attempt in range(3):
         digest = hashlib.sha256()
         sha1 = hashlib.sha1()
         size = 0
@@ -96,20 +132,35 @@ def latest():
                 digest.update(chunk)
                 sha1.update(chunk)
                 size += len(chunk)
-        if sha1.hexdigest() != minimal["sha1"]:
-            fail(f"SHA-1 of {minimal['name']} differs from the index")
-        entries[native] = {"url": url, "sha256": digest.hexdigest(), "bytes": size}
+        if sha1.hexdigest() == minimal["sha1"]:
+            return build, {"url": url, "sha256": digest.hexdigest(), "bytes": size}
+        print(f"SHA-1 of {minimal['name']} differs from the index (attempt {attempt + 1})",
+              file=sys.stderr)
+    fail(f"SHA-1 of {minimal['name']} differs from the index")
+
+
+def latest(pinned):
+    with urllib.request.urlopen(INDEX) as response:
+        index = json.load(response)
+    entries = {}
+    version = LOCK["cef"]["version"]
+    for native, name in PLATFORMS.items():
+        if pinned:
+            build, entries[native] = entry(index, name, lambda build: build["cef_version"] == version)
+        else:
+            build, entries[native] = entry(index, name, lambda build: build.get("channel") == "stable")
         print(f"{native}: CEF {build['cef_version']} (Chromium {build['chromium_version']})",
               file=sys.stderr)
     print(json.dumps({"version": build["cef_version"], "platforms": entries}, indent=2))
 
 
 def main():
-    if "--latest" in sys.argv[1:]:
-        return latest()
+    if "--latest" in sys.argv[1:] or "--pinned" in sys.argv[1:]:
+        return latest("--pinned" in sys.argv[1:])
     version = api_version()
     native, _ = asset_for("cef")
-    home = install("cef", CACHE / "cef" / LOCK["cef"]["version"] / native, "Release/libcef.so")
+    home = install("cef", CACHE / "cef" / LOCK["cef"]["version"] / native,
+                   f"Release/{LIBRARY[system()]}")
     headers(home)
     print(runtime(home, version))
 

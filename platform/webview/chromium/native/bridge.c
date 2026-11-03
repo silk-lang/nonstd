@@ -1,8 +1,11 @@
-// The Chromium backend of platform/webview on Linux: CEF, rendering offscreen (C ABI in
-// bridge.h).
+// The Chromium backend of platform/webview: CEF, rendering offscreen (C ABI in bridge.h), on
+// Linux, macOS and Windows.
 //
-// libcef.so is loaded at run time from the runtime directory the app names (scripts/install-cef
-// puts one together), so programs build without CEF and report Unsupported when it is missing.
+// CEF's library (libcef.so, libcef.dll, or the Chromium Embedded Framework on macOS) is loaded
+// at run time from the runtime directory the app names (scripts/install-cef puts one together),
+// so programs build without CEF and report Unsupported when it is missing. The few OS services
+// the bridge needs (loading the library, a lock, a condition and a thread for the pump timer, a
+// temporary directory) are in the "Port" section; everything else is the same everywhere.
 // CEF runs its browser process UI thread on the app's main thread with an external message pump:
 // CEF says when it wants work (on_schedule_message_pump_work, from any thread), a timer thread
 // wakes platform-window's nextEvent then, and the app's loop calls silk_cef_pump, which does the
@@ -16,18 +19,24 @@
 // script runs in an isolated world of its own ("silk-agent"), which pages cannot see, and agent
 // clicks, keys and wheel turns are Input.dispatch* events, which pages get as trusted input. A
 // person's input, forwarded from the window, goes through CEF's own send_*_event calls.
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "include/cef_api_hash.h"
 #include "include/capi/cef_app_capi.h"
@@ -49,13 +58,152 @@
 #include "bridge.h"
 #include "keys.h"
 
-// platform-window's bridge (platform/window/native/bridge.h). Weak, so this package's own unit
-// tests link without platform-window; a program with web views has it for its windows.
+// platform-window's wake (platform/window/native/bridge.h; silk_macos_wake on macOS). Weak, so
+// this package's own unit tests link without platform-window; a program with web views has it
+// for its windows. The MSVC linker has no weak symbols: /alternatename names a stand-in that it
+// uses when platform-window's is not there.
+#if defined(_WIN32)
+void silk_window_wake(void);
+void silk_cef_no_wake(void) {}
+#pragma comment(linker, "/alternatename:silk_window_wake=silk_cef_no_wake")
+static void wake_window(void) { silk_window_wake(); }
+#elif defined(__APPLE__)
+void silk_macos_wake(void) __attribute__((weak));
+static void wake_window(void) {
+    if (silk_macos_wake) silk_macos_wake();
+}
+#else
 void silk_window_wake(void) __attribute__((weak));
-
 static void wake_window(void) {
     if (silk_window_wake) silk_window_wake();
 }
+#endif
+
+// ---------------------------------------------------------------------------------------
+// Port: what the bridge needs from the OS.
+
+#if defined(_WIN32)
+#define PATH_SEPARATOR '\\'
+static const char libraryName[] = "libcef.dll";
+static const char helperName[] = "silk-cef-helper.exe";
+typedef SRWLOCK PortLock;
+#define PORT_LOCK_INIT SRWLOCK_INIT
+typedef CONDITION_VARIABLE PortCondition;
+#define PORT_CONDITION_INIT CONDITION_VARIABLE_INIT
+typedef HANDLE PortThread;
+static void port_lock(PortLock *lock) { AcquireSRWLockExclusive(lock); }
+static void port_unlock(PortLock *lock) { ReleaseSRWLockExclusive(lock); }
+static void port_signal(PortCondition *condition) { WakeConditionVariable(condition); }
+static void port_wait(PortCondition *condition, PortLock *lock, double seconds) {
+    DWORD ms = isinf(seconds) ? INFINITE : (DWORD)(seconds * 1000.0) + 1;
+    SleepConditionVariableSRW(condition, lock, ms, 0);
+}
+static void *(*portThreadMain)(void *);
+static DWORD WINAPI port_thread_entry(LPVOID unused) {
+    portThreadMain(NULL);
+    return 0;
+}
+static void port_start_thread(PortThread *thread, void *(*main)(void *)) {
+    portThreadMain = main;
+    *thread = CreateThread(NULL, 0, port_thread_entry, NULL, 0, NULL);
+}
+static void port_join_thread(PortThread thread) {
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+}
+static void port_sleep_ms(unsigned ms) { Sleep(ms); }
+static double port_now(void) {
+    static LARGE_INTEGER frequency;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER count;
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)frequency.QuadPart;
+}
+static char portLoadError[256];
+static void *port_load(const char *path) {
+    // CEF's own DLLs (chrome_elf.dll, ...) sit beside libcef.dll.
+    HMODULE module = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!module) snprintf(portLoadError, sizeof portLoadError, "Windows error %lu", GetLastError());
+    return module;
+}
+static void *port_symbol(void *module, const char *name) {
+    return (void *)GetProcAddress((HMODULE)module, name);
+}
+static void port_unload(void *module) { FreeLibrary((HMODULE)module); }
+static const char *port_load_error(void) { return portLoadError; }
+static void port_mkdir(const char *path) { CreateDirectoryA(path, NULL); }
+// A new empty directory under the temporary directory, malloc'd (NULL when it cannot be made).
+static char *port_temp_dir(void) {
+    char base[MAX_PATH];
+    DWORD length = GetTempPathA(MAX_PATH, base);
+    if (!length || length > MAX_PATH - 40) return NULL;
+    for (unsigned attempt = 0; attempt < 100; attempt++) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%ssilk-cef-%lu-%u", base, GetCurrentProcessId(), attempt);
+        if (CreateDirectoryA(path, NULL)) {
+            char *out = malloc(strlen(path) + 1);
+            if (out) strcpy(out, path);
+            return out;
+        }
+    }
+    return NULL;
+}
+#else
+#define PATH_SEPARATOR '/'
+#if defined(__APPLE__)
+static const char libraryName[] =
+    "Chromium Embedded Framework.framework/Chromium Embedded Framework";
+#else
+static const char libraryName[] = "libcef.so";
+#endif
+static const char helperName[] = "silk-cef-helper";
+typedef pthread_mutex_t PortLock;
+#define PORT_LOCK_INIT PTHREAD_MUTEX_INITIALIZER
+typedef pthread_cond_t PortCondition;
+#define PORT_CONDITION_INIT PTHREAD_COND_INITIALIZER
+typedef pthread_t PortThread;
+static void port_lock(PortLock *lock) { pthread_mutex_lock(lock); }
+static void port_unlock(PortLock *lock) { pthread_mutex_unlock(lock); }
+static void port_signal(PortCondition *condition) { pthread_cond_signal(condition); }
+static void port_wait(PortCondition *condition, PortLock *lock, double seconds) {
+    if (isinf(seconds)) {
+        pthread_cond_wait(condition, lock);
+        return;
+    }
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    long nanoseconds = until.tv_nsec + (long)(fmod(seconds, 1.0) * 1e9);
+    until.tv_sec += (time_t)seconds + nanoseconds / 1000000000L;
+    until.tv_nsec = nanoseconds % 1000000000L;
+    pthread_cond_timedwait(condition, lock, &until);
+}
+static void port_start_thread(PortThread *thread, void *(*main)(void *)) {
+    pthread_create(thread, NULL, main, NULL);
+}
+static void port_join_thread(PortThread thread) { pthread_join(thread, NULL); }
+static void port_sleep_ms(unsigned ms) { usleep(ms * 1000); }
+static double port_now(void) {
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (double)time.tv_sec + (double)time.tv_nsec / 1e9;
+}
+static void *port_load(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static void *port_symbol(void *module, const char *name) { return dlsym(module, name); }
+static void port_unload(void *module) { dlclose(module); }
+static const char *port_load_error(void) {
+    const char *error = dlerror();
+    return error ? error : "";
+}
+static void port_mkdir(const char *path) { mkdir(path, 0700); }
+static char *port_temp_dir(void) {
+    char pattern[] = "/tmp/silk-cef-XXXXXX";
+    char *made = mkdtemp(pattern);
+    if (!made) return NULL;
+    char *out = malloc(strlen(made) + 1);
+    if (out) strcpy(out, made);
+    return out;
+}
+#endif
 
 static const char agentWorld[] = "silk-agent";
 static const char agentMissing[] = "the agent script is not in this page";
@@ -476,11 +624,7 @@ static void init_base(cef_base_ref_counted_t *base, size_t size) {
     base->has_at_least_one_ref = static_has_at_least_one_ref;
 }
 
-static double now_seconds(void) {
-    struct timespec time;
-    clock_gettime(CLOCK_MONOTONIC, &time);
-    return (double)time.tv_sec + (double)time.tv_nsec / 1e9;
-}
+static double now_seconds(void) { return port_now(); }
 
 // ---------------------------------------------------------------------------------------
 // Base64, for screenshots (PNG in the protocol's answers) and LoadHtml bodies.
@@ -654,7 +798,9 @@ static void free_op(Op *op) {
 
 static void close_frame(Frame *frame) {
     for (uint32_t i = 0; i < frame->planeCount; i++) {
+#if defined(__linux__)
         if (frame->planes[i].fd >= 0) close(frame->planes[i].fd);
+#endif
         frame->planes[i].fd = -1;
     }
     frame->planeCount = 0;
@@ -1505,9 +1651,9 @@ static void CEF_CALLBACK process_context_initialized(cef_browser_process_handler
 
 // --- The message pump: a timer thread wakes the app's loop when CEF wants work. -----------
 
-static pthread_mutex_t pumpLock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t pumpChanged = PTHREAD_COND_INITIALIZER;
-static pthread_t pumpThread;
+static PortLock pumpLock = PORT_LOCK_INIT;
+static PortCondition pumpChanged = PORT_CONDITION_INIT;
+static PortThread pumpThread;
 static bool pumpRunning;
 static double pumpDeadline = INFINITY; // when CEF wants work, in now_seconds()
 static double pumpWoken = -1;          // the deadline the timer thread last woke the loop for
@@ -1516,13 +1662,13 @@ static double pumpWoken = -1;          // the deadline the timer thread last wok
 static const double maxPumpDelay = 1.0 / 30.0;
 
 static void schedule(double delaySeconds) {
-    pthread_mutex_lock(&pumpLock);
+    port_lock(&pumpLock);
     double at = now_seconds() + (delaySeconds > 0 ? delaySeconds : 0);
     if (at < pumpDeadline) {
         pumpDeadline = at;
-        pthread_cond_signal(&pumpChanged);
+        port_signal(&pumpChanged);
     }
-    pthread_mutex_unlock(&pumpLock);
+    port_unlock(&pumpLock);
 }
 
 static void CEF_CALLBACK process_schedule_work(cef_browser_process_handler_t *self,
@@ -1531,31 +1677,23 @@ static void CEF_CALLBACK process_schedule_work(cef_browser_process_handler_t *se
 }
 
 static void *pump_timer(void *unused) {
-    pthread_mutex_lock(&pumpLock);
+    port_lock(&pumpLock);
     while (pumpRunning) {
         double now = now_seconds();
         if (pumpDeadline <= now) {
             if (pumpWoken != pumpDeadline) {
                 pumpWoken = pumpDeadline;
-                pthread_mutex_unlock(&pumpLock);
+                port_unlock(&pumpLock);
                 wake_window();
-                pthread_mutex_lock(&pumpLock);
+                port_lock(&pumpLock);
                 continue;
             }
-            pthread_cond_wait(&pumpChanged, &pumpLock);
-        } else if (isinf(pumpDeadline)) {
-            pthread_cond_wait(&pumpChanged, &pumpLock);
+            port_wait(&pumpChanged, &pumpLock, INFINITY);
         } else {
-            double wait = pumpDeadline - now;
-            struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            long nanoseconds = until.tv_nsec + (long)(fmod(wait, 1.0) * 1e9);
-            until.tv_sec += (time_t)wait + nanoseconds / 1000000000L;
-            until.tv_nsec = nanoseconds % 1000000000L;
-            pthread_cond_timedwait(&pumpChanged, &pumpLock, &until);
+            port_wait(&pumpChanged, &pumpLock, pumpDeadline - now);
         }
     }
-    pthread_mutex_unlock(&pumpLock);
+    port_unlock(&pumpLock);
     return NULL;
 }
 
@@ -1566,19 +1704,19 @@ static void do_work(void) {
 
 uint8_t silk_cef_pump(void) {
     if (!started) return 0;
-    pthread_mutex_lock(&pumpLock);
+    port_lock(&pumpLock);
     bool due = pumpDeadline <= now_seconds();
     if (due) pumpDeadline = INFINITY;
-    pthread_mutex_unlock(&pumpLock);
+    port_unlock(&pumpLock);
     if (due) do_work();
     return 1;
 }
 
 double silk_cef_next_pump(void) {
     if (!started) return INFINITY;
-    pthread_mutex_lock(&pumpLock);
+    port_lock(&pumpLock);
     double wait = pumpDeadline - now_seconds();
-    pthread_mutex_unlock(&pumpLock);
+    port_unlock(&pumpLock);
     return wait > 0 ? wait : 0;
 }
 
@@ -1692,6 +1830,8 @@ static void CEF_CALLBACK render_paint(cef_render_handler_t *self, cef_browser_t 
 #define FOURCC(a, b, c, d) \
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 
+#if defined(__linux__)
+// Shared textures are dma-bufs on Linux; macOS and Windows get CPU frames.
 static void CEF_CALLBACK render_accelerated_paint(cef_render_handler_t *self,
                                                   cef_browser_t *browser,
                                                   cef_paint_element_type_t type, size_t dirtyCount,
@@ -1720,6 +1860,7 @@ static void CEF_CALLBACK render_accelerated_paint(cef_render_handler_t *self,
     if (type == PET_POPUP) view->frame.generation++;
     wake_window();
 }
+#endif
 
 static void CEF_CALLBACK render_ime_range(cef_render_handler_t *self, cef_browser_t *browser,
                                           const cef_range_t *selected, size_t count,
@@ -2157,7 +2298,9 @@ static void init_handlers(void) {
     renderHandler.on_popup_show = render_popup_show;
     renderHandler.on_popup_size = render_popup_size;
     renderHandler.on_paint = render_paint;
+#if defined(__linux__)
     renderHandler.on_accelerated_paint = render_accelerated_paint;
+#endif
     renderHandler.on_ime_composition_range_changed = render_ime_range;
 
     init_base(&displayHandler.base, sizeof displayHandler);
@@ -2202,7 +2345,9 @@ static void init_handlers(void) {
 static char *path_join(const char *dir, size_t dirLength, const char *name) {
     Buffer out = {0};
     buffer_add(&out, dir, dirLength);
-    if (dirLength && dir[dirLength - 1] != '/') buffer_add(&out, "/", 1);
+    char separator = PATH_SEPARATOR;
+    if (dirLength && dir[dirLength - 1] != '/' && dir[dirLength - 1] != separator)
+        buffer_add(&out, &separator, 1);
     buffer_text(&out, name);
     return out.data;
 }
@@ -2211,9 +2356,9 @@ static void set_path(cef_string_t *field, const char *text) {
     *field = make_string(text, strlen(text));
 }
 
-// Forgets a libcef.so that turned out not to fit, so a later start can try another.
+// Forgets a CEF library that turned out not to fit, so a later start can try another.
 static void unload_library(void) {
-    dlclose(library);
+    port_unload(library);
     library = NULL;
     memset(&cef, 0, sizeof cef);
 }
@@ -2225,18 +2370,18 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
                         size_t scriptLength) {
     if (started || library) return SILK_CEF_ALREADY;
     const char *dir = (const char *)runtimeDir;
-    char *libraryPath = path_join(dir, runtimeDirLength, "libcef.so");
-    library = dlopen(libraryPath, RTLD_NOW | RTLD_LOCAL);
+    char *libraryPath = path_join(dir, runtimeDirLength, libraryName);
+    library = port_load(libraryPath);
     if (!library) {
-        set_error("libcef.so did not load: %s", dlerror());
+        set_error("the CEF library did not load: %s", port_load_error());
         free(libraryPath);
         return SILK_CEF_NO_LIBRARY;
     }
     free(libraryPath);
 #define RESOLVE(name)                                                     \
-    cef.name = (__typeof__(name) *)dlsym(library, #name);                 \
+    cef.name = (__typeof__(name) *)port_symbol(library, #name);           \
     if (!cef.name) {                                                      \
-        set_error("libcef.so has no %s", #name);                          \
+        set_error("the CEF library has no %s", #name);                    \
         unload_library();                                                 \
         return SILK_CEF_WRONG_VERSION;                                    \
     }
@@ -2245,7 +2390,7 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
     // Configures the API version this bridge was built for, and checks the library has it.
     const char *hash = cef.cef_api_hash(CEF_API_VERSION, 0);
     if (!hash || strcmp(hash, CEF_API_HASH_PLATFORM) != 0) {
-        set_error("libcef.so is not the CEF version this bridge was built for (API hash %s)", hash);
+        set_error("the CEF library is not the version this bridge was built for (API hash %s)", hash);
         unload_library();
         return SILK_CEF_WRONG_VERSION;
     }
@@ -2258,17 +2403,26 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
         cacheRoot = copy_bytes(root, rootLength);
     } else {
         // CEF wants a root directory even when nothing persists.
-        char pattern[] = "/tmp/silk-cef-XXXXXX";
-        char *made = mkdtemp(pattern);
-        cacheRoot = copy_bytes(made ? made : "/tmp", strlen(made ? made : "/tmp"));
+        cacheRoot = port_temp_dir();
+        if (!cacheRoot) {
+            set_error("no temporary directory for CEF's cache%s", "");
+            unload_library();
+            return SILK_CEF_INIT_FAILED;
+        }
     }
-    mkdir(cacheRoot, 0700);
+    port_mkdir(cacheRoot);
     init_handlers();
 
     cef_settings_t settings;
     memset(&settings, 0, sizeof settings);
     settings.size = sizeof settings;
+#if defined(__linux__)
     settings.no_sandbox = (flags & SILK_CEF_NO_SANDBOX) ? 1 : 0;
+#else
+    // The sandbox on macOS and Windows needs CEF's sandbox library linked into the helper, which
+    // this package does not do yet.
+    settings.no_sandbox = 1;
+#endif
     settings.multi_threaded_message_loop = 0;
     settings.external_message_pump = 1;
     settings.windowless_rendering_enabled = 1;
@@ -2276,23 +2430,37 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
     settings.persist_session_cookies = 1;
     // Without a helper named, CEF's other processes run silk-cef-helper from the runtime directory.
     char *helper = helperPathLength ? copy_bytes(helperPath, helperPathLength)
-                                    : path_join(dir, runtimeDirLength, "silk-cef-helper");
+                                    : path_join(dir, runtimeDirLength, helperName);
     char *dirText = copy_bytes(dir, runtimeDirLength);
     char *locales = path_join(dir, runtimeDirLength, "locales");
     set_path(&settings.browser_subprocess_path, helper);
+#if defined(__APPLE__)
+    // The framework holds its resources and locales.
+    char *framework = path_join(dir, runtimeDirLength, "Chromium Embedded Framework.framework");
+    set_path(&settings.framework_dir_path, framework);
+    free(framework);
+#else
     set_path(&settings.resources_dir_path, dirText);
     set_path(&settings.locales_dir_path, locales);
+#endif
     set_path(&settings.root_cache_path, cacheRoot);
     const char *log = getenv("SILK_CEF_LOG");
     settings.log_severity = log && log[0] ? LOGSEVERITY_VERBOSE : LOGSEVERITY_ERROR;
     if (log && log[0]) set_path(&settings.log_file, log);
     settings.background_color = 0xFFFFFFFF;
 
+#if defined(_WIN32)
+    cef_main_args_t args = {GetModuleHandleW(NULL)};
+#else
     char *argv0 = copy_bytes("silk-app", 8);
     char *argv[] = {argv0, NULL};
     cef_main_args_t args = {1, argv};
+#endif
     int ok = cef.cef_initialize(&args, &settings, &app, NULL);
     clear_string(&settings.browser_subprocess_path);
+#if defined(__APPLE__)
+    clear_string(&settings.framework_dir_path);
+#endif
     clear_string(&settings.resources_dir_path);
     clear_string(&settings.locales_dir_path);
     clear_string(&settings.root_cache_path);
@@ -2306,7 +2474,7 @@ uint32_t silk_cef_start(const uint8_t *runtimeDir, size_t runtimeDirLength,
     }
     started = true;
     pumpRunning = true;
-    pthread_create(&pumpThread, NULL, pump_timer, NULL);
+    port_start_thread(&pumpThread, pump_timer);
     schedule(0);
     return SILK_CEF_STARTED;
 }
@@ -2327,13 +2495,13 @@ void silk_cef_shutdown(void) {
             if (views[i]->browser) open = true;
         if (!open && contextReady) break;
         cef.cef_do_message_loop_work();
-        usleep(5000);
+        port_sleep_ms(5);
     }
-    pthread_mutex_lock(&pumpLock);
+    port_lock(&pumpLock);
     pumpRunning = false;
-    pthread_cond_signal(&pumpChanged);
-    pthread_mutex_unlock(&pumpLock);
-    pthread_join(pumpThread, NULL);
+    port_signal(&pumpChanged);
+    port_unlock(&pumpLock);
+    port_join_thread(pumpThread);
     cef.cef_shutdown();
     started = false;
 }
@@ -2378,7 +2546,9 @@ uint32_t silk_cef_open(uint32_t id, const uint8_t *url, size_t urlLength, const 
     memset(&window, 0, sizeof window);
     window.size = sizeof window;
     window.windowless_rendering_enabled = 1;
+#if defined(__linux__)
     window.shared_texture_enabled = (startFlags & SILK_CEF_SHARED_TEXTURES) ? 1 : 0;
+#endif
     window.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 
     cef_browser_settings_t settings;
@@ -2700,7 +2870,15 @@ void silk_cef_key(uint32_t id, uint32_t kind, uint32_t code, uint32_t character,
     event.modifiers = event_flags(modifiers);
     if (code < SILK_CEF_KEY_COUNT) {
         event.windows_key_code = silk_cef_keys[code][0];
+#if defined(__APPLE__)
+        event.native_key_code = silk_cef_keys[code][2] == 0xFFFF ? 0 : silk_cef_keys[code][2];
+#elif defined(_WIN32)
+        // As WM_KEYDOWN's lParam: the repeat count 1, the scan code, the extended bit.
+        uint32_t scan = silk_cef_keys[code][3];
+        event.native_key_code = (int)(1u | ((scan & 0xFFu) << 16) | ((scan & 0xFF00u) ? 1u << 24 : 0));
+#else
         event.native_key_code = silk_cef_keys[code][1];
+#endif
     }
     event.is_system_key = (modifiers & 4) ? 1 : 0;
     if (kind == SILK_CEF_KEY_CHAR) {
