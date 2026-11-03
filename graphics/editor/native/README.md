@@ -41,7 +41,7 @@ libraries/frameworks; it does not depend on a running compiler or this checkout.
   inner shadows, layer blur, backdrop blur, brightness, contrast, saturation, and
   blend mode. Group/ungroup, align, change order, hide, and lock layers.
 - Use undo/redo, copy/paste within the document, pages, and a virtualized layer list
-  with search. Shift+1 fits the page, Shift+2 fits selection, and 0 sets 100% zoom.
+  with nested, collapsible groups/frames and search. Selection changes reuse the cached hierarchy. Shift+1 fits the page, Shift+2 fits selection, and 0 sets 100% zoom.
 - **Commands → Add 100k rectangles** creates the supplied image as 100,000
   independently editable rectangles, with small gaps and two labels. It is not a
   flattened bitmap. **Add effects playground** adds a smaller filter demonstration.
@@ -68,6 +68,8 @@ reliably. SVG text metrics depend on fonts in the viewer.
 ```sh
 python3 graphics/editor/native/scripts/test --release
 python3 graphics/editor/native/scripts/studio check --release
+# After building ui-inspect-cli and ui-inspect-mcp in release mode:
+python3 graphics/editor/native/scripts/inspect-check --stress
 ```
 
 The contract executable tests pointer-driven creation, native inspector input,
@@ -87,8 +89,19 @@ The optional local UI inspector is off in release builds unless explicitly enabl
 SILK_UI_INSPECT=/tmp/silk-studio.sock python3 graphics/editor/native/scripts/studio --release --inspect
 ```
 
-It inspects UI controls; canvas layers remain in the drawing document rather than
-becoming UI tree nodes. OS accessibility exposure is currently limited by the
+Inspector screenshots include the complete canvas and controls. `--test-id canvas` crops
+the canvas; `capture sequence.png --count 10 --interval 100` returns a contact sheet with
+actual times and frame numbers. `pointer --phase down/move/up --x X --y Y` and
+`key KEY --phase down/up` feed the same UI dispatcher and application event pump as window
+input. Compound clicks process each event before the next. See the
+[CLI](../../../ui/inspect/cli/README.md) and [MCP tools](../../../ui/inspect/mcp/README.md).
+
+Marquee movement requests a frame even when the selected IDs do not change. The canvas
+revision participates in invalidation independently of the control tree. This covers empty
+marquees, movement through gaps and clearing the marquee on release. Inspector requests
+also receive composed frames when the window is occluded.
+
+Canvas layers remain in the drawing document rather than becoming UI tree nodes. OS accessibility exposure is currently limited by the
 shared window/UI bridge. Shape clipboard data is currently local to this app;
 text fields use the OS clipboard. Snapping currently rounds drag positions to
 whole canvas units. Cloud, collaboration, and font discovery are outside this port.
