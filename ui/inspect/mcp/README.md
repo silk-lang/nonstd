@@ -64,6 +64,7 @@ match in tree order wins.
 | `ui_type` | `type` | types `text` into the focused input, or into `query` after clicking it |
 | `ui_wait` | `wait` | until the target exists (or, with `gone`, does not); `timeout` in ms, default 5000 |
 | `ui_stats` | `stats` | the last frame's counters |
+| `ui_events` | `events` | the event records the app took (click, keydown, input, ...), with `since` and `limit` |
 
 Results are text: the snapshot or node view text, otherwise the protocol's reply line. A failed
 command (no node matches, a covered node, a timed out wait) is a tool result with `isError`, so

@@ -6,6 +6,11 @@
 //! the app subscribes to animation frames. Input goes to the tree, the tree's records go to the
 //! runtime, and a frame is drawn when the tree wants one.
 //!
+//! An app runs with the inspector (ui/inspect/server) when it passes one that is on to
+//! [`runWindowWith`]: requests are served from the loop, input they dispatch is pumped to the app
+//! like window input, the records the app takes go to the inspector's event log, and the
+//! highlight is drawn over the frame.
+//!
 //! `check` mode ignores real input: after the first frame it clicks the node named
 //! `options.checkClick` and presses Tab through the same path a user's input takes, draws two
 //! more frames, reads the window's surface back and compares it with the CPU reference of the
@@ -16,6 +21,7 @@ import ui_app.harness { click, press }
 import ui_tree.inspect { findAll }
 import ui_tree.lib { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
 import ui_tree_window.lib { feed, windowCursor }
+import ui_inspect_server.lib { Inspector }
 import font_collection.lib { FontCollection }
 import demo.compare { Tolerance, compare }
 import demo_host.frames { copyOut, isBgra, pickFormat, readbackSize, unpack }
@@ -159,7 +165,27 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 ) -> i32
   ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? R | &mut Allocator {
+  return run runWindowWith(&mut app, collection, move resources, move options, Inspector.off())
+}
+
+/// [`runWindow`] serving `inspector` (from `Inspector.start`, which is off unless the build and
+/// `SILK_UI_INSPECT` allow it). Check mode does not serve it.
+pub effect fn runWindowWith<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  app: &mut Runtime<A, M, C>,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
   let check = options.check
+  let mut inspector = if check {
+    drop inspector
+    Inspector.off()
+  } else {
+    move inspector
+  }
   let mut clock = OsMonotonicClock.make()
   let started = run seconds(&mut clock)
   let mut tree = run UiTree.make(collection)
@@ -222,15 +248,27 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
     let wait = if check {
       Wait.Poll
     } else {
-      match app.nextDeadline() {
+      let deadline = match app.nextDeadline() {
+        Option<f64>.Some { value } => if value > now {
+          value - now
+        } else {
+          0.0
+        }
+        Option<f64>.None => -1.0
+      }
+      match inspector.pollInterval() {
         Option<f64>.Some { value } => Wait.Seconds {
-          seconds: if value > now {
-            value - now
+          seconds: if deadline >= 0.0 && deadline < value {
+            deadline
           } else {
-            0.0
+            value
           },
         }
-        Option<f64>.None => Wait.Forever
+        Option<f64>.None => if deadline >= 0.0 {
+          Wait.Seconds { seconds: deadline }
+        } else {
+          Wait.Forever
+        }
       }
     }
     let next = run platform.nextEvent(wait)
@@ -239,6 +277,13 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
     if !check {
       run tick(&mut app, &mut tree, time, false)
       redraw = tree.needsFrame()
+    }
+    if run inspector.poll(&mut tree) {
+      // Input from the inspector is answered like window input.
+      run inspector.observe(&tree)
+      drop run pump(&mut app, &mut tree)
+      platform.setCursor(owner, windowCursor(tree.cursor()))
+      redraw = true
     }
     if let Option<Event>.Some { value } = &next {
       let mut resized = false
@@ -275,6 +320,7 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
               textures.write(&queue, list[i].tile, pending.pixels(list[i]))
               i = i + 1
             }
+            run inspector.afterFrame(&tree)
             run snapshot.sync(&mut tree)
             let deviceWidth = deviceSize(width, scale)
             let deviceHeight = deviceSize(height, scale)
@@ -283,7 +329,7 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
             run renderer.draw(
               &device,
               &queue,
-              tree.scene(),
+              inspector.scene(&tree),
               &textures,
               &view,
               deviceWidth,
@@ -333,6 +379,7 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
         }
         _ => {
           if !check && run feed(&mut tree, &value) {
+            run inspector.observe(&tree)
             drop run pump(&mut app, &mut tree)
             platform.setCursor(owner, windowCursor(tree.cursor()))
             redraw = tree.needsFrame()
@@ -354,6 +401,7 @@ pub effect fn runWindow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
       platform.requestFrame(owner)
     }
   }
+  run inspector.close()
   surface.unconfigure()
   platform.closeWindow(owner)
   return status

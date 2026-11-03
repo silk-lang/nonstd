@@ -13,6 +13,9 @@ Packages:
   loop helpers (`seq.silk`).
 - `ui/app/window` (`ui-app-window`): `runWindow`, the loop that runs an app in a native window
   through [platform/window](../../platform/window) and [ui_renderer](../../graphics/ui_renderer).
+  `runWindowWith` also serves an [inspector](../inspect/server) (debug builds with
+  `SILK_UI_INSPECT` set), so ui-inspect-cli, ui-inspect-mcp and the
+  [devtools window](../inspect/devtools) can look at the app.
 - `ui/app/examples`: a counter and a todo list. `ui/app/demo` runs the todo list in a window.
 - `ui/app/tests`: unit tests and the golden scenes.
 
