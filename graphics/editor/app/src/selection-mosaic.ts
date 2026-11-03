@@ -1,7 +1,7 @@
 import pixels from './assets/selection-pixels.json' with { type: 'json' }
 import { makeNode, type Node } from './document'
 
-export const selectionTitle = ['SILK + WEBGPU +EFFECT + FOLDKIT', '100K elements'] as const
+export const selectionTitle = ['SILK + WEBGPU + EFFECT + FOLDKIT', '100K elements'] as const
 const titleWidth = (text: string): number => Math.ceil(text.length * 512 * 0.6 + 4) * 2.5
 export const selectionMosaicBounds = {
   x: 0,
