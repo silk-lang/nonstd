@@ -1,3 +1,4 @@
+import { registerImages } from './image-assets'
 import { Editor } from '../../dist/editor.js'
 import wasm from '../../dist/editor.wasm?url'
 import { CanvasHost } from './canvas-host'
@@ -49,6 +50,7 @@ export const rasterExport = async (page: Page, selection: readonly string[]): Pr
   })
   const host = new CanvasHost(editor)
   try {
+    await registerImages(editor)
     editor.resize(canvas.width, canvas.height, 1)
     host.sync({ ...page, nodes }, { x: bounds.x, y: bounds.y, zoom: scale })
     editor.render()

@@ -24,6 +24,8 @@ const properties = (n: Node, nodes: readonly Node[], opacity: number): ElementPr
   innerShadowY: n.innerShadowY,
   type: n.kind === 'frame' || n.kind === 'group' ? 'rect' : n.kind,
   name: n.name,
+  image: n.image,
+  imageCrop: n.imageCrop,
   x: n.x,
   y: n.y,
   width: n.width,

@@ -1,6 +1,6 @@
-import { selectionRoots } from './hierarchy'
+import { nodeIndex, selectionRoots } from './hierarchy'
 import { currentPage, descendants, replaceNodes, type DesignDocument, type Node } from './document'
-import { boundsOf, effectiveFlag } from './geometry'
+import { boundsOf, effectiveFlag, type Bounds } from './geometry'
 import { type Model } from './model'
 import { starterDocument } from './starter'
 
@@ -56,12 +56,36 @@ export const idFor = (doc: DesignDocument): { id: string; nextId: number } => {
   while (used.has(`n${next}`)) next++
   return { id: `n${next}`, nextId: next + 1 }
 }
-export const groupBounds = (nodes: readonly Node[]): readonly Node[] =>
-  nodes.map((n) => {
-    if (n.kind !== 'group') return n
-    const b = boundsOf(descendants(nodes, [n.id]).filter((child) => child.kind !== 'group'))
-    return b ? { ...n, ...b } : n
+/** Accumulate drawable bounds through ancestors once, independent of document order. */
+export const groupBounds = (nodes: readonly Node[]): readonly Node[] => {
+  const lookup = nodeIndex(nodes)
+  const bounds = new Map<string, Bounds>()
+  for (const node of nodes) {
+    if (node.kind === 'group') continue
+    let parent = node.parentId
+    while (parent !== null) {
+      const ancestor = lookup.get(parent)
+      if (!ancestor) break
+      if (ancestor.kind === 'group') {
+        const previous = bounds.get(parent)
+        bounds.set(parent, previous ? boundsOf([previous, node])! : node)
+      }
+      parent = ancestor.parentId
+    }
+  }
+  return nodes.map((node) => {
+    const next = bounds.get(node.id)
+    if (
+      !next ||
+      (node.x === next.x &&
+        node.y === next.y &&
+        node.width === next.width &&
+        node.height === next.height)
+    )
+      return node
+    return { ...node, x: next.x, y: next.y, width: next.width, height: next.height }
   })
+}
 export const changeNodes = (m: Model, nodes: readonly Node[]): Model =>
   markChanged(m, replaceNodes(m.document, groupBounds(nodes)))
 export const mutableSelection = (m: Model): readonly Node[] => {

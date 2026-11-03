@@ -1,3 +1,4 @@
+import { registerImages } from './image-assets'
 import { Data, Effect, Queue, Stream } from 'effect'
 import { Command, Mount } from 'foldkit'
 import { Editor } from '../../dist/editor.js'
@@ -45,6 +46,7 @@ const mount = (element: Element, queue: Queue.Enqueue<CanvasMessage>) => {
           resource.destroy()
         }),
     )
+    yield* Effect.tryPromise({ try: () => registerImages(instance.editor), catch: canvasError })
     host = instance
     yield* Effect.acquireRelease(
       Effect.sync(() => new CanvasInput(element, emit)),

@@ -45,6 +45,17 @@ export const NodeSchema = Schema.Struct({
   blur: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1000 })),
   shadowX: coordinate,
   shadowY: coordinate,
+  image: Schema.NullOr(Schema.Literal('tweet-challenge')).pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(null)),
+  ),
+  imageCrop: Schema.NullOr(
+    Schema.Struct({
+      x: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+      y: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+      width: Schema.Finite.check(Schema.isBetween({ minimum: 0.000001, maximum: 1 })),
+      height: Schema.Finite.check(Schema.isBetween({ minimum: 0.000001, maximum: 1 })),
+    }),
+  ).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
   text: Schema.String.check(Schema.isMaxLength(10_000)),
   fontSize: Schema.Finite.check(Schema.isBetween({ minimum: 1, maximum: 512 })),
   fontFamily: Schema.Literals(['Arial', 'Georgia', 'Courier New']),
@@ -72,7 +83,7 @@ export type Camera = typeof CameraSchema.Type
 export const PageSchema = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
-  nodes: Schema.Array(NodeSchema).check(Schema.isMaxLength(200_000)),
+  nodes: Schema.Array(NodeSchema).check(Schema.isMaxLength(400_000)),
 })
 export type Page = typeof PageSchema.Type
 export const DesignDocumentSchema = Schema.Struct({
@@ -103,6 +114,8 @@ export const makeNode = (id: string, kind: Kind, patch: Partial<Node> = {}): Nod
   blur: 16,
   shadowX: 0,
   shadowY: 8,
+  image: null,
+  imageCrop: null,
   text: 'Your words here',
   fontSize: 32,
   fontFamily: 'Arial',
@@ -128,6 +141,24 @@ export const replaceNodes = (doc: DesignDocument, nodes: readonly Node[]): Desig
   ...doc,
   pages: doc.pages.map((p) => (p.id === doc.activePageId ? { ...p, nodes } : p)),
 })
+
+const imageIssue = (n: Node): string | null => {
+  if (
+    n.image &&
+    (n.kind !== 'rect' ||
+      n.strokeWidth > 0 ||
+      n.shadow !== '#00000000' ||
+      n.innerShadow !== '#00000000')
+  )
+    return 'Image layers require a rectangle without strokes or shadows.'
+  if (
+    n.imageCrop &&
+    (n.imageCrop.x + n.imageCrop.width > 1.0000001 ||
+      n.imageCrop.y + n.imageCrop.height > 1.0000001)
+  )
+    return 'Image crops must stay within their source.'
+  return null
+}
 
 /** Structural checks supplement the schema before an imported file can replace a document. */
 export const documentIssue = (doc: DesignDocument): string | null => {
@@ -158,6 +189,8 @@ export const documentIssue = (doc: DesignDocument): string | null => {
           n.blendMode !== 'normal')
       )
         return 'Filters on whole groups are not supported yet. Apply them to individual layers.'
+      const imageProblem = imageIssue(n)
+      if (imageProblem !== null) return imageProblem
       const path = new Set([n.id])
       let parent = n.parentId
       while (parent !== null) {

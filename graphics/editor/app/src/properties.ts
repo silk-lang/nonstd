@@ -85,6 +85,7 @@ const patchSelected = (m: Model, field: string, properties: Partial<Node>): Mode
     m,
     nodes.map((n) => {
       if (!selected.has(n.id)) return n
+      if (n.image && ['strokeWidth', 'shadow', 'innerShadow'].includes(field)) return n
       if ((n.kind === 'ellipse' || n.kind === 'text') && ['strokeWidth', 'shadow'].includes(field))
         return n
       if (

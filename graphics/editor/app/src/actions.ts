@@ -1,3 +1,4 @@
+import { addChallengePage } from './challenge-page'
 import { addEffectsPage } from './effects-page'
 import { nodeIndex } from './hierarchy'
 import { addSelectionPage } from './selection-page'
@@ -17,6 +18,7 @@ import {
 import { align } from './properties'
 
 const handlers: Readonly<Record<string, (m: Model) => Model>> = {
+  'challenge-page': addChallengePage,
   'selection-page': addSelectionPage,
   'effects-page': addEffectsPage,
   undo: (m) => {

@@ -64,10 +64,10 @@ export const inspector = (m: Model, h: H): Html => {
         geometrySection(m, n, h),
         typographySection(m, n, h),
         appearanceSection(m, n, h),
-        strokeSection(m, n, h),
+        ...(n.image ? [] : [strokeSection(m, n, h)]),
         effectsSection(m, n, h),
-        shadowSection(m, n, h),
-        innerShadowSection(m, n, h),
+        ...(n.image ? [] : [shadowSection(m, n, h)]),
+        ...(n.image ? [] : [innerShadowSection(m, n, h)]),
         arrangeSection(h),
         exportSection(h),
       ]

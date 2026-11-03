@@ -93,6 +93,27 @@ measurements do not establish performance for thousands of filtered layers. GPU 
 cover blur, clipped backdrop blur, inner shadows, color filters, blend modes, undo, and resource
 reuse. The shared renderer fixture compares GPU output against the CPU reference in two formats.
 
+## 100k image and text cards
+
+Choose **Commands → Add 100k image + text cards**. The page places the supplied tweet
+above 100,000 editable groups, each containing one image rectangle and one text layer.
+There are 100,000 distinct source-pixel crop windows into that screenshot, plus 196 word
+pairs in Arial, Georgia and Courier New (588 shared text styles). Including the caption,
+the document has 300,004 layers and 200,004 drawable elements. Existing pages and edits
+are preserved; invoking the command again selects its existing page.
+
+This workload deliberately reuses one source image and repeated word pairs. It does not
+represent 100,000 unrelated photographs or unique text strings. Image crops share one GPU
+upload; text shares rasters by content, font and color. Zoom still adjusts text resolution.
+Overview camera changes retain GPU buffers, while close views cull offscreen elements.
+Overlapping translucent elements preserve painter order. Group bounds accumulate through
+ancestors in one pass, so a small edit avoids scanning the document for every group.
+
+The [production measurements](benchmarks/image-text.json) cover overview and 400% close-up
+zoom/pan, including returning to the overview after larger text rasters have been allocated.
+[Reproduction and limitations](benchmarks/image-text.md) explain the input sequence.
+Initial rasterization and cache transitions can still produce isolated slow frames.
+
 ## Current boundaries
 
 This remains a demo application, with deliberate scope: single-line text in Arial, Georgia, and Courier New; rectangular frames without clipping; no rotation, paths, image import, rich text, auto layout, components, collaboration, or cloud sync. Ellipse/text stroke and shadow controls are omitted because the current renderer does not support them. Whole-group filters are not supported; apply effects to individual layers. Filter textures are viewport sized, so blur can clip at viewport edges when its source extends beyond them. Backdrop blur currently processes the full viewport. Group opacity multiplies each descendant's opacity, rather than compositing the group into an offscreen surface. Undo retains up to 50 document snapshots for the current session. Concurrent editing of the same document in multiple tabs is not coordinated.
