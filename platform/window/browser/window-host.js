@@ -87,6 +87,7 @@ export class WindowHost {
     this.started = false;
     this.focused = 0;
     this.waiter = null;
+    this.woken = false;
     /** Called whenever an event is queued; a page without JSPI polls from here. */
     this.onWake = undefined;
     this.imports = Object.fromEntries(IMPORTS.map(name => [name, (...args) => this[name](...args)]));
@@ -139,6 +140,21 @@ export class WindowHost {
     this.onWake?.();
   }
 
+  /**
+   * Ends a wait in `nextEvent` (it returns with nothing), for code with its own events such as a
+   * web view. A wake while nothing waits makes the next `nextEvent` return at once.
+   */
+  wake() {
+    if (this.waiter) {
+      const finish = this.waiter;
+      this.waiter = null;
+      finish();
+    } else {
+      this.woken = true;
+    }
+    this.onWake?.();
+  }
+
   pushText(kind, window, text) {
     const record = event(kind, window);
     record.texts = [text];
@@ -164,6 +180,10 @@ export class WindowHost {
   }
 
   waitEvent(timeout, ptr) {
+    if (this.woken) {
+      this.woken = false;
+      return this.pop(ptr);
+    }
     if (this.queue.length || timeout === 0) return this.pop(ptr);
     return new Promise(resolve => {
       let timer;

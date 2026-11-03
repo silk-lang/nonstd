@@ -8,6 +8,10 @@
 // dialog processes and the next frame time.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <unistd.h>
+#include <sys/eventfd.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +20,9 @@
 
 static int backend = SILK_BACKEND_NONE;
 static uint32_t appearanceValue;
+// silk_window_wake: the flag says a wake is pending, the eventfd ends a poll that waits.
+static atomic_bool woken;
+static int wakeFd = -1;
 
 // Builds without the Wayland headers define SILK_WINDOW_NO_WAYLAND and get X11 only.
 #ifdef SILK_WINDOW_NO_WAYLAND
@@ -53,7 +60,27 @@ int32_t silk_window_start(void) {
         return 3;
     }
     appearanceValue = detect_appearance();
+    wakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     return 0;
+}
+
+void silk_window_wake(void) {
+    if (atomic_exchange(&woken, true)) return;
+    if (wakeFd >= 0) {
+        uint64_t one = 1;
+        ssize_t written = write(wakeFd, &one, sizeof one);
+        (void)written;
+    }
+}
+
+static bool take_wake(void) {
+    if (!atomic_exchange(&woken, false)) return false;
+    if (wakeFd >= 0) {
+        uint64_t count;
+        ssize_t got = read(wakeFd, &count, sizeof count);
+        (void)got;
+    }
+    return true;
 }
 
 uint32_t silk_window_backend(void) { return (uint32_t)backend; }
@@ -83,6 +110,7 @@ uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
         double now = silk_now();
         double nextFrame = DISPATCH(frames)(now);
         if (silk_queue_pop(event)) return 1;
+        if (take_wake()) return 0;
         now = silk_now();
         if (now >= deadline) return 0;
         double wake = deadline < nextFrame ? deadline : nextFrame;
@@ -92,11 +120,14 @@ uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
             milliseconds = wait <= 0 ? 0 : (int)ceil(wait);
         }
         if (!DISPATCH(prepare_wait)()) continue;
-        struct pollfd fds[17];
+        struct pollfd fds[18];
         fds[0].fd = DISPATCH(fd)();
         fds[0].events = POLLIN;
         fds[0].revents = 0;
-        int count = 1 + silk_dialog_fds(fds + 1, 16);
+        fds[1].fd = wakeFd;
+        fds[1].events = POLLIN;
+        fds[1].revents = 0;
+        int count = 2 + silk_dialog_fds(fds + 2, 16);
         int ready = poll(fds, (nfds_t)count, milliseconds);
         if (ready < 0 && errno != EINTR) {
             DISPATCH(cancel_wait)();

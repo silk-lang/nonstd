@@ -98,6 +98,8 @@ static void *mainFiber;
 static void *pumpFiber;
 static bool onPump;
 static double deadline;
+// silk_window_wake, from any thread: the flag, and a posted message that ends the wait.
+static volatile LONG woken;
 
 // Frame pacing.
 static HANDLE vblankEvent;
@@ -248,7 +250,7 @@ static void check_vblank(void) {
 static void yield_if_ready(void) {
     if (!fiberMode || !onPump) return;
     deliver_frames(false);
-    if (!silk_queue_empty() || silk_now() >= deadline) {
+    if (!silk_queue_empty() || woken || silk_now() >= deadline) {
         onPump = false;
         SwitchToFiber(mainFiber);
         onPump = true;
@@ -285,7 +287,7 @@ static void CALLBACK pump_fiber(void *unused) {
     (void)unused;
     for (;;) {
         onPump = true;
-        while (silk_queue_empty() && silk_now() < deadline) pump_once(wait_millis());
+        while (silk_queue_empty() && !woken && silk_now() < deadline) pump_once(wait_millis());
         onPump = false;
         SwitchToFiber(mainFiber);
     }
@@ -340,18 +342,28 @@ uint32_t silk_window_backend(void) { return started ? SILK_BACKEND_WIN32 : SILK_
 
 uint32_t silk_window_appearance(void) { return appearanceValue; }
 
+void silk_window_wake(void) {
+    if (InterlockedExchange(&woken, 1)) return;
+    if (helper) PostMessageW(helper, WM_NULL, 0, 0);
+}
+
+static bool take_wake(void) { return InterlockedExchange(&woken, 0) != 0; }
+
 uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
     if (!started) return 0;
     deadline = timeout < 0 ? INFINITY : silk_now() + timeout;
     for (;;) {
         if (silk_queue_pop(event)) return 1;
+        if (take_wake()) return 0;
         if (fiberMode) {
             SwitchToFiber(pumpFiber);
             if (silk_queue_pop(event)) return 1;
+            if (take_wake()) return 0;
             if (silk_now() >= deadline) return 0;
         } else {
             pump_once(0);
             if (silk_queue_pop(event)) return 1;
+            if (take_wake()) return 0;
             if (silk_now() >= deadline) return 0;
             pump_once(wait_millis());
         }
