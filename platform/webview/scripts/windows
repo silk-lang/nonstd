@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Build the WebView2 bridge, then build or run the native smoke test on Windows.
+
+  scripts/windows native                  build .cache/platform-webview/windows/silkwebview.lib
+  scripts/windows smoke [--build-only] [--release]
+
+scripts/prepare-windows runs `native` and names the result, with the import libraries it needs,
+as the override of platform/webview's `win32-webview` archive, so plain `silk build` links it.
+The bridge loads WebView2Loader.dll (from the pinned WebView2 SDK, copied next to the library) at
+run time, so a program that opens web views ships it beside its executable; `smoke` does that.
+
+Run from an x64 Visual Studio developer shell with the Windows SDK (the same setup as
+platform/window), and with the Edge WebView2 Runtime installed (part of Windows 11).
+"""
+import argparse
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+
+PACKAGE = Path(__file__).resolve().parent.parent
+REPO = PACKAGE.parent.parent
+sys.path.insert(0, str(REPO / "gpu/webgpu/scripts"))
+from _build import command_path, executable  # noqa: E402
+
+NATIVE = PACKAGE / "native"
+OUT = REPO / ".cache/platform-webview/windows"
+# Silk links without the C runtime defaults, so the bridge uses the DLL runtime (ucrt and
+# vcruntime, staged beside the library), which initializes itself.
+FLAGS = ["--target=x86_64-pc-windows-msvc", "-fms-runtime-lib=dll", "-std=c11", "-O2",
+         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+         "-Wno-missing-field-initializers", "-D_CRT_SECURE_NO_WARNINGS"]
+
+
+def sdk():
+    """The pinned WebView2 SDK's root."""
+    output = subprocess.check_output([sys.executable, str(REPO / "scripts/install-webview2")], text=True)
+    return Path(output.strip())
+
+
+def event_token_include():
+    """-I for a stand-in EventToken.h when the Windows SDK's winrt headers are not on INCLUDE
+    (WebView2.h includes it for one struct)."""
+    for directory in os.environ.get("INCLUDE", "").split(os.pathsep):
+        if directory and (Path(directory) / "EventToken.h").is_file():
+            return []
+    stub = OUT / "include"
+    stub.mkdir(parents=True, exist_ok=True)
+    (stub / "EventToken.h").write_text(
+        "#pragma once\ntypedef struct EventRegistrationToken { __int64 value; } EventRegistrationToken;\n",
+        encoding="utf-8")
+    return ["-I", str(stub)]
+
+
+def native():
+    if os.name != "nt":
+        raise SystemExit("The WebView2 bridge builds only on Windows.")
+    clang = Path(os.environ.get("SILK_CLANG") or command_path("install-llvm"))
+    root = sdk()
+    OUT.mkdir(parents=True, exist_ok=True)
+    obj = OUT / "bridge.obj"
+    subprocess.run([str(clang), *FLAGS, "-I", str(root / "build/native/include"), *event_token_include(),
+                    "-c", str(NATIVE / "windows/bridge.c"), "-o", str(obj)], check=True)
+    library = OUT / "silkwebview.lib"
+    if library.exists():
+        library.unlink()
+    lib = clang.parent / executable("llvm-lib")
+    if lib.exists():
+        subprocess.run([str(lib), f"/out:{library}", str(obj)], check=True)
+    else:
+        subprocess.run([str(clang.parent / executable("llvm-ar")), "rcs", str(library), str(obj)], check=True)
+    shutil.copy2(root / "build/native/x64/WebView2Loader.dll", OUT / "WebView2Loader.dll")
+    return library
+
+
+def smoke(build_only, release):
+    # Builds both bridges and names them to Silk as their packages' archive overrides.
+    subprocess.run([sys.executable, str(REPO / "scripts/prepare-windows")], check=True)
+    built_executable = runpy.run_path(str(REPO / "platform/window/scripts/windows"))["built_executable"]
+    compiler_bin = command_path("install-silk")
+    clang = os.environ.get("SILK_CLANG") or str(command_path("install-llvm"))
+    tests = PACKAGE / "tests/native"
+    command = [str(compiler_bin / executable("silkc")), "build", "--manifest-path",
+               str(tests / "silk.toml"), "--stdlib", str(compiler_bin.parent / "lib/silk/stdlib"),
+               "--clang", clang]
+    if release:
+        command.append("--release")
+    env = dict(os.environ, SILK_CLANG=clang)
+    output = subprocess.run(command, cwd=tests, env=env, capture_output=True, text=True)
+    sys.stdout.write(output.stdout)
+    sys.stderr.write(output.stderr)
+    if output.returncode != 0:
+        return output.returncode
+    program = built_executable(output.stdout + output.stderr, tests)
+    shutil.copy2(OUT / "WebView2Loader.dll", program.parent / "WebView2Loader.dll")
+    if build_only:
+        print(program)
+        return 0
+    return subprocess.run([str(program)], env=env, timeout=300).returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("target", choices=["native", "smoke"])
+    parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--release", action="store_true")
+    args = parser.parse_args()
+    if args.target == "native":
+        print(native())
+        return 0
+    return smoke(args.build_only, args.release)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

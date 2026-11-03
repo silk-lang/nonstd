@@ -1,12 +1,13 @@
-// The C ABI between platform/webview's Silk code (src/macos.silk) and the WKWebView backend
-// (bridge.m). Every function must be called on the main thread, after platform-window's
-// MacPlatform has started. Strings are UTF-8 with a length and no terminator. Nothing here calls
-// back into Silk: events queue here, and each one wakes platform-window's nextEvent.
+// The C ABI between platform/webview's Silk code (src/bridge.silk) and the native web view
+// backends: WKWebView on macOS (macos/bridge.m) and WebView2 on Windows (windows/bridge.c).
+// Every function must be called on the thread platform-window runs on (the main thread), after
+// its platform has started. Strings are UTF-8 with a length and no terminator. Nothing here
+// calls back into Silk: events queue here, and each one wakes platform-window's nextEvent.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 
-// Event kinds; src/macos.silk decodes the same numbers into webview.EventKind.
+// Event kinds; src/bridge.silk decodes the same numbers into webview.EventKind.
 enum {
     SILK_WEBVIEW_CREATED = 1,
     SILK_WEBVIEW_CLOSED = 2,
@@ -77,7 +78,9 @@ typedef struct SilkWebViewEvent {
 } SilkWebViewEvent;
 
 // Makes view `view` in platform-window's window `window`, hidden until placed, and queues
-// Created. `agentScript` is injected into every page at document start, in its own content world.
+// Created once the engine is ready (at once on macOS; WebView2 starts asynchronously, and
+// commands sent before then run after it, in order). `agentScript` is injected into every page
+// at document start, in a script world of its own.
 uint32_t silk_webview_open(uint32_t view, uint32_t window, const uint8_t *url, size_t urlLength,
                            const uint8_t *profile, size_t profileLength, uint32_t flags,
                            const uint8_t *agentScript, size_t agentScriptLength);
@@ -119,6 +122,8 @@ void silk_webview_type_text(uint32_t view, const uint8_t *text, size_t length);
 uint8_t silk_webview_press_key(uint32_t view, const uint8_t *key, size_t length,
                                uint32_t modifiers);
 void silk_webview_answer_navigation(uint32_t view, uint32_t request, uint8_t allow);
+// Opens the engine's developer tools; 0 when this backend cannot (WebKit, or not inspectable).
+uint8_t silk_webview_open_devtools(uint32_t view);
 
 // Test hooks: where the web view is, in points of the window's content area, and whether it shows.
 void silk_webview_test_frame(uint32_t view, double *x, double *y, double *width, double *height,

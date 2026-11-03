@@ -1,16 +1,15 @@
-//! Drives the WebKit backend in a real window: a data: page loads and reports its title, the
-//! view sits where `place` puts it and follows a resize, the agent snapshot has refs, and
-//! ClickElement and FillElement change the page through synthesized input. Needs a logged-in
-//! macOS session. Exit code 0 when every check passed.
+//! Drives the native web view backend in a real window: WebKit on macOS, WebView2 on Windows. A
+//! data: page loads and reports its title, the view sits where `place` puts it and follows a
+//! resize, the agent snapshot has refs, and ClickElement and FillElement change the page through
+//! real input. Needs a logged-in desktop session. Exit code 0 when every check passed.
 import webview.command { Command }
 import webview.event { WebViewEvent, EventKind }
+import webview.bridge { BridgeWebViews, ViewFrame }
 import webview.host { WebViewHost }
-import webview.macos { MacWebViews, ViewFrame }
-import webview.types { WebViewOptions, WebViewError, Placement }
+import webview.types { WebViewOptions, WebViewError, Placement, Backend }
 import window.event { Event }
-import window.macos { MacPlatform }
 import window.platform { Platform }
-import window.types { WindowOptions, WindowError, Wait }
+import window.types { WindowOptions, WindowError, Wait, WindowId }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -21,6 +20,14 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.f64
 import silk.text.string { String }
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  import window.macos { MacPlatform }
+  type TestPlatform = MacPlatform
+} else {
+  import window.bridge { BridgePlatform }
+  type TestPlatform = BridgePlatform
+}
 
 const VIEW: u32 = 1
 
@@ -142,8 +149,8 @@ effect fn refOn(outline: string, needle: string) -> String
 
 /// Pumps the window and the web view for up to `seconds`, or until `done` says the wait is over.
 effect fn pump(
-  platform: &mut MacPlatform,
-  views: &mut MacWebViews,
+  platform: &mut TestPlatform,
+  views: &mut BridgeWebViews,
   seen: &mut Seen,
   seconds: f64,
   until: fn(&Seen) -> bool,
@@ -274,8 +281,8 @@ fn never(seen: &Seen) -> bool {
 /// Evaluates `script` until its JSON value is `expected` or about `seconds` pass: input reaches
 /// the page asynchronously.
 effect fn waitForValue(
-  platform: &mut MacPlatform,
-  views: &mut MacWebViews,
+  platform: &mut TestPlatform,
+  views: &mut BridgeWebViews,
   seen: &mut Seen,
   script: string,
   expected: string,
@@ -299,20 +306,37 @@ effect fn waitForValue(
   return false
 }
 
+/// Says where the platform runs its event loop (CI checks both ways on macOS).
+fn describeLoop(platform: &TestPlatform) -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if platform.usesFiber() {
+      StderrWriter.print("info  AppKit runs on its own stack\n", &())
+    } else {
+      StderrWriter.print("info  AppKit runs on the caller's stack\n", &())
+    }
+  }
+}
+
+fn simulateResize(platform: &mut TestPlatform, window: WindowId, size: Size2<f64>) -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    platform.simulateResize(window, size)
+  } else {
+    if !platform.simulateResize(window, size) {
+      StderrWriter.print("info  the platform cannot simulate a resize\n", &())
+    }
+  }
+}
+
 effect fn smoke(checks: &mut Checks) -> ()
   ! WindowError | WebViewError | OutOfMemoryError
   ? &mut Allocator {
-  let mut platform = run MacPlatform.start()
-  if platform.usesFiber() {
-    StderrWriter.print("info  AppKit runs on its own stack\n", &())
-  } else {
-    StderrWriter.print("info  AppKit runs on the caller's stack\n", &())
-  }
+  let mut platform = run TestPlatform.start()
+  describeLoop(&platform)
   let options = WindowOptions.make("platform-webview smoke test", 640.0, 480.0)
   let window = run platform.openWindow(&options)
   platform.focus(window)
 
-  let mut views = MacWebViews.make()
+  let mut views = BridgeWebViews.make()
   let mut seen = Seen.make()
   let viewOptions = run WebViewOptions.make(window.value, PAGE)
   run views.open(VIEW, &viewOptions)
@@ -320,7 +344,8 @@ effect fn smoke(checks: &mut Checks) -> ()
   let first = placementFor(size.width, size.height)
   views.place(VIEW, first)
 
-  run pump(&mut platform, &mut views, &mut seen, 10.0, titled)
+  // WebView2 starts its browser processes on the first view, which can take a while on CI.
+  run pump(&mut platform, &mut views, &mut seen, 60.0, titled)
   checks.check(seen.created, "Created")
   checks.check(seen.loaded, "the data: page loads")
   checks.check(seen.title.view() == "Silk smoke", "TitleChanged has the page title")
@@ -392,12 +417,22 @@ effect fn smoke(checks: &mut Checks) -> ()
     "Screenshot has the view's device pixels",
   )
 
-  run views.send(VIEW, Command.OpenDevTools)
-  run pump(&mut platform, &mut views, &mut seen, 1.0, never)
-  checks.check(seen.unsupported.view() == "OpenDevTools", "OpenDevTools is Unsupported")
+  match views.backend() {
+    Backend.WebKit => {
+      run views.send(VIEW, Command.OpenDevTools)
+      run pump(&mut platform, &mut views, &mut seen, 1.0, never)
+      checks.check(seen.unsupported.view() == "OpenDevTools", "OpenDevTools is Unsupported")
+    }
+    _ => {
+      // WebView2 opens its DevTools window, which closes with the view.
+      run views.send(VIEW, Command.OpenDevTools)
+      run pump(&mut platform, &mut views, &mut seen, 1.0, never)
+      checks.check(String.byteLength(seen.unsupported.view()) == 0, "OpenDevTools opens DevTools")
+    }
+  }
 
   seen.resizes = 0
-  platform.simulateResize(window, Size2<f64>.new(800.0, 600.0))
+  simulateResize(&mut platform, window, Size2<f64>.new(800.0, 600.0))
   run pump(&mut platform, &mut views, &mut seen, 2.0, resized)
   run pump(&mut platform, &mut views, &mut seen, 0.2, never)
   checks.check(seen.resizedWidth == 800.0, "the window resized")

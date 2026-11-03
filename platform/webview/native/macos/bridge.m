@@ -1,4 +1,4 @@
-// The WKWebView backend of platform/webview (C ABI in bridge.h).
+// The WKWebView backend of platform/webview (C ABI in ../bridge.h).
 //
 // Each view is a WKWebView inside a clip view, both children of platform-window's content view
 // (a flipped SilkView whose layer is the window's CAMetalLayer), so the page draws over the Silk
@@ -18,7 +18,7 @@
 #import <WebKit/WebKit.h>
 #include <pthread.h>
 #include <string.h>
-#include "bridge.h"
+#include "../bridge.h"
 
 // platform-window's AppKit bridge (platform/window/native/macos/bridge.h).
 void silk_macos_wake(void);
@@ -547,6 +547,9 @@ void silk_webview_answer_navigation(uint32_t view, uint32_t request, uint8_t all
     [record.decisions removeObjectForKey:@(request)];
     decision(allow ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
 }
+
+// WebKit has no API to open Web Inspector; Safari's Develop menu attaches to inspectable views.
+uint8_t silk_webview_open_devtools(uint32_t view) { return 0; }
 
 // ---------------------------------------------------------------------------------------
 // Scripts.
