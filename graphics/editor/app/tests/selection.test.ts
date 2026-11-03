@@ -18,7 +18,7 @@ test('the 100k-pixel mosaic plus its caption can be saved and imported as a docu
   const m = addSelectionPage(initialModel(emptyDocument('mosaic')))
   const nodes = currentPage(m.document).nodes
   expect(nodes.filter((n) => n.kind === 'rect')).toHaveLength(100_000)
-  expect(nodes.filter((n) => n.kind === 'text').map((n) => n.text)).toEqual([selectionTitle])
+  expect(nodes.filter((n) => n.kind === 'text').map((n) => n.text)).toEqual([...selectionTitle])
   expect(Schema.is(DesignDocumentSchema)(m.document)).toBe(true)
 })
 

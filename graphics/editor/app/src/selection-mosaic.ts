@@ -1,7 +1,7 @@
 import pixels from './assets/selection-pixels.json' with { type: 'json' }
 import { makeNode, type Node } from './document'
 
-export const selectionTitle = 'SILK + EFFECT + FOLDKIT / 100K elements'
+export const selectionTitle = ['SILK + EFFECT + FOLDKIT', '100K elements'] as const
 export const selectionMosaicBounds = {
   x: 0,
   y: 0,
@@ -10,8 +10,8 @@ export const selectionMosaicBounds = {
 } as const
 export const selectionPageBounds = {
   ...selectionMosaicBounds,
-  y: -1400,
-  height: selectionMosaicBounds.height + 1400,
+  y: -4800,
+  height: selectionMosaicBounds.height + 4800,
 } as const
 const shades = Array.from(
   { length: 256 },
@@ -32,16 +32,18 @@ export const mosaicPixel = (id: string, index: number): Node => {
     fill: shades[samples.codePointAt(index) ?? 255] ?? '#ffffff',
   })
 }
-export const mosaicTitle = (id: string): Node => {
+export const mosaicTitle = (id: string, line: number): Node => {
   // Courier New is monospaced; match the renderer's font-size and padding metrics.
-  const width = Math.ceil(selectionTitle.length * 512 * 0.6 + 4)
+  const text = selectionTitle[line] ?? ''
+  const scale = 2.5
+  const width = Math.ceil(text.length * 512 * 0.6 + 4) * scale
   return makeNode(id, 'text', {
-    name: selectionTitle,
-    text: selectionTitle,
+    name: text,
+    text,
     x: (selectionMosaicBounds.width - width) / 2,
-    y: selectionPageBounds.y,
+    y: selectionPageBounds.y + line * 2000,
     width,
-    height: 772,
+    height: 772 * scale,
     fontSize: 512,
     fontFamily: 'Courier New',
     fontWeight: 700,

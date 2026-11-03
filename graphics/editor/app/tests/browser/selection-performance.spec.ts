@@ -86,7 +86,7 @@ const openSelectionPage = async (page: Page): Promise<void> => {
     .getByRole('dialog')
     .getByRole('button', { name: 'Add 100k rectangles', exact: true })
     .click()
-  await expect(page.locator('.count-badge')).toHaveText('100001')
+  await expect(page.locator('.count-badge')).toHaveText('100002')
   await expect(page.getByText('Saved on this device', { exact: true })).toBeVisible()
 }
 

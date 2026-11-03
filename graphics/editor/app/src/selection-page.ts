@@ -2,7 +2,7 @@ import { currentPage } from './document'
 import { boundsOf, fit } from './geometry'
 import type { Model } from './model'
 import { markChanged } from './state'
-import { mosaicPixel, mosaicTitle } from './selection-mosaic'
+import { mosaicPixel, mosaicTitle, selectionTitle } from './selection-mosaic'
 
 export const addSelectionPage = (m: Model): Model => {
   const existing = m.document.pages.find((page) =>
@@ -23,7 +23,7 @@ export const addSelectionPage = (m: Model): Model => {
   const id = existing?.id ?? allocate()
   const nodes = [
     ...Array.from({ length: 100_000 }, (_, index) => mosaicPixel(allocate(), index)),
-    mosaicTitle(allocate()),
+    ...selectionTitle.map((_, line) => mosaicTitle(allocate(), line)),
   ]
   const document = {
     ...m.document,
