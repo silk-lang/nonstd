@@ -18,16 +18,17 @@ const shades = Array.from(
   (_, value) => `#${value.toString(16).padStart(2, '0').repeat(3)}`,
 )
 const samples = atob(pixels.grayscale)
+const pixelGap = 2
 
 export const mosaicPixel = (id: string, index: number): Node => {
   const width = selectionMosaicBounds.width / pixels.columns
   const height = selectionMosaicBounds.height / pixels.rows
   return makeNode(id, 'rect', {
     name: `Pixel ${String(index + 1).padStart(6, '0')}`,
-    x: (index % pixels.columns) * width,
-    y: Math.floor(index / pixels.columns) * height,
-    width,
-    height,
+    x: (index % pixels.columns) * width + pixelGap / 2,
+    y: Math.floor(index / pixels.columns) * height + pixelGap / 2,
+    width: width - pixelGap,
+    height: height - pixelGap,
     fill: shades[samples.codePointAt(index) ?? 255] ?? '#ffffff',
   })
 }
