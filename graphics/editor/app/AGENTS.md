@@ -2,14 +2,4 @@
 
 Use `bun`. `bun run check` (format, lint, typecheck) must pass before any commit; `bun run check:write` auto-fixes. Oxlint enables type-aware checking and treats correctness, suspicious, pedantic, and performance rules as errors. Lint warnings and nested ternaries are errors.
 
-## Vendored Repositories
-
-This project vendors external repositories under @repos/
-
-- Use vendored repositories as read-only reference material when working with related libraries
-- Prefer examples and patterns from the vendored source code over generated guesses or web search results
-- Do not edit files under @repos/ unless explicitly asked
-- Do not import from @repos/ - application code should continue importing from normal package dependencies
-
-When writing Effect code, inspect @repos/effect/ for examples of idiomatic usage, tests, module structure, and API design.
-Update the vendored copy with `git -C ../../.. subtree pull --prefix=graphics/editor/app/repos/effect https://github.com/Effect-TS/effect.git main --squash` from this app directory
+Use Effect from the installed package dependency. Consult its installed source/types or official documentation when needed; do not vendor the Effect repository into this project.
