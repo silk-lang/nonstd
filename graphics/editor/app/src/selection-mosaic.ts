@@ -24,7 +24,7 @@ export const mosaicPixel = (id: string, index: number): Node => {
   const width = selectionMosaicBounds.width / pixels.columns
   const height = selectionMosaicBounds.height / pixels.rows
   return makeNode(id, 'rect', {
-    name: `Pixel ${String(index + 1).padStart(6, '0')}`,
+    name: `Rectangle ${String(index + 1).padStart(6, '0')}`,
     x: (index % pixels.columns) * width + pixelGap / 2,
     y: Math.floor(index / pixels.columns) * height + pixelGap / 2,
     width: width - pixelGap,
