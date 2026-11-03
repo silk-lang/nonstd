@@ -24,8 +24,9 @@ run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 2.0, time: 0.0 }
 
 - **Mutations** (`mutation.silk`): `Create`, `InsertBefore`, `Remove`, `Destroy`, `SetStyle`
   (per `StyleState`: base, hover, active, focus, focus-visible), `ClearStyle`, `SetText`,
-  `SetAttribute` (role, label, test id, tab index, cursor, disabled, focus trap, and for
-  inputs multiline, read-only and placeholder), `SetSelection`,
+  `SetAttribute` (role, label, test id, tab index, cursor, disabled, focus trap, the states
+  checked, selected and expanded, and for inputs multiline, read-only and placeholder),
+  `SetSelection`,
   `SetListeners` (a `LISTEN_*` bit set), `SetRoot`, `Focus`, `Blur`, `ScrollTo`,
   `ScrollIntoView`, `SetSource`, `SetCanvas`, and the resource definitions `DefineFontFamily`,
   `DefineImage` (PNG or JPEG bytes) and `DefineIcon` (SVG bytes). `apply` stops at the first
@@ -71,8 +72,8 @@ input against the last frame's layout, and the changes show at the next frame
   with the `FocusTrap` attribute they cycle within it. Focus that came from the keyboard shows
   the `FocusVisible` look (inputs always do), and Tab scrolls the new focus into view.
 - **Keys** go to the focused node, or the root, with the key, code, modifiers and repeat.
-  Enter on a focused button, link, menu item or tab and Space (on key up) on a button,
-  checkbox, radio, menu item or tab queue a click with click count 0.
+  Enter on a focused button, link, menu item, tab or option and Space (on key up) on a button,
+  checkbox, radio, switch, menu item, tab or option queue a click with click count 0.
 - **Scrolling.** Boxes with `overflow: auto` or `scroll` on an axis scroll with the wheel. Each
   axis of a wheel delta goes to the nearest container that can still move that way, and the
   rest goes outwards, so nested scroll boxes work. `hidden` scrolls only by mutation:
@@ -153,7 +154,8 @@ For people and agents looking at a running UI (`inspect.silk`):
   `fragmentsOf` its layout fragments with border, padding and content rects; `childrenOf`, and
   `findAll(tree, value)` finds nodes by test id, label or text.
 - `describe(tree, options, &mut out)` writes a deterministic text snapshot, one line per node
-  with role, label, test id, text, focus, disabled, rects and scroll offsets, and with `DescribeOptions.withStyles()` the styles
+  with role, label, test id, text, focus, disabled, checked, selected, expanded, rects and
+  scroll offsets, and with `DescribeOptions.withStyles()` the styles
   that differ from the defaults or the parent. `describeNodeById` does one subtree.
 - `CpuSnapshot` renders the whole frame, or one node's subtree cropped to its box
   (`renderNode`), with the CPU reference; `encodePng` turns either into PNG bytes.

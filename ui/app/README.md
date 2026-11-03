@@ -6,6 +6,9 @@ runtime calls again; it diffs the new description against the last one and sends
 tree the fewest `Mutation`s it can. It uses only the tree's public `Mutation` and `Event` API, so
 anything this package does, another client of the tree can do too.
 
+Components (buttons, fields, lists, tabs, menus, dialogs and more) are in
+[ui-components](../components), built on this package.
+
 Packages:
 
 - `ui/app` (`ui-app`): the builder (`ui.silk`), the diff (`diff.silk`), the app contract
@@ -69,10 +72,32 @@ for the state variants), shorthands such as `padding`, `gap`, `background`, `col
 **Handlers are never stored.** `onClick(|| Message.Increment)` records only that the node
 listens for clicks. When the tree reports an event, the runtime runs `view` again in dispatch
 mode: it enters only the nodes on the event's path and calls the handlers there, in bubbling
-order from the target up. `on(kind, handler)` takes a `fn(&Event) -> Reply<M>`, where `Reply`
+order from the target up. `onInput(|text| ...)` hands the handler the input's new value as an owned `String`, and
+`onEnter(handler)` sends a message for Enter (an input's submit). `on(kind, handler)` takes a
+`fn(&Event) -> Reply<M>`, where `Reply`
 is `Emit`, `EmitAndStop`, `Stop` or `Pass`. Enter, leave, focus, blur and scroll go to the
 target only. So a handler sees the model as it is when the event arrives, and nothing captured
 can go stale.
+
+The state attributes `checked`, `selected` and `expanded`, and for inputs `placeholder`,
+`multiline` and `readOnly`, describe a node to the tree (and so to inspectors and tests).
+`decimal(value, places)` is a text node with a number.
+
+**Focus, anchors and overlays.** These are what popups and composite components need, still
+without stored closures:
+
+- `ui.takeFocus()` focuses the open node when this render asks and the last one did not (or the
+  node is new): a dialog's first field when it opens, a menu's button when the menu closes. A
+  view can keep asking while the condition holds; the last node asking wins. `ui.reveal()`
+  scrolls the node into view the same way.
+- `ui.anchor(key)` names the open node; before each render and dispatch the runtime reads the
+  layout boxes of the anchored nodes from the tree, and `ui.anchorRect(key)` returns one (and
+  `ui.anchorPressed(key)` whether a press on it is in progress). A popup places itself next to
+  its button with it, and a slider maps the pointer to a value.
+- `ui.overlay(key, body)` puts the nodes `body` opens in the overlay layer: a box under the root
+  after everything else, so they are drawn and hit above the rest, wherever the `overlay` call
+  is in the view. Their events bubble to the root. For an event in an overlay the dispatch pass
+  runs the whole view to find the call, and handlers outside it do not run.
 
 **Lists** use `ui.each(items, key, body)` (and `ui.enumerate` with the index): the first node
 the body opens for an item takes its key, so the diff keeps the node (and its focus, scroll and
@@ -113,7 +138,9 @@ long it can wait.
 
 `harness` drives an app without a window through the tree's real input path: `click(runtime,
 tree, viewport, "Add")` finds a node by test id, label or text and clicks its center;
-`press(..., "n", MOD_CONTROL)` presses a key; `snapshot` returns the `describe` text. The tests
+`press(..., "n", MOD_CONTROL)` presses a key; `locateRole` and `clickRole` find a node by role and
+name ("the Save button"), `typeText` types into the focused input, and `clickAt`, `drag`,
+`hover`, `moveTo` and `wheel` drive the pointer; `snapshot` returns the `describe` text. The tests
 check counts and stats with these, and `ui/app/tests` renders golden scenes (`describe` text and
 PNG) for the counter and the todo list. `ui/app/demo/scripts/demo check` runs the todo list in a
 real window on X11 and Wayland, clicks Add and compares a frame.
@@ -125,9 +152,11 @@ real window on X11 and Wayland, clicks Add and compares a frame.
   (a channel or poll) that std does not have yet. There is no cancellation by key.
 - There is no `ui.map` for embedding a child app with its own message type, and no custom
   subscription kind.
-- Text editing in `input` comes with ui-tree T5; `onInput` is wired but nothing fires it yet.
 - Style and attribute calls a `lazy` body makes on its parent are not kept when the region is
   reused; open a node inside `lazy` instead.
+- A `lazy` region that opened an overlay is not reused.
+- Anchor boxes come from the tree's last frame, so a popup opened in the same pass that moved
+  its button sits where the button was.
 - Two items with the same key under one parent: the second gets a new node each render.
 - Running out of memory traps.
 - Compiler limits shape the API (Silk dev.45): effect lambdas cannot nest, and an effect op of a
