@@ -1,0 +1,339 @@
+//! Native editing contracts and a 100k-element selection workload.
+import studio.model { Studio, Message, Pointer }
+import studio.editing as editing
+import studio.samples as samples
+import studio.format as format
+import studio.exports as exports
+import studio.render { Canvas, textResources }
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime }
+import ui_app.harness { click, clickRole, drag, typeText, press }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, Role }
+import ui_tree.input { MOD_CONTROL, MOD_META }
+import ui_fixtures.fixtures as fixtures
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.io.writer_native { StderrWriter }
+import silk.text.string { String }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { SystemClock }
+import silk.num.i64
+import silk.num.f32
+import silk.num.usize
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  const PRIMARY: u32 = MOD_META
+} else {
+  const PRIMARY: u32 = MOD_CONTROL
+}
+
+struct Failed {}
+
+effect fn expect(condition: bool, message: string) -> ()
+  ! Failed {
+  if !condition {
+    StderrWriter.print("FAIL: {}\n", &(message,))
+    fail Failed {}
+  }
+}
+
+fn pointer(x: f32, y: f32) -> Pointer {
+  return Pointer { x: x, y: y, shift: false, alt: false, pan: false, double: false }
+}
+
+effect fn now(clock: &mut OsMonotonicClock) -> f64 {
+  let t = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+  return i64.toF64(SystemClock.seconds(&t)) * 1000.0
+    + i64.toF64(SystemClock.nanoseconds(&t)) / 1000000.0
+}
+
+effect fn contracts() -> ()
+  ! Failed | OutOfMemoryError | JsonError | format.InvalidDocument
+  ? &mut Allocator {
+  let mut m = Studio.make()
+  samples.starter(&mut m)
+  m.cameraX = 0.0
+  m.cameraY = 0.0
+  m.zoom = 1.0
+  let initial = m.elements.length()
+
+  // One drag is one undo operation, and moving a frame moves its descendants once.
+  let frame = m.elements.get(0)
+  m.select(frame.id, false)
+  let child = m.elements.get(1)
+  editing.down(&mut m, pointer(244.0, 76.0))
+  editing.drag(&mut m, pointer(264.0, 96.0))
+  editing.up(&mut m, pointer(264.0, 96.0))
+  run expect(m.past.length() == 1, "drag has a single history entry")
+  run expect(m.elements.get(1).shape.x == child.shape.x + 20.0, "frame movement carries text")
+  editing.undo(&mut m, false)
+  run expect(m.elements.get(1).shape.x == child.shape.x, "undo restores descendants")
+  editing.undo(&mut m, true)
+  run expect(m.elements.get(1).shape.x == child.shape.x + 20.0, "redo restores descendants")
+
+  // Duplicate keeps internal parent references; deleting it leaves the original intact.
+  editing.action(&mut m, 3)
+  run expect(m.elements.length() > initial, "duplicate includes descendants")
+  let duplicate = m.primary
+  run expect(duplicate != frame.id, "duplicate has new identity")
+  editing.action(&mut m, 2)
+  run expect(m.elements.length() == initial, "delete removes only duplicated subtree")
+
+  // Alt-drag is a single duplication transaction, including when cancelled.
+  m.select(frame.id, false)
+  let originalCount = m.elements.length()
+  let mut alt = pointer(264.0, 96.0)
+  alt.alt = true
+  editing.down(&mut m, alt)
+  let mut destination = pointer(304.0, 136.0)
+  destination.alt = true
+  editing.up(&mut m, destination)
+  run expect(m.elements.length() > originalCount, "alt-drag duplicates a subtree")
+  editing.undo(&mut m, false)
+  run expect(m.elements.length() == originalCount, "alt-drag undo removes duplicate")
+  editing.down(&mut m, alt)
+  editing.cancel(&mut m)
+  run expect(m.elements.length() == originalCount, "cancel removes provisional duplicate")
+
+  // JSON round trips Unicode, styles and hierarchy through the browser schema.
+  m.title = m.intern("Design \"quoted\" — café")
+  let json = run format.encode(&m)
+  let restored = run format.decode(String.utf8Bytes(String.view(&json)))
+  run expect(restored.elements.length() == m.elements.length(), "file preserves layers")
+  run expect(
+    restored.string(restored.title) == m.string(m.title),
+    "file preserves Unicode and quotes",
+  )
+  run expect(
+    restored.elements.get(1).parent == restored.elements.get(0).id,
+    "file preserves parent links",
+  )
+  let invalid = run Effect.result(
+    format.decode(
+      b"{\"version\":1,\"activePageId\":\"p\",\"pages\":[{\"id\":\"p\",\"nodes\":[{\"id\":\"a\",\"kind\":\"group\",\"parentId\":\"b\"},{\"id\":\"b\",\"kind\":\"group\",\"parentId\":\"a\"}]}]}",
+    ),
+  )
+  let rejected = match move invalid {
+    Result<Studio, JsonError | format.InvalidDocument | OutOfMemoryError>.Success { value } => {
+      drop value
+      false
+    }
+    Result<Studio, JsonError | format.InvalidDocument | OutOfMemoryError>.Failure { error } => {
+      drop error
+      true
+    }
+  }
+  run expect(rejected, "cyclic imported hierarchy is rejected")
+  let countBeforeNew = m.elements.length()
+  m.draftField = 18
+  m.draft = run String.copy("Committed before save")
+  editing.action(&mut m, 13)
+  run expect(m.string(m.title) == "Committed before save", "save commits the active field")
+  editing.action(&mut m, 12)
+  run expect(
+    m.elements.length() == countBeforeNew && m.exportRequested == 5,
+    "new document waits for a separate destination",
+  )
+  StderrWriter.print("ok: editing, hierarchy, history, portable files\n", &())
+}
+
+effect fn uiContract() -> ()
+  ! Failed | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut fonts = Batch.make()
+  run fonts.fontFamily(1, "Noto Sans")
+  run tree.apply(run fonts.take())
+  let mut m = Studio.make()
+  samples.page(&mut m, "Test page")
+  m.title = m.intern("Input test")
+  m.cameraX = 0.0
+  m.cameraY = 0.0
+  m.zoom = 1.0
+  let mut app = Runtime<Studio, Message, NoCommand>.make(move m)
+  run app.start(&mut tree, 0.0)
+  let viewport = FrameInput { width: 1440.0, height: 960.0, scale: 1.0, time: 0.0 }
+  run expect(
+    run click(&mut app, &mut tree, viewport, "Rectangle"),
+    "native rectangle tool is reachable",
+  )
+  run drag(&mut app, &mut tree, viewport, 400.0, 250.0, 550.0, 350.0, 5)
+  run expect(app.model.elements.length() == 1, "native canvas pointer creates a rectangle")
+  run expect(
+    app.model.elements.get(0).shape.width == 150.0,
+    "native drag uses canvas world coordinates",
+  )
+  run expect(
+    run clickRole(&mut app, &mut tree, viewport, Role.TextBox, "Width"),
+    "inspector width is reachable",
+  )
+  run press(&mut app, &mut tree, viewport, "a", PRIMARY)
+  run typeText(&mut app, &mut tree, viewport, "240")
+  run press(&mut app, &mut tree, viewport, "Enter", 0)
+  run expect(
+    app.model.elements.get(0).shape.width == 240.0,
+    "native text input commits numeric edit",
+  )
+  run expect(run click(&mut app, &mut tree, viewport, "Undo"), "undo button is reachable")
+  run expect(app.model.elements.get(0).shape.width == 150.0, "native undo restores inspector edit")
+  StderrWriter.print("ok: native tool, canvas drag, inspector input and undo\n", &())
+}
+
+effect fn rendering() -> ()
+  ! Failed | TreeError | AtlasError | GeometryError | OutOfMemoryError | exports.UnsupportedBackdrop
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut text = run UiTree.make(&fonts)
+  run textResources(&mut tree)
+  run textResources(&mut text)
+  run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 })
+  let mut raster = CpuSnapshot.make()
+  let mut snapshot = CpuSnapshot.make()
+  let mut canvas = Canvas.make()
+  let mut m = Studio.make()
+  samples.page(&mut m, "Exports")
+  let id = m.add(0, "Red", 10.0, 20.0, 100.0, 80.0, 0xff0000ff)
+  drop m.add(0, "Outside selection", 300.0, 20.0, 100.0, 80.0, 0x00ff00ff)
+  m.select(id, false)
+  let pixels = run canvas.exportPixels(&mut m, &mut tree, &mut text, &mut raster, &mut snapshot)
+  run expect(pixels.width() == 100 && pixels.height() == 80, "PNG bounds use the selected subtree")
+  let bytes = pixels.data()
+  let middle: usize = (40 * 100 + 50) * 4
+  run expect(
+    bytes[middle] > 240 && bytes[middle + 1] < 10 && bytes[middle + 3] == 255,
+    "PNG contains rendered red pixels",
+  )
+  let svg = run exports.svg(&m)
+  run expect(String.contains(String.view(&svg), "width=\"100\""), "SVG exports selected geometry")
+
+  // A heavily magnified glyph must use vector coverage and a viewport-sized tile.
+  m.elements.clear()
+  m.reindex()
+  let label = m.add(2, "A", 0.0, 0.0, 100.0, 100.0, 0x000000ff)
+  let at = m.index(label)
+  let mut e = m.elements.get(at)
+  e.fontSize = 64.0
+  m.elements.set(at, e)
+  m.zoom = 64.0
+  m.cameraX = 30.0
+  m.cameraY = 30.0
+  m.width = 800.0
+  m.height = 600.0
+  m.geometryRevision = m.geometryRevision + 1
+  run canvas.frame(&m, &mut tree, &mut text, &mut raster, 1.0)
+  run expect(text.scene().paths(0).length > 0, "extreme zoom renders glyph outlines")
+  canvas.reset(&mut tree)
+  m.cameraX = 40.0
+  run canvas.frame(&m, &mut tree, &mut text, &mut raster, 1.0)
+  StderrWriter.print("ok: PNG selection export, SVG, high-zoom vector text and cache reset\n", &())
+}
+
+effect fn selectionFrames(model: Studio) -> Studio
+  ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut text = run UiTree.make(&fonts)
+  run textResources(&mut text)
+  let mut snapshot = CpuSnapshot.make()
+  let mut canvas = Canvas.make()
+  let mut app = Runtime<Studio, Message, NoCommand>.make(move model)
+  run app.start(&mut tree, 0.0)
+  let viewport = FrameInput { width: 1440.0, height: 960.0, scale: 1.0, time: 0.0 }
+  drop run canvas.normalize(&mut app.model, &mut text)
+  run tree.frame(viewport)
+  run canvas.frame(&app.model, &mut tree, &mut text, &mut snapshot, 1.0)
+  let mut clock = OsMonotonicClock.make()
+  app.model.clearSelection()
+  editing.down(&mut app.model, pointer(225.0, 130.0))
+  let start = run now(&mut clock)
+  let mut i: usize = 0
+  while i < 30 {
+    editing.drag(
+      &mut app.model,
+      pointer(400.0 + usize.toF32(i) * 20.0, 400.0 + usize.toF32(i) * 10.0),
+    )
+    run app.render(&mut tree)
+    run tree.frame(viewport)
+    run canvas.frame(&app.model, &mut tree, &mut text, &mut snapshot, 1.0)
+    i = i + 1
+  }
+  let end = run now(&mut clock)
+  editing.up(&mut app.model, pointer(980.0, 690.0))
+  StderrWriter.print(
+    "100k selection frame CPU (model + UI layout + scene; excludes GPU): {} ms average\n",
+    &((end - start) / 30.0,),
+  )
+  return move app.model
+}
+
+effect fn stress() -> ()
+  ! Failed | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut m = Studio.make()
+  samples.mosaic(&mut m)
+  m.fit(false)
+  run expect(
+    m.elements.length() == 100002,
+    "stress page contains 100k independent rectangles and two labels",
+  )
+  let mut clock = OsMonotonicClock.make()
+  let start = run now(&mut clock)
+  editing.down(&mut m, pointer(225.0, 130.0))
+  let mut i: usize = 0
+  while i < 120 {
+    let fraction = usize.toF32(i + 1) / 120.0
+    editing.drag(&mut m, pointer(225.0 + fraction * 900.0, 130.0 + fraction * 700.0))
+    i = i + 1
+  }
+  editing.up(&mut m, pointer(1125.0, 830.0))
+  let end = run now(&mut clock)
+  run expect(m.selected > 10000, "large marquee selects real individual elements")
+  StderrWriter.print(
+    "100k marquee: {} ms / 120 samples; {} selected\n",
+    &((end - start), m.selected),
+  )
+  let current = move m
+  m = run selectionFrames(move current)
+  editing.action(&mut m, 6)
+  let editStart = run now(&mut clock)
+  editing.field(&mut m, 5, "#456789")
+  editing.action(&mut m, 25)
+  let editEnd = run now(&mut clock)
+  run expect(m.elements.get(50000).shape.fill == 0x456789ff, "bulk edit changes all rectangles")
+  StderrWriter.print("100k fill + align: {} ms\n", &((editEnd - editStart),))
+}
+
+effect fn program() -> i32
+  ! Failed
+    | TreeError
+    | AtlasError
+    | GeometryError
+    | OutOfMemoryError
+    | JsonError
+    | format.InvalidDocument
+    | exports.UnsupportedBackdrop
+  ? &mut Allocator {
+  run contracts()
+  run uiContract()
+  run rendering()
+  run stress()
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub effect fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

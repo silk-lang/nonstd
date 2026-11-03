@@ -1,0 +1,568 @@
+//! Composes a retained graphics document with native UI chrome.
+import exports as exportDocument
+import vector.pixmap { Pixmap }
+import model { Studio, Element }
+import editing
+import editor.document { Document, Node, Camera }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot }
+import ui_tree.mutation {
+  NodeKind,
+  Property,
+  Length,
+  LineHeight,
+  WhiteSpace,
+  Position,
+  Side,
+  Overflow
+}
+import ui_scene.scene { Scene }
+import ui_scene.primitives { Quad, ContentMask, Background }
+import ui_scene.color as color
+import atlas.atlas { AtlasError, AtlasTile, Kind }
+import vector.geometry_error { GeometryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.geometry.insets { Insets }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+
+struct TextTile {
+  id: u32,
+  text: u32,
+  size: f32,
+  weight: u32,
+  fill: u32,
+  family: u32,
+  width: f32,
+  height: f32,
+  density: f32,
+  cropX: f32,
+  cropY: f32,
+  naturalWidth: f32,
+  naturalHeight: f32,
+  stretchX: f32,
+  stretchY: f32,
+  pixelsWidth: f32,
+  pixelsHeight: f32,
+  tile: AtlasTile
+}
+
+impl Copy for TextTile {}
+
+/// Retained shape and text caches. The UI tree owns the GPU atlas.
+pub struct Canvas {
+  document: Document,
+  text: List<TextTile>,
+  pub scene: Scene,
+  shapes: Scene,
+  revision: u64,
+  exporting: bool,
+  editing: u32,
+  cropped: bool,
+  cameraX: f32,
+  cameraY: f32,
+  width: f32,
+  height: f32,
+  page: u32,
+  zoom: f32,
+  scale: f32
+}
+
+impl Canvas {
+  pub fn make() -> Canvas {
+    return Canvas {
+      document: Document.make(),
+      text: List<TextTile>.make(),
+      scene: Scene.make(),
+      shapes: Scene.make(),
+      revision: 18446744073709551615,
+      exporting: false,
+      editing: 0,
+      cropped: false,
+      cameraX: 0.0,
+      cameraY: 0.0,
+      width: 0.0,
+      height: 0.0,
+      page: 0,
+      zoom: 0.0,
+      scale: 0.0,
+    }
+  }
+
+  /// Resolves natural dimensions only for newly created or edited text; resized/imported
+  /// text keeps its explicit dimensions.
+  pub effect fn normalize(self: &mut Self, m: &mut Studio, tree: &mut UiTree) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let mut e = m.elements.get(i)
+      if e.kind == 2 && e.autoSize {
+        let size = run measureText(&m.*, e, &mut tree)
+        e.shape.width = size[0]
+        e.shape.height = size[1]
+        e.autoSize = false
+        m.elements.set(i, e)
+        changed = true
+      }
+      i = i + 1
+    }
+    if changed {
+      m.revision = m.revision + 1
+      m.geometryRevision = m.geometryRevision + 1
+    }
+    return changed
+  }
+
+  /// Drops document-local atlas entries before replacing a document with reused identities.
+  pub fn reset(self: &mut Self, tree: &mut UiTree) -> () {
+    let mut i: usize = 0
+    while i < self.text.length() {
+      drop tree.atlas.free(self.text.get(i).tile.id)
+      i = i + 1
+    }
+    self.* = Canvas.make()
+  }
+
+  effect fn textTile(
+    self: &mut Self,
+    m: &Studio,
+    e: Element,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+  ) -> TextTile
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut old = usize.MAX
+    let mut naturalWidth: f32 = 0.0
+    let mut naturalHeight: f32 = 0.0
+    let mut i: usize = 0
+    while i < self.text.length() {
+      let cached = self.text.get(i)
+      if cached.id == e.id {
+        old = i
+        if cached.text == e.text && cached.size == e.fontSize && cached.weight == e.fontWeight
+          && cached.family == e.fontFamily {
+          naturalWidth = cached.naturalWidth
+          naturalHeight = cached.naturalHeight
+        }
+        break
+      }
+      i = i + 1
+    }
+    if naturalWidth == 0.0 {
+      let size = run measureText(m, e, &mut textTree)
+      naturalWidth = size[0]
+      naturalHeight = size[1]
+    }
+    let stretchX = e.shape.width / naturalWidth
+    let stretchY = e.shape.height / naturalHeight
+    let wanted = f32.max(0.001, m.zoom * scale * f32.max(stretchX, stretchY))
+    let density = if self.exporting {
+      wanted
+    } else {
+      f32.ceil(wanted * 4.0) / 4.0
+    }
+    let totalWidth = f32.max(1.0, f32.ceil(naturalWidth * density))
+    let totalHeight = f32.max(1.0, f32.ceil(naturalHeight * density))
+    let clipped = totalWidth > 4096.0 || totalHeight > 4096.0
+    if clipped {
+      self.cropped = true
+    }
+    let cropX: f32 = if clipped && !self.exporting {
+      f32.max(0.0, f32.floor((m.cameraX - e.shape.x) / stretchX * density) - 64.0)
+    } else {
+      0.0
+    }
+    let cropY: f32 = if clipped && !self.exporting {
+      f32.max(0.0, f32.floor((m.cameraY - e.shape.y) / stretchY * density) - 64.0)
+    } else {
+      0.0
+    }
+    let w = f32.max(
+      1.0,
+      f32.min(
+        totalWidth - cropX,
+        if clipped {
+          f32.min(4096.0, (m.width - 464.0) * density / m.zoom / stretchX + 128.0)
+        } else {
+          4096.0
+        },
+      ),
+    )
+    let h = f32.max(
+      1.0,
+      f32.min(
+        totalHeight - cropY,
+        if clipped {
+          f32.min(4096.0, (m.height - 88.0) * density / m.zoom / stretchY + 128.0)
+        } else {
+          4096.0
+        },
+      ),
+    )
+    if old != usize.MAX {
+      let cached = self.text.get(old)
+      if cached.text == e.text && cached.size == e.fontSize && cached.weight == e.fontWeight
+        && cached.fill == e.shape.fill
+        && cached.family == e.fontFamily
+        && cached.width == e.shape.width
+        && cached.height == e.shape.height
+        && cached.density == density
+        && cached.cropX == cropX
+        && cached.cropY == cropY
+        && cached.pixelsWidth == w
+        && cached.pixelsHeight == h
+        && tree.atlas.touch(cached.tile.id) {
+        return cached
+      }
+    }
+
+    let mut batch = Batch.make()
+    run batch.setText(2, m.string(e.text))
+    run batch.style(
+      1,
+      &[
+        Property.Width { value: Length.px(w) },
+        Property.Height { value: Length.px(h) },
+        Property.WhiteSpace { value: WhiteSpace.Pre },
+        Property.FontFamily { family: e.fontFamily + 2 },
+        Property.FontSize { value: e.fontSize * density },
+        Property.FontWeight { value: u32.toF32(e.fontWeight) },
+        Property.Color { color: color.rgba(e.shape.fill) },
+        Property.LineHeight { value: LineHeight.Number { value: 1.5 } },
+      ],
+    )
+    run batch.style(
+      3,
+      &[
+        Property.Position { value: Position.Absolute },
+        Property.Inset { side: Side.Left, value: Length.px(-cropX) },
+        Property.Inset { side: Side.Top, value: Length.px(-cropY) },
+        Property.Width { value: Length.px(totalWidth) },
+        Property.Height { value: Length.px(totalHeight) },
+      ],
+    )
+    run textTree.apply(run batch.take())
+    run textTree.frame(FrameInput { width: w, height: h, scale: 1.0, time: 0.0 })
+    run snapshot.sync(&mut textTree)
+    let pixels = run snapshot.render(&textTree.*)
+    if old != usize.MAX {
+      drop tree.atlas.free(self.text.get(old).tile.id)
+    }
+    let tile = run tree.atlas.allocate(Kind.Polychrome, pixels.width(), pixels.height())
+    run tree.uploads.push(tile, pixels.data(), 0, pixels.width() * 4)
+    let cached = TextTile {
+      id: e.id,
+      text: e.text,
+      size: e.fontSize,
+      weight: e.fontWeight,
+      fill: e.shape.fill,
+      family: e.fontFamily,
+      width: e.shape.width,
+      height: e.shape.height,
+      density: density,
+      cropX: cropX,
+      cropY: cropY,
+      naturalWidth: naturalWidth,
+      naturalHeight: naturalHeight,
+      stretchX: stretchX,
+      stretchY: stretchY,
+      pixelsWidth: w,
+      pixelsHeight: h,
+      tile: tile,
+    }
+    if old == usize.MAX {
+      run self.text.append(cached)
+    } else {
+      self.text.set(old, cached)
+    }
+    return cached
+  }
+
+  /// Renders the selection or page to a transparent image, capped at 4096 pixels per axis.
+  pub effect fn exportPixels(
+    self: &mut Self,
+    m: &mut Studio,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    textSnapshot: &mut CpuSnapshot,
+    snapshot: &mut CpuSnapshot,
+  ) -> Pixmap
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let bounds = exportDocument.bounds(&m.*)
+    let width = f32.max(1.0, bounds.xMax - bounds.xMin)
+    let height = f32.max(1.0, bounds.yMax - bounds.yMin)
+    let density = f32.min(1.0, 4096.0 / f32.max(width, height))
+    let savedZoom = m.zoom
+    m.zoom = density
+    self.exporting = true
+    self.revision = 18446744073709551615
+    run self.frame(&m.*, &mut tree, &mut textTree, &mut textSnapshot, 1.0)
+    m.zoom = savedZoom
+    self.exporting = false
+    self.revision = 18446744073709551615
+    let mut scene = Scene.make()
+    let w = f32.ceil(width * density)
+    let h = f32.ceil(height * density)
+    run self.document.paint(
+      &mut scene,
+      Camera { x: bounds.xMin, y: bounds.yMin, zoom: density, scale: 1.0, width: w, height: h },
+      true,
+    )
+    run snapshot.copyUploads(&tree.*)
+
+    // The reference renderer takes its output dimensions from the tree's viewport.
+    run textTree.frame(FrameInput { width: w, height: h, scale: 1.0, time: 0.0 })
+    return run snapshot.renderScene(&textTree.*, &scene)
+  }
+
+  /// Builds the visible document and chrome into one scene in physical pixels.
+  pub effect fn frame(
+    self: &mut Self,
+    m: &Studio,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let rebuild = (self.cropped
+      && (self.cameraX != m.cameraX || self.cameraY != m.cameraY || self.width != m.width
+        || self.height != m.height))
+      || self.editing != m.editing
+      || self.revision != m.geometryRevision
+      || self.page != m.page
+      || self.zoom != m.zoom
+      || self.scale != scale
+    if rebuild {
+      self.document = Document.make()
+      self.cropped = false
+      let elements = m.elements.asSlice()
+      let mut i: usize = 0
+      while i < elements.length {
+        let e = elements[i]
+        if e.page == m.page && e.kind != 4 && (self.exporting || e.id != m.editing)
+          && (!self.exporting || exportDocument.included(m, e))
+          && !editing.flag(m, e, 1) {
+          let mut node = e.shape
+          node.opacity = editing.opacity(m, e)
+          if e.kind == 2 {
+            if e.shape.width * m.zoom * scale > 4096.0 || e.shape.height * m.zoom * scale > 4096.0 {
+              self.cropped = true
+              if !self.exporting
+                && (e.shape.x + e.shape.width < m.cameraX || e.shape.y + e.shape.height < m.cameraY
+                  || e.shape.x > m.cameraX + (m.width - 464.0) / m.zoom
+                  || e.shape.y > m.cameraY + (m.height - 88.0) / m.zoom) {
+                i = i + 1
+                continue
+              }
+            }
+            let tile = run self.textTile(m, e, &mut tree, &mut textTree, &mut snapshot, scale)
+            node.kind = run self.document.addTile(tile.tile)
+            node.x = node.x + tile.cropX / tile.density * tile.stretchX
+            node.y = node.y + tile.cropY / tile.density * tile.stretchY
+            node.width = tile.pixelsWidth / tile.density * tile.stretchX
+            node.height = tile.pixelsHeight / tile.density * tile.stretchY
+            node.fill = 0xffffffff
+          }
+          drop run self.document.add(node)
+        }
+        i = i + 1
+      }
+      self.revision = m.geometryRevision
+      self.page = m.page
+      self.editing = m.editing
+      self.zoom = m.zoom
+      self.scale = scale
+    }
+    if rebuild || self.cameraX != m.cameraX || self.cameraY != m.cameraY || self.width != m.width
+      || self.height != m.height {
+      run self.document.paint(
+        &mut self.shapes,
+        Camera {
+          x: m.cameraX - 224.0 / m.zoom,
+          y: m.cameraY - 56.0 / m.zoom,
+          zoom: m.zoom,
+          scale: scale,
+          width: m.width,
+          height: m.height,
+        },
+        true,
+      )
+      self.cameraX = m.cameraX
+      self.cameraY = m.cameraY
+      self.width = m.width
+      self.height = m.height
+    }
+    self.scene.clear()
+    let full = Rect<f32>.new(0.0, 0.0, m.width * scale, m.height * scale)
+    let mask = ContentMask.new(
+      Rect<f32>.new(
+        224.0 * scale,
+        56.0 * scale,
+        (m.width - 240.0) * scale,
+        (m.height - 32.0) * scale,
+      ),
+    )
+    drop run self.scene.quad(
+      Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0xeeede7))),
+    )
+    if m.grid && m.zoom > 0.15 {
+      let spacing = f32.max(8.0, 20.0 * m.zoom) * scale
+      let mut x = 224.0 * scale - (m.cameraX * m.zoom * scale) % spacing
+      while x < (m.width - 240.0) * scale {
+        let mut y = 56.0 * scale - (m.cameraY * m.zoom * scale) % spacing
+        while y < (m.height - 32.0) * scale {
+          drop run self.scene.quad(
+            Quad.fill(
+              Rect<f32>.new(x, y, x + scale, y + scale),
+              mask,
+              Background.solid(color.rgba(0x99a18c50)),
+            ),
+          )
+          y = y + spacing
+        }
+        x = x + spacing
+      }
+    }
+    run self.scene.replay(&self.shapes, 0, self.shapes.operationCount())
+    if m.selected > 0 {
+      let b = editing.bounds(m)
+      let x = (b[0] - m.cameraX) * m.zoom + 224.0
+      let y = (b[1] - m.cameraY) * m.zoom + 56.0
+      let r = (b[2] - m.cameraX) * m.zoom + 224.0
+      let bottom = (b[3] - m.cameraY) * m.zoom + 56.0
+      let mut outline = Quad.fill(
+        Rect<f32>.new(x * scale, y * scale, r * scale, bottom * scale),
+        mask,
+        Background.solid(color.transparent()),
+      )
+      outline.borderWidths = Insets<f32>.uniform(scale)
+      outline.borderColor = color.rgb(0x4563e6)
+      drop run self.scene.quad(outline)
+      let mut corner: usize = 0
+      while corner < 8 {
+        let cx = if corner == 0 || corner == 6 || corner == 7 {
+          x
+        } else if corner == 1 || corner == 5 {
+          (x + r) * 0.5
+        } else {
+          r
+        }
+        let cy = if corner < 3 {
+          y
+        } else if corner == 3 || corner == 7 {
+          (y + bottom) * 0.5
+        } else {
+          bottom
+        }
+        let mut q = Quad.fill(
+          Rect<f32>.new(
+            (cx - 3.0) * scale,
+            (cy - 3.0) * scale,
+            (cx + 3.0) * scale,
+            (cy + 3.0) * scale,
+          ),
+          mask,
+          Background.solid(color.white()),
+        )
+        q.borderWidths = Insets<f32>.uniform(scale)
+        q.borderColor = color.rgb(0x4563e6)
+        drop run self.scene.quad(q)
+        corner = corner + 1
+      }
+    }
+    if m.gesture == 4 {
+      let x = (f32.min(m.startX, m.currentX) - m.cameraX) * m.zoom + 224.0
+      let y = (f32.min(m.startY, m.currentY) - m.cameraY) * m.zoom + 56.0
+      let r = (f32.max(m.startX, m.currentX) - m.cameraX) * m.zoom + 224.0
+      let bottom = (f32.max(m.startY, m.currentY) - m.cameraY) * m.zoom + 56.0
+      let mut q = Quad.fill(
+        Rect<f32>.new(x * scale, y * scale, r * scale, bottom * scale),
+        mask,
+        Background.solid(color.rgba(0x4563e620)),
+      )
+      q.borderWidths = Insets<f32>.uniform(scale)
+      q.borderColor = color.rgb(0x4563e6)
+      drop run self.scene.quad(q)
+    }
+    run self.scene.replay(tree.scene(), 0, tree.scene().operationCount())
+    run self.scene.finish()
+  }
+}
+
+/// Creates the reusable native text measurement/rasterization tree.
+pub effect fn textResources(tree: &mut UiTree) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run batch.fontFamily(2, "Arial, Noto Sans, sans-serif")
+  run batch.fontFamily(3, "Georgia, Noto Serif, serif")
+  run batch.fontFamily(4, "Courier New, Noto Mono, monospace")
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[Property.OverflowX { value: Overflow.Hidden }, Property.OverflowY { value: Overflow.Hidden }],
+  )
+  run batch.box(1, 3, &[])
+  run batch.text(3, 2, "")
+  run tree.apply(run batch.take())
+}
+
+effect fn measureText(m: &Studio, e: Element, tree: &mut UiTree) -> [f32; 2]
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut width: f32 = 0.0
+  let mut height: f32 = 0.0
+  let mut measure = Batch.make()
+  run measure.setText(2, m.string(e.text))
+  run measure.style(
+    1,
+    &[
+      Property.Width { value: Length.px(1000000.0) },
+      Property.Height { value: Length.px(1.0) },
+      Property.WhiteSpace { value: WhiteSpace.Pre },
+      Property.FontFamily { family: e.fontFamily + 2 },
+      Property.FontSize { value: e.fontSize },
+      Property.FontWeight { value: u32.toF32(e.fontWeight) },
+      Property.LineHeight { value: LineHeight.Number { value: 1.5 } },
+    ],
+  )
+  run measure.style(
+    3,
+    &[
+      Property.Position { value: Position.Absolute },
+      Property.Inset { side: Side.Left, value: Length.px(0.0) },
+      Property.Inset { side: Side.Top, value: Length.px(0.0) },
+      Property.Width { value: Length.px(1000000.0) },
+      Property.Height { value: Length.px(e.fontSize * 1.5) },
+    ],
+  )
+  run tree.apply(run measure.take())
+  run tree.layoutNow()
+  let css = tree.node(tree.slotOf(2)).css
+  let fragments = tree.output.fragments.values.asSlice()
+  let mut j: usize = 0
+  while j < fragments.length {
+    let f = fragments[j]
+    if f.source == css {
+      width = f32.max(width, f.worldLocation.x + f.size.width)
+      height = f32.max(height, f.worldLocation.y + f.size.height)
+    }
+    j = j + 1
+  }
+  width = f32.ceil(f32.max(1.0, width) + 4.0)
+  height = f32.ceil(f32.max(e.fontSize * 1.5, height) + 4.0)
+  return [width, height]
+}
