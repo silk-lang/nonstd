@@ -1,0 +1,228 @@
+import headless { HeadlessWebViews, HeadlessView }
+import host { WebViewHost }
+import command { Command }
+import event { WebViewEvent, EventKind }
+import types { WebViewOptions, WebViewError, Placement, Backend, BUTTON_PRIMARY }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+const VIEW: u32 = 7
+
+effect fn drain(views: &mut HeadlessWebViews) -> List<WebViewEvent>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<WebViewEvent>.make()
+  run views.takeEvents(&mut events)
+  return move events
+}
+
+fn isTitle(event: &WebViewEvent, title: string) -> bool {
+  return match &event.kind {
+    EventKind.TitleChanged { title: value } => String.view(&value) == title
+    _ => false
+  }
+}
+
+fn isHistory(event: &WebViewEvent, back: bool, forward: bool) -> bool {
+  return match &event.kind {
+    EventKind.HistoryChanged { canGoBack, canGoForward } => canGoBack == back
+      && canGoForward == forward
+    _ => false
+  }
+}
+
+fn titleOf(views: &HeadlessWebViews) -> string {
+  return match views.view(VIEW) {
+    Option<&HeadlessView>.Some { value } => String.view(&value.title)
+    Option<&HeadlessView>.None => ""
+  }
+}
+
+effect fn navigate(views: &mut HeadlessWebViews, url: string) -> ()
+  ! WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  run views.send(VIEW, Command.Navigate { url: run String.copy(url) })
+}
+
+effect fn pagesBody() -> ()
+  ! AssertionError<'static> | WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut views = HeadlessWebViews.make()
+  run Testing.expect(views.backend() == Backend.Headless, "the backend says what it is")
+  let options = run WebViewOptions.make(1, "data:text/html,<title>Home</title><p>hi")
+  run views.open(VIEW, &options)
+  let opened = run drain(&mut views)
+  run Testing.expect(opened.length() == 7, "created, then a load's six events")
+  run Testing.expect(
+    match &opened.asSlice()[0].kind {
+      EventKind.Created => true
+      _ => false
+    },
+    "created comes first",
+  )
+  run Testing.expect(isTitle(&opened.asSlice()[3], "Home"), "the title comes from the page")
+  run Testing.expect(isHistory(&opened.asSlice()[6], false, false), "history has one entry")
+
+  run navigate(&mut views, "data:text/html,<title>Docs</title>")
+  run navigate(&mut views, "data:text/html,<title>Blog</title>")
+  drop run drain(&mut views)
+  run views.send(VIEW, Command.Back)
+  let back = run drain(&mut views)
+  run Testing.expect(titleOf(&views) == "Docs", "back shows the previous page")
+  run Testing.expect(
+    isHistory(&back.asSlice()[back.length() - 1], true, true),
+    "with history both ways",
+  )
+  run views.send(VIEW, Command.Back)
+  run navigate(&mut views, "data:text/html,<title>Other</title>")
+  let other = run drain(&mut views)
+  run Testing.expect(
+    isHistory(&other.asSlice()[other.length() - 1], true, false),
+    "a new page drops the forward entries",
+  )
+  run views.send(
+    VIEW,
+    Command.LoadHtml {
+      html: run String.copy("<title>Inline</title>"),
+      baseUrl: run String.copy("https://example.com/"),
+    },
+  )
+  run Testing.expect(titleOf(&views) == "Inline", "LoadHtml shows its HTML")
+  drop run drain(&mut views)
+
+  run views.close(VIEW)
+  let closed = run drain(&mut views)
+  run Testing.expect(
+    closed.length() == 1
+      && match &closed.asSlice()[0].kind {
+        EventKind.Closed => true
+        _ => false
+      },
+    "closing queues Closed",
+  )
+  let refused = run Effect.catch<WebViewError>(sent(&mut views), wasInvalid)
+  run Testing.expect(refused, "a closed view takes no commands")
+}
+
+effect fn sent(views: &mut HeadlessWebViews) -> bool
+  ! WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  run views.send(VIEW, Command.Reload)
+  return false
+}
+
+effect fn wasInvalid(error: WebViewError) -> bool {
+  return error == WebViewError.InvalidView
+}
+
+test effect fn pagesLoadAndHistoryWorks() -> ()
+  ! AssertionError<'static> | WebViewError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pagesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn askingBody() -> ()
+  ! AssertionError<'static> | WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut views = HeadlessWebViews.make()
+  let mut options = run WebViewOptions.make(1, "")
+  options.askBeforeNavigating = true
+  run views.open(VIEW, &options)
+  drop run drain(&mut views)
+  run navigate(&mut views, "data:text/html,<title>Asked</title>")
+  let asked = run drain(&mut views)
+  let request = match &asked.asSlice()[0].kind {
+    EventKind.NavigationRequested { request: found, .. } => found
+    _ => 0
+  }
+  run Testing.expect(asked.length() == 1 && request != 0, "the view asks first")
+  run Testing.expect(titleOf(&views) == "", "and loads nothing yet")
+  run views.send(VIEW, Command.AnswerNavigation { request: request, allow: true })
+  run Testing.expect(titleOf(&views) == "Asked", "allowing it loads the page")
+  run navigate(&mut views, "data:text/html,<title>Denied</title>")
+  let second = run drain(&mut views)
+  let next = match &second.asSlice()[second.length() - 1].kind {
+    EventKind.NavigationRequested { request: found, .. } => found
+    _ => 0
+  }
+  run views.send(VIEW, Command.AnswerNavigation { request: next, allow: false })
+  run Testing.expect(titleOf(&views) == "Asked", "denying it stays")
+}
+
+test effect fn navigationsCanBeAskedFirst() -> ()
+  ! AssertionError<'static> | WebViewError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run askingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn inputBody() -> ()
+  ! AssertionError<'static> | WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut views = HeadlessWebViews.make()
+  run views.open(VIEW, &run WebViewOptions.make(1, ""))
+  let box = Rect<f32>.new(10.0, 20.0, 410.0, 320.0)
+  let placement = Placement { bounds: box, clip: box, visible: true, scale: 2.0 }
+  views.place(VIEW, placement)
+  views.place(VIEW, placement)
+  run views.send(
+    VIEW,
+    Command.ClickAt { x: 12.4, y: 30.6, button: BUTTON_PRIMARY, clickCount: 1, modifiers: 0 },
+  )
+  run views.send(VIEW, Command.TypeText { text: run String.copy("hello") })
+  run views.send(VIEW, Command.PressKey { key: run String.copy("Enter"), modifiers: 0 })
+  run views.send(VIEW, Command.Screenshot { request: 4 })
+  run views.send(VIEW, Command.ClickElement { request: 5, element: run String.copy("e1") })
+  run views.send(VIEW, Command.OpenDevTools)
+  let events = run drain(&mut views)
+  match views.view(VIEW) {
+    Option<&HeadlessView>.Some { value } => {
+      run Testing.expect(value.moves == 1, "placing it twice the same way moves it once")
+      run Testing.expect(value.focused, "a click focuses the page")
+      run Testing.expect(
+        value.log.length() == 3 && String.view(&value.log.asSlice()[0]) == "click 12 31"
+          && String.view(&value.log.asSlice()[1]) == "type hello"
+          && String.view(&value.log.asSlice()[2]) == "key Enter",
+        "input lands in the log",
+      )
+    }
+    Option<&HeadlessView>.None => run Testing.expect(false, "the view is open")
+  }
+  let mut sawFocus = false
+  let mut sawShot = false
+  let mut sawAction = false
+  let mut sawUnsupported = false
+  let mut i: usize = 0
+  while i < events.length() {
+    match &events.asSlice()[i].kind {
+      EventKind.FocusChanged { focused } => {
+        sawFocus = focused
+      }
+      EventKind.Screenshot { request, width, height, pixels } => {
+        sawShot = request == 4 && width == 800 && height == 600 && pixels.length() == 800 * 600 * 4
+      }
+      EventKind.ActionResult { request, ok, .. } => {
+        sawAction = request == 5 && !ok
+      }
+      EventKind.Unsupported { command, .. } => {
+        sawUnsupported = String.view(&command) == "OpenDevTools"
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  run Testing.expect(sawFocus, "the page reports taking focus")
+  run Testing.expect(sawShot, "a screenshot is the placement's device pixels")
+  run Testing.expect(sawAction, "element actions answer with their request")
+  run Testing.expect(sawUnsupported, "what the backend cannot do is reported by name")
+}
+
+test effect fn inputIsLoggedAndAnswersCarryRequests() -> ()
+  ! AssertionError<'static> | WebViewError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run inputBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

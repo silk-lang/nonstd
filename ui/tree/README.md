@@ -28,13 +28,15 @@ run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 2.0, time: 0.0 }
   checked, selected and expanded, and for inputs multiline, read-only and placeholder),
   `SetSelection`,
   `SetListeners` (a `LISTEN_*` bit set), `SetRoot`, `Focus`, `Blur`, `ScrollTo`,
-  `ScrollIntoView`, `SetSource`, `SetCanvas`, and the resource definitions `DefineFontFamily`,
+  `ScrollIntoView`, `SetSource`, `SetHostedView`, `SetCanvas`, and the resource definitions `DefineFontFamily`,
   `DefineImage` (PNG or JPEG bytes) and `DefineIcon` (SVG bytes). `apply` stops at the first
   mutation that fails and returns a `TreeError` naming its index; the ones before it stay
   applied. Destroyed ids can be used again.
 - **Node kinds**: box, text, image, icon (an SVG tinted with the text color, sized to the font
   size unless styled), input (an editable text field, see [Text editing](#text-editing)) and
-  canvas (fill and stroke path commands in the node's content box).
+  canvas (fill and stroke path commands in the node's content box) and hosted (a box whose
+  content the host draws itself, such as a web view: `hostedPlacements` says where each one is
+  after a frame, clipped by its scrolling ancestors; see `platform/webview`).
 - **Styles** are typed `Property` values. Text properties (family, size, weight, style, line
   height, color, alignment, white space, direction, decoration) inherit; the rest do not. Hover,
   active and focus variants apply over the base style while the node is in that state.
