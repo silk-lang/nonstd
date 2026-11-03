@@ -1,5 +1,4 @@
 import { Editor } from '/dist/editor.js';
-import { WebGPUHost } from '/dist/host.js';
 
 // Draw the same complete, browser-shaped runs directly into the viewport. This reference
 // never resizes a whole-line bitmap, so a capped atlas cannot silently pass the comparison.
@@ -53,17 +52,14 @@ export async function runTextZoomContracts() {
     const stable = editor.diagnostics.textRasterizations;
     editor.setViewport({ x: .25, y: 8.25 }); sharp('Fractional pan within overscan');
     check(editor.diagnostics.textRasterizations === stable, 'Small pans reuse the overscan raster');
-    const call = WebGPUHost.prototype.call, allocated = editor.diagnostics.textAtlasTiles;
+    const copyImage = GPUQueue.prototype.copyExternalImageToTexture, allocated = editor.diagnostics.textAtlasTiles;
     let attempts = 0;
     try {
-      WebGPUHost.prototype.call = function(name, ...args) {
-        if (name === 'editor_image_replace') { attempts++; return 0; }
-        return call.call(this, name, ...args);
-      };
+      GPUQueue.prototype.copyExternalImageToTexture = function() { attempts++; throw new Error('Simulated canvas copy refusal'); };
       editor.setViewport({ x: 5.5, y: 10 }); editor.render(); editor.render();
       check(attempts === 1 && editor.diagnostics.limitedTextRuns === 1 && editor.diagnostics.textAtlasTiles === allocated,
         'A failed crop upload preserves live allocations, reports fallback quality, and avoids repeated retries');
-    } finally { WebGPUHost.prototype.call = call; }
+    } finally { GPUQueue.prototype.copyExternalImageToTexture = copyImage; }
     const retry = editor.text('Allocation retry', { x: -10000, y: -10000 }); editor.remove(retry);
     sharp('Pan retries after atlas changes without displaying a stale crop');
     editor.setViewport({ x: 0, y: 8 });
@@ -87,6 +83,14 @@ export async function runTextZoomContracts() {
     editor.remove(id); editor.render();
     check(editor.diagnostics.textAtlasTiles === editor.diagnostics.textRuns, 'Removing a cropped element releases its allocation');
     editor.undo(); sharp('Undo restores a released crop');
+    editor.setViewport({ x: 0, y: 8, zoom: 32 }); editor.render();
+    const zoomRasters = editor.diagnostics.textRasterizations;
+    for (let i = 1; i <= 60; i++) {
+      editor.zoomAt(32 * 2 ** (i / 60), 360, 140); editor.render();
+    }
+    check(editor.diagnostics.textRasterizations - zoomRasters <= 4,
+      'Continuous zoom reuses sufficient-resolution rasters instead of uploading every frame');
+    sharp('Sharpness after a continuous zoom gesture');
     editor.resize(2200, 1000, 1); editor.render(); const capped = editor.diagnostics.textRasterizations;
     editor.render(); editor.render();
     check(editor.diagnostics.limitedTextRuns === 1 && editor.diagnostics.textRasterizations === capped,

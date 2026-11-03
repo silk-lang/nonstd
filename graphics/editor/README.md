@@ -117,8 +117,9 @@ gradients; borders and shadows on ellipses are explicitly rejected.
 `hidden` suppresses painting and hits. `locked` suppresses hits but keeps painting. Transparent
 shapes still hit their geometric area. Making an element hidden or locked removes it from selection.
 
-Text is one line, shaped and rasterized by browser Canvas2D, then uploaded as a premultiplied
-texture to Silk's atlas. The browser's installed fonts determine its appearance; await your
+Text is one line, shaped and rasterized by browser Canvas2D, then copied directly into
+Silk's GPU atlas with premultiplied alpha. The browser performs the copy without JavaScript
+pixel readback, per-pixel conversion, or a WASM staging buffer. The browser's installed fonts determine its appearance; await your
 webfonts before creating text. `fontFamily`, numeric `fontWeight`, `fontSize`, and `fill` control
 the raster. Width/height changes stretch the line without reflowing it.
 
@@ -137,6 +138,10 @@ keeps kerning, ligatures, and browser font fallback intact while avoiding magnif
 from a capped whole-line bitmap. It also preserves the original rounded-corner clipping.
 
 Small pans reuse the overscan pixels; crossing the cached window triggers another upload.
+Windows target two samples per displayed pixel and reuse their pixels during zoom while
+at least 1.5 samples per pixel remain. This density margin avoids an upload on every small
+zoom-in step while keeping edges sharp. A raster constrained by the memory budget may still
+refresh each step, but its pixels travel directly from Canvas2D to the GPU.
 Different visible copies have independent windows. Offscreen, removed, or zoomed-out windows
 release their atlas allocation, and their registered slots are recycled. Updating a raster
 changes neither world geometry nor undo history. A replacement releases its old allocation

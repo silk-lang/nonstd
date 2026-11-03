@@ -1,5 +1,9 @@
 # Extreme-zoom text verification
 
+This records the quality fix in `690a1e6`. The later
+[continuous zoom optimization](../text-zoom-performance/README.md) removes the pixel readback
+and reduces repeated uploads; the timings below describe the earlier implementation.
+
 The old implementation (`a24d968`) capped a bitmap of the entire line. At extreme zoom,
 that cap magnified individual texels. The new implementation rasterizes the visible window
 of the complete shaped line, then composites that window through Silk's GPU atlas.

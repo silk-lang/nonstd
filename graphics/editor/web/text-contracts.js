@@ -10,6 +10,8 @@ export async function runTextContracts() {
     calls.push({ width: this.canvas.width, height: this.canvas.height });
     return original.apply(this, args);
   };
+  const readPixels = CanvasRenderingContext2D.prototype.getImageData; let readbacks = 0;
+  CanvasRenderingContext2D.prototype.getImageData = function(...args) { readbacks++; return readPixels.apply(this, args); };
   let passed = 0;
   const check = (value, message) => { if (!value) throw new Error(message); passed++; };
   try {
@@ -74,7 +76,7 @@ export async function runTextContracts() {
     try {
       // Simulate an allocation refusal at the ABI boundary; the existing native tile survives.
       WebGPUHost.prototype.call = function(name, ...args) {
-        if (name === 'editor_image_replace') { replacements++; return 0; }
+        if (name === 'editor_canvas') { replacements++; return 0; }
         return call.call(this, name, ...args);
       };
       editor.setViewport({ zoom: 8 }); editor.render();
@@ -86,7 +88,8 @@ export async function runTextContracts() {
     editor.text('Retry', { fontSize: 12 }); editor.render();
     check(editor.diagnostics.textAtlasTiles === 2 && editor.diagnostics.limitedTextRuns === 0,
       'Atlas changes permit a previously failed resolution update to retry');
+    check(readbacks === 0, 'Text uploads never synchronously read pixels back into JavaScript');
     await editor.flush();
     return { passed };
-  } finally { CanvasRenderingContext2D.prototype.fillText = original; editor.destroy(); canvas.remove(); }
+  } finally { CanvasRenderingContext2D.prototype.getImageData = readPixels; CanvasRenderingContext2D.prototype.fillText = original; editor.destroy(); canvas.remove(); }
 }

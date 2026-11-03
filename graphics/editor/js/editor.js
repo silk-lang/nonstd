@@ -70,6 +70,7 @@ const densityBucket = ratio => 2 ** Math.ceil(Math.log2(Math.max(Number.MIN_VALU
 export class Editor extends EventTarget {
   #host; #token; #lastId = 0; #nodes = new Map(); #selection = new Set(); #frame = 0;
   #dead = false; #transaction = null; #undo = []; #redo = []; #replaying = false;
+  #textCanvas; #uploadCanvas;
   #textTiles = new Map(); #textNodes = new Map(); #textViews = new Map(); #textViewPool = []; #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
   #observer; #cleanups = []; #camera = { x: 0, y: 0, zoom: 1 }; #autoRender;
   #width = 1; #height = 1; #scale = 1;
@@ -89,6 +90,19 @@ export class Editor extends EventTarget {
     host.canvases.set('silk-editor', canvas);
     const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compileStreaming(fetch(wasm));
     const instance = await WebAssembly.instantiate(module, { webgpu: host.imports, editor: {
+      copy_image: (queue, texture, x, y, width, height) => {
+        try {
+          if (!editor.#uploadCanvas) return 0;
+          host.table.get(queue, 'WGPUQueue').copyExternalImageToTexture(
+            { source: editor.#uploadCanvas },
+            { texture: host.table.get(texture, 'WGPUTexture'), origin: { x, y }, premultipliedAlpha: true, colorSpace: 'srgb' },
+            { width, height });
+          return 1;
+        } catch (error) {
+          // The native upload still holds a mutable state loan. Notify listeners after it returns.
+          queueMicrotask(() => { if (!editor.#dead) editor.#error(error); }); return 0;
+        }
+      },
       now: () => performance.now(),
       metric: (buildMs, drawMs, visible, visited, batches) => {
         editor.stats = Object.freeze({ buildMs, drawMs, textMs: editor.#textMs, visible, visited, batches, frames: editor.stats.frames + 1 });
@@ -179,7 +193,7 @@ export class Editor extends EventTarget {
     if (!entry.failedSize && entry.width === size.width && entry.height === size.height &&
       JSON.stringify([entry.view, entry.radius]) === JSON.stringify([size.view, size.radius])) return true;
     if (entry.failedSize === key && entry.failedRevision === this.#textAtlasRevision) { entry.limited = true; return false; }
-    const canvas = document.createElement('canvas'); canvas.width = size.width; canvas.height = size.height;
+    const canvas = this.#textCanvas ??= document.createElement('canvas'); canvas.width = size.width; canvas.height = size.height;
     const ctx = canvas.getContext('2d'), layout = entry.layout;
     const view = size.view ?? { x: 0, y: 0, width: 1, height: 1 };
     ctx.scale(size.width / (layout.width * view.width), size.height / (layout.height * view.height));
@@ -190,25 +204,13 @@ export class Editor extends EventTarget {
     }
     ctx.font = layout.font; ctx.fillStyle = entry.fill; ctx.textBaseline = 'alphabetic';
     ctx.fillText(entry.text, layout.left, layout.baseline);
-    const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let i = 0; i < pixels.length; i += 4) {
-      const coverage = pixels[i + 3];
-      // Canvas readback is transparent black outside the glyphs. Only fractional coverage
-      // needs premultiplication; large zoomed windows are mostly clear or opaque interiors.
-      if (coverage === 0 || coverage === 255) continue;
-      const alpha = coverage / 255;
-      pixels[i] = Math.round(pixels[i] * alpha); pixels[i + 1] = Math.round(pixels[i + 1] * alpha); pixels[i + 2] = Math.round(pixels[i + 2] * alpha);
-    }
-    const pointer = this.#host.call('webgpu_alloc', pixels.length);
-    if (!pointer) throw new Error('Could not allocate text pixels');
+    // Copy the browser canvas directly to the atlas. No pixel readback or WASM staging buffer.
     let kind;
-    try {
-      new Uint8Array(this.#host.exports.memory.buffer, pointer, pixels.length).set(pixels);
-      kind = entry.kind ? this.#call('editor_image_replace', entry.kind, canvas.width, canvas.height, pointer)
-        : this.#call('editor_image', canvas.width, canvas.height, pointer);
-    } finally { this.#host.call('webgpu_free', pointer, pixels.length); }
+    this.#uploadCanvas = canvas;
+    try { kind = this.#call('editor_canvas', entry.kind, canvas.width, canvas.height); }
+    finally { this.#uploadCanvas = null; }
     if (!kind) {
-      if (!entry.kind && !size.view) throw new Error('Text atlas is full');
+      if (!entry.kind && !size.view) throw new Error('Could not upload text to the atlas');
       // A failed replacement leaves the old tile intact. Do not retry this size every frame.
       entry.failedSize = key; entry.failedRevision = this.#textAtlasRevision; entry.limited = true; return false;
     }
@@ -240,10 +242,10 @@ export class Editor extends EventTarget {
     const radius = { x: Math.min(n.radius, n.width / 2, n.height / 2) / n.width,
       y: Math.min(n.radius, n.width / 2, n.height / 2) / n.height };
     const old = entry.view;
-    // Overscan lets small pans reuse pixels. Keep at least two samples per displayed pixel.
+    // Overscan and density headroom let small camera changes reuse pixels. Refresh below 1.5 samples per pixel.
     const reuse = old && old.x * width <= Math.max(0, left) && old.y * height <= Math.max(0, top) &&
       (old.x + old.width) * width >= right && (old.y + old.height) * height >= bottom &&
-      entry.width >= old.width * width * 2 - .01 && entry.height >= old.height * height * 2 - .01 &&
+      entry.width >= old.width * width * 1.5 - .01 && entry.height >= old.height * height * 1.5 - .01 &&
       entry.width < old.width * width * 8 && entry.height < old.height * height * 8 &&
       entry.radius.x === radius.x && entry.radius.y === radius.y;
     if (!reuse) {
@@ -454,6 +456,8 @@ export class Editor extends EventTarget {
     if (this.#token) this.#host.call('editor_drop', this.#token);
     this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear();
     this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear(); this.#textViews.clear(); this.#textViewPool.length = 0;
+    if (this.#textCanvas) this.#textCanvas.width = this.#textCanvas.height = 0;
+    this.#textCanvas = this.#uploadCanvas = null;
     this.emit('destroy', {});
   }
 }

@@ -8,7 +8,7 @@ import { serve } from './serve.mjs';
 const root = new URL('../', import.meta.url), output = new URL('bench/text-zoom/', root);
 const baseline = new URL('dist/editor-zoom-before.js', root);
 const source = execFileSync('git', ['show', 'a24d968:graphics/editor/js/editor.js'], { cwd: fileURLToPath(root), encoding: 'utf8' });
-await writeFile(baseline, source.replace('../../../gpu/webgpu/browser/host.ts', './host.js'));
+await writeFile(baseline, source.replace('../../../gpu/webgpu/browser/host.ts', './host.js').replace('now: () => performance.now(),', 'copy_image: () => 0, now: () => performance.now(),'));
 await mkdir(output, { recursive: true });
 const { chromium } = createRequire(import.meta.url)(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const server = await serve(); let browser;
