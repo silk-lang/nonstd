@@ -6,8 +6,8 @@ import { markChanged } from './state'
 const colors = ['#25352b', '#b8c5ac', '#e6b84e', '#e3ad90', '#799a9d'] as const
 
 export const addSelectionPage = (m: Model): Model => {
-  const existing = m.document.pages.find(
-    (page) => page.name === '4k rectangles' || page.name === '10k rectangles',
+  const existing = m.document.pages.find((page) =>
+    ['4k rectangles', '10k rectangles', '100k rectangles'].includes(page.name),
   )
   if (!existing && m.document.pages.length >= 100)
     return { ...m, notice: 'This document has reached its page limit.' }
@@ -22,21 +22,21 @@ export const addSelectionPage = (m: Model): Model => {
     return id
   }
   const id = existing?.id ?? allocate()
-  const nodes = Array.from({ length: 10_000 }, (_, index) =>
+  const nodes = Array.from({ length: 100_000 }, (_, index) =>
     makeNode(allocate(), 'rect', {
-      name: `Rectangle ${String(index + 1).padStart(5, '0')}`,
-      x: (index % 100) * 80,
-      y: Math.floor(index / 100) * 64,
+      name: `Rectangle ${String(index + 1).padStart(6, '0')}`,
+      x: (index % 250) * 80,
+      y: Math.floor(index / 250) * 64,
       width: 64,
       height: 48,
-      fill: colors[((index % 100) + Math.floor(index / 100)) % colors.length] ?? '#b8c5ac',
+      fill: colors[((index % 250) + Math.floor(index / 250)) % colors.length] ?? '#b8c5ac',
     }),
   )
   const document = {
     ...m.document,
     pages: [
       ...m.document.pages.filter((page) => page.id !== id),
-      { id, name: '10k rectangles', nodes },
+      { id, name: '100k rectangles', nodes },
     ],
     activePageId: id,
     nextId,
