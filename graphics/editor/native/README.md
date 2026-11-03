@@ -13,7 +13,7 @@ From the repository root, with Python 3.11 or newer:
 
 ```sh
 python3 graphics/editor/native/scripts/studio --release
-python3 graphics/editor/native/scripts/studio --release --file ~/Design.silk
+python3 graphics/editor/native/scripts/studio --release --file ~/Design.silkdesign
 ```
 
 The runner uses the repository's pinned Silk compiler, LLVM, and Dawn installers.
@@ -49,11 +49,11 @@ libraries/frameworks; it does not depend on a running compiler or this checkout.
 ## Files and exports
 
 The first launch opens the Form & Field example and autosaves to
-`~/.silk-studio.silk`. Edits are encoded and atomically written on a background
+`~/.silk-studio.silkdesign`. Edits are encoded and atomically written on a background
 thread; close, open, and Save As wait for pending writes. New asks for a separate
 file before replacing the current document. Failed writes retain the open design.
 
-Open and Save As use native dialogs. The version-1 `.silk` JSON schema is shared
+Open and Save As use native dialogs. The version-1 `.silkdesign` JSON schema is shared
 with the browser Studio. Import validates identifiers, hierarchy, numeric bounds,
 colors, and node kinds before replacing the active document. Installed fonts can
 produce different text metrics across platforms.
