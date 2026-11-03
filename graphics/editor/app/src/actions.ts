@@ -1,3 +1,4 @@
+import { addSelectionPage } from './selection-page'
 import { currentPage, makeNode, replaceNodes } from './document'
 import { boundsOf, effectiveFlag, fit, zoomAt } from './geometry'
 import { type Model } from './model'
@@ -14,6 +15,7 @@ import {
 import { align } from './properties'
 
 const handlers: Readonly<Record<string, (m: Model) => Model>> = {
+  'selection-page': addSelectionPage,
   undo: (m) => {
     const previous = m.past.at(-1)
     return previous
