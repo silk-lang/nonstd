@@ -1,11 +1,15 @@
 import { WebGPUHost } from '../../../gpu/webgpu/browser/host.ts';
 
+export const blendModes = Object.freeze(['normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity']);
+
 const defaults = Object.freeze({ type: 'rect', x: 0, y: 0, width: 100, height: 100,
+  opacity: 1, layerBlur: 0, backdropBlur: 0, brightness: 1, contrast: 1, saturation: 1, blendMode: 'normal',
+  innerShadow: '#00000000', innerBlur: 16, innerShadowX: 0, innerShadowY: 4,
   radius: 0, fill: '#9b87f5', border: '#00000000', borderWidth: 0,
   shadow: '#00000000', blur: 0, shadowX: 0, shadowY: 0, gradient: null,
   hidden: false, locked: false, name: '', text: '', fontSize: 24, fontFamily: 'sans-serif', fontWeight: 400 });
 const properties = Object.keys(defaults);
-const numeric = ['x', 'y', 'width', 'height', 'radius', 'borderWidth', 'blur', 'shadowX', 'shadowY'];
+const numeric = ['x', 'y', 'width', 'height', 'radius', 'borderWidth', 'blur', 'shadowX', 'shadowY', 'layerBlur', 'backdropBlur', 'brightness', 'contrast', 'saturation', 'innerBlur', 'innerShadowX', 'innerShadowY'];
 const colorCache = new Map();
 /** Converts #RGB, #RGBA, #RRGGBB, or #RRGGBBAA to the Silk ABI's RGBA word. */
 export function rgba(value) {
@@ -29,7 +33,13 @@ function normalize(value) {
   }
   if (n.width <= 0 || n.height <= 0 || n.radius < 0 || n.borderWidth < 0 || n.blur < 0)
     throw new RangeError('Sizes must be positive; radius, border and blur must be nonnegative');
-  for (const key of ['fill', 'border', 'shadow']) rgba(n[key]);
+  for (const key of ['fill', 'border', 'shadow', 'innerShadow']) rgba(n[key]);
+  for (const key of ['layerBlur', 'backdropBlur', 'innerBlur']) if (n[key] < 0 || n[key] > 1000) throw new RangeError(`Invalid ${key}`);
+  for (const key of ['brightness', 'contrast', 'saturation']) if (n[key] < 0 || n[key] > 4) throw new RangeError(`Invalid ${key}`);
+  if (!Number.isFinite(n.opacity) || n.opacity < 0 || n.opacity > 1) throw new RangeError('Invalid opacity');
+  if (!blendModes.includes(n.blendMode)) throw new TypeError('Unknown blend mode');
+  if (n.type !== 'rect' && rgba(n.innerShadow) % 256) throw new TypeError('Inner shadows require a rectangle');
+  if (n.type === 'text' && n.backdropBlur) throw new TypeError('Backdrop blur requires a rectangle or ellipse');
   if (n.gradient !== null) {
     rgba(n.gradient.to);
     if (!Number.isFinite(n.gradient.angle)) throw new RangeError('Invalid gradient angle');
@@ -162,7 +172,9 @@ export class Editor extends EventTarget {
     const result = this.#call('editor_set', id, text ? text.kind : n.type === 'ellipse' ? 1 : 0, n.x, n.y, n.width, n.height,
       n.radius, n.type === 'text' ? 0xffffffff : rgba(n.fill), rgba(n.border), n.borderWidth, n.blur, n.shadowX, n.shadowY,
       rgba(n.shadow), rgba(n.gradient?.to ?? n.fill), n.gradient?.angle ?? 90,
-      (n.hidden ? 1 : 0) | (n.locked ? 2 : 0) | (n.gradient ? 4 : 0));
+      (n.hidden ? 1 : 0) | (n.locked ? 2 : 0) | (n.gradient ? 4 : 0),
+      n.opacity, n.layerBlur, n.backdropBlur, n.brightness, n.contrast, n.saturation, blendModes.indexOf(n.blendMode),
+      rgba(n.innerShadow), n.innerBlur, n.innerShadowX, n.innerShadowY);
     if (!result) throw new Error('Silk could not store the element');
     if (text) this.#textNodes.set(result, text); else this.#textNodes.delete(result);
     return result;

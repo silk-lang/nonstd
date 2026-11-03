@@ -1,6 +1,7 @@
 import { paintOrder, inheritedOpacity, nodeIndex } from './hierarchy'
 import { Editor, type ElementProperties, type HexColor } from '../../dist/editor.js'
 import { descendants, type Camera, type Page, type Node } from './document'
+import { hasLayerEffects } from './layer-effects'
 import { effectiveFlag } from './geometry'
 
 const alpha = (color: string, opacity: number): HexColor => {
@@ -10,6 +11,17 @@ const alpha = (color: string, opacity: number): HexColor => {
     .padStart(2, '0')}`
 }
 const properties = (n: Node, nodes: readonly Node[], opacity: number): ElementProperties => ({
+  opacity: hasLayerEffects(n) ? opacity : 1,
+  layerBlur: n.layerBlur,
+  backdropBlur: n.backdropBlur,
+  brightness: n.brightness,
+  contrast: n.contrast,
+  saturation: n.saturation,
+  blendMode: n.blendMode,
+  innerShadow: alpha(n.innerShadow, hasLayerEffects(n) ? 1 : opacity),
+  innerBlur: n.innerBlur,
+  innerShadowX: n.innerShadowX,
+  innerShadowY: n.innerShadowY,
   type: n.kind === 'frame' || n.kind === 'group' ? 'rect' : n.kind,
   name: n.name,
   x: n.x,
@@ -17,10 +29,10 @@ const properties = (n: Node, nodes: readonly Node[], opacity: number): ElementPr
   width: n.width,
   height: n.height,
   radius: n.radius,
-  fill: alpha(n.fill, opacity),
-  border: alpha(n.stroke, opacity),
+  fill: alpha(n.fill, hasLayerEffects(n) ? 1 : opacity),
+  border: alpha(n.stroke, hasLayerEffects(n) ? 1 : opacity),
   borderWidth: n.strokeWidth,
-  shadow: alpha(n.shadow, opacity),
+  shadow: alpha(n.shadow, hasLayerEffects(n) ? 1 : opacity),
   blur: n.blur,
   shadowX: n.shadowX,
   shadowY: n.shadowY,

@@ -1,3 +1,4 @@
+import { addEffectsPage } from './effects-page'
 import { nodeIndex } from './hierarchy'
 import { addSelectionPage } from './selection-page'
 import { currentPage, makeNode, replaceNodes } from './document'
@@ -17,6 +18,7 @@ import { align } from './properties'
 
 const handlers: Readonly<Record<string, (m: Model) => Model>> = {
   'selection-page': addSelectionPage,
+  'effects-page': addEffectsPage,
   undo: (m) => {
     const previous = m.past.at(-1)
     return previous

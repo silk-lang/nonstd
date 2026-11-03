@@ -114,6 +114,34 @@ Rectangle styles include a uniform corner radius, uniform border, two-stop linea
 from up; blur follows CSS's convention (twice the Gaussian sigma). Ellipses support fills and
 gradients; borders and shadows on ellipses are explicitly rejected.
 
+All elements support `opacity` (0–1), `layerBlur` (0–1000 world-unit Gaussian sigma),
+`brightness`, `contrast`, and `saturation` (0–4, neutral 1), and `blendMode`. Exported
+`blendModes` lists the 16 standard modes, including multiply, screen, overlay, and luminosity.
+Color adjustments run after layer blur, in saturation → brightness → contrast order in straight sRGB.
+Rectangles and ellipses also support `backdropBlur` (Gaussian sigma), clipped to their shape;
+use a translucent fill to see the blurred background. Text does not support backdrop blur.
+Rectangles support `innerShadow`, `innerBlur`, `innerShadowX`, and `innerShadowY`;
+`innerBlur`, like drop-shadow `blur`, is twice Gaussian sigma.
+
+```js
+editor.rect({
+  x: 80, y: 80, width: 280, height: 180,
+  radius: 24, fill: '#ffffff40', backdropBlur: 12,
+  innerShadow: '#00000040', innerBlur: 16, innerShadowY: 4,
+});
+editor.ellipse({
+  x: 300, y: 120, width: 160, height: 160,
+  fill: '#ff8844', layerBlur: 10, blendMode: 'screen', saturation: 0.6,
+});
+```
+
+Filtered elements composite through pooled GPU textures; ordinary scenes retain their direct
+rendering path. The pool is reused between frames, but blur and blend work still scales with
+painted area and layer count. Backdrop blur currently filters the viewport. Filter surfaces
+are viewport sized, so effects that need source pixels beyond the viewport can clip at its edges.
+This is not a claim that 100,000 blurred layers run at the speed of 100,000 plain rectangles.
+Ship the generated JavaScript and WASM together: their internal bridge ABI must match.
+
 `hidden` suppresses painting and hits. `locked` suppresses hits but keeps painting. Transparent
 shapes still hit their geometric area. Making an element hidden or locked removes it from selection.
 

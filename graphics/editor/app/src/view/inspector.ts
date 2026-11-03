@@ -1,3 +1,4 @@
+import { effectsSection, innerShadowSection } from './inspector-effects'
 import type { Html } from 'foldkit/html'
 import { currentPage } from '../document'
 import { icon } from '../icons'
@@ -64,7 +65,9 @@ export const inspector = (m: Model, h: H): Html => {
         typographySection(m, n, h),
         appearanceSection(m, n, h),
         strokeSection(m, n, h),
+        effectsSection(m, n, h),
         shadowSection(m, n, h),
+        innerShadowSection(m, n, h),
         arrangeSection(h),
         exportSection(h),
       ]

@@ -1,3 +1,4 @@
+import { rasterExport } from './raster-export'
 import { loadDocument, listDocuments, saveDocument } from './storage'
 import { Data, Effect, Schema } from 'effect'
 import { Command } from 'foldkit'
@@ -127,6 +128,33 @@ const pngBlob = (svg: string) =>
         URL.revokeObjectURL(url)
       }),
   )
+const exportImage = (
+  document: Model['document'],
+  selection: readonly string[],
+  format: 'png' | 'svg',
+) =>
+  Effect.gen(function* () {
+    const page = currentPage(document)
+    if (
+      format === 'png' &&
+      page.nodes.some(
+        (n) =>
+          n.layerBlur > 0 ||
+          n.backdropBlur > 0 ||
+          n.blendMode !== 'normal' ||
+          n.brightness !== 1 ||
+          n.contrast !== 1 ||
+          n.saturation !== 1 ||
+          n.innerShadow !== '#00000000',
+      )
+    )
+      return yield* Effect.tryPromise({
+        try: () => rasterExport(page, selection),
+        catch: fileError,
+      })
+    const svg = yield* Effect.try({ try: () => svgDocument(page, selection), catch: fileError })
+    return format === 'png' ? yield* pngBlob(svg) : new Blob([svg], { type: 'image/svg+xml' })
+  })
 export const ExportDocument = Command.define('ExportDocument', {
   args: {
     document: DesignDocumentSchema,
@@ -140,14 +168,12 @@ export const ExportDocument = Command.define('ExportDocument', {
       if (format === 'json')
         yield* Effect.sync(() => {
           download(
-            new Blob([JSON.stringify(document, null, 2)], { type: 'application/json' }),
+            new Blob([JSON.stringify(document)], { type: 'application/json' }),
             `${name}.silk`,
           )
         })
       else {
-        const svg = svgDocument(currentPage(document), selection)
-        const blob =
-          format === 'png' ? yield* pngBlob(svg) : new Blob([svg], { type: 'image/svg+xml' })
+        const blob = yield* exportImage(document, selection, format)
         yield* Effect.sync(() => {
           download(blob, `${name}.${format}`)
         })

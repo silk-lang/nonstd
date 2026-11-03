@@ -1,3 +1,5 @@
+export type BlendMode = 'normal' | 'multiply' | 'screen' | 'overlay' | 'darken' | 'lighten' | 'color-dodge' | 'color-burn' | 'hard-light' | 'soft-light' | 'difference' | 'exclusion' | 'hue' | 'saturation' | 'color' | 'luminosity';
+export const blendModes: readonly BlendMode[];
 export type ElementId = number;
 export type HexColor = `#${string}`;
 export type ElementType = 'rect' | 'ellipse' | 'text';
@@ -5,6 +7,15 @@ export interface ElementProperties {
   type?: ElementType; name?: string; x?: number; y?: number; width?: number; height?: number;
   fill?: HexColor; radius?: number; border?: HexColor; borderWidth?: number;
   shadow?: HexColor; blur?: number; shadowX?: number; shadowY?: number;
+  /** Opacity of the complete element, 0–1; default 1. */
+  opacity?: number;
+  /** Gaussian standard deviation in world units; zero disables blur. */
+  layerBlur?: number; backdropBlur?: number;
+  /** Straight-sRGB multipliers, 0–4; default 1. Applied saturation, brightness, then contrast. */
+  brightness?: number; contrast?: number; saturation?: number;
+  blendMode?: BlendMode;
+  /** Rectangle-only inset shadow; blur is twice the Gaussian standard deviation. */
+  innerShadow?: HexColor; innerBlur?: number; innerShadowX?: number; innerShadowY?: number;
   gradient?: Readonly<{ to: HexColor; angle: number }> | null;
   hidden?: boolean; locked?: boolean;
   text?: string; fontSize?: number; fontFamily?: string; fontWeight?: 100|200|300|400|500|600|700|800|900;

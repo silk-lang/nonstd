@@ -1,3 +1,5 @@
+import { Schema } from 'effect'
+import { BlendModeSchema } from './document'
 import { patchGeometry } from './property-geometry'
 import { naturalText } from './text-layout'
 import { currentPage, type Node } from './document'
@@ -12,6 +14,8 @@ const numericProperty = (field: string, number: number): Partial<Node> => {
     case 'y':
     case 'shadowX':
     case 'shadowY':
+    case 'innerShadowX':
+    case 'innerShadowY':
       return { [field]: Math.max(-1_000_000, Math.min(1_000_000, number)) }
     case 'width':
     case 'height':
@@ -20,7 +24,14 @@ const numericProperty = (field: string, number: number): Partial<Node> => {
       return { radius: Math.max(0, Math.min(50_000, number)) }
     case 'strokeWidth':
     case 'blur':
+    case 'layerBlur':
+    case 'backdropBlur':
+    case 'innerBlur':
       return { [field]: Math.max(0, Math.min(1000, number)) }
+    case 'brightness':
+    case 'contrast':
+    case 'saturation':
+      return { [field]: Math.max(0, Math.min(4, number / 100)) }
     case 'opacity':
       return { opacity: Math.max(0, Math.min(1, number / 100)) }
     case 'fontSize':
@@ -33,8 +44,15 @@ export const patch = (m: Model, field: string, value: string): Model => {
   const number = Number(value)
   let properties: Partial<Node> = {}
   if (field === 'name') properties = { name: value.slice(0, 160) }
+  else if (field === 'blendMode' && Schema.is(BlendModeSchema)(value))
+    properties = { blendMode: value }
   else if (field === 'text') properties = { text: value.replaceAll('\n', ' ').slice(0, 10_000) }
-  else if (field === 'fill' || field === 'stroke' || field === 'shadow') {
+  else if (
+    field === 'fill' ||
+    field === 'stroke' ||
+    field === 'shadow' ||
+    field === 'innerShadow'
+  ) {
     const normalized = value.startsWith('#') ? value : `#${value}`
     if (!/^#[\da-f]{6}([\da-f]{2})?$/iu.test(normalized))
       return { ...m, notice: 'Use a six- or eight-digit hex color.' }
@@ -52,6 +70,9 @@ export const patch = (m: Model, field: string, value: string): Model => {
   else if (Number.isFinite(number) && value.trim() !== '') {
     properties = numericProperty(field, number)
   } else return m
+  return patchSelected(m, field, properties)
+}
+const patchSelected = (m: Model, field: string, properties: Partial<Node>): Model => {
   const nodes = currentPage(m.document).nodes
   const selection = selectedNodes(m).filter((n) => !effectiveFlag(n, nodes, 'locked'))
   const selected = new Set(selection.map((n) => n.id))
@@ -66,6 +87,21 @@ export const patch = (m: Model, field: string, value: string): Model => {
       if (!selected.has(n.id)) return n
       if ((n.kind === 'ellipse' || n.kind === 'text') && ['strokeWidth', 'shadow'].includes(field))
         return n
+      if (
+        n.kind === 'group' &&
+        [
+          'layerBlur',
+          'backdropBlur',
+          'brightness',
+          'contrast',
+          'saturation',
+          'blendMode',
+          'innerShadow',
+        ].includes(field)
+      )
+        return n
+      if ((n.kind === 'text' || n.kind === 'ellipse') && field === 'innerShadow') return n
+      if (n.kind === 'text' && field === 'backdropBlur') return n
       const changed = Object.assign({}, n, properties)
       return n.kind === 'text' && ['text', 'fontFamily', 'fontWeight', 'fontSize'].includes(field)
         ? naturalText(changed)

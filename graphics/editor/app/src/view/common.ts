@@ -71,6 +71,11 @@ export const numeric = (
     | 'radius'
     | 'strokeWidth'
     | 'blur'
+    | 'layerBlur'
+    | 'backdropBlur'
+    | 'innerBlur'
+    | 'innerShadowX'
+    | 'innerShadowY'
     | 'shadowX'
     | 'shadowY'
     | 'fontSize',
@@ -80,7 +85,7 @@ export const colorField = (
   m: Model,
   h: H,
   n: Node,
-  field: 'fill' | 'stroke' | 'shadow',
+  field: 'fill' | 'stroke' | 'shadow' | 'innerShadow',
   title: string,
 ): Html =>
   h.div(

@@ -19,7 +19,11 @@ test('the 100k-pixel mosaic plus its caption can be saved and imported as a docu
   const nodes = currentPage(m.document).nodes
   expect(nodes.filter((n) => n.kind === 'rect')).toHaveLength(100_000)
   expect(nodes.filter((n) => n.kind === 'text').map((n) => n.text)).toEqual([...selectionTitle])
-  expect(Schema.is(DesignDocumentSchema)(m.document)).toBe(true)
+  const backup = JSON.stringify(m.document)
+  expect(new Blob([backup]).size).toBeLessThan(64 * 1024 * 1024)
+  const restored = Schema.decodeUnknownSync(DesignDocumentSchema)(JSON.parse(backup) as unknown)
+  expect(currentPage(restored).nodes).toHaveLength(100002)
+  expect(currentPage(restored).nodes[50000]).toEqual(nodes[50000])
 })
 
 const point = (x: number, y: number, shift = false): Pointer => ({

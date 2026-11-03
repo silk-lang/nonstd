@@ -43,6 +43,7 @@ try {
   } else {
     const result = await page.evaluate(async () => (await import('/web/contracts.js')).runContracts());
     console.log('Contracts:', result);
+    console.log('Effect contracts:', await page.evaluate(async () => (await import('/web/effect-contracts.js')).runEffectContracts()));
     console.log('Text contracts:', await page.evaluate(async () => (await import('/web/text-contracts.js')).runTextContracts()));
     console.log('High-zoom text contracts:', await page.evaluate(async () => (await import('/web/text-zoom-contracts.js')).runTextZoomContracts()));
     await page.selectOption('#workload', 'overview'); await page.selectOption('#count', '100000');

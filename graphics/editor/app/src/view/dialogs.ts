@@ -18,6 +18,7 @@ const commands: readonly (readonly [string, string, string, IconName])[] = [
   ['Toggle grid', 'grid', '', 'grid'],
   ['Toggle smart guides', 'snap', '', 'snap'],
   ['Add page', 'new-page', '', 'plus'],
+  ['Add effects playground', 'effects-page', '', 'rect'],
   ['Add 100k rectangles', 'selection-page', '', 'rect'],
   ['Download .silk file', 'export-json', '⌘S', 'export'],
   ['Import document', 'import', '', 'file'],

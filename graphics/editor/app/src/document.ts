@@ -1,4 +1,4 @@
-import { Schema } from 'effect'
+import { Effect, Schema } from 'effect'
 
 const coordinate = Schema.Finite.check(
   Schema.isBetween({ minimum: -1_000_000, maximum: 1_000_000 }),
@@ -7,6 +7,26 @@ const dimension = Schema.Finite.check(Schema.isBetween({ minimum: 0.1, maximum: 
 const color = Schema.String.check(Schema.isPattern(/^#[\da-f]{6}([\da-f]{2})?$/iu))
 export const KindSchema = Schema.Literals(['rect', 'ellipse', 'text', 'frame', 'group'])
 export type Kind = typeof KindSchema.Type
+export const BlendModeSchema = Schema.Literals([
+  'normal',
+  'multiply',
+  'screen',
+  'overlay',
+  'darken',
+  'lighten',
+  'color-dodge',
+  'color-burn',
+  'hard-light',
+  'soft-light',
+  'difference',
+  'exclusion',
+  'hue',
+  'saturation',
+  'color',
+  'luminosity',
+])
+const blurSize = Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 1000 }))
+const multiplier = Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: 4 }))
 export const NodeSchema = Schema.Struct({
   id: Schema.String,
   parentId: Schema.NullOr(Schema.String),
@@ -29,6 +49,16 @@ export const NodeSchema = Schema.Struct({
   fontSize: Schema.Finite.check(Schema.isBetween({ minimum: 1, maximum: 512 })),
   fontFamily: Schema.Literals(['Arial', 'Georgia', 'Courier New']),
   fontWeight: Schema.Literals([400, 500, 600, 700]),
+  layerBlur: blurSize.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
+  backdropBlur: blurSize.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
+  brightness: multiplier.pipe(Schema.withDecodingDefaultKey(Effect.succeed(1))),
+  contrast: multiplier.pipe(Schema.withDecodingDefaultKey(Effect.succeed(1))),
+  saturation: multiplier.pipe(Schema.withDecodingDefaultKey(Effect.succeed(1))),
+  blendMode: BlendModeSchema.pipe(Schema.withDecodingDefaultKey(Effect.succeed('normal'))),
+  innerShadow: color.pipe(Schema.withDecodingDefaultKey(Effect.succeed('#00000000'))),
+  innerBlur: blurSize.pipe(Schema.withDecodingDefaultKey(Effect.succeed(16))),
+  innerShadowX: coordinate.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
+  innerShadowY: coordinate.pipe(Schema.withDecodingDefaultKey(Effect.succeed(4))),
   hidden: Schema.Boolean,
   locked: Schema.Boolean,
 })
@@ -77,6 +107,16 @@ export const makeNode = (id: string, kind: Kind, patch: Partial<Node> = {}): Nod
   fontSize: 32,
   fontFamily: 'Arial',
   fontWeight: 400,
+  layerBlur: 0,
+  backdropBlur: 0,
+  brightness: 1,
+  contrast: 1,
+  saturation: 1,
+  blendMode: 'normal',
+  innerShadow: '#00000000',
+  innerBlur: 16,
+  innerShadowX: 0,
+  innerShadowY: 4,
   hidden: false,
   locked: false,
   ...patch,
@@ -105,6 +145,19 @@ export const documentIssue = (doc: DesignDocument): string | null => {
       )
         return 'Text and ellipses do not support strokes or shadows in this version.'
       ids.add(n.id)
+      if ((n.kind === 'text' || n.kind === 'group') && n.backdropBlur > 0)
+        return 'Backdrop blur requires a rectangle, frame or ellipse.'
+      if (n.kind !== 'rect' && n.kind !== 'frame' && n.innerShadow.toLowerCase() !== '#00000000')
+        return 'Inner shadows require a rectangle or frame.'
+      if (
+        n.kind === 'group' &&
+        (n.layerBlur > 0 ||
+          n.brightness !== 1 ||
+          n.contrast !== 1 ||
+          n.saturation !== 1 ||
+          n.blendMode !== 'normal')
+      )
+        return 'Filters on whole groups are not supported yet. Apply them to individual layers.'
       const path = new Set([n.id])
       let parent = n.parentId
       while (parent !== null) {

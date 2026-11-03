@@ -29,7 +29,15 @@ Double-click text to edit it on the canvas. Changing its text or font uses natur
 
 Documents save automatically to IndexedDB on this browser origin. The header confirms completed saves. **Open local documents** lists the most recently saved documents. Download `.silk` files for portable backups; clearing browser site data also clears local documents. Importing creates an independent document, validates its schema and hierarchy, and preserves the current document when a file is invalid. Files up to 64 MB and 200,000 layers per page are accepted, subject to available device resources.
 
-SVG and PNG export the selection, including selected containers' descendants, or the whole current page when nothing is selected. PNG uses up to 2× resolution, bounded to 8192 pixels on its longest side. Exports include shadow extents and the text's current scale. SVG text remains text and relies on the recipient having the selected font.
+Choose **Commands → Add effects playground** for an editable example of frosted glass,
+blurred glows, inset shadows, blend modes, and color adjustments. Select a shape to use the
+inspector's **Effects** section: layer blur, backdrop blur, brightness, contrast, saturation,
+and 16 blend modes. Rectangle/frame layers also expose inner shadows. Blur distances scale
+with zoom; layer/backdrop blur values are Gaussian sigma in document units, while shadow
+blur values are twice sigma. Color controls use percentages with 100% as neutral. Existing
+documents decode neutral defaults. Changes participate in undo and local persistence.
+
+SVG and PNG export the selection, including selected containers' descendants, or the whole current page when nothing is selected. PNG uses up to 2× resolution, bounded to 8192 pixels on its longest side for ordinary scenes and 4096 for scenes with effects. Effect PNGs use the GPU renderer. Exports include shadow extents and the text's current scale. SVG text remains text and relies on the recipient having the selected font. SVG preserves layer blur, inner shadows, color adjustments, and blend styles; backdrop blur export reports an error directing you to PNG or `.silk`, since SVG cannot reliably preserve it.
 
 | Shortcut                          | Action                                           |
 | --------------------------------- | ------------------------------------------------ |
@@ -58,10 +66,11 @@ bun run bench --grep '100k rectangles' # Selection benchmark only
 bun run bench:selection:cpu # Reducer and shared selection calculations, without rendering
 bun run bench:edits:cpu # 100k alignment, undo/redo, width and duplication
 bun run bench tests/browser/edit-performance.spec.ts # 100k alignment and undo through saving
+bun run bench tests/browser/effects-performance.spec.ts # Effects playground zoom
 bun run build
 ```
 
-Browser tests use installed Google Chrome with WebGPU enabled. Playwright writes failure traces and screenshots under ignored `test-results/`. The benchmark attaches JSON measurements and prints them. Its fixed viewport is 1440×960 at DPR 2; each size uses 40 repeated labels, 120 idle warm-up frames, then 120 zoom updates. All layers remain visible through the measured overview gesture. It measures browser animation-frame intervals, not GPU completion or input-to-display latency.
+Browser tests use installed Google Chrome with WebGPU enabled. Set `SILK_STUDIO_URL=http://127.0.0.1:4173` to run the effects workflow or performance tests against an already-running production preview; storage-contract tests still require the development server. Playwright writes failure traces and screenshots under ignored `test-results/`. The benchmark attaches JSON measurements and prints them. Its fixed viewport is 1440×960 at DPR 2; each size uses 40 repeated labels, 120 idle warm-up frames, then 120 zoom updates. All layers remain visible through the measured overview gesture. It measures browser animation-frame intervals, not GPU completion or input-to-display latency.
 
 The [recorded run](benchmarks/overview.json) reached approximately 16.7 ms median and 16.8 ms p95 frame intervals at both sizes. Cold loading and the warm-up are reported separately as `settledMs`; they took about 3.4 s and 7.0 s in that run. This is a reproducible workload, not a general claim about every design or a new comparison with Figma. Distinct glyphs, large text, effects, hardware, and browsers change the workload substantially.
 
@@ -77,8 +86,15 @@ Bulk alignment and inspector geometry changes traverse the document once, with a
 
 Local storage uses IndexedDB version 2. Small saves journal changed nodes by document and node ID; opening a document overlays that journal onto its snapshot. Initial saves, structural changes, metadata changes, and batches over 512 nodes atomically checkpoint the whole document and clear its journal. The last-saved baseline advances only when the transaction completes. Browser contracts verify migration from version 1, reloads, undo, deletion checkpoints, and rollback/retry after a partially queued write fails. Portable `.silk` files keep their existing format.
 
+The [effects measurements](benchmarks/effects.json) record animation-frame intervals for the
+27-layer playground, plus the existing 100k selection and bulk-edit regressions with the new
+renderer. The effects benchmark verifies that zoom actually changes. These small-composition
+measurements do not establish performance for thousands of filtered layers. GPU pixel contracts
+cover blur, clipped backdrop blur, inner shadows, color filters, blend modes, undo, and resource
+reuse. The shared renderer fixture compares GPU output against the CPU reference in two formats.
+
 ## Current boundaries
 
-This remains a demo application, with deliberate scope: single-line text in Arial, Georgia, and Courier New; rectangular frames without clipping; no rotation, paths, image import, rich text, auto layout, components, collaboration, or cloud sync. Ellipse/text stroke and shadow controls are omitted because the current renderer does not support them. Group opacity multiplies each descendant's opacity, rather than compositing the group into an offscreen surface. Undo retains up to 50 document snapshots for the current session. Concurrent editing of the same document in multiple tabs is not coordinated.
+This remains a demo application, with deliberate scope: single-line text in Arial, Georgia, and Courier New; rectangular frames without clipping; no rotation, paths, image import, rich text, auto layout, components, collaboration, or cloud sync. Ellipse/text stroke and shadow controls are omitted because the current renderer does not support them. Whole-group filters are not supported; apply effects to individual layers. Filter textures are viewport sized, so blur can clip at viewport edges when its source extends beyond them. Backdrop blur currently processes the full viewport. Group opacity multiplies each descendant's opacity, rather than compositing the group into an offscreen surface. Undo retains up to 50 document snapshots for the current session. Concurrent editing of the same document in multiple tabs is not coordinated.
 
 The stack pins Foldkit 0.170.0, Effect 4.1.2, TypeScript 7.0.2, Oxc, and Tailwind 4.3.4. `prepare` patches the native TypeScript and Oxlint integrations with `@effect/tsgo`. Strict lint categories and warnings-as-errors are enabled. Readonly-parameter exceptions are limited to imperative browser/test handles, framework view/queue types, and tagged errors; document and model types remain readonly.
