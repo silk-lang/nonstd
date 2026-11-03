@@ -164,3 +164,18 @@ test('deleting a container includes locked children and leaves no orphan referen
   expect(currentPage(deleted.document).nodes).toHaveLength(0)
   expect(documentIssue(deleted.document)).toBeNull()
 })
+
+test('click jitter keeps the source document and a return-to-origin drag adds no history', () => {
+  const before = model([makeNode('a', 'text', { text: 'edit me' })], ['a'])
+  const down = reduce(before, Messages.PointerDown({ point: point(20, 20) }))
+  const jitter = reduce(down, Messages.PointerMove({ point: point(21, 21) }))
+  expect(jitter.document).toBe(before.document)
+  expect(reduce(jitter, Messages.PointerUp({ point: point(21, 21) })).past).toHaveLength(0)
+  const away = reduce(down, Messages.PointerMove({ point: point(40, 40) }))
+  const returned = reduce(away, Messages.PointerMove({ point: point(20, 20) }))
+  const done = reduce(returned, Messages.PointerUp({ point: point(20, 20) }))
+  expect(done.document).toBe(before.document)
+  expect(done.past).toHaveLength(0)
+  const editing = reduce(done, Messages.DoubleClick({ point: { x: 20, y: 20 } }))
+  expect(editing.editingId).toBe('a')
+})

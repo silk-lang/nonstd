@@ -1,3 +1,5 @@
+import { finish } from '../src/gesture-move'
+import { begin } from '../src/gesture-start'
 import { expect, test } from 'bun:test'
 import { currentPage, emptyDocument, makeNode, replaceNodes } from '../src/document'
 import { align, patch } from '../src/properties'
@@ -78,3 +80,26 @@ test('one width edit in 100k grouped cards stays within a linear-work budget', (
   expect(changed[0]).toBe(nodes[0])
   expect(next.past).toEqual([m.document])
 }, 10_000)
+
+test('releasing a stationary click on a 300k-layer document does not serialize it or add history', () => {
+  const nodes = Array.from({ length: 300_000 }, (_, i) =>
+    makeNode(`t${i}`, 'text', { text: 'around these boxes', x: i }),
+  )
+  const base = initialModel(replaceNodes(emptyDocument('click'), nodes))
+  const pointer = {
+    x: 0,
+    y: 0,
+    button: 0,
+    shift: false,
+    alt: false,
+    meta: false,
+    space: false,
+    handle: '',
+  }
+  const model = { ...base, gesture: begin(base, pointer, 'move') }
+  const start = performance.now()
+  const result = finish(model)
+  expect(performance.now() - start).toBeLessThan(100)
+  expect(result.document).toBe(base.document)
+  expect(result.past).toHaveLength(0)
+})

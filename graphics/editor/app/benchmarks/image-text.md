@@ -9,7 +9,7 @@ wheel handler and measures animation-frame cadence. It does not measure GPU comp
 input-to-display latency, or compare another product. The first ten intervals are omitted.
 
 ```js
-async function cameraGesture(pan = false) {
+async function cameraGesture(pan = false, zoomDelta = 30) {
   const host = document.querySelector('#canvas-host')
   const bounds = host.getBoundingClientRect()
   return new Promise((resolve) => {
@@ -27,7 +27,7 @@ async function cameraGesture(pan = false) {
           clientX: bounds.x + bounds.width / 2,
           clientY: bounds.y + bounds.height / 2,
           deltaX: pan ? -direction * 18 : 0,
-          deltaY: pan ? 0 : direction * 2,
+          deltaY: pan ? 0 : direction * zoomDelta,
           ctrlKey: !pan,
         }),
       )
@@ -64,3 +64,24 @@ comparisons had zero pixel difference in the local run. Native tests protect ord
 across texture pages and cache invalidation. App tests cover distinct integer crop windows,
 legacy document decoding, SVG asset reuse, nested group bounds, and a 100k-group edit
 budget. Production inspector width editing and undo were also exercised through the UI.
+
+## Wide zoom and direct text editing regression
+
+The original measurements above used a narrow ±2 wheel delta. That missed the stalls
+when crossing many raster-density levels. Use the function's default ±30 delta starting
+from Fit all for the wider regression, then repeat without reloading. Wait for the page
+to finish loading before sampling. The two-second gesture crosses from the overview to
+readable cards and back; both cold and warmed results matter. The target is p95 below
+25 ms. [Follow-up measurements](image-text-zoom-fix.json) retain the worst intervals too.
+
+The fix reserves bounded useful rasters for small labels, keeps them while memory permits,
+prunes text preparation by spatial blocks, switches to CPU culling sooner, and reuses
+image bind groups within a render pass. It preserves text resolution and painter order.
+
+Direct editing was verified by selecting Box 100000's text, choosing **Zoom to selection**,
+double-clicking its canvas bounds, replacing the text, pressing Enter, waiting for local
+save, and undoing. Releasing a stationary click previously serialized the entire document
+twice; a 300k-layer CPU reproduction took 339 ms and allocated large temporary strings.
+The identity-based path took under 1 ms. A three-pixel drag threshold also prevents click
+jitter from invoking snapping and document transformations before text editing begins.
+The model tests guard click, jitter, return-to-origin drag, and history behavior.

@@ -121,10 +121,14 @@ const panMove = (m: Model, p: Pointer, gesture: Gesture): Model => {
     },
   }
 }
+const isClickMotion = (m: Model, p: Pointer, g: Gesture): boolean =>
+  g.type === 'move' && m.document === g.source && Math.hypot(p.x - g.start.x, p.y - g.start.y) < 3
+
 export const move = (m: Model, p: Pointer): Model => {
   const g = m.gesture
   if (!g) return m
   const gesture = { ...g, current: { x: p.x, y: p.y } }
+  if (isClickMotion(m, p, g)) return { ...m, gesture }
   if (g.type === 'pan') return panMove(m, p, gesture)
   const start = worldPoint(g.start, g.camera)
   const end = worldPoint(p, g.camera)
@@ -183,6 +187,40 @@ export const finish = (m: Model): Model => {
     next = { ...next, document: replaceNodes(m.document, nodes), tool: 'select' }
   }
   if (g.type === 'pan' || g.type === 'marquee') return next
-  if (JSON.stringify(next.document) === JSON.stringify(g.before)) return next
+  if (sameGestureDocument(next.document, g.before)) return { ...next, document: g.before }
   return markChanged(next, next.document, g.before)
 }
+
+// A gesture edits one page and preserves nested property references. Compare only
+// changed node snapshots; never allocate serialized copies of every page on click.
+const sameGestureDocument = (after: Model['document'], before: Model['document']): boolean => {
+  if (after === before) return true
+  if (
+    after.id !== before.id ||
+    after.name !== before.name ||
+    after.activePageId !== before.activePageId ||
+    after.nextId !== before.nextId ||
+    after.pages.length !== before.pages.length
+  )
+    return false
+  return after.pages.every((page, index) => {
+    const original = before.pages[index]
+    if (page === original) return true
+    if (
+      !original ||
+      page.id !== original.id ||
+      page.name !== original.name ||
+      page.nodes.length !== original.nodes.length
+    )
+      return false
+    return page.nodes.every((node, i) => {
+      const prior = original.nodes[i]
+      return node === prior || (prior !== undefined && sameSnapshot(node, prior))
+    })
+  })
+}
+
+const sameSnapshot = (
+  left: Readonly<Record<string, unknown>>,
+  right: Readonly<Record<string, unknown>>,
+): boolean => Object.keys(left).every((key) => left[key] === right[key])
