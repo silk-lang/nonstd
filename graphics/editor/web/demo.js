@@ -1,6 +1,6 @@
 import { Editor } from '/dist/editor.js';
 import { attachInteractions } from '/dist/interaction.js';
-import { makeScene, runBenchmark } from './benchmark.js';
+import { makeScene, makeOverview, overviewCamera, runBenchmark } from './benchmark.js';
 const $ = id => document.getElementById(id);
 let editor;
 function toast(message) { $('toast').textContent = message; $('toast').style.display = 'block'; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').style.display = 'none', 4000); }
@@ -96,20 +96,22 @@ try {
   $('export').onclick = () => download(editor.toJSON(), 'silk-document.json');
   $('stress').onclick = () => {
     const count = Number($('count').value); const start = performance.now();
-    editor.load({ version: 1, elements: makeScene(count) }); editor.clearHistory();
-    editor.setViewport({ x: 0, y: 0, zoom: 1 }); layers();
+    const overview = $('workload').value.startsWith('overview') ? makeOverview(count, { shadows: $('shadows').checked }) : null;
+    editor.load({ version: 1, elements: overview?.nodes ?? makeScene(count, { shadows: $('shadows').checked }) }); editor.clearHistory();
+    editor.setViewport(overview ? overviewCamera(overview, editor.viewport.width, editor.viewport.height, 0) : { x: 0, y: 0, zoom: 1 }); layers();
     toast(`${count.toLocaleString()} layers loaded in ${(performance.now() - start).toFixed(0)} ms. Pan and zoom to explore.`);
   };
   $('benchmark').onclick = async () => {
     $('benchmark').disabled = true;
     try {
-      const report = await runBenchmark({ count: Number($('count').value), onProgress: s => $('bench-status').textContent = s });
+      const report = await runBenchmark({ count: Number($('count').value), workload: $('workload').value, shadows: $('shadows').checked,
+        frames: 30, warmup: 5, modes: ['silk', 'dom', 'dom-culled', 'dom-composited'], onProgress: s => $('bench-status').textContent = s });
       window.benchmarkReport = report;
-      $('bench-status').textContent = 'CPU update median · lower is better'; $('bench-results').replaceChildren();
-      const max = Math.max(...report.results.map(r => r.updateMedianMs));
+      $('bench-status').textContent = 'Frame cadence · higher is better'; $('bench-results').replaceChildren();
+      const max = Math.max(...report.results.map(r => r.averageFps));
       for (const r of report.results) {
         const row = document.createElement('div'); row.className = 'bar-row';
-        row.innerHTML = `<div><span>${r.mode === 'silk' ? 'Silk / WASM + WebGPU' : r.mode === 'dom' ? 'DOM / all layers' : 'DOM / viewport culling'}</span><span>${r.updateMedianMs.toFixed(2)} ms</span></div><div class="bar" style="width:${Math.max(2, r.updateMedianMs / max * 100)}%"></div><small>${r.averageFps.toFixed(1)} avg rAF fps · p95 ${r.frameP95Ms.toFixed(1)} ms</small>`;
+        row.innerHTML = `<div><span>${r.mode === 'silk' ? 'Silk / WASM + WebGPU' : r.mode === 'dom' ? 'DOM / all layers' : r.mode === 'dom-composited' ? 'DOM / compositor hint' : 'DOM / viewport culling'}</span><span>${r.averageFps.toFixed(1)} fps</span></div><div class="bar" style="width:${Math.max(2, r.averageFps / max * 100)}%"></div><small>${r.updateMedianMs.toFixed(1)} ms CPU · frame p95 ${r.frameP95Ms.toFixed(1)} ms</small>`;
         $('bench-results').append(row);
       }
       const save = document.createElement('button'); save.textContent = 'Download measurements'; save.onclick = () => download(report, 'silk-benchmark.json'); $('bench-results').append(save);

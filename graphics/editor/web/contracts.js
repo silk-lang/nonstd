@@ -61,6 +61,23 @@ export async function runContracts() {
     check(screen.x === 20 && screen.y === 30, 'World/screen inverse');
     const anchor = e.screenToWorld(50, 60); e.zoomAt(3, 50, 60);
     const anchored = e.screenToWorld(50, 60); check(Math.abs(anchor.x - anchored.x) < 1e-10 && Math.abs(anchor.y - anchored.y) < 1e-10, 'Zoom preserves pointer anchor');
+    // The quad-only fast path must match the mixed-kind overlap-ordering path byte for byte.
+    e.setViewport({ x: -4.25, y: 2.5, zoom: .65 }); e.resize(256, 192, 1);
+    e.load({ version: 1, elements: [
+      { x: 0, y: 0, width: 240, height: 180, fill: '#ccaa88', radius: 12 },
+      { x: 10, y: 10, width: 140, height: 100, fill: '#ff000080', radius: 9 },
+      { x: 60, y: 40, width: 140, height: 100, fill: '#0000ff80', gradient: { to: '#33ff3380', angle: 130 }, border: '#fff8', borderWidth: 3 },
+    ] });
+    const fast = pixels(e);
+    const sentinel = e.ellipse({ x: 10000, y: 10000, width: 10, height: 10 });
+    const reference = pixels(e);
+    check(fast.every((v, i) => v === reference[i]), 'Pinned quads preserve translucent overlap, gradients and borders');
+    e.update(sentinel, { hidden: true });
+    check(pixels(e).every((v, i) => v === reference[i]), 'Hiding mixed geometry restores quad optimization safely');
+    e.update(sentinel, { type: 'rect', hidden: false, shadow: '#fff', blur: 4 });
+    check(pixels(e).every((v, i) => v === reference[i]), 'Adding a shadow restores mixed ordering safely');
+    e.remove(sentinel); e.undo(); e.redo();
+    check(pixels(e).every((v, i) => v === reference[i]), 'Remove/undo/redo keep ordering eligibility consistent');
     e.load({ version: 1, elements: [] }); pixels(e); check(e.stats.visible === 0, 'Empty document renders'); e.setViewport({ x: 0, y: 0, zoom: 1 }); e.resize(256, 192, 1);
     const t = e.text('Silk', { x: 10, y: 10, fill: '#ffffff', fontSize: 32 }); data = pixels(e);
     check(data.some((v, i) => i % 4 === 0 && v > 0), 'Text atlas reaches GPU canvas');

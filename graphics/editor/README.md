@@ -17,7 +17,10 @@ python3 graphics/editor/scripts/browser serve
 
 Open **http://127.0.0.1:8050/** in a WebGPU browser. The studio includes a layer list,
 property inspector, shape insertion, JSON export, a 100,000-layer stress scene, and a performance
-lab that compares Silk with full and viewport-culled DOM rendering.
+lab that compares Silk with full DOM, viewport-culled DOM, and DOM with a compositor hint.
+The default stress scene fits every artboard into view; choose a cropped workload to exercise culling.
+The lab also supports zoom plus 1,000 width edits per frame and optional shadows. Its bars show
+frame cadence (higher is better); synchronous CPU time alone excludes DOM layout and painting.
 
 Drag to move; drag the bottom-right handle to resize. Shift-click extends selection.
 Space-drag or middle-button-drag pans. Ctrl/Command-wheel zooms around the pointer.
@@ -137,7 +140,8 @@ or external side effects performed by a callback.
 
 - [`src/document.silk`](src/document.silk): stable slots, rounded/ellipse hits, conservative
   64-element bounds blocks, and lowering into `ui_scene.Scene`. Dirty block bounds rebuild once
-  before the next hit test or frame, even after many edits to that block.
+  before the next hit test or frame, even after many edits to that block. Rectangle-only scenes
+  without shadows preserve insertion order directly, avoiding the mixed-primitive overlap tree.
 - [`browser/src/bridge.silk`](browser/src/bridge.silk): the owned WASM token, asynchronous GPU
   initialization, surface, and reusable renderer/atlas. The raw C ABI is private and trusted;
   use the validated JS wrapper. Never call it with invented pointers or expired tokens.
@@ -149,7 +153,10 @@ or external side effects performed by a callback.
 
 A frame culls world-space paint bounds **including shadow reach**, transforms visible shapes
 once into physical pixels, and lets the existing renderer batch them. The 100,000-rectangle grid
-benchmark draws about 110 visible elements in one instanced draw. Idle editors schedule no frames.
+cropped benchmark draws about 110 visible elements in one instanced draw. The overview benchmark
+keeps all 100,000 elements visible across 1,000 synthetic artboards, with no level-of-detail
+removal or artboard raster cache. These artboards are flat background rectangles, and their
+text-like bars are rectangles, not text. Idle editors schedule no frames.
 
 Blocks follow insertion order. Spatially coherent documents benefit most; randomly interleaved
 or heavily overlapping shapes can force a full scan. Removed slots are kept for stable IDs and
@@ -173,11 +180,13 @@ export PLAYWRIGHT_CHROMIUM_EXECUTABLE=/absolute/path/to/chrome
 python3 graphics/editor/scripts/check --browser
 node graphics/editor/web/test.mjs --bench
 EDITOR_WORKLOAD=edit node graphics/editor/web/test.mjs --bench
+EDITOR_WORKLOAD=overview EDITOR_MODES=silk,dom-composited node graphics/editor/web/test.mjs --bench
 EDITOR_COUNTS=100000 EDITOR_SHADOWS=1 node graphics/editor/web/test.mjs --bench
 ```
 
 Browser tests check GPU pixels, clipping, conservative shadow culling, camera/DPR transforms,
-text atlas output, history, identity, transaction rollback, independent instances, destruction,
+text atlas output, translucent rectangle ordering across fast/mixed paths, history, identity,
+transaction rollback, independent instances, destruction,
 and real pointer drag/resize/cancel plus keyboard edits. Browser/benchmark output goes to
 `build/editor-results/` (override with `EDITOR_RESULTS`). Benchmarks have no timing assertions.
 

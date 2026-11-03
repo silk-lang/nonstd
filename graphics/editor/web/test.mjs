@@ -31,8 +31,10 @@ try {
   if (process.argv.includes('--bench')) {
     const reports = [];
     await page.evaluate(({workload, shadows}) => { window.benchmarkWorkload = workload; window.benchmarkShadows = shadows; }, { workload: process.env.EDITOR_WORKLOAD || 'pan', shadows: process.env.EDITOR_SHADOWS === '1' });
+    await page.evaluate(({frames, warmup, modes}) => { window.benchmarkFrames = frames; window.benchmarkWarmup = warmup; window.benchmarkModes = modes; },
+      { frames: Number(process.env.EDITOR_FRAMES || 90), warmup: Number(process.env.EDITOR_WARMUP || 20), modes: (process.env.EDITOR_MODES || 'silk,dom,dom-culled').split(',') });
     for (const count of (process.env.EDITOR_COUNTS || '1000,10000,100000').split(',').map(Number)) {
-      const report = await page.evaluate(async count => window.runBenchmark({ count, frames: 90, warmup: 20, workload: window.benchmarkWorkload || "pan", shadows: window.benchmarkShadows || false }), count);
+      const report = await page.evaluate(async count => window.runBenchmark({ count, frames: window.benchmarkFrames, warmup: window.benchmarkWarmup, modes: window.benchmarkModes, workload: window.benchmarkWorkload || "pan", shadows: window.benchmarkShadows || false }), count);
       report.environment = environment; report.browserVersion = browser.version(); reports.push(report);
       await writeFile(`${output}/benchmark-${count}.json`, JSON.stringify(report, null, 2));
       console.log(JSON.stringify(report.results.map(({ samples, ...r }) => r), null, 2));
@@ -41,6 +43,11 @@ try {
   } else {
     const result = await page.evaluate(async () => (await import('/web/contracts.js')).runContracts());
     console.log('Contracts:', result);
+    await page.selectOption('#workload', 'overview'); await page.selectOption('#count', '100000');
+    await page.click('#stress');
+    await page.waitForFunction(() => editor.stats.visible === 100000);
+    await page.screenshot({ path: `${output}/overview.png` });
+    console.log('PASS overview demo keeps all 100,000 elements visible');
     // Real input, including a canceled gesture and coordinate conversion at non-unit zoom.
     await page.evaluate(() => {
       editor.load({ version: 1, elements: [{ x: 80, y: 80, width: 100, height: 80, fill: '#ff0000' }] });
