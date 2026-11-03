@@ -35,6 +35,7 @@ let wait = match inspector.pollInterval() {          // wake up to serve request
 while true {
   let next = run platform.nextEvent(wait)
   if run inspector.poll(&mut tree) {                 // a request dispatched input or highlighted
+    run inspector.observe(&tree)                     // log the records for `events`
     run tree.takeEvents(&mut records)                // answer the records as for window input
     ...
     platform.requestFrame(window)
@@ -49,8 +50,9 @@ run inspector.close()
 ```
 
 After a request dispatches input, the next request waits until the app has drawn a frame
-(`afterFrame`), so every request sees the app's answer to the one before. `ui/tree/demo` is the
-worked example.
+(`afterFrame`), so every request sees the app's answer to the one before. Call `inspector.observe(&tree)` before every
+`takeEvents` (window input too) so the `events` log sees what the app sees. `ui/tree/demo` is
+the worked example; ui-app apps get all of this from `runWindowWith` in ui/app/window.
 
 ## Protocol
 
@@ -75,7 +77,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `hello` | | `protocol` (1), `commands`, `width`, `height`, `scale`, `frame`, `root`, `nodes`, `highlight` |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
 | `query` | target, `limit` | `count`, `nodes` (node objects, tree order) |
-| `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view |
+| `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
 | `pick` | `x`, `y` | `node` (what the element picker selects), `path` (ids hit testing reaches) |
 | `highlight` | `nodes` (ids) or a target (all matches); none clears it | `nodes` highlighted |
 | `screenshot` | target (optional: that node alone, cropped), `highlight` (default true) | `png` (Base64), `width`, `height` (device pixels), `scale`, `node` |
@@ -86,6 +88,8 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `type` | `text` (as `TextInput` records to the focused input; newlines and tabs as Enter and Tab); a target in `query` is clicked first | `typed` (characters) |
 | `wait` | target, `gone`, `timeout` (ms) | `node`, or `"pending": true` when it does not hold yet |
 | `stats` | | the last frame's `FrameStats`: nodes, fragments, layout counters, replayed and repainted subtrees, glyphs, primitives |
+| `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `width`, `height`, `scale`, `frame` |
+| `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
 
 `modifiers` is a list of `shift`, `control` (or `ctrl`), `alt`, `meta`. Pointer input goes to
 the point `pointOf` finds (the centre of the node's visible box, or a grid point that hit
@@ -124,7 +128,9 @@ python3 ui/tree/demo/scripts/demo inspect     # the CLI drives the demo in a win
 - One request per connection (see above); `wait` is answered `pending` and the client asks
   again (ui-inspect-cli does, every 50 ms).
 - `type` sends `TextInput` records (Enter and Tab for newlines and tabs); IME preedit is not driven.
-- No event log or session recording over the wire yet; sessions are still in memory
+- The event log keeps the last 500 records the app took (`Inspector.observe`); input the
+  tree did not queue a record for (no node listens) is not in it. No session recording over
+  the wire yet; sessions are still in memory
   (ui-inspect's `Session`).
 - Screenshots come from the CPU renderer, not a GPU readback.
 - The highlight has no name tag over the node.
