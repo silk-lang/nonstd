@@ -70,7 +70,7 @@ const densityBucket = ratio => 2 ** Math.ceil(Math.log2(Math.max(Number.MIN_VALU
 export class Editor extends EventTarget {
   #host; #token; #lastId = 0; #nodes = new Map(); #selection = new Set(); #frame = 0;
   #dead = false; #transaction = null; #undo = []; #redo = []; #replaying = false;
-  #textCanvas; #uploadCanvas;
+  #textCanvas; #uploadCanvas; #textPreparation;
   #textTiles = new Map(); #textNodes = new Map(); #textViews = new Map(); #textViewPool = []; #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
   #observer; #cleanups = []; #camera = { x: 0, y: 0, zoom: 1 }; #autoRender;
   #width = 1; #height = 1; #scale = 1;
@@ -157,6 +157,7 @@ export class Editor extends EventTarget {
     for (let id = 1; id <= this.#lastId; id++) { const node = this.#nodes.get(id); if (node) yield node; }
   }
   #write(id, n) {
+    this.#textPreparation = null;
     const text = n.type === 'text' ? this.#textKind(n) : null;
     const result = this.#call('editor_set', id, text ? text.kind : n.type === 'ellipse' ? 1 : 0, n.x, n.y, n.width, n.height,
       n.radius, n.type === 'text' ? 0xffffffff : rgba(n.fill), rgba(n.border), n.borderWidth, n.blur, n.shadowX, n.shadowY,
@@ -264,7 +265,31 @@ export class Editor extends EventTarget {
     entry.limited = reuse ? false : entry.rasterLimited;
     this.#call('editor_image_node', id, entry.kind);
   }
+  #preparedTextFits() {
+    const p = this.#textPreparation, v = this.#camera, scale = v.zoom * this.#scale;
+    return p && scale > p.minScale && scale <= p.maxScale && v.x <= p.left && v.y <= p.top &&
+      v.x + this.#width / v.zoom >= p.right && v.y + this.#height / v.zoom >= p.bottom;
+  }
+  #cacheTextPreparation() {
+    this.#textPreparation = null;
+    if (this.#textViews.size) return;
+    const p = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity, minScale: 0, maxScale: Infinity };
+    const v = this.#camera, right = v.x + this.#width / v.zoom, bottom = v.y + this.#height / v.zoom;
+    for (const [id, entry] of this.#textNodes) {
+      const n = this.#nodes.get(id); if (!n || n.hidden) continue;
+      if (entry.limited || n.x < v.x || n.y < v.y || n.x + n.width > right || n.y + n.height > bottom) return;
+      p.left = Math.min(p.left, n.x); p.top = Math.min(p.top, n.y);
+      p.right = Math.max(p.right, n.x + n.width); p.bottom = Math.max(p.bottom, n.y + n.height);
+      // The whole scene must remain visible, with 2–8 raster samples per physical pixel.
+      // This conservative interval avoids both undersampling and retaining excessive density.
+      p.minScale = Math.max(p.minScale, entry.width / (n.width * 8), entry.height / (n.height * 8));
+      p.maxScale = Math.min(p.maxScale, entry.width / (n.width * 2), entry.height / (n.height * 2));
+    }
+    this.#textPreparation = p;
+    if (!this.#preparedTextFits()) this.#textPreparation = null;
+  }
   #prepareText() {
+    if (this.#preparedTextFits()) return;
     for (const [id, entry] of this.#textViews) {
       const n = this.#nodes.get(id), base = this.#textNodes.get(id);
       const size = n && base ? this.#textSize(n, base) : null;
@@ -291,6 +316,7 @@ export class Editor extends EventTarget {
       if (target.width !== entry.width || target.height !== entry.height) this.#rasterText(entry, target);
       else entry.limited = target.limited;
     }
+    this.#cacheTextPreparation();
   }
   #record(id, before, after) {
     if (this.#replaying) return;
@@ -333,7 +359,7 @@ export class Editor extends EventTarget {
   remove(id) {
     this.#assert(); const before = this.#nodes.get(id);
     if (!before) return false;
-    this.#call('editor_remove', id); this.#nodes.delete(id); this.#textNodes.delete(id); this.#record(id, before, undefined);
+    this.#textPreparation = null; this.#call('editor_remove', id); this.#nodes.delete(id); this.#textNodes.delete(id); this.#record(id, before, undefined);
     if (this.#selection.has(id)) this.select(this.selection.filter(value => value !== id));
     this.invalidate(); return true;
   }
@@ -368,7 +394,7 @@ export class Editor extends EventTarget {
       for (const change of changes) {
         const value = change[side];
         if (value) { this.#write(change.id, value); this.#nodes.set(change.id, value); }
-        else { this.#call('editor_remove', change.id); this.#nodes.delete(change.id); this.#textNodes.delete(change.id); }
+        else { this.#textPreparation = null; this.#call('editor_remove', change.id); this.#nodes.delete(change.id); this.#textNodes.delete(change.id); }
       }
     } finally { this.#replaying = false; }
     this.select(this.selection.filter(id => this.#nodes.has(id)));
@@ -457,7 +483,7 @@ export class Editor extends EventTarget {
     this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear();
     this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear(); this.#textViews.clear(); this.#textViewPool.length = 0;
     if (this.#textCanvas) this.#textCanvas.width = this.#textCanvas.height = 0;
-    this.#textCanvas = this.#uploadCanvas = null;
+    this.#textCanvas = this.#uploadCanvas = this.#textPreparation = null;
     this.emit('destroy', {});
   }
 }

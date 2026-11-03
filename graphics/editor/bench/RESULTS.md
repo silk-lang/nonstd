@@ -1,6 +1,7 @@
 # Browser performance measurements
 
-Actual-text comparisons, including 100,000 visible labels and live edits: [text benchmark report](text-browser/README.md).
+Latest actual-text comparison and optimizations: [text throughput report](text-throughput/README.md).
+The [initial text benchmark](text-browser/README.md) is retained as the pre-optimization baseline.
 
 Recorded 2026-11-03 UTC (2026-11-02 in the user’s local work session), on this development machine.
 

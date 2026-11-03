@@ -98,6 +98,18 @@ export async function runContracts() {
       const separate = pixels(e);
       check(grouped.every((v, i) => v === separate[i]), `Shadow ordering survives run splits at zoom ${zoom}, DPR ${scale}`);
     }
+    const textScene = Array.from({ length: 130 }, (_, i) => ({ type: 'text', text: ['MMMM', 'WWWW', 'oooo'][i % 3],
+      fontSize: 24, x: i * 37 % 230 - 20, y: i * 23 % 160 - 10, width: 140, height: 40,
+      radius: i % 5, fill: ['#ee331180', '#22dd6690', '#4455eed0'][i % 3] }));
+    textScene.splice(70, 0, { type: 'rect', x: 80, y: 50, width: 80, height: 60, fill: '#ffffff80' });
+    for (const [zoom, scale] of [[1, 1], [.65, 2], [.03, 1]]) {
+      e.resize(256, 192, scale); e.setViewport({ x: -3.25, y: 2.75, zoom });
+      e.load({ version: 1, elements: textScene }); const grouped = pixels(e);
+      e.load({ version: 1, elements: textScene.flatMap(n => [n,
+        { type: 'ellipse', x: 10000, y: 10000, width: 1, height: 1 }]) });
+      const separate = pixels(e);
+      check(grouped.every((v, i) => v === separate[i]), `Image runs preserve mixed translucent text at zoom ${zoom}, DPR ${scale}`);
+    }
     e.load({ version: 1, elements: [] }); pixels(e); check(e.stats.visible === 0, 'Empty document renders'); e.setViewport({ x: 0, y: 0, zoom: 1 }); e.resize(256, 192, 1);
     const t = e.text('Silk', { x: 10, y: 10, fill: '#ffffff', fontSize: 32 }); data = pixels(e);
     check(data.some((v, i) => i % 4 === 0 && v > 0), 'Text atlas reaches GPU canvas');

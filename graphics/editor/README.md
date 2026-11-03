@@ -130,6 +130,12 @@ shrink an axis, which avoids repeated uploads around bucket boundaries. Panning 
 frames reuse ordinary whole-run rasters. Offscreen/hidden text does not rerasterize until visible again.
 Explicit `resize(width, height, pixelRatio)` updates density when device scale changes.
 
+When every visible text node fits entirely inside the viewport and uses an unrestricted
+whole-run raster, preparation caches the scene bounds and a safe density interval. Camera
+changes within those bounds reuse the rasters without scanning every text node. Edits and
+history changes invalidate this cache; partial visibility, cropped windows, and allocation
+limits continue through per-node preparation.
+
 Identical content/font/color shares a replaceable whole-run atlas slot. When the requested
 whole-run raster would exceed 4094 pixels per side or 4,194,304 pixels total, each visible
 copy instead gets a **visible-window raster**, including a small overscan margin. Canvas2D
@@ -176,8 +182,9 @@ or external side effects performed by a callback.
 - [`src/document.silk`](src/document.silk): stable slots, rounded/ellipse hits, conservative
   64-element bounds blocks, and lowering into `ui_scene.Scene`. Dirty block bounds rebuild once
   before the next hit test or frame, even after many edits to that block. Consecutive rectangle runs
-  share one conservative ordering bound, even among shadows, paths, and text. Runs stop at
-  mixed primitives and culling-block boundaries. Entire rectangle-only scenes without shadows
+  share one conservative ordering bound, even among shadows, paths, and text. Consecutive
+  text/image sprites also share a bound when they use the same atlas texture. Runs stop at
+  mixed primitives, texture changes, and culling-block boundaries. Entire rectangle-only scenes without shadows
   use one pinned order. The shared scene sorter sorts equal-key runs and copies them in bulk.
 - [`browser/src/bridge.silk`](browser/src/bridge.silk): the owned WASM token, asynchronous GPU
   initialization, surface, and reusable renderer/atlas. The raw C ABI is private and trusted;
@@ -191,11 +198,16 @@ or external side effects performed by a callback.
 A frame culls world-space paint bounds **including shadow reach**, transforms visible shapes
 once into physical pixels, and lets the existing renderer batch them. Ordering bounds round
 out to covered pixels, so fractional edges keep painter order. `stats.visited` counts main-pass
-element visits; rectangle-run bounds lookahead is additional and limited to the same 64-slot block.
+element visits; paint-run bounds lookahead is additional and limited to the same 64-slot block.
 The cropped 100,000-rectangle grid draws about 110 visible elements in one instanced draw. The overview benchmark
 keeps all 100,000 elements visible across 1,000 synthetic artboards, with no level-of-detail
 removal or artboard raster cache. These artboards are flat background rectangles, and their
 text-like bars are rectangles, not text. Idle editors schedule no frames.
+
+The separate [actual-text benchmark](bench/text-throughput/README.md) keeps 100,000 labels
+visible while zooming. Bounded image runs and cached preparation brought it from about
+12 FPS to the machine's roughly 120 FPS ceiling, ahead of ordinary HTML and near
+compositor-cached HTML. This repeated-string overview does not represent 100,000 unique styles.
 
 Blocks follow insertion order. Spatially coherent documents benefit most; randomly interleaved
 or heavily overlapping shapes can force a full scan. Removed slots are kept for stable IDs and

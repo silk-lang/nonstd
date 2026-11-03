@@ -1,5 +1,9 @@
 # Silk versus browser text
 
+Historical baseline before image-run batching and preparation caching. See the
+[latest results](../text-throughput/README.md): the 100,000-label Silk overview now reaches
+roughly 120 FPS on this machine.
+
 **The winner depends on the workload.** HTML wins the huge static overview. Silk wins the
 10,000-label edit workloads. High-zoom text, 1,000 labels, and 2,000 unique labels are
 essentially tied at this machine's display ceiling.

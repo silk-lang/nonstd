@@ -88,6 +88,26 @@ export async function runTextContracts() {
     editor.text('Retry', { fontSize: 12 }); editor.render();
     check(editor.diagnostics.textAtlasTiles === 2 && editor.diagnostics.limitedTextRuns === 0,
       'Atlas changes permit a previously failed resolution update to retry');
+    // A fully visible overview can skip preparation, but every document/visibility change
+    // must invalidate that proof before reusing the cached density interval.
+    editor.load({ version: 1, elements: [] }); editor.setViewport({ x: 0, y: 0, zoom: 1 });
+    const cachedId = editor.text('Cache proof', { x: 2, y: 2, fontSize: 16 }); editor.render();
+    const steady = calls.length; editor.setViewport({ zoom: .95 }); editor.render();
+    check(calls.length === steady, 'A fully visible camera change reuses sufficient whole-run density');
+    editor.update(cachedId, { fontSize: 32 }); editor.render();
+    check(calls.length > steady, 'Text style changes invalidate prepared-scene reuse');
+    const normal = editor.get(cachedId);
+    editor.update(cachedId, { hidden: true, width: normal.width * 4, height: normal.height * 4 }); editor.render();
+    const hiddenRasters = calls.length; editor.update(cachedId, { hidden: false }); editor.render();
+    check(calls.length > hiddenRasters, 'Revealing scaled hidden text recomputes density');
+    editor.undo(); editor.render(); editor.undo(); editor.render();
+    const offscreen = editor.text('Newly visible', { x: 10000, y: 10000, fontSize: 16 }); editor.render();
+    const outside = calls.length; editor.update(offscreen, { x: 5, y: 5 }); editor.render();
+    check(calls.length > outside, 'Moving an offscreen run into a prepared viewport refreshes its raster');
+    editor.remove(offscreen); editor.render(); editor.undo(); editor.render();
+    editor.update(cachedId, { type: 'rect' }); editor.render(); editor.undo(); editor.render();
+    check(editor.get(cachedId).type === 'text' && editor.get(offscreen).type === 'text',
+      'Remove and type-conversion undo restore text after preparation caching');
     check(readbacks === 0, 'Text uploads never synchronously read pixels back into JavaScript');
     await editor.flush();
     return { passed };
