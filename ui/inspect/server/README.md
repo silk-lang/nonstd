@@ -111,7 +111,7 @@ python3 ui/tree/demo/scripts/demo inspect     # the CLI drives the demo in a win
   inspect equals `inspectNode`, queries by role and name, pick, highlight and screenshots (with
   and without the overlay, one node cropped), click (the app sees the click record), Tab,
   scroll, type, wait (holds, pending, gone, timed out) and the error replies.
-- Over a real Unix socket: hello, a click followed by a query that waits for the app's frame,
+- Over a real Unix socket (not on Windows): hello, a click followed by a query that waits for the app's frame,
   a pending wait, bad JSON, and `close` removing the socket file.
 - `demo inspect` (CI job `demo` in ui-inspect.yml): snapshot, click New by role and name, wait
   for the new row, highlight Archive, inspect it, screenshot to a PNG.
