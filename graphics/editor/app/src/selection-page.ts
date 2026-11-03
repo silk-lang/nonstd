@@ -6,7 +6,10 @@ import { markChanged } from './state'
 const colors = ['#25352b', '#b8c5ac', '#e6b84e', '#e3ad90', '#799a9d'] as const
 
 export const addSelectionPage = (m: Model): Model => {
-  if (m.document.pages.length >= 100)
+  const existing = m.document.pages.find(
+    (page) => page.name === '4k rectangles' || page.name === '10k rectangles',
+  )
+  if (!existing && m.document.pages.length >= 100)
     return { ...m, notice: 'This document has reached its page limit.' }
   const used = new Set(
     m.document.pages.flatMap((page) => [page.id, ...page.nodes.map((node) => node.id)]),
@@ -18,20 +21,23 @@ export const addSelectionPage = (m: Model): Model => {
     used.add(id)
     return id
   }
-  const id = allocate()
-  const nodes = Array.from({ length: 4_000 }, (_, index) =>
+  const id = existing?.id ?? allocate()
+  const nodes = Array.from({ length: 10_000 }, (_, index) =>
     makeNode(allocate(), 'rect', {
-      name: `Rectangle ${String(index + 1).padStart(4, '0')}`,
-      x: (index % 80) * 80,
-      y: Math.floor(index / 80) * 64,
+      name: `Rectangle ${String(index + 1).padStart(5, '0')}`,
+      x: (index % 100) * 80,
+      y: Math.floor(index / 100) * 64,
       width: 64,
       height: 48,
-      fill: colors[((index % 80) + Math.floor(index / 80)) % colors.length] ?? '#b8c5ac',
+      fill: colors[((index % 100) + Math.floor(index / 100)) % colors.length] ?? '#b8c5ac',
     }),
   )
   const document = {
     ...m.document,
-    pages: [...m.document.pages, { id, name: '4k rectangles', nodes }],
+    pages: [
+      ...m.document.pages.filter((page) => page.id !== id),
+      { id, name: '10k rectangles', nodes },
+    ],
     activePageId: id,
     nextId,
   }
