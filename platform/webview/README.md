@@ -120,6 +120,10 @@ WebKit, and a program using it also depends on platform-window (which it needs f
 
 `python3 platform/webview/scripts/macos smoke` drives it in a real window (CI job `macos`), with
 tests/native, the smoke test both native backends share.
+`python3 platform/webview/scripts/macos demo` runs `examples/browser`: a Silk UI toolbar and status
+bar around a live page, with an "Agent demo" page that the agent button fills in through
+snapshot refs and native input. It uses ui-app-window's `runWindowHosting` and `WindowHost`, the
+hook that places native content on hosted nodes after each frame.
 Manual checks on a Mac: scroll a page with the trackpad, type with the Japanese input method in a
 page field, click between the page and the Silk UI and watch focus move, open the view in
 Safari's Develop menu.

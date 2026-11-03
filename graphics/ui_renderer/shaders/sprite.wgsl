@@ -2,8 +2,11 @@
 // tile, read with textureLoad so no texel outside the tile is touched.
 @group(0) @binding(2) var atlas: texture_2d<f32>;
 
-// Tile `tile` (texel rectangle xMin, yMin, xMax, yMax) stretched over `bounds`, at pixel center `p`.
-fn sampleTile(tile: vec4f, bounds: vec4f, p: vec2f) -> vec4f {
+// Tile `whole` (texel rectangle xMin, yMin, xMax, yMax, clipped to the texture) stretched over
+// `bounds`, at pixel center `p`.
+fn sampleTile(whole: vec4f, bounds: vec4f, p: vec2f) -> vec4f {
+  let dims = vec2f(textureDimensions(atlas));
+  let tile = vec4f(min(whole.xy, dims), min(whole.zw, dims));
   let size = tile.zw - tile.xy;
   let uv = (p - bounds.xy) * size / (bounds.zw - bounds.xy);
   let f = clamp(uv - 0.5, vec2f(0.0), size - 1.0);
