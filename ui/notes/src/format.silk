@@ -1,0 +1,211 @@
+//! The notes on disk: [`Note`] and [`Library`], and their JSON form.
+//!
+//! ```json
+//! {"version":1,"dark":false,"notes":[{"id":1,"title":"Groceries","body":"Milk","pinned":true,"stamp":3}]}
+//! ```
+//!
+//! [`encode`] writes it and [`decode`] reads it back. Fields a file leaves out get their
+//! defaults, and unknown fields are ignored, so files from later versions still open.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value, JsonChild }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.u8
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+
+/// One note.
+pub struct Note {
+  /// Unique among the notes, never 0.
+  pub id: u64,
+  pub title: String,
+  pub body: String,
+  /// Pinned notes come first in the list.
+  pub pinned: bool,
+  /// When it was last edited, on the library's clock: higher is more recent.
+  pub stamp: u64,
+}
+
+/// Everything the app saves.
+pub struct Library {
+  pub notes: List<Note>,
+  /// Whether the dark theme is on.
+  pub dark: bool,
+}
+
+impl Library {
+  pub fn make() -> Library {
+    return Library { notes: List<Note>.make(), dark: false }
+  }
+}
+
+/// Appends `value` in decimal.
+pub effect fn appendNumber(text: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = u64.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  while count > 0 {
+    count = count - 1
+    let one: [u8; 1] = [digits[count]]
+    run text.append(String.fromUtf8(&one) |> Result<string, InvalidUtf8>.unwrapOr("0"))
+  }
+}
+
+const HEX: string<'static> = "0123456789abcdef"
+
+/// Appends `value` as a JSON string, quotes included.
+pub effect fn appendJsonString(text: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run text.append("\"")
+  let bytes = String.utf8Bytes(value)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let byte = bytes[i]
+    if byte == 34 || byte == 92 || byte < 32 {
+      // Everything up to here is whole characters: escapes are ASCII.
+      run text.append(String.slice(value, start, i - start))
+      if byte == 34 {
+        run text.append("\\\"")
+      } else if byte == 92 {
+        run text.append("\\\\")
+      } else if byte == 10 {
+        run text.append("\\n")
+      } else if byte == 13 {
+        run text.append("\\r")
+      } else if byte == 9 {
+        run text.append("\\t")
+      } else {
+        run text.append("\\u00")
+        let high = u8.toUsize(u8.shiftRight(byte, 4))
+        let low = u8.toUsize(u8.bitAnd(byte, 15))
+        run text.append(String.slice(HEX, high, 1))
+        run text.append(String.slice(HEX, low, 1))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run text.append(String.slice(value, start, bytes.length - start))
+  run text.append("\"")
+}
+
+/// The JSON form of `notes` and the settings.
+pub effect fn encode(notes: &[Note], dark: bool) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run text.append("{\"version\":1,\"dark\":")
+  run text.append(
+    if dark {
+      "true"
+    } else {
+      "false"
+    },
+  )
+  run text.append(",\"notes\":[")
+  let mut i: usize = 0
+  while i < notes.length {
+    let note = &notes[i]
+    if i > 0 {
+      run text.append(",")
+    }
+    run text.append("\n{\"id\":")
+    run appendNumber(&mut text, note.id)
+    run text.append(",\"title\":")
+    run appendJsonString(&mut text, String.view(&note.title))
+    run text.append(",\"body\":")
+    run appendJsonString(&mut text, String.view(&note.body))
+    run text.append(",\"pinned\":")
+    run text.append(
+      if note.pinned {
+        "true"
+      } else {
+        "false"
+      },
+    )
+    run text.append(",\"stamp\":")
+    run appendNumber(&mut text, note.stamp)
+    run text.append("}")
+    i = i + 1
+  }
+  run text.append("\n]}\n")
+  return move text
+}
+
+fn asBool(value: Option<&Value>) -> bool {
+  return match value {
+    Option<&Value>.Some { value: found } => match &found.* {
+      Value.Bool { value: flag } => flag
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+/// Reads a library [`encode`] wrote. Notes without an id, or with an id seen before, get a new
+/// one.
+pub effect fn decode(bytes: &[u8]) -> Library
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let document = run Json.parse(bytes)
+  let mut library = Library.make()
+  library.dark = asBool(Json.field(&document, "dark"))
+  let mut highest: u64 = 0
+  if let Option<&Value>.Some { value: list } = Json.field(&document, "notes") {
+    if let Value.Array { values } = &list.* {
+      let children = values.get()[0].asSlice()
+      let mut i: usize = 0
+      while i < children.length {
+        if let JsonChild.Item { value: item } = &children[i] {
+          let id = Json.asU64(Json.field(&item, "id")) |> Option<u64>.unwrapOr(0)
+          let title = Json.asString(Json.field(&item, "title")) |> Option<string>.unwrapOr("")
+          let body = Json.asString(Json.field(&item, "body")) |> Option<string>.unwrapOr("")
+          let note = Note {
+            id: id,
+            title: run String.copy(title),
+            body: run String.copy(body),
+            pinned: asBool(Json.field(&item, "pinned")),
+            stamp: Json.asU64(Json.field(&item, "stamp")) |> Option<u64>.unwrapOr(0),
+          }
+          if id > highest {
+            highest = id
+          }
+          run library.notes.append(move note)
+        }
+        i = i + 1
+      }
+    }
+  }
+
+  // Ids must be unique and not 0.
+  let notes = library.notes.asMutSlice()
+  let mut i: usize = 0
+  while i < notes.length {
+    let mut clash = notes[i].id == 0
+    let mut j: usize = 0
+    while j < i && !clash {
+      clash = notes[j].id == notes[i].id
+      j = j + 1
+    }
+    if clash {
+      highest = highest + 1
+      notes[i].id = highest
+    }
+    i = i + 1
+  }
+  return move library
+}

@@ -1,0 +1,613 @@
+//! Notes tests: the JSON format, the text helpers, and the app driven through the real tree with
+//! synthetic input, the way a person would use it. Run from the repository root.
+import ui_notes.lib {
+  Notes,
+  Note,
+  Message,
+  Command,
+  Store,
+  Library,
+  SANS,
+  encode,
+  decode,
+  wordCount,
+  matches,
+  preview,
+  displayTitle
+}
+import ui_notes.text { characterCount, compareIgnoringCase }
+import ui_app.runtime { Runtime, tick }
+import ui_app.harness { click, clickRole, press, typeText, locate, locateRole, focusedId, snapshot }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, NodeInfo, Role, MOD_CONTROL, MOD_SHIFT }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.u32
+
+pub fn viewport() -> FrameInput {
+  return FrameInput { width: 900.0, height: 600.0, scale: 1.0, time: 0.0 }
+}
+
+/// Keeps what was saved.
+pub struct MemoryStore {
+  pub saves: u64,
+  pub text: String,
+}
+
+impl MemoryStore {
+  pub fn make() -> MemoryStore {
+    return MemoryStore { saves: 0, text: String.make() }
+  }
+}
+
+impl Store for MemoryStore {
+  effect fn save(self: &mut Self, text: string) -> bool {
+    self.saves = self.saves + 1
+    self.text.clear()
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let result = run Effect.result(self.text.append(text))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    return match move result {
+      Result<(), OutOfMemoryError>.Success { value } => true
+      Result<(), OutOfMemoryError>.Failure { error } => false
+    }
+  }
+}
+
+/// Refuses every save, like a full disk.
+pub struct FailingStore {
+  pub attempts: u64,
+}
+
+impl Store for FailingStore {
+  effect fn save(self: &mut Self, text: string) -> bool {
+    self.attempts = self.attempts + 1
+    return false
+  }
+}
+
+effect fn fonts(tree: &mut UiTree) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+}
+
+/// The tree id of the first node whose test id, label or text is `value`, or 0.
+effect fn idOf(tree: &mut UiTree, value: string) -> u32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locate(&mut tree, viewport(), value) {
+    Option<NodeInfo>.Some { value: node } => node.id
+    Option<NodeInfo>.None => 0
+  }
+}
+
+/// The tree id of the first node with role `accessRole` named `name`, or 0.
+effect fn roleId(tree: &mut UiTree, accessRole: Role, name: string) -> u32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locateRole(&mut tree, viewport(), accessRole, name) {
+    Option<NodeInfo>.Some { value: node } => node.id
+    Option<NodeInfo>.None => 0
+  }
+}
+
+/// Whether `text` contains `part`.
+fn contains(text: string, part: string) -> bool {
+  return String.contains(text, part)
+}
+
+/// Whether the describe snapshot contains `part`.
+effect fn shows(tree: &mut UiTree, part: string) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run snapshot(&mut tree, viewport())
+  return contains(String.view(&text), part)
+}
+
+/// The number of times `part` occurs in the describe snapshot.
+effect fn occurrences(tree: &mut UiTree, part: string) -> usize
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run snapshot(&mut tree, viewport())
+  let mut rest = String.view(&text)
+  let mut count: usize = 0
+  while true {
+    match String.find(rest, part) {
+      Option<usize>.Some { value } => {
+        count = count + 1
+        let from = value + String.byteLength(part)
+        rest = String.slice(rest, from, String.byteLength(rest) - from)
+      }
+      Option<usize>.None => {
+        break
+      }
+    }
+  }
+  return count
+}
+
+/// The ids of the notes in list order.
+effect fn listed(app: &Notes) -> List<u64>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let order = run app.visible()
+  let mut ids = List<u64>.make()
+  let shown = order.asSlice()
+  let mut i: usize = 0
+  while i < shown.length {
+    run ids.append(app.notes.asSlice()[shown[i]].id)
+    i = i + 1
+  }
+  return move ids
+}
+
+fn sameIds(ids: &List<u64>, expected: &[u64]) -> bool {
+  let a = ids.asSlice()
+  if a.length != expected.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != expected[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn noteTitle(app: &Notes, id: u64) -> string {
+  return match app.indexOf(id) {
+    Option<usize>.Some { value } => String.view(&app.notes.asSlice()[value].title)
+    Option<usize>.None => ""
+  }
+}
+
+fn noteBody(app: &Notes, id: u64) -> string {
+  return match app.indexOf(id) {
+    Option<usize>.Some { value } => String.view(&app.notes.asSlice()[value].body)
+    Option<usize>.None => ""
+  }
+}
+
+// The format and the text helpers.
+
+effect fn formatBody() -> ()
+  ! AssertionError<'static> | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut notes = List<Note>.make()
+  run notes.append(
+    Note {
+      id: 7,
+      title: run String.copy("Quotes \"and\" back\\slashes"),
+      body: run String.copy("Line one\nLine\ttwo\r\u{1}end ✓ café"),
+      pinned: true,
+      stamp: 12,
+    },
+  )
+  run notes.append(
+    Note { id: 9, title: String.make(), body: String.make(), pinned: false, stamp: 3 },
+  )
+  let text = run encode(notes.asSlice(), true)
+  run Testing.expect(contains(String.view(&text), "\\u0001"), "control characters are escaped")
+  let library = run decode(String.utf8Bytes(String.view(&text)))
+  run Testing.expect(library.dark, "the dark setting comes back")
+  run Testing.expect(library.notes.length() == 2, "both notes come back")
+  let first = &library.notes.asSlice()[0]
+  run Testing.expect(first.id == 7 && first.pinned && first.stamp == 12, "the fields come back")
+  run Testing.expect(
+    String.view(&first.title) == "Quotes \"and\" back\\slashes",
+    "the title comes back with its quotes and backslashes",
+  )
+  run Testing.expect(
+    String.view(&first.body) == "Line one\nLine\ttwo\r\u{1}end ✓ café",
+    "the body comes back with its line breaks, tabs and non-ASCII text",
+  )
+  let second = &library.notes.asSlice()[1]
+  run Testing.expect(
+    second.id == 9 && String.ownedByteLength(&second.title) == 0,
+    "an empty note comes back",
+  )
+
+  // Missing fields get defaults; unknown ones are ignored; ids are made unique.
+  let loose = run decode(
+    b"{\"notes\":[{\"title\":\"A\",\"color\":\"red\"},{\"id\":3,\"body\":\"B\"},{\"id\":3}],\"extra\":1}",
+  )
+  run Testing.expect(!loose.dark, "dark defaults to off")
+  run Testing.expect(loose.notes.length() == 3, "every note is read")
+  let ids = loose.notes.asSlice()
+  run Testing.expect(
+    ids[0].id != 0 && ids[1].id == 3 && ids[2].id != 3 && ids[0].id != ids[2].id,
+    "missing and repeated ids get new ones",
+  )
+  run Testing.expect(String.view(&ids[1].body) == "B", "fields that are there are read")
+}
+
+test effect fn formatRoundTripsAndToleratesOldFiles() -> ()
+  ! AssertionError<'static> | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run formatBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn textHelpers() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(wordCount("") == 0, "no words in nothing")
+  run Testing.expect(wordCount("  one two\nthree\t four  ") == 4, "words between spaces")
+  run Testing.expect(characterCount("café ✓") == 6, "characters, not bytes")
+  run Testing.expect(matches("Groceries", "Milk", "MILK"), "search ignores case")
+  run Testing.expect(matches("Groceries", "Milk", " gro "), "and the spaces around the query")
+  run Testing.expect(!matches("Groceries", "Milk", "tea"), "no match")
+  run Testing.expect(matches("Groceries", "Milk", ""), "an empty search matches everything")
+  let mut cut = false
+  run Testing.expect(
+    preview("\n  \n  First line  \nSecond", 40, &mut cut) == "First line",
+    "the preview is the first line with text",
+  )
+  run Testing.expect(!cut, "not cut")
+  run Testing.expect(preview("abcdefgh", 3, &mut cut) == "abc" && cut, "long lines are cut")
+  run Testing.expect(displayTitle("   ") == "Untitled", "a blank title shows as Untitled")
+  run Testing.expect(compareIgnoringCase("apple", "Banana") < 0, "titles sort ignoring case")
+  run Testing.expect(compareIgnoringCase("Pear", "pear") == 0, "same but for case")
+}
+
+// The app.
+
+effect fn startBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  run Testing.expect(app.model.selected == 1, "the pinned welcome note is selected")
+  run Testing.expect((run occurrences(&mut tree, "option")) == 4, "the list has four notes")
+  run Testing.expect(run shows(&mut tree, "\"4 notes\""), "the count says so")
+  run Testing.expect(run shows(&mut tree, "PINNED"), "the pinned note is marked")
+  run Testing.expect(run shows(&mut tree, "\"Saved\""), "nothing to save yet")
+  let sorted = run listed(&app.model)
+  run Testing.expect(sameIds(&sorted, &[1, 4, 3, 2]), "pinned first, then the most recent")
+
+  // A click on a row opens it in the editor.
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Option, "Groceries"),
+    "the Groceries row is an option",
+  )
+  run Testing.expect(app.model.selected == 2, "a click selects it")
+  run Testing.expect(run shows(&mut tree, "Coffee beans"), "the editor shows its body")
+  run Testing.expect(run shows(&mut tree, "Lemons"), "all of it")
+
+  // The list has focus now; the arrow keys move the selection.
+  run press(&mut app, &mut tree, viewport(), "ArrowUp", 0)
+  run Testing.expect(app.model.selected == 3, "ArrowUp selects the note above")
+  run press(&mut app, &mut tree, viewport(), "Home", 0)
+  run Testing.expect(app.model.selected == 1, "Home selects the first")
+}
+
+test effect fn startSelectsAndArrowKeysMove() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore.make()
+  run startBody()
+    |> Effect.provideMut<Store>(&mut store)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn newNoteBody(store: &mut MemoryStore) -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError | JsonError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  // New note: added, selected, its title focused.
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Button, "New note")
+      |> Effect.provideMut<Store>(&mut store),
+    "New note is a button",
+  )
+  run Testing.expect(app.model.notes.length() == 5, "a note is added")
+  let id = app.model.selected
+  run Testing.expect(id == 5, "and selected")
+  let title = run idOf(&mut tree, "title")
+  run Testing.expect(title != 0 && focusedId(&tree) == title, "its title has focus")
+  run Testing.expect(run shows(&mut tree, "\"Edited\""), "there is something to save")
+
+  // Typing goes into the model; Tab moves on to the Note menu, then the body.
+  run typeText(&mut app, &mut tree, viewport(), "Ideas") |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(noteTitle(&app.model, id) == "Ideas", "the title is typed")
+  run press(&mut app, &mut tree, viewport(), "Tab", 0) |> Effect.provideMut<Store>(&mut store)
+  run press(&mut app, &mut tree, viewport(), "Tab", 0) |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(focusedId(&tree) == (run idOf(&mut tree, "body")), "Tab reaches the body")
+  run typeText(&mut app, &mut tree, viewport(), "One two three")
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(noteBody(&app.model, id) == "One two three", "the body is typed")
+  run Testing.expect(run shows(&mut tree, "\"3\""), "the word count follows")
+  let sorted = run listed(&app.model)
+  run Testing.expect(sameIds(&sorted, &[1, 5, 4, 3, 2]), "the edited note is the most recent")
+  run Testing.expect(store.saves == 0, "nothing saved yet")
+
+  // A second later the autosave runs, and stops once saved.
+  run tick(&mut app, &mut tree, 1.25, false) |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(store.saves == 1, "the autosave ran")
+  run Testing.expect(!app.model.dirty(), "everything is saved")
+  run Testing.expect(run shows(&mut tree, "\"Saved\""), "the toolbar says so")
+  run tick(&mut app, &mut tree, 5.0, false) |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(store.saves == 1, "no more saves without edits")
+
+  // What was saved reads back as the same notes.
+  let saved = run decode(String.utf8Bytes(String.view(&store.text)))
+  run Testing.expect(saved.notes.length() == 5, "the file has the five notes")
+  run Testing.expect(String.view(&saved.notes.asSlice()[4].title) == "Ideas", "with the new one")
+
+  // Ctrl+S saves at once.
+  run typeText(&mut app, &mut tree, viewport(), " four") |> Effect.provideMut<Store>(&mut store)
+  run press(&mut app, &mut tree, viewport(), "s", MOD_CONTROL)
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(store.saves == 2 && !app.model.dirty(), "Ctrl+S saves")
+}
+
+test effect fn newNoteTypingAndAutosave() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError | JsonError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore.make()
+  run newNoteBody(&mut store) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn searchBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  // Ctrl+F focuses the search field; typing filters titles and bodies.
+  run press(&mut app, &mut tree, viewport(), "f", MOD_CONTROL)
+  let search = run idOf(&mut tree, "search")
+  run Testing.expect(focusedId(&tree) == search, "Ctrl+F focuses the search field")
+  run typeText(&mut app, &mut tree, viewport(), "CASTLE")
+  run Testing.expect((run occurrences(&mut tree, "option")) == 1, "one note mentions a castle")
+  run Testing.expect(run shows(&mut tree, "\"1 of 4 notes\""), "the count says one of four")
+
+  // Enter opens the first match, ready to type.
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect(app.model.selected == 3, "Enter opens Trip ideas")
+  run Testing.expect(focusedId(&tree) == (run idOf(&mut tree, "body")), "with the body focused")
+
+  // Escape in the search field clears it.
+  run press(&mut app, &mut tree, viewport(), "f", MOD_CONTROL)
+  run Testing.expect(focusedId(&tree) == search, "Ctrl+F again")
+  run press(&mut app, &mut tree, viewport(), "Escape", 0)
+  run Testing.expect(String.ownedByteLength(&app.model.search) == 0, "Escape clears the search")
+  run Testing.expect((run occurrences(&mut tree, "option")) == 4, "every note shows again")
+
+  // No match.
+  run typeText(&mut app, &mut tree, viewport(), "zebra")
+  run Testing.expect((run idOf(&mut tree, "no-notes")) != 0, "no notes match")
+  run Testing.expect(run shows(&mut tree, "No notes match."), "and the list says so")
+  run Testing.expect(app.model.selected == 3, "the editor keeps its note")
+}
+
+test effect fn searchFiltersOpensAndClears() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore.make()
+  run searchBody()
+    |> Effect.provideMut<Store>(&mut store)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn pinAndSortBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  // Pin Trip ideas from the Note menu.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Option, "Trip ideas")
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note"),
+    "the Note menu button",
+  )
+  run Testing.expect(app.model.noteMenu.open, "opens the menu")
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Pin"),
+    "Pin is in it",
+  )
+  run Testing.expect(!app.model.noteMenu.open, "choosing closes it")
+  let pinned = run listed(&app.model)
+  run Testing.expect(sameIds(&pinned, &[3, 1, 4, 2]), "pinned notes first, most recent first")
+  run Testing.expect((run occurrences(&mut tree, "PINNED")) == 2, "both are marked")
+  run Testing.expect(run shows(&mut tree, "Pinned · "), "the editor says it is pinned")
+
+  // Sort by title: pinned first still, each group by title.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Sort")
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Option, "Title"),
+    "Title is a sort option",
+  )
+  run Testing.expect(app.model.sort == 1, "the sort changes")
+  let byTitle = run listed(&app.model)
+  run Testing.expect(sameIds(&byTitle, &[3, 1, 2, 4]), "sorted by title within each group")
+
+  // The menu says Unpin now.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Unpin")
+  let unpinned = run listed(&app.model)
+  run Testing.expect(sameIds(&unpinned, &[1, 2, 4, 3]), "unpinned, it sorts with the others")
+
+  // Duplicate copies the note and selects the copy.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Duplicate")
+  run Testing.expect(app.model.notes.length() == 5, "a copy is added")
+  run Testing.expect(noteTitle(&app.model, app.model.selected) == "Trip ideas copy", "and selected")
+  run Testing.expect(
+    String.startsWith(noteBody(&app.model, app.model.selected), "Lisbon in the spring."),
+    "with the same body",
+  )
+  run Testing.expect(focusedId(&tree) == (run idOf(&mut tree, "title")), "its title focused")
+}
+
+test effect fn pinSortAndDuplicate() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore.make()
+  run pinAndSortBody()
+    |> Effect.provideMut<Store>(&mut store)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn deleteBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  // Delete asks first; Cancel keeps the note.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Option, "Trip ideas")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Delete...")
+  let dialog = run roleId(&mut tree, Role.Dialog, "Delete this note?")
+  run Testing.expect(dialog != 0, "the dialog asks")
+  run Testing.expect(
+    focusedId(&tree) == (run roleId(&mut tree, Role.Button, "Cancel")),
+    "Cancel focused",
+  )
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect((run roleId(&mut tree, Role.Dialog, "Delete this note?")) == 0, "it closes")
+  run Testing.expect(app.model.notes.length() == 4, "nothing is deleted")
+  run Testing.expect(focusedId(&tree) == (run idOf(&mut tree, "body")), "the body takes focus")
+
+  // Escape closes it too; Delete deletes, and the next note in the list takes its place.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Delete...")
+  run press(&mut app, &mut tree, viewport(), "Escape", 0)
+  run Testing.expect(!app.model.confirm.open, "Escape closes the dialog")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Delete...")
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Delete"),
+    "Delete is a button",
+  )
+  run Testing.expect(app.model.notes.length() == 3, "the note is deleted")
+  run Testing.expect(app.model.selected == 2, "the note below it is selected")
+  run Testing.expect(!app.model.dirty(), "and the deletion is saved at once")
+
+  // Deleting every note leaves an empty editor that can make one.
+  let mut left: usize = 3
+  while left > 0 {
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Note")
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Delete...")
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Delete")
+    left = left - 1
+  }
+  run Testing.expect(app.model.notes.length() == 0, "all gone")
+  run Testing.expect((run idOf(&mut tree, "empty")) != 0, "the editor is empty")
+  run Testing.expect((run idOf(&mut tree, "no-notes")) != 0, "the list says no notes yet")
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Create a note"),
+    "the empty editor offers a new note",
+  )
+  run Testing.expect(app.model.notes.length() == 1, "which makes one")
+}
+
+test effect fn deleteAsksAndMovesTheSelection() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore.make()
+  run deleteBody()
+    |> Effect.provideMut<Store>(&mut store)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn failingBody(store: &mut FailingStore) -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  // Dark mode is a setting worth saving; the store refuses it.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Switch, "Dark mode")
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(app.model.dark, "the switch turns dark mode on")
+  run Testing.expect(app.model.theme.background.r < 0.2, "the theme is dark")
+  run press(&mut app, &mut tree, viewport(), "s", MOD_CONTROL)
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(store.attempts == 1 && app.model.failed, "the save failed")
+  run Testing.expect(run shows(&mut tree, "\"Not saved\""), "the toolbar says so")
+
+  // No autosave retries until the next edit.
+  run tick(&mut app, &mut tree, 3.0, false) |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(store.attempts == 1, "no retry loop")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Switch, "Dark mode")
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(!app.model.failed && !app.model.dark, "an edit clears the failure")
+  run tick(&mut app, &mut tree, 4.5, false) |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(store.attempts == 2, "and the autosave tries again")
+}
+
+test effect fn darkModeAndFailedSaves() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = FailingStore { attempts: 0 }
+  run failingBody(&mut store) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn keyboardBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Notes, Message, Command>.make(run Notes.make(run Notes.sample()))
+  run app.start(&mut tree, 0.0)
+
+  // Ctrl+N works from anywhere, even inside an input.
+  run press(&mut app, &mut tree, viewport(), "n", MOD_CONTROL)
+  run typeText(&mut app, &mut tree, viewport(), "Keyboard only")
+  run press(&mut app, &mut tree, viewport(), "n", MOD_CONTROL)
+  run Testing.expect(app.model.notes.length() == 6, "Ctrl+N inside the title makes another")
+  run typeText(&mut app, &mut tree, viewport(), "Second")
+
+  // Shift+Tab walks back from the title to the list, where the arrows pick a note.
+  run press(&mut app, &mut tree, viewport(), "Tab", MOD_SHIFT)
+  run Testing.expect(
+    focusedId(&tree) == (run roleId(&mut tree, Role.ListBox, "Notes")),
+    "Shift+Tab reaches the list",
+  )
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run Testing.expect(noteTitle(&app.model, app.model.selected) == "Keyboard only", "ArrowDown")
+}
+
+test effect fn keyboardOnly() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore.make()
+  run keyboardBody()
+    |> Effect.provideMut<Store>(&mut store)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

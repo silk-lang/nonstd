@@ -22,11 +22,12 @@ Packages:
 
 The app to inspect must be a debug build started with `SILK_UI_INSPECT` set (see
 [ui-inspect-server](../server/README.md#turning-it-on)). Every ui-app app run with
-`runWindowWith` and an `Inspector` serves it; the todo demo (ui/app/demo) and the inbox demo
-(ui/tree/demo) do.
+`runWindowWith` and an `Inspector` serves it; the notes app (ui/notes/app), the todo demo
+(ui/app/demo), the component gallery (ui/components/demo) and the inbox demo (ui/tree/demo) do.
 
 ```sh
-ui/inspect/devtools/scripts/devtools todo                  # the todo demo and the devtools on it
+ui/inspect/devtools/scripts/devtools notes                 # the notes app and the devtools on it
+ui/inspect/devtools/scripts/devtools todo                  # the same with the todo demo
 SILK_UI_INSPECT=1 ui-app-demo &                            # or any app, then:
 ui/inspect/devtools/scripts/devtools --connect 1           # 1, tcp:<port> or a socket path
 ```
@@ -84,12 +85,13 @@ python3 ui/inspect/devtools/scripts/devtools check
   shows in the status line and the next good refresh clears it.
 - Goldens (`describe` text and PNG, tolerance 2 per channel): the styles panel, the box model
   panel, the event log, and the todo app with the highlight the devtools asked for.
-- `check` (CI job `demo` in ui-inspect.yml) is the exit test in real windows: it starts the todo
-  demo and the devtools window under Xvfb and drives the devtools through their own inspector
-  socket with ui-inspect-cli: it waits for the Add button's row, clicks it, checks the todo app
-  highlights the button and the styles panel shows `padding-left: 10px`, opens the box model,
-  clicks Add in the todo app and finds the click in the event log. Screenshots of both windows
-  are left in `.cache/ui-devtools/`.
+- `check` (CI job `demo` in ui-inspect.yml) is the exit test in real windows: it starts the
+  [notes app](../../notes) (with a fresh notes file) and the devtools window under Xvfb and
+  drives the devtools through their own inspector socket with ui-inspect-cli: it waits for the
+  New note button's row, clicks it, checks the notes app highlights the button and the styles
+  panel shows `padding-left: 12px`, opens the box model, clicks New note in the notes app, finds
+  the click in the event log and the new count in the element tree, and checks the app saved the
+  note to its file. Screenshots of both windows are left in `.cache/ui-devtools/`.
 
 ## Limits
 
@@ -100,5 +102,3 @@ python3 ui/inspect/devtools/scripts/devtools check
 - Styles are read only; editing a declaration would be a `setStyle` request the protocol does not
   have yet.
 - The window uses the tree fixtures' fonts (Noto Sans), as the demos do.
-- The F3 component set and the F4 example app do not exist yet, so the exit test inspects the F2
-  todo demo; pointing it at F4's app is a change of the program the script starts.
