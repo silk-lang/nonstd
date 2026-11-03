@@ -78,7 +78,7 @@ try {
   editor.on('change', () => { layers(); inspector(); });
   editor.on('selectionchange', () => { layers(); inspector(); $('status').textContent = editor.selection.length ? `${editor.selection.length} selected · drag to move` : 'Silk engine · ready'; });
   editor.on('viewportchange', () => $('zoom-reset').textContent = `${Math.round(editor.viewport.zoom * 100)}%`);
-  editor.on('render', e => { const s = e.detail; $('stats').textContent = `${s.visible} visible / ${editor.size.toLocaleString()} layers · ${s.batches} draws · ${(s.buildMs + s.drawMs).toFixed(2)} ms CPU`; });
+  editor.on('render', e => { const s = e.detail; $('stats').textContent = `${s.visible} visible / ${editor.size.toLocaleString()} layers · ${s.batches} draws · ${(s.textMs + s.buildMs + s.drawMs).toFixed(2)} ms CPU`; });
   populate(); layers(); inspector();
   const v = editor.viewport, zoom = Math.min(1, (v.width - 55) / 850, (v.height - 50) / 700);
   editor.setViewport({ zoom: Math.max(.3, zoom), x: -5, y: 0 });

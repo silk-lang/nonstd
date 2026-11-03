@@ -101,7 +101,7 @@ The complete declarations are in [`js/editor.d.ts`](js/editor.d.ts). Useful oper
 | `screenToWorld(x,y)`, `worldToScreen(x,y)` | Convert coordinates relative to the canvas's CSS content box. |
 | `resize(width,height,pixelRatio)` | CSS viewport size and device scale. ResizeObserver tracks layout size; call resize to change device scale. |
 | `render()`, `invalidate()`, `flush()` | Submit immediately, schedule one frame, or wait for submitted GPU work. Normal rendering never waits for GPU completion. |
-| `stats`, `diagnostics` | Last frame's build/encode times, visible elements, main-pass visits and draw batches; WASM bytes, live GPU handles and text runs. |
+| `stats`, `diagnostics` | Last frame's text/build/encode times, visible elements, main-pass visits and draw batches; WASM bytes, live GPU handles and text runs. |
 | `toJSON()`, `load(document)` | Version-one geometry/style document. Loading replaces elements in one undo group and allocates new IDs. The exported camera is informational; load keeps the current camera. |
 
 Positions use world units, positive y down. Sizes must be positive; radius, blur and border widths
@@ -117,13 +117,34 @@ gradients; borders and shadows on ellipses are explicitly rejected.
 `hidden` suppresses painting and hits. `locked` suppresses hits but keeps painting. Transparent
 shapes still hit their geometric area. Making an element hidden or locked removes it from selection.
 
-Text is one line, shaped and rasterized by browser Canvas2D once at 2×, then uploaded as a
-premultiplied texture to Silk's atlas. The browser's installed fonts determine its appearance;
-await your webfonts before creating text. `fontFamily`, numeric `fontWeight`, `fontSize`, and
-`fill` control the raster. Width/height changes scale the existing raster. Text is not re-rasterized
-on zoom; large magnification can look soft. Atlas entries are immutable so undo can reuse them;
-they live until destruction, with at most 4096 cached runs and eight atlas textures. Full atlases
-raise an error. Text bounds are not tight glyph hit regions. Text has no native editing/IME API yet.
+Text is one line, shaped and rasterized by browser Canvas2D, then uploaded as a premultiplied
+texture to Silk's atlas. The browser's installed fonts determine its appearance; await your
+webfonts before creating text. `fontFamily`, numeric `fontWeight`, `fontSize`, and `fill` control
+the raster. Width/height changes stretch the line without reflowing it.
+
+Before each render, visible text selects raster density from **element width/height × camera zoom
+× device pixel ratio**. The target is at least two raster samples per displayed pixel, rounded up
+to power-of-two density buckets independently on each axis. A fourfold reduction is needed to
+shrink an axis, which avoids repeated uploads around bucket boundaries. Panning and unchanged
+frames reuse the current raster. Offscreen/hidden text does not rerasterize until visible again.
+Explicit `resize(width, height, pixelRatio)` updates density when device scale changes.
+
+Identical content/font/color shares one replaceable atlas slot at the largest density needed by
+its visible copies. Updating raster density changes neither world geometry nor undo history.
+Old atlas allocations are released after a replacement upload succeeds. GPU atlas textures retain
+their high-water allocation until destruction; zoom does not add an immutable cache entry for
+every scale. Content/style entries remain cached for undo, up to 4096 entries and eight atlas
+textures per editor.
+
+Each raster is capped at 4094 pixels per side and 4,194,304 pixels total. Extreme magnification
+can therefore still look soft. If an atlas replacement cannot allocate space, the old raster
+remains valid; the editor retries after the requested size or atlas allocations change. Creating
+a new style with no available atlas space throws. `diagnostics.limitedTextRuns` counts cached
+runs whose latest requested density hit a raster or allocation limit. `textRasterizations`,
+`textAtlasTiles`, and `textPixels` expose successful raster updates, live atlas tiles, and cached
+raster pixel counts. `stats.textMs` measures the frame's text preparation separately from Silk
+scene construction and GPU encoding. Text bounds are not tight glyph hit regions, and text has
+no native editing/IME API yet.
 
 Events are `CustomEvent`s; payloads are in `event.detail`. `on(name, listener)` returns an
 unsubscribe function. `change` reports affected IDs and a source, `selectionchange` reports IDs,
@@ -189,7 +210,7 @@ EDITOR_COUNTS=100000 EDITOR_SHADOWS=1 node graphics/editor/web/test.mjs --bench
 ```
 
 Browser tests check GPU pixels, clipping, conservative shadow culling, camera/DPR transforms,
-text atlas output, translucent rectangle ordering across fast/mixed paths, history, identity,
+text atlas output and adaptive zoom/scale/DPR resolution, translucent rectangle ordering across fast/mixed paths, history, identity,
 transaction rollback, independent instances, destruction,
 and real pointer drag/resize/cancel plus keyboard edits. Browser/benchmark output goes to
 `build/editor-results/` (override with `EDITOR_RESULTS`). Benchmarks have no timing assertions.

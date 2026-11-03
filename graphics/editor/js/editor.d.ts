@@ -12,7 +12,20 @@ export interface ElementProperties {
 export type ElementSnapshot = Readonly<Required<ElementProperties> & { id: ElementId }>;
 export interface Camera { x: number; y: number; zoom: number }
 export interface Viewport extends Camera { width: number; height: number; pixelRatio: number }
-export interface RenderStats { buildMs: number; drawMs: number; visible: number; visited: number; batches: number; frames: number }
+export interface RenderStats { buildMs: number; drawMs: number; textMs: number; visible: number; visited: number; batches: number; frames: number }
+/** Resource counters and the latest quality limits of cached text styles. */
+export interface EditorDiagnostics {
+  gpuHandles: number; wasmBytes: number; destroyed: boolean;
+  textRuns: number;
+  /** Successful uploads, including replacements of a shared text raster. */
+  textRasterizations: number;
+  /** Live native atlas allocations; replacing a raster releases its old allocation. */
+  textAtlasTiles: number;
+  /** Sum of cached raster areas; GPU textures can retain a larger high-water allocation. */
+  textPixels: number;
+  /** Cached styles whose latest requested resolution was capped or could not be allocated. */
+  limitedTextRuns: number;
+}
 export interface EditorDocument { version: 1; elements: ElementProperties[]; viewport?: Camera }
 export interface EditorOptions {
   canvas: HTMLCanvasElement; wasm?: string | URL | WebAssembly.Module;
@@ -40,7 +53,7 @@ export class Editor extends EventTarget {
   background: HexColor;
   culling: boolean;
   readonly stats: Readonly<RenderStats>;
-  readonly diagnostics: Readonly<{ gpuHandles: number; wasmBytes: number; textRuns: number; destroyed: boolean }>;
+  readonly diagnostics: Readonly<EditorDiagnostics>;
   readonly size: number;
   readonly viewport: Viewport;
   readonly selection: ElementId[];

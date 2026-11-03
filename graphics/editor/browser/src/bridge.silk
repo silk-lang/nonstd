@@ -3,7 +3,8 @@
 //! The JavaScript wrapper serializes calls and releases each token once. Raw callers must
 //! never reuse a released token or call into the module while another call holds a loan.
 static if Intrinsic.targetArchitecture() == "wasm32" {
-  import atlas.atlas { Atlas, AtlasOptions, AtlasError, Kind }
+  import atlas.atlas { Atlas, AtlasOptions, AtlasError, AtlasTile, Kind }
+  import silk.core.option { Option }
   import silk.num.u32
   import editor.document { Document, Node, Camera }
   import ui_scene.scene { Scene }
@@ -341,15 +342,35 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     }
   }
 
-  // The host owns bytes for this synchronous call; no borrowed pixels escape it.
-  effect fn upload(state: &mut State, width: u32, height: u32, pixels: &[u8]) -> u32
-    ! GpuError | OutOfMemoryError | AtlasError
+  effect fn installImage(state: &mut State, kind: u32, tile: AtlasTile, pixels: &[u8]) -> u32
+    ! GpuError | OutOfMemoryError
     ? &mut Allocator {
     if let Running active = &mut state.stage {
-      let tile = run state.tiles.allocate(Kind.Polychrome, width, height)
       run active.atlas.sync(&active.device, &state.tiles)
       active.atlas.write(&active.queue, tile, pixels)
-      return run state.document.addTile(tile)
+      if kind == 0 {
+        return run state.document.addTile(tile)
+      }
+      if let Option<AtlasTile>.Some { value } = state.document.replaceTile(kind, tile) {
+        drop state.tiles.free(value.id)
+        return kind
+      }
+    }
+    return 0
+  }
+
+  // Allocate before replacing: a full atlas leaves the current image valid. This atlas does
+  // not advance frames, so allocate cannot evict another live document tile implicitly.
+  effect fn upload(state: &mut State, kind: u32, width: u32, height: u32, pixels: &[u8]) -> u32
+    ! GpuError | OutOfMemoryError | AtlasError
+    ? &mut Allocator {
+    if let Running _ = &mut state.stage {
+      let tile = run state.tiles.allocate(Kind.Polychrome, width, height)
+      let result = run Effect.catchAll(installImage(&mut state, kind, tile, pixels), failedId)
+      if result == 0 {
+        drop state.tiles.free(tile.id)
+      }
+      return result
     }
     return 0
   }
@@ -365,7 +386,29 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     let mut pixelsAnchor = ()
     let pixels = unsafe Pointer.borrowMany(&pixelsAnchor, bytes, u32.toUsize(width * height * 4))
     let mut allocator = Allocator.systemAllocatorProvider()
-    return run Effect.catchAll(upload(&mut state, width, height, pixels), failedId)
+    return run Effect.catchAll(upload(&mut state, 0, width, height, pixels), failedId)
       |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  export "C" fn editorImageReplace(
+    token: *mut u8,
+    kind: u32,
+    width: u32,
+    height: u32,
+    bytes: [*]const u8,
+  ) -> u32 as "editor_image_replace" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    let mut pixelsAnchor = ()
+    let pixels = unsafe Pointer.borrowMany(&pixelsAnchor, bytes, u32.toUsize(width * height * 4))
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(upload(&mut state, kind, width, height, pixels), failedId)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  export "C" fn editorImageCount(token: *mut u8) -> u32 as "editor_image_count" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    return state.tiles.tileCount()
   }
 }

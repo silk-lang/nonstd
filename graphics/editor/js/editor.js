@@ -43,6 +43,25 @@ function normalize(value) {
   return Object.freeze(n);
 }
 
+// Quantized raster density avoids a texture upload on every wheel event. Raster dimensions
+// are independent per axis, so nonuniform element scaling keeps the original text geometry.
+const maxTextSide = 4094, maxTextPixels = 4 * 1024 * 1024;
+function measureText(n) {
+  const ctx = document.createElement('canvas').getContext('2d');
+  const font = `${n.fontWeight} ${n.fontSize}px ${n.fontFamily}`;
+  ctx.font = font; const m = ctx.measureText(n.text);
+  const left = Math.max(0, m.actualBoundingBoxLeft || 0);
+  const ascent = Math.max(n.fontSize, m.actualBoundingBoxAscent || 0);
+  const descent = Math.max(n.fontSize * .5, m.actualBoundingBoxDescent || 0);
+  return { font, width: Math.max(1, Math.ceil(Math.max(m.width, m.actualBoundingBoxRight || 0) + left + 4)),
+    height: Math.ceil(ascent + descent + 4), left: left + 2, baseline: ascent + 2 };
+}
+function boundedTextSize(width, height) {
+  const factor = Math.min(1, maxTextSide / width, maxTextSide / height, Math.sqrt(maxTextPixels / (width * height)));
+  return { width: Math.max(1, Math.floor(width * factor)), height: Math.max(1, Math.floor(height * factor)), limited: factor < 1 };
+}
+const densityBucket = ratio => 2 ** Math.ceil(Math.log2(Math.max(Number.MIN_VALUE, ratio)));
+
 /**
  * Retained Silk document and WebGPU surface. Construct with Editor.create().
  * All coordinates are world units; viewport dimensions are CSS pixels.
@@ -51,10 +70,10 @@ function normalize(value) {
 export class Editor extends EventTarget {
   #host; #token; #lastId = 0; #nodes = new Map(); #selection = new Set(); #frame = 0;
   #dead = false; #transaction = null; #undo = []; #redo = []; #replaying = false;
-  #textTiles = new Map();
+  #textTiles = new Map(); #textNodes = new Map(); #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
   #observer; #cleanups = []; #camera = { x: 0, y: 0, zoom: 1 }; #autoRender;
   #width = 1; #height = 1; #scale = 1;
-  stats = Object.freeze({ buildMs: 0, drawMs: 0, visible: 0, visited: 0, batches: 0, frames: 0 });
+  stats = Object.freeze({ buildMs: 0, drawMs: 0, textMs: 0, visible: 0, visited: 0, batches: 0, frames: 0 });
   culling = true;
   /** Initializes an independent WASM module and GPU device; rejects on unsupported WebGPU. */
   static async create({ canvas, wasm = new URL('./editor.wasm', import.meta.url),
@@ -72,7 +91,7 @@ export class Editor extends EventTarget {
     const instance = await WebAssembly.instantiate(module, { webgpu: host.imports, editor: {
       now: () => performance.now(),
       metric: (buildMs, drawMs, visible, visited, batches) => {
-        editor.stats = Object.freeze({ buildMs, drawMs, visible, visited, batches, frames: editor.stats.frames + 1 });
+        editor.stats = Object.freeze({ buildMs, drawMs, textMs: editor.#textMs, visible, visited, batches, frames: editor.stats.frames + 1 });
       },
     } });
     host.attach(instance);
@@ -106,7 +125,11 @@ export class Editor extends EventTarget {
   /** Registers input-controller cleanup with the editor lifetime. */
   addCleanup(cleanup) { this.#assert(); this.#cleanups.push(cleanup); }
   get diagnostics() { return Object.freeze({ gpuHandles: this.#host?.table.size ?? 0,
-    wasmBytes: this.#host?.exports?.memory.buffer.byteLength ?? 0, textRuns: this.#textTiles.size, destroyed: this.#dead }); }
+    wasmBytes: this.#host?.exports?.memory.buffer.byteLength ?? 0, textRuns: this.#textTiles.size,
+    textRasterizations: this.#textRasterizations,
+    textAtlasTiles: this.#token && !this.#dead ? this.#call('editor_image_count') : 0,
+    textPixels: [...this.#textTiles.values()].reduce((sum, entry) => sum + entry.width * entry.height, 0),
+    limitedTextRuns: [...this.#textTiles.values()].filter(entry => entry.limited).length, destroyed: this.#dead }); }
   get size() { return this.#nodes.size; }
   get viewport() { return { ...this.#camera, width: this.#width, height: this.#height, pixelRatio: this.#scale }; }
   get selection() { return [...this.#selection]; }
@@ -120,27 +143,43 @@ export class Editor extends EventTarget {
     for (let id = 1; id <= this.#lastId; id++) { const node = this.#nodes.get(id); if (node) yield node; }
   }
   #write(id, n) {
-    const result = this.#call('editor_set', id, n.type === 'text' ? this.#textKind(n) : n.type === 'ellipse' ? 1 : 0, n.x, n.y, n.width, n.height,
+    const text = n.type === 'text' ? this.#textKind(n) : null;
+    const result = this.#call('editor_set', id, text ? text.kind : n.type === 'ellipse' ? 1 : 0, n.x, n.y, n.width, n.height,
       n.radius, n.type === 'text' ? 0xffffffff : rgba(n.fill), rgba(n.border), n.borderWidth, n.blur, n.shadowX, n.shadowY,
       rgba(n.shadow), rgba(n.gradient?.to ?? n.fill), n.gradient?.angle ?? 90,
       (n.hidden ? 1 : 0) | (n.locked ? 2 : 0) | (n.gradient ? 4 : 0));
     if (!result) throw new Error('Silk could not store the element');
+    if (text) this.#textNodes.set(result, text); else this.#textNodes.delete(result);
     return result;
+  }
+  #textVisible(n) {
+    const { x, y, zoom } = this.#camera;
+    return !n.hidden && n.x + n.width > x && n.y + n.height > y &&
+      n.x < x + this.#width / zoom && n.y < y + this.#height / zoom;
+  }
+  #textSize(n, entry) {
+    const scale = this.#camera.zoom * this.#scale * 2;
+    return { width: Math.max(1, Math.ceil(entry.layout.width * densityBucket(n.width * scale / entry.layout.width))),
+      height: Math.max(1, Math.ceil(entry.layout.height * densityBucket(n.height * scale / entry.layout.height))) };
   }
   #textKind(n) {
     const key = JSON.stringify([n.text, n.fontSize, n.fontFamily, n.fontWeight, n.fill]);
-    if (this.#textTiles.has(key)) return this.#textTiles.get(key);
-    if (this.#textTiles.size >= 4096) throw new RangeError('Text cache limit reached (4096 immutable runs per editor)');
-    const canvas = document.createElement('canvas'), ctx = canvas.getContext('2d');
-    const ratio = 2, font = `${n.fontWeight} ${n.fontSize}px ${n.fontFamily}`;
-    ctx.font = font;
-    const measured = ctx.measureText(n.text);
-    const width = Math.max(1, Math.ceil(Math.max(measured.width, measured.actualBoundingBoxRight || 0) + Math.max(0, measured.actualBoundingBoxLeft || 0) + 4));
-    const height = Math.ceil(n.fontSize * 1.5 + 4);
-    if (width * ratio > 4094 || height * ratio > 4094) throw new RangeError('Text raster exceeds 4094 pixels; split the line');
-    canvas.width = width * ratio; canvas.height = height * ratio;
-    ctx.scale(ratio, ratio); ctx.font = font; ctx.fillStyle = n.fill; ctx.textBaseline = 'alphabetic';
-    ctx.fillText(n.text, 2 + Math.max(0, measured.actualBoundingBoxLeft || 0), n.fontSize + 2);
+    const cached = this.#textTiles.get(key); if (cached) return cached;
+    if (this.#textTiles.size >= 4096) throw new RangeError('Text cache limit reached (4096 text styles per editor)');
+    const entry = { kind: 0, layout: measureText(n), text: n.text, fill: n.fill, width: 0, height: 0, limited: false, failedSize: '', failedRevision: -1 };
+    const size = this.#textVisible(n) ? this.#textSize(n, entry) : { width: 1, height: 1 };
+    this.#rasterText(entry, boundedTextSize(size.width, size.height));
+    this.#textTiles.set(key, entry); return entry;
+  }
+  #rasterText(entry, size) {
+    const key = `${size.width}x${size.height}`;
+    entry.limited = size.limited;
+    if (entry.failedSize === key && entry.failedRevision === this.#textAtlasRevision) { entry.limited = true; return; }
+    const canvas = document.createElement('canvas'); canvas.width = size.width; canvas.height = size.height;
+    const ctx = canvas.getContext('2d'), layout = entry.layout;
+    ctx.scale(size.width / layout.width, size.height / layout.height);
+    ctx.font = layout.font; ctx.fillStyle = entry.fill; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(entry.text, layout.left, layout.baseline);
     const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
     for (let i = 0; i < pixels.length; i += 4) {
       const alpha = pixels[i + 3] / 255;
@@ -151,10 +190,34 @@ export class Editor extends EventTarget {
     let kind;
     try {
       new Uint8Array(this.#host.exports.memory.buffer, pointer, pixels.length).set(pixels);
-      kind = this.#call('editor_image', canvas.width, canvas.height, pointer);
+      kind = entry.kind ? this.#call('editor_image_replace', entry.kind, canvas.width, canvas.height, pointer)
+        : this.#call('editor_image', canvas.width, canvas.height, pointer);
     } finally { this.#host.call('webgpu_free', pointer, pixels.length); }
-    if (!kind) throw new Error('Text atlas is full');
-    this.#textTiles.set(key, kind); return kind;
+    if (!kind) {
+      if (!entry.kind) throw new Error('Text atlas is full');
+      // A failed replacement leaves the old tile intact. Do not retry this size every frame.
+      entry.failedSize = key; entry.failedRevision = this.#textAtlasRevision; entry.limited = true; return;
+    }
+    entry.kind = kind; entry.width = size.width; entry.height = size.height; entry.failedSize = '';
+    this.#textRasterizations++; this.#textAtlasRevision++;
+  }
+  #prepareText() {
+    if (!this.#textNodes.size) return;
+    const requests = new Map();
+    for (const [id, entry] of this.#textNodes) {
+      const n = this.#nodes.get(id); if (!n || !this.#textVisible(n)) continue;
+      const size = this.#textSize(n, entry), prior = requests.get(entry);
+      requests.set(entry, prior ? { width: Math.max(prior.width, size.width), height: Math.max(prior.height, size.height) } : size);
+    }
+    for (const [entry, requested] of requests) {
+      const size = boundedTextSize(requested.width, requested.height);
+      // Grow as soon as needed; shrink only after a fourfold drop to avoid bucket oscillation.
+      const width = size.width > entry.width || size.width * 4 <= entry.width ? size.width : entry.width;
+      const height = size.height > entry.height || size.height * 4 <= entry.height ? size.height : entry.height;
+      const target = boundedTextSize(width, height); target.limited ||= size.limited;
+      if (target.width !== entry.width || target.height !== entry.height) this.#rasterText(entry, target);
+      else entry.limited = target.limited;
+    }
   }
   #record(id, before, after) {
     if (this.#replaying) return;
@@ -178,14 +241,11 @@ export class Editor extends EventTarget {
   }
   rect(properties = {}) { return this.add({ ...properties, type: 'rect' }); }
   ellipse(properties = {}) { return this.add({ ...properties, type: 'ellipse' }); }
-  /** Adds one line of browser-shaped text, cached at 2× and composited by Silk on the GPU. */
+  /** Adds one line of browser-shaped text with raster density adapted to its displayed size. */
   text(content, properties = {}) {
     const n = normalize({ ...properties, type: 'text', text: content });
-    const ctx = document.createElement('canvas').getContext('2d');
-    ctx.font = `${n.fontWeight} ${n.fontSize}px ${n.fontFamily}`;
-    const m = ctx.measureText(content);
-    const width = Math.ceil(Math.max(m.width, m.actualBoundingBoxRight || 0) + Math.max(0, m.actualBoundingBoxLeft || 0) + 4);
-    return this.add({ ...n, width: properties.width ?? Math.max(1, width), height: properties.height ?? Math.ceil(n.fontSize * 1.5 + 4) });
+    const layout = measureText(n);
+    return this.add({ ...n, width: properties.width ?? layout.width, height: properties.height ?? layout.height });
   }
   /** Atomically validates and replaces properties of a live element. */
   update(id, patch) {
@@ -200,7 +260,7 @@ export class Editor extends EventTarget {
   remove(id) {
     this.#assert(); const before = this.#nodes.get(id);
     if (!before) return false;
-    this.#call('editor_remove', id); this.#nodes.delete(id); this.#record(id, before, undefined);
+    this.#call('editor_remove', id); this.#nodes.delete(id); this.#textNodes.delete(id); this.#record(id, before, undefined);
     if (this.#selection.has(id)) this.select(this.selection.filter(value => value !== id));
     this.invalidate(); return true;
   }
@@ -235,7 +295,7 @@ export class Editor extends EventTarget {
       for (const change of changes) {
         const value = change[side];
         if (value) { this.#write(change.id, value); this.#nodes.set(change.id, value); }
-        else { this.#call('editor_remove', change.id); this.#nodes.delete(change.id); }
+        else { this.#call('editor_remove', change.id); this.#nodes.delete(change.id); this.#textNodes.delete(change.id); }
       }
     } finally { this.#replaying = false; }
     this.select(this.selection.filter(id => this.#nodes.has(id)));
@@ -291,8 +351,9 @@ export class Editor extends EventTarget {
     if (this.#dead || !this.#autoRender || this.#frame) return;
     this.#frame = requestAnimationFrame(() => { this.#frame = 0; try { this.render(); } catch (error) { this.#error(error); } });
   }
-  /** Submits a frame synchronously. stats separates Silk scene work from WebGPU encoding. */
+  /** Submits a frame synchronously. stats separates text refresh, Silk scene work, and WebGPU encoding. */
   render() {
+    this.#assert(); const textStart = performance.now(); this.#prepareText(); this.#textMs = performance.now() - textStart;
     const { x, y, zoom } = this.#camera;
     const result = this.#call('editor_draw', x, y, zoom, this.#scale, this.#width, this.#height, this.culling ? 1 : 0, rgba(this.background));
     if (result < 0) throw new Error('Silk rendering failed (device, surface, geometry, or allocation)');
@@ -321,7 +382,7 @@ export class Editor extends EventTarget {
     cancelAnimationFrame(this.#frame); this.#frame = 0; this.#transaction = null;
     if (this.#token) this.#host.call('editor_drop', this.#token);
     this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear();
-    this.#undo.length = this.#redo.length = 0; this.#textTiles.clear();
+    this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear();
     this.emit('destroy', {});
   }
 }
