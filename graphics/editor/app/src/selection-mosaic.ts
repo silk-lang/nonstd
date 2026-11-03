@@ -1,15 +1,22 @@
 import pixels from './assets/selection-pixels.json' with { type: 'json' }
 import { makeNode, type Node } from './document'
 
-export const selectionTitle = ['SILK + EFFECT + FOLDKIT', '100K elements'] as const
+export const selectionTitle = ['SILK + WEBGPU +EFFECT + FOLDKIT', '100K elements'] as const
+const titleWidth = (text: string): number => Math.ceil(text.length * 512 * 0.6 + 4) * 2.5
 export const selectionMosaicBounds = {
   x: 0,
   y: 0,
   width: 20_000,
   height: (20_000 * pixels.sourceHeight) / pixels.sourceWidth,
 } as const
+const pageWidth = Math.max(
+  selectionMosaicBounds.width,
+  ...selectionTitle.map((text) => titleWidth(text)),
+)
 export const selectionPageBounds = {
   ...selectionMosaicBounds,
+  x: (selectionMosaicBounds.width - pageWidth) / 2,
+  width: pageWidth,
   y: -4800,
   height: selectionMosaicBounds.height + 4800,
 } as const
@@ -36,7 +43,7 @@ export const mosaicTitle = (id: string, line: number): Node => {
   // Courier New is monospaced; match the renderer's font-size and padding metrics.
   const text = selectionTitle[line] ?? ''
   const scale = 2.5
-  const width = Math.ceil(text.length * 512 * 0.6 + 4) * scale
+  const width = titleWidth(text)
   return makeNode(id, 'text', {
     name: text,
     text,
