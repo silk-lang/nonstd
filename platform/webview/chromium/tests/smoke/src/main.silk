@@ -1,0 +1,726 @@
+//! Drives the Chromium backend in a real window (Linux, under Xvfb in CI): a data: page loads and
+//! reports its title, agent commands change the page, window input reaches it, its CPU frames
+//! follow the placement through a resize, and the UI renderer draws a frame through a
+//! SurfaceSprite the way the CPU frame shows it. The first argument is the CEF runtime directory
+//! (`scripts/install-cef` prints it). Exit code 0 when every check passed.
+import chromium.chromium { ChromiumWebViews, StartError, FramePixels }
+import chromium.options { ChromiumOptions }
+import webview.command { Command }
+import webview.event { WebViewEvent, EventKind }
+import webview.host { WebViewHost }
+import webview.types { WebViewOptions, WebViewError, Placement }
+import window.bridge { BridgePlatform, MouseAction }
+import window.event { Event, Modifiers, MouseButton }
+import window.keys { KeyCode }
+import window.platform { Platform }
+import window.types { WindowOptions, WindowError, Wait, WindowId }
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.resources { Queue, Texture }
+import webgpu.descriptors {
+  BufferDescriptor,
+  DeviceDescriptor,
+  Extent3D,
+  TexelCopyBufferInfo,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureDescriptor,
+  TextureViewDescriptor,
+}
+import webgpu_sys.generated_webgpu as flags
+import ui_scene.color as color
+import ui_scene.primitives { ContentMask, SurfaceSprite }
+import ui_scene.scene { Scene }
+import ui_renderer.atlas_textures { GpuAtlas }
+import ui_renderer.renderer { UiRenderer }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.point { Point2 }
+import silk.geometry.rect { Rect }
+import silk.geometry.size { Size2 }
+import silk.geometry.vector { Vector2 }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String, InvalidUtf8 }
+
+const VIEW: u32 = 1
+
+const MARGIN: f32 = 20.0
+
+const TOP: f32 = 48.0
+
+/// A page with a button that retitles it, a text field and a blue square, all at fixed places.
+const PAGE: string<
+  'static
+> = "data:text/html,%3C!doctype%20html%3E%3Ctitle%3ESilk%20smoke%3C/title%3E%3Cbody%20style=%22margin:0;background:%23fff%22%3E%3Cbutton%20style=%22position:absolute;left:0;top:0;width:120px;height:40px%22%20onclick=%22document.title='clicked'%22%3EPress%3C/button%3E%3Cinput%20id=%22name%22%20aria-label=%22Name%22%20style=%22position:absolute;left:0;top:60px;width:200px;height:30px%22%3E%3Cdiv%20style=%22position:absolute;left:0;top:120px;width:100px;height:100px;background:%231e90ff%22%3E%3C/div%3E%3Cscript%3Econsole.log('page%20ready')%3C/script%3E%3C/body%3E"
+
+/// What arrived from the web view, latest values.
+struct Seen {
+  created: bool,
+  closed: bool,
+  title: String,
+  loaded: bool,
+  console: String,
+  snapshot: String,
+  snapshots: u32,
+  actionOk: u32,
+  actionFailed: u32,
+  script: String,
+  scriptOk: bool,
+  scripts: u32,
+  screenshotWidth: u32,
+  screenshotBytes: usize,
+  unsupported: String,
+  resizedWidth: f64,
+  resizes: u32,
+}
+
+impl Seen {
+  fn make() -> Seen {
+    return Seen {
+      created: false,
+      closed: false,
+      title: String.make(),
+      loaded: false,
+      console: String.make(),
+      snapshot: String.make(),
+      snapshots: 0,
+      actionOk: 0,
+      actionFailed: 0,
+      script: String.make(),
+      scriptOk: false,
+      scripts: 0,
+      screenshotWidth: 0,
+      screenshotBytes: 0,
+      unsupported: String.make(),
+      resizedWidth: 0.0,
+      resizes: 0,
+    }
+  }
+}
+
+struct Checks {
+  failed: u32,
+}
+
+impl Checks {
+  fn check(self: &mut Self, ok: bool, what: string<'static>) -> () {
+    if ok {
+      StderrWriter.print("ok    {}\n", &(what,))
+    } else {
+      StderrWriter.print("FAIL  {}\n", &(what,))
+      self.failed = self.failed + 1
+    }
+  }
+}
+
+/// The node's placement for a content area of `size`: inset, below a pretend toolbar.
+fn placementFor(width: f64, height: f64) -> Placement {
+  let bounds = Rect<f32>.new(MARGIN, TOP, f64.toF32(width) - MARGIN, f64.toF32(height) - MARGIN)
+  return Placement { bounds: bounds, clip: bounds, visible: true, scale: 1.0 }
+}
+
+/// The `[ref=...]` on the first outline line containing `needle`, or empty.
+effect fn refOn(outline: string, needle: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = String.split(outline, "\n")
+  while let Option<string>.Some { value: line } = lines.next() {
+    if String.contains(line, needle) {
+      if let Option<usize>.Some { value: at } = String.find(line, "[ref=") {
+        let start = at + 5
+        let rest = String.slice(line, start, String.byteLength(line) - start)
+        if let Option<usize>.Some { value: end } = String.find(rest, "]") {
+          return run String.copy(String.slice(rest, 0, end))
+        }
+      }
+    }
+  }
+  return String.make()
+}
+
+/// Pumps the window and the web views for up to `seconds`, or until `until` says the wait is
+/// over. Window input goes to the views, as an app's loop sends it.
+effect fn pump(
+  platform: &mut BridgePlatform,
+  views: &mut ChromiumWebViews,
+  seen: &mut Seen,
+  seconds: f64,
+  until: fn(&Seen) -> bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut waited: f64 = 0.0
+  let mut events = List<WebViewEvent>.make()
+  while waited < seconds {
+    match move run platform.nextEvent(Wait.Seconds { seconds: 0.01 }) {
+      Option<Event>.Some { value } => {
+        match &value {
+          Event.Resized { size, .. } => {
+            seen.resizedWidth = size.width
+            seen.resizes = seen.resizes + 1
+            views.place(VIEW, placementFor(size.width, size.height))
+          }
+          _ => {
+            drop views.forward(&value)
+          }
+        }
+      }
+      Option<Event>.None => {
+        waited = waited + 0.01
+      }
+    }
+    run views.takeEvents(&mut events)
+    while events.length() != 0 {
+      let event = events.remove(0)
+      match &event.kind {
+        EventKind.Created => {
+          seen.created = true
+        }
+        EventKind.Closed => {
+          seen.closed = true
+        }
+        EventKind.TitleChanged { title } => {
+          seen.title.clear()
+          run seen.title.append(title.view())
+          StderrWriter.print("info  title \"{}\"\n", &(title.view(),))
+        }
+        EventKind.LoadFinished { ok, error, .. } => {
+          if ok {
+            seen.loaded = true
+          } else {
+            StderrWriter.print("info  load failed: {}\n", &(error.view(),))
+          }
+        }
+        EventKind.Console { message, .. } => {
+          seen.console.clear()
+          run seen.console.append(message.view())
+        }
+        EventKind.Snapshot { text, .. } => {
+          seen.snapshot.clear()
+          run seen.snapshot.append(text.view())
+          seen.snapshots = seen.snapshots + 1
+        }
+        EventKind.ActionResult { ok, error, .. } => {
+          if ok {
+            seen.actionOk = seen.actionOk + 1
+          } else {
+            seen.actionFailed = seen.actionFailed + 1
+            StderrWriter.print("info  action failed: {}\n", &(error.view(),))
+          }
+        }
+        EventKind.ScriptResult { ok, value, .. } => {
+          seen.script.clear()
+          run seen.script.append(value.view())
+          seen.scriptOk = ok
+          seen.scripts = seen.scripts + 1
+        }
+        EventKind.Screenshot { width, pixels, .. } => {
+          seen.screenshotWidth = width
+          seen.screenshotBytes = pixels.length()
+        }
+        EventKind.Unsupported { command, .. } => {
+          seen.unsupported.clear()
+          run seen.unsupported.append(command.view())
+        }
+        EventKind.Crashed { .. } => {
+          StderrWriter.print("info  the page process crashed\n", &())
+        }
+        _ => {}
+      }
+    }
+    if until(&seen) {
+      return ()
+    }
+  }
+}
+
+fn titled(seen: &Seen) -> bool {
+  return seen.title.view() == "Silk smoke" && seen.loaded
+}
+
+fn clicked(seen: &Seen) -> bool {
+  return seen.title.view() == "clicked"
+}
+
+fn retitled(seen: &Seen) -> bool {
+  return seen.title.view() == "Silk smoke"
+}
+
+fn snapshotted(seen: &Seen) -> bool {
+  return seen.snapshots > 0
+}
+
+fn acted(seen: &Seen) -> bool {
+  return seen.actionOk + seen.actionFailed > 0
+}
+
+fn answered(seen: &Seen) -> bool {
+  return seen.scripts > 0
+}
+
+fn screenshotted(seen: &Seen) -> bool {
+  return seen.screenshotWidth > 0
+}
+
+fn resized(seen: &Seen) -> bool {
+  return seen.resizes > 0
+}
+
+fn closed(seen: &Seen) -> bool {
+  return seen.closed
+}
+
+fn never(seen: &Seen) -> bool {
+  return false
+}
+
+/// Evaluates `script` until its JSON value is `expected` or about `seconds` pass: input reaches
+/// the page asynchronously.
+effect fn waitForValue(
+  platform: &mut BridgePlatform,
+  views: &mut ChromiumWebViews,
+  seen: &mut Seen,
+  script: string,
+  expected: string,
+  seconds: f64,
+) -> bool
+  ! WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tries: u32 = 0
+  let limit = f64.toU32(seconds / 0.1)
+  while tries < limit {
+    seen.scripts = 0
+    run views.send(VIEW, Command.Evaluate { request: 100 + tries, script: run String.copy(script) })
+    run pump(&mut platform, &mut views, &mut seen, 2.0, answered)
+    if seen.scriptOk && seen.script.view() == expected {
+      return true
+    }
+    run pump(&mut platform, &mut views, &mut seen, 0.1, never)
+    tries = tries + 1
+  }
+  StderrWriter.print("info  {} is {}\n", &(script, seen.script.view()))
+  return false
+}
+
+/// Waits for a CPU frame of the placement's size, `width` x `height` device pixels.
+effect fn waitForFrame(
+  platform: &mut BridgePlatform,
+  views: &mut ChromiumWebViews,
+  seen: &mut Seen,
+  width: u32,
+  height: u32,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut tries: u32 = 0
+  while tries < 50 {
+    match run views.framePixels(VIEW) {
+      Option<FramePixels>.Some { value } => {
+        if value.width == width && value.height == height {
+          return true
+        }
+        if tries == 49 {
+          StderrWriter.print("info  the frame is {} x {}\n", &(value.width, value.height))
+        }
+      }
+      Option<FramePixels>.None => {}
+    }
+    run pump(&mut platform, &mut views, &mut seen, 0.1, never)
+    tries = tries + 1
+  }
+  return false
+}
+
+fn press(platform: &mut BridgePlatform, window: WindowId, x: f64, y: f64) -> () {
+  let at = Point2<f64>.new(x, y)
+  let none = Vector2<f64>.new(0.0, 0.0)
+  drop platform.simulateMouse(window, MouseAction.Move, MouseButton.Left, at, none)
+  drop platform.simulateMouse(window, MouseAction.Press, MouseButton.Left, at, none)
+  drop platform.simulateMouse(window, MouseAction.Release, MouseButton.Left, at, none)
+}
+
+/// The pixel at (x, y) of a BGRA frame, as RGB.
+fn framePixel(frame: &FramePixels, x: u32, y: u32) -> u32 {
+  let at = u32.toUsize((y * frame.width + x) * 4)
+  let bytes = frame.pixels.asSlice()
+  return u32.shiftLeft(u8.toU32(bytes[at + 2]), 16) | u32.shiftLeft(u8.toU32(bytes[at + 1]), 8)
+    | u8.toU32(bytes[at])
+}
+
+fn extent(width: u32, height: u32) -> Extent3D {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  return size
+}
+
+/// `texture`'s RGBA rows, tightly packed.
+effect fn readBack(
+  device: &Device,
+  queue: &Queue,
+  texture: &Texture,
+  width: u32,
+  height: u32,
+) -> List<u8>
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let stride = (width * 4 + 255) / 256 * 256
+  let size = u32.toUsize(stride * height)
+  let readback = run gpu.createBuffer(
+    device,
+    &BufferDescriptor.make(
+      b"smoke readback",
+      usize.toU64(size),
+      flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead,
+      false,
+    ),
+  )
+  let mut encoder = run gpu.createCommandEncoder(device, b"smoke readback")
+  let source = TexelCopyTextureInfo.default().withTexture(texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(stride)
+  layout.setRowsPerImage(height)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(width, height))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"smoke readback")
+  queue.submit(&[commands.reference()])
+  run device.checkErrors()
+  let padded = run runtime.mapRead(device, &readback, 0, size)
+  let mut out = List<u8>.make()
+  let bytes = padded.asSlice()
+  let mut y: u32 = 0
+  while y < height {
+    run out.appendSlice(Slice.view<u8>(bytes, u32.toUsize(y * stride), u32.toUsize(width * 4)))
+    y = y + 1
+  }
+  return move out
+}
+
+/// Uploads the view's frame with `present`, draws it through a SurfaceSprite covering a target of
+/// its size, and compares the result with the CPU frame. True when they match within a little
+/// rounding.
+effect fn drawsLikeTheFrame(views: &mut ChromiumWebViews) -> bool
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run gpu.getQueue(&device)
+  let mut renderer = run UiRenderer.make(&device, flags.WGPUTextureFormat_RGBA8Unorm)
+  run views.present(&device, &queue, &mut renderer)
+
+  // Nothing pumps between present and this copy, so it is the frame present uploaded.
+  let frame = match run views.framePixels(VIEW) {
+    Option<FramePixels>.Some { value } => move value
+    Option<FramePixels>.None => {
+      StderrWriter.print("info  no CPU frame to draw\n", &())
+      return false
+    }
+  }
+  let width = frame.width
+  let height = frame.height
+  let bounds = Rect<f32>.new(0.0, 0.0, u32.toF32(width), u32.toF32(height))
+  let mut scene = Scene.make()
+  drop run scene.surface(SurfaceSprite.make(bounds, ContentMask.new(bounds), VIEW, width, height))
+  run scene.finish()
+  let mut descriptor = TextureDescriptor.default().withLabel(b"smoke target")
+  descriptor.setSize(extent(width, height))
+  descriptor.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  let target = run gpu.createTexture(&device, &descriptor)
+  let targetView = run target.createView(&TextureViewDescriptor.default())
+  let atlas = GpuAtlas.make()
+  run renderer.draw(
+    &device,
+    &queue,
+    &scene,
+    &atlas,
+    &targetView,
+    width,
+    height,
+    color.transparent(),
+  )
+  run device.checkErrors()
+  let drawn = run readBack(&device, &queue, &target, width, height)
+  let cpu = frame.pixels.asSlice()
+  let gpuBytes = drawn.asSlice()
+  let mut max: u32 = 0
+  let mut sum: f64 = 0.0
+  let mut i: usize = 0
+  while i + 3 < cpu.length && i + 3 < gpuBytes.length {
+    // The frame is BGRA, the target RGBA.
+    let mut c: usize = 0
+    while c < 4 {
+      let source = if c == 3 {
+        3
+      } else {
+        2 - c
+      }
+      let a = u8.toU32(cpu[i + source])
+      let b = u8.toU32(gpuBytes[i + c])
+      let d = if a > b {
+        a - b
+      } else {
+        b - a
+      }
+      if d > max {
+        max = d
+      }
+      sum = sum + u32.toF64(d)
+      c = c + 1
+    }
+    i = i + 4
+  }
+  let mean = sum / usize.toF64(cpu.length)
+  StderrWriter.print("info  drawn frame vs CPU frame: max delta {}, mean {}\n", &(max, mean))
+  return gpuBytes.length == cpu.length && max <= 8 && mean <= 0.5
+}
+
+effect fn smoke(checks: &mut Checks, runtimeDir: string) -> ()
+  ! WindowError | WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut cefOptions = run ChromiumOptions.make(runtimeDir)
+
+  // CI containers have neither user namespaces for the sandbox nor a GPU.
+  cefOptions.sandbox = false
+  cefOptions.gpu = false
+  let started = run Effect.catchAll(startViews(&cefOptions), notStarted)
+  let mut views = match move started {
+    Option<ChromiumWebViews>.Some { value } => move value
+    Option<ChromiumWebViews>.None => {
+      let why = run ChromiumWebViews.startError()
+      StderrWriter.print("info  {}\n", &(why.view(),))
+      checks.check(false, "CEF starts")
+      return ()
+    }
+  }
+  checks.check(true, "CEF starts")
+
+  let mut platform = run BridgePlatform.start()
+  let options = WindowOptions.make("platform-webview-chromium smoke test", 640.0, 480.0)
+  let window = run platform.openWindow(&options)
+  platform.focus(window)
+
+  let mut seen = Seen.make()
+  let mut viewOptions = run WebViewOptions.make(window.value, PAGE)
+  viewOptions.inspectable = false
+  run views.open(VIEW, &viewOptions)
+  let size = platform.contentSize(window)
+  views.place(VIEW, placementFor(size.width, size.height))
+
+  run pump(&mut platform, &mut views, &mut seen, 30.0, titled)
+  checks.check(seen.created, "Created")
+  checks.check(seen.loaded, "the data: page loads")
+  checks.check(seen.title.view() == "Silk smoke", "TitleChanged has the page title")
+  run pump(&mut platform, &mut views, &mut seen, 0.5, never)
+  checks.check(seen.console.view() == "page ready", "console.log reaches Console")
+
+  let width = f64.toU32(size.width) - 2 * f32.toU32(MARGIN)
+  let height = f64.toU32(size.height) - f32.toU32(MARGIN) - f32.toU32(TOP)
+  checks.check(
+    run waitForFrame(&mut platform, &mut views, &mut seen, width, height),
+    "frames arrive at the placement's size",
+  )
+  match run views.framePixels(VIEW) {
+    Option<FramePixels>.Some { value } => {
+      checks.check(framePixel(&value, 50, 170) == 0x1e90ff, "the frame shows the page")
+    }
+    Option<FramePixels>.None => {
+      checks.check(false, "the frame shows the page")
+    }
+  }
+  checks.check(
+    run Effect.catchAll(drawsLikeTheFrame(&mut views), notDrawn),
+    "the UI renderer draws the frame through a SurfaceSprite",
+  )
+
+  // Window input: a click on the button, then typing into the field.
+  press(&mut platform, window, f32.toF64(MARGIN) + 60.0, f32.toF64(TOP) + 20.0)
+  run pump(&mut platform, &mut views, &mut seen, 5.0, clicked)
+  checks.check(seen.title.view() == "clicked", "a window click reaches the page")
+  press(&mut platform, window, f32.toF64(MARGIN) + 100.0, f32.toF64(TOP) + 75.0)
+  run pump(&mut platform, &mut views, &mut seen, 0.3, never)
+  drop platform.simulateKey(window, KeyCode.KeyA, "a", Modifiers.none())
+  let typed = run waitForValue(
+    &mut platform,
+    &mut views,
+    &mut seen,
+    "document.getElementById('name').value",
+    "\"a\"",
+    3.0,
+  )
+  checks.check(typed, "window typing reaches the focused field")
+
+  seen.scripts = 0
+  run views.send(VIEW, Command.Evaluate { request: 1, script: run String.copy("6 * 7") })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, answered)
+  checks.check(seen.scriptOk && seen.script.view() == "42", "Evaluate answers with JSON")
+  seen.scripts = 0
+  run views.send(
+    VIEW,
+    Command.Evaluate {
+      request: 2,
+      script: run String.copy("new Promise(done => setTimeout(() => done({ a: [1, 'b'] }), 10))"),
+    },
+  )
+  run pump(&mut platform, &mut views, &mut seen, 5.0, answered)
+  checks.check(
+    seen.scriptOk && seen.script.view() == "{\"a\":[1,\"b\"]}",
+    "Evaluate awaits a promise",
+  )
+  seen.scripts = 0
+  run views.send(
+    VIEW,
+    Command.Evaluate { request: 3, script: run String.copy("document.title = 'Silk smoke'") },
+  )
+  run pump(&mut platform, &mut views, &mut seen, 5.0, retitled)
+
+  run views.send(VIEW, Command.Snapshot { request: 4 })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, snapshotted)
+  StderrWriter.print("info  snapshot:\n{}\n", &(seen.snapshot.view(),))
+  let button = run refOn(seen.snapshot.view(), "button \"Press\"")
+  let field = run refOn(seen.snapshot.view(), "textbox \"Name\"")
+  checks.check(
+    String.byteLength(button.view()) != 0 && String.byteLength(field.view()) != 0,
+    "the snapshot has refs for the button and the field",
+  )
+
+  seen.actionOk = 0
+  seen.actionFailed = 0
+  run views.send(VIEW, Command.ClickElement { request: 5, element: move button })
+  run pump(&mut platform, &mut views, &mut seen, 5.0, acted)
+  checks.check(seen.actionOk == 1, "ClickElement answers ok")
+  run pump(&mut platform, &mut views, &mut seen, 3.0, clicked)
+  checks.check(seen.title.view() == "clicked", "ClickElement clicks the button (its handler ran)")
+
+  seen.actionOk = 0
+  seen.actionFailed = 0
+  run views.send(
+    VIEW,
+    Command.FillElement { request: 6, element: move field, text: run String.copy("hello") },
+  )
+  run pump(&mut platform, &mut views, &mut seen, 5.0, acted)
+  checks.check(seen.actionOk == 1, "FillElement answers ok")
+  let filled = run waitForValue(
+    &mut platform,
+    &mut views,
+    &mut seen,
+    "document.getElementById('name').value",
+    "\"hello\"",
+    3.0,
+  )
+  checks.check(filled, "FillElement replaces the field's text")
+
+  seen.actionOk = 0
+  seen.actionFailed = 0
+  run views.send(VIEW, Command.ClickElement { request: 7, element: run String.copy("x); alert(1") })
+  run pump(&mut platform, &mut views, &mut seen, 2.0, acted)
+  checks.check(seen.actionFailed == 1, "a malformed ref is refused")
+
+  run views.send(VIEW, Command.Screenshot { request: 8 })
+  run pump(&mut platform, &mut views, &mut seen, 10.0, screenshotted)
+  checks.check(
+    seen.screenshotWidth >= 580 && seen.screenshotBytes != 0,
+    "Screenshot has the view's pixels",
+  )
+
+  run views.send(VIEW, Command.OpenDevTools)
+  run pump(&mut platform, &mut views, &mut seen, 1.0, never)
+  checks.check(
+    seen.unsupported.view() == "OpenDevTools",
+    "OpenDevTools is Unsupported when the view is not inspectable",
+  )
+
+  seen.resizes = 0
+  drop platform.simulateResize(window, Size2<f64>.new(800.0, 600.0))
+  run pump(&mut platform, &mut views, &mut seen, 3.0, resized)
+  checks.check(seen.resizedWidth == 800.0, "the window resized")
+  checks.check(
+    run waitForFrame(&mut platform, &mut views, &mut seen, 760, 532),
+    "after a resize, frames follow the placement",
+  )
+
+  run views.close(VIEW)
+  run pump(&mut platform, &mut views, &mut seen, 5.0, closed)
+  checks.check(seen.closed, "Closed")
+  platform.closeWindow(window)
+  views.shutdown()
+}
+
+effect fn startViews(options: &ChromiumOptions) -> Option<ChromiumWebViews>
+  ! StartError
+  ? &mut Allocator {
+  return Option<ChromiumWebViews>.some(run ChromiumWebViews.start(options))
+}
+
+effect fn notStarted(error: StartError) -> Option<ChromiumWebViews> {
+  drop error
+  return Option<ChromiumWebViews>.None
+}
+
+effect fn notDrawn<E>(error: E) -> bool {
+  drop error
+  StderrWriter.print("info  the GPU device, renderer or readback failed\n", &())
+  return false
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn program() -> i32
+  ! WindowError | WebViewError | OutOfMemoryError | HostInputError
+  ? &mut HostInput | &mut Allocator {
+  let mut checks = Checks { failed: 0 }
+  let argument = run HostInput.argument(1)
+  let runtimeDir = match move argument {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      StderrWriter.print("usage: smoke <CEF runtime directory>\n", &())
+      return 2
+    }
+  }
+  match HostInput.text(runtimeDir.asSlice()) {
+    Result<string, InvalidUtf8>.Success { value } => {
+      run smoke(&mut checks, value)
+    }
+    _ => {
+      return 2
+    }
+  }
+  if checks.failed != 0 {
+    StderrWriter.print("{} checks failed\n", &(checks.failed,))
+    return 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print(
+    "FAIL  the window system did not start, or a window or view was refused\n",
+    &(),
+  )
+  return 2
+}

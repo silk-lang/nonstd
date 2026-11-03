@@ -10,7 +10,7 @@ The engine backends land in steps on the `feature/webview` branch (see [Plan](#p
 | `HeadlessWebViews` | none | records, for tests | Complete |
 | `MacWebViews` (macOS) | WKWebView | native child view over the window | W2 (see below) |
 | `WindowsWebViews` (Windows) | Edge WebView2 | native child window | W5 (see below) |
-| Chromium (Linux; optional on macOS and Windows) | CEF, offscreen | shared GPU texture drawn by ui_renderer | Planned (W3, W4, W6) |
+| `ChromiumWebViews` (Linux; optional on macOS and Windows later) | CEF, offscreen | texture drawn by ui_renderer (CPU frames, or shared dma-bufs) | W4 on Linux, in [chromium/](chromium/README.md); W6 for macOS and Windows |
 
 ## The model
 
@@ -200,4 +200,4 @@ PR into `feature/webview`:
 | W5 | Windows backend: WebView2 child windows, same contract, DevTools protocol for agent input | W1 |
 | W6 | Chromium as the optional backend on macOS and Windows, a `ui/app` web view component and an agent-and-chat demo | W2, W4, W5 |
 
-The Chromium backend lives in its own package, so only apps that choose it download and ship CEF.
+The Chromium backend lives in its own package ([chromium/](chromium/README.md)), so only apps that choose it download and ship CEF.
