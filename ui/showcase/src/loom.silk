@@ -1,0 +1,710 @@
+//! Silk Loom: the showcase app. Five ribbons of silk threads weave behind a glass card; the
+//! threads part around the pointer, a press leaves a ripple, and "Reweave" blends every thread
+//! into the next palette.
+//!
+//! It is an ordinary ui-app: a model, messages, a `view` the runtime diffs into ui-tree
+//! mutations, and an animation frame subscription. The weave is one canvas node whose commands
+//! change every frame; the card is boxes and text laid out by css-layout, with gradients, a
+//! shadow, hover and press looks, color emoji from a COLR font and an animated SVG icon.
+import assets { SANS, MONO, LOOM_ICON }
+import palette { RIBBONS, PALETTES, hsv, rgb, rgba, white, ribbonHue, paletteName, ease, mixHue }
+import weave { Frame, STROKES, weave, ripples, arrow }
+import ui_app.app { App, Context, Subscriptions, NoCommand }
+import ui_app.ui { Ui, Reply }
+import ui_tree.mutation {
+  CanvasCommand,
+  Property,
+  Length,
+  Side,
+  Align,
+  Position,
+  Overflow,
+  FlexWrap,
+  LineHeight,
+  BoxShadow,
+  BorderStyle,
+  Cursor
+}
+import ui_tree.node { EventKind }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.geometry.corners { Corners }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+
+/// The chips under the subtitle; one at a time is in the spotlight.
+const CHIPS: u32 = 5
+
+/// Bars in the equalizer.
+const BARS: u32 = 30
+
+pub struct Loom {
+  /// The animation clock in seconds (it stops while paused).
+  pub clock: f64,
+  /// The time of the last frame, to measure the step.
+  pub now: f64,
+  pub frames: u64,
+  pub paused: bool,
+  pub width: f32,
+  pub height: f32,
+  /// Where the pointer is, and the eased point the threads part around.
+  pub pointerX: f32,
+  pub pointerY: f32,
+  pub easedX: f32,
+  pub easedY: f32,
+  pub pull: f32,
+  pub pointerSeen: bool,
+  /// The last press, on the clock (negative for none) and whether the button is still down.
+  pub pressX: f32,
+  pub pressY: f32,
+  pub pressedAt: f64,
+  pub pressed: bool,
+  /// The palette and the hues the blend into it started from.
+  pub palette: u32,
+  pub fromHues: [f32; 5],
+  pub changedAt: f64,
+  /// Draw an arrow at the pointer (the recorder has no system cursor).
+  pub showPointer: bool,
+}
+
+pub union Message {
+  Frame { pub time: f64 },
+  Resize { pub width: f32, pub height: f32 },
+  Pointer { pub x: f32, pub y: f32 },
+  Press { pub x: f32, pub y: f32 },
+  Release,
+  Reweave,
+  TogglePause,
+}
+
+impl Loom {
+  /// The app at `width` by `height` CSS pixels.
+  pub fn make(width: f32, height: f32, showPointer: bool) -> Loom {
+    return Loom {
+      clock: 0.0,
+      now: 0.0,
+      frames: 0,
+      paused: false,
+      width: width,
+      height: height,
+      pointerX: width * 0.5,
+      pointerY: height * 0.5,
+      easedX: width * 0.5,
+      easedY: height * 0.5,
+      pull: 0.0,
+      pointerSeen: false,
+      pressX: 0.0,
+      pressY: 0.0,
+      pressedAt: -10.0,
+      pressed: false,
+      palette: 0,
+      fromHues: [
+        ribbonHue(0, 0),
+        ribbonHue(0, 1),
+        ribbonHue(0, 2),
+        ribbonHue(0, 3),
+        ribbonHue(0, 4),
+      ],
+      changedAt: -10.0,
+      showPointer: showPointer,
+    }
+  }
+
+  /// The ribbons' hues now: on the way from `fromHues` to the palette's.
+  pub fn hues(self: &Self) -> [f32; 5] {
+    let t = ease(f64.toF32((self.clock - self.changedAt) / 1.2))
+    let mut out: [f32; 5] = [0.0; 5]
+    let mut i: u32 = 0
+    while i < RIBBONS {
+      let index = u32.toUsize(i)
+      out[index] = mixHue(self.fromHues[index], ribbonHue(self.palette, i), t)
+      i = i + 1
+    }
+    return out
+  }
+
+  fn time(self: &Self) -> f32 {
+    return f64.toF32(self.clock)
+  }
+
+  fn frame(self: &Self) -> Frame {
+    return Frame {
+      width: self.width,
+      height: self.height,
+      time: self.time(),
+      pointerX: self.easedX,
+      pointerY: self.easedY,
+      pull: self.pull,
+      hues: self.hues(),
+      rippleX: self.pressX,
+      rippleY: self.pressY,
+      rippleAge: f64.toF32(self.clock - self.pressedAt),
+    }
+  }
+}
+
+fn px(value: f32) -> Length {
+  return Length.Px { value: value }
+}
+
+fn round(radius: f32) -> Corners<f32> {
+  return Corners<f32> { topLeft: radius, topRight: radius, bottomRight: radius, bottomLeft: radius }
+}
+
+fn padding(ui: &mut Ui<Message>, vertical: f32, horizontal: f32) -> () {
+  ui.style(
+    &[
+      Property.Padding { side: Side.Top, value: px(vertical) },
+      Property.Padding { side: Side.Bottom, value: px(vertical) },
+      Property.Padding { side: Side.Left, value: px(horizontal) },
+      Property.Padding { side: Side.Right, value: px(horizontal) },
+    ],
+  )
+}
+
+fn border(ui: &mut Ui<Message>, width: f32, color: Rgba<f32>) -> () {
+  ui.style(
+    &[
+      Property.BorderWidth { side: Side.Top, value: width },
+      Property.BorderWidth { side: Side.Right, value: width },
+      Property.BorderWidth { side: Side.Bottom, value: width },
+      Property.BorderWidth { side: Side.Left, value: width },
+      Property.BorderStyle { value: BorderStyle.Solid },
+      Property.BorderColor { color: color },
+    ],
+  )
+}
+
+/// Covers the whole viewport, out of the flow.
+fn fill(ui: &mut Ui<Message>) -> () {
+  ui.style(
+    &[
+      Property.Position { value: Position.Absolute },
+      Property.Inset { side: Side.Top, value: px(0.0) },
+      Property.Inset { side: Side.Left, value: px(0.0) },
+      Property.Width { value: Length.Percent { value: 100.0 } },
+      Property.Height { value: Length.Percent { value: 100.0 } },
+    ],
+  )
+}
+
+fn chipLabel(index: u32) -> string<'static> {
+  return match index {
+    0 => "🎨 Gradients"
+    1 => "🧵 Paths"
+    2 => "✨ SVG animation"
+    3 => "⚡ Glyphs"
+    _ => "🦋 Emoji"
+  }
+}
+
+fn chip(ui: &mut Ui<Message>, index: u32, spotlight: f32, hue: f32) -> () {
+  ui.box(
+    |ui| {
+      ui.testId(chipLabel(index))
+      padding(&mut ui, 7.0, 13.0)
+      ui.style(
+        &[
+          Property.BorderRadius { value: round(999.0) },
+          Property.FontSize { value: 13.5 },
+          Property.FontWeight { value: 700.0 },
+        ],
+      )
+      ui.cursor(Cursor.Pointer)
+      if spotlight > 0.0 {
+        border(&mut ui, 1.0, hsv(hue, 0.55, 1.0, 0.35 + 0.5 * spotlight))
+        ui.style(
+          &[
+            Property.BackgroundGradient {
+              angle: 120.0,
+              from: hsv(hue, 0.75, 0.95, 0.12 + 0.45 * spotlight),
+              to: hsv(hue + 50.0, 0.75, 0.95, 0.06 + 0.2 * spotlight),
+            },
+            Property.Color { color: white(0.8 + 0.2 * spotlight) },
+          ],
+        )
+      } else {
+        border(&mut ui, 1.0, white(0.14))
+        ui.style(
+          &[Property.BackgroundColor { color: white(0.06) }, Property.Color { color: white(0.78) }],
+        )
+      }
+      ui.hover(
+        &[
+          Property.BackgroundColor { color: white(0.2) },
+          Property.BorderColor { color: white(0.6) },
+          Property.Color { color: white(1.0) },
+        ],
+      )
+      ui.text(chipLabel(index))
+    },
+  )
+}
+
+fn equalizer(ui: &mut Ui<Message>, time: f32, hues: [f32; 5]) -> () {
+  ui.row(
+    |ui| {
+      ui.gap(4.0)
+      ui.style(&[Property.AlignItems { value: Align.End }, Property.Height { value: px(46.0) }])
+      let mut i: u32 = 0
+      while i < BARS {
+        let x = u32.toF32(i)
+        let wave = 0.5 + 0.5 * f32.sin(time * 3.1 + x * 0.42)
+        let swell = 0.55 + 0.45 * f32.sin(time * 1.3 - x * 0.19)
+        let height = 5.0 + 40.0 * wave * swell
+        ui.box(
+          |ui| {
+            ui.style(
+              &[
+                Property.Width { value: px(5.0) },
+                Property.Height { value: px(height) },
+                Property.BorderRadius { value: round(2.5) },
+                Property.BackgroundGradient {
+                  angle: 0.0,
+                  from: hsv(hues[2], 0.7, 1.0, 0.9),
+                  to: hsv(hues[0], 0.65, 1.0, 0.95),
+                },
+              ],
+            )
+          },
+        )
+        i = i + 1
+      }
+    },
+  )
+}
+
+fn reweaveButton(ui: &mut Ui<Message>, hues: [f32; 5], time: f32) -> () {
+  ui.pressable(
+    || Message.Reweave,
+    |ui| {
+      ui.testId("reweave")
+      ui.label("Reweave")
+      padding(&mut ui, 13.0, 24.0)
+      let glow = 0.45 + 0.1 * f32.sin(time * 2.4)
+      ui.style(
+        &[
+          Property.BorderRadius { value: round(999.0) },
+          Property.FontSize { value: 16.0 },
+          Property.FontWeight { value: 700.0 },
+          Property.Color { color: white(1.0) },
+          Property.BackgroundGradient {
+            angle: 115.0,
+            from: hsv(hues[0], 0.78, 0.95, 1.0),
+            to: hsv(hues[1], 0.78, 0.85, 1.0),
+          },
+          Property.BoxShadow {
+            value: BoxShadow {
+              offsetX: 0.0,
+              offsetY: 10.0,
+              blur: 30.0,
+              spread: 0.0,
+              color: hsv(hues[0], 0.8, 1.0, glow),
+              inset: false,
+            },
+          },
+        ],
+      )
+      ui.hover(
+        &[
+          Property.BackgroundGradient {
+            angle: 115.0,
+            from: hsv(hues[0], 0.6, 1.0, 1.0),
+            to: hsv(hues[1], 0.65, 1.0, 1.0),
+          },
+          Property.BoxShadow {
+            value: BoxShadow {
+              offsetX: 0.0,
+              offsetY: 14.0,
+              blur: 44.0,
+              spread: 4.0,
+              color: hsv(hues[0], 0.8, 1.0, 0.75),
+              inset: false,
+            },
+          },
+        ],
+      )
+      ui.active(
+        &[
+          Property.BackgroundGradient {
+            angle: 115.0,
+            from: hsv(hues[1], 0.8, 0.8, 1.0),
+            to: hsv(hues[0], 0.8, 0.75, 1.0),
+          },
+          Property.BoxShadow {
+            value: BoxShadow {
+              offsetX: 0.0,
+              offsetY: 4.0,
+              blur: 14.0,
+              spread: 0.0,
+              color: hsv(hues[0], 0.8, 1.0, 0.6),
+              inset: false,
+            },
+          },
+        ],
+      )
+      ui.text("Reweave ✨")
+    },
+  )
+}
+
+impl App<Message, NoCommand> for Loom {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    let time = self.time()
+    let hues = self.hues()
+    ui.style(
+      &[
+        Property.FontFamily { family: SANS },
+        Property.Color { color: white(1.0) },
+        Property.BackgroundGradient { angle: 160.0, from: rgb(0x170B3B), to: rgb(0x030209) },
+        Property.Position { value: Position.Relative },
+        Property.OverflowX { value: Overflow.Hidden },
+        Property.OverflowY { value: Overflow.Hidden },
+      ],
+    )
+    ui.on(
+      EventKind.PointerMove,
+      |event| Reply<Message>.Emit { message: Message.Pointer { x: event.x, y: event.y } },
+    )
+    ui.on(
+      EventKind.PointerDown,
+      |event| Reply<Message>.Emit { message: Message.Press { x: event.x, y: event.y } },
+    )
+    ui.on(EventKind.PointerUp, |event| Reply<Message>.Emit { message: Message.Release })
+
+    // The weave.
+    let mut commands = List<CanvasCommand>.make()
+    if !ui.isDispatching() {
+      ui.alloc(weave(&mut commands, self.frame()))
+    }
+    ui.canvas(
+      commands.asSlice(),
+      |ui| {
+        ui.testId("weave")
+        fill(&mut ui)
+        ui.style(&[Property.PointerEvents { value: false }])
+      },
+    )
+
+    // The card, centered.
+    ui.column(
+      |ui| {
+        fill(&mut ui)
+        ui.style(
+          &[
+            Property.JustifyContent { value: Align.Center },
+            Property.AlignItems { value: Align.Center },
+          ],
+        )
+        ui.column(
+          |ui| {
+            ui.testId("card")
+            ui.gap(20.0)
+
+            // The card rises and fades in over the first second.
+            let intro = ease(time / 1.1)
+            if intro < 1.0 {
+              ui.style(
+                &[
+                  Property.Opacity { value: intro },
+                  Property.Margin { side: Side.Top, value: px(36.0 * (1.0 - intro)) },
+                ],
+              )
+            }
+            padding(&mut ui, 40.0, 44.0)
+            border(&mut ui, 1.0, white(0.16))
+            ui.style(
+              &[
+                Property.Width { value: px(720.0) },
+                Property.BorderRadius { value: round(30.0) },
+                Property.BackgroundGradient {
+                  angle: 150.0,
+                  from: rgba(0x2A1D5C, 0.62),
+                  to: rgba(0x0B0820, 0.74),
+                },
+                Property.BoxShadow {
+                  value: BoxShadow {
+                    offsetX: 0.0,
+                    offsetY: 40.0,
+                    blur: 90.0,
+                    spread: 0.0,
+                    color: rgba(0x000000, 0.65),
+                    inset: false,
+                  },
+                },
+              ],
+            )
+            ui.row(
+              |ui| {
+                ui.gap(12.0)
+                ui.style(&[Property.AlignItems { value: Align.Center }])
+                ui.box(
+                  |ui| {
+                    ui.style(
+                      &[
+                        Property.Width { value: px(30.0) },
+                        Property.Height { value: px(30.0) },
+                        Property.Color { color: hsv(hues[0], 0.55, 1.0, 1.0) },
+                      ],
+                    )
+                    ui.icon(LOOM_ICON)
+                  },
+                )
+                ui.box(
+                  |ui| {
+                    ui.style(
+                      &[
+                        Property.FontSize { value: 13.0 },
+                        Property.FontWeight { value: 700.0 },
+                        Property.Color { color: white(0.6) },
+                      ],
+                    )
+                    ui.text("SILK  ·  UI STACK DEMO")
+                  },
+                )
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.testId("title")
+                ui.style(
+                  &[
+                    Property.FontSize { value: 66.0 },
+                    Property.FontWeight { value: 900.0 },
+                    Property.LineHeight { value: LineHeight.Number { value: 1.05 } },
+                  ],
+                )
+                ui.text("Woven in Silk 🧵")
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.style(
+                  &[
+                    Property.Width { value: px(150.0) },
+                    Property.Height { value: px(4.0) },
+                    Property.BorderRadius { value: round(2.0) },
+                    Property.BackgroundGradient {
+                      angle: 90.0 + 40.0 * f32.sin(time * 0.9),
+                      from: hsv(hues[0], 0.7, 1.0, 1.0),
+                      to: hsv(hues[2], 0.7, 1.0, 1.0),
+                    },
+                  ],
+                )
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.style(
+                  &[
+                    Property.FontSize { value: 19.0 },
+                    Property.FontWeight { value: 300.0 },
+                    Property.LineHeight { value: LineHeight.Number { value: 1.45 } },
+                    Property.Color { color: white(0.74) },
+                  ],
+                )
+                ui.text(
+                  "Every pixel here is a quad, shadow, path, glyph or sprite: laid out by ui/tree, diffed by ui/app and drawn by ui_renderer, all written in Silk.",
+                )
+              },
+            )
+            ui.row(
+              |ui| {
+                ui.gap(10.0)
+                ui.style(&[Property.FlexWrap { value: FlexWrap.Wrap }])
+                let beat = time / 1.3
+                let current = u32.bitAnd(f32.toU32(f32.floor(f32.max(beat, 0.0))), 0xFFFF) % CHIPS
+                let progress = beat - f32.floor(beat)
+                let mut i: u32 = 0
+                while i < CHIPS {
+                  let spotlight: f32 = if i == current {
+                    f32.sin(3.1415927 * progress)
+                  } else {
+                    0.0
+                  }
+                  chip(&mut ui, i, spotlight, hues[u32.toUsize(i)])
+                  i = i + 1
+                }
+              },
+            )
+            ui.row(
+              |ui| {
+                ui.style(
+                  &[
+                    Property.AlignItems { value: Align.End },
+                    Property.JustifyContent { value: Align.SpaceBetween },
+                    Property.Margin { side: Side.Top, value: px(8.0) },
+                  ],
+                )
+                equalizer(&mut ui, time, hues)
+                reweaveButton(&mut ui, hues, time)
+              },
+            )
+          },
+        )
+      },
+    )
+
+    // The corners.
+    ui.row(
+      |ui| {
+        ui.gap(10.0)
+        ui.style(
+          &[
+            Property.Position { value: Position.Absolute },
+            Property.Inset { side: Side.Top, value: px(26.0) },
+            Property.Inset { side: Side.Left, value: px(32.0) },
+            Property.AlignItems { value: Align.Center },
+            Property.FontSize { value: 15.0 },
+          ],
+        )
+        ui.box(
+          |ui| {
+            ui.style(
+              &[
+                Property.Width { value: px(22.0) },
+                Property.Height { value: px(22.0) },
+                Property.Color { color: hsv(hues[2], 0.5, 1.0, 1.0) },
+              ],
+            )
+            ui.icon(LOOM_ICON)
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.style(&[Property.FontWeight { value: 700.0 }])
+            ui.text("nonstd")
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.color(white(0.45))
+            ui.text("/ silk loom")
+          },
+        )
+      },
+    )
+    ui.row(
+      |ui| {
+        ui.style(
+          &[
+            Property.Position { value: Position.Absolute },
+            Property.Inset { side: Side.Bottom, value: px(22.0) },
+            Property.Inset { side: Side.Left, value: px(32.0) },
+            Property.FontFamily { family: MONO },
+            Property.FontSize { value: 12.0 },
+            Property.Color { color: white(0.42) },
+          ],
+        )
+        ui.text("ui_scene · ui_renderer · font/raster · sprites · ui/tree · ui/app")
+      },
+    )
+    ui.row(
+      |ui| {
+        ui.testId("status")
+        ui.style(
+          &[
+            Property.Position { value: Position.Absolute },
+            Property.Inset { side: Side.Bottom, value: px(22.0) },
+            Property.Inset { side: Side.Right, value: px(32.0) },
+            Property.FontFamily { family: MONO },
+            Property.FontSize { value: 12.0 },
+            Property.Color { color: white(0.42) },
+          ],
+        )
+        ui.text("frame ")
+        ui.number(u64.toI64(self.frames))
+        ui.text(" · ")
+        ui.number(u32.toI64(STROKES))
+        ui.text(" strokes · ")
+        ui.text(paletteName(self.palette))
+        if self.paused {
+          ui.text(" · paused")
+        }
+      },
+    )
+
+    // Over everything: the ripple, and the recorder's pointer.
+    let mut effects = List<CanvasCommand>.make()
+    if !ui.isDispatching() {
+      ui.alloc(ripples(&mut effects, self.frame()))
+      if self.showPointer && self.pointerSeen {
+        ui.alloc(arrow(&mut effects, self.pointerX, self.pointerY, self.pressed))
+      }
+    }
+    ui.canvas(
+      effects.asSlice(),
+      |ui| {
+        fill(&mut ui)
+        ui.style(&[Property.PointerEvents { value: false }])
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Frame { time } => {
+        let mut step = time - self.now
+        if step < 0.0 {
+          step = 0.0
+        }
+        if step > 0.1 {
+          step = 0.1
+        }
+        self.now = time
+        self.frames = self.frames + 1
+        if !self.paused {
+          self.clock = self.clock + step
+        }
+        let follow = f32.min(1.0, f64.toF32(step) * 7.0)
+        self.easedX = self.easedX + (self.pointerX - self.easedX) * follow
+        self.easedY = self.easedY + (self.pointerY - self.easedY) * follow
+        let target: f32 = if self.pointerSeen {
+          1.0
+        } else {
+          0.0
+        }
+        self.pull = self.pull + (target - self.pull) * f32.min(1.0, f64.toF32(step) * 2.5)
+      }
+      Message.Resize { width, height } => {
+        self.width = width
+        self.height = height
+      }
+      Message.Pointer { x, y } => {
+        if !self.pointerSeen {
+          self.easedX = x
+          self.easedY = y
+        }
+        self.pointerX = x
+        self.pointerY = y
+        self.pointerSeen = true
+      }
+      Message.Press { x, y } => {
+        self.pressX = x
+        self.pressY = y
+        self.pressedAt = self.clock
+        self.pressed = true
+      }
+      Message.Release => {
+        self.pressed = false
+      }
+      Message.Reweave => {
+        self.fromHues = self.hues()
+        self.palette = (self.palette + 1) % PALETTES
+        self.changedAt = self.clock
+      }
+      Message.TogglePause => {
+        self.paused = !self.paused
+      }
+    }
+  }
+
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
+    subs.animationFrame(1, |time| Message.Frame { time: time })
+    subs.resize(2, |width, height| Message.Resize { width: width, height: height })
+    subs.keyBinding(3, " ", 0, || Message.TogglePause)
+    subs.keyBinding(4, "r", 0, || Message.Reweave)
+  }
+}
