@@ -787,6 +787,9 @@ static void push_button(Win32Window *window, bool down, uint32_t button, LPARAM 
     event.y = y / window->scale;
     event.modifiers = current_modifiers();
     if (down) {
+        // A click on the window's own content takes keyboard focus back from a child window
+        // (a web view), as clicking outside a text field does.
+        if (GetFocus() != window->hwnd) SetFocus(window->hwnd);
         event.count = click(window, button, x, y);
         SetCapture(window->hwnd);
     } else if (!(GetKeyState(VK_LBUTTON) & 0x8000) && !(GetKeyState(VK_RBUTTON) & 0x8000) &&
@@ -1017,10 +1020,16 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     case WM_SETFOCUS:
     case WM_KILLFOCUS: {
         bool focused = message == WM_SETFOCUS;
-        window->focused = focused;
-        SilkWindowEvent event = silk_event(SILK_EVENT_FOCUSED, window->id);
-        if (focused) event.flags |= SILK_FLAG_ON;
-        silk_queue_push(&event);
+        // Keyboard focus moving between the window and a child window inside it (a web view)
+        // leaves the window focused.
+        HWND other = (HWND)wParam;
+        bool withinWindow = other && IsChild(hwnd, other);
+        if (!withinWindow && window->focused != focused) {
+            window->focused = focused;
+            SilkWindowEvent event = silk_event(SILK_EVENT_FOCUSED, window->id);
+            if (focused) event.flags |= SILK_FLAG_ON;
+            silk_queue_push(&event);
+        }
         if (focused) place_ime(window);
         break;
     }

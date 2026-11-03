@@ -9,7 +9,7 @@ The engine backends land in steps on the `feature/webview` branch (see [Plan](#p
 | --- | --- | --- | --- |
 | `HeadlessWebViews` | none | records, for tests | Complete |
 | `MacWebViews` (macOS) | WKWebView | native child view over the window | W2 (see below) |
-| WebView2 (Windows) | Edge WebView2 | native child window | Planned (W5) |
+| `WindowsWebViews` (Windows) | Edge WebView2 | native child window | W5 (see below) |
 | `ChromiumWebViews` (Linux; optional on macOS and Windows later) | CEF, offscreen | texture drawn by ui_renderer (CPU frames, or shared dma-bufs) | W4 on Linux, in [chromium/](chromium/README.md); W6 for macOS and Windows |
 
 ## The model
@@ -80,6 +80,13 @@ results.
 
 The one known gap: WebKit cannot intercept requests or read every response body.
 
+## The native backends
+
+`bridge.BridgeWebViews` is the Silk side of both native backends, over one C ABI
+(`native/bridge.h`): `macos.MacWebViews` and `windows.WindowsWebViews` are names for it, and
+`native.NativeWebViews` is it on macOS and Windows. Each view is the system's engine in a native
+child of the platform-window window, drawn over the Silk UI at its hosted node.
+
 ## The WebKit backend (macOS)
 
 `macos.MacWebViews` (also `native.NativeWebViews` on macOS) runs each view as a `WKWebView` in
@@ -111,10 +118,64 @@ WebKit, and a program using it also depends on platform-window (which it needs f
 - **Not available**: `OpenDevTools` is `Unsupported` (WebKit has no API to open Web Inspector;
   with `inspectable` on, Safari's Develop menu attaches), and WebKit cannot intercept requests.
 
-`python3 platform/webview/scripts/macos smoke` drives it in a real window (CI job `macos`).
+`python3 platform/webview/scripts/macos smoke` drives it in a real window (CI job `macos`), with
+tests/native, the smoke test both native backends share.
+`python3 platform/webview/scripts/macos demo` runs `examples/browser`: a Silk UI toolbar and status
+bar around a live page, with an "Agent demo" page that the agent button fills in through
+snapshot refs and native input. It uses ui-app-window's `runWindowHosting` and `WindowHost`, the
+hook that places native content on hosted nodes after each frame.
 Manual checks on a Mac: scroll a page with the trackpad, type with the Japanese input method in a
 page field, click between the page and the Silk UI and watch focus move, open the view in
 Safari's Develop menu.
+
+## The WebView2 backend (Windows)
+
+`windows.WindowsWebViews` (also `native.NativeWebViews` on Windows) runs each view as an Edge
+WebView2 controller in platform-window's Win32 window: open the window first and pass its
+`WindowId.value` as `WebViewOptions.window`. The bridge is `native/windows/bridge.c`, built by
+`scripts/windows native` (which `scripts/prepare-windows` runs) against the pinned WebView2 SDK.
+
+- **Starting.** WebView2 starts asynchronously. `open` returns at once; `Created` follows when the
+  engine and the agent script are ready (the first view of a process waits for the browser
+  processes, a second or two), and commands sent before then run in order after it. A view that
+  cannot start queues `Crashed` and answers its waiting commands as failed.
+- **Runtime.** The bridge loads `WebView2Loader.dll` at run time, from beside the program or the
+  DLL search path, and needs the Edge WebView2 Runtime (part of Windows 11; installable on 10).
+  Without either, `open` fails with `Unsupported`. Ship `WebView2Loader.dll` (from the SDK,
+  `.cache/platform-webview/windows/` after a build) beside the executable.
+- **Placement.** The controller sits in a clip window, a child of the Silk window. `place` moves
+  the clip window to the visible part of the node and the controller's bounds to the node's bounds
+  inside it, in device pixels of the window's scale.
+- **Waking the loop.** WebView2 calls back from the window's message loop; each event the bridge
+  queues calls `silk_window_wake`, so `nextEvent` returns (maybe `None`). Drain `takeEvents` after
+  every turn.
+- **Focus.** The controller's GotFocus and LostFocus become `FocusChanged`. A click on the Silk UI
+  takes keyboard focus back to the window, and focus moving between the window and a web view does
+  not report the window as unfocused.
+- **Agent commands** use the DevTools protocol. The agent script is added with
+  `Page.addScriptToEvaluateOnNewDocument` in an isolated world (`silk-agent`) that pages cannot
+  see; calls run there through `Page.createIsolatedWorld` and `Runtime.evaluate` (a page that
+  started before the script was added gets it on first use). Clicks, wheel turns and keys are
+  `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent`; characters off the keyboard layout are
+  `Input.insertText`.
+- **Evaluate** is `Runtime.evaluate` of the script with indirect `eval` in the page's world, its
+  value (awaited when a promise) as JSON.
+- **Console** messages come from a script that wraps `console.*` in the main frame and posts them
+  over the web message channel.
+- **Navigation policy.** WebView2 decides navigations synchronously, so with `askBeforeNavigating`
+  the asked navigation is canceled and, when allowed, started again (a form's POST body is not
+  sent again). Back, forward and reload are never asked about.
+- **LoadHtml** without a base URL is `NavigateToString`; with one, the view navigates to the base
+  URL and answers that request with the HTML (http and https base URLs).
+- **Profiles.** An empty `profile` is an InPrivate session; a name is a WebView2 profile, under
+  `%LOCALAPPDATA%\<program>\WebView2`.
+- **OpenDevTools** opens the DevTools window (unless `inspectable` is off: then `Unsupported`).
+  `capabilities()` reports the DevTools protocol and request interception, which WebView2 has.
+
+`python platform/webview/scripts/windows smoke` drives it in a real window (CI job `windows`,
+with the message loop on its own fiber and on the caller's stack). Manual checks on Windows: type
+with an input method (Japanese IME) in a page field, scroll with a touchpad, click between the
+page and the Silk UI and watch focus move, move the window between monitors of different scales.
 
 ## Build and test
 
@@ -136,7 +197,7 @@ PR into `feature/webview`:
 | W2 | macOS backend: WKWebView child views, placement and clipping per frame, focus handoff, agent commands through the script and synthesized NSEvents, a way for the webview to wake platform-window's `nextEvent` | W1 |
 | W3 | Offscreen plumbing: Dawn `SharedTextureMemory` bindings in gpu/webgpu (dmabuf first, then IOSurface and D3D shared handles) and an external texture sprite in ui_scene and ui_renderer; a hosted node can draw a texture | |
 | W4 | Chromium backend on Linux: CEF C API bridge, offscreen frames into W3's sprite, input and IME forwarding, CDP for agent commands, packaging the helper processes | W1, W3 |
-| W5 | Windows backend: WebView2 child windows, same contract | W1 |
+| W5 | Windows backend: WebView2 child windows, same contract, DevTools protocol for agent input | W1 |
 | W6 | Chromium as the optional backend on macOS and Windows, a `ui/app` web view component and an agent-and-chat demo | W2, W4, W5 |
 
 The Chromium backend lives in its own package ([chromium/](chromium/README.md)), so only apps that choose it download and ship CEF.
