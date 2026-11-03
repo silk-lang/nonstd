@@ -18,26 +18,20 @@
 //! cannot be reached or the arguments are wrong.
 import ui_inspect_server.server { Address, parseAddress, describeAddress, resolved }
 import ui_inspect_server.reply { writeString }
+import ui_inspect_server.client { connect, exchange }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.encoding.base64 { Base64, Base64Error }
-import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.io.byte_duplex { ByteIoError }
 import silk.io.writer { Writer, WriterError }
 import silk.io.writer_native { StderrWriter, StdoutWriter }
 import silk.json.scanner { JsonError }
 import silk.json.value { Json, Value }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
-import silk.net.socket_native {
-  ConnectOptions,
-  Connection,
-  NativeSocketError,
-  connectResolvedOwned,
-  connectUnixOwned
-}
+import silk.net.socket_native { Connection, NativeSocketError }
 import silk.collections.slice { Slice }
 import silk.num.u64
 import silk.system.filesystem { FileError, FileSystem, Path }
@@ -48,9 +42,6 @@ import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.system.system_clock { Instant, SystemClock }
 import silk.text.format { Format, ParseError }
 import silk.text.string { String, InvalidUtf8 }
-
-/// How long one request may take, in nanoseconds.
-const REQUEST_TIMEOUT: u64 = 30000000000
 
 effect fn out(text: string) -> () {
   let mut writer = StdoutWriter.make()
@@ -349,81 +340,6 @@ effect fn request(c: &mut Command, line: &mut String) -> bool
   return true
 }
 
-effect fn connect(address: &Address) -> Connection
-  ! NativeSocketError
-  ? &mut MonotonicClock {
-  let start = run MonotonicClock.now()
-  let deadline = Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 5000000000))
-  return match &address.* {
-    Address.Unix { path } => run connectUnixOwned(
-      path.ownedUtf8Bytes(),
-      ConnectOptions.defaults(),
-      move deadline,
-    )
-    Address.Tcp { port } => {
-      let endpoints = [
-        Endpoint.make(
-          IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
-          Port.fromU16(port),
-        ),
-      ]
-      return run connectResolvedOwned(&endpoints, ConnectOptions.defaults(), move deadline)
-    }
-  }
-}
-
-/// Sends one request line and reads the reply line into `reply`.
-effect fn exchange(connection: &mut Connection, line: &String, reply: &mut Bytes) -> ()
-  ! ByteIoError | OutOfMemoryError
-  ? &mut MonotonicClock | &mut Allocator {
-  let start = run MonotonicClock.now()
-  let bytes = line.ownedUtf8Bytes()
-  let mut at: usize = 0
-  while at < bytes.length {
-    let n = run ByteDuplex.writeSome(
-      Slice.view(bytes, at, bytes.length - at),
-      Option<Instant>.some(MonotonicClock.deadlineAfter(&start, REQUEST_TIMEOUT)),
-    )
-      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
-    at = at + n
-  }
-  drop run ByteDuplex.writeSome(
-    b"\n",
-    Option<Instant>.some(MonotonicClock.deadlineAfter(&start, REQUEST_TIMEOUT)),
-  )
-    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
-  reply.clear()
-  let mut chunk: [u8; 65536] = [0; 65536]
-  while true {
-    match run ByteDuplex.readSome(
-      &mut chunk,
-      Option<Instant>.some(MonotonicClock.deadlineAfter(&start, REQUEST_TIMEOUT)),
-    )
-      |> Effect.provideMut<ByteDuplex>(&mut connection.*) {
-      ReadTransfer.Data { count } => {
-        let mut end = count
-        let mut done = false
-        let mut i: usize = 0
-        while i < count {
-          if chunk[i] == 10 {
-            end = i
-            done = true
-            break
-          }
-          i = i + 1
-        }
-        run reply.append(Slice.view(&chunk, 0, end))
-        if done {
-          return ()
-        }
-      }
-      ReadTransfer.End => {
-        return ()
-      }
-    }
-  }
-}
-
 /// Writes the screenshot in `reply` to `file`. False when the reply has no PNG.
 effect fn saveScreenshot(document: &Value, file: string) -> bool
   ! FileError | HostInputError | OutOfMemoryError
@@ -467,7 +383,7 @@ effect fn serveOnce(address: &Address, c: &Command, line: &String) -> i32
   ? &mut MonotonicClock | &mut Allocator | &mut HostInput {
   let mut connection = run connect(address)
   let mut reply = Bytes.make()
-  run exchange(&mut connection, line, &mut reply)
+  run exchange(&mut connection, String.view(line), &mut reply)
   drop run Effect.result(connection.close())
   let parsed = run Effect.result(Json.parse(reply.asSlice()))
   let document = match move parsed {
