@@ -1,5 +1,7 @@
 # Browser performance measurements
 
+Actual-text comparisons, including 100,000 visible labels and live edits: [text benchmark report](text-browser/README.md).
+
 Recorded 2026-11-03 UTC (2026-11-02 in the user’s local work session), on this development machine.
 
 The latest shadow optimization closes the previous gap. At 100,000 visible elements with shadows
