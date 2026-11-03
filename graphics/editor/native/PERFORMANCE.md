@@ -14,13 +14,15 @@ claim. GPU submission, compositor scheduling, and display refresh are excluded.
 
 | Workload | Measured CPU time |
 | --- | ---: |
-| 120 growing marquee updates, selecting 96,402 layers | 73.320 ms total (0.611 ms/update) |
-| 30 selection frames: input dispatch, model update, native UI render/layout, canvas scene | 7.7062 ms/frame average |
-| Select-all recolor followed by left alignment | 7.423 ms combined |
+| 120 growing marquee updates, selecting 96,402 layers | 86.592 ms total (0.722 ms/update) |
+| 30 selection frames: input dispatch, model update, native UI render/layout, canvas scene | 7.7905 ms/frame average |
+| Select-all recolor followed by left alignment | 6.140 ms combined |
 
 The frame workload warms the retained document once, then dispatches pointer input
 through the UI tree and application pump to change the marquee and selection on
-every iteration. These measurements were refreshed on 2026-11-03. The layer list is virtualized. Selection-only
+every iteration. These measurements were refreshed on 2026-11-03. The layer list is virtualized.
+Selection bounds are collected during the selection count pass and shared by the
+UI handles and scene renderer; geometry edits invalidate that cache. Selection-only
 frames reuse document geometry and shaped text; they still compose the scene and
 UI each frame. The bulk-edit workload checks that a rectangle in the middle of
 the document actually changed color.
@@ -33,6 +35,6 @@ sizes. Many distinct text layers and continuously changing zoom merit separate
 profiling; the rectangle workload does not establish their performance.
 
 The native GPU check also passed at 2880×1920 physical pixels: mean absolute
-channel difference 0.01092/255 against the CPU reference, with 2,544 of 22,118,400
+channel difference 0.00745/255 against the CPU reference, with 1,874 of 22,118,400
 channels exceeding the 8/255 comparison threshold. This is rendering validation,
 not a GPU speed measurement.

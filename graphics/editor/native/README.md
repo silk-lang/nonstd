@@ -76,7 +76,13 @@ python3 graphics/editor/native/scripts/test --release
 python3 graphics/editor/native/scripts/studio check --release
 # After building ui-inspect-cli and ui-inspect-mcp in release mode:
 python3 graphics/editor/native/scripts/inspect-check --stress
+python3 graphics/editor/native/scripts/parity-check
 ```
+
+The parity check opens an isolated copy of the browser starter at 1440×960 and
+1000×700, exercises controls through the inspector, and saves screenshots and
+semantic snapshots to `build/native-parity`. See [PARITY.md](PARITY.md) for the
+comparison contract and platform differences.
 
 The contract executable tests pointer-driven creation, native inspector input,
 undo/redo, subtree transforms, Alt-drag/cancel, validated file round trips, selected
@@ -94,6 +100,8 @@ The optional local UI inspector is off in release builds unless explicitly enabl
 ```sh
 SILK_UI_INSPECT=/tmp/silk-studio.sock python3 graphics/editor/native/scripts/studio --release --inspect
 ```
+
+For reproducible window sizes, the executable accepts `--width=1440 --height=960`.
 
 Inspector screenshots include the complete canvas and controls. `--test-id canvas` crops
 the canvas; `capture sequence.png --count 10 --interval 100` returns a contact sheet with

@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Exercise Studio's native controls through user-equivalent inspector input.
+
+Uses an isolated copy of the browser fixture and records reviewable screenshots and
+semantic snapshots at both desktop viewport sizes. No model mutation or OS automation.
+Build the release app first with scripts/studio --release --bundle.
+"""
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+
+REPO = Path(__file__).resolve().parents[4]
+NATIVE = REPO / 'graphics/editor/native'
+
+
+def run(app, output, width, height):
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='studio-parity-', dir='/tmp') as temp:
+        root = Path(temp)
+        document = root / 'review.silkdesign'
+        shutil.copy2(NATIVE / 'tests/explorations.silkdesign', document)
+        address = root / 'ui.sock'
+        with (output / 'app.log').open('w') as log:
+            process = subprocess.Popen([str(app), '--inspect', f'--width={width}', f'--height={height}', str(document)],
+                cwd=REPO, env=dict(os.environ, SILK_UI_INSPECT=str(address)), stdout=log, stderr=log)
+        def ask(cmd, **kwargs):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(45)
+                client.connect(str(address))
+                client.sendall(json.dumps(dict(cmd=cmd, **kwargs)).encode() + b'\n')
+                chunks = []
+                while True:
+                    chunk = client.recv(65536)
+                    assert chunk, f'{cmd}: inspector disconnected'
+                    chunks.append(chunk)
+                    if b'\n' in chunk:
+                        break
+            reply = json.loads(b''.join(chunks))
+            assert reply.get('ok'), (cmd, kwargs, reply)
+            return reply
+        def click(label, role='button'):
+            nodes = ask('query', role=role, label=label, exact=True)['nodes']
+            if nodes and nodes[0]['x'] > width - 255 and nodes[0]['y'] > height - 60:
+                ask('scroll', x=width-80, y=height*.6, dx=0, dy=nodes[0]['y']-height*.5)
+            return ask('click', role=role, label=label, exact=True)
+        def press(key, modifiers=[]):
+            return ask('press', key=key, modifiers=modifiers)
+        primary = 'meta' if os.uname().sysname == 'Darwin' else 'control'
+        def edit(label, value):
+            node = ask('query', role='textbox', label=label, exact=True)['nodes'][0]
+            if node['x'] > width - 255 and (node['y'] < 110 or node['y'] > height - 60):
+                ask('scroll', x=width-80, y=height*.6, dx=0, dy=node['y']-height*.5)
+            click(label, 'textbox')
+            press('a', [primary])
+            press('Backspace')
+            if value:
+                ask('type', text=value)
+            press('Enter')
+        def value(label):
+            text = ask('snapshot', role='textbox', label=label, exact=True)['text']
+            values = re.findall(r'"((?:[^"\\]|\\.)*)"', text)
+            assert values, text
+            return values[-1]
+        def capture(name):
+            # Move away from controls so incidental tooltips do not obscure the state.
+            ask('pointer', phase='move', x=width*.5, y=100)
+            (output / f'{name}.png').write_bytes(base64.b64decode(ask('screenshot', maxWidth=1280)['png']))
+            (output / f'{name}.txt').write_text(ask('snapshot')['text'])
+        def canvas():
+            return ask('query', testId='canvas')['nodes'][0]
+        try:
+            deadline = time.monotonic() + 40
+            while True:
+                assert process.poll() is None, (output / 'app.log').read_text()
+                try:
+                    if ask('hello')['frame'] > 0:
+                        break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    pass
+                assert time.monotonic() < deadline
+                time.sleep(.05)
+            c = canvas()
+            assert c['x'] == (224 if width > 1100 else 190), c
+            assert c['width'] == (width - 476 if width > 1100 else width - 415), c
+            capture('page')
+            # Collapse only the frame subtree, without selecting its row.
+            click('Collapse layer')
+            assert ask('query', label='Expand layer', exact=True)['count'] == 1
+            assert ask('query', label='Layer name', exact=True)['count'] == 0
+            click('Expand layer')
+            # Search is useful at either viewport, and must be insensitive to case.
+            edit('Find a layer', 'sUN')
+            click('Sun')
+            assert value('Width') == '112'
+            edit('Find a layer', '')
+            capture('ellipse')
+            edit('Width', '160')
+            assert value('Width') == '160'
+            click('Undo')
+            assert value('Width') == '112'
+            edit('Fill', '112233')
+            assert value('Fill') == '112233'
+            click('Undo')
+            assert value('Fill') == 'E6B84E'
+            click('Fill color')
+            capture('color')
+            click('Red', 'slider')
+            press('Home')
+            press('End')
+            press('Escape')
+            assert value('Fill') == 'FFB84E'
+            click('Undo')
+            assert value('Fill') == 'E6B84E', 'Picker changes must be one history entry'
+            click('Commands')
+            edit('Search commands', 'dUPLICATE selection')
+            assert value('Layer name') == 'Sun'
+            # edit() pressed Enter: the first matching command executed.
+            edit('Find a layer', 'Sun')
+            assert ask('query', role='button', label='Sun', exact=True)['count'] == 2
+            click('Undo')
+            edit('Find a layer', '')
+            click('Commands')
+            click('Search commands', 'textbox')
+            ask('type', text='fit')
+            capture('commands')
+            press('Escape')
+            assert value('Layer name') == 'Sun', 'Closing a menu must retain selection'
+            assert ask('query', role='button', label='Commands', exact=True)['nodes'][0].get('focused'), 'Dialog restores trigger focus'
+            click('Keyboard shortcuts')
+            capture('shortcuts')
+            press('Escape')
+            click('File')
+            capture('file')
+            press('Escape')
+            # Layer flags preserve selection and support undo.
+            edit('Find a layer', 'Sun')
+            click('Hide Sun')
+            assert ask('query', role='button', label='Show Sun', exact=True)['count'] == 1
+            click('Undo')
+            click('Lock Sun')
+            assert ask('query', role='button', label='Unlock Sun', exact=True)['count'] == 1
+            click('Undo')
+            # Scrollable shape properties remain editable, with one undo per commit.
+            edit('Find a layer', 'Explore button')
+            click('Explore button')
+            for label, new_value in [('Stroke width', '3'), ('Layer blur', '2'),
+                                     ('Backdrop blur', '4'), ('Brightness %', '120'),
+                                     ('Shadow blur', '8'), ('Inner blur', '3')]:
+                before = value(label)
+                edit(label, new_value)
+                assert value(label) == new_value, label
+                capture('property-' + label.lower().replace(' ', '-').replace('%', 'percent'))
+                click('Undo')
+                assert value(label) == before, label
+            ask('scroll', x=width-80, y=height*.6, dx=0, dy=-10000)
+            # Live text editing cancellation must not modify the document.
+            edit('Find a layer', 'Make room')
+            click('Make room')
+            capture('typography')
+            click('Font family')
+            press('ArrowDown')
+            press('Enter')
+            click('Undo')
+            click('Font weight')
+            press('End')
+            press('Enter')
+            click('Undo')
+            # The searchable command is also used when the row is below the fold.
+            edit('Find a layer', '')
+            edit('Zoom percentage', '100')
+            assert value('Zoom percentage') == '100%'
+            click('Fit')
+            # Canvas text's known fixture coordinates and the fitted camera.
+            c = canvas()
+            zoom = min(2, (c['width']-120)/860, (c['height']-160)/560)
+            left = c['x']+(c['width']-860*zoom)*.5
+            top = 56+(c['height']-560*zoom)*.5
+            x, y = left+120*zoom, top+150*zoom
+            ask('pointer', phase='down', x=x, y=y, count=2)
+            ask('pointer', phase='up', x=x, y=y, count=2)
+            assert ask('query', role='textbox', label='Edit text', exact=True)['count'] == 1
+            click('Edit text', 'textbox')
+            press('a', [primary])
+            ask('type', text='Do not commit this')
+            press('Escape')
+            assert value('Text') == 'Make room'
+            capture('text-cancelled')
+            # Multi-selection uses held Shift through the native-equivalent key channel.
+            edit('Find a layer', 'Swatch')
+            click('Swatch 1')
+            ask('key', phase='down', key='Shift', code='ShiftLeft')
+            click('Swatch 2')
+            ask('key', phase='up', key='Shift', code='ShiftLeft')
+            assert '2 layers selected' in ask('snapshot')['text']
+            capture('multi-selection')
+            before = value('X')
+            click('Align left')
+            click('Undo')
+            assert value('X') == before
+            # Layer flags and geometry are still present after multi-selection history.
+            assert '2 layers selected' in ask('snapshot')['text']
+            # Exercise the canvas shortcuts while focus is on a non-text control.
+            before_x = float(value('X'))
+            press('ArrowRight')
+            assert float(value('X')) == before_x + 1
+            click('Undo')
+            press('c', [primary])
+            press('x', [primary])
+            assert ask('query', role='button', label='Swatch 1', exact=True)['count'] == 0
+            press('v', [primary])
+            assert ask('query', role='button', label='Swatch 1', exact=True)['count'] == 1
+            click('Undo')
+            click('Undo')
+            assert '2 layers selected' in ask('snapshot')['text']
+            press('g', [primary])
+            capture('group')
+            assert value('Layer name') == 'Group', value('Layer name')
+            press('g', [primary, 'shift'])
+            assert '2 layers selected' in ask('snapshot')['text']
+            click('Undo')
+            click('Undo')
+            def swatches():
+                return [n['name'] for n in ask('query', role='button', label='Swatch')['nodes']
+                        if n['name'].startswith('Swatch ')]
+            before_order = swatches()
+            press(']', [primary])
+            assert swatches() != before_order
+            click('Undo')
+            assert swatches() == before_order
+            # Put focus on canvas before global shortcuts; textbox Tab remains normal editing.
+            ask('pointer', phase='down', x=c['x']+20, y=100)
+            ask('pointer', phase='up', x=c['x']+20, y=100)
+            press('Tab')
+            assert canvas()['x'] == 0 and canvas()['width'] == width
+            capture('panels-hidden')
+            press('Tab')
+            assert canvas()['x'] == c['x']
+            edit('Find a layer', 'no matching layer')
+            capture('empty-search')
+            assert 'No matching layers' in ask('snapshot')['text']
+            edit('Find a layer', '')
+            click('Add page')
+            assert value('Page name') != 'Explorations'
+            capture('new-page')
+            click('Delete this page')
+            assert value('Page name') == 'Explorations'
+            print(f'PASS: {width}x{height} parity interactions and captures', flush=True)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--app', type=Path)
+    parser.add_argument('--artifacts', type=Path, default=REPO / 'build/native-parity')
+    args = parser.parse_args()
+    app = args.app or next((REPO / 'build/llvm').glob('*/release/silk-studio-native-app'))
+    for width, height in [(1440, 960), (1000, 700)]:
+        run(app, args.artifacts / f'{width}x{height}', width, height)
+
+
+if __name__ == '__main__':
+    main()
