@@ -1,8 +1,26 @@
 import { expect, test } from 'bun:test'
-import { emptyDocument, makeNode, replaceNodes, type Node } from '../src/document'
+import { Schema } from 'effect'
+import {
+  currentPage,
+  DesignDocumentSchema,
+  emptyDocument,
+  makeNode,
+  replaceNodes,
+  type Node,
+} from '../src/document'
+import { addSelectionPage } from '../src/selection-page'
+import { selectionTitle } from '../src/selection-mosaic'
 import { selectionRoots } from '../src/hierarchy'
 import { Messages, type Model, type Pointer } from '../src/model'
 import { initialModel, reduce } from '../src/update'
+
+test('the 100k-pixel mosaic plus its caption can be saved and imported as a document', () => {
+  const m = addSelectionPage(initialModel(emptyDocument('mosaic')))
+  const nodes = currentPage(m.document).nodes
+  expect(nodes.filter((n) => n.kind === 'rect')).toHaveLength(100_000)
+  expect(nodes.filter((n) => n.kind === 'text').map((n) => n.text)).toEqual([selectionTitle])
+  expect(Schema.is(DesignDocumentSchema)(m.document)).toBe(true)
+})
 
 const point = (x: number, y: number, shift = false): Pointer => ({
   x,

@@ -42,7 +42,7 @@ export type Camera = typeof CameraSchema.Type
 export const PageSchema = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
-  nodes: Schema.Array(NodeSchema).check(Schema.isMaxLength(100_000)),
+  nodes: Schema.Array(NodeSchema).check(Schema.isMaxLength(200_000)),
 })
 export type Page = typeof PageSchema.Type
 export const DesignDocumentSchema = Schema.Struct({

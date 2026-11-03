@@ -1,0 +1,49 @@
+import pixels from './assets/selection-pixels.json' with { type: 'json' }
+import { makeNode, type Node } from './document'
+
+export const selectionTitle = 'SILK + EFFECT + FOLDKIT / 100K elements'
+export const selectionMosaicBounds = {
+  x: 0,
+  y: 0,
+  width: 20_000,
+  height: (20_000 * pixels.sourceHeight) / pixels.sourceWidth,
+} as const
+export const selectionPageBounds = {
+  ...selectionMosaicBounds,
+  y: -1400,
+  height: selectionMosaicBounds.height + 1400,
+} as const
+const shades = Array.from(
+  { length: 256 },
+  (_, value) => `#${value.toString(16).padStart(2, '0').repeat(3)}`,
+)
+const samples = atob(pixels.grayscale)
+
+export const mosaicPixel = (id: string, index: number): Node => {
+  const width = selectionMosaicBounds.width / pixels.columns
+  const height = selectionMosaicBounds.height / pixels.rows
+  return makeNode(id, 'rect', {
+    name: `Pixel ${String(index + 1).padStart(6, '0')}`,
+    x: (index % pixels.columns) * width,
+    y: Math.floor(index / pixels.columns) * height,
+    width,
+    height,
+    fill: shades[samples.codePointAt(index) ?? 255] ?? '#ffffff',
+  })
+}
+export const mosaicTitle = (id: string): Node => {
+  // Courier New is monospaced; match the renderer's font-size and padding metrics.
+  const width = Math.ceil(selectionTitle.length * 512 * 0.6 + 4)
+  return makeNode(id, 'text', {
+    name: selectionTitle,
+    text: selectionTitle,
+    x: (selectionMosaicBounds.width - width) / 2,
+    y: selectionPageBounds.y,
+    width,
+    height: 772,
+    fontSize: 512,
+    fontFamily: 'Courier New',
+    fontWeight: 700,
+    fill: '#25352b',
+  })
+}

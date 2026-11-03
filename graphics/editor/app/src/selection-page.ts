@@ -1,9 +1,8 @@
-import { currentPage, makeNode } from './document'
+import { currentPage } from './document'
 import { boundsOf, fit } from './geometry'
 import type { Model } from './model'
 import { markChanged } from './state'
-
-const colors = ['#25352b', '#b8c5ac', '#e6b84e', '#e3ad90', '#799a9d'] as const
+import { mosaicPixel, mosaicTitle } from './selection-mosaic'
 
 export const addSelectionPage = (m: Model): Model => {
   const existing = m.document.pages.find((page) =>
@@ -22,16 +21,10 @@ export const addSelectionPage = (m: Model): Model => {
     return id
   }
   const id = existing?.id ?? allocate()
-  const nodes = Array.from({ length: 100_000 }, (_, index) =>
-    makeNode(allocate(), 'rect', {
-      name: `Rectangle ${String(index + 1).padStart(6, '0')}`,
-      x: (index % 250) * 80,
-      y: Math.floor(index / 250) * 64,
-      width: 64,
-      height: 48,
-      fill: colors[((index % 250) + Math.floor(index / 250)) % colors.length] ?? '#b8c5ac',
-    }),
-  )
+  const nodes = [
+    ...Array.from({ length: 100_000 }, (_, index) => mosaicPixel(allocate(), index)),
+    mosaicTitle(allocate()),
+  ]
   const document = {
     ...m.document,
     pages: [

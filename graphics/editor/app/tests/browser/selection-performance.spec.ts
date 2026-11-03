@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { fit } from '../../src/geometry'
+import { selectionMosaicBounds, selectionPageBounds } from '../../src/selection-mosaic'
 import { openStudio } from './helpers'
 
 interface Sweep {
@@ -68,12 +69,12 @@ const summary = (intervals: readonly number[]) => {
 const coordinates = async (page: Page): Promise<Sweep> => {
   const box = await page.locator('#canvas-host').boundingBox()
   if (!box) throw new Error('Canvas is missing')
-  const camera = fit({ x: 0, y: 0, width: 19984, height: 25584 }, box.width, box.height)
+  const camera = fit(selectionPageBounds, box.width, box.height)
   return {
     left: box.x + (-100 - camera.x) * camera.zoom,
     top: box.y + (-100 - camera.y) * camera.zoom,
-    width: 20084 * camera.zoom,
-    height: 25684 * camera.zoom,
+    width: (selectionMosaicBounds.width + 100) * camera.zoom,
+    height: (selectionMosaicBounds.height + 100) * camera.zoom,
     active: false,
   }
 }
@@ -85,7 +86,7 @@ const openSelectionPage = async (page: Page): Promise<void> => {
     .getByRole('dialog')
     .getByRole('button', { name: 'Add 100k rectangles', exact: true })
     .click()
-  await expect(page.locator('.count-badge')).toHaveText('100000')
+  await expect(page.locator('.count-badge')).toHaveText('100001')
   await expect(page.getByText('Saved on this device', { exact: true })).toBeVisible()
 }
 
