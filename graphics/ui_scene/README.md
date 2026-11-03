@@ -21,13 +21,14 @@ depends on a GPU, so it builds for wasm32 too.
   - `ImageSprite`: a premultiplied color tile, with opacity, corner radii and grayscale.
   - `PathSprite`: `vector` strip coverage at an integer origin (made by `path_cache`).
   - Every primitive has a `ContentMask`, the rectangle it is clipped to.
+- `effects`: `LayerEffects` for isolated-layer blur, backdrop blur, and color adjustments.
 - `color`: helpers over `silk.color`. Primitives store `silk.color.rgba.Rgba<f32>`, straight-alpha
   sRGB ready for an instance buffer: `color.rgb(0x3366cc)`, `color.rgba(...)`, or
   `color.fromColor(c)` to gamut-map any `silk.color.color.Color`. `color.mix` interpolates stops.
 - `bounds_tree`: `BoundsTree`, a balanced bounding-volume tree that gives a rectangle one more than
   the highest order of anything it overlaps, as GPUI's `BoundsTree`.
 - `scene`: `Scene` with `quad`, `shadow`, `underline`, `glyph`, `image`, `pathCoverage`,
-  `pushLayer`/`pushIsolatedLayer`/`popLayer`, `replay`, `finish`, and per-layer `batches`.
+  `pushLayer`/`pushIsolatedLayer`/`pushEffectLayer`/`popLayer`, `replay`, `finish`, and per-layer `batches`.
 - `path_cache`: `PathCache` rasterizes `vector` paths (fills and strokes) into a scene and keeps
   their coverage across frames.
 - `cpu`: `CpuRenderer` and `AtlasPixels` (CPU copies of atlas textures).
@@ -71,6 +72,23 @@ there draw in kind order (shadows, quads, paths, underlines, glyphs, images, lay
 and batched on their own (layer `n`), and the parent draws one `LayerSprite` that composites the
 group with an opacity and a `vector.layer` blend mode.
 
+`pushEffectLayer(bounds, mask, isolation, effects)` adds filters to an isolated group.
+Start with `LayerEffects.none()`. Set `blur` or `backdropBlur` to a Gaussian standard deviation
+in device pixels; zero disables that blur. Unlike `Shadow.blurRadius`, these fields are sigma,
+not twice sigma. Expand the layer's paint bounds by three blur standard deviations on each side
+when its content is blurred. Set `clip`, `radius`, and `shape` (0 rounded rectangle, 1 ellipse)
+to describe the backdrop region separately from those expanded bounds.
+
+`brightness`, `contrast`, and `saturation` are multipliers with neutral value 1. The color matrix
+applies saturation, brightness, then contrast in straight sRGB, after content blur and before
+the layer's opacity and blend mode. Backdrop blur samples the preceding content, clips to the
+specified shape, and mixes with the original backdrop using the layer opacity. Ordinary
+`pushIsolatedLayer` calls keep their existing behavior through neutral effects.
+
+Ordering bounds round outward to whole pixels so fractional primitives that cover the same
+pixel retain painter order. Sorting coalesces consecutive equal-order/equal-texture runs before
+sorting keys, then copies each run intact; ties retain insertion order.
+
 ## Replay
 
 Every paint call is logged. Keep two scenes, note `operationCount()` before and after a view
@@ -95,7 +113,7 @@ integer: a GPU renderer offsets the bands rather than aligning them to multiples
 `CpuRenderer.draw(&scene, &pixels, &mut pixmap)` lowers everything to `vector`: quads, borders and
 underlines become paths with exact area coverage, dashed borders are `vector` strokes clipped to
 the border band, shadows are filled shapes blurred with `vector.filter.gaussianBlur`, isolated
-layers are composited with `vector.layer`. Content masks clip by pixel area. Gradients are
+layers are composited with `vector.layer`. Layer filters use `vector.filter`; replay retains their settings. Content masks clip by pixel area. Gradients are
 evaluated at pixel centers. Sprites sample their tile bilinearly, clamped to the tile. A GPU
 renderer with SDF quads and an erf shadow is expected to match it within a small tolerance, not
 byte for byte. Paths match `vector`'s own fill byte for byte.

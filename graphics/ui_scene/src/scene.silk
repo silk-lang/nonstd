@@ -5,6 +5,8 @@
 //! disjoint primitives share orders. [`Scene.finish`] sorts every kind by order (sprites also by
 //! texture) and merges the kinds back into a list of [`Batch`] runs per layer, so a renderer issues
 //! one draw per run instead of one per primitive.
+//! Ordering bounds round outward to whole pixels, matching raster coverage: fractional shapes
+//! can blend into the same pixel even when their geometric interiors do not overlap.
 //!
 //! # Layers
 //!
@@ -39,6 +41,7 @@ import silk.num.i32
 import silk.num.u32
 import silk.num.usize
 import vector.strips { Fill, Strip }
+import effects { LayerEffects }
 import bounds_tree { BoundsTree }
 import color
 import primitives {
@@ -124,6 +127,7 @@ struct SortKey {
   order: u32,
   texture: u32,
   index: u32,
+  end: usize,
 }
 
 impl Copy for SortKey {}
@@ -215,24 +219,34 @@ impl<T: Copy> Items<T> {
     self.sortedOrders.clear()
     self.sortedTextures.clear()
     let count = self.added.length()
-    run self.keys.reserve(count)
     run self.sorted.reserve(count)
     run self.sortedOrders.reserve(count)
     run self.sortedTextures.reserve(count)
     let mut i: usize = 0
     while i < count {
-      run self.keys.append(
-        SortKey { order: self.orders.get(i), texture: self.textures.get(i), index: usize.toU32(i) },
-      )
+      let start = i
+      let order = self.orders.get(i)
+      let texture = self.textures.get(i)
       i = i + 1
+      while i < count && self.orders.get(i) == order && self.textures.get(i) == texture {
+        i = i + 1
+      }
+
+      // Equal-key consecutive items already have the right relative order. Sort the runs
+      // by order, texture and first index, then copy them intact: the same final ordering.
+      run self.keys.append(
+        SortKey { order: order, texture: texture, index: usize.toU32(start), end: i },
+      )
     }
     run self.keys.sort()
     let mut j: usize = 0
-    while j < count {
-      let at = u32.toUsize(self.keys.get(j).index)
-      run self.sorted.append(self.added.get(at))
-      run self.sortedOrders.append(self.orders.get(at))
-      run self.sortedTextures.append(self.textures.get(at))
+    while j < self.keys.length() {
+      let key = self.keys.get(j)
+      let at = u32.toUsize(key.index)
+      let length = key.end - at
+      run self.sorted.appendSlice(Slice.view<T>(self.added.asSlice(), at, length))
+      run self.sortedOrders.appendSlice(Slice.view<u32>(self.orders.asSlice(), at, length))
+      run self.sortedTextures.appendSlice(Slice.view<u32>(self.textures.asSlice(), at, length))
       j = j + 1
     }
   }
@@ -388,6 +402,7 @@ struct Push {
   bounds: Rect<f32>,
   mask: ContentMask,
   isolation: Isolation,
+  effects: LayerEffects,
 }
 
 impl Copy for Push {}
@@ -423,6 +438,15 @@ fn clipped(bounds: Rect<f32>, mask: ContentMask) -> Rect<f32> {
 
 fn isVisible(bounds: Rect<f32>) -> bool {
   return bounds.xMin < bounds.xMax && bounds.yMin < bounds.yMax
+}
+
+fn pixelBounds(bounds: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.floor(bounds.xMin),
+    f32.floor(bounds.yMin),
+    f32.ceil(bounds.xMax),
+    f32.ceil(bounds.yMax),
+  )
 }
 
 impl Scene {
@@ -496,7 +520,9 @@ impl Scene {
     if context.pinned != 0 {
       return context.pinned
     }
-    return run self.layerData.asMutSlice()[u32.toUsize(context.layer)].tree.insert(visible)
+    return run self.layerData.asMutSlice()[u32.toUsize(context.layer)].tree.insert(
+      pixelBounds(visible),
+    )
   }
 
   effect fn log(self: &mut Self, kind: u32, index: u32) -> ()
@@ -662,7 +688,7 @@ impl Scene {
     let pinned = if context.pinned != 0 {
       context.pinned
     } else {
-      run self.layerData.asMutSlice()[u32.toUsize(context.layer)].tree.insert(bounds)
+      run self.layerData.asMutSlice()[u32.toUsize(context.layer)].tree.insert(pixelBounds(bounds))
     }
     let index = usize.toU32(self.pushes.length())
     run self.pushes.append(
@@ -670,6 +696,7 @@ impl Scene {
         bounds: bounds,
         mask: ContentMask.new(bounds),
         isolation: Isolation { opacity: 1.0, blend: 0 },
+        effects: LayerEffects.none(),
       },
     )
     run self.log(OP_PUSH_PINNED, index)
@@ -687,9 +714,26 @@ impl Scene {
   ) -> u32
     ! OutOfMemoryError
     ? &mut Allocator {
+    return run self.pushEffectLayer(bounds, mask, isolation, LayerEffects.none())
+  }
+
+  /// Opens an isolated layer with device-pixel blur and color filters.
+  /// Include three blur standard deviations in `bounds` to keep the visible blur tails.
+  /// The backdrop clip in `effects` is independent of these expanded paint bounds.
+  pub effect fn pushEffectLayer(
+    self: &mut Self,
+    bounds: Rect<f32>,
+    mask: ContentMask,
+    isolation: Isolation,
+    effects: LayerEffects,
+  ) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
     run self.ensureRoot()
     let pushIndex = usize.toU32(self.pushes.length())
-    run self.pushes.append(Push { bounds: bounds, mask: mask, isolation: isolation })
+    run self.pushes.append(
+      Push { bounds: bounds, mask: mask, isolation: isolation, effects: effects },
+    )
     run self.log(OP_PUSH_ISOLATED, pushIndex)
     let visible = clipped(bounds, mask)
     let target = Rect<f32>.new(
@@ -703,7 +747,7 @@ impl Scene {
     let layer = run self.newLayer()
     if order != 0 && isolation.opacity > 0.0 {
       drop run self.layerData.asMutSlice()[u32.toUsize(parent)].layers.push(
-        LayerSprite { layer: layer, bounds: target, isolation: isolation },
+        LayerSprite { layer: layer, bounds: target, isolation: isolation, effects: effects },
         order,
         0,
       )
@@ -765,7 +809,7 @@ impl Scene {
         run self.pushLayer(previous.pushes.get(at).bounds)
       } else if op.kind == OP_PUSH_ISOLATED {
         let push = previous.pushes.get(at)
-        drop run self.pushIsolatedLayer(push.bounds, push.mask, push.isolation)
+        drop run self.pushEffectLayer(push.bounds, push.mask, push.isolation, push.effects)
       } else if op.kind == OP_POP {
         run self.popLayer()
       }

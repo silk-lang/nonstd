@@ -37,7 +37,7 @@ Every batch of the scene is one instanced draw of six vertices per instance, as 
 | Glyph | `shaders/mono.wgsl` | A8 atlas tile, bilinear at pixel centers clamped to the tile, with DirectWrite's contrast and gamma correction for text (see below). |
 | Image | `shaders/poly.wgsl` | Premultiplied RGBA tile, bilinear, with corner radii, opacity and grayscale. |
 | Path | `shaders/path.wgsl` | `vector` coverage strips in gpu_scene's run layout (4-row bands, a word of coverage per column), placed at the sprite's integer origin; bands start at the sprite's own `y`. |
-| Layer | `shaders/layer.wgsl` | Isolated layers drawn into pooled RGBA8 textures and composited with gpu_scene's `blend.wgsl` (all `vector.layer` blend modes) and the group opacity. |
+| Layer | `shaders/layer.wgsl` | Isolated layers drawn into pooled RGBA8 textures and composited with gpu_scene's `blend.wgsl` (all `vector.layer` blend modes) and the group opacity, with optional layer/backdrop blur and color filters. |
 
 Gradients have two stops and any `silk.color` interpolation. sRGB gradients are mixed in the
 shader; every other interpolation (linear sRGB, Oklab, Oklch and the other polar spaces with their
@@ -55,6 +55,22 @@ with them, the frame is drawn into an RGBA8 texture and copied to the target at 
 Paths do not go through `gpu_scene.SceneRenderer` itself: UI paths need content masks and gradient
 ramps, which its paint records lack. They reuse its band layout, its buffer helpers and its
 blend modes.
+
+### Layer effects and atlas uploads
+
+`Scene.pushEffectLayer` carries the shared [`LayerEffects`](../ui_scene/src/effects.silk)
+settings into the renderer. Gaussian blur and color matrices reuse `gpu_scene.FilterRenderer`;
+filter scratch textures and uniforms are pooled between frames. A scene without isolated layers
+keeps the direct rendering path. Backdrop blur currently copies and filters the full viewport.
+Filter surfaces are viewport sized, so source pixels beyond their edges cannot contribute to
+blur. Cost scales with filtered area and layer count; these changes do not make large stacks of
+blurred layers free.
+
+`GpuAtlas.texture(index)` exposes a borrowed texture for external uploads. Call `sync` first,
+write only the allocated tile, and provide premultiplied pixels for color tiles. Color atlas
+textures now include render-attachment usage, which browser canvas-to-texture copies require;
+monochrome textures keep their previous usage. Instance packing writes whole little-endian
+vectors in bulk rather than appending each byte separately.
 
 ### Text correction
 
@@ -105,11 +121,11 @@ python3 graphics/ui_renderer/scripts/test-browser   # the comparison in installe
 python3 graphics/ui_renderer/scripts/bench          # dense scene against bench/budget.json
 ```
 
-The comparison renders seven fixtures (the four `ui_scene` golden scenes, nested isolated layers
-with clipped sprites and paths, gradients in eight interpolations on quads and paths, and a text
-coverage ramp) into RGBA8 and BGRA8 targets, checks the
-text correction against `TextSettings.correct` within one level, and draws the layered and gradient
-scenes again after another scene to check that pooled buffers and textures carry nothing over.
+The comparison renders eight fixtures (the four `ui_scene` golden scenes, nested isolated layers
+with clipped sprites and paths, gradients in eight interpolations on quads and paths, layer/backdrop
+blur with color adjustments and blending, and a text coverage ramp) into RGBA8 and BGRA8 targets.
+It checks text correction against `TextSettings.correct` within one level and redraws the layered,
+gradient, and effects scenes after another scene to check that pooled resources carry nothing over.
 
 The benchmark draws 320 cards (shadow, bordered rounded quad, a line of glyphs; 3,521 primitives)
 at 1280 x 800 and reports the median build, encode and frame times. On lavapipe in a 4-core
