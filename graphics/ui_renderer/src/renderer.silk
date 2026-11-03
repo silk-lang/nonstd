@@ -22,15 +22,7 @@ import silk.num.u32
 import silk.num.u8
 import silk.num.usize
 import webgpu.resources as gpu
-import webgpu.resources {
-  BindGroup,
-  Buffer,
-  CommandEncoder,
-  Queue,
-  RenderPipeline,
-  Texture,
-  TextureView
-}
+import webgpu.resources { BindGroup, Buffer, CommandEncoder, Queue, RenderPipeline, TextureView }
 import webgpu.runtime { Device, GpuError }
 import webgpu.descriptors {
   BindGroupDescriptor,
@@ -47,13 +39,14 @@ import webgpu.descriptors {
   RenderPassDescriptor,
   RenderPipelineDescriptor,
   TexelCopyTextureInfo,
-  TextureDescriptor,
-  TextureViewDescriptor,
   VertexState,
 }
 import webgpu_sys.generated_webgpu as flags
 import gpu_scene.renderer { entry, extent, storage, textureEntry, upload }
 import silk.color.rgba { Rgba }
+import gpu_scene.filter { FilterImage, FilterRenderer }
+import vector.filter { BlurPlan, Region }
+import ui_scene.effects { LayerEffects }
 import ui_scene.primitives { LayerSprite }
 import ui_scene.scene { Batch, PrimitiveKind, Scene }
 import atlas_textures { GpuAtlas }
@@ -176,30 +169,6 @@ effect fn makePipelines(device: &Device, modules: &Modules, format: u32) -> Pipe
   }
 }
 
-/// An offscreen RGBA8 texture of the frame's size.
-struct Layer {
-  texture: Texture,
-  view: TextureView,
-}
-
-effect fn makeLayer(device: &Device, width: u32, height: u32) -> Layer
-  ! GpuError {
-  let mut descriptor = TextureDescriptor.default().withLabel(b"ui layer")
-  descriptor.setSize(extent(width, height))
-  descriptor.setFormat(LAYER_FORMAT)
-  descriptor.setDimension(flags.WGPUTextureDimension_2D)
-  descriptor.setMipLevelCount(1)
-  descriptor.setSampleCount(1)
-  descriptor.setUsage(
-    flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_TextureBinding
-      | flags.WGPUTextureUsage_CopySrc
-      | flags.WGPUTextureUsage_CopyDst,
-  )
-  let texture = run gpu.createTexture(device, &descriptor)
-  let view = run texture.createView(&TextureViewDescriptor.default())
-  return Layer { texture: move texture, view: move view }
-}
-
 fn clearOf(color: Rgba<f32>) -> ClearColor {
   let a = f32.max(f32.min(color.a, 1.0), 0.0)
   let mut clear = ClearColor.default()
@@ -279,10 +248,11 @@ pub struct UiRenderer {
   instances: Instances,
   /// The globals uniform and the instance buffers (see GLOBALS .. RAMPS).
   buffers: List<Buffer>,
-  /// One 16-byte uniform per composite or copy pass of a frame.
+  /// One 48-byte uniform per composite or copy pass of a frame.
   params: List<Buffer>,
   /// 0 is the backdrop copy, 1 + d the target of nesting depth d.
-  layers: List<Layer>,
+  layers: List<FilterImage>,
+  filters: List<FilterRenderer>,
   layerWidth: u32,
   layerHeight: u32,
 }
@@ -311,7 +281,8 @@ impl UiRenderer {
       instances: Instances.make(),
       buffers: List<Buffer>.make(),
       params: List<Buffer>.make(),
-      layers: List<Layer>.make(),
+      layers: List<FilterImage>.make(),
+      filters: List<FilterRenderer>.make(),
       layerWidth: 0,
       layerHeight: 0,
     }
@@ -420,6 +391,8 @@ impl UiRenderer {
       0,
       255,
       1,
+      0,
+      LayerEffects.none(),
       Area { x: 0, y: 0, width: width, height: height },
     )
   }
@@ -558,18 +531,22 @@ impl UiRenderer {
   ) -> ()
     ! GpuError | OutOfMemoryError
     ? &mut Allocator {
+    if self.filters.length() == 0 {
+      run self.filters.append(run FilterRenderer.make(device, queue))
+    }
+    self.filters.asMutSlice()[0].reset()
     if width != self.layerWidth || height != self.layerHeight {
       self.layers.clear()
       self.layerWidth = width
       self.layerHeight = height
     }
-    let needed = u32.toUsize(depthOf(scene, 0)) + 2
+    let needed = u32.toUsize(depthOf(scene, 0)) + 5
     while self.layers.length() < needed {
-      let layer = run makeLayer(device, width, height)
+      let layer = run FilterImage.make(device, width, height)
       run self.layers.append(move layer)
     }
     let passes = compositesOf(scene, 0) + 1
-    let zeros: [u8; 16] = [0; 16]
+    let zeros: [u8; 48] = [0; 48]
     while self.params.length() < passes {
       let buffer = run storage(
         device,
@@ -585,7 +562,7 @@ impl UiRenderer {
   /// Draws `layer` into the layer texture of nesting `depth`, cleared to `clear`, compositing the
   /// isolated layers it holds as they come in its batches.
   effect fn isolated(
-    self: &Self,
+    self: &mut Self,
     device: &Device,
     queue: &Queue,
     encoder: &mut CommandEncoder,
@@ -600,7 +577,7 @@ impl UiRenderer {
   ) -> ()
     ! GpuError | OutOfMemoryError
     ? &mut Allocator {
-    let target = &self.layers.asSlice()[u32.toUsize(depth) + 1]
+    let targetIndex = u32.toUsize(depth) + 1
     let batches = scene.batches(layer)
     let mut from: usize = 0
     let mut load = false
@@ -615,7 +592,7 @@ impl UiRenderer {
         run self.drawRange(
           device,
           &mut encoder,
-          &target.view,
+          &self.layers.asSlice()[targetIndex].view,
           &self.offscreen,
           scene,
           atlas,
@@ -649,14 +626,42 @@ impl UiRenderer {
 
             // The blend reads what is under the layer from a copy.
             let list = self.layers.asSlice()
+            let target = &list[targetIndex]
             let mut origin = Origin3D.default()
-            origin.setX(area.x)
-            origin.setY(area.y)
+            if sprite.effects.backdropBlur == 0.0 {
+              origin.setX(area.x)
+              origin.setY(area.y)
+            }
             let mut source = TexelCopyTextureInfo.default().withTexture(&target.texture)
             source.setOrigin(origin)
             let mut copy = TexelCopyTextureInfo.default().withTexture(&list[0].texture)
             copy.setOrigin(origin)
-            encoder.copyTextureToTexture(&source, &copy, &extent(area.width, area.height))
+            encoder.copyTextureToTexture(
+              &source,
+              &copy,
+              &extent(
+                if sprite.effects.backdropBlur > 0.0 {
+                  width
+                } else {
+                  area.width
+                },
+                if sprite.effects.backdropBlur > 0.0 {
+                  height
+                } else {
+                  area.height
+                },
+              ),
+            )
+            drop list
+            let content = run self.filterLayer(
+              device,
+              queue,
+              &mut encoder,
+              sprite,
+              u32.toUsize(depth) + 2,
+              width,
+              height,
+            )
             let opacity = f32.toU32(
               f32.max(f32.min(sprite.isolation.opacity, 1.0), 0.0) * 255.0 + 0.5,
             )
@@ -665,12 +670,18 @@ impl UiRenderer {
               queue,
               &mut encoder,
               &self.composite,
-              &target.view,
+              &self.layers.asSlice()[targetIndex].view,
               slot.*,
               OP_COMPOSITE,
               u8ToU32(sprite.isolation.blend),
               opacity,
-              u32.toUsize(depth) + 2,
+              content,
+              if sprite.effects.backdropBlur > 0.0 {
+                self.layers.length() - 2
+              } else {
+                0
+              },
+              sprite.effects,
               move area,
             )
             slot.* = slot.* + 1
@@ -685,7 +696,7 @@ impl UiRenderer {
       run self.drawRange(
         device,
         &mut encoder,
-        &target.view,
+        &self.layers.asSlice()[targetIndex].view,
         &self.offscreen,
         scene,
         atlas,
@@ -696,6 +707,74 @@ impl UiRenderer {
         clear,
       )
     }
+  }
+
+  effect fn filterLayer(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    encoder: &mut CommandEncoder,
+    sprite: LayerSprite,
+    source: usize,
+    width: u32,
+    height: u32,
+  ) -> usize
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let effects = sprite.effects
+    let scratch = self.layers.length() - 3
+    let area = areaOf(&sprite, width, height)
+    let region = Region.make(area.x, area.y, area.x + area.width, area.y + area.height)
+    let images = self.layers.asSlice()
+    let filter = &mut self.filters.asMutSlice()[0]
+    let mut content = source
+    if effects.blur > 0.0 {
+      let plan = run BlurPlan.make(f32.toF64(effects.blur))
+      run filter.gaussianBlur(
+        device,
+        queue,
+        &mut encoder,
+        &images[scratch],
+        &images[source],
+        &images[scratch + 1],
+        &plan,
+        &plan,
+        region,
+      )
+      content = scratch
+    }
+    if effects.hasColor() {
+      let output = if content == source {
+        scratch
+      } else {
+        source
+      }
+      run filter.colorMatrix(
+        device,
+        queue,
+        &mut encoder,
+        &images[output],
+        &images[content],
+        effects.matrix(),
+        region,
+      )
+      content = output
+    }
+    if effects.backdropBlur > 0.0 {
+      let plan = run BlurPlan.make(f32.toF64(effects.backdropBlur))
+      run filter.gaussianBlur(
+        device,
+        queue,
+        &mut encoder,
+        &images[scratch + 1],
+        &images[0],
+        &images[scratch + 2],
+        &plan,
+        &plan,
+        Region.make(0, 0, width, height),
+      )
+    }
+    return content
   }
 
   /// A full-target pass of `shaders/layer.wgsl` through `pipeline` onto `output`, limited to
@@ -712,13 +791,30 @@ impl UiRenderer {
     mode: u32,
     opacity: u32,
     content: usize,
+    backdropContent: usize,
+    effects: LayerEffects,
     area: Area,
   ) -> ()
     ! GpuError {
-    let mut header: [u8; 16] = [0; 16]
+    let mut header: [u8; 48] = [0; 48]
     writeU32(&mut header, 0, op)
     writeU32(&mut header, 4, mode)
     writeU32(&mut header, 8, opacity)
+    writeU32(
+      &mut header,
+      12,
+      if effects.backdropBlur > 0.0 {
+        1
+      } else {
+        0
+      },
+    )
+    writeU32(&mut header, 16, f32.toBits(effects.clip.xMin))
+    writeU32(&mut header, 20, f32.toBits(effects.clip.yMin))
+    writeU32(&mut header, 24, f32.toBits(effects.clip.xMax))
+    writeU32(&mut header, 28, f32.toBits(effects.clip.yMax))
+    writeU32(&mut header, 32, f32.toBits(effects.radius))
+    writeU32(&mut header, 36, effects.shape)
     let params = &self.params.asSlice()[slot]
     queue.writeBuffer(params, 0, &header)
     let list = self.layers.asSlice()
@@ -727,6 +823,7 @@ impl UiRenderer {
       entry(0, params),
       textureEntry(1, &list[0].view),
       textureEntry(2, &list[content].view),
+      textureEntry(3, &list[backdropContent].view),
     ]
     let group = run gpu.createBindGroup(
       device,
