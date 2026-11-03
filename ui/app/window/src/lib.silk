@@ -34,7 +34,7 @@ import ui_renderer.text { TextSettings }
 import window.event { Event }
 import window.native { NativePlatform }
 import window.platform { Platform }
-import window.types { RawSurface, Wait, WindowError, WindowId, WindowOptions }
+import window.types { Cursor, RawSurface, Wait, WindowError, WindowId, WindowOptions }
 import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
 import webgpu.runtime as runtime
 import webgpu.resources { Queue, Texture, getQueue }
@@ -191,8 +191,13 @@ pub effect fn runWindowWith<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 }
 
 /// Native content an app shows in its window next to the tree, such as web views
-/// (platform/webview) on `ui.hosted` nodes. The loop calls it at three points; everything it
+/// (platform/webview) on `ui.hosted` nodes. The loop calls it at fixed points; everything it
 /// tells the app goes in as messages.
+///
+/// Native child views (WKWebView, WebView2) only need `opened`, `framed` and `poll`. Content
+/// drawn offscreen (Chromium) also takes the window's input over its nodes (`input`), uploads
+/// its frames before each frame is drawn (`present`), sets the cursor over itself (`cursor`)
+/// and asks for frames and turns of the loop (`wantsFrame`, `nextTurn`).
 pub interface WindowHost<A, M> {
   /// The window is open (`window` is its `WindowId.value`).
   effect fn opened(self: &mut Self, window: u32) -> () ! OutOfMemoryError ? &mut Allocator
@@ -206,6 +211,30 @@ pub interface WindowHost<A, M> {
   effect fn poll(self: &mut Self, model: &mut A, out: &mut List<M>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator
+
+  /// A window event (input; not resizes, frames or closing) before the tree sees it. Returns
+  /// true when the host took it, and the tree then does not get it.
+  effect fn input(self: &mut Self, event: &Event) -> bool ! OutOfMemoryError ? &mut Allocator
+
+  /// Just before a frame is drawn: put the host's pixels where `renderer` draws them (surface
+  /// textures for hosted nodes).
+  effect fn present(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    renderer: &mut UiRenderer,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator
+
+  /// The cursor while the pointer is over the host's content, or None for the tree's.
+  fn cursor(self: &Self) -> Option<Cursor>
+
+  /// Whether the host has new pixels to show: the loop requests a frame.
+  fn wantsFrame(self: &mut Self) -> bool
+
+  /// Seconds until the host needs a turn of the loop without any event, or None.
+  fn nextTurn(self: &Self) -> Option<f64>
 }
 
 /// No native content.
@@ -228,6 +257,59 @@ impl<A, M> WindowHost<A, M> for NoHost {
     ! OutOfMemoryError
     ? &mut Allocator {
     return false
+  }
+
+  effect fn input(self: &mut Self, event: &Event) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  effect fn present(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    renderer: &mut UiRenderer,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    return ()
+  }
+
+  fn cursor(self: &Self) -> Option<Cursor> {
+    return Option<Cursor>.None
+  }
+
+  fn wantsFrame(self: &mut Self) -> bool {
+    return false
+  }
+
+  fn nextTurn(self: &Self) -> Option<f64> {
+    return Option<f64>.None
+  }
+}
+
+/// The host's cursor over its content, else the tree's.
+fn cursorOf<A, M, H: WindowHost<A, M>>(host: &H, tree: &UiTree) -> Cursor {
+  return match host.cursor() {
+    Option<Cursor>.Some { value } => value
+    Option<Cursor>.None => windowCursor(tree.cursor())
+  }
+}
+
+/// The sooner of two waits in seconds, negative meaning none.
+fn sooner(a: f64, b: Option<f64>) -> f64 {
+  return match b {
+    Option<f64>.Some { value } => if a < 0.0 || value < a {
+      if value < 0.0 {
+        0.0
+      } else {
+        value
+      }
+    } else {
+      a
+    }
+    Option<f64>.None => a
   }
 }
 
@@ -313,14 +395,17 @@ pub effect fn runWindowHosting<A: App<M, C>, M, C: Perform<M, E, R>, E, H: Windo
     let wait = if check {
       Wait.Poll
     } else {
-      let deadline = match app.nextDeadline() {
-        Option<f64>.Some { value } => if value > now {
-          value - now
-        } else {
-          0.0
-        }
-        Option<f64>.None => -1.0
-      }
+      let deadline = sooner(
+        match app.nextDeadline() {
+          Option<f64>.Some { value } => if value > now {
+            value - now
+          } else {
+            0.0
+          }
+          Option<f64>.None => -1.0
+        },
+        host.nextTurn(),
+      )
       match inspector.pollInterval() {
         Option<f64>.Some { value } => Wait.Seconds {
           seconds: if deadline >= 0.0 && deadline < value {
@@ -347,7 +432,7 @@ pub effect fn runWindowHosting<A: App<M, C>, M, C: Perform<M, E, R>, E, H: Windo
       // Input from the inspector is answered like window input.
       run inspector.observe(&tree)
       drop run pump(&mut app, &mut tree)
-      platform.setCursor(owner, windowCursor(tree.cursor()))
+      platform.setCursor(owner, cursorOf<A, M, H>(&host, &tree))
       redraw = true
     }
     if let Option<Event>.Some { value } = &next {
@@ -386,6 +471,7 @@ pub effect fn runWindowHosting<A: App<M, C>, M, C: Perform<M, E, R>, E, H: Windo
               textures.write(&queue, list[i].tile, pending.pixels(list[i]))
               i = i + 1
             }
+            run host.present(&device, &queue, &mut renderer)
             run inspector.afterFrame(&tree)
             run snapshot.sync(&mut tree)
             let deviceWidth = deviceSize(width, scale)
@@ -423,7 +509,7 @@ pub effect fn runWindowHosting<A: App<M, C>, M, C: Perform<M, E, R>, E, H: Windo
             if check && drawn >= CHECK_FRAME {
               break
             }
-            platform.setCursor(owner, windowCursor(tree.cursor()))
+            platform.setCursor(owner, cursorOf<A, M, H>(&host, &tree))
           }
           redraw = check || app.wantsFrames() || tree.needsFrame()
         }
@@ -444,10 +530,12 @@ pub effect fn runWindowHosting<A: App<M, C>, M, C: Perform<M, E, R>, E, H: Windo
           break
         }
         _ => {
-          if !check && run feed(&mut tree, &value) {
+          if !check && run host.input(&value) {
+            platform.setCursor(owner, cursorOf<A, M, H>(&host, &tree))
+          } else if !check && run feed(&mut tree, &value) {
             run inspector.observe(&tree)
             drop run pump(&mut app, &mut tree)
-            platform.setCursor(owner, windowCursor(tree.cursor()))
+            platform.setCursor(owner, cursorOf<A, M, H>(&host, &tree))
             redraw = tree.needsFrame()
           }
         }
@@ -468,6 +556,9 @@ pub effect fn runWindowHosting<A: App<M, C>, M, C: Perform<M, E, R>, E, H: Windo
         app.send(hosted.remove(0))
       }
       drop run pump(&mut app, &mut tree)
+      redraw = true
+    }
+    if !check && host.wantsFrame() {
       redraw = true
     }
     if redraw {

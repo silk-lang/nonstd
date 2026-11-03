@@ -1,0 +1,272 @@
+//! [`WebViewsHost`]: the `WindowHost` that runs an app's web views in its window, on any
+//! backend. After each turn of the loop it takes the [`WebViewRequests`] the model queued and
+//! hands them to the backend, and turns every event of every view into the app's message
+//! (through [`WebViewApp.webViewMessage`], usually wrapping a [`PageMessage`]). After each frame
+//! it places each open view on its hosted node, and hides views whose node is gone.
+//!
+//! ```silk,ignore
+//! impl WebViewApp<Message> for Browser {
+//!   fn webViewRequests(self: &mut Self) -> &mut WebViewRequests { return &mut self.requests }
+//!   fn webViewMessage(self: &Self, view: u32, message: PageMessage) -> Message {
+//!     return Message.Page { view: view, message: move message }
+//!   }
+//! }
+//! let mut host = WebViewsHost<NativeWebViews, Browser, Message>.make(NativeWebViews.make())
+//! run runWindowHosting(&mut runtime, &collection, resources, options, inspector, &mut host)
+//! ```
+import backend { WindowBackend }
+import page { PageMessage }
+import requests { WebViewRequests, Request }
+import webview.command { Command, commandName, requestOf }
+import webview.event { WebViewEvent, EventKind }
+import webview.host { WebViewHost }
+import webview.types { WebViewOptions, WebViewError, Placement }
+import ui_app_window.lib { WindowHost }
+import ui_tree.hosted { HostedPlacement, hostedPlacements }
+import ui_tree.lib { UiTree }
+import ui_renderer.renderer { UiRenderer }
+import window.event { Event }
+import window.types { Cursor }
+import webgpu.resources { Queue }
+import webgpu.runtime { Device, GpuError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// What a model that shows web views gives the host.
+pub interface WebViewApp<M> {
+  /// The work the model queued for its web views.
+  fn webViewRequests(self: &mut Self) -> &mut WebViewRequests
+
+  /// The message for `message` about view `view`.
+  fn webViewMessage(self: &Self, view: u32, message: PageMessage) -> M
+}
+
+/// Web views on backend `B` in the window of an app with model `A` and messages `M`.
+pub struct WebViewsHost<B, A, M> {
+  /// The backend, for what goes beyond the requests (tests read the headless backend here).
+  pub views: B,
+  window: u32,
+  windowOpen: bool,
+  /// The views opened and not closed, in the order they opened.
+  open: List<u32>,
+  placements: List<HostedPlacement>,
+  events: List<WebViewEvent>,
+  /// Events the host makes itself (a refused open or command), queued for the next poll.
+  own: List<WebViewEvent>,
+  /// Names `A` and `M` in the type (the host never stores either).
+  model: Option<A>,
+  message: Option<M>,
+}
+
+impl<B, A, M> WebViewsHost<B, A, M> {
+  pub fn make(views: B) -> WebViewsHost<B, A, M> {
+    return WebViewsHost<B, A, M> {
+      views: move views,
+      window: 0,
+      windowOpen: false,
+      open: List<u32>.make(),
+      placements: List<HostedPlacement>.make(),
+      events: List<WebViewEvent>.make(),
+      own: List<WebViewEvent>.make(),
+      model: Option<A>.None,
+      message: Option<M>.None,
+    }
+  }
+
+  /// Whether view `view` is open.
+  pub fn isOpen(self: &Self, view: u32) -> bool {
+    return self.indexOf(view) < self.open.length()
+  }
+
+  fn indexOf(self: &Self, view: u32) -> usize {
+    let list = self.open.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i] == view {
+        return i
+      }
+      i = i + 1
+    }
+    return list.length
+  }
+}
+
+impl<B: WebViewHost + WindowBackend, A: WebViewApp<M>, M> WebViewsHost<B, A, M> {
+  /// Runs one request now (`poll` runs them all; tests drive the host without a window).
+  pub effect fn handle(self: &mut Self, request: Request) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move request {
+      Request.Open { view, options } => {
+        let mut chosen = move options
+        chosen.window = self.window
+        if run Effect.catch<WebViewError>(openView(&mut self.views, view, &chosen), refused) {
+          run self.open.append(view)
+        } else {
+          let reason = run String.copy("the web view could not be created")
+          run self.own.append(
+            WebViewEvent { view: view, kind: EventKind.Crashed { reason: move reason } },
+          )
+        }
+      }
+      Request.Close { view } => {
+        let at = self.indexOf(view)
+        if at < self.open.length() {
+          drop self.open.remove(at)
+          run self.views.close(view)
+        }
+      }
+      Request.Send { view, command } => {
+        let request = requestOf(&command)
+        let name = commandName(&command)
+        if !run Effect.catch<WebViewError>(sendView(&mut self.views, view, move command), refused) {
+          // Whoever waits for an answer gets one.
+          let command = run String.copy(name)
+          run self.own.append(
+            WebViewEvent {
+              view: view,
+              kind: EventKind.Unsupported { request: request, command: move command },
+            },
+          )
+        }
+      }
+    }
+  }
+
+  /// Takes the model's requests and appends a message for every event (`poll` without the
+  /// window).
+  pub effect fn exchange(self: &mut Self, model: &mut A, out: &mut List<M>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let requests = model.webViewRequests()
+    while requests.length() != 0 {
+      run self.handle(requests.take())
+    }
+    let before = out.length()
+    while self.own.length() != 0 {
+      let event = self.own.remove(0)
+      run out.append(model.webViewMessage(event.view, PageMessage.Event { event: move event.kind }))
+    }
+    run self.views.takeEvents(&mut self.events)
+    while self.events.length() != 0 {
+      let event = self.events.remove(0)
+      if let EventKind.Closed = &event.kind {
+        let at = self.indexOf(event.view)
+        if at < self.open.length() {
+          drop self.open.remove(at)
+        }
+      }
+      run out.append(model.webViewMessage(event.view, PageMessage.Event { event: move event.kind }))
+    }
+    return out.length() != before
+  }
+
+  /// Places every open view on its hosted node in `tree`, and hides the ones with no node.
+  pub effect fn placeAll(self: &mut Self, tree: &UiTree) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run hostedPlacements(tree, &mut self.placements)
+    let open = self.open.asSlice()
+    let mut i: usize = 0
+    while i < open.length {
+      let view = open[i]
+      let mut placement = Placement.hidden()
+      let list = self.placements.asSlice()
+      let mut j: usize = 0
+      while j < list.length {
+        if list[j].view == view {
+          let p = list[j]
+          placement = Placement {
+            bounds: p.bounds,
+            clip: p.clip,
+            visible: p.visible,
+            scale: p.scale,
+          }
+          break
+        }
+        j = j + 1
+      }
+      self.views.place(view, placement)
+      i = i + 1
+    }
+  }
+}
+
+impl<A: WebViewApp<M>, M, B: WebViewHost + WindowBackend> WindowHost<A, M> for WebViewsHost<
+  B,
+  A,
+  M
+> {
+  effect fn opened(self: &mut Self, window: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.window = window
+    self.windowOpen = true
+  }
+
+  effect fn framed(self: &mut Self, tree: &UiTree) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.placeAll(tree)
+  }
+
+  effect fn poll(self: &mut Self, model: &mut A, out: &mut List<M>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.windowOpen {
+      return false
+    }
+    return run self.exchange(&mut model, &mut out)
+  }
+
+  effect fn input(self: &mut Self, event: &Event) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.views.forward(event)
+  }
+
+  effect fn present(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    renderer: &mut UiRenderer,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.views.present(device, queue, &mut renderer)
+  }
+
+  fn cursor(self: &Self) -> Option<Cursor> {
+    return self.views.pointerCursor()
+  }
+
+  fn wantsFrame(self: &mut Self) -> bool {
+    return self.views.newFrames()
+  }
+
+  fn nextTurn(self: &Self) -> Option<f64> {
+    return self.views.nextWork()
+  }
+}
+
+effect fn openView<B: WebViewHost>(views: &mut B, view: u32, options: &WebViewOptions) -> bool
+  ! WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  run views.open(view, options)
+  return true
+}
+
+effect fn sendView<B: WebViewHost>(views: &mut B, view: u32, command: Command) -> bool
+  ! WebViewError | OutOfMemoryError
+  ? &mut Allocator {
+  run views.send(view, move command)
+  return true
+}
+
+effect fn refused(error: WebViewError) -> bool {
+  drop error
+  return false
+}

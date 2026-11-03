@@ -1,0 +1,228 @@
+//! [`Page`]: what an app keeps about one web view (its URL, title, load and history state,
+//! focus), the submodel its [`component.webView`] node shows, and [`PageMessage`], the messages
+//! that keep it current.
+//!
+//! The host turns every event of the view into `PageMessage.Event`, and the app's `update`
+//! passes it to [`Page.update`]: state events (title, URL, progress, history, focus, crash)
+//! change the page, and the rest (answers to `Snapshot`, `Evaluate`, `ClickElement`..., console
+//! messages, new window and navigation requests) come back for the app to handle. Navigation
+//! helpers queue the commands an app's toolbar sends; the toolbar itself (an address bar,
+//! buttons) is the app's.
+import requests { WebViewRequests }
+import webview.command { Command }
+import webview.event { EventKind }
+import webview.types { WebViewOptions }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// What the app knows about one web view.
+pub struct Page {
+  /// The view id: the host view its hosted node names, and the id it is opened with.
+  pub view: u32,
+  /// The view exists (`Created` arrived) and has not closed.
+  pub created: bool,
+  pub url: String,
+  pub title: String,
+  /// The main frame's load, `0 ..= 1`.
+  pub progress: f32,
+  pub loading: bool,
+  pub canGoBack: bool,
+  pub canGoForward: bool,
+  /// The page has keyboard focus. The component then focuses its hosted node.
+  pub focused: bool,
+  /// Why the last load failed, or empty.
+  pub error: String,
+  /// Why the page's process died, or empty while it runs.
+  pub crashed: String,
+}
+
+/// What changes a [`Page`].
+pub union PageMessage {
+  /// An event of the view, from the host.
+  Event { pub event: EventKind },
+  /// The tree focused the view's node (Tab, or `ui.takeFocus`): the page gets keyboard focus.
+  NodeFocused,
+}
+
+impl Page {
+  pub fn make(view: u32) -> Page {
+    return Page {
+      view: view,
+      created: false,
+      url: String.make(),
+      title: String.make(),
+      progress: 0.0,
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      focused: false,
+      error: String.make(),
+      crashed: String.make(),
+    }
+  }
+
+  /// Opens the view loading `url` (inspectable, in a session that forgets everything).
+  pub effect fn open(self: &mut Self, requests: &mut WebViewRequests, url: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let options = run WebViewOptions.make(0, url)
+    run self.openWith(&mut requests, move options)
+  }
+
+  /// Opens the view with `options` (the host fills in the window).
+  pub effect fn openWith(
+    self: &mut Self,
+    requests: &mut WebViewRequests,
+    options: WebViewOptions,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.url = run String.copy(options.url.view())
+    run requests.open(self.view, move options)
+  }
+
+  pub effect fn close(self: &mut Self, requests: &mut WebViewRequests) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run requests.close(self.view)
+  }
+
+  pub effect fn navigate(self: &mut Self, requests: &mut WebViewRequests, url: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run requests.send(self.view, Command.Navigate { url: run String.copy(url) })
+  }
+
+  pub effect fn back(self: &mut Self, requests: &mut WebViewRequests) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run requests.send(self.view, Command.Back)
+  }
+
+  pub effect fn forward(self: &mut Self, requests: &mut WebViewRequests) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run requests.send(self.view, Command.Forward)
+  }
+
+  /// Reloads, or stops the load in progress.
+  pub effect fn reloadOrStop(self: &mut Self, requests: &mut WebViewRequests) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.loading {
+      run requests.send(self.view, Command.Stop)
+    } else {
+      run requests.send(self.view, Command.Reload)
+    }
+  }
+
+  /// Sends any command to the view.
+  pub effect fn send(self: &mut Self, requests: &mut WebViewRequests, command: Command) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run requests.send(self.view, move command)
+  }
+
+  /// Applies `message`. State events change the page and return None; every other event is
+  /// returned for the app.
+  pub effect fn update(
+    self: &mut Self,
+    message: PageMessage,
+    requests: &mut WebViewRequests,
+  ) -> Option<EventKind>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      PageMessage.NodeFocused => {
+        if !self.focused && self.created {
+          run requests.send(self.view, Command.Focus)
+        }
+        return Option<EventKind>.None
+      }
+      PageMessage.Event { event } => {
+        return self.apply(move event)
+      }
+    }
+  }
+
+  /// Applies one event of the view (see [`update`]).
+  pub fn apply(self: &mut Self, event: EventKind) -> Option<EventKind> {
+    if !isState(&event) {
+      return Option<EventKind>.some(move event)
+    }
+    match move event {
+      EventKind.Created => {
+        self.created = true
+        self.crashed = String.make()
+      }
+      EventKind.Closed => {
+        self.created = false
+        self.loading = false
+        self.focused = false
+      }
+      EventKind.LoadStarted { url } => {
+        self.url = move url
+        self.loading = true
+        self.progress = 0.0
+        self.error = String.make()
+      }
+      EventKind.LoadProgress { fraction } => {
+        self.progress = fraction
+      }
+      EventKind.LoadFinished { url, ok, error } => {
+        drop url
+        self.loading = false
+        self.progress = 1.0
+        self.error = move error
+        if ok {
+          self.error = String.make()
+        }
+      }
+      EventKind.UrlChanged { url } => {
+        self.url = move url
+      }
+      EventKind.TitleChanged { title } => {
+        self.title = move title
+      }
+      EventKind.HistoryChanged { canGoBack, canGoForward } => {
+        self.canGoBack = canGoBack
+        self.canGoForward = canGoForward
+      }
+      EventKind.FocusChanged { focused } => {
+        self.focused = focused
+      }
+      EventKind.Crashed { reason } => {
+        self.crashed = move reason
+        self.loading = false
+      }
+      _ => {}
+    }
+    return Option<EventKind>.None
+  }
+
+  /// The title, or the URL while the page has none.
+  pub fn heading(self: &Self) -> string {
+    if String.byteLength(self.title.view()) != 0 {
+      return self.title.view()
+    }
+    return self.url.view()
+  }
+}
+
+/// Whether `event` changes a [`Page`] rather than answering the app.
+pub fn isState(event: &EventKind) -> bool {
+  return match &event.* {
+    EventKind.Created => true
+    EventKind.Closed => true
+    EventKind.LoadStarted { .. } => true
+    EventKind.LoadProgress { .. } => true
+    EventKind.LoadFinished { .. } => true
+    EventKind.UrlChanged { .. } => true
+    EventKind.TitleChanged { .. } => true
+    EventKind.HistoryChanged { .. } => true
+    EventKind.FocusChanged { .. } => true
+    EventKind.Crashed { .. } => true
+    _ => false
+  }
+}

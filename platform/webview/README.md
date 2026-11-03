@@ -14,6 +14,9 @@ The engine backends land in steps on the `feature/webview` branch (see [Plan](#p
 
 ## The model
 
+Apps built on ui-app use this through [ui-webview](../../ui/webview/README.md), which keeps
+the loop below for them. The contract itself:
+
 ```silk,ignore
 import webview.lib { WebViewHost, WebViewOptions, Command, Placement, EventKind }
 import ui_tree.lib { hostedPlacements }
@@ -122,8 +125,9 @@ WebKit, and a program using it also depends on platform-window (which it needs f
 tests/native, the smoke test both native backends share.
 `python3 platform/webview/scripts/macos demo` runs `examples/browser`: a Silk UI toolbar and status
 bar around a live page, with an "Agent demo" page that the agent button fills in through
-snapshot refs and native input. It uses ui-app-window's `runWindowHosting` and `WindowHost`, the
-hook that places native content on hosted nodes after each frame.
+snapshot refs and native input. It is built on [ui-webview](../../ui/webview/README.md), the
+ui-app component for web views (a `Page` per view, the `webView` node and `WebViewsHost`, the
+window host that runs any backend).
 Manual checks on a Mac: scroll a page with the trackpad, type with the Japanese input method in a
 page field, click between the page and the Silk UI and watch focus move, open the view in
 Safari's Develop menu.
