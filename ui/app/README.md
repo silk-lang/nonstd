@@ -7,7 +7,8 @@ tree the fewest `Mutation`s it can. It uses only the tree's public `Mutation` an
 anything this package does, another client of the tree can do too.
 
 Components (buttons, fields, lists, tabs, menus, dialogs and more) are in
-[ui-components](../components), built on this package.
+[ui-components](../components), built on this package, and [ui/notes](../notes) is a complete
+example app. [ui/README.md](../README.md) is the overview of the whole UI stack.
 
 Packages:
 

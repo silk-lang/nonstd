@@ -1,0 +1,1195 @@
+//! The notes app: model, messages, `update`, `view`, subscriptions and the save command.
+//!
+//! The window is a toolbar over two panes. The sidebar has a search field, a sort select and
+//! the list of notes (pinned first). The editor shows the selected note's title and body, its
+//! word count and a Note menu (pin, duplicate, delete). Deleting asks first in a dialog.
+//!
+//! Every edit bumps `revision`. While the saved revision is behind, an `every` subscription
+//! sends `AutoSave` once a second, and `update` answers with a `Save` command that the host's
+//! [`Store`] performs. Ctrl+S (or Cmd+S) saves at once, Ctrl+N makes a note and Ctrl+F goes to
+//! the search field.
+import format { Note, Library, encode, appendNumber }
+import text { matches, displayTitle, wordCount, characterCount, compareIgnoringCase }
+import look
+import ui_components.lib {
+  Theme,
+  Tone,
+  MenuState,
+  MenuMessage,
+  Disclosure,
+  NO_SELECTION,
+  rgb,
+  rgba,
+  corners,
+  surface,
+  clear,
+  focusRing,
+  caption,
+  paragraph,
+  noWrap,
+  pad,
+  primaryButton,
+  buttonWith,
+  buttonLook,
+  switch,
+  moveSelection,
+  menu,
+  dialog,
+  tooltip
+}
+import ui_app.app { App, Perform, Context, Subscriptions }
+import ui_app.ui { Ui, Reply }
+import ui_tree.input { MOD_CONTROL, MOD_META }
+import ui_tree.mutation {
+  Property,
+  Length,
+  Align,
+  Overflow,
+  LineHeight,
+  Role,
+  BoxSizing,
+  Side,
+  Cursor,
+  CanvasCommand,
+  Display,
+  FlexDirection
+}
+import silk.color.rgba { Rgba }
+import ui_tree.node { Event }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The font family id the app defines (`Noto Sans, sans-serif`).
+pub const SANS: u32 = 1
+
+/// The sort orders, as the Sort select shows them.
+pub const SORTS: [string<'static>; 2] = ["Recent", "Title"]
+
+/// Seconds between autosaves while there are unsaved edits.
+pub const AUTOSAVE_SECONDS: f64 = 1.0
+
+/// Characters of a note's first line the list shows.
+const PREVIEW_LENGTH: usize = 38
+
+/// Anchor and subscription keys.
+const NEW_TIP: u64 = 1
+
+const SORT_MENU: u64 = 2
+
+const NOTE_MENU: u64 = 3
+
+const AUTOSAVE: u64 = 10
+
+/// What takes focus at the next render.
+pub enum Focus {
+  Nothing,
+  Search,
+  Title,
+  Body,
+}
+
+pub struct Notes {
+  pub theme: Theme,
+  pub dark: bool,
+  pub notes: List<Note>,
+  pub nextId: u64,
+  /// The edit clock: each edit stamps its note with the next value.
+  pub clock: u64,
+  /// The id of the note in the editor, or 0.
+  pub selected: u64,
+  pub search: String,
+  /// An index into [`SORTS`].
+  pub sort: usize,
+  pub sortMenu: MenuState,
+  pub noteMenu: MenuState,
+  pub confirm: Disclosure,
+  pub focus: Focus,
+  /// Bumped by every change worth saving.
+  pub revision: u64,
+  /// The revision the store last confirmed.
+  pub savedRevision: u64,
+  pub saving: bool,
+  /// The last save failed.
+  pub failed: bool,
+  /// The key of the tooltip showing, or 0.
+  pub tip: u64,
+}
+
+pub union Message {
+  New,
+  Select { pub id: u64 },
+  Search { pub text: String },
+  ClearSearch,
+  FocusSearch,
+  /// Enter in the search field: the first match, ready to edit.
+  OpenFirst,
+  Title { pub text: String },
+  Body { pub text: String },
+  Sort { pub message: MenuMessage },
+  NoteMenu { pub message: MenuMessage },
+  CancelDelete,
+  Delete,
+  Dark { pub value: bool },
+  Save,
+  AutoSave,
+  Saved { pub revision: u64, pub ok: bool },
+  Tip { pub key: u64, pub show: bool },
+}
+
+pub union Command {
+  /// Save `text` (the library's JSON), which is revision `revision`.
+  Save { pub revision: u64, pub text: String },
+}
+
+/// Where the notes are saved. The window app writes a file; tests keep the text in memory.
+pub service Store {
+  /// Saves the library's JSON `text`; false when it could not.
+  effect fn save(text: string) -> bool ? &mut Store
+}
+
+impl Perform<Message, never ? &mut Store> for Command {
+  effect fn perform(self: &Self) -> Message
+    ? &mut Store {
+    return match &self.* {
+      Command.Save { revision, text } => Message.Saved {
+        revision: revision,
+        ok: run Store.save(String.view(&text)),
+      }
+    }
+  }
+}
+
+fn maxOf(a: u64, b: u64) -> u64 {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn themeFor(dark: bool) -> Theme {
+  return look.theme(SANS, dark)
+}
+
+effect fn sampleNote(id: u64, title: string, body: string, pinned: bool) -> Note
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Note {
+    id: id,
+    title: run String.copy(title),
+    body: run String.copy(body),
+    pinned: pinned,
+    stamp: id,
+  }
+}
+
+impl Notes {
+  /// The app over `library`, the most recent note selected.
+  pub effect fn make(library: Library) -> Notes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut highest: u64 = 0
+    let mut clock: u64 = 0
+    let notes = library.notes.asSlice()
+    let mut i: usize = 0
+    while i < notes.length {
+      highest = maxOf(highest, notes[i].id)
+      clock = maxOf(clock, notes[i].stamp)
+      i = i + 1
+    }
+    let mut app = Notes {
+      theme: themeFor(library.dark),
+      dark: library.dark,
+      notes: move library.notes,
+      nextId: highest + 1,
+      clock: clock,
+      selected: 0,
+      search: String.make(),
+      sort: 0,
+      sortMenu: MenuState.make().ghosted(),
+      noteMenu: MenuState.endAligned().ghosted(),
+      confirm: Disclosure.make(),
+      focus: Focus.Nothing,
+      revision: 0,
+      savedRevision: 0,
+      saving: false,
+      failed: false,
+      tip: 0,
+    }
+    let order = run app.visible()
+    if order.length() != 0 {
+      app.selected = app.notes.asSlice()[order.asSlice()[0]].id
+    }
+    return move app
+  }
+
+  /// A library with a few notes to start from.
+  pub effect fn sample() -> Library
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut library = Library.make()
+    run library.notes.append(
+      run sampleNote(
+        1,
+        "Welcome to Notes",
+        "This is a Silk UI app.\n\nThe list on the left has your notes, pinned ones first. Search looks at titles and bodies. Edits save on their own after a second.\n\nCtrl+N makes a note, Ctrl+F searches, Ctrl+S saves now.",
+        true,
+      ),
+    )
+    run library.notes.append(
+      run sampleNote(2, "Groceries", "Milk\nEggs\nCoffee beans\nLemons", false),
+    )
+    run library.notes.append(
+      run sampleNote(
+        3,
+        "Trip ideas",
+        "Lisbon in the spring. Take the tram up to the castle, then walk down through Alfama.",
+        false,
+      ),
+    )
+    run library.notes.append(
+      run sampleNote(
+        4,
+        "Reading list",
+        "The Left Hand of Darkness\nPiranesi\nThe Dispossessed",
+        false,
+      ),
+    )
+    return move library
+  }
+
+  /// Whether there are edits the store has not confirmed.
+  pub fn dirty(self: &Self) -> bool {
+    return self.revision != self.savedRevision
+  }
+
+  /// The index of note `id` in `notes`, or none.
+  pub fn indexOf(self: &Self, id: u64) -> Option<usize> {
+    let notes = self.notes.asSlice()
+    let mut i: usize = 0
+    while i < notes.length {
+      if notes[i].id == id {
+        return Option<usize>.Some { value: i }
+      }
+      i = i + 1
+    }
+    return Option<usize>.None
+  }
+
+  /// Whether note `a` comes before note `b` in the list (both indices into `notes`).
+  fn before(self: &Self, a: usize, b: usize) -> bool {
+    let notes = self.notes.asSlice()
+    let x = &notes[a]
+    let y = &notes[b]
+    if x.pinned != y.pinned {
+      return x.pinned
+    }
+    if self.sort == 1 {
+      let order = compareIgnoringCase(
+        displayTitle(String.view(&x.title)),
+        displayTitle(String.view(&y.title)),
+      )
+      if order != 0 {
+        return order < 0
+      }
+      return x.id < y.id
+    }
+    if x.stamp != y.stamp {
+      return x.stamp > y.stamp
+    }
+    return x.id > y.id
+  }
+
+  /// The indices into `notes` of the notes the list shows, in list order: the ones matching the
+  /// search, pinned first, then by the sort order.
+  pub effect fn visible(self: &Self) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut order = List<usize>.make()
+    let notes = self.notes.asSlice()
+    let query = String.view(&self.search)
+    let mut i: usize = 0
+    while i < notes.length {
+      if matches(String.view(&notes[i].title), String.view(&notes[i].body), query) {
+        run order.append(i)
+      }
+      i = i + 1
+    }
+
+    // Insertion sort: lists of notes are short, and it is stable.
+    let slots = order.asMutSlice()
+    let mut a: usize = 1
+    while a < slots.length {
+      let current = slots[a]
+      let mut b = a
+      while b > 0 && self.before(current, slots[b - 1]) {
+        slots[b] = slots[b - 1]
+        b = b - 1
+      }
+      slots[b] = current
+      a = a + 1
+    }
+    return move order
+  }
+
+  /// A change worth saving.
+  fn touch(self: &mut Self) -> () {
+    self.revision = self.revision + 1
+    self.failed = false
+  }
+
+  /// The next edit stamp.
+  fn tick(self: &mut Self) -> u64 {
+    self.clock = self.clock + 1
+    return self.clock
+  }
+
+  fn save(self: &mut Self, cx: &mut Context<Command>) -> () {
+    if !self.dirty() || self.saving {
+      return ()
+    }
+    self.saving = true
+    let text = cx.alloc(encode(self.notes.asSlice(), self.dark))
+    cx.command(Command.Save { revision: self.revision, text: move text })
+  }
+
+  /// Adds a note and returns its id.
+  fn add(self: &mut Self, title: String, body: String, cx: &mut Context<Command>) -> u64 {
+    let id = self.nextId
+    self.nextId = id + 1
+    let stamp = self.tick()
+    cx.alloc(
+      self.notes.append(
+        Note { id: id, title: move title, body: move body, pinned: false, stamp: stamp },
+      ),
+    )
+    self.touch()
+    return id
+  }
+
+  fn deleteSelected(self: &mut Self, cx: &mut Context<Command>) -> () {
+    let index = match self.indexOf(self.selected) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return ()
+      }
+    }
+
+    // The note after it in the list takes its place, or the one before it.
+    let order = cx.alloc(self.visible())
+    let shown = order.asSlice()
+    let mut next: u64 = 0
+    let mut position: usize = 0
+    while position < shown.length {
+      if shown[position] == index {
+        if position + 1 < shown.length {
+          next = self.notes.asSlice()[shown[position + 1]].id
+        } else if position > 0 {
+          next = self.notes.asSlice()[shown[position - 1]].id
+        }
+      }
+      position = position + 1
+    }
+    drop self.notes.remove(index)
+    self.selected = next
+    self.touch()
+  }
+
+  fn chooseNoteAction(self: &mut Self, action: usize, cx: &mut Context<Command>) -> () {
+    let index = match self.indexOf(self.selected) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => {
+        return ()
+      }
+    }
+    if action == 0 {
+      let notes = self.notes.asMutSlice()
+      notes[index].pinned = !notes[index].pinned
+      self.touch()
+    } else if action == 1 {
+      let source = &self.notes.asSlice()[index]
+      let mut title = cx.copy(displayTitle(String.view(&source.title)))
+      cx.alloc(title.append(" copy"))
+      let body = cx.copy(String.view(&source.body))
+      self.selected = self.add(move title, move body, &mut cx)
+
+      // The copy's title takes focus, not the menu button.
+      self.noteMenu.returnFocus = false
+      self.focus = Focus.Title
+    } else {
+      self.confirm.show()
+    }
+  }
+}
+
+impl App<Message, Command> for Notes {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    let theme = self.theme
+    surface(&mut ui, &theme)
+    ui.row(
+      |ui| {
+        ui.grow(1.0)
+        ui.style(
+          &[
+            Property.MinHeight { value: Length.px(0.0) },
+            Property.AlignItems { value: Align.Stretch },
+          ],
+        )
+        self.sidebar(&mut ui, &theme)
+        if let Option<usize>.Some { value: index } = self.indexOf(self.selected) {
+          self.editor(&mut ui, &theme, &self.notes.asSlice()[index])
+        } else {
+          self.nothingSelected(&mut ui, &theme)
+        }
+      },
+    )
+    self.confirmDialog(&mut ui, &theme)
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<Command>) -> () {
+    // Focus moves only on the render right after the message that asks for it.
+    self.focus = Focus.Nothing
+    match move message {
+      Message.New => {
+        self.search.clear()
+        self.selected = self.add(String.make(), String.make(), &mut cx)
+        self.focus = Focus.Title
+      }
+      Message.Select { id } => {
+        self.selected = id
+      }
+      Message.Search { text } => {
+        self.search = move text
+      }
+      Message.ClearSearch => {
+        self.search.clear()
+      }
+      Message.FocusSearch => {
+        self.focus = Focus.Search
+      }
+      Message.OpenFirst => {
+        let order = cx.alloc(self.visible())
+        if order.length() != 0 {
+          self.selected = self.notes.asSlice()[order.asSlice()[0]].id
+          self.focus = Focus.Body
+        }
+      }
+      Message.Title { text } => {
+        if let Option<usize>.Some { value: index } = self.indexOf(self.selected) {
+          let stamp = self.tick()
+          let notes = self.notes.asMutSlice()
+          notes[index].title = move text
+          notes[index].stamp = stamp
+          self.touch()
+        }
+      }
+      Message.Body { text } => {
+        if let Option<usize>.Some { value: index } = self.indexOf(self.selected) {
+          let stamp = self.tick()
+          let notes = self.notes.asMutSlice()
+          notes[index].body = move text
+          notes[index].stamp = stamp
+          self.touch()
+        }
+      }
+      Message.Sort { message: menuMessage } => {
+        if let Option<usize>.Some { value } = self.sortMenu.update(menuMessage) {
+          self.sort = value
+        }
+      }
+      Message.NoteMenu { message: menuMessage } => {
+        if let Option<usize>.Some { value } = self.noteMenu.update(menuMessage) {
+          self.chooseNoteAction(value, &mut cx)
+        }
+      }
+      Message.CancelDelete => {
+        self.confirm.hide()
+        self.focus = Focus.Body
+      }
+      Message.Delete => {
+        self.confirm.hide()
+        self.deleteSelected(&mut cx)
+        self.save(&mut cx)
+      }
+      Message.Dark { value } => {
+        self.dark = value
+        self.theme = themeFor(value)
+        self.touch()
+      }
+      Message.Save => {
+        self.save(&mut cx)
+      }
+      Message.AutoSave => {
+        self.save(&mut cx)
+      }
+      Message.Saved { revision, ok } => {
+        self.saving = false
+        if ok {
+          self.savedRevision = maxOf(self.savedRevision, revision)
+        }
+        self.failed = !ok
+      }
+      Message.Tip { key, show } => {
+        if show {
+          self.tip = key
+        } else if self.tip == key {
+          self.tip = 0
+        }
+      }
+    }
+  }
+
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
+    subs.keyBinding(1, "n", MOD_CONTROL, || Message.New)
+    subs.keyBinding(2, "n", MOD_META, || Message.New)
+    subs.keyBinding(3, "f", MOD_CONTROL, || Message.FocusSearch)
+    subs.keyBinding(4, "f", MOD_META, || Message.FocusSearch)
+    subs.keyBinding(5, "s", MOD_CONTROL, || Message.Save)
+    subs.keyBinding(6, "s", MOD_META, || Message.Save)
+    if self.dirty() && !self.saving && !self.failed {
+      subs.every(AUTOSAVE, AUTOSAVE_SECONDS, |time| Message.AutoSave)
+    }
+  }
+}
+
+/// "3 notes", or "1 of 3 notes" while searching.
+effect fn countText(shown: usize, total: usize, searching: bool) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  if searching {
+    run appendNumber(&mut text, usize.toU64(shown))
+    run text.append(" of ")
+  }
+  run appendNumber(&mut text, usize.toU64(total))
+  run text.append(
+    if total == 1 {
+      " note"
+    } else {
+      " notes"
+    },
+  )
+  return move text
+}
+
+/// A borderless input: the editor's title and body.
+fn plainInput(ui: &mut Ui<Message>, theme: &Theme) -> () {
+  ui.background(clear())
+  ui.style(
+    &[
+      Property.PlaceholderColor { color: theme.mutedText },
+      Property.CaretColor { color: theme.accent },
+      Property.SelectionColor { color: theme.highlight },
+    ],
+  )
+}
+
+fn isEscapeKey(event: &Event) -> bool {
+  return String.view(&event.key) == "Escape" && event.modifiers == 0
+}
+
+/// The look of a sidebar row: 28 pixels high, rounded, a gray wash on hover.
+fn rowLook(ui: &mut Ui<Message>, theme: &Theme) -> () {
+  pad(&mut ui, 0.0, 8.0)
+  ui.gap(8.0)
+  ui.height(Length.px(28.0))
+  ui.style(
+    &[
+      Property.Display { value: Display.Flex },
+      Property.FlexDirection { value: FlexDirection.Row },
+      Property.AlignItems { value: Align.Center },
+      Property.FlexShrink { value: 0.0 },
+      Property.BorderRadius { value: corners(4.0) },
+    ],
+  )
+  ui.hover(&[Property.BackgroundColor { color: theme.hover }])
+}
+
+/// A 16 pixel icon.
+fn icon(ui: &mut Ui<Message>, commands: &[CanvasCommand], size: f32) -> () {
+  ui.canvas(
+    commands,
+    |ui| {
+      ui.width(Length.px(size))
+      ui.height(Length.px(size))
+      ui.style(&[Property.FlexShrink { value: 0.0 }])
+    },
+  )
+}
+
+fn sideText(dark: bool) -> Rgba<f32> {
+  return if dark {
+    rgba(0xFFFFFF, 0.62)
+  } else {
+    rgb(0x5F5E5B)
+  }
+}
+
+fn saveState(ui: &mut Ui<Message>, theme: &Theme, app: &Notes) -> () {
+  ui.box(
+    |ui| {
+      ui.testId("save-state")
+      ui.fontSize(theme.smallSize)
+      noWrap(&mut ui)
+      if app.failed {
+        ui.color(theme.danger)
+        ui.text("Not saved")
+      } else if app.saving {
+        ui.color(theme.mutedText)
+        ui.text("Saving...")
+      } else if app.dirty() {
+        ui.color(theme.mutedText)
+        ui.text("Edited")
+      } else {
+        ui.color(theme.mutedText)
+        ui.text("Saved")
+      }
+    },
+  )
+}
+
+impl Notes {
+  fn sidebar(self: &Self, ui: &mut Ui<Message>, theme: &Theme) -> () {
+    let order = ui.alloc(self.visible())
+    let shown = order.asSlice()
+    let notes = self.notes.asSlice()
+    let mut position = NO_SELECTION
+    let mut i: usize = 0
+    while i < shown.length {
+      if notes[shown[i]].id == self.selected {
+        position = i
+      }
+      i = i + 1
+    }
+    let searching = String.byteLength(String.trim(String.view(&self.search))) != 0
+    let dark = self.dark
+    let tip = self.tip
+    let quiet = sideText(dark)
+    ui.column(
+      |ui| {
+        ui.accessRole(Role.Navigation)
+        ui.label("Sidebar")
+        ui.width(Length.px(248.0))
+        ui.padding(6.0)
+        ui.gap(1.0)
+        ui.background(look.sidebar(dark))
+        ui.color(quiet)
+        ui.style(
+          &[Property.FlexShrink { value: 0.0 }, Property.MinHeight { value: Length.px(0.0) }],
+        )
+
+        // The workspace: an initial, the name, and whether everything is saved.
+        ui.row(
+          |ui| {
+            pad(&mut ui, 0.0, 8.0)
+            ui.gap(8.0)
+            ui.height(Length.px(40.0))
+            ui.style(
+              &[Property.AlignItems { value: Align.Center }, Property.FlexShrink { value: 0.0 }],
+            )
+            ui.row(
+              |ui| {
+                ui.width(Length.px(22.0))
+                ui.height(Length.px(22.0))
+                ui.background(look.badge(dark))
+                ui.color(theme.text)
+                ui.fontSize(12.0)
+                ui.style(
+                  &[
+                    Property.BorderRadius { value: corners(4.0) },
+                    Property.AlignItems { value: Align.Center },
+                    Property.JustifyContent { value: Align.Center },
+                    Property.FontWeight { value: 700.0 },
+                    Property.FlexShrink { value: 0.0 },
+                  ],
+                )
+                ui.text("N")
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.grow(1.0)
+                ui.color(theme.text)
+                ui.style(&[Property.FontWeight { value: 700.0 }])
+                ui.text("Notes")
+              },
+            )
+            saveState(&mut ui, &theme, &self)
+          },
+        )
+
+        // Search.
+        ui.row(
+          |ui| {
+            rowLook(&mut ui, &theme)
+            let glass = look.searchIcon(theme.mutedText)
+            icon(&mut ui, &glass, 16.0)
+            ui.input(
+              String.view(&self.search),
+              |ui| {
+                ui.testId("search")
+                ui.label("Search")
+                ui.placeholder("Search")
+                ui.background(clear())
+                ui.grow(1.0)
+                ui.color(theme.text)
+                ui.height(Length.px(28.0))
+                pad(&mut ui, 4.0, 0.0)
+                ui.style(
+                  &[
+                    Property.MinWidth { value: Length.px(0.0) },
+                    Property.LineHeight { value: LineHeight.Px { value: 20.0 } },
+                    Property.BoxSizing { value: BoxSizing.BorderBox },
+                    Property.PlaceholderColor { color: quiet },
+                    Property.CaretColor { color: theme.accent },
+                    Property.SelectionColor { color: rgba(0x2383E2, 0.25) },
+                  ],
+                )
+                if self.focus == Focus.Search {
+                  ui.takeFocus()
+                }
+                ui.onInput(|text| Message.Search { text: move text })
+                ui.onEnter(|| Message.OpenFirst)
+                ui.onKeyDown(
+                  |event| if isEscapeKey(event) && searching {
+                    Reply<Message>.EmitAndStop { message: Message.ClearSearch }
+                  } else {
+                    Reply<Message>.Pass
+                  },
+                )
+              },
+            )
+          },
+        )
+
+        // New note.
+        ui.pressable(
+          || Message.New,
+          |ui| {
+            rowLook(&mut ui, &theme)
+            focusRing(&mut ui, &theme)
+            tooltip(
+              &mut ui,
+              &theme,
+              NEW_TIP,
+              tip == NEW_TIP,
+              "Ctrl+N or Cmd+N",
+              |show| Message.Tip { key: NEW_TIP, show: show },
+            )
+            let plus = look.plusIcon(theme.mutedText)
+            icon(&mut ui, &plus, 16.0)
+            ui.text("New note")
+          },
+        )
+
+        // The pages, under a header with the sort menu.
+        ui.row(
+          |ui| {
+            ui.style(
+              &[
+                Property.AlignItems { value: Align.Center },
+                Property.FlexShrink { value: 0.0 },
+                Property.Margin { side: Side.Top, value: Length.px(14.0) },
+              ],
+            )
+            pad(&mut ui, 0.0, 8.0)
+            ui.gap(4.0)
+            ui.fontSize(theme.smallSize)
+            ui.box(
+              |ui| {
+                ui.grow(1.0)
+                ui.color(theme.mutedText)
+                ui.style(&[Property.FontWeight { value: 700.0 }])
+                ui.text("Pages")
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.testId("sort-order")
+                ui.color(theme.mutedText)
+                ui.text(
+                  if self.sort == 1 {
+                    "by title"
+                  } else {
+                    "by recent"
+                  },
+                )
+              },
+            )
+            menu(
+              &mut ui,
+              &theme,
+              SORT_MENU,
+              &self.sortMenu,
+              "Sort",
+              &SORTS,
+              |message| Message.Sort { message: message },
+            )
+          },
+        )
+        ui.column(
+          |ui| {
+            ui.grow(1.0)
+            ui.style(
+              &[
+                Property.FlexBasis { value: Length.px(0.0) },
+                Property.MinHeight { value: Length.px(0.0) },
+                Property.OverflowY { value: Overflow.Auto },
+              ],
+            )
+            if shown.length == 0 {
+              ui.box(
+                |ui| {
+                  ui.testId("no-notes")
+                  pad(&mut ui, 6.0, 8.0)
+                  ui.color(theme.mutedText)
+                  ui.text(
+                    if searching {
+                      "No notes match."
+                    } else {
+                      "No notes yet."
+                    },
+                  )
+                },
+              )
+            } else {
+              self.pageList(&mut ui, &theme, shown, position)
+            }
+          },
+        )
+
+        // The count and the theme.
+        ui.row(
+          |ui| {
+            pad(&mut ui, 8.0, 8.0)
+            ui.gap(8.0)
+            ui.style(
+              &[Property.AlignItems { value: Align.Center }, Property.FlexShrink { value: 0.0 }],
+            )
+            ui.box(
+              |ui| {
+                ui.testId("count")
+                ui.grow(1.0)
+                ui.fontSize(theme.smallSize)
+                ui.color(theme.mutedText)
+                let count = ui.alloc(countText(shown.length, notes.length, searching))
+                ui.text(String.view(&count))
+              },
+            )
+            switch(&mut ui, &theme, "Dark mode", self.dark, |value| Message.Dark { value: value })
+          },
+        )
+      },
+    )
+  }
+
+  /// The list of pages: one tab stop, Up, Down, Home and End move the selection.
+  fn pageList(
+    self: &Self,
+    ui: &mut Ui<Message>,
+    theme: &Theme,
+    shown: &[usize],
+    position: usize,
+  ) -> () {
+    let notes = self.notes.asSlice()
+    let count = shown.length
+    let dark = self.dark
+    ui.column(
+      |ui| {
+        ui.accessRole(Role.ListBox)
+        ui.label("Notes")
+        ui.tabIndex(0)
+        ui.gap(1.0)
+        ui.style(&[Property.BorderRadius { value: corners(4.0) }])
+        focusRing(&mut ui, &theme)
+        ui.onKeyDown(
+          |event| match moveSelection(event, position, count) {
+            Option<usize>.Some { value: next } => Reply<Message>.EmitAndStop {
+              message: Message.Select { id: notes[shown[next]].id },
+            }
+            Option<usize>.None => Reply<Message>.Pass
+          },
+        )
+        ui.enumerate(
+          shown,
+          |index| notes[index.*].id,
+          |ui, at, index| {
+            let note = &notes[index.*]
+            let isSelected = at == position
+            let title = displayTitle(String.view(&note.title))
+            ui.row(
+              |ui| {
+                ui.accessRole(Role.Option)
+                ui.label(title)
+                ui.selected(isSelected)
+                ui.cursor(Cursor.Pointer)
+                rowLook(&mut ui, &theme)
+                if isSelected {
+                  ui.background(look.selectedRow(dark))
+                  ui.color(theme.text)
+                  ui.reveal()
+                }
+                ui.onClick(|| Message.Select { id: note.id })
+                let page = look.pageIcon(theme.mutedText)
+                icon(&mut ui, &page, 16.0)
+                ui.box(
+                  |ui| {
+                    noWrap(&mut ui)
+                    ui.grow(1.0)
+                    ui.style(
+                      &[
+                        Property.MinWidth { value: Length.px(0.0) },
+                        Property.OverflowX { value: Overflow.Hidden },
+                      ],
+                    )
+                    ui.text(title)
+                  },
+                )
+                if note.pinned {
+                  let pin = look.pinIcon(theme.mutedText)
+                  ui.canvas(
+                    &pin,
+                    |ui| {
+                      ui.testId("pinned")
+                      ui.width(Length.px(12.0))
+                      ui.height(Length.px(12.0))
+                      ui.style(&[Property.FlexShrink { value: 0.0 }])
+                    },
+                  )
+                }
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
+  fn editor(self: &Self, ui: &mut Ui<Message>, theme: &Theme, note: &Note) -> () {
+    let pinLabel = if note.pinned {
+      "Unpin"
+    } else {
+      "Pin"
+    }
+    let actions: [string; 3] = [pinLabel, "Duplicate", "Delete..."]
+    let body = String.view(&note.body)
+    let words = wordCount(body)
+    let title = displayTitle(String.view(&note.title))
+    ui.column(
+      |ui| {
+        ui.testId("editor")
+        ui.grow(1.0)
+        ui.background(theme.background)
+        ui.style(
+          &[
+            Property.FlexBasis { value: Length.px(0.0) },
+            Property.MinWidth { value: Length.px(0.0) },
+          ],
+        )
+
+        // The page bar: where you are, and the page's menu.
+        ui.row(
+          |ui| {
+            ui.height(Length.px(44.0))
+            pad(&mut ui, 0.0, 12.0)
+            ui.gap(6.0)
+            ui.style(
+              &[Property.AlignItems { value: Align.Center }, Property.FlexShrink { value: 0.0 }],
+            )
+            let page = look.pageIcon(theme.mutedText)
+            icon(&mut ui, &page, 16.0)
+            ui.box(
+              |ui| {
+                ui.testId("crumb")
+                noWrap(&mut ui)
+                ui.grow(1.0)
+                ui.style(
+                  &[
+                    Property.MinWidth { value: Length.px(0.0) },
+                    Property.OverflowX { value: Overflow.Hidden },
+                  ],
+                )
+                ui.text(title)
+              },
+            )
+            menu(
+              &mut ui,
+              &theme,
+              NOTE_MENU,
+              &self.noteMenu,
+              "Note",
+              &actions,
+              |message| Message.NoteMenu { message: message },
+            )
+          },
+        )
+
+        // The page itself, in a centered column.
+        ui.column(
+          |ui| {
+            ui.grow(1.0)
+            ui.style(
+              &[
+                Property.FlexBasis { value: Length.px(0.0) },
+                Property.MinHeight { value: Length.px(0.0) },
+                Property.AlignItems { value: Align.Center },
+              ],
+            )
+            ui.column(
+              |ui| {
+                ui.grow(1.0)
+                ui.width(Length.percent(100.0))
+                ui.style(
+                  &[
+                    Property.MaxWidth { value: Length.px(720.0) },
+                    Property.BoxSizing { value: BoxSizing.BorderBox },
+                    Property.Padding { side: Side.Top, value: Length.px(36.0) },
+                    Property.Padding { side: Side.Bottom, value: Length.px(24.0) },
+                    Property.Padding { side: Side.Left, value: Length.px(56.0) },
+                    Property.Padding { side: Side.Right, value: Length.px(56.0) },
+                  ],
+                )
+                ui.input(
+                  String.view(&note.title),
+                  |ui| {
+                    ui.testId("title")
+                    ui.label("Title")
+                    ui.placeholder("Untitled")
+                    plainInput(&mut ui, &theme)
+                    ui.fontSize(36.0)
+                    ui.height(Length.px(48.0))
+                    ui.style(
+                      &[
+                        Property.FontWeight { value: 700.0 },
+                        Property.LineHeight { value: LineHeight.Px { value: 46.0 } },
+                        Property.FlexShrink { value: 0.0 },
+                        Property.PlaceholderColor { color: theme.strongBorder },
+                      ],
+                    )
+                    if self.focus == Focus.Title {
+                      ui.takeFocus()
+                    }
+                    ui.onInput(|text| Message.Title { text: move text })
+                  },
+                )
+                ui.box(
+                  |ui| {
+                    ui.testId("stats")
+                    ui.fontSize(theme.smallSize)
+                    ui.color(theme.mutedText)
+                    ui.style(
+                      &[
+                        Property.Margin { side: Side.Top, value: Length.px(6.0) },
+                        Property.Margin { side: Side.Bottom, value: Length.px(18.0) },
+                        Property.FlexShrink { value: 0.0 },
+                      ],
+                    )
+                    if note.pinned {
+                      ui.text("Pinned · ")
+                    }
+                    ui.number(usize.toI64(words))
+                    ui.text(
+                      if words == 1 {
+                        " word · "
+                      } else {
+                        " words · "
+                      },
+                    )
+                    ui.number(usize.toI64(characterCount(body)))
+                    ui.text(" characters")
+                  },
+                )
+                ui.input(
+                  body,
+                  |ui| {
+                    ui.testId("body")
+                    ui.label("Body")
+                    ui.placeholder("Start writing")
+                    ui.multiline(true)
+                    plainInput(&mut ui, &theme)
+                    ui.grow(1.0)
+                    ui.fontSize(16.0)
+                    ui.style(
+                      &[
+                        Property.FlexBasis { value: Length.px(0.0) },
+                        Property.MinHeight { value: Length.px(0.0) },
+                        Property.LineHeight { value: LineHeight.Px { value: 26.0 } },
+                      ],
+                    )
+                    if self.focus == Focus.Body {
+                      ui.takeFocus()
+                    }
+                    ui.onInput(|text| Message.Body { text: move text })
+                  },
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
+  fn nothingSelected(self: &Self, ui: &mut Ui<Message>, theme: &Theme) -> () {
+    ui.column(
+      |ui| {
+        ui.testId("empty")
+        ui.grow(1.0)
+        ui.gap(12.0)
+        ui.background(theme.background)
+        ui.style(
+          &[
+            Property.AlignItems { value: Align.Center },
+            Property.JustifyContent { value: Align.Center },
+          ],
+        )
+        caption(&mut ui, &theme, "No note selected")
+        primaryButton(&mut ui, &theme, "Create a note", || Message.New)
+      },
+    )
+  }
+
+  fn confirmDialog(self: &Self, ui: &mut Ui<Message>, theme: &Theme) -> () {
+    let title = match self.indexOf(self.selected) {
+      Option<usize>.Some { value: index } => displayTitle(
+        String.view(&self.notes.asSlice()[index].title),
+      )
+      Option<usize>.None => ""
+    }
+    dialog(
+      &mut ui,
+      &theme,
+      &self.confirm,
+      "Delete this note?",
+      || Message.CancelDelete,
+      |ui| {
+        ui.box(
+          |ui| {
+            ui.style(&[Property.FontWeight { value: 700.0 }])
+            ui.text(title)
+          },
+        )
+        paragraph(&mut ui, "It will be gone for good.")
+        ui.row(
+          |ui| {
+            ui.gap(8.0)
+            ui.style(&[Property.JustifyContent { value: Align.End }])
+            ui.pressable(
+              || Message.CancelDelete,
+              |ui| {
+                buttonLook(&mut ui, &theme, Tone.Secondary, false)
+                ui.takeFocus()
+                ui.text("Cancel")
+              },
+            )
+            buttonWith(&mut ui, &theme, Tone.Danger, false, "Delete", || Message.Delete)
+          },
+        )
+      },
+    )
+  }
+}
