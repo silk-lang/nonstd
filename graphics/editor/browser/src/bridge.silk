@@ -86,6 +86,12 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     instance: Instance,
     document: Document,
     scene: Scene,
+    retained: bool,
+    retainedRevision: u64,
+    boundsRevision: u64,
+    boundsChecked: bool,
+    retainedBounds: Option<Rect<f32>>,
+    retainedCamera: Camera,
     tiles: Atlas,
     stage: Failed | FindingAdapter | FindingDevice | Running,
     root: Unrooted | Root,
@@ -101,6 +107,12 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
         instance: move instance,
         document: Document.make(),
         scene: Scene.make(),
+        retained: false,
+        retainedRevision: 0,
+        boundsRevision: 0,
+        boundsChecked: false,
+        retainedBounds: Option<Rect<f32>>.None,
+        retainedCamera: Camera { x: 0.0, y: 0.0, zoom: 1.0, scale: 1.0, width: 1.0, height: 1.0 },
         tiles: Atlas.make(
           AtlasOptions { textureSize: 2048, maxTextureSize: 4096, maxTextures: 8, padding: 1 },
         ),
@@ -198,7 +210,13 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     return 0
   }
 
-  effect fn draw(state: &mut State, camera: Camera, cull: bool, background: u32) -> i32
+  effect fn draw(
+    state: &mut State,
+    camera: Camera,
+    cull: bool,
+    retained: bool,
+    background: u32,
+  ) -> i32
     ! GpuError | GeometryError | OutOfMemoryError
     ? &mut Allocator {
     if let Running active = &mut state.stage {
@@ -215,20 +233,75 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
         active.height = height
       }
       let begin = unsafe now()
-      run state.document.paint(&mut state.scene, camera, cull)
+      if retained && (!state.boundsChecked || state.boundsRevision != state.document.revision) {
+        state.retainedBounds = state.document.retainedImageBounds()
+        state.boundsRevision = state.document.revision
+        state.boundsChecked = true
+      }
+
+      // Close views benefit from CPU culling; dense overviews reuse the GPU scene.
+      // Cache eligibility separately so an unchanged close view never scans all nodes.
+      let mut useRetained = false
+      if retained {
+        if let Option<Rect<f32>>.Some { value: bounds } = state.retainedBounds {
+          let sceneArea = (bounds.xMax - bounds.xMin) * (bounds.yMax - bounds.yMin)
+          let viewArea = camera.width * camera.height / (camera.zoom * camera.zoom)
+          useRetained = !cull || viewArea >= sceneArea * 0.05
+        }
+      }
+      if !useRetained {
+        state.retained = false
+      }
+      let refresh = !state.retained || state.retainedRevision != state.document.revision
+      if useRetained && refresh {
+        if let Option<Rect<f32>>.Some { value: bounds } = state.retainedBounds {
+          state.retainedCamera = Camera {
+            x: bounds.xMin - 1.0,
+            y: bounds.yMin - 1.0,
+            zoom: 1.0,
+            scale: 1.0,
+            width: bounds.xMax - bounds.xMin + 2.0,
+            height: bounds.yMax - bounds.yMin + 2.0,
+          }
+          run state.document.paint(&mut state.scene, state.retainedCamera, false)
+          state.retainedRevision = state.document.revision
+          state.retained = true
+        }
+      }
+      if !state.retained {
+        run state.document.paint(&mut state.scene, camera, cull)
+      }
       let prepared = unsafe now()
       let texture = run active.surface.getCurrentTexture()
       let view = run texture.texture.createView(&TextureViewDescriptor.default())
-      run active.renderer.draw(
-        &active.device,
-        &active.queue,
-        &state.scene,
-        &active.atlas,
-        &view,
-        width,
-        height,
-        color.rgba(background),
-      )
+      if state.retained {
+        let scale = camera.zoom * camera.scale
+        run active.renderer.drawRetainedImages(
+          &active.device,
+          &active.queue,
+          &state.scene,
+          &active.atlas,
+          &view,
+          width,
+          height,
+          color.rgba(background),
+          scale,
+          (state.retainedCamera.x - camera.x) * scale,
+          (state.retainedCamera.y - camera.y) * scale,
+          refresh,
+        )
+      } else {
+        run active.renderer.draw(
+          &active.device,
+          &active.queue,
+          &state.scene,
+          &active.atlas,
+          &view,
+          width,
+          height,
+          color.rgba(background),
+        )
+      }
       run active.surface.present()
       let end = unsafe now()
       unsafe metric(
@@ -289,6 +362,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
     let node = Node {
       kind: kind,
+      source: Rect<f32>.new(0.0, 0.0, 1.0, 1.0),
       x: x,
       y: y,
       width: width,
@@ -365,7 +439,10 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
     let mut allocator = Allocator.systemAllocatorProvider()
     let camera = Camera { x: x, y: y, zoom: zoom, scale: scale, width: width, height: height }
-    return run Effect.catchAll(draw(&mut state, camera, cull != 0, background), failed)
+    return run Effect.catchAll(
+      draw(&mut state, camera, (cull & 1) != 0, (cull & 2) != 0, background),
+      failed,
+    )
       |> Effect.provideMut<Allocator>(&mut allocator)
   }
 
@@ -510,6 +587,23 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     let mut anchor = ()
     let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
     return if state.document.setImageKind(id, kind) {
+      1
+    } else {
+      0
+    }
+  }
+
+  export "C" fn editorImageSource(
+    token: *mut u8,
+    id: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+  ) -> u32 as "editor_image_source" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    return if state.document.setImageSource(id, Rect<f32>.new(x, y, x + width, y + height)) {
       1
     } else {
       0

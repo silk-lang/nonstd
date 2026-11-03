@@ -8,6 +8,8 @@ struct Globals {
   unused: f32,
   // Text: DirectWrite gamma correction ratios (all 0 turns it off).
   gamma: vec4f,
+  // Image-only retained scenes: uniform scale, reserved, translation x/y.
+  imageCamera: vec4f,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 

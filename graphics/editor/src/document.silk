@@ -31,6 +31,8 @@ import vector.strips { NONZERO }
 pub struct Node {
   /// Shape kind: zero for a rectangle, one for an ellipse, or a kind returned by `addTile`.
   pub kind: u32,
+  /// Normalized source rectangle within the image tile; independent of hit geometry.
+  pub source: Rect<f32>,
   /// Left edge in world units.
   pub x: f32,
   /// Top edge in world units.
@@ -86,6 +88,7 @@ impl Node {
   pub fn rect(x: f32, y: f32, width: f32, height: f32, fill: u32) -> Node {
     return Node {
       kind: 0,
+      source: Rect<f32>.new(0.0, 0.0, 1.0, 1.0),
       x: x,
       y: y,
       width: width,
@@ -170,6 +173,8 @@ impl Copy for Camera {}
 
 /// A retained shape store. Use `paint` to build a frame for `ui_renderer`.
 pub struct Document {
+  /// Changes whenever document geometry, image bindings or atlas views change.
+  pub revision: u64,
   nodes: List<Node>,
   blocks: List<Rect<f32>>,
   dirty: List<bool>,
@@ -235,6 +240,7 @@ impl Document {
   /// Creates an empty document with no allocated shape slots.
   pub fn make() -> Document {
     return Document {
+      revision: 0,
       nodes: List<Node>.make(),
       blocks: List<Rect<f32>>.make(),
       dirty: List<bool>.make(),
@@ -253,6 +259,7 @@ impl Document {
   pub effect fn addTile(self: &mut Self, tile: AtlasTile) -> u32
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.revision = self.revision + 1
     run self.tiles.append(
       ImageTile { tile: tile, view: Rect<f32>.new(0.0, 0.0, 1.0, 1.0), cropped: false, live: true },
     )
@@ -269,6 +276,7 @@ impl Document {
       return Option<AtlasTile>.None
     }
     let index = u32.toUsize(kind - 2)
+    self.revision = self.revision + 1
     let previous = self.tiles.get(index)
     self.tiles.set(
       index,
@@ -287,6 +295,7 @@ impl Document {
     }
     let index = u32.toUsize(kind - 2)
     let mut image = self.tiles.get(index)
+    self.revision = self.revision + 1
     image.view = view
     image.cropped = true
     self.tiles.set(index, image)
@@ -306,6 +315,7 @@ impl Document {
     if !image.live {
       return Option<AtlasTile>.None
     }
+    self.revision = self.revision + 1
     image.live = false
     self.tiles.set(index, image)
     return Option<AtlasTile>.Some { value: image.tile }
@@ -323,7 +333,31 @@ impl Document {
     if !node.alive || node.kind < 2 {
       return false
     }
+    if node.kind == kind {
+      return true
+    }
+    self.revision = self.revision + 1
     node.kind = kind
+    self.nodes.set(index, node)
+    return true
+  }
+
+  /// Sets an image element's normalized source crop without copying its texture.
+  /// Rejects unknown/non-image elements and nonfinite, empty or out-of-range crops.
+  pub fn setImageSource(self: &mut Self, id: u32, source: Rect<f32>) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length()
+      || !(source.xMin >= 0.0 && source.yMin >= 0.0 && source.xMax <= 1.0 && source.yMax <= 1.0
+        && source.xMax > source.xMin
+        && source.yMax > source.yMin) {
+      return false
+    }
+    let index = u32.toUsize(id - 1)
+    let mut node = self.nodes.get(index)
+    if !node.alive || node.kind < 2 {
+      return false
+    }
+    self.revision = self.revision + 1
+    node.source = source
     self.nodes.set(index, node)
     return true
   }
@@ -341,6 +375,7 @@ impl Document {
       run self.blocks.append(emptyBounds())
       run self.dirty.append(false)
     }
+    self.revision = self.revision + 1
     run self.nodes.append(node)
     if needsMixedOrder(node) {
       self.mixedCount = self.mixedCount + 1
@@ -365,6 +400,7 @@ impl Document {
     if needsMixedOrder(node) {
       self.mixedCount = self.mixedCount + 1
     }
+    self.revision = self.revision + 1
     nodes[i] = node
     drop nodes
     self.markDirty(i / BLOCK)
@@ -384,6 +420,7 @@ impl Document {
     if needsMixedOrder(nodes[i]) {
       self.mixedCount = self.mixedCount - 1
     }
+    self.revision = self.revision + 1
     nodes[i].alive = false
     drop nodes
     self.markDirty(i / BLOCK)
@@ -493,18 +530,26 @@ impl Document {
     return PaintRun { end: end, bounds: bounds }
   }
 
-  // A pinned image run must use one texture: Scene.finish also sorts images by texture,
-  // so crossing texture pages here would reorder overlapping translucent sprites.
-  fn imageRun(
-    self: &Self,
-    start: usize,
-    camera: Camera,
-    mask: Rect<f32>,
-    texture: u32,
-  ) -> PaintRun {
+  // Scene.finish sorts by texture. Disjoint texture envelopes can share a run;
+  // stop before crossing envelopes overlap so translucent painter order stays intact.
+  fn imageRun(self: &Self, start: usize, camera: Camera, mask: Rect<f32>) -> PaintRun {
     let mut bounds = emptyBounds()
     let mut end = start
-    let limit = (start / BLOCK + 1) * BLOCK
+
+    // Culling blocks stay small; image batches can span them when order permits.
+    let limit = start + 1024
+    let mut textures: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let mut envelopes: [Rect<f32>; 8] = [
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+    ]
+    let mut count: usize = 0
     let s = camera.zoom * camera.scale
     while end < self.nodes.length() && end < limit {
       let n = self.nodes.asSlice()[end]
@@ -517,10 +562,6 @@ impl Document {
         }
         let image = self.tiles.asSlice()[u32.toUsize(n.kind - 2)]
         if image.live {
-          if image.tile.texture.index != texture {
-            break
-          }
-
           // Match the cropped sprite arithmetic exactly, then clip before union.
           let x = (n.x - camera.x) * s
           let y = (n.y - camera.y) * s
@@ -532,6 +573,30 @@ impl Document {
             f32.min(y + view.yMax * n.height * s, mask.yMax),
           )
           if b.xMin < b.xMax && b.yMin < b.yMax {
+            let texture = image.tile.texture.index
+            let mut slot = count
+            let mut check: usize = 0
+            let mut overlaps = false
+            while check < count {
+              if textures[check] == texture {
+                slot = check
+              } else {
+                let prior = envelopes[check]
+                if b.xMin < prior.xMax && b.xMax > prior.xMin && b.yMin < prior.yMax
+                  && b.yMax > prior.yMin {
+                  overlaps = true
+                }
+              }
+              check = check + 1
+            }
+            if overlaps || slot == 8 {
+              break
+            }
+            if slot == count {
+              textures[slot] = texture
+              count = count + 1
+            }
+            envelopes[slot] = unionBounds(envelopes[slot], b)
             bounds = unionBounds(bounds, b)
           }
         }
@@ -539,6 +604,30 @@ impl Document {
       end = end + 1
     }
     return PaintRun { end: end, bounds: bounds }
+  }
+
+  /// Bounds of an image-only scene suitable for GPU camera transforms. Hidden
+  /// elements are ignored; filters and mixed primitives use the ordinary painter.
+  pub fn retainedImageBounds(self: &Self) -> Option<Rect<f32>> {
+    let mut bounds = emptyBounds()
+    let mut found = false
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = self.nodes.get(i)
+      if node.alive && (node.flags & 1) == 0 {
+        if node.kind < 2 || hasEffects(node) {
+          return Option<Rect<f32>>.None
+        }
+        bounds = unionBounds(bounds, node.paintBounds())
+        found = true
+      }
+      i = i + 1
+    }
+    return if found {
+      Option<Rect<f32>>.Some { value: bounds }
+    } else {
+      Option<Rect<f32>>.None
+    }
   }
 
   /// Paints visible elements in insertion order, then finishes the scene's batches.
@@ -633,7 +722,7 @@ impl Document {
           continue
         }
         if i > runEnd {
-          let group = self.imageRun(i - 1, camera, mask.bounds, image.tile.texture.index)
+          let group = self.imageRun(i - 1, camera, mask.bounds)
           runEnd = group.end
           if !isolated && group.end > i && group.bounds.xMin < group.bounds.xMax
             && group.bounds.yMin < group.bounds.yMax {
@@ -652,7 +741,7 @@ impl Document {
           ImageSprite {
             bounds: imageBounds,
             mask: mask,
-            tile: image.tile,
+            tile: sourceTile(image.tile, n.source),
             opacity: color.rgba(n.fill).a,
             cornerRadii: Corners<f32>.uniform(
               if image.cropped {
@@ -728,4 +817,31 @@ impl Document {
     }
     run scene.finish()
   }
+}
+
+// Cropping changes UV bounds only. Allocation identity stays shared, so atlas
+// replacement, texture batching and lifetime remain owned by the original image.
+fn sourceTile(tile: AtlasTile, source: Rect<f32>) -> AtlasTile {
+  let width = u32.toF32(tile.bounds.xMax - tile.bounds.xMin)
+  let height = u32.toF32(tile.bounds.yMax - tile.bounds.yMin)
+  let x = tile.bounds.xMin + f32.toU32(f32.min(width - 1.0, f32.round(source.xMin * width)))
+  let y = tile.bounds.yMin + f32.toU32(f32.min(height - 1.0, f32.round(source.yMin * height)))
+  let mut result = tile
+  let right = tile.bounds.xMin + f32.toU32(f32.round(source.xMax * width))
+  let bottom = tile.bounds.yMin + f32.toU32(f32.round(source.yMax * height))
+  result.bounds = Rect<u32>.new(
+    x,
+    y,
+    if right > x {
+      right
+    } else {
+      x + 1
+    },
+    if bottom > y {
+      bottom
+    } else {
+      y + 1
+    },
+  )
+  return result
 }

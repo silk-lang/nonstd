@@ -7,7 +7,7 @@ const defaults = Object.freeze({ type: 'rect', x: 0, y: 0, width: 100, height: 1
   innerShadow: '#00000000', innerBlur: 16, innerShadowX: 0, innerShadowY: 4,
   radius: 0, fill: '#9b87f5', border: '#00000000', borderWidth: 0,
   shadow: '#00000000', blur: 0, shadowX: 0, shadowY: 0, gradient: null,
-  hidden: false, locked: false, name: '', text: '', fontSize: 24, fontFamily: 'sans-serif', fontWeight: 400 });
+  image: null, imageCrop: null, hidden: false, locked: false, name: '', text: '', fontSize: 24, fontFamily: 'sans-serif', fontWeight: 400 });
 const properties = Object.keys(defaults);
 const numeric = ['x', 'y', 'width', 'height', 'radius', 'borderWidth', 'blur', 'shadowX', 'shadowY', 'layerBlur', 'backdropBlur', 'brightness', 'contrast', 'saturation', 'innerBlur', 'innerShadowX', 'innerShadowY'];
 const colorCache = new Map();
@@ -40,6 +40,13 @@ function normalize(value) {
   if (!blendModes.includes(n.blendMode)) throw new TypeError('Unknown blend mode');
   if (n.type !== 'rect' && rgba(n.innerShadow) % 256) throw new TypeError('Inner shadows require a rectangle');
   if (n.type === 'text' && n.backdropBlur) throw new TypeError('Backdrop blur requires a rectangle or ellipse');
+  if (n.image !== null && (typeof n.image !== 'string' || !n.image || n.type !== 'rect')) throw new TypeError('Images require a registered name and rectangle type');
+  if (n.imageCrop !== null) {
+    const { x, y, width, height } = n.imageCrop;
+    if (![x, y, width, height].every(Number.isFinite) || x < 0 || y < 0 || width <= 0 || height <= 0 || x + width > 1.0000001 || y + height > 1.0000001) throw new RangeError('Image crop must be within [0, 1]');
+    n.imageCrop = Object.freeze({ x, y, width, height });
+  }
+  if (n.image && (n.borderWidth || rgba(n.shadow) % 256 || rgba(n.innerShadow) % 256 || n.gradient)) throw new TypeError('Image layers do not support borders, shadows or gradients');
   if (n.gradient !== null) {
     rgba(n.gradient.to);
     if (!Number.isFinite(n.gradient.angle)) throw new RangeError('Invalid gradient angle');
@@ -56,8 +63,9 @@ function normalize(value) {
 // Quantized raster density avoids a texture upload on every wheel event. Raster dimensions
 // are independent per axis, so nonuniform element scaling keeps the original text geometry.
 const maxTextSide = 4094, maxTextPixels = 4 * 1024 * 1024;
+let measurementContext;
 function measureText(n) {
-  const ctx = document.createElement('canvas').getContext('2d');
+  const ctx = measurementContext ??= document.createElement('canvas').getContext('2d');
   const font = `${n.fontWeight} ${n.fontSize}px ${n.fontFamily}`;
   ctx.font = font; const m = ctx.measureText(n.text);
   const left = Math.max(0, m.actualBoundingBoxLeft || 0);
@@ -81,11 +89,14 @@ export class Editor extends EventTarget {
   #host; #token; #lastId = 0; #nodes = new Map(); #selection = new Set(); #frame = 0;
   #dead = false; #transaction = null; #undo = []; #redo = []; #replaying = false;
   #textCanvas; #uploadCanvas; #textPreparation;
+  #images = new Map();
   #textTiles = new Map(); #textNodes = new Map(); #textViews = new Map(); #textViewPool = []; #textRasterizations = 0; #textAtlasRevision = 0; #textMs = 0;
   #observer; #cleanups = []; #camera = { x: 0, y: 0, zoom: 1 }; #autoRender;
   #width = 1; #height = 1; #scale = 1;
   stats = Object.freeze({ buildMs: 0, drawMs: 0, textMs: 0, visible: 0, visited: 0, batches: 0, frames: 0 });
   culling = true;
+  /** Diagnostic switch: false forces rebuilding image-only scenes on camera moves. */
+  retainedImages = true;
   /** Initializes an independent WASM module and GPU device; rejects on unsupported WebGPU. */
   static async create({ canvas, wasm = new URL('./editor.wasm', import.meta.url),
     autoRender = true, pixelRatio = globalThis.devicePixelRatio || 1, background = '#17191e' } = {}) {
@@ -150,7 +161,7 @@ export class Editor extends EventTarget {
   addCleanup(cleanup) { this.#assert(); this.#cleanups.push(cleanup); }
   get diagnostics() { return Object.freeze({ gpuHandles: this.#host?.table.size ?? 0,
     wasmBytes: this.#host?.exports?.memory.buffer.byteLength ?? 0, textRuns: this.#textTiles.size,
-    textRasterizations: this.#textRasterizations,
+    textRasterizations: this.#textRasterizations, imageSources: this.#images.size,
     textAtlasTiles: this.#token && !this.#dead ? this.#call('editor_image_count') : 0,
     textPixels: [...this.#textTiles.values(), ...this.#textViews.values()].reduce((sum, entry) => sum + entry.width * entry.height, 0),
     limitedTextRuns: [...this.#textTiles.values(), ...this.#textViews.values()].filter(entry => entry.limited).length, destroyed: this.#dead }); }
@@ -169,14 +180,24 @@ export class Editor extends EventTarget {
   #write(id, n) {
     this.#textPreparation = null;
     const text = n.type === 'text' ? this.#textKind(n) : null;
-    const result = this.#call('editor_set', id, text ? text.kind : n.type === 'ellipse' ? 1 : 0, n.x, n.y, n.width, n.height,
+    const image = n.image ? this.#images.get(n.image) : null;
+    if (n.image && !image) throw new Error(`Image is not registered: ${n.image}`);
+    const result = this.#call('editor_set', id, text ? text.kind : image ? image.kind : n.type === 'ellipse' ? 1 : 0, n.x, n.y, n.width, n.height,
       n.radius, n.type === 'text' ? 0xffffffff : rgba(n.fill), rgba(n.border), n.borderWidth, n.blur, n.shadowX, n.shadowY,
       rgba(n.shadow), rgba(n.gradient?.to ?? n.fill), n.gradient?.angle ?? 90,
       (n.hidden ? 1 : 0) | (n.locked ? 2 : 0) | (n.gradient ? 4 : 0),
       n.opacity, n.layerBlur, n.backdropBlur, n.brightness, n.contrast, n.saturation, blendModes.indexOf(n.blendMode),
       rgba(n.innerShadow), n.innerBlur, n.innerShadowX, n.innerShadowY);
     if (!result) throw new Error('Silk could not store the element');
-    if (text) this.#textNodes.set(result, text); else this.#textNodes.delete(result);
+    if (image && n.imageCrop) {
+      const c = n.imageCrop;
+      this.#call('editor_image_source', result, c.x, c.y, c.width, c.height);
+    }
+    if (text) {
+      if (text.uniformWidth === undefined) { text.uniformWidth = n.width; text.uniformHeight = n.height; text.uniform = true; }
+      else if (text.uniformWidth !== n.width || text.uniformHeight !== n.height) text.uniform = false;
+      this.#textNodes.set(result, text);
+    } else this.#textNodes.delete(result);
     return result;
   }
   #textVisible(n) {
@@ -311,6 +332,9 @@ export class Editor extends EventTarget {
     if (!this.#textNodes.size) return;
     const requests = new Map();
     for (const [id, entry] of this.#textNodes) {
+      // Identically sized copies share one raster request. Avoid measuring and
+      // quantizing all 100k instances once a visible representative requested it.
+      if (entry.uniform && requests.has(entry)) continue;
       const n = this.#nodes.get(id); if (!n || !this.#textVisible(n)) continue;
       const size = this.#textSize(n, entry), prior = requests.get(entry);
       if (boundedTextSize(size.width, size.height).limited) {
@@ -342,6 +366,21 @@ export class Editor extends EventTarget {
     }
   }
   #trimHistory() { if (this.#undo.length > 100) this.#undo.shift(); }
+  /** Uploads an image once. Rectangle image/imageCrop properties reuse its texture.
+   * Names are immutable for the editor lifetime; register assets before loading a document.
+   * Sources must be origin-clean and at most 4094 pixels per side. */
+  registerImage(name, source) {
+    this.#assert();
+    if (typeof name !== 'string' || !name || this.#images.has(name)) throw new TypeError('Image name must be nonempty and unique');
+    const width = source.width, height = source.height;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 4094 || height > 4094) throw new RangeError('Image dimensions must be 1–4094 pixels');
+    this.#uploadCanvas = source;
+    let kind;
+    try { kind = this.#call('editor_canvas', 0, width, height); }
+    finally { this.#uploadCanvas = null; }
+    if (!kind) throw new Error('Could not upload image');
+    this.#images.set(name, { kind, width, height });
+  }
   /** Adds a rectangle or ellipse and returns a stable ID. */
   add(properties = {}) {
     this.#assert();
@@ -466,7 +505,7 @@ export class Editor extends EventTarget {
   render() {
     this.#assert(); const textStart = performance.now(); this.#prepareText(); this.#textMs = performance.now() - textStart;
     const { x, y, zoom } = this.#camera;
-    const result = this.#call('editor_draw', x, y, zoom, this.#scale, this.#width, this.#height, this.culling ? 1 : 0, rgba(this.background));
+    const result = this.#call('editor_draw', x, y, zoom, this.#scale, this.#width, this.#height, (this.culling ? 1 : 0) | (this.retainedImages ? 2 : 0), rgba(this.background));
     if (result < 0) throw new Error('Silk rendering failed (device, surface, geometry, or allocation)');
     this.emit('render', this.stats); return this.stats;
   }
@@ -482,6 +521,7 @@ export class Editor extends EventTarget {
   load(data) {
     if (data?.version !== 1 || !Array.isArray(data.elements) || data.elements.some(n => !n || typeof n !== 'object')) throw new TypeError('Unsupported document');
     const nodes = data.elements.map(normalize);
+    for (const n of nodes) if (n.image && !this.#images.has(n.image)) throw new Error(`Image is not registered: ${n.image}`);
     this.batch(() => { for (const id of [...this.#nodes.keys()]) this.remove(id); for (const n of nodes) this.add(n); });
   }
   /** Releases observers, input listeners, pending frames, WASM state and GPU handles. Idempotent. */
@@ -492,7 +532,7 @@ export class Editor extends EventTarget {
     // Cancel again: canceling an active gesture can invalidate its rolled-back frame.
     cancelAnimationFrame(this.#frame); this.#frame = 0; this.#transaction = null;
     if (this.#token) this.#host.call('editor_drop', this.#token);
-    this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear();
+    this.#token = 0; this.#dead = true; this.#nodes.clear(); this.#selection.clear(); this.#images.clear();
     this.#undo.length = this.#redo.length = 0; this.#textTiles.clear(); this.#textNodes.clear(); this.#textViews.clear(); this.#textViewPool.length = 0;
     if (this.#textCanvas) this.#textCanvas.width = this.#textCanvas.height = 0;
     this.#textCanvas = this.#uploadCanvas = this.#textPreparation = null;

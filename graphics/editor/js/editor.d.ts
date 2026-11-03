@@ -4,6 +4,10 @@ export type ElementId = number;
 export type HexColor = `#${string}`;
 export type ElementType = 'rect' | 'ellipse' | 'text';
 export interface ElementProperties {
+  /** Registered image name for a rectangle. Assets must be registered before load(). */
+  image?: string | null;
+  /** Normalized source crop; geometry and hit bounds remain unchanged. */
+  imageCrop?: Readonly<{ x: number; y: number; width: number; height: number }> | null;
   type?: ElementType; name?: string; x?: number; y?: number; width?: number; height?: number;
   fill?: HexColor; radius?: number; border?: HexColor; borderWidth?: number;
   shadow?: HexColor; blur?: number; shadowX?: number; shadowY?: number;
@@ -28,6 +32,7 @@ export interface RenderStats { buildMs: number; drawMs: number; textMs: number; 
 export interface EditorDiagnostics {
   gpuHandles: number; wasmBytes: number; destroyed: boolean;
   textRuns: number;
+  imageSources: number;
   /** Successful uploads of whole-run and visible-window rasters. */
   textRasterizations: number;
   /** Live native atlas allocations; replacing a raster releases its old allocation. */
@@ -63,6 +68,8 @@ export class Editor extends EventTarget {
   readonly canvas: HTMLCanvasElement;
   background: HexColor;
   culling: boolean;
+  /** Cache image-only scene buffers; disable for rendering comparisons. Default true. */
+  retainedImages: boolean;
   readonly stats: Readonly<RenderStats>;
   readonly diagnostics: Readonly<EditorDiagnostics>;
   readonly size: number;
@@ -75,6 +82,7 @@ export class Editor extends EventTarget {
   addCleanup(cleanup: () => void): void;
   get(id: ElementId): ElementSnapshot | undefined;
   elements(): IterableIterator<ElementSnapshot>;
+  registerImage(name: string, source: ImageBitmap | HTMLCanvasElement | OffscreenCanvas): void;
   add(properties?: ElementProperties): ElementId;
   rect(properties?: ElementProperties): ElementId;
   ellipse(properties?: ElementProperties): ElementId;

@@ -82,6 +82,39 @@ rejects if WebGPU is unavailable, initialization fails, or it takes over 30 seco
 Destruction is idempotent. Device/rendering errors are surfaced; automatic device recovery
 is not implemented.
 
+## Image layers
+
+Register an origin-clean `ImageBitmap`, canvas, or `OffscreenCanvas` once, then reuse it
+through independent editable rectangles:
+
+```js
+const bitmap = await createImageBitmap(await (await fetch('./photo.png')).blob());
+editor.registerImage('photo', bitmap);
+bitmap.close();
+editor.rect({
+  image: 'photo', imageCrop: { x: 0.25, y: 0, width: 0.5, height: 1 },
+  x: 20, y: 20, width: 300, height: 200, radius: 12, fill: '#ffffff',
+});
+```
+
+Crops use normalized source coordinates, rounded to source pixel boundaries. They stretch
+to the element bounds and share the original atlas allocation. `fill` alpha multiplies the
+image alpha; its RGB does not tint the image. Rounded corners, opacity and layer filters
+work on images. Image borders, gradients and drop/inner shadows are rejected.
+
+Names are immutable for an editor's lifetime. Sources must be 1–4094 pixels per side and
+fit the shared atlas. JSON stores names and crops, not image bytes: register matching assets
+before `load()`. Missing assets are rejected before the current document is replaced.
+`destroy()` releases all images. This is a reusable image API, not an unlimited texture cache.
+
+Dense image/text-only scenes retain their GPU geometry across camera moves; close views
+use CPU culling again. Changes to geometry, source crops, raster density or atlas bindings
+invalidate the cached scene. Mixed primitives and filters use the ordinary compositor.
+`retainedImages = false` forces the ordinary path for comparisons. `stats.visible` on a
+retained frame counts submitted sprites, including GPU-clipped sprites. The historical
+`diagnostics.textAtlasTiles` counter includes registered image allocations as well as text;
+`imageSources` counts registered source images separately.
+
 ## API
 
 The complete declarations are in [`js/editor.d.ts`](js/editor.d.ts). Useful operations:
