@@ -1,0 +1,80 @@
+export type ElementId = number;
+export type HexColor = `#${string}`;
+export type ElementType = 'rect' | 'ellipse' | 'text';
+export interface ElementProperties {
+  type?: ElementType; name?: string; x?: number; y?: number; width?: number; height?: number;
+  fill?: HexColor; radius?: number; border?: HexColor; borderWidth?: number;
+  shadow?: HexColor; blur?: number; shadowX?: number; shadowY?: number;
+  gradient?: Readonly<{ to: HexColor; angle: number }> | null;
+  hidden?: boolean; locked?: boolean;
+  text?: string; fontSize?: number; fontFamily?: string; fontWeight?: 100|200|300|400|500|600|700|800|900;
+}
+export type ElementSnapshot = Readonly<Required<ElementProperties> & { id: ElementId }>;
+export interface Camera { x: number; y: number; zoom: number }
+export interface Viewport extends Camera { width: number; height: number; pixelRatio: number }
+export interface RenderStats { buildMs: number; drawMs: number; visible: number; visited: number; batches: number; frames: number }
+export interface EditorDocument { version: 1; elements: ElementProperties[]; viewport?: Camera }
+export interface EditorOptions {
+  canvas: HTMLCanvasElement; wasm?: string | URL | WebAssembly.Module;
+  autoRender?: boolean; pixelRatio?: number; background?: HexColor;
+}
+export interface EditorEvents {
+  change: { ids: ElementId[]; source: 'api'|'transaction'|'undo'|'redo'|'cancel' };
+  selectionchange: { ids: ElementId[] };
+  viewportchange: Viewport;
+  render: Readonly<RenderStats>;
+  error: { error: Error };
+  destroy: Record<string, never>;
+  pointerdown: { point: { x: number; y: number }; originalEvent: PointerEvent };
+  pointermove: { point: { x: number; y: number }; originalEvent: PointerEvent };
+  transformstart: { ids: ElementId[]; mode: 'drag'|'resize' };
+  transform: { ids: ElementId[]; mode: 'drag'|'resize'; dx: number; dy: number };
+  transformend: { ids: ElementId[]; mode: 'drag'|'resize'; canceled: boolean };
+}
+export function rgba(value: HexColor): number;
+/** Retained Silk document and WebGPU canvas. Use create(), then destroy() at unmount. */
+export class Editor extends EventTarget {
+  private constructor();
+  static create(options: EditorOptions): Promise<Editor>;
+  readonly canvas: HTMLCanvasElement;
+  background: HexColor;
+  culling: boolean;
+  readonly stats: Readonly<RenderStats>;
+  readonly diagnostics: Readonly<{ gpuHandles: number; wasmBytes: number; textRuns: number; destroyed: boolean }>;
+  readonly size: number;
+  readonly viewport: Viewport;
+  readonly selection: ElementId[];
+  readonly canUndo: boolean;
+  readonly canRedo: boolean;
+  on<K extends keyof EditorEvents>(type: K, listener: (event: CustomEvent<EditorEvents[K]>) => void): () => void;
+  emit<K extends keyof EditorEvents>(type: K, detail: EditorEvents[K]): boolean;
+  addCleanup(cleanup: () => void): void;
+  get(id: ElementId): ElementSnapshot | undefined;
+  elements(): IterableIterator<ElementSnapshot>;
+  add(properties?: ElementProperties): ElementId;
+  rect(properties?: ElementProperties): ElementId;
+  ellipse(properties?: ElementProperties): ElementId;
+  text(content: string, properties?: ElementProperties): ElementId;
+  update(id: ElementId, patch: ElementProperties): void;
+  remove(id: ElementId): boolean;
+  beginTransaction(): void;
+  commitTransaction(): void;
+  cancelTransaction(): void;
+  batch<T>(fn: (editor: Editor) => T): T;
+  undo(): boolean;
+  redo(): boolean;
+  clearHistory(): void;
+  select(ids: ElementId[]): void;
+  hitTest(x: number, y: number): ElementId | null;
+  screenToWorld(x: number, y: number): { x: number; y: number };
+  worldToScreen(x: number, y: number): { x: number; y: number };
+  setViewport(patch: Partial<Camera>): void;
+  zoomAt(zoom: number, x: number, y: number): void;
+  resize(width: number, height: number, pixelRatio?: number): void;
+  invalidate(): void;
+  render(): Readonly<RenderStats>;
+  flush(): Promise<void>;
+  toJSON(): EditorDocument;
+  load(document: EditorDocument): void;
+  destroy(): void;
+}

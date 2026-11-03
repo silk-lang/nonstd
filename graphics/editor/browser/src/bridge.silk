@@ -1,0 +1,371 @@
+//! Browser ABI. Each token owns a document, a surface, and its GPU resources.
+//!
+//! The JavaScript wrapper serializes calls and releases each token once. Raw callers must
+//! never reuse a released token or call into the module while another call holds a loan.
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import atlas.atlas { Atlas, AtlasOptions, AtlasError, Kind }
+  import silk.num.u32
+  import editor.document { Document, Node, Camera }
+  import ui_scene.scene { Scene }
+  import ui_scene.color
+  import ui_renderer.renderer { UiRenderer }
+  import ui_renderer.atlas_textures { GpuAtlas }
+  import webgpu.runtime {
+    Adapter,
+    AdapterRequest,
+    Device,
+    DeviceRequest,
+    Instance,
+    RequestAdapterOptions,
+    GpuError
+  }
+  import webgpu.resources { Queue, getQueue }
+  import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
+  import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
+  import webgpu_sys.generated_webgpu as flags
+  import vector.geometry_error { GeometryError }
+  import silk.core.effect { Effect }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.mem.box { Box }
+  import silk.mem.pointer { Pointer }
+  import silk.num.f32
+  import silk.num.usize
+
+  unsafe extern "C" fn now() -> f64 as "editor#now"
+
+  unsafe extern "C" fn metric(
+    build: f64,
+    draw: f64,
+    visible: u32,
+    visited: u32,
+    batches: u32,
+  ) -> () as "editor#metric"
+
+  struct Failed {}
+
+  struct FindingAdapter {
+    request: AdapterRequest<'static>
+  }
+
+  struct FindingDevice {
+    adapter: Adapter,
+    request: DeviceRequest
+  }
+
+  struct Running {
+    device: Device,
+    queue: Queue,
+    surface: Surface<'static>,
+    renderer: UiRenderer,
+    atlas: GpuAtlas,
+    format: u32,
+    width: u32,
+    height: u32,
+  }
+
+  struct Unrooted {}
+
+  struct Root {
+    storage: Box<State>
+  }
+
+  struct State {
+    instance: Instance,
+    document: Document,
+    scene: Scene,
+    tiles: Atlas,
+    stage: Failed | FindingAdapter | FindingDevice | Running,
+    root: Unrooted | Root,
+  }
+
+  effect fn start() -> ?*mut u8
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let instance = run Instance.create()
+    let request = run instance.requestAdapterStart(&RequestAdapterOptions.default())
+    let mut storage = run Box<State>.make(
+      State {
+        instance: move instance,
+        document: Document.make(),
+        scene: Scene.make(),
+        tiles: Atlas.make(
+          AtlasOptions { textureSize: 2048, maxTextureSize: 4096, maxTextures: 8, padding: 1 },
+        ),
+        stage: FindingAdapter { request: move request },
+        root: Unrooted {},
+      },
+    )
+    let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+    let mut anchor = ()
+    let fresh = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    fresh.root = Root { storage: move storage }
+    return unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pinned)
+  }
+
+  effect fn failedStart<E>(error: E) -> ?*mut u8 {
+    drop error
+    return Pointer.null<u8>()
+  }
+
+  effect fn failed<E>(error: E) -> i32 {
+    drop error
+    return -1
+  }
+
+  effect fn failedId<E>(error: E) -> u32 {
+    drop error
+    return 0
+  }
+
+  fn pointer(token: *mut u8) -> *mut State {
+    return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(token)
+  }
+
+  effect fn poll(state: &mut State) -> i32
+    ! GpuError | OutOfMemoryError {
+    let previous = Intrinsic.replace(state.stage, Failed {})
+    match move previous {
+      FindingAdapter { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let adapter = run pending.finish()
+          let next = run adapter.requestDeviceStart(&DeviceDescriptor.default())
+          state.stage = FindingDevice { adapter: move adapter, request: move next }
+        } else {
+          state.stage = FindingAdapter { request: move pending }
+        }
+      }
+      FindingDevice { adapter, request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let device = run pending.finish()
+          let target = SurfaceTarget.canvasId(b"silk-editor")
+          let surface = run Surface.create(&state.instance, &target, b"editor")
+          let capabilities = run surface.getCapabilities(&adapter)
+          let formats = capabilities.formats()
+          let mut format: u32 = 0
+          let mut i: usize = 0
+          while i < formats.length {
+            if formats[i] == flags.WGPUTextureFormat_BGRA8Unorm
+              || formats[i] == flags.WGPUTextureFormat_RGBA8Unorm {
+              format = formats[i]
+              break
+            }
+            i = i + 1
+          }
+          if format == 0 {
+            fail GpuError.status(0xffffffff)
+          }
+          let queue = run getQueue(&device)
+          let renderer = run UiRenderer.make(&device, format)
+          state.stage = Running {
+            device: move device,
+            queue: move queue,
+            surface: move surface,
+            renderer: move renderer,
+            atlas: GpuAtlas.make(),
+            format: format,
+            width: 0,
+            height: 0,
+          }
+          return 1
+        } else {
+          state.stage = FindingDevice { adapter: move adapter, request: move pending }
+        }
+      }
+      Running running => {
+        run running.device.checkErrors()
+        state.stage = move running
+        return 1
+      }
+      Failed empty => {
+        return -1
+      }
+    }
+    return 0
+  }
+
+  effect fn draw(state: &mut State, camera: Camera, cull: bool, background: u32) -> i32
+    ! GpuError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    if let Running active = &mut state.stage {
+      run active.device.checkErrors()
+      let width = f32.toU32(camera.width * camera.scale)
+      let height = f32.toU32(camera.height * camera.scale)
+      if width == 0 || height == 0 {
+        return 0
+      }
+      if width != active.width || height != active.height {
+        let configuration = SurfaceConfiguration.make(&active.device, active.format, width, height)
+        active.surface.configure(&configuration)
+        active.width = width
+        active.height = height
+      }
+      let begin = unsafe now()
+      run state.document.paint(&mut state.scene, camera, cull)
+      let prepared = unsafe now()
+      let texture = run active.surface.getCurrentTexture()
+      let view = run texture.texture.createView(&TextureViewDescriptor.default())
+      run active.renderer.draw(
+        &active.device,
+        &active.queue,
+        &state.scene,
+        &active.atlas,
+        &view,
+        width,
+        height,
+        color.rgba(background),
+      )
+      run active.surface.present()
+      let end = unsafe now()
+      unsafe metric(
+        prepared - begin,
+        end - prepared,
+        state.document.visible,
+        state.document.visited,
+        usize.toU32(state.scene.batches(0).length),
+      )
+      return 1
+    }
+    return -1
+  }
+
+  export "C" fn editorStart() -> ?*mut u8 as "editor_start" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(start(), failedStart) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  export "C" fn editorPoll(token: *mut u8) -> i32 as "editor_poll" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    return run Effect.catchAll(poll(&mut state), failed)
+  }
+
+  export "C" fn editorSet(
+    token: *mut u8,
+    id: u32,
+    kind: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    fill: u32,
+    border: u32,
+    borderWidth: f32,
+    blur: f32,
+    shadowX: f32,
+    shadowY: f32,
+    shadow: u32,
+    fill2: u32,
+    angle: f32,
+    flags_: u32,
+  ) -> u32 as "editor_set" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    let node = Node {
+      kind: kind,
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      radius: radius,
+      fill: fill,
+      border: border,
+      borderWidth: borderWidth,
+      blur: blur,
+      shadowX: shadowX,
+      shadowY: shadowY,
+      shadow: shadow,
+      fill2: fill2,
+      angle: angle,
+      flags: flags_,
+      alive: true,
+    }
+    if id == 0 {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      return run Effect.catchAll(state.document.add(node), failedId)
+        |> Effect.provideMut<Allocator>(&mut allocator)
+    }
+    return if state.document.set(id, node) {
+      id
+    } else {
+      0
+    }
+  }
+
+  export "C" fn editorRemove(token: *mut u8, id: u32) -> u32 as "editor_remove" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    return if state.document.remove(id) {
+      1
+    } else {
+      0
+    }
+  }
+
+  export "C" fn editorHit(token: *mut u8, x: f32, y: f32) -> u32 as "editor_hit" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    return state.document.hit(x, y)
+  }
+
+  export "C" fn editorDraw(
+    token: *mut u8,
+    x: f32,
+    y: f32,
+    zoom: f32,
+    scale: f32,
+    width: f32,
+    height: f32,
+    cull: u32,
+    background: u32,
+  ) -> i32 as "editor_draw" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let camera = Camera { x: x, y: y, zoom: zoom, scale: scale, width: width, height: height }
+    return run Effect.catchAll(draw(&mut state, camera, cull != 0, background), failed)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  export "C" fn editorDrop(token: *mut u8) -> () as "editor_drop" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    let root = Intrinsic.replace(state.root, Unrooted {})
+    match move root {
+      Root { storage } => {
+        drop storage
+      }
+      Unrooted empty => ()
+    }
+  }
+
+  // The host owns bytes for this synchronous call; no borrowed pixels escape it.
+  effect fn upload(state: &mut State, width: u32, height: u32, pixels: &[u8]) -> u32
+    ! GpuError | OutOfMemoryError | AtlasError
+    ? &mut Allocator {
+    if let Running active = &mut state.stage {
+      let tile = run state.tiles.allocate(Kind.Polychrome, width, height)
+      run active.atlas.sync(&active.device, &state.tiles)
+      active.atlas.write(&active.queue, tile, pixels)
+      return run state.document.addTile(tile)
+    }
+    return 0
+  }
+
+  export "C" fn editorImage(
+    token: *mut u8,
+    width: u32,
+    height: u32,
+    bytes: [*]const u8,
+  ) -> u32 as "editor_image" {
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pointer(token))
+    let mut pixelsAnchor = ()
+    let pixels = unsafe Pointer.borrowMany(&pixelsAnchor, bytes, u32.toUsize(width * height * 4))
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(upload(&mut state, width, height, pixels), failedId)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+}

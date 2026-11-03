@@ -23,6 +23,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`graphics/atlas`](graphics/atlas) | `graphics-atlas` | A texture atlas allocator for glyphs, icons and images, with eviction by last use |
 | [`graphics/ui_scene`](graphics/ui_scene) | `graphics-ui-scene` | UI frame primitives (quads, shadows, sprites, paths) ordered and batched for a GPU, with a CPU reference renderer |
 | [`graphics/sprites`](graphics/sprites) | `graphics-sprites` | SVG icons and decoded images as atlas tiles for the UI renderer |
+| [`graphics/editor`](graphics/editor) | `graphics-editor` | Retained WASM editor primitives, a JavaScript API, interactive WebGPU studio, and DOM benchmarks |
 | [`graphics/demo`](graphics/demo) | `graphics-demo` | The UI drawing layer's integration demo, natively in a window and in the browser |
 | [`gpu/webgpu`](gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and `navigator.gpu` in browsers |
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |

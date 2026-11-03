@@ -1,0 +1,419 @@
+//! Retained shapes and image tiles with stable IDs, geometric hit tests, and viewport painting.
+//!
+//! Coordinates use world units with positive y down. IDs start at one and are never reused.
+//! Insertion order is paint order. Removal leaves an empty slot, so other IDs remain valid.
+//! Native callers supply finite coordinates, positive sizes, and nonnegative radii, blur, and border widths.
+import atlas.atlas { AtlasTile }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import ui_scene.color
+import ui_scene.scene { Scene }
+import ui_scene.primitives { Background, ContentMask, Quad, Shadow, ImageSprite }
+import ui_scene.path_cache { PathCache }
+import vector.path { Path }
+import vector.geometry { Affine }
+import vector.geometry_error { GeometryError }
+import vector.strips { NONZERO }
+
+/// A rectangle, ellipse, or registered image tile in world coordinates. Colors use `0xRRGGBBAA`.
+pub struct Node {
+  /// Shape kind: zero for a rectangle, one for an ellipse, or a kind returned by `addTile`.
+  pub kind: u32,
+  /// Left edge in world units.
+  pub x: f32,
+  /// Top edge in world units.
+  pub y: f32,
+  /// Width in world units; must be positive.
+  pub width: f32,
+  /// Height in world units; must be positive.
+  pub height: f32,
+  /// Rectangle corner radius in world units.
+  pub radius: f32,
+  /// Fill color in straight-alpha sRGB.
+  pub fill: u32,
+  /// Border color in straight-alpha sRGB.
+  pub border: u32,
+  /// Rectangle border width in world units.
+  pub borderWidth: f32,
+  /// Rectangle shadow blur diameter in world units.
+  pub blur: f32,
+  /// Horizontal shadow offset in world units.
+  pub shadowX: f32,
+  /// Vertical shadow offset in world units.
+  pub shadowY: f32,
+  /// Rectangle shadow color in straight-alpha sRGB.
+  pub shadow: u32,
+  /// Second gradient stop; used when flag bit two is set.
+  pub fill2: u32,
+  /// Gradient angle in clockwise degrees from up.
+  pub angle: f32,
+  /// Bit zero hides the shape; bit one disables hit tests; bit two enables a gradient.
+  pub flags: u32,
+  /// Whether the slot contains an element. Removed slots have `false`.
+  pub alive: bool,
+}
+
+impl Copy for Node {}
+
+impl Node {
+  /// Creates a filled rectangle with no border or shadow.
+  pub fn rect(x: f32, y: f32, width: f32, height: f32, fill: u32) -> Node {
+    return Node {
+      kind: 0,
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      radius: 0.0,
+      fill: fill,
+      border: 0,
+      borderWidth: 0.0,
+      blur: 0.0,
+      shadowX: 0.0,
+      shadowY: 0.0,
+      shadow: 0,
+      fill2: fill,
+      angle: 90.0,
+      flags: 0,
+      alive: true,
+    }
+  }
+
+  /// Returns bounds that include the rectangle's shadow.
+  pub fn paintBounds(self: &Self) -> Rect<f32> {
+    let reach: f32 = if self.kind == 0 && (self.shadow & 255) != 0 {
+      self.blur * 1.5
+    } else {
+      0.0
+    }
+    return Rect<f32>.new(
+      self.x + f32.min(0.0, self.shadowX - reach),
+      self.y + f32.min(0.0, self.shadowY - reach),
+      self.x + self.width + f32.max(0.0, self.shadowX + reach),
+      self.y + self.height + f32.max(0.0, self.shadowY + reach),
+    )
+  }
+
+  /// Tests the filled geometry, including rounded corners. Shadows do not receive hits.
+  pub fn contains(self: &Self, x: f32, y: f32) -> bool {
+    if !self.alive || (self.flags & 3) != 0 || self.width <= 0.0 || self.height <= 0.0 {
+      return false
+    }
+    let dx = x - self.x
+    let dy = y - self.y
+    if dx < 0.0 || dy < 0.0 || dx > self.width || dy > self.height {
+      return false
+    }
+    if self.kind == 1 {
+      let a = dx * 2.0 / self.width - 1.0
+      let b = dy * 2.0 / self.height - 1.0
+      return a * a + b * b <= 1.0
+    }
+    let r = f32.min(self.radius, f32.min(self.width, self.height) * 0.5)
+    let cx = f32.max(f32.max(r - dx, dx - (self.width - r)), 0.0)
+    let cy = f32.max(f32.max(r - dy, dy - (self.height - r)), 0.0)
+    return cx * cx + cy * cy <= r * r
+  }
+}
+
+/// A camera in CSS pixels. Device scale is separate from zoom.
+pub struct Camera {
+  /// World x coordinate at the viewport's left edge.
+  pub x: f32,
+  /// World y coordinate at the viewport's top edge.
+  pub y: f32,
+  /// CSS pixels per world unit; must be positive.
+  pub zoom: f32,
+  /// Physical pixels per CSS pixel; must be positive.
+  pub scale: f32,
+  /// Viewport width in CSS pixels.
+  pub width: f32,
+  /// Viewport height in CSS pixels.
+  pub height: f32,
+}
+
+impl Copy for Camera {}
+
+/// A retained shape store. Use `paint` to build a frame for `ui_renderer`.
+pub struct Document {
+  nodes: List<Node>,
+  blocks: List<Rect<f32>>,
+  dirty: List<bool>,
+  dirtyCount: usize,
+  paths: PathCache,
+  circle: Path,
+  tiles: List<AtlasTile>,
+  /// Number of elements submitted by the most recent paint. Includes offscreen elements when culling is disabled.
+  pub visible: u32,
+  /// Number of element bounds tested in the most recent painted frame.
+  pub visited: u32,
+}
+
+const BLOCK: usize = 64
+
+fn emptyBounds() -> Rect<f32> {
+  return Rect<f32>.new(1.0e30, 1.0e30, -1.0e30, -1.0e30)
+}
+
+fn unionBounds(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+fn overlaps(a: Rect<f32>, b: Rect<f32>) -> bool {
+  return a.xMin < b.xMax && a.xMax > b.xMin && a.yMin < b.yMax && a.yMax > b.yMin
+}
+
+impl Document {
+  /// Creates an empty document with no allocated shape slots.
+  pub fn make() -> Document {
+    return Document {
+      nodes: List<Node>.make(),
+      blocks: List<Rect<f32>>.make(),
+      dirty: List<bool>.make(),
+      dirtyCount: 0,
+      paths: PathCache.make(),
+      circle: Path.make(),
+      tiles: List<AtlasTile>.make(),
+      visible: 0,
+      visited: 0,
+    }
+  }
+
+  /// Registers an immutable image tile and returns its shape kind (two or greater).
+  /// The caller keeps the tile allocated and uploads its pixels to the renderer atlas.
+  pub effect fn addTile(self: &mut Self, tile: AtlasTile) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.tiles.append(tile)
+    return usize.toU32(self.tiles.length()) + 1
+  }
+
+  /// Appends an element and returns its nonzero ID. IDs are not reused after removal.
+  pub effect fn add(self: &mut Self, node: Node) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Reserve both lists before mutation, so allocation failure cannot break the block map.
+    run self.nodes.reserve(1)
+    let index = self.nodes.length() / BLOCK
+    if self.nodes.length() % BLOCK == 0 {
+      run self.blocks.reserve(1)
+      run self.dirty.reserve(1)
+      run self.blocks.append(emptyBounds())
+      run self.dirty.append(false)
+    }
+    run self.nodes.append(node)
+    if node.alive && (node.flags & 1) == 0 {
+      let blocks = self.blocks.asMutSlice()
+      blocks[index] = unionBounds(blocks[index], node.paintBounds())
+    }
+    return usize.toU32(self.nodes.length())
+  }
+
+  /// Replaces an allocated slot, including a removed slot for undo. Returns false for unknown IDs.
+  pub fn set(self: &mut Self, id: u32, node: Node) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length() {
+      return false
+    }
+    let i = u32.toUsize(id - 1)
+    let nodes = self.nodes.asMutSlice()
+    nodes[i] = node
+    drop nodes
+    self.markDirty(i / BLOCK)
+    return true
+  }
+
+  /// Removes a live element. Returns false for an invalid or removed ID.
+  pub fn remove(self: &mut Self, id: u32) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length() {
+      return false
+    }
+    let i = u32.toUsize(id - 1)
+    if !self.nodes.asSlice()[i].alive {
+      return false
+    }
+    let nodes = self.nodes.asMutSlice()
+    nodes[i].alive = false
+    drop nodes
+    self.markDirty(i / BLOCK)
+    return true
+  }
+
+  fn markDirty(self: &mut Self, index: usize) -> () {
+    let dirty = self.dirty.asMutSlice()
+    if !dirty[index] {
+      dirty[index] = true
+      self.dirtyCount = self.dirtyCount + 1
+    }
+  }
+
+  fn refreshBounds(self: &mut Self) -> () {
+    if self.dirtyCount == 0 {
+      return
+    }
+    let mut i: usize = 0
+    while i < self.dirty.length() {
+      if self.dirty.asSlice()[i] {
+        self.rebuildBlock(i)
+      }
+      i = i + 1
+    }
+    self.dirtyCount = 0
+  }
+
+  fn rebuildBlock(self: &mut Self, index: usize) -> () {
+    let mut bounds = emptyBounds()
+    let mut i = index * BLOCK
+    let end = if i + BLOCK < self.nodes.length() {
+      i + BLOCK
+    } else {
+      self.nodes.length()
+    }
+    while i < end {
+      let n = self.nodes.asSlice()[i]
+      if n.alive && (n.flags & 1) == 0 {
+        bounds = unionBounds(bounds, n.paintBounds())
+      }
+      i = i + 1
+    }
+    let blocks = self.blocks.asMutSlice()
+    blocks[index] = bounds
+    let dirty = self.dirty.asMutSlice()
+    dirty[index] = false
+  }
+
+  /// Returns the topmost unlocked visible element at a world point, or zero.
+  pub fn hit(self: &mut Self, x: f32, y: f32) -> u32 {
+    self.refreshBounds()
+    let mut block = self.blocks.length()
+    while block > 0 {
+      block = block - 1
+      let b = self.blocks.asSlice()[block]
+      if x < b.xMin || y < b.yMin || x > b.xMax || y > b.yMax {
+        continue
+      }
+      let start = block * BLOCK
+      let mut i = if start + BLOCK < self.nodes.length() {
+        start + BLOCK
+      } else {
+        self.nodes.length()
+      }
+      while i > start {
+        i = i - 1
+        if self.nodes.asSlice()[i].contains(x, y) {
+          return usize.toU32(i + 1)
+        }
+      }
+    }
+    return 0
+  }
+
+  /// Paints visible elements in insertion order, then finishes the scene's batches.
+  ///
+  /// Camera values must be finite, with positive zoom and scale. `cull` disables offscreen
+  /// submission when true. False is a diagnostic baseline and still clips to the viewport.
+  pub effect fn paint(self: &mut Self, scene: &mut Scene, camera: Camera, cull: bool) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    self.refreshBounds()
+    scene.clear()
+    self.visible = 0
+    self.visited = 0
+    run self.paths.beginFrame()
+    if self.circle.isEmpty() {
+      run self.circle.circle(0.5, 0.5, 0.5)
+    }
+    let s = camera.zoom * camera.scale
+    let mask = ContentMask.new(
+      Rect<f32>.new(0.0, 0.0, camera.width * camera.scale, camera.height * camera.scale),
+    )
+    let viewport = Rect<f32>.new(
+      camera.x,
+      camera.y,
+      camera.x + camera.width / camera.zoom,
+      camera.y + camera.height / camera.zoom,
+    )
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      if cull && i % BLOCK == 0 && !overlaps(self.blocks.asSlice()[i / BLOCK], viewport) {
+        i = i + BLOCK
+        continue
+      }
+      let n = self.nodes.asSlice()[i]
+      i = i + 1
+      self.visited = self.visited + 1
+      if !n.alive || (n.flags & 1) != 0 {
+        continue
+      }
+      if cull && !overlaps(n.paintBounds(), viewport) {
+        continue
+      }
+      self.visible = self.visible + 1
+      let x = (n.x - camera.x) * s
+      let y = (n.y - camera.y) * s
+      let bounds = Rect<f32>.new(x, y, x + n.width * s, y + n.height * s)
+      let fill = if (n.flags & 4) != 0 {
+        Background.linear(n.angle, color.rgba(n.fill), color.rgba(n.fill2))
+      } else {
+        Background.solid(color.rgba(n.fill))
+      }
+      if n.kind >= 2 && u32.toUsize(n.kind - 2) < self.tiles.length() {
+        drop run scene.image(
+          ImageSprite {
+            bounds: bounds,
+            mask: mask,
+            tile: self.tiles.asSlice()[u32.toUsize(n.kind - 2)],
+            opacity: color.rgba(n.fill).a,
+            cornerRadii: Corners<f32>.uniform(n.radius * s),
+            grayscale: false,
+          },
+        )
+      } else if n.kind == 1 {
+        let transform = Affine.new(
+          f32.toF64(n.width * s),
+          0.0,
+          0.0,
+          f32.toF64(n.height * s),
+          f32.toF64(x),
+          f32.toF64(y),
+        )
+        drop run self.paths.fill(&mut scene, 1, &self.circle, &transform, NONZERO, fill, mask)
+      } else {
+        let radius = Corners<f32>.uniform(n.radius * s)
+        if (n.shadow & 255) != 0 {
+          drop run scene.shadow(
+            Shadow {
+              bounds: bounds,
+              mask: mask,
+              cornerRadii: radius,
+              color: color.rgba(n.shadow),
+              blurRadius: n.blur * s,
+              offset: Vector2<f32>.new(n.shadowX * s, n.shadowY * s),
+              spread: 0.0,
+              inset: false,
+            },
+          )
+        }
+        let mut quad = Quad.fill(bounds, mask, fill)
+        quad.cornerRadii = radius
+        quad.borderWidths = Insets<f32>.uniform(n.borderWidth * s)
+        quad.borderColor = color.rgba(n.border)
+        drop run scene.quad(quad)
+      }
+    }
+    run scene.finish()
+  }
+}
