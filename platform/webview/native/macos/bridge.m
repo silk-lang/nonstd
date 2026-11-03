@@ -14,6 +14,7 @@
 // the way WebKit's own test runner drives it, so pages see trusted input.
 #import <Cocoa/Cocoa.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <QuartzCore/QuartzCore.h>
 #import <WebKit/WebKit.h>
 #include <pthread.h>
 #include <string.h>
