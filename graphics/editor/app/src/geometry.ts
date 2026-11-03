@@ -63,6 +63,7 @@ export const effectiveFlag = (
   nodes: readonly Node[],
   flag: 'hidden' | 'locked',
 ): boolean => {
+  if (node.parentId === null) return node[flag]
   const lookup = nodeIndex(nodes)
   let n: Node | undefined = node
   const visited = new Set<string>()

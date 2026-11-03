@@ -1,4 +1,5 @@
-import { currentPage, descendants, type Node } from './document'
+import { currentPage, type Node } from './document'
+import { transformSubtrees } from './selection-transform'
 import { effectiveFlag } from './geometry'
 import type { Model } from './model'
 import { changeNodes, selectedNodes } from './state'
@@ -11,18 +12,14 @@ export const patchGeometry = (
 ): Model => {
   const nodes = currentPage(m.document).nodes
   const roots = selectedNodes(m).filter((n) => !effectiveFlag(n, nodes, 'locked'))
-  let next = nodes
-  for (const root of roots) {
-    const ids = new Set(descendants(nodes, [root.id]).map((n) => n.id))
-    next = next.map((n) => {
-      if (!ids.has(n.id)) return n
-      if (field === 'x' || field === 'y')
-        return Object.assign({}, n, { [field]: n[field] + value - root[field] })
-      if (root.kind !== 'group')
-        return n.id === root.id ? Object.assign({}, n, { [field]: value }) : n
-      return scaleNode(n, root, field, value / root[field])
-    })
-  }
+  const next = transformSubtrees(nodes, roots, (n, root) => {
+    if (root[field] === value) return n
+    if (field === 'x' || field === 'y')
+      return Object.assign({}, n, { [field]: n[field] + value - root[field] })
+    if (root.kind !== 'group')
+      return n.id === root.id ? Object.assign({}, n, { [field]: value }) : n
+    return scaleNode(n, root, field, value / root[field])
+  })
   return changeNodes(m, next)
 }
 const scaleNode = (n: Node, root: Node, field: 'width' | 'height', scale: number): Node => {

@@ -1,3 +1,4 @@
+import { nodeIndex } from './hierarchy'
 import { addSelectionPage } from './selection-page'
 import { currentPage, makeNode, replaceNodes } from './document'
 import { boundsOf, effectiveFlag, fit, zoomAt } from './geometry'
@@ -24,9 +25,7 @@ const handlers: Readonly<Record<string, (m: Model) => Model>> = {
           document: previous,
           past: m.past.slice(0, -1),
           future: [...m.future, m.document],
-          selection: m.selection.filter((id) =>
-            currentPage(previous).nodes.some((n) => n.id === id),
-          ),
+          selection: m.selection.filter((id) => nodeIndex(currentPage(previous).nodes).has(id)),
           revision: m.revision + 1,
           editingId: null,
           gesture: null,
@@ -41,7 +40,7 @@ const handlers: Readonly<Record<string, (m: Model) => Model>> = {
           document: next,
           past: [...m.past, m.document],
           future: m.future.slice(0, -1),
-          selection: m.selection.filter((id) => currentPage(next).nodes.some((n) => n.id === id)),
+          selection: m.selection.filter((id) => nodeIndex(currentPage(next).nodes).has(id)),
           revision: m.revision + 1,
           editingId: null,
         }

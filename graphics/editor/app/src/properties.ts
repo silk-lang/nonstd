@@ -1,6 +1,7 @@
 import { patchGeometry } from './property-geometry'
 import { naturalText } from './text-layout'
-import { currentPage, descendants, type Node } from './document'
+import { currentPage, type Node } from './document'
+import { transformSubtrees } from './selection-transform'
 import { boundsOf, effectiveFlag } from './geometry'
 import { type Model } from './model'
 import { changeNodes, selectedNodes } from './state'
@@ -79,7 +80,7 @@ export const align = (m: Model, direction: string): Model => {
   )
   const bounds = boundsOf(selection)
   if (!bounds || selection.length < 2) return m
-  let nodes = currentPage(m.document).nodes
+  const offsets = new Map<string, Readonly<{ dx: number; dy: number }>>()
   for (const n of selection) {
     let dx = 0
     let dy = 0
@@ -103,10 +104,12 @@ export const align = (m: Model, direction: string): Model => {
         dy = bounds.y + bounds.height - n.height - n.y
         break
     }
-    const ids = new Set(descendants(nodes, [n.id]).map((child) => child.id))
-    nodes = nodes.map((child) =>
-      ids.has(child.id) ? { ...child, x: child.x + dx, y: child.y + dy } : child,
-    )
+    offsets.set(n.id, { dx, dy })
   }
+  const nodes = transformSubtrees(currentPage(m.document).nodes, selection, (node, root) => {
+    const offset = offsets.get(root.id)
+    if (!offset || (offset.dx === 0 && offset.dy === 0)) return node
+    return { ...node, x: node.x + offset.dx, y: node.y + offset.dy }
+  })
   return changeNodes(m, nodes)
 }

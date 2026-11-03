@@ -10,40 +10,18 @@ export const openStudio = async (page: Page): Promise<void> => {
 }
 export const savedDocument = async (page: Page): Promise<DesignDocument> => {
   const stored: unknown = await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('silk-studio', 1)
-      request.addEventListener(
-        'success',
-        () => {
-          resolve(request.result)
-        },
-        { once: true },
-      )
-      request.addEventListener(
-        'error',
-        () => {
-          reject(new Error('Could not open local documents'))
-        },
-        {
-          once: true,
-        },
-      )
-    })
-    const read = (store: string, key: string): Promise<unknown> =>
-      new Promise((resolve) => {
-        const request = db.transaction(store, 'readonly').objectStore(store).get(key)
-        request.addEventListener(
-          'success',
-          () => {
-            resolve(request.result)
-          },
-          { once: true },
-        )
-      })
-    const id = await read('metadata', 'current')
-    const value = typeof id === 'string' ? await read('documents', id) : null
-    db.close()
-    return value
+    const reader: unknown = await import(
+      new URL('/tests/browser/storage-access.ts', location.href).href
+    )
+    // This guard must live inside the callback serialized into the browser.
+    // oxlint-disable-next-line unicorn/consistent-function-scoping
+    const isReader = (value: unknown): value is { readonly readCurrentDocument: () => unknown } =>
+      typeof value === 'object' &&
+      value !== null &&
+      'readCurrentDocument' in value &&
+      typeof value.readCurrentDocument === 'function'
+    if (!isReader(reader)) throw new Error('Storage helper is unavailable')
+    return reader.readCurrentDocument()
   })
   return Schema.decodeUnknownSync(DesignDocumentSchema)(stored)
 }

@@ -1,6 +1,6 @@
-import { paintOrder, inheritedOpacity } from './hierarchy'
+import { paintOrder, inheritedOpacity, nodeIndex } from './hierarchy'
 import { Editor, type ElementProperties, type HexColor } from '../../dist/editor.js'
-import type { Camera, Page, Node } from './document'
+import { descendants, type Camera, type Page, type Node } from './document'
 import { effectiveFlag } from './geometry'
 
 const alpha = (color: string, opacity: number): HexColor => {
@@ -31,58 +31,77 @@ const properties = (n: Node, nodes: readonly Node[], opacity: number): ElementPr
   fontFamily: n.fontFamily,
   fontWeight: n.fontWeight,
 })
+const sameStructure = (before: Page, after: Page): boolean =>
+  before.id === after.id &&
+  before.nodes.length === after.nodes.length &&
+  after.nodes.every((node, i) => {
+    const previous = before.nodes[i]
+    return (
+      previous?.id === node.id &&
+      previous.parentId === node.parentId &&
+      (previous.kind === 'group') === (node.kind === 'group')
+    )
+  })
+const inheritedChanges = (before: Page, after: Page): ReadonlySet<string> => {
+  const changed = after.nodes
+    .filter((node, i) => {
+      const previous = before.nodes[i]
+      return (
+        (node.kind === 'group' || node.kind === 'frame') &&
+        previous !== node &&
+        (previous?.hidden !== node.hidden ||
+          previous.locked !== node.locked ||
+          previous.opacity !== node.opacity)
+      )
+    })
+    .map((node) => node.id)
+  return new Set(changed.length > 0 ? descendants(after.nodes, changed).map((node) => node.id) : [])
+}
+const nodeProperties = (node: Node, nodes: readonly Node[]): ElementProperties =>
+  properties(
+    node,
+    nodes,
+    node.parentId === null ? node.opacity : inheritedOpacity(node, nodeIndex(nodes)),
+  )
+
 export class CanvasHost {
   readonly editor: Editor
   private page: Page | null = null
   private ids = new Map<string, number>()
-  private previous = new Map<string, string>()
   constructor(editor: Editor) {
     this.editor = editor
   }
   sync(page: Page, camera: Camera): void {
     this.editor.setViewport(camera)
-    if (page !== this.page) {
-      const lookup = new Map(page.nodes.map((n) => [n.id, n]))
-      const drawable = paintOrder(page.nodes).filter((n) => n.kind !== 'group')
-      const order = drawable.map((n) => n.id)
-      const previousOrder = [...this.ids.keys()]
-      const sameOrder =
-        order.length === previousOrder.length && order.every((id, i) => previousOrder[i] === id)
-      if (!sameOrder || page.id !== this.page?.id) {
-        this.replaceScene(drawable, page.nodes, lookup)
-      }
+    const previous = this.page
+    if (page === previous) return
+    if (!previous || !sameStructure(previous, page)) this.replaceScene(page)
+    else if (page.nodes !== previous.nodes) {
+      const inherited = inheritedChanges(previous, page)
       this.editor.batch(() => {
-        for (const n of drawable) {
-          const props = properties(n, page.nodes, inheritedOpacity(n, lookup))
-          const serialized = JSON.stringify(props)
-          const id = this.ids.get(n.id)
-          if (id !== undefined && this.previous.get(n.id) !== serialized)
-            this.editor.update(id, props)
-          this.previous.set(n.id, serialized)
-        }
+        page.nodes.forEach((node, i) => {
+          if (node.kind === 'group' || (node === previous.nodes[i] && !inherited.has(node.id)))
+            return
+          const id = this.ids.get(node.id)
+          if (id !== undefined) this.editor.update(id, nodeProperties(node, page.nodes))
+        })
       })
-      this.editor.clearHistory()
-      this.page = page
     }
+    this.editor.clearHistory()
+    this.page = page
   }
-  private replaceScene(
-    drawable: readonly Node[],
-    nodes: readonly Node[],
-    lookup: ReadonlyMap<string, Node>,
-  ): void {
-    const elements = drawable.map((n) => properties(n, nodes, inheritedOpacity(n, lookup)))
-    this.editor.load({ version: 1, elements })
-    const snapshots = [...this.editor.elements()]
-    this.ids.clear()
-    this.previous.clear()
-    drawable.forEach((n, i) => {
-      const native = snapshots[i]
-      const props = elements[i]
-      if (native && props) {
-        this.ids.set(n.id, native.id)
-        this.previous.set(n.id, JSON.stringify(props))
-      }
+  private replaceScene(page: Page): void {
+    const drawable = paintOrder(page.nodes).filter((node) => node.kind !== 'group')
+    this.editor.load({
+      version: 1,
+      elements: drawable.map((node) => nodeProperties(node, page.nodes)),
     })
+    const snapshots = this.editor.elements()
+    this.ids.clear()
+    for (const node of drawable) {
+      const native = snapshots.next()
+      if (native.done !== true) this.ids.set(node.id, native.value.id)
+    }
   }
   destroy(): void {
     this.editor.destroy()

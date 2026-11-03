@@ -98,16 +98,13 @@ export const duplicate = (m: Model, source = mutableSelection(m), offset = 24): 
     y: n.y + offset,
     name: `${n.name} copy`,
   }))
-  const roots: readonly Node[] = copies.filter(
-    (n) => !copies.some((parent) => parent.id === n.parentId),
-  )
+  const copiedIds = new Set(copies.map((n) => n.id))
+  const roots: readonly Node[] = copies.filter((n) => !copiedIds.has(n.parentId ?? ''))
   const liveIds = new Set(currentPage(doc).nodes.map((n) => n.id))
   const safeCopies: readonly Node[] = copies.map((n) =>
     Object.assign({}, n, {
       parentId:
-        n.parentId !== null &&
-        !liveIds.has(n.parentId) &&
-        !copies.some((parent) => parent.id === n.parentId)
+        n.parentId !== null && !liveIds.has(n.parentId) && !copiedIds.has(n.parentId ?? '')
           ? null
           : n.parentId,
     }),

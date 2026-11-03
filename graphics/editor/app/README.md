@@ -53,9 +53,11 @@ The in-app shortcut reference includes the remaining controls. Clipboard operati
 bun run check        # Oxfmt, strict type-aware Oxlint, Effect diagnostics, TypeScript 7
 bun run test         # Model, undo, hierarchy, import, export, and resize contracts
 bun run test:browser # Real Chrome workflows, persistence, and export recovery
-bun run bench        # Text overview zoom and 100k-rectangle marquee frame intervals
+bun run bench        # Text overview, 100k marquee, and bulk edit regressions
 bun run bench --grep '100k rectangles' # Selection benchmark only
 bun run bench:selection:cpu # Reducer and shared selection calculations, without rendering
+bun run bench:edits:cpu # 100k alignment, undo/redo, width and duplication
+bun run bench tests/browser/edit-performance.spec.ts # 100k alignment and undo through saving
 bun run build
 ```
 
@@ -68,6 +70,12 @@ Layer rows are virtualized. Hierarchy indexes, paint order, and layer-tree rows 
 For selection stress testing, choose **Commands → Add 100k rectangles**. This creates a 400×250 grayscale mosaic from the supplied reference image, with 100,000 individually editable rectangles and a larger two-line caption above them (two editable text layers). Pixel dimensions preserve the source aspect ratio, with a 2-unit gap between rectangles that becomes visible when zooming in. The command replaces the existing stress-test page and fits the mosaic and caption into view. Regenerate the bundled samples with `python3 benchmarks/generate-selection-pixels.py` (requires ImageMagick); the source is `benchmarks/fixtures/selection-source.png`. The marquee benchmark keeps all 100,000 rectangles visible, sweeps twice between small and large selections, and verifies live updates reaching over 85,000 selected items. It also holds the gesture idle to catch accidental development reloads. The first ten frame intervals are reported separately from steady state. The dedicated benchmark fails if p95 exceeds 25 ms or 1.5× idle p95, whichever is greater. This is a machine-dependent performance guard, separate from the ordinary browser suite.
 
 The [selection results](benchmarks/selection.json), recorded before the fixture became an image mosaic, separate CPU calculations from browser frame intervals and development-tool overhead. Selection queries reuse eligibility by immutable document reference, share membership and root calculations across views, and reuse the nodes found by the marquee scan. Changing geometry, hierarchy, visibility, or lock state creates a new reference and invalidates the corresponding derived data. Shift-selection still unions with the gesture's original selection; cancellation and undo retain their original snapshots.
+
+The [edit measurements](benchmarks/edits.json) cover the 100k mosaic. The browser regression aligns all 100,002 layers, verifies their stored coordinates, undoes the operation, and verifies the original scene. Each command has a separate 5-second regression budget; the measured final run took about 550 ms to align and save, and 489 ms to undo and save. Single-item nudge/save measurements fell from a 270 ms median to 66 ms across three profiled samples. These are development-server command timings including automation overhead, not input-to-display latency or GPU throughput.
+
+Bulk alignment and inspector geometry changes traverse the document once, with ancestor lookup for nested selections. Undo, redo, resize membership, and duplication use indexed membership instead of a full scan per selected node. Renderer synchronization reuses immutable node references, sends only changed properties, and explicitly invalidates descendants when inherited opacity, visibility, or locking changes. Reordering and hierarchy changes rebuild the native scene.
+
+Local storage uses IndexedDB version 2. Small saves journal changed nodes by document and node ID; opening a document overlays that journal onto its snapshot. Initial saves, structural changes, metadata changes, and batches over 512 nodes atomically checkpoint the whole document and clear its journal. The last-saved baseline advances only when the transaction completes. Browser contracts verify migration from version 1, reloads, undo, deletion checkpoints, and rollback/retry after a partially queued write fails. Portable `.silk` files keep their existing format.
 
 ## Current boundaries
 

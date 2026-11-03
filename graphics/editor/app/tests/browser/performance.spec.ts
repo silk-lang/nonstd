@@ -5,7 +5,7 @@ import { openStudio } from './helpers'
 const seed = (page: Page, document: DesignDocument): Promise<void> =>
   page.evaluate(async (doc) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('silk-studio', 1)
+      const request = indexedDB.open('silk-studio')
       request.addEventListener(
         'success',
         () => {

@@ -1,6 +1,6 @@
 import { resizeBounds } from './resize'
 import { marqueeSelection } from './marquee'
-import { selectionRoots } from './hierarchy'
+import { selectionRoots, selectionSet } from './hierarchy'
 import { currentPage, descendants, replaceNodes, type Node } from './document'
 import { boundsOf, effectiveFlag, round, worldPoint, type Bounds } from './geometry'
 import { type Gesture, type Model, type Pointer } from './model'
@@ -90,7 +90,7 @@ const resizeNodes = (
   ids: ReadonlySet<string>,
 ): readonly Node[] => {
   const { x, y, width, height } = resizeBounds(b, g.handle, dx, dy, p.shift)
-  const frames = chosen.filter((n) => n.kind === 'frame' && m.selection.includes(n.id))
+  const frames = chosen.filter((n) => n.kind === 'frame' && selectionSet(m.selection).has(n.id))
   const retained = new Set(
     descendants(
       originals,
@@ -100,7 +100,7 @@ const resizeNodes = (
   return originals.map((n) => {
     if (!ids.has(n.id)) return n
     // Frame resizing changes its boundary; its contents keep their dimensions.
-    if (!m.selection.includes(n.id) && retained.has(n.id)) return n
+    if (!selectionSet(m.selection).has(n.id) && retained.has(n.id)) return n
     return Object.assign({}, n, {
       x: round(x + ((n.x - b.x) * width) / b.width),
       y: round(y + ((n.y - b.y) * height) / b.height),
