@@ -5,6 +5,9 @@
 //! whole text item. Each such segment is itemized by script and, per cluster, by the face that
 //! has its first character (font fallback). Glyphs then go back to the tokens they came from:
 //! a `TextRun` never crosses a token, a level change, or a font change.
+import layout.lib { WritingMode, TextOrientation }
+import silk.text.vertical_text { Orientation, OrientationRun }
+import silk.text.vertical_text
 import fonts { FontState, RawGlyph }
 import glyphs { GlyphStore, PositionedGlyph }
 import analysis { tokenLength }
@@ -59,6 +62,7 @@ impl Copy for Piece {}
 
 // A shaped item of a segment: one script, one face.
 struct Item {
+  upright: bool,
   start: usize,
   end: usize,
   key: usize,
@@ -90,6 +94,7 @@ pub struct Shaping {
   pieces: List<Piece>,
   segment: String,
   scripts: List<ScriptRun>,
+  orientations: List<OrientationRun>,
   chain: List<Selection>,
   items: List<Item>,
   raw: List<RawGlyph>,
@@ -105,6 +110,7 @@ impl Shaping {
       pieces: List<Piece>.make(),
       segment: String.make(),
       scripts: List<ScriptRun>.make(),
+      orientations: List<OrientationRun>.make(),
       chain: List<Selection>.make(),
       items: List<Item>.make(),
       raw: List<RawGlyph>.make(),
@@ -292,7 +298,9 @@ effect fn collectPieces(state: &mut Shaping, request: &TextShapeRequest, trailin
           let mut joined = false
           if open && state.pieces.length() > 0 {
             let last = state.pieces.get(state.pieces.length() - 1)
-            if last.kind == PieceKind.Text && last.fontKey == token.fontKey && last.level == level {
+            if last.kind == PieceKind.Text && last.fontKey == token.fontKey && last.level == level
+              && tokens[last.unit].writingMode == token.writingMode
+              && tokens[last.unit].textOrientation == token.textOrientation {
               joined = true
             }
           }
@@ -325,12 +333,16 @@ effect fn itemize<'a>(
   fonts: &mut FontState<'a>,
   styleKey: usize,
   rtl: bool,
+  mode: WritingMode,
+  orientation: TextOrientation,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   state.items.clear()
   state.raw.clear()
   state.scripts.clear()
+  state.orientations.clear()
+  run vertical_text.orientations(state.segment.view(), &mut state.orientations)
   run script_itemization.scripts(state.segment.view(), &mut state.scripts)
   if fonts.key(styleKey).instance == usize.MAX {
     return
@@ -345,9 +357,19 @@ effect fn itemize<'a>(
     let mut at = scriptRun.start
     let mut itemStart = at
     let mut face = usize.MAX
+    let mut upright = false
+    let mut orientationIndex: usize = 0
     let mut selection = state.chain.get(0)
     while at < scriptRun.end {
       let decoded = utf8_scan.decode(String.utf8Bytes(state.segment.view()), at)
+      while orientationIndex + 1 < state.orientations.length()
+        && state.orientations.get(orientationIndex).end <= at {
+        orientationIndex = orientationIndex + 1
+      }
+      let nextUpright = (mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr)
+        && (orientation == TextOrientation.Upright
+          || orientation == TextOrientation.Mixed
+            && state.orientations.get(orientationIndex).orientation == Orientation.Upright)
       if face == usize.MAX || !continuesCluster(decoded.scalar) {
         let mut chosen = selection
         if let Option<Selection>.Some { value } = run fonts.matcher.select(
@@ -358,7 +380,7 @@ effect fn itemize<'a>(
         ) {
           chosen = value
         }
-        if face != usize.MAX && chosen.face != face {
+        if face != usize.MAX && (chosen.face != face || nextUpright != upright) {
           run shapeItem(
             &mut state,
             &mut fonts,
@@ -368,9 +390,11 @@ effect fn itemize<'a>(
             at,
             rtl,
             scriptRun.script,
+            upright,
           )
           itemStart = at
         }
+        upright = nextUpright
         face = chosen.face
         selection = chosen
       }
@@ -386,6 +410,7 @@ effect fn itemize<'a>(
         scriptRun.end,
         rtl,
         scriptRun.script,
+        upright,
       )
     }
     runIndex = runIndex + 1
@@ -401,15 +426,32 @@ effect fn shapeItem<'a>(
   end: usize,
   rtl: bool,
   script: Script,
+  upright: bool,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let key = run fonts.keyFor(style, selection)
   let glyphStart = state.raw.length()
   let instance = fonts.instanceOf(key)
-  run fonts.shapeText(instance, state.segment.view(), start, end, rtl, script, &mut state.raw)
+  run fonts.shapeTextOriented(
+    instance,
+    state.segment.view(),
+    start,
+    end,
+    rtl,
+    script,
+    upright,
+    &mut state.raw,
+  )
   run state.items.append(
-    Item { start: start, end: end, key: key, glyphStart: glyphStart, glyphEnd: state.raw.length() },
+    Item {
+      upright: upright,
+      start: start,
+      end: end,
+      key: key,
+      glyphStart: glyphStart,
+      glyphEnd: state.raw.length(),
+    },
   )
 }
 
@@ -448,14 +490,37 @@ effect fn emit<'a>(
     let raw = state.raw.get(index)
     let cluster = u32.toUsize(raw.cluster)
     if cluster >= low && cluster < high {
-      let advance = i32.toF32(raw.xAdvance) * scale
+      let advance = i32.toF32(
+        if item.upright {
+          -raw.yAdvance
+        } else {
+          raw.xAdvance
+        },
+      )
+        * scale
       let offset = piece.start + cluster - piece.segmentStart
       run state.glyphs.append(
         PositionedGlyph {
           glyph: raw.glyph,
           cluster: token.sourceStart + offset,
-          x: pen + i32.toF32(raw.xOffset) * scale,
-          y: -i32.toF32(raw.yOffset) * scale,
+          upright: item.upright,
+          x: pen
+            + i32.toF32(
+              if item.upright {
+                -raw.yOffset
+              } else {
+                raw.xOffset
+              },
+            )
+              * scale,
+          y: i32.toF32(
+            if item.upright {
+              raw.xOffset
+            } else {
+              -raw.yOffset
+            },
+          )
+            * scale,
           advance: advance,
         },
       )
@@ -539,7 +604,14 @@ effect fn shapeSegments<'a>(
       run state.segment.append(String.slice(text, member.start, member.end - member.start))
       last = last + 1
     }
-    run itemize(&mut state, &mut fonts, piece.fontKey, piece.level % 2 == 1)
+    run itemize(
+      &mut state,
+      &mut fonts,
+      piece.fontKey,
+      piece.level % 2 == 1,
+      tokens[piece.unit].writingMode,
+      tokens[piece.unit].textOrientation,
+    )
     let mut member = index
     while member < last {
       let current = state.pieces.get(member)
@@ -629,6 +701,7 @@ effect fn hyphenate<'a>(state: &mut Shaping, fonts: &mut FontState<'a>) -> ()
         let advance = i32.toF32(raw.xAdvance) * scale
         run extra.append(
           PositionedGlyph {
+            upright: false,
             glyph: raw.glyph,
             cluster: cluster,
             x: pen + i32.toF32(raw.xOffset) * scale,
@@ -726,6 +799,8 @@ pub effect fn shapeLine<'a>(
       )
     } else {
       let mut face = usize.MAX
+      let mut upright = false
+      let mut orientationIndex: usize = 0
       let mut size: f32 = 0.0
       let mut key = pending.key
       if key < fonts.keyCount() {

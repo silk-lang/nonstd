@@ -18,6 +18,11 @@
 //! cannot be reached or the arguments are wrong.
 import ui_inspect_server.server { Address, parseAddress, describeAddress, resolved }
 import ui_inspect_server.reply { writeString }
+import ui_inspect_server.mcp { Bridge, Action }
+import ui_inspect_server.client as client
+import silk.mem.box { Box }
+import silk.json.value { JsonChild }
+import silk.num.i64
 import ui_inspect_server.client { connect, exchange }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
@@ -78,6 +83,12 @@ struct Command {
 
 /// Options that take a text value, and the request member they become.
 fn textOption(flag: string) -> string<'static> {
+  if flag == "--phase" {
+    return "phase"
+  }
+  if flag == "--key" {
+    return "key"
+  }
   if flag == "--role" {
     return "role"
   }
@@ -101,6 +112,18 @@ fn textOption(flag: string) -> string<'static> {
 
 /// Options that take a number, and their request member.
 fn numberOption(flag: string) -> string<'static> {
+  if flag == "--interval" {
+    return "intervalMs"
+  }
+  if flag == "--columns" {
+    return "columns"
+  }
+  if flag == "--tile-width" {
+    return "tileWidth"
+  }
+  if flag == "--button" {
+    return "button"
+  }
   if flag == "--node" {
     return "node"
   }
@@ -305,13 +328,13 @@ effect fn request(c: &mut Command, line: &mut String) -> bool
       line.clear()
       run line.append("{\"id\":1,\"cmd\":\"highlight\"")
     }
-  } else if cmd == "screenshot" {
+  } else if cmd == "screenshot" || cmd == "capture" {
     if pos.length != 1 {
       run err("ui-inspect-cli: screenshot takes the PNG file to write\n")
       return false
     }
     c.file = run String.copy(String.view(&pos[0]))
-  } else if cmd == "press" {
+  } else if cmd == "press" || cmd == "key" {
     if pos.length != 1 {
       run err("ui-inspect-cli: press takes a key (UI Events key value, such as Enter or a)\n")
       return false
@@ -381,6 +404,9 @@ effect fn saveScreenshot(document: &Value, file: string) -> bool
 effect fn serveOnce(address: &Address, c: &Command, line: &String) -> i32
   ! NativeSocketError | ByteIoError | FileError | HostInputError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator | &mut HostInput {
+  if String.view(&c.cmd) == "capture" {
+    return run captureSequence(address, c, line)
+  }
   let mut connection = run connect(address)
   let mut reply = Bytes.make()
   run exchange(&mut connection, String.view(line), &mut reply)
@@ -423,7 +449,7 @@ effect fn serveOnce(address: &Address, c: &Command, line: &String) -> i32
     return 1
   }
   let cmd = String.view(&c.cmd)
-  if cmd == "screenshot" {
+  if cmd == "screenshot" || cmd == "capture" {
     if !run saveScreenshot(&document, String.view(&c.file)) {
       run err("ui-inspect-cli: the reply has no PNG\n")
       return 1
@@ -446,6 +472,73 @@ effect fn serveOnce(address: &Address, c: &Command, line: &String) -> i32
   run out(textOf(&reply))
   run out("\n")
   return 0
+}
+
+/// Uses the same capture implementation as the MCP tool, with a PNG file as the output.
+effect fn captureSequence(address: &Address, c: &Command, line: &String) -> i32
+  ! NativeSocketError | ByteIoError | FileError | HostInputError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut HostInput {
+  let mut description = String.make()
+  run describeAddress(address, &mut description)
+  let mut bridge = run Bridge.make(String.view(&description))
+  let mut call = run String.copy(
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_capture\",\"arguments\":",
+  )
+  run call.append(String.view(line))
+  run call.append("}}")
+  let mut wire = String.make()
+  let mut action = run bridge.handle(call.ownedUtf8Bytes(), &mut wire)
+  let start = run MonotonicClock.now()
+  let mut reply = Bytes.make()
+  while action == Action.Ask || action == Action.Retry {
+    if action == Action.Retry {
+      let clockNow = run MonotonicClock.now()
+      let since = (SystemClock.seconds(&clockNow) - SystemClock.seconds(&start)) * 1000
+        + (SystemClock.nanoseconds(&clockNow) - SystemClock.nanoseconds(&start)) / 1000000
+      run MonotonicClock.waitFor(bridge.retryDelay(i64.toU64(since)) * 1000000)
+    }
+    run client.request(address, String.view(&wire), &mut reply)
+    let now = run MonotonicClock.now()
+    let a = SystemClock.seconds(&start) * 1000 + SystemClock.nanoseconds(&start) / 1000000
+    let b = SystemClock.seconds(&now) * 1000 + SystemClock.nanoseconds(&now) / 1000000
+    action = run bridge.answer(reply.asSlice(), true, i64.toU64(b - a), &mut wire)
+  }
+  let parsed = run Effect.result(Json.parse(wire.ownedUtf8Bytes()))
+  if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move parsed {
+    let contents = Json.fieldAt(Json.field(&value, "result"), "content")
+    if let Option<&Value>.Some { value: array } = contents {
+      if let Value.Array { values } = &array.* {
+        let children = Box<List<JsonChild>>.get(&values)[0].asSlice()
+        let mut i: usize = 0
+        let mut saved = false
+        while i < children.length {
+          if let JsonChild.Item { value: item } = &children[i] {
+            let kind = Json.asString(Json.field(&item, "type")).unwrapOr("")
+            if kind == "image" {
+              let mut wrapped = run String.copy("{\"png\":")
+              run writeString(&mut wrapped, Json.asString(Json.field(&item, "data")).unwrapOr(""))
+              run wrapped.append("}")
+              let image = run Effect.result(Json.parse(wrapped.ownedUtf8Bytes()))
+              if let Result<Value, JsonError | OutOfMemoryError>.Success {
+                value: png
+              } = move image {
+                saved = run saveScreenshot(&png, String.view(&c.file))
+              }
+            } else if kind == "text" {
+              run out(Json.asString(Json.field(&item, "text")).unwrapOr(""))
+              run out("\n")
+            }
+          }
+          i = i + 1
+        }
+        if saved {
+          return 0
+        }
+      }
+    }
+  }
+  run err("ui-inspect-cli: capture failed\n")
+  return 1
 }
 
 effect fn process() -> i32

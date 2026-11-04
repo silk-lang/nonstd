@@ -13,6 +13,9 @@
 //! documents them all. Results are text (the reply line, or the text of `snapshot` and
 //! `inspect`), except `ui_screenshot`, which returns the PNG as image content.
 import reply { writeString }
+import capture { Capture }
+import codec.png { PngError }
+import codec.image { ImageError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -23,6 +26,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
 import silk.text.string { String }
 import ui_tree.inspect { writeInt }
+import silk.num.u32
 
 /// The MCP revision this server implements; an initialize request asking for another known
 /// revision gets that one back.
@@ -71,7 +75,7 @@ pub enum Action {
   Respond,
   /// Send `out` to the app as an inspector request and pass the reply to [`Bridge.answer`].
   Ask,
-  /// Pause [`RETRY_PAUSE`] milliseconds, then send the same request (`out` again) and pass the
+  /// Pause `bridge.retryDelay(elapsed)` milliseconds, then send `out` again and pass the
   /// reply to [`Bridge.answer`].
   Retry,
   /// Nothing to write (a notification).
@@ -88,6 +92,7 @@ pub struct Bridge {
   request: String,
   /// For `wait`: how long the call may wait, in milliseconds.
   timeout: u64,
+  capture: Capture,
   /// Where the app is expected, for error messages (such as `unix:/path`).
   pub address: String,
 }
@@ -102,8 +107,23 @@ impl Bridge {
       cmd: String.make(),
       request: String.make(),
       timeout: WAIT_TIMEOUT,
+      capture: Capture.make(),
       address: run String.copy(address),
     }
+  }
+
+  /// Delay before retrying, accounting for decoding/composition time in the client.
+  /// `elapsed` is monotonic milliseconds since this tool call began.
+  pub fn retryDelay(self: &Self, elapsed: u64) -> u64 {
+    if String.view(&self.cmd) == "capture" {
+      let due = u32.toU64(self.capture.taken) * self.capture.interval
+      return if due > elapsed {
+        due - elapsed
+      } else {
+        0
+      }
+    }
+    return RETRY_PAUSE
   }
 
   /// Handles one JSON-RPC message from the client and writes what to send into `out`.
@@ -197,6 +217,16 @@ impl Bridge {
       }
       Option<&Value>.None => {}
     }
+    self.capture = Capture.make()
+    if cmd == "capture" && !self.capture.configure(arguments) {
+      run rpcError(
+        &mut out,
+        id,
+        32602,
+        "capture requires count 1..24, intervalMs 16..60000, columns 1..6 (at most count), tileWidth 160..800",
+      )
+      return Action.Respond
+    }
     self.callId.clear()
     run self.callId.append(id)
     self.cmd.clear()
@@ -207,7 +237,14 @@ impl Bridge {
     }
     self.request.clear()
     run self.request.append("{\"cmd\":")
-    run writeString(&mut self.request, cmd)
+    run writeString(
+      &mut self.request,
+      if cmd == "capture" {
+        "screenshot"
+      } else {
+        cmd
+      },
+    )
     match arguments {
       Option<&Value>.Some { value } => {
         match &value.* {
@@ -239,6 +276,10 @@ impl Bridge {
     if cmd == "wait" && !has(arguments, "timeout") {
       run self.request.append(",\"timeout\":")
       run writeInt(&mut self.request, WAIT_TIMEOUT)
+    }
+    if cmd == "capture" {
+      run self.request.append(",\"maxWidth\":")
+      run writeInt(&mut self.request, u32.toU64(self.capture.tileWidth))
     }
     run self.request.append("}")
     out.clear()
@@ -298,6 +339,31 @@ impl Bridge {
       return Action.Respond
     }
     let cmd = String.view(&self.cmd)
+    if cmd == "capture" {
+      let added = run Effect.result(self.capture.append(&document, waited))
+      match move added {
+        Result<(), PngError | ImageError | OutOfMemoryError>.Failure { error } => {
+          run toolText(&mut out, id, "Could not decode a capture frame; sequence aborted.", true)
+          return Action.Respond
+        }
+        Result<(), PngError | ImageError | OutOfMemoryError>.Success { value } => {}
+      }
+      if self.capture.taken < self.capture.count {
+        run out.append(String.view(&self.request))
+        return Action.Retry
+      }
+      let mut mosaic = String.make()
+      let finished = run Effect.result(self.capture.finish(&mut mosaic))
+      match move finished {
+        Result<(), ImageError | OutOfMemoryError>.Failure { error } => {
+          run toolText(&mut out, id, "Could not encode the capture mosaic.", true)
+          return Action.Respond
+        }
+        Result<(), ImageError | OutOfMemoryError>.Success { value } => {}
+      }
+      self.cmd = run String.copy("screenshot")
+      return run self.answer(mosaic.ownedUtf8Bytes(), true, waited, &mut out)
+    }
     if cmd == "snapshot" || cmd == "inspect" {
       match Json.asString(Json.field(&document, "text")) {
         Option<string>.Some { value } => {
@@ -320,6 +386,13 @@ impl Bridge {
           run summary.append(numberText(&document, "height"))
           run summary.append(" device pixels at scale ")
           run summary.append(numberText(&document, "scale"))
+          if self.capture.taken != 0 {
+            run summary.append(
+              ". Contact sheet in reading order. Captions: sample +elapsed milliseconds, f=source frame. CPU reference captures, not a GPU/FPS benchmark. Samples: [",
+            )
+            run summary.append(self.capture.timings())
+            run summary.append("]")
+          }
           run writeString(&mut out, String.view(&summary))
           run out.append("}],\"isError\":false}}")
           return Action.Respond
@@ -347,7 +420,7 @@ pub fn commandOf(name: string) -> string<'static> {
   return ""
 }
 
-const TOOLS: [string<'static>; 15] = [
+const TOOLS: [string<'static>; 18] = [
   "ui_status",
   "ui_snapshot",
   "ui_query",
@@ -363,9 +436,12 @@ const TOOLS: [string<'static>; 15] = [
   "ui_wait",
   "ui_stats",
   "ui_events",
+  "ui_pointer",
+  "ui_key",
+  "ui_capture",
 ]
 
-const COMMANDS: [string<'static>; 15] = [
+const COMMANDS: [string<'static>; 18] = [
   "hello",
   "snapshot",
   "query",
@@ -381,6 +457,9 @@ const COMMANDS: [string<'static>; 15] = [
   "wait",
   "stats",
   "events",
+  "pointer",
+  "key",
+  "capture",
 ]
 
 fn has(value: Option<&Value>, key: string) -> bool {
@@ -726,7 +805,7 @@ effect fn toolList(out: &mut String) -> ()
   let screenshot = run props(
     &[
       TARGET,
-      r""" "highlight":{"type":"boolean","description":"Include the highlight overlay (default true)."}""",
+      r""" "highlight":{"type":"boolean","description":"Include the highlight overlay (default true)."},"maxWidth":{"type":"integer","minimum":1,"maximum":4096,"description":"Reduce before encoding, preserving aspect ratio; omitted for full device resolution."}""",
     ],
   )
   run tool(
@@ -856,6 +935,56 @@ effect fn toolList(out: &mut String) -> ()
     "Event log",
     "The event records the app took from the UI tree (click, keydown, input, focus, scroll and so on), oldest first, each with seq, frame, kind, target id, the id path from the root and, where they apply, position, key and input value. Only kinds some node listens for are recorded. next is the seq the next record will get.",
     &events,
+    "",
+    true,
+  )
+  let pointer = run props(
+    &[
+      TARGET,
+      POINT,
+      MODIFIERS,
+      r""" "phase":{"type":"string","enum":["down","move","up"]},"button":{"type":"integer","minimum":0,"maximum":5},"count":{"type":"integer","description":"Native click count on down; defaults to 1."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pointer",
+    "Pointer event",
+    "Sends a single native-equivalent pointer input through hit testing, focus and capture. Use down, moves, then up to drag. Positions are viewport CSS pixels.",
+    &pointer,
+    "\"phase\"",
+    false,
+  )
+  let key = run props(
+    &[
+      MODIFIERS,
+      r""" "phase":{"type":"string","enum":["down","up"]},"key":{"type":"string"},"code":{"type":"string"},"repeat":{"type":"boolean"}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_key",
+    "Key event",
+    "Sends a key down or up through the normal focused-node input dispatcher. Allows holding Space or modifier keys across pointer commands.",
+    &key,
+    "\"phase\",\"key\"",
+    false,
+  )
+  let capture = run props(
+    &[
+      TARGET,
+      r""" "count":{"type":"integer","minimum":1,"maximum":24,"default":10},"intervalMs":{"type":"integer","minimum":16,"maximum":60000,"default":100},"columns":{"type":"integer","minimum":1,"maximum":6},"tileWidth":{"type":"integer","minimum":160,"maximum":800,"default":480},"highlight":{"type":"boolean"}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_capture",
+    "Timed capture mosaic",
+    "Captures a sequence of the app's last composed frames and returns one PNG mosaic. Defaults to 10 samples at 100 ms intervals, 5 columns. Captions show actual elapsed milliseconds and source frame numbers. Sampling is in the client; the app keeps handling input. Slow captures may exceed the requested interval. CPU reference rendering; not an FPS benchmark.",
+    &capture,
     "",
     true,
   )

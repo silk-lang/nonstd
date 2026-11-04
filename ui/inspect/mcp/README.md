@@ -57,6 +57,9 @@ match in tree order wins.
 | `ui_pick` | `pick` | the node at `x`, `y` and the hit path |
 | `ui_highlight` | `highlight` | box model overlay on `nodes` or the target matches; neither clears it |
 | `ui_screenshot` | `screenshot` | the frame (or one node, cropped) as **image content** (PNG) |
+| `ui_capture` | repeated `screenshot` | one PNG mosaic; `count` (default 10), `intervalMs` (100), `columns` (up to 6), `tileWidth` (480), optional target |
+| `ui_pointer` | `pointer` | individual `down` / `move` / `up`; supports drags through normal pointer capture |
+| `ui_key` | `key` | individual key `down` / `up`, including held Space and repeat |
 | `ui_click` | `click` | clicks the target (or `x`, `y`); `count`, `modifiers` |
 | `ui_hover` | `hover` | moves the pointer over the target |
 | `ui_scroll` | `scroll` | wheel input over the target; `dx`, `dy` |
@@ -109,3 +112,19 @@ python3 ui/tree/demo/scripts/demo mcp     # an MCP client drives the demo in a w
 - No MCP resources, prompts or progress notifications; cancellation is ignored.
 - Whatever the inspector protocol does not do (event log, session recording, GPU readback, IME
   preedit) the tools do not do either.
+
+## Capturing a sequence
+
+Call `ui_capture` with `{"count":10,"intervalMs":100,"testId":"canvas"}` to receive an
+image contact sheet of ten canvas captures. Leave out the target to capture the whole app.
+Cells run left to right, then top to bottom. Captions show sample number, actual elapsed
+milliseconds and source frame (`f`). The text result includes the same timing metadata.
+
+Capture is bounded to 24 cells, widths 160–800 pixels, at most 6 columns and intervals
+16–60,000 ms. Thumbnails preserve aspect ratio, with at most 600 pixels of image height.
+Rendering/transport time may exceed the requested interval; samples are never fabricated or
+relabelled to hide it. CPU reference screenshots are diagnostic images, not a GPU benchmark.
+
+The client performs the waits. Other inspector clients and real user input can operate
+between samples. For a scripted gesture, use a second client to send `ui_pointer` down,
+moves and up while capture runs. Explicit `modifiers` apply to each event.
