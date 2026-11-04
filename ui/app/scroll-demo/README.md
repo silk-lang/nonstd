@@ -39,6 +39,32 @@ window host's frame timings, including upload, draw, and presentation submission
 measures time between presentation submissions. These are CPU timings and a pacing
 proxy, not GPU completion timestamps or proof that every frame reached the display.
 
+## Inspect with devtools
+
+Start a debug build with the inspector enabled:
+
+```sh
+SILK_UI_INSPECT=1 python3 ui/app/scroll-demo/scripts/run --debug
+```
+
+From another terminal in the same repository checkout, open the devtools window:
+
+```sh
+python3 ui/inspect/devtools/scripts/devtools --connect 1
+```
+
+The demo prints `ui-inspect: listening on ...` when ready. Inspection is disabled
+in release builds and when `SILK_UI_INSPECT` is unset. The element tree shows the
+currently mounted virtual rows. To check socket discovery and a real button click:
+
+```sh
+python3 ui/app/scroll-demo/scripts/inspect-check
+```
+
+This macOS/Linux smoke test builds the debug app, starts it on an isolated socket,
+checks the element tree, clicks Reverse, and verifies Forward appears. It requires
+a desktop display and GPU; `--binary PATH` reuses an existing debug build.
+
 ## Measure
 
 Build once, then run the same document headlessly through the real wheel dispatcher,
