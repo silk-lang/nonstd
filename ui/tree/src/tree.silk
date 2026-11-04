@@ -1,6 +1,10 @@
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
 import layout.lib { Fragmentainers, computeFragmented }
+import virtual_list { VirtualList, VirtualRange }
+import virtual_list as virtual
+import anchoring
+import anchoring { Anchored }
 import inspect
 import mutation {
   Mutation,
@@ -38,7 +42,7 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { Painter, paintRoots, hashFragments }
+import paint { TextInk, Painter, paintRoots, hashFragments }
 import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
@@ -93,6 +97,8 @@ pub union TreeError {
   BadResource { pub index: usize, pub resource: u32 },
   /// Layout or text shaping failed.
   Layout,
+  /// Virtual list configuration or bindings are invalid.
+  BadVirtualList { pub index: usize, pub id: u32 },
 }
 
 impl Copy for TreeError {}
@@ -156,6 +162,10 @@ fn applyAll(computed: &mut Computed, list: &List<Property>) -> () {
 /// [`UiTree.frame`], hand [`UiTree.scene`] and [`UiTree.uploads`] to a renderer, and drain
 /// [`UiTree.takeEvents`].
 pub struct UiTree<'a> {
+  /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
+  pub virtualLists: List<VirtualList>,
+  /// Retained popup placement relationships. Configure them through SetAnchor.
+  pub anchors: List<Anchored>,
   pub layout: Tree,
   pub output: LayoutTree,
   pub provider: Provider<'a>,
@@ -197,9 +207,15 @@ pub struct UiTree<'a> {
   pub paintOrder: List<u32>,
   /// Per fragment of the last layout: the hash of its subtree's paint inputs.
   pub fragmentHashes: List<u64>,
+  pub textInk: List<TextInk>,
+  facesDirty: bool,
   pub uploads: Pending,
   /// The first fragment of each css-layout node in the last layout, or NO_INDEX.
   pub fragmentOf: List<usize>,
+  /// Next fragment with the same CSS source, in arena order.
+  pub nextSourceFragment: List<usize>,
+  /// First paint-order index per node slot, or NONE.
+  pub paintIndexOf: List<u32>,
   /// Whether focus should show as focus-visible: the last focus change came from the keyboard.
   pub focusVisible: bool,
   /// The hovered nodes as (slot, id) pairs, the target first, then its ancestors.
@@ -246,6 +262,8 @@ impl<'a> UiTree<'a> {
     let resources = run Effect.catch<ResourceError>(Resources.make(), layoutFailed)
     let seed = Hash.seed(0x7569747265)
     return UiTree<'a> {
+      virtualLists: List<VirtualList>.make(),
+      anchors: List<Anchored>.make(),
       layout: move layout,
       output: LayoutTree.make(),
       provider: Provider<'a> {
@@ -281,8 +299,12 @@ impl<'a> UiTree<'a> {
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
       fragmentHashes: List<u64>.make(),
+      textInk: List<TextInk>.make(),
+      facesDirty: true,
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
+      nextSourceFragment: List<usize>.make(),
+      paintIndexOf: List<u32>.make(),
       focusVisible: false,
       hoverChain: List<u64>.make(),
       pressChain: List<u64>.make(),
@@ -343,6 +365,12 @@ impl<'a> UiTree<'a> {
       run self.slotOfCss.append(NONE)
     }
     self.slotOfCss.set(index, slot)
+  }
+
+  /// Returns the items a virtual container needs mounted after the latest configuration or frame.
+  /// Clients reconcile this range with ordinary node mutations, then call `frame` again.
+  pub fn virtualRange(self: &Self, id: u32) -> Option<VirtualRange> {
+    return virtual.request(&self, id)
   }
 
   /// The number of live nodes.
@@ -415,6 +443,21 @@ impl<'a> UiTree<'a> {
     self.semanticRevision = self.semanticRevision + 1
     self.applied = true
     match move mutation {
+      Mutation.SetAnchor { id, target, options } => {
+        run anchoring.configure(&mut self, index, id, target, options)
+      }
+      Mutation.ClearAnchor { id } => {
+        anchoring.clear(&mut self, id)
+      }
+      Mutation.SetVirtualList { id, count, options } => {
+        run virtual.configure(&mut self, index, id, count, options)
+      }
+      Mutation.SetVirtualItems { id, items } => {
+        run virtual.bind(&mut self, index, id, move items)
+      }
+      Mutation.ClearVirtualList { id } => {
+        run virtual.clear(&mut self, id)
+      }
       Mutation.Create { id, kind } => {
         run self.create(index, id, kind)
       }
@@ -868,6 +911,13 @@ impl<'a> UiTree<'a> {
       run doomed.appendSlice(children.asSlice())
       at = at + 1
     }
+    let mut v: usize = 0
+    while v < doomed.length() {
+      let id = self.node(doomed.get(v)).id
+      run virtual.clear(&mut self, id)
+      anchoring.clear(&mut self, id)
+      v = v + 1
+    }
     let css = self.node(slot).css
     run Effect.catchAll(self.layout.destroy(NodeId { index: css }), layoutFailed)
     let mut i: usize = 0
@@ -1284,6 +1334,7 @@ impl<'a> UiTree<'a> {
         }
       }
     }
+    anchoring.apply(&self, node.id, &mut computed)
     let kind = node.kind
     let css = node.css
     let previousLayout = node.layoutHash
@@ -1340,6 +1391,7 @@ impl<'a> UiTree<'a> {
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run self.resolveStyles()
+    run virtual.prepare(&mut self)
     run self.layoutFrame()
     if run interact.settleScrolls(&mut self) {
       run self.layoutFrame()
@@ -1356,6 +1408,8 @@ impl<'a> UiTree<'a> {
       run self.resolveStyles()
       run self.layoutFrame()
     }
+    run self.settleVirtual()
+    run self.settleAnchors()
     run self.notifyLayout()
     edit.beginPaint(&mut self)
     run self.paintFrame()
@@ -1364,13 +1418,57 @@ impl<'a> UiTree<'a> {
     self.stats.fragments = self.output.fragments.values.length()
   }
 
+  effect fn settleAnchors(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass <= self.anchors.length() {
+      if !(run anchoring.settle(&mut self)) {
+        break
+      }
+      run self.resolveStyles()
+      run self.layoutFrame()
+      if run interact.settleScrolls(&mut self) {
+        run self.layoutFrame()
+      }
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
+  effect fn settleVirtual(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass < 4 {
+      if !(run virtual.settle(&mut self)) {
+        break
+      }
+      run virtual.prepare(&mut self)
+      run self.layoutFrame()
+      if run interact.settleScrolls(&mut self) {
+        run self.layoutFrame()
+      }
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
   /// Lays out and paints pages or columns supplied by the host. Break policies, widows,
   /// orphans and fixed page-positioned elements use the same styles as continuous frames.
   /// Geometry queries describe this output until the next frame; `frame` resumes continuous
   /// layout. Fragmentainer slices are borrowed only for this call.
+  /// Virtual scroll containers require continuous layout; clear them first or this returns `TreeError.Layout`.
   pub effect fn frameFragmented(self: &mut Self, input: FrameInput, frames: Fragmentainers) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if self.virtualLists.length() != 0 {
+      fail TreeError.Layout
+    }
     self.frameNumber = self.frameNumber + 1
     self.applied = false
     self.input = input
@@ -1430,7 +1528,13 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     run self.resolveStyles()
+    run virtual.prepare(&mut self)
     run self.layoutFrame()
+    if run interact.settleScrolls(&mut self) {
+      run self.layoutFrame()
+    }
+    run self.settleVirtual()
+    run self.settleAnchors()
   }
 
   effect fn layoutFrame(self: &mut Self) -> ()
@@ -1449,15 +1553,22 @@ impl<'a> UiTree<'a> {
       && self.input.height == self.laidOut.height {
       return ()
     }
-    run Effect.catchAll(
-      Engine.compute(
-        &self.layout,
-        &mut self.output,
-        &mut self.provider,
-        OptionalSize.definite(self.input.width, self.input.height),
-      ),
-      layoutFailed,
-    )
+    let viewport = OptionalSize.definite(self.input.width, self.input.height)
+    let moved = self.layout.revision() == self.laidOutRevision
+      && self.input.width == self.laidOut.width
+      && self.input.height == self.laidOut.height
+      && (run Engine.repositionScroll(&self.layout, &mut self.output, viewport))
+    if !moved {
+      run Effect.catchAll(
+        Engine.compute(
+          &self.layout,
+          &mut self.output,
+          &mut self.provider,
+          OptionalSize.definite(self.input.width, self.input.height),
+        ),
+        layoutFailed,
+      )
+    }
     self.output.fragments.resolveLocations()
     self.semanticRevision = self.semanticRevision + 1
     self.laidOut = self.input
@@ -1465,7 +1576,9 @@ impl<'a> UiTree<'a> {
     self.laidOutScrolls = self.layout.scrollRevision()
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
-    run self.indexFragments()
+    if !moved {
+      run self.indexFragments()
+    }
     self.layoutObserversDirty = true
   }
 
@@ -1509,14 +1622,18 @@ impl<'a> UiTree<'a> {
   effect fn indexFragments(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.facesDirty = true
     self.fragmentOf.clear()
     run self.fragmentOf.appendRepeated(NO_INDEX, self.layout.nodes.length())
     let values = self.output.fragments.values.asSlice()
+    self.nextSourceFragment.clear()
+    run self.nextSourceFragment.appendRepeated(NO_INDEX, values.length)
     let mut i = values.length
     while i > 0 {
       i = i - 1
       let source = values[i].source
       if source < self.fragmentOf.length() && !values[i].positioningShell {
+        self.nextSourceFragment.set(i, self.fragmentOf.get(source))
         self.fragmentOf.set(source, i)
       }
     }
@@ -1526,6 +1643,9 @@ impl<'a> UiTree<'a> {
   effect fn loadFaces(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if !self.facesDirty {
+      return ()
+    }
     let count = self.output.fragments.texts.length()
     let mut i: usize = 0
     while i < count {
@@ -1540,6 +1660,7 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+    self.facesDirty = false
   }
 
   effect fn paintFrame(self: &mut Self) -> ()
@@ -1576,6 +1697,7 @@ impl<'a> UiTree<'a> {
         faces: &self.faces,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
+        textInk: &mut self.textInk,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneB,
@@ -1606,6 +1728,7 @@ impl<'a> UiTree<'a> {
         faces: &self.faces,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
+        textInk: &mut self.textInk,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneA,
@@ -1627,6 +1750,16 @@ impl<'a> UiTree<'a> {
       self.stats.primitives = self.sceneA.primitiveCount()
     }
     self.replayable = true
+    self.paintIndexOf.clear()
+    run self.paintIndexOf.appendRepeated(NONE, self.nodes.length())
+    let mut orderIndex: usize = 0
+    while orderIndex < self.paintOrder.length() {
+      let slot = self.slotOf(self.paintOrder.get(orderIndex))
+      if slot != NONE && self.paintIndexOf.get(u32.toUsize(slot)) == NONE {
+        self.paintIndexOf.set(u32.toUsize(slot), usize.toU32(orderIndex))
+      }
+      orderIndex = orderIndex + 1
+    }
     run self.gatherUploads()
   }
 
@@ -1654,6 +1787,7 @@ impl<'a> UiTree<'a> {
       faces: &self.faces,
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
+      textInk: &mut self.textInk,
       resources: &mut self.resources,
       paths: &mut self.paths,
       scene: &mut scene,

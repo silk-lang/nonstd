@@ -1,0 +1,849 @@
+//! Retained shapes and image tiles with stable IDs, geometric hit tests, and viewport painting.
+//!
+//! Coordinates use world units with positive y down. IDs start at one and are never reused.
+//! Insertion order is paint order. Removal leaves an empty slot, so other IDs remain valid.
+//! Native callers supply finite coordinates, positive sizes, and nonnegative radii, blur, and border widths.
+import atlas.atlas { AtlasTile }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import ui_scene.effects { LayerEffects }
+import ui_scene.primitives { Isolation }
+import ui_scene.color
+import ui_scene.scene { Scene }
+import ui_scene.primitives { Background, ContentMask, Quad, Shadow, ImageSprite }
+import ui_scene.path_cache { PathCache }
+import vector.path { Path }
+import vector.geometry { Affine }
+import vector.geometry_error { GeometryError }
+import vector.strips { NONZERO }
+
+/// A rectangle, ellipse, or registered image tile in world coordinates. Colors use `0xRRGGBBAA`.
+pub struct Node {
+  /// Shape kind: zero for a rectangle, one for an ellipse, or a kind returned by `addTile`.
+  pub kind: u32,
+  /// Normalized source rectangle within the image tile; independent of hit geometry.
+  pub source: Rect<f32>,
+  /// Left edge in world units.
+  pub x: f32,
+  /// Top edge in world units.
+  pub y: f32,
+  /// Width in world units; must be positive.
+  pub width: f32,
+  /// Height in world units; must be positive.
+  pub height: f32,
+  /// Rectangle corner radius in world units.
+  pub radius: f32,
+  /// Fill color in straight-alpha sRGB.
+  pub fill: u32,
+  /// Border color in straight-alpha sRGB.
+  pub border: u32,
+  /// Rectangle border width in world units.
+  pub borderWidth: f32,
+  /// Rectangle shadow blur diameter in world units.
+  pub blur: f32,
+  /// Horizontal shadow offset in world units.
+  pub shadowX: f32,
+  /// Vertical shadow offset in world units.
+  pub shadowY: f32,
+  /// Rectangle shadow color in straight-alpha sRGB.
+  pub shadow: u32,
+  /// Second gradient stop; used when flag bit two is set.
+  pub fill2: u32,
+  /// Gradient angle in clockwise degrees from up.
+  pub angle: f32,
+  /// Bit zero hides the shape; bit one disables hit tests; bit two enables a gradient.
+  pub flags: u32,
+  /// Opacity of the complete element, from zero through one.
+  pub opacity: f32,
+  /// Layer filters; blur distances and clip radius use world units before painting.
+  pub effects: LayerEffects,
+  /// A `vector.layer` blend mode from zero through fifteen.
+  pub blend: u8,
+  /// Inset shadow color in straight-alpha sRGB; zero alpha disables the inset shadow.
+  pub innerShadow: u32,
+  /// Inset shadow blur diameter in world units.
+  pub innerBlur: f32,
+  /// Inset shadow horizontal offset in world units.
+  pub innerX: f32,
+  /// Inset shadow vertical offset in world units.
+  pub innerY: f32,
+  /// Whether the slot contains an element. Removed slots have `false`.
+  pub alive: bool,
+}
+
+impl Copy for Node {}
+
+impl Node {
+  /// Creates a filled rectangle with no border or shadow.
+  pub fn rect(x: f32, y: f32, width: f32, height: f32, fill: u32) -> Node {
+    return Node {
+      kind: 0,
+      source: Rect<f32>.new(0.0, 0.0, 1.0, 1.0),
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      radius: 0.0,
+      fill: fill,
+      border: 0,
+      borderWidth: 0.0,
+      blur: 0.0,
+      shadowX: 0.0,
+      shadowY: 0.0,
+      shadow: 0,
+      fill2: fill,
+      angle: 90.0,
+      flags: 0,
+      opacity: 1.0,
+      effects: LayerEffects.none(),
+      blend: 0,
+      innerShadow: 0,
+      innerBlur: 0.0,
+      innerX: 0.0,
+      innerY: 0.0,
+      alive: true,
+    }
+  }
+
+  /// Returns bounds that include the rectangle's shadow.
+  pub fn paintBounds(self: &Self) -> Rect<f32> {
+    let reach: f32 = if self.kind == 0 && (self.shadow & 255) != 0 {
+      self.blur * 1.5
+    } else {
+      0.0
+    }
+    let padding = self.effects.blur * 3.0
+    return Rect<f32>.new(
+      self.x - padding + f32.min(0.0, self.shadowX - reach),
+      self.y - padding + f32.min(0.0, self.shadowY - reach),
+      self.x + self.width + padding + f32.max(0.0, self.shadowX + reach),
+      self.y + self.height + padding + f32.max(0.0, self.shadowY + reach),
+    )
+  }
+
+  /// Tests the filled geometry, including rounded corners. Shadows do not receive hits.
+  pub fn contains(self: &Self, x: f32, y: f32) -> bool {
+    if !self.alive || (self.flags & 3) != 0 || self.width <= 0.0 || self.height <= 0.0 {
+      return false
+    }
+    let dx = x - self.x
+    let dy = y - self.y
+    if dx < 0.0 || dy < 0.0 || dx > self.width || dy > self.height {
+      return false
+    }
+    if self.kind == 1 {
+      let a = dx * 2.0 / self.width - 1.0
+      let b = dy * 2.0 / self.height - 1.0
+      return a * a + b * b <= 1.0
+    }
+    let r = f32.min(self.radius, f32.min(self.width, self.height) * 0.5)
+    let cx = f32.max(f32.max(r - dx, dx - (self.width - r)), 0.0)
+    let cy = f32.max(f32.max(r - dy, dy - (self.height - r)), 0.0)
+    return cx * cx + cy * cy <= r * r
+  }
+}
+
+/// A camera in CSS pixels. Device scale is separate from zoom.
+pub struct Camera {
+  /// World x coordinate at the viewport's left edge.
+  pub x: f32,
+  /// World y coordinate at the viewport's top edge.
+  pub y: f32,
+  /// CSS pixels per world unit; must be positive.
+  pub zoom: f32,
+  /// Physical pixels per CSS pixel; must be positive.
+  pub scale: f32,
+  /// Viewport width in CSS pixels.
+  pub width: f32,
+  /// Viewport height in CSS pixels.
+  pub height: f32,
+}
+
+impl Copy for Camera {}
+
+/// A retained shape store. Use `paint` to build a frame for `ui_renderer`.
+pub struct Document {
+  /// Changes whenever document geometry, image bindings or atlas views change.
+  pub revision: u64,
+  nodes: List<Node>,
+  blocks: List<Rect<f32>>,
+  dirty: List<bool>,
+  dirtyCount: usize,
+  mixedCount: usize,
+  paths: PathCache,
+  circle: Path,
+  tiles: List<ImageTile>,
+  /// Number of elements submitted by the most recent paint. Includes offscreen elements when culling is disabled.
+  pub visible: u32,
+  /// Elements visited by the main paint pass; excludes rectangle-run bounds lookahead.
+  pub visited: u32,
+}
+
+struct ImageTile {
+  tile: AtlasTile,
+  view: Rect<f32>,
+  cropped: bool,
+  live: bool,
+}
+
+impl Copy for ImageTile {}
+
+const BLOCK: usize = 64
+
+fn emptyBounds() -> Rect<f32> {
+  return Rect<f32>.new(1.0e30, 1.0e30, -1.0e30, -1.0e30)
+}
+
+fn unionBounds(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+fn overlaps(a: Rect<f32>, b: Rect<f32>) -> bool {
+  return a.xMin < b.xMax && a.xMax > b.xMin && a.yMin < b.yMax && a.yMax > b.yMin
+}
+
+// Pinned same-kind quads retain insertion order, even when translucent rectangles overlap.
+// Paths, sprites, and shadows need the scene's mixed-kind overlap ordering instead.
+fn hasEffects(node: Node) -> bool {
+  return node.opacity != 1.0 || node.effects.blur > 0.0 || node.effects.backdropBlur > 0.0
+    || node.effects.hasColor()
+    || node.blend != 0
+}
+
+fn needsMixedOrder(node: Node) -> bool {
+  return node.alive && (node.flags & 1) == 0
+    && (node.kind != 0 || (node.shadow & 255) != 0 || (node.innerShadow & 255) != 0
+      || hasEffects(node))
+}
+
+struct PaintRun {
+  end: usize,
+  bounds: Rect<f32>,
+}
+
+impl Document {
+  /// Creates an empty document with no allocated shape slots.
+  pub fn make() -> Document {
+    return Document {
+      revision: 0,
+      nodes: List<Node>.make(),
+      blocks: List<Rect<f32>>.make(),
+      dirty: List<bool>.make(),
+      dirtyCount: 0,
+      mixedCount: 0,
+      paths: PathCache.make(),
+      circle: Path.make(),
+      tiles: List<ImageTile>.make(),
+      visible: 0,
+      visited: 0,
+    }
+  }
+
+  /// Registers an image tile and returns its stable shape kind (two or greater).
+  /// The caller keeps the tile allocated and uploads its pixels to the renderer atlas.
+  pub effect fn addTile(self: &mut Self, tile: AtlasTile) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.revision = self.revision + 1
+    run self.tiles.append(
+      ImageTile { tile: tile, view: Rect<f32>.new(0.0, 0.0, 1.0, 1.0), cropped: false, live: true },
+    )
+    return usize.toU32(self.tiles.length()) + 1
+  }
+
+  /// Replaces a registered tile for every element that uses its shape kind.
+  ///
+  /// Returns the previous tile, possibly already detached by `releaseTile`. Release its allocation
+  /// only if still live and different from the replacement's. Returns `None` for an unknown kind. Element geometry and
+  /// identity do not change. The caller must upload and keep the replacement tile allocated.
+  pub fn replaceTile(self: &mut Self, kind: u32, tile: AtlasTile) -> Option<AtlasTile> {
+    if kind < 2 || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return Option<AtlasTile>.None
+    }
+    let index = u32.toUsize(kind - 2)
+    self.revision = self.revision + 1
+    let previous = self.tiles.get(index)
+    self.tiles.set(
+      index,
+      ImageTile { tile: tile, view: Rect<f32>.new(0.0, 0.0, 1.0, 1.0), cropped: false, live: true },
+    )
+    return Option<AtlasTile>.Some { value: previous.tile }
+  }
+
+  /// Maps a tile onto a normalized subrectangle of every element using its kind.
+  ///
+  /// Supply finite bounds within `[0, 1]` with positive area. Cropped pixels must already
+  /// include any rounded-corner clipping. Hit geometry stays unchanged. Unknown kinds fail.
+  pub fn setTileView(self: &mut Self, kind: u32, view: Rect<f32>) -> bool {
+    if kind < 2 || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return false
+    }
+    let index = u32.toUsize(kind - 2)
+    let mut image = self.tiles.get(index)
+    self.revision = self.revision + 1
+    image.view = view
+    image.cropped = true
+    self.tiles.set(index, image)
+    return image.live
+  }
+
+  /// Detaches a registered tile and returns its allocation for the caller to release.
+  ///
+  /// Consumers draw nothing until `replaceTile` installs another tile in the same kind.
+  /// Repeated release or an unknown kind returns `None`.
+  pub fn releaseTile(self: &mut Self, kind: u32) -> Option<AtlasTile> {
+    if kind < 2 || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return Option<AtlasTile>.None
+    }
+    let index = u32.toUsize(kind - 2)
+    let mut image = self.tiles.get(index)
+    if !image.live {
+      return Option<AtlasTile>.None
+    }
+    self.revision = self.revision + 1
+    image.live = false
+    self.tiles.set(index, image)
+    return Option<AtlasTile>.Some { value: image.tile }
+  }
+
+  /// Switches an image element to a registered tile without changing its hit bounds.
+  /// Returns false for unknown IDs, non-image elements, or unregistered kinds.
+  pub fn setImageKind(self: &mut Self, id: u32, kind: u32) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length() || kind < 2
+      || u32.toUsize(kind - 2) >= self.tiles.length() {
+      return false
+    }
+    let index = u32.toUsize(id - 1)
+    let mut node = self.nodes.get(index)
+    if !node.alive || node.kind < 2 {
+      return false
+    }
+    if node.kind == kind {
+      return true
+    }
+    self.revision = self.revision + 1
+    node.kind = kind
+    self.nodes.set(index, node)
+    return true
+  }
+
+  /// Sets an image element's normalized source crop without copying its texture.
+  /// Rejects unknown/non-image elements and nonfinite, empty or out-of-range crops.
+  pub fn setImageSource(self: &mut Self, id: u32, source: Rect<f32>) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length()
+      || !(source.xMin >= 0.0 && source.yMin >= 0.0 && source.xMax <= 1.0 && source.yMax <= 1.0
+        && source.xMax > source.xMin
+        && source.yMax > source.yMin) {
+      return false
+    }
+    let index = u32.toUsize(id - 1)
+    let mut node = self.nodes.get(index)
+    if !node.alive || node.kind < 2 {
+      return false
+    }
+    self.revision = self.revision + 1
+    node.source = source
+    self.nodes.set(index, node)
+    return true
+  }
+
+  /// Appends an element and returns its nonzero ID. IDs are not reused after removal.
+  pub effect fn add(self: &mut Self, node: Node) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Reserve both lists before mutation, so allocation failure cannot break the block map.
+    run self.nodes.reserve(1)
+    let index = self.nodes.length() / BLOCK
+    if self.nodes.length() % BLOCK == 0 {
+      run self.blocks.reserve(1)
+      run self.dirty.reserve(1)
+      run self.blocks.append(emptyBounds())
+      run self.dirty.append(false)
+    }
+    self.revision = self.revision + 1
+    run self.nodes.append(node)
+    if needsMixedOrder(node) {
+      self.mixedCount = self.mixedCount + 1
+    }
+    if node.alive && (node.flags & 1) == 0 {
+      let blocks = self.blocks.asMutSlice()
+      blocks[index] = unionBounds(blocks[index], node.paintBounds())
+    }
+    return usize.toU32(self.nodes.length())
+  }
+
+  /// Replaces an allocated slot, including a removed slot for undo. Returns false for unknown IDs.
+  pub fn set(self: &mut Self, id: u32, node: Node) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length() {
+      return false
+    }
+    let i = u32.toUsize(id - 1)
+    let nodes = self.nodes.asMutSlice()
+    if needsMixedOrder(nodes[i]) {
+      self.mixedCount = self.mixedCount - 1
+    }
+    if needsMixedOrder(node) {
+      self.mixedCount = self.mixedCount + 1
+    }
+    self.revision = self.revision + 1
+    nodes[i] = node
+    drop nodes
+    self.markDirty(i / BLOCK)
+    return true
+  }
+
+  /// Removes a live element. Returns false for an invalid or removed ID.
+  pub fn remove(self: &mut Self, id: u32) -> bool {
+    if id == 0 || u32.toUsize(id) > self.nodes.length() {
+      return false
+    }
+    let i = u32.toUsize(id - 1)
+    if !self.nodes.asSlice()[i].alive {
+      return false
+    }
+    let nodes = self.nodes.asMutSlice()
+    if needsMixedOrder(nodes[i]) {
+      self.mixedCount = self.mixedCount - 1
+    }
+    self.revision = self.revision + 1
+    nodes[i].alive = false
+    drop nodes
+    self.markDirty(i / BLOCK)
+    return true
+  }
+
+  fn markDirty(self: &mut Self, index: usize) -> () {
+    let dirty = self.dirty.asMutSlice()
+    if !dirty[index] {
+      dirty[index] = true
+      self.dirtyCount = self.dirtyCount + 1
+    }
+  }
+
+  fn refreshBounds(self: &mut Self) -> () {
+    if self.dirtyCount == 0 {
+      return
+    }
+    let mut i: usize = 0
+    while i < self.dirty.length() {
+      if self.dirty.asSlice()[i] {
+        self.rebuildBlock(i)
+      }
+      i = i + 1
+    }
+    self.dirtyCount = 0
+  }
+
+  fn rebuildBlock(self: &mut Self, index: usize) -> () {
+    let mut bounds = emptyBounds()
+    let mut i = index * BLOCK
+    let end = if i + BLOCK < self.nodes.length() {
+      i + BLOCK
+    } else {
+      self.nodes.length()
+    }
+    while i < end {
+      let n = self.nodes.asSlice()[i]
+      if n.alive && (n.flags & 1) == 0 {
+        bounds = unionBounds(bounds, n.paintBounds())
+      }
+      i = i + 1
+    }
+    let blocks = self.blocks.asMutSlice()
+    blocks[index] = bounds
+    let dirty = self.dirty.asMutSlice()
+    dirty[index] = false
+  }
+
+  /// Returns the topmost unlocked visible element at a world point, or zero.
+  pub fn hit(self: &mut Self, x: f32, y: f32) -> u32 {
+    self.refreshBounds()
+    let mut block = self.blocks.length()
+    while block > 0 {
+      block = block - 1
+      let b = self.blocks.asSlice()[block]
+      if x < b.xMin || y < b.yMin || x > b.xMax || y > b.yMax {
+        continue
+      }
+      let start = block * BLOCK
+      let mut i = if start + BLOCK < self.nodes.length() {
+        start + BLOCK
+      } else {
+        self.nodes.length()
+      }
+      while i > start {
+        i = i - 1
+        if self.nodes.asSlice()[i].contains(x, y) {
+          return usize.toU32(i + 1)
+        }
+      }
+    }
+    return 0
+  }
+
+  // The first rectangle's shadow has already been emitted. Stop before the next shadow,
+  // path or sprite: only same-kind quads may share an order without changing painter order.
+  // Stop at a culling-block boundary too, so a visible quad never scans distant blocks.
+  fn quadRun(self: &Self, start: usize, camera: Camera, mask: Rect<f32>) -> PaintRun {
+    let mut bounds = emptyBounds()
+    let mut end = start
+    let limit = (start / BLOCK + 1) * BLOCK
+    let s = camera.zoom * camera.scale
+    while end < self.nodes.length() && end < limit {
+      let n = self.nodes.asSlice()[end]
+      if end != start
+        && (needsMixedOrder(n) || hasEffects(self.nodes.asSlice()[start])
+          || (self.nodes.asSlice()[start].innerShadow & 255) != 0) {
+        break
+      }
+      if n.alive && (n.flags & 1) == 0 {
+        // Match paint's f32 arithmetic exactly, then clip before taking the union.
+        let x = (n.x - camera.x) * s
+        let y = (n.y - camera.y) * s
+        let b = Rect<f32>.new(
+          f32.max(x, mask.xMin),
+          f32.max(y, mask.yMin),
+          f32.min(x + n.width * s, mask.xMax),
+          f32.min(y + n.height * s, mask.yMax),
+        )
+        if b.xMin < b.xMax && b.yMin < b.yMax {
+          bounds = unionBounds(bounds, b)
+        }
+      }
+      end = end + 1
+    }
+    return PaintRun { end: end, bounds: bounds }
+  }
+
+  // Scene.finish sorts by texture. Disjoint texture envelopes can share a run;
+  // stop before crossing envelopes overlap so translucent painter order stays intact.
+  fn imageRun(self: &Self, start: usize, camera: Camera, mask: Rect<f32>) -> PaintRun {
+    let mut bounds = emptyBounds()
+    let mut end = start
+
+    // Culling blocks stay small; image batches can span them when order permits.
+    let limit = start + 1024
+    let mut textures: [u32; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let mut envelopes: [Rect<f32>; 8] = [
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+      emptyBounds(),
+    ]
+    let mut count: usize = 0
+    let s = camera.zoom * camera.scale
+    while end < self.nodes.length() && end < limit {
+      let n = self.nodes.asSlice()[end]
+      if end > start && (hasEffects(n) || hasEffects(self.nodes.asSlice()[start])) {
+        break
+      }
+      if n.alive && (n.flags & 1) == 0 {
+        if n.kind < 2 || u32.toUsize(n.kind - 2) >= self.tiles.length() {
+          break
+        }
+        let image = self.tiles.asSlice()[u32.toUsize(n.kind - 2)]
+        if image.live {
+          // Match the cropped sprite arithmetic exactly, then clip before union.
+          let x = (n.x - camera.x) * s
+          let y = (n.y - camera.y) * s
+          let view = image.view
+          let b = Rect<f32>.new(
+            f32.max(x + view.xMin * n.width * s, mask.xMin),
+            f32.max(y + view.yMin * n.height * s, mask.yMin),
+            f32.min(x + view.xMax * n.width * s, mask.xMax),
+            f32.min(y + view.yMax * n.height * s, mask.yMax),
+          )
+          if b.xMin < b.xMax && b.yMin < b.yMax {
+            let texture = image.tile.texture.index
+            let mut slot = count
+            let mut check: usize = 0
+            let mut overlaps = false
+            while check < count {
+              if textures[check] == texture {
+                slot = check
+              } else {
+                let prior = envelopes[check]
+                if b.xMin < prior.xMax && b.xMax > prior.xMin && b.yMin < prior.yMax
+                  && b.yMax > prior.yMin {
+                  overlaps = true
+                }
+              }
+              check = check + 1
+            }
+            if overlaps || slot == 8 {
+              break
+            }
+            if slot == count {
+              textures[slot] = texture
+              count = count + 1
+            }
+            envelopes[slot] = unionBounds(envelopes[slot], b)
+            bounds = unionBounds(bounds, b)
+          }
+        }
+      }
+      end = end + 1
+    }
+    return PaintRun { end: end, bounds: bounds }
+  }
+
+  /// Bounds of an image-only scene suitable for GPU camera transforms. Hidden
+  /// elements are ignored; filters and mixed primitives use the ordinary painter.
+  pub fn retainedImageBounds(self: &Self) -> Option<Rect<f32>> {
+    let mut bounds = emptyBounds()
+    let mut found = false
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = self.nodes.get(i)
+      if node.alive && (node.flags & 1) == 0 {
+        if node.kind < 2 || hasEffects(node) {
+          return Option<Rect<f32>>.None
+        }
+        bounds = unionBounds(bounds, node.paintBounds())
+        found = true
+      }
+      i = i + 1
+    }
+    return if found {
+      Option<Rect<f32>>.Some { value: bounds }
+    } else {
+      Option<Rect<f32>>.None
+    }
+  }
+
+  /// Paints visible elements in insertion order, then finishes the scene's batches.
+  ///
+  /// Camera values must be finite, with positive zoom and scale. `cull` disables offscreen
+  /// submission when true. False is a diagnostic baseline and still clips to the viewport.
+  pub effect fn paint(self: &mut Self, scene: &mut Scene, camera: Camera, cull: bool) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    self.refreshBounds()
+    scene.clear()
+    self.visible = 0
+    self.visited = 0
+    run self.paths.beginFrame()
+    if self.circle.isEmpty() {
+      run self.circle.circle(0.5, 0.5, 0.5)
+    }
+    let s = camera.zoom * camera.scale
+    let mask = ContentMask.new(
+      Rect<f32>.new(0.0, 0.0, camera.width * camera.scale, camera.height * camera.scale),
+    )
+    let viewport = Rect<f32>.new(
+      camera.x,
+      camera.y,
+      camera.x + camera.width / camera.zoom,
+      camera.y + camera.height / camera.zoom,
+    )
+    if self.mixedCount == 0 {
+      run scene.pushLayer(mask.bounds)
+    }
+    let mut runEnd: usize = 0
+    let mut pinnedRun = false
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      if pinnedRun && i >= runEnd {
+        run scene.popLayer()
+        pinnedRun = false
+      }
+      if cull && i % BLOCK == 0 && !overlaps(self.blocks.asSlice()[i / BLOCK], viewport) {
+        i = i + BLOCK
+        continue
+      }
+      let n = self.nodes.asSlice()[i]
+      i = i + 1
+      self.visited = self.visited + 1
+      if !n.alive || (n.flags & 1) != 0 {
+        continue
+      }
+      if cull && !overlaps(n.paintBounds(), viewport) {
+        continue
+      }
+      self.visible = self.visible + 1
+      let x = (n.x - camera.x) * s
+      let y = (n.y - camera.y) * s
+      let bounds = Rect<f32>.new(x, y, x + n.width * s, y + n.height * s)
+      let isolated = hasEffects(n)
+      if isolated {
+        let paint = n.paintBounds()
+        let mut effects = n.effects
+        effects.blur = effects.blur * s
+        effects.backdropBlur = effects.backdropBlur * s
+        effects.clip = bounds
+        effects.radius = n.radius * s
+        effects.shape = if n.kind == 1 {
+          1
+        } else {
+          0
+        }
+        drop run scene.pushEffectLayer(
+          Rect<f32>.new(
+            (paint.xMin - camera.x) * s,
+            (paint.yMin - camera.y) * s,
+            (paint.xMax - camera.x) * s,
+            (paint.yMax - camera.y) * s,
+          ),
+          mask,
+          Isolation { opacity: n.opacity, blend: n.blend },
+          effects,
+        )
+      }
+      let fill = if (n.flags & 4) != 0 {
+        Background.linear(n.angle, color.rgba(n.fill), color.rgba(n.fill2))
+      } else {
+        Background.solid(color.rgba(n.fill))
+      }
+      if n.kind >= 2 && u32.toUsize(n.kind - 2) < self.tiles.length() {
+        let image = self.tiles.asSlice()[u32.toUsize(n.kind - 2)]
+        if !image.live {
+          if isolated {
+            run scene.popLayer()
+          }
+          continue
+        }
+        if i > runEnd {
+          let group = self.imageRun(i - 1, camera, mask.bounds)
+          runEnd = group.end
+          if !isolated && group.end > i && group.bounds.xMin < group.bounds.xMax
+            && group.bounds.yMin < group.bounds.yMax {
+            run scene.pushLayer(group.bounds)
+            pinnedRun = true
+          }
+        }
+        let view = image.view
+        let imageBounds = Rect<f32>.new(
+          x + view.xMin * n.width * s,
+          y + view.yMin * n.height * s,
+          x + view.xMax * n.width * s,
+          y + view.yMax * n.height * s,
+        )
+        drop run scene.image(
+          ImageSprite {
+            quarterTurns: 0,
+            clipBounds: imageBounds,
+            bounds: imageBounds,
+            mask: mask,
+            tile: sourceTile(image.tile, n.source),
+            opacity: color.rgba(n.fill).a,
+            cornerRadii: Corners<f32>.uniform(
+              if image.cropped {
+                0.0
+              } else {
+                n.radius * s
+              },
+            ),
+            grayscale: false,
+          },
+        )
+      } else if n.kind == 1 {
+        let transform = Affine.new(
+          f32.toF64(n.width * s),
+          0.0,
+          0.0,
+          f32.toF64(n.height * s),
+          f32.toF64(x),
+          f32.toF64(y),
+        )
+        drop run self.paths.fill(&mut scene, 1, &self.circle, &transform, NONZERO, fill, mask)
+      } else {
+        let radius = Corners<f32>.uniform(n.radius * s)
+        if (n.shadow & 255) != 0 {
+          drop run scene.shadow(
+            Shadow {
+              bounds: bounds,
+              mask: mask,
+              cornerRadii: radius,
+              color: color.rgba(n.shadow),
+              blurRadius: n.blur * s,
+              offset: Vector2<f32>.new(n.shadowX * s, n.shadowY * s),
+              spread: 0.0,
+              inset: false,
+            },
+          )
+        }
+        if self.mixedCount != 0 && i > runEnd {
+          let group = self.quadRun(i - 1, camera, mask.bounds)
+          runEnd = group.end
+          if !isolated && group.end > i && group.bounds.xMin < group.bounds.xMax
+            && group.bounds.yMin < group.bounds.yMax {
+            run scene.pushLayer(group.bounds)
+            pinnedRun = true
+          }
+        }
+        let mut quad = Quad.fill(bounds, mask, fill)
+        quad.cornerRadii = radius
+        quad.borderWidths = Insets<f32>.uniform(n.borderWidth * s)
+        quad.borderColor = color.rgba(n.border)
+        drop run scene.quad(quad)
+        if (n.innerShadow & 255) != 0 {
+          drop run scene.shadow(
+            Shadow {
+              bounds: bounds,
+              mask: mask,
+              cornerRadii: radius,
+              color: color.rgba(n.innerShadow),
+              blurRadius: n.innerBlur * s,
+              offset: Vector2<f32>.new(n.innerX * s, n.innerY * s),
+              spread: 0.0,
+              inset: true,
+            },
+          )
+        }
+      }
+      if isolated {
+        run scene.popLayer()
+      }
+    }
+    if self.mixedCount == 0 || pinnedRun {
+      run scene.popLayer()
+    }
+    run scene.finish()
+  }
+}
+
+// Cropping changes UV bounds only. Allocation identity stays shared, so atlas
+// replacement, texture batching and lifetime remain owned by the original image.
+fn sourceTile(tile: AtlasTile, source: Rect<f32>) -> AtlasTile {
+  let width = u32.toF32(tile.bounds.xMax - tile.bounds.xMin)
+  let height = u32.toF32(tile.bounds.yMax - tile.bounds.yMin)
+  let x = tile.bounds.xMin + f32.toU32(f32.min(width - 1.0, f32.round(source.xMin * width)))
+  let y = tile.bounds.yMin + f32.toU32(f32.min(height - 1.0, f32.round(source.yMin * height)))
+  let mut result = tile
+  let right = tile.bounds.xMin + f32.toU32(f32.round(source.xMax * width))
+  let bottom = tile.bounds.yMin + f32.toU32(f32.round(source.yMax * height))
+  result.bounds = Rect<u32>.new(
+    x,
+    y,
+    if right > x {
+      right
+    } else {
+      x + 1
+    },
+    if bottom > y {
+      bottom
+    } else {
+      y + 1
+    },
+  )
+  return result
+}

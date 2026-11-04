@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Measure ordinary UI-tree scrolling. Build the release demo with scripts/run first."""
+import argparse
+import datetime
+import json
+import hashlib
+from pathlib import Path
+import platform
+import re
+import statistics
+import subprocess
+
+REPO = Path(__file__).resolve().parents[4]
+ROW = re.compile(r'scroll-ms: input=(\S+) frame=(\S+) y=(\S+) painted=(\S+) replayed=(\S+) glyphs=(\S+) layoutSkipped=(\S+)')
+
+
+def stats(values):
+    values = sorted(values)
+    return dict(medianMs=statistics.median(values), p95Ms=values[int((len(values)-1)*.95)], maxMs=max(values))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--sizes', nargs='+', type=int, default=[100, 1000])
+    parser.add_argument('--fully-mounted', action='store_true')
+    parser.add_argument('--phases', action='store_true', help='Resolve layout separately before painting; use to diagnose, not for the normal baseline')
+    parser.add_argument('--timeout', type=int, default=600)
+    parser.add_argument('--steps', type=int, default=120)
+    parser.add_argument('--directory', type=Path, default=REPO / 'build/scroll-lab')
+    args = parser.parse_args()
+    if args.steps < 2 or args.steps > 1000 or any(n < 1 or n > 10000 for n in args.sizes):
+        parser.error('sizes must be 1..10000 and steps 2..1000')
+    candidates = list((REPO/'build/llvm').glob('*/release/silk-scroll-demo'))
+    if len(candidates) != 1:
+        parser.error('Build the release demo first')
+    args.directory.mkdir(parents=True, exist_ok=True)
+    result = dict(date=datetime.datetime.now(datetime.timezone.utc).isoformat(), machine=platform.machine(),
+        viewport=dict(width=1280,height=900,scale=2),
+        revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
+        dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=REPO, text=True).strip()),
+        binarySha256=hashlib.sha256(candidates[0].read_bytes()).hexdigest(),
+        metric='CPU wheel dispatch/runtime pump and UI-tree frame (layout/paint); excludes GPU, native accessibility, and presentation',
+        phases=args.phases,
+        document='Fully mounted' if args.fully_mounted else 'Library-virtualized variable-height mixed-content sections', cases=[])
+    for size in args.sizes:
+        log = args.directory / f'{size}.log'
+        with log.open('w') as out:
+            subprocess.run([str(candidates[0]),'--benchmark',f'--sections={size}',f'--steps={args.steps}'] + (['--phases'] if args.phases else []) + (['--fully-mounted'] if args.fully_mounted else []),
+                cwd=REPO,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=args.timeout)
+        text = log.read_text()
+        rows = ROW.findall(text)
+        assert len(rows) == args.steps, (size, len(rows), text[-1000:])
+        mount = re.search(r'mount-ms: (\S+) nodes=(\S+) fragments=(\S+)',text)
+        case=dict(sections=size,nodes=int(mount[2]),fragments=int(mount[3]),mountMs=float(mount[1]),
+            samples=len(rows),input=stats([float(r[0]) for r in rows]),
+            frame=stats([float(r[1]) for r in rows]),
+            total=stats([float(r[0])+float(r[1]) for r in rows]),
+            paintedFragmentsMax=max(int(r[3]) for r in rows),layoutSkippedFrames=sum(r[6]=='true' for r in rows))
+        mount_phases = re.search(r'mount-phases-ms: build=(\S+) firstFrame=(\S+)', text)
+        if mount_phases:
+            case.update(buildMs=float(mount_phases[1]), firstFrameMs=float(mount_phases[2]))
+        phases = re.findall(r'phase-ms: layout=(\S+) remainingFrame=(\S+) fullLayouts=(\S+)', text)
+        if phases:
+            case.update(layout=stats([float(p[0]) for p in phases]), remainingFrame=stats([float(p[1]) for p in phases]), fullLayoutsMax=max(int(p[2]) for p in phases))
+        full_layouts = re.findall(r'layoutSkipped=\S+ fullLayouts=(\d+)', text)
+        if full_layouts:
+            case['fullLayoutsMax'] = max(int(n) for n in full_layouts)
+        case['glyphsMax'] = max(int(r[5]) for r in rows)
+        result['cases'].append(case)
+        (args.directory/'results.json').write_text(json.dumps(result,indent=2)+'\n')
+        print(json.dumps(case),flush=True)
+    print(args.directory/'results.json')
+
+
+if __name__ == '__main__':
+    main()

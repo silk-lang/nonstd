@@ -1,0 +1,229 @@
+//! Contracts for retained identity, shape hits, and conservative viewport culling.
+import document { Document, Node, Camera }
+import ui_scene.scene { Scene }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.geometry.rect { Rect }
+import silk.num.u32
+import atlas.atlas { Atlas, AtlasOptions, AtlasError, Kind, AtlasTile }
+import silk.core.option { Option }
+import vector.geometry_error { GeometryError }
+
+effect fn identity() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut doc = Document.make()
+  let mut n = Node.rect(10.0, 10.0, 40.0, 30.0, 0xffffffff)
+  let a = run doc.add(n)
+  n.kind = 1
+  let b = run doc.add(n)
+  run Testing.expect(doc.hit(30.0, 25.0) == b, "the last painted element receives the hit")
+  run Testing.expect(doc.hit(10.0, 10.0) == a, "ellipse corner passes through to rectangle")
+  n.flags = 2
+  drop doc.set(b, n)
+  run Testing.expect(doc.hit(30.0, 25.0) == a, "locked geometry does not receive hits")
+  drop doc.remove(a)
+  run Testing.expect(doc.hit(30.0, 25.0) == 0, "removed geometry does not receive hits")
+  run Testing.expect(
+    !doc.remove(a) && !doc.remove(0) && !doc.set(999, n),
+    "invalid IDs cannot mutate another element",
+  )
+  n.flags = 0
+  n.kind = 0
+  n.radius = 10.0
+  drop doc.set(a, n)
+  run Testing.expect(doc.hit(10.0, 10.0) == 0, "restored rounded corner remains empty")
+  let c = run doc.add(n)
+  run Testing.expect(c > b && a == 1, "IDs do not recycle")
+}
+
+test effect fn stableIdentityAndGeometry() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run identity() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn culling() -> ()
+  ! OutOfMemoryError | GeometryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut doc = Document.make()
+  let mut i: u32 = 0
+  while i < 10000 {
+    drop run doc.add(
+      Node.rect(u32.toF32(i % 100) * 100.0, u32.toF32(i / 100) * 100.0, 50.0, 50.0, 0xffffffff),
+    )
+    i = i + 1
+  }
+  let mut scene = Scene.make()
+  let camera = Camera { x: 0.0, y: 0.0, zoom: 1.0, scale: 2.0, width: 90.0, height: 90.0 }
+  run doc.paint(&mut scene, camera, true)
+  run Testing.expect(
+    doc.visible == 1 && scene.quads(0).length == 1,
+    "only the first grid element is visible",
+  )
+  run Testing.expect(doc.visited < 1000, "block pruning avoids a full element scan")
+  let moved = Node.rect(20.0, 20.0, 50.0, 50.0, 0xff0000ff)
+  drop doc.set(9999, moved)
+  run doc.paint(&mut scene, camera, true)
+  run Testing.expect(
+    doc.visible == 2 && doc.hit(30.0, 30.0) == 9999,
+    "a move updates culling and hit bounds",
+  )
+  drop doc.remove(9999)
+  run doc.paint(&mut scene, camera, true)
+  run Testing.expect(doc.visible == 1 && doc.hit(30.0, 30.0) == 1, "removal updates block bounds")
+  let mut hidden = moved
+  hidden.flags = 1
+  drop doc.set(9999, hidden)
+  run doc.paint(&mut scene, camera, true)
+  run Testing.expect(doc.visible == 1, "hidden restored slots remain excluded")
+  let mut shadow = Node.rect(-25.0, 20.0, 10.0, 20.0, 0xffffffff)
+  shadow.shadow = 0xffffffff
+  shadow.blur = 30.0
+  drop doc.set(9999, shadow)
+  run doc.paint(&mut scene, camera, true)
+  run Testing.expect(
+    doc.visible == 2 && scene.shadows(0).length == 1,
+    "offscreen geometry keeps visible shadow reach",
+  )
+  let distant = Camera {
+    x: -1000.0,
+    y: -1000.0,
+    zoom: 2.0,
+    scale: 1.0,
+    width: 100.0,
+    height: 100.0,
+  }
+  run doc.paint(&mut scene, distant, true)
+  run Testing.expect(doc.visible == 0 && doc.visited == 0, "empty viewport submits no elements")
+}
+
+test effect fn cullingFollowsMutationsAndShadowReach() -> ()
+  ! OutOfMemoryError | GeometryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run culling() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn replaceImage() -> ()
+  ! OutOfMemoryError | GeometryError | AtlasError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(AtlasOptions.default())
+  let original = run atlas.allocate(Kind.Polychrome, 8, 8)
+  let replacement = run atlas.allocate(Kind.Polychrome, 16, 16)
+  let mut doc = Document.make()
+  let kind = run doc.addTile(original)
+  let mut node = Node.rect(0.0, 0.0, 20.0, 20.0, 0xffffffff)
+  node.kind = kind
+  let id = run doc.add(node)
+  node.x = 25.0
+  drop run doc.add(node)
+  let previous = doc.replaceTile(kind, replacement)
+  let valid = match previous {
+    Option<AtlasTile>.Some { value } => value.id.index == original.id.index
+    Option<AtlasTile>.None => false
+  }
+  run Testing.expect(valid, "replacement returns the old allocation for release")
+  let invalid = doc.replaceTile(kind + 1, original)
+  run Testing.expect(
+    match invalid {
+      Option<AtlasTile>.None => true
+      _ => false
+    },
+    "unknown image kinds cannot replace another slot",
+  )
+  let mut scene = Scene.make()
+  run doc.paint(
+    &mut scene,
+    Camera { x: 0.0, y: 0.0, zoom: 1.0, scale: 1.0, width: 100.0, height: 100.0 },
+    true,
+  )
+  run Testing.expect(scene.images(0).length == 2, "both image elements survive replacement")
+  run Testing.expect(
+    scene.images(0)[0].tile.id.index == replacement.id.index
+      && scene.images(0)[1].tile.id.index == replacement.id.index
+      && doc.hit(5.0, 5.0) == id,
+    "tile replacement updates every consumer without changing element geometry or identity",
+  )
+  run Testing.expect(
+    doc.setTileView(kind, Rect<f32>.new(0.25, 0.5, 0.75, 1.0)),
+    "a tile can represent a normalized image window",
+  )
+  run doc.paint(
+    &mut scene,
+    Camera { x: 0.0, y: 0.0, zoom: 1.0, scale: 1.0, width: 100.0, height: 100.0 },
+    true,
+  )
+  run Testing.expect(
+    scene.images(0)[0].bounds.xMin == 5.0 && scene.images(0)[0].bounds.yMin == 10.0
+      && scene.images(0)[0].bounds.xMax == 15.0
+      && scene.images(0)[0].bounds.yMax == 20.0
+      && doc.hit(1.0, 1.0) == id,
+    "image cropping changes paint bounds, not hit geometry",
+  )
+  let alternate = run doc.addTile(original)
+  run Testing.expect(
+    doc.setImageKind(id, alternate) && !doc.setImageKind(999, alternate),
+    "image rebinding validates element IDs",
+  )
+  drop doc.releaseTile(kind)
+  run doc.paint(
+    &mut scene,
+    Camera { x: 0.0, y: 0.0, zoom: 1.0, scale: 1.0, width: 100.0, height: 100.0 },
+    true,
+  )
+  run Testing.expect(
+    scene.images(0).length == 1 && scene.images(0)[0].tile.id.index == original.id.index,
+    "released tiles stop painting while independent image consumers stay live",
+  )
+}
+
+test effect fn imageReplacementPreservesSharedIdentity() -> ()
+  ! OutOfMemoryError | GeometryError | AtlasError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run replaceImage() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn imageTextureOrder() -> ()
+  ! OutOfMemoryError | GeometryError | AtlasError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut atlas = Atlas.make(
+    AtlasOptions { textureSize: 16, maxTextureSize: 16, maxTextures: 8, padding: 1 },
+  )
+  let a = run atlas.allocate(Kind.Polychrome, 8, 8)
+  let b = run atlas.allocate(Kind.Polychrome, 8, 8)
+  run Testing.expect(a.texture.index != b.texture.index, "fixture spans atlas pages")
+  let mut doc = Document.make()
+  let ka = run doc.addTile(a)
+  let kb = run doc.addTile(b)
+  let mut i: u32 = 0
+  while i < 130 {
+    let mut n = Node.rect(0.25, 0.5, 30.0, 20.0, 0xffffff80)
+    n.kind = if i == 64 {
+      kb
+    } else {
+      ka
+    }
+    drop run doc.add(n)
+    i = i + 1
+  }
+  let mut scene = Scene.make()
+  run doc.paint(
+    &mut scene,
+    Camera { x: 0.0, y: 0.0, zoom: 0.03, scale: 2.0, width: 100.0, height: 100.0 },
+    true,
+  )
+  run Testing.expect(scene.images(0).length == 130, "batching retains every image")
+  run Testing.expect(
+    scene.images(0)[63].tile.texture.index == a.texture.index
+      && scene.images(0)[64].tile.texture.index == b.texture.index
+      && scene.images(0)[65].tile.texture.index == a.texture.index,
+    "overlapping image runs preserve painter order across texture pages and block boundaries",
+  )
+}
+
+test effect fn imageRunsPreserveTextureOrder() -> ()
+  ! OutOfMemoryError | GeometryError | AtlasError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run imageTextureOrder() |> Effect.provideMut<Allocator>(&mut allocator)
+}
