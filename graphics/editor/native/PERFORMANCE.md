@@ -38,3 +38,37 @@ The native GPU check also passed at 2880×1920 physical pixels: mean absolute
 channel difference 0.00745/255 against the CPU reference, with 1,874 of 22,118,400
 channels exceeding the 8/255 comparison threshold. This is rendering validation,
 not a GPU speed measurement.
+
+## Image/text camera workload after glyph-cache and native rendering fixes
+
+Measured on the same Apple M1 Max at 1440×960 logical pixels, 2× scale, in a
+release build. Run `python3 graphics/editor/native/scripts/camera-check` after
+building the app. Raw stage summaries are in [benchmarks/camera.json](benchmarks/camera.json).
+
+The benchmark creates 100k image/text cards in memory, then dispatches 120 zoom
+steps and 40 overview pan steps through the native UI event path. It compares the
+ordinary renderer with GPU-retained overview geometry in the same executable.
+The creation frame is excluded. These are frame submission wall times, including
+surface waits; they are not GPU timestamp measurements or display FPS. This is
+not a new browser-versus-native measurement.
+
+| Native path | Zoom median | Overview pan median |
+| --- | ---: | ---: |
+| Ordinary | 16.25 ms | 30.58 ms |
+| Retained images | 8.25 ms | 9.03 ms |
+
+The retained/ordinary GPU readback comparison passes at 2880×1920: mean channel
+difference 0.01195/255, maximum 12, and 180 of 22,118,400 channels differing by
+more than 8. Native chrome is composited separately; backdrop-dependent controls,
+grid, and unsupported document primitives/effects use the ordinary renderer.
+
+The disappearing characters came from the scratch glyph atlas never advancing
+its eviction frame. Old zoom sizes filled it and allocation failures became empty
+glyphs. Each label raster now advances the atlas frame and repaints its active
+glyphs. A regression renders all 26 letters through 48 zoom/font changes under
+atlas pressure. Another compares shared text after zoom/pan against fresh pixels.
+
+Close-up text changes update visible bindings in place, and power-of-two raster
+densities reduce repeated work during zoom. The optional inspector keeps a full
+CPU scene for screenshots and uses ordinary composition; its IPC timings do not
+measure the retained native path.

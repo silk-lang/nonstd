@@ -52,7 +52,11 @@ impl Copy for Measurement {}
 
 struct TextProbe {
   element: usize,
-  cache: usize
+  cache: usize,
+  node: u32,
+  kind: u32,
+  tileIndex: u32,
+  tileGeneration: u32,
 }
 
 impl Copy for TextProbe {}
@@ -97,8 +101,17 @@ pub struct Canvas {
   rasterFrame: u64,
   normalizedRevision: u64,
   probes: List<TextProbe>,
+  allTextBound: bool,
   probeBounds: List<Rect<f32>>,
   pub scene: Scene,
+  /// Image-only overview geometry, transformed by the GPU independently of chrome.
+  pub retainedScene: Scene,
+  pub retained: bool,
+  pub retainedRevision: u64,
+  pub retainedX: f32,
+  pub retainedY: f32,
+  retainedValid: bool,
+  imageBounds: Option<Rect<f32>>,
   shapes: Scene,
   revision: u64,
   paintedRevision: u64,
@@ -140,8 +153,16 @@ impl Canvas {
       rasterFrame: 0,
       normalizedRevision: 18446744073709551615,
       probes: List<TextProbe>.make(),
+      allTextBound: false,
       probeBounds: List<Rect<f32>>.make(),
       scene: Scene.make(),
+      retainedScene: Scene.make(),
+      retained: false,
+      retainedRevision: 0,
+      retainedX: 0.0,
+      retainedY: 0.0,
+      retainedValid: false,
+      imageBounds: Option<Rect<f32>>.None,
       shapes: Scene.make(),
       revision: 18446744073709551615,
       paintedRevision: 18446744073709551615,
@@ -286,7 +307,7 @@ impl Canvas {
     let stretchY = e.shape.height / naturalHeight
     let wanted = f32.max(0.001, m.zoom * scale * f32.max(stretchX, stretchY))
     let small = e.fontSize <= 12.0 && naturalWidth <= 256.0 && naturalHeight <= 32.0
-    let density = if self.exporting {
+    let requested = if self.exporting {
       wanted
     } else {
       f32.max(
@@ -297,6 +318,13 @@ impl Canvas {
         },
         f32.ceil(wanted * 4.0) / 4.0,
       )
+    }
+    let mut density = requested
+    if !self.exporting {
+      density = 0.25
+      while density < requested {
+        density = density * 2.0
+      }
     }
     let totalWidth = f32.max(1.0, f32.ceil(naturalWidth * density))
     let totalHeight = f32.max(1.0, f32.ceil(naturalHeight * density))
@@ -382,7 +410,17 @@ impl Canvas {
       ],
     )
     run textTree.apply(run batch.take())
+
+    // This scratch tree paints one label, then copies its pixels into the canvas
+    // atlas. Earlier labels no longer need their glyph tiles. Advance eviction
+    // and disable subtree replay so every glyph used now is touched again.
+    drop textTree.atlas.beginFrame()
+    textTree.invalidatePaint()
     run textTree.frame(FrameInput { width: w, height: h, scale: 1.0, time: 0.0 })
+    if textTree.atlas.evicted().length > 0 {
+      drop run textTree.glyphs.prune(&textTree.atlas)
+      textTree.atlas.clearEvicted()
+    }
     run snapshot.sync(&mut textTree)
     let pixels = run snapshot.render(&textTree.*)
     if old != usize.MAX {
@@ -490,9 +528,24 @@ impl Canvas {
     }
   }
 
-  effect fn probe(self: &mut Self, element: usize, e: Element, cache: usize) -> ()
+  effect fn probe(
+    self: &mut Self,
+    element: usize,
+    e: Element,
+    cache: usize,
+    node: u32,
+    kind: u32,
+  ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if cache == usize.MAX {
+      self.allTextBound = false
+    } else {
+      let tile = self.text.get(cache)
+      if croppedText(tile) {
+        self.allTextBound = false
+      }
+    }
     let block = self.probes.length() / 64
     let bounds = Rect<f32>.new(
       e.shape.x,
@@ -514,12 +567,53 @@ impl Canvas {
         ),
       )
     }
-    run self.probes.append(TextProbe { element: element, cache: cache })
+    run self.probes.append(
+      TextProbe {
+        element: element,
+        cache: cache,
+        node: node,
+        kind: kind,
+        tileIndex: if cache == usize.MAX {
+          0
+        } else {
+          self.text.get(cache).tile.id.index
+        },
+        tileGeneration: if cache == usize.MAX {
+          0
+        } else {
+          self.text.get(cache).tile.id.generation
+        },
+      },
+    )
   }
 
   // Most camera changes need no document rebuild: all small labels already have
   // sufficient raster density. Check only text blocks intersecting the viewport.
   fn needsText(self: &Self, m: &Studio, scale: f32, tree: &UiTree) -> bool {
+    // Complete overview bindings share hundreds of rasters across 100k labels.
+    // Validate each current raster once instead of checking every instance.
+    if self.allTextBound {
+      let mut at: usize = 0
+      while at < self.text.length() {
+        let tile = self.text.get(at)
+        if tile.used == self.rasterFrame {
+          if let Option<AtlasTile>.None = tree.atlas.get(tile.tile.id) {
+            return true
+          }
+          let wanted = f32.max(
+            0.25,
+            f32.ceil(m.zoom * scale * f32.max(tile.stretchX, tile.stretchY) * 4.0) / 4.0,
+          )
+          let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0 && tile.naturalHeight <= 32.0
+          if tile.density < wanted
+            || tile.density > wanted * 4.0 && !(small && self.textPixels < 16000000) {
+            return true
+          }
+        }
+        at = at + 1
+      }
+      return false
+    }
     let viewport = Rect<f32>.new(
       m.cameraX,
       m.cameraY,
@@ -547,6 +641,10 @@ impl Canvas {
               return true
             }
             let tile = self.text.get(probe.cache)
+            if probe.tileIndex != tile.tile.id.index
+              || probe.tileGeneration != tile.tile.id.generation {
+              return true
+            }
             if let Option<AtlasTile>.None = tree.atlas.get(tile.tile.id) {
               return true
             }
@@ -574,6 +672,70 @@ impl Canvas {
       block = block + 1
     }
     return false
+  }
+
+  // Camera motion only refreshes visible text bindings, preserving the shape store,
+  // hierarchy, spatial blocks, and the other 100k image nodes.
+  effect fn refreshText(
+    self: &mut Self,
+    m: &Studio,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    self.rasterFrame = self.rasterFrame + 1
+    let mut updated: usize = 0
+    let mut cropped = false
+    let right = m.cameraX + m.canvasWidth() / m.zoom
+    let bottom = m.cameraY + m.canvasHeight() / m.zoom
+    let mut block: usize = 0
+    while block < self.probeBounds.length() {
+      let b = self.probeBounds.get(block)
+      if b.xMin < right && b.xMax > m.cameraX && b.yMin < bottom && b.yMax > m.cameraY {
+        let mut at = block * 64
+        let end = if at + 64 < self.probes.length() {
+          at + 64
+        } else {
+          self.probes.length()
+        }
+        while at < end {
+          let mut probe = self.probes.get(at)
+          let e = m.elements.get(probe.element)
+          if e.shape.x < right && e.shape.x + e.shape.width > m.cameraX && e.shape.y < bottom
+            && e.shape.y + e.shape.height > m.cameraY {
+            let tile = run self.textTile(m, e, &mut tree, &mut textTree, &mut snapshot, scale)
+            updated = updated + 1
+            cropped = cropped || croppedText(tile)
+            let mut node = e.shape
+            node.opacity = editing.opacity(m, e)
+            if probe.kind < 2 {
+              probe.kind = run self.document.addTile(tile.tile)
+            } else {
+              drop self.document.replaceTile(probe.kind, tile.tile)
+            }
+            node.kind = probe.kind
+            node.x = node.x + tile.cropX / tile.density * tile.stretchX
+            node.y = node.y + tile.cropY / tile.density * tile.stretchY
+            node.width = tile.pixelsWidth / tile.density * tile.stretchX
+            node.height = tile.pixelsHeight / tile.density * tile.stretchY
+            node.fill = 0xffffffff
+            drop self.document.set(probe.node, node)
+            probe.cache = tile.cache
+            probe.tileIndex = tile.tile.id.index
+            probe.tileGeneration = tile.tile.id.generation
+            self.probes.set(at, probe)
+          }
+          at = at + 1
+        }
+      }
+      block = block + 1
+    }
+    self.allTextBound = updated == self.probes.length() && !cropped
+    self.retainedValid = false
+    self.imageBounds = self.document.retainedImageBounds()
   }
 
   /// Renders the selection or page to a transparent image, capped at 4096 pixels per axis.
@@ -625,6 +787,36 @@ impl Canvas {
   ) -> ()
     ! TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? &mut Allocator {
+    run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, false)
+  }
+
+  /// Prepares GPU-retained overview images and a separate chrome scene when eligible.
+  /// Otherwise produces the ordinary complete scene. Use `frame` for CPU captures.
+  pub effect fn frameRetained(
+    self: &mut Self,
+    m: &Studio,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, true)
+  }
+
+  /// Builds the visible document and chrome into one scene in physical pixels.
+  effect fn prepare(
+    self: &mut Self,
+    m: &Studio,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+    retain: bool,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
     let cameraChanged = self.cameraX != m.cameraX || self.cameraY != m.cameraY
       || self.width != m.width
       || self.height != m.height
@@ -633,11 +825,11 @@ impl Canvas {
     let rebuild = self.editing != m.editing || self.revision != m.geometryRevision
       || self.page != m.page
       || self.scale != scale
-      || cameraChanged && self.needsText(m, scale, &tree.*)
     if rebuild {
       self.rasterFrame = self.rasterFrame + 1
       self.document = Document.make()
       self.probes.clear()
+      self.allTextBound = true
       self.probeBounds.clear()
       let imageKind = if let Option<AtlasTile>.Some { value: tile } = self.image {
         drop tree.atlas.touch(tile.id)
@@ -664,31 +856,70 @@ impl Canvas {
                 && (e.shape.x + e.shape.width < m.cameraX || e.shape.y + e.shape.height < m.cameraY
                   || e.shape.x > m.cameraX + (m.canvasWidth()) / m.zoom
                   || e.shape.y > m.cameraY + (m.canvasHeight()) / m.zoom) {
-                run self.probe(i, e, usize.MAX)
+                node.flags = node.flags | 1
+                let id = run self.document.add(node)
+                run self.probe(i, e, usize.MAX, id, 0)
                 i = i + 1
                 continue
               }
             }
             let tile = run self.textTile(m, e, &mut tree, &mut textTree, &mut snapshot, scale)
-            run self.probe(i, e, tile.cache)
             node.kind = run self.document.addTile(tile.tile)
             node.x = node.x + tile.cropX / tile.density * tile.stretchX
             node.y = node.y + tile.cropY / tile.density * tile.stretchY
             node.width = tile.pixelsWidth / tile.density * tile.stretchX
             node.height = tile.pixelsHeight / tile.density * tile.stretchY
             node.fill = 0xffffffff
+            let id = run self.document.add(node)
+            run self.probe(i, e, tile.cache, id, node.kind)
+          } else {
+            drop run self.document.add(node)
           }
-          drop run self.document.add(node)
         }
         i = i + 1
       }
+      self.retainedValid = false
+      self.imageBounds = self.document.retainedImageBounds()
       self.revision = m.geometryRevision
       self.page = m.page
       self.editing = m.editing
       self.zoom = m.zoom
       self.scale = scale
     }
-    if rebuild || cameraChanged {
+    let refreshText = !rebuild && cameraChanged && self.needsText(m, scale, &tree.*)
+    if refreshText {
+      run self.refreshText(m, &mut tree, &mut textTree, &mut snapshot, scale)
+    }
+    let previouslyRetained = self.retained
+    self.retained = false
+    if retain && !self.exporting && !m.grid && overlayIndependent(tree.scene()) {
+      if let Option<Rect<f32>>.Some { value: bounds } = self.imageBounds {
+        let area = (bounds.xMax - bounds.xMin) * (bounds.yMax - bounds.yMin)
+        let visibleArea = m.canvasWidth() * m.canvasHeight() / (m.zoom * m.zoom)
+        if visibleArea >= area * 0.1 {
+          if !self.retainedValid {
+            self.retainedX = bounds.xMin - 1.0
+            self.retainedY = bounds.yMin - 1.0
+            run self.document.paint(
+              &mut self.retainedScene,
+              Camera {
+                x: self.retainedX,
+                y: self.retainedY,
+                zoom: 1.0,
+                scale: 1.0,
+                width: bounds.xMax - bounds.xMin + 2.0,
+                height: bounds.yMax - bounds.yMin + 2.0,
+              },
+              false,
+            )
+            self.retainedRevision = self.retainedRevision + 1
+            self.retainedValid = true
+          }
+          self.retained = true
+        }
+      }
+    }
+    if !self.retained && (rebuild || refreshText || cameraChanged || previouslyRetained) {
       run self.document.paint(
         &mut self.shapes,
         Camera {
@@ -708,6 +939,12 @@ impl Canvas {
       self.width = m.width
       self.height = m.height
     }
+    self.zoom = m.zoom
+    self.scale = scale
+    self.cameraX = m.cameraX
+    self.cameraY = m.cameraY
+    self.width = m.width
+    self.height = m.height
     self.scene.clear()
     let full = Rect<f32>.new(0.0, 0.0, m.width * scale, m.height * scale)
     let mask = ContentMask.new(
@@ -718,9 +955,11 @@ impl Canvas {
         (m.height - 27.0) * scale,
       ),
     )
-    drop run self.scene.quad(
-      Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0xe8eae6))),
-    )
+    if !self.retained {
+      drop run self.scene.quad(
+        Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0xe8eae6))),
+      )
+    }
     if m.grid && m.zoom > 0.15 {
       let spacing = f32.max(4.0, 16.0 * m.zoom) * scale
       let mut x = m.leftWidth() * scale - (m.cameraX * m.zoom * scale) % spacing
@@ -739,7 +978,9 @@ impl Canvas {
         x = x + spacing
       }
     }
-    run self.scene.replay(&self.shapes, 0, self.shapes.operationCount())
+    if !self.retained {
+      run self.scene.replay(&self.shapes, 0, self.shapes.operationCount())
+    }
     if m.selected > 0 {
       let b = editing.bounds(m)
       let x = (b[0] - m.cameraX) * m.zoom + m.leftWidth()
@@ -873,4 +1114,27 @@ effect fn measureText(m: &Studio, e: Element, tree: &mut UiTree) -> [f32; 3]
   width = f32.ceil(f32.max(1.0, width) + 4.0)
   height = f32.ceil(f32.max(e.fontSize * 1.5, height) + 4.0)
   return [width, height, baseline]
+}
+
+// Backdrop-dependent chrome (such as the command palette) needs the normal compositor.
+fn overlayIndependent(scene: &Scene) -> bool {
+  let mut layer: u32 = 0
+  while layer < scene.layerCount() {
+    let sprites = scene.layers(layer)
+    let mut i: usize = 0
+    while i < sprites.length {
+      if sprites[i].effects.backdropBlur > 0.0 || sprites[i].isolation.blend != 0 {
+        return false
+      }
+      i = i + 1
+    }
+    layer = layer + 1
+  }
+  return true
+}
+
+fn croppedText(tile: TextTile) -> bool {
+  return tile.cropX > 0.0 || tile.cropY > 0.0
+    || tile.pixelsWidth < f32.ceil(tile.naturalWidth * tile.density)
+    || tile.pixelsHeight < f32.ceil(tile.naturalHeight * tile.density)
 }

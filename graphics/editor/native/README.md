@@ -150,9 +150,11 @@ preserve the browser's `image` and normalized `imageCrop` fields, including crop
 coordinates precise enough to survive a round trip to the same source pixels.
 
 Repeated labels share measurements and raster tiles by text, font, weight, color
-and dimensions. Small labels start with a bounded 4× density cache; larger zooms
-refresh visible text. Spatial blocks restrict quality checks to visible text,
-and camera changes reuse document geometry when the existing rasters suffice.
+and dimensions. Small labels start with a bounded 4× density cache; larger zooms use power-of-two
+raster densities and refresh visible text bindings in place. Spatial blocks restrict
+quality checks to visible text. The scratch glyph atlas advances between label
+rasters, so old font sizes can be evicted without dropping letters. Shared label
+bindings carry the allocation generation and are refreshed when they enter view.
 The desktop atlas allocates up to eight 2048-pixel base pages per kind lazily;
 high-resolution tiles can request larger pages. Unused canvas text tiles are
 reclaimed under atlas pressure without evicting cached UI sprites. Shared renderer changes
@@ -172,3 +174,31 @@ latency, including IPC and host scheduling. Neither measurement is presentation
 FPS. It exercises fit-all through roughly 180% zoom and back twice, panning,
 marquee redraw, direct canvas text editing and undo. Its isolated design, log and
 JSON report live in `/tmp/silk-native-tweet`; the default user document is untouched.
+
+## Native camera performance and rendering regressions
+
+Dense image-only overviews retain their geometry in GPU buffers; panning and zooming
+update a camera uniform. Close views use viewport culling. Native chrome is composited
+as a separate overlay, including its opacity layers. Grid, document effects, and
+backdrop-dependent chrome use ordinary composition. Text raster updates preserve the
+retained document and update the visible labels rather than rebuilding every layer.
+
+After building the release app:
+
+```sh
+python3 graphics/editor/native/scripts/camera-check
+```
+
+This runs the same 120 zoom and 40 pan inputs through the native UI dispatcher with
+and without retained geometry, then compares the two GPU outputs. Each run builds
+an in-memory challenge and exits without reading or saving a user design. Results
+and logs go to `build/native-camera-check`. The initial creation frame is excluded.
+The numbers are CPU frame preparation and submission times, not display FPS or GPU
+execution times. The executable also accepts `--profile` for frame-stage timings,
+`--benchmark` for the scripted workload, and `--no-retained` for the ordinary path.
+
+The optional inspector requires a complete CPU scene for screenshots, so it uses
+ordinary composition. Use `camera-check` for performance of the normal native path;
+`challenge-check` covers inspector-driven interactions. The contracts also check
+all 26 letters under glyph-atlas pressure and compare shared text after zoom/pan
+with fresh raster pixels.

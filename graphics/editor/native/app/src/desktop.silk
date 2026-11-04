@@ -31,6 +31,7 @@ import ui_tree.inspect { encodePng }
 import studio.model { Studio, Message }
 import studio.render { Canvas, textResources }
 import ui_app.app { NoCommand }
+import ui_tree.input { Input, MOD_CONTROL }
 import ui_app.runtime { Runtime, pump, tick, resize }
 import ui_app.harness { click, press }
 import ui_tree.inspect { findAll }
@@ -78,6 +79,11 @@ pub struct RunOptions {
   pub height: f64,
   /// Script and check the frame instead of taking input (see the module documentation).
   pub check: bool,
+  /// Print frame-stage CPU timings for local performance investigations.
+  pub profile: bool,
+  /// Exercise a deterministic overview zoom and pan path, then exit without saving.
+  pub benchmark: bool,
+  pub retained: bool,
   /// The test id, label or text of the node `check` clicks.
   pub checkClick: string<'static>,
   /// The test id, label or text of a node that must exist after the click.
@@ -187,7 +193,7 @@ pub effect fn runWindowWith(
     | OutOfMemoryError
   ? &mut Allocator {
   let check = options.check
-  let mut inspector = if check {
+  let mut inspector = if check || options.benchmark {
     drop inspector
     Inspector.off()
   } else {
@@ -235,6 +241,8 @@ pub effect fn runWindowWith(
   let device = run adapter.requestDevice(&DeviceDescriptor.default())
   let queue = run getQueue(&device)
   let mut renderer = run UiRenderer.make(&device, format)
+  let mut imageRenderer = run UiRenderer.make(&device, format)
+  let mut uploadedImages: u64 = 18446744073709551615
   let mut textures = GpuAtlas.make()
   let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
   if check {
@@ -264,7 +272,7 @@ pub effect fn runWindowWith(
   while true {
     // Wait for input or a frame, at most until the next timer.
     let now = (run seconds(&mut clock)) - started
-    let wait = if check {
+    let wait = if check || options.benchmark {
       Wait.Seconds { seconds: 0.016 }
     } else {
       let deadline = match app.nextDeadline() {
@@ -290,8 +298,13 @@ pub effect fn runWindowWith(
         }
       }
     }
-    let next = run platform.nextEvent(wait)
+    let mut next = run platform.nextEvent(wait)
     let time = (run seconds(&mut clock)) - started
+    if options.benchmark {
+      if let Option<Event>.None = &next {
+        next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
+      }
+    }
     let mut redraw = false
     if !check {
       run tick(&mut app, &mut tree, time, false)
@@ -329,25 +342,68 @@ pub effect fn runWindowWith(
               scale: f64.toF32(scale),
               time: targetTime,
             }
-            if check && drawn == 1 {
+            if check && !options.benchmark && drawn == 1 {
               drop run click(&mut app, &mut tree, viewport, options.checkClick)
               run press(&mut app, &mut tree, viewport, "Tab", 0)
             }
             if !check && app.wantsFrames() {
               run tick(&mut app, &mut tree, time, true)
             }
+            let frameStart = run seconds(&mut clock)
+            if options.benchmark && drawn > 0 {
+              run tree.dispatch(
+                Input.Wheel {
+                  x: 740.0,
+                  y: 550.0,
+                  deltaX: if drawn > 120 {
+                    if drawn <= 140 {
+                      6.0
+                    } else {
+                      -6.0
+                    }
+                  } else {
+                    0.0
+                  },
+                  deltaY: if drawn <= 60 {
+                    -17.5
+                  } else if drawn <= 120 {
+                    16.35514
+                  } else {
+                    0.0
+                  },
+                  modifiers: if drawn <= 120 {
+                    MOD_CONTROL
+                  } else {
+                    0
+                  },
+                },
+              )
+              drop run pump(&mut app, &mut tree)
+            }
             if run canvas.normalize(&mut app.model, &mut textTree) {
               run app.render(&mut tree)
             }
             run tree.frame(viewport)
             run serve(&mut platform, owner, &mut tree, &mut host)
-            run canvas.frame(
-              &app.model,
-              &mut tree,
-              &mut textTree,
-              &mut textSnapshot,
-              f64.toF32(scale),
-            )
+            let layoutEnd = run seconds(&mut clock)
+            if !inspector.enabled() && options.retained {
+              run canvas.frameRetained(
+                &app.model,
+                &mut tree,
+                &mut textTree,
+                &mut textSnapshot,
+                f64.toF32(scale),
+              )
+            } else {
+              run canvas.frame(
+                &app.model,
+                &mut tree,
+                &mut textTree,
+                &mut textSnapshot,
+                f64.toF32(scale),
+              )
+            }
+            let canvasEnd = run seconds(&mut clock)
             run textures.sync(&device, &tree.atlas)
             let pending = tree.pendingUploads()
             let list = pending.entries()
@@ -362,42 +418,144 @@ pub effect fn runWindowWith(
             let deviceHeight = deviceSize(height, scale)
             let texture = run surface.getCurrentTexture()
             let view = run texture.texture.createView(&TextureViewDescriptor.default())
-            run renderer.draw(
-              &device,
-              &queue,
-              inspector.sceneWith(&canvas.scene),
-              &textures,
-              &view,
-              deviceWidth,
-              deviceHeight,
-              color.white(),
-            )
-            drawn = drawn + 1
-            if check && drawn == CHECK_FRAME && !(run exists(&tree, options.checkExpect)) {
-              StderrWriter.print("check: the scripted click did not reach the app\n", &())
-              status = 1
-            } else if check && drawn == CHECK_FRAME {
-              let reference = run snapshot.renderScene(&tree, &canvas.scene)
-              let png = run encodePng(&reference)
-              drop run storage.writeBytes("/tmp/silk-studio-native-check.png", Bytes.asSlice(&png))
-              status = run checkFrame(
+            let uploadEnd = run seconds(&mut clock)
+            if canvas.retained {
+              let imageScale = app.model.zoom * f64.toF32(scale)
+              run imageRenderer.drawRetainedImages(
                 &device,
                 &queue,
-                &texture.texture,
-                isBgra(format),
-                reference.data(),
+                &canvas.retainedScene,
+                &textures,
+                &view,
+                deviceWidth,
+                deviceHeight,
+                color.rgb(0xe8eae6),
+                imageScale,
+                (canvas.retainedX - app.model.cameraX) * imageScale
+                  + app.model.leftWidth() * f64.toF32(scale),
+                (canvas.retainedY - app.model.cameraY) * imageScale + 56.0 * f64.toF32(scale),
+                uploadedImages != canvas.retainedRevision,
+              )
+              uploadedImages = canvas.retainedRevision
+              run renderer.drawOverlay(
+                &device,
+                &queue,
+                &canvas.scene,
+                &textures,
+                &view,
                 deviceWidth,
                 deviceHeight,
               )
+            } else {
+              run renderer.draw(
+                &device,
+                &queue,
+                inspector.sceneWith(&canvas.scene),
+                &textures,
+                &view,
+                deviceWidth,
+                deviceHeight,
+                color.white(),
+              )
+            }
+            let drawEnd = run seconds(&mut clock)
+            drawn = drawn + 1
+            if check && !options.benchmark && drawn == CHECK_FRAME
+              && !(run exists(&tree, options.checkExpect)) {
+              StderrWriter.print("check: the scripted click did not reach the app\n", &())
+              status = 1
+            } else if check
+              && ((!options.benchmark && drawn == CHECK_FRAME)
+                || options.benchmark && drawn == 161) {
+              if options.benchmark {
+                // Compare two real GPU paths on the same device and atlas. The CPU
+                // sampler differs visibly for subpixel-sized image crops at fit-all.
+                let buffer = run copyOut(
+                  &device,
+                  &queue,
+                  &texture.texture,
+                  deviceWidth,
+                  deviceHeight,
+                )
+                let padded = run runtime.mapRead(
+                  &device,
+                  &buffer,
+                  0,
+                  readbackSize(deviceWidth, deviceHeight),
+                )
+                let retainedPixels = run unpack(
+                  padded.asSlice(),
+                  deviceWidth,
+                  deviceHeight,
+                  isBgra(format),
+                )
+                run canvas.frame(
+                  &app.model,
+                  &mut tree,
+                  &mut textTree,
+                  &mut textSnapshot,
+                  f64.toF32(scale),
+                )
+                run renderer.draw(
+                  &device,
+                  &queue,
+                  &canvas.scene,
+                  &textures,
+                  &view,
+                  deviceWidth,
+                  deviceHeight,
+                  color.white(),
+                )
+                status = run checkFrame(
+                  &device,
+                  &queue,
+                  &texture.texture,
+                  isBgra(format),
+                  retainedPixels.asSlice(),
+                  deviceWidth,
+                  deviceHeight,
+                )
+              } else {
+                let reference = run snapshot.renderScene(&tree, &canvas.scene)
+                let png = run encodePng(&reference)
+                drop run storage.writeBytes(
+                  "/tmp/silk-studio-native-check.png",
+                  Bytes.asSlice(&png),
+                )
+                status = run checkFrame(
+                  &device,
+                  &queue,
+                  &texture.texture,
+                  isBgra(format),
+                  reference.data(),
+                  deviceWidth,
+                  deviceHeight,
+                )
+              }
             }
             run surface.present()
             run device.checkErrors()
-            if check && drawn >= CHECK_FRAME {
+            if options.profile {
+              let frameEnd = run seconds(&mut clock)
+              StderrWriter.print(
+                "frame-ms: layout={} canvas={} upload={} draw={} present={}\n",
+                &(
+                  (layoutEnd - frameStart) * 1000.0,
+                  (canvasEnd - layoutEnd) * 1000.0,
+                  (uploadEnd - canvasEnd) * 1000.0,
+                  (drawEnd - uploadEnd) * 1000.0,
+                  (frameEnd - drawEnd) * 1000.0
+                ),
+              )
+            }
+            if options.benchmark && drawn >= 161
+              || check && !options.benchmark && drawn >= CHECK_FRAME {
               break
             }
             platform.setCursor(owner, windowCursor(tree.cursor()))
           }
-          redraw = check || app.wantsFrames() || canvas.needsFrame(&app.model, &tree)
+          redraw = check || options.benchmark || app.wantsFrames()
+            || canvas.needsFrame(&app.model, &tree)
         }
         Event.Resized { window: _, size, scaleFactor } => {
           width = size.width
@@ -451,6 +609,7 @@ pub effect fn runWindowWith(
                 if saved {
                   if let Option<Studio>.Some { value: loaded } = run storage.open(chosen) {
                     canvas.reset(&mut tree)
+                    uploadedImages = 18446744073709551615
                     app.model = move loaded
                   } else {
                     app.model.notice = run String.copy("Could not open that Silk document")
@@ -507,6 +666,7 @@ pub effect fn runWindowWith(
                   storage.path = run String.copy(chosen)
                   if run storage.save(&mut fresh) {
                     canvas.reset(&mut tree)
+                    uploadedImages = 18446744073709551615
                     app.model = move fresh
                   } else {
                     storage.path = move previous
@@ -528,7 +688,7 @@ pub effect fn runWindowWith(
         }
         Event.CloseRequested { window: _ } => {
           editing.commitDraft(&mut app.model)
-          if !check && app.model.revision != app.model.savedRevision
+          if !check && !options.benchmark && app.model.revision != app.model.savedRevision
             && !(run storage.save(&mut app.model)) {
             continue
           }
@@ -536,7 +696,7 @@ pub effect fn runWindowWith(
         }
         Event.QuitRequested => {
           editing.commitDraft(&mut app.model)
-          if !check && app.model.revision != app.model.savedRevision
+          if !check && !options.benchmark && app.model.revision != app.model.savedRevision
             && !(run storage.save(&mut app.model)) {
             continue
           }
@@ -563,11 +723,11 @@ pub effect fn runWindowWith(
         redraw = true
       }
     }
-    if !check && storage.collect(&mut app.model, false) {
+    if !check && !options.benchmark && storage.collect(&mut app.model, false) {
       run app.render(&mut tree)
       redraw = true
     }
-    if !check && app.model.saveRequested {
+    if !check && !options.benchmark && app.model.saveRequested {
       run storage.autosave(&mut app.model)
       run app.render(&mut tree)
       redraw = true

@@ -15,7 +15,7 @@ import ui_app.harness { click, clickRole, drag, typeText, press }
 import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, Role }
 import ui_tree.input { Input, MOD_CONTROL, MOD_META }
 import ui_fixtures.fixtures as fixtures
-import atlas.atlas { Atlas, AtlasError }
+import atlas.atlas { Atlas, AtlasError, AtlasOptions }
 import vector.geometry_error { GeometryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -336,6 +336,121 @@ effect fn marqueeRepaint() -> ()
   StderrWriter.print("ok: empty marquee schedules presentation and removal\n", &())
 }
 
+// A small scratch atlas makes repeated zoom exhaust old glyph sizes quickly.
+// Every letter must still be present in the actual scene rasterized into a label tile.
+effect fn zoomGlyphs() -> ()
+  ! Failed | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut text = run UiTree.make(&fonts)
+  let mut options = AtlasOptions.default()
+  options.textureSize = 512
+  options.maxTextures = 1
+  text.atlas = Atlas.make(options)
+  run textResources(&mut text)
+  let mut m = Studio.make()
+  samples.page(&mut m, "Zoom glyphs")
+  let id = m.add(2, "abcdefghijklmnopqrstuvwxyz", 0.0, 0.0, 200.0, 15.0, 0x263e30ff)
+  let at = m.index(id)
+  let mut e = m.elements.get(at)
+  e.fontSize = 7.0
+  m.elements.set(at, e)
+  let mut canvas = Canvas.make()
+  drop run canvas.normalize(&mut m, &mut text)
+  let mut snapshot = CpuSnapshot.make()
+  let mut step: usize = 0
+  while step < 48 {
+    m.zoom = 2.0 + usize.toF32(step % 20) * 0.25
+    let mut label = m.elements.get(at)
+    label.fontFamily = usize.toU32(step % 3)
+    m.elements.set(at, label)
+    m.geometryRevision = m.geometryRevision + 1
+    run canvas.frame(&m, &mut tree, &mut text, &mut snapshot, 2.0)
+    run expect(text.stats.glyphs == 26, "every character survives repeated zoom rasterization")
+    step = step + 1
+  }
+  StderrWriter.print(
+    "ok: all 26 letters survive 48 zoom/font changes under glyph atlas pressure\n",
+    &(),
+  )
+}
+
+// Updating a shared raster must refresh every visible instance that still names its
+// old tile, including instances that enter the viewport after a pan.
+effect fn sharedTextPan() -> ()
+  ! Failed | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut text = run UiTree.make(&fonts)
+  run textResources(&mut text)
+  run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 })
+  let mut m = Studio.make()
+  m.width = 800.0
+  m.height = 600.0
+  samples.page(&mut m, "Shared text")
+  let mut i: usize = 0
+  while i < 120 {
+    let id = m.add(
+      2,
+      "around those",
+      usize.toF32(i % 12) * 80.0,
+      usize.toF32(i / 12) * 40.0,
+      70.0,
+      15.0,
+      0x263e30ff,
+    )
+    let at = m.index(id)
+    let mut e = m.elements.get(at)
+    e.fontSize = 7.0
+    e.fontFamily = usize.toU32(i % 3)
+    m.elements.set(at, e)
+    i = i + 1
+  }
+  let mut canvas = Canvas.make()
+  let mut raster = CpuSnapshot.make()
+  let mut pixels = CpuSnapshot.make()
+  drop run canvas.normalize(&mut m, &mut text)
+  let mut step: usize = 0
+  while step < 6 {
+    m.zoom = if step == 0 {
+      1.0
+    } else if step < 6 {
+      5.0
+    } else {
+      1.0
+    }
+    m.cameraX = usize.toF32(step % 4) * 80.0
+    m.cameraY = 10.0
+    run canvas.frame(&m, &mut tree, &mut text, &mut raster, 1.0)
+    run pixels.sync(&mut tree)
+    let actual = run pixels.renderScene(&tree, &canvas.scene)
+    let mut fresh = Canvas.make()
+    run fresh.frame(&m, &mut tree, &mut text, &mut raster, 1.0)
+    run pixels.sync(&mut tree)
+    let expected = run pixels.renderScene(&tree, &fresh.scene)
+    let mut different: usize = 0
+    let mut y: usize = 100
+    while y < 550 {
+      let mut x = f32.toUsize(m.leftWidth())
+      while x < f32.toUsize(m.width - m.rightWidth()) {
+        let pixel = (y * 800 + x) * 4
+        if actual.data()[pixel] != expected.data()[pixel] {
+          different = different + 1
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+    StderrWriter.print("shared text step {}: {} different canvas pixels\n", &(step, different))
+    run expect(different == 0, "zoom/pan text pixels match a fresh document render")
+    fresh.reset(&mut tree)
+    step = step + 1
+  }
+  StderrWriter.print("ok: shared text zoom/pan matches fresh raster pixels\n", &())
+}
+
 effect fn rendering() -> ()
   ! Failed | TreeError | AtlasError | GeometryError | OutOfMemoryError | exports.UnsupportedBackdrop
   ? &mut Allocator {
@@ -493,6 +608,8 @@ effect fn program() -> i32
   run uiContract()
   run layerHierarchy()
   run marqueeRepaint()
+  run zoomGlyphs()
+  run sharedTextPan()
   run rendering()
   run stress()
   run challenge()
@@ -553,6 +670,20 @@ effect fn challenge() -> ()
   run canvas.frame(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
   let tiles = canvas.textTileCount()
   run expect(tiles <= 591, "100k labels share at most 588 text/font rasters and three headings")
+  run canvas.frameRetained(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+  run expect(canvas.retained, "dense image overview uses retained GPU geometry")
+  let retainedRevision = canvas.retainedRevision
+  app.model.cameraX = app.model.cameraX + 1.0
+  run canvas.frameRetained(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+  run expect(
+    canvas.retained && canvas.retainedRevision == retainedRevision,
+    "overview camera motion preserves uploaded geometry",
+  )
+  app.model.grid = true
+  run canvas.frameRetained(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
+  run expect(!canvas.retained, "grid rendering uses ordinary composition")
+  app.model.grid = false
+  run canvas.frame(&app.model, &mut tree, &mut textTree, &mut snapshot, 2.0)
   let mut clock = OsMonotonicClock.make()
   let started = run now(&mut clock)
   let mut i: usize = 0
