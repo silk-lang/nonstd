@@ -86,3 +86,28 @@ The native contract checks a single heading at 400%, 401%, 801%, and 6400% on a
 the cached crop must refresh it. The original Explorations interaction sequence
 also passes after the fix. Inspector latency includes IPC and scheduling and is
 not a presentation-FPS measurement.
+
+### Continuous wheel zoom
+
+The pan fix left density upgrades on the input path: each new quarter-step raster
+size rebuilt visible headings while the wheel gesture was still running. A fresh
+Explorations zoom sweep stalled while a repeated sweep through cached sizes did not.
+The native interactive frame now reuses cached text during motion and schedules a
+quality pass 150 ms after the last camera change. Crop coverage, atlas residency,
+and content/style changes remain immediate requirements. Full-quality `frame` and
+`frameRetained` calls, including captures, exports and the deterministic benchmark,
+continue to resolve density synchronously.
+
+The regression drives 40 wheel inputs across 400% with a visible heading. It asserts
+no density rasterizations during motion, an explicit idle deadline, one refinement
+without further camera movement, matching pixels against a fresh full-quality render,
+and no repeated idle work. It also checks that a
+synchronous capture consumes pending quality work and that panning beyond a cropped
+raster still fills missing pixels during the gesture. The native event loop includes
+the quality deadline in its wait and avoids polling with a zero timeout while an
+occluded window waits for a display callback.
+
+The original Explorations wheel replay passes after the change, in both zoom
+directions; the earlier cold-versus-cached latency cliff no longer reproduces.
+These inspector measurements include IPC and CPU screenshot work, so they are
+interaction regression evidence rather than native presentation-FPS measurements.

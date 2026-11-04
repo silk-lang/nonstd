@@ -116,6 +116,9 @@ pub struct Canvas {
   revision: u64,
   paintedRevision: u64,
   exporting: bool,
+  deferDensity: bool,
+  refinePending: bool,
+  refineAt: f64,
   editing: u32,
   cameraX: f32,
   cameraY: f32,
@@ -167,6 +170,9 @@ impl Canvas {
       revision: 18446744073709551615,
       paintedRevision: 18446744073709551615,
       exporting: false,
+      deferDensity: false,
+      refinePending: false,
+      refineAt: 0.0,
       editing: 0,
       cameraX: 0.0,
       cameraY: 0.0,
@@ -373,8 +379,9 @@ impl Canvas {
         && cached.family == e.fontFamily
         && cached.width == e.shape.width
         && cached.height == e.shape.height
-        && cached.density >= density
-        && (cached.density <= density * 4.0 || small && self.textPixels < 16000000)
+        && (self.deferDensity
+          || cached.density >= density
+            && (cached.density <= density * 4.0 || small && self.textPixels < 16000000))
         && (if self.exporting {
           !croppedText(cached)
         } else {
@@ -595,7 +602,7 @@ impl Canvas {
 
   // Most camera changes need no document rebuild: all small labels already have
   // sufficient raster density. Check only text blocks intersecting the viewport.
-  fn needsText(self: &Self, m: &Studio, scale: f32, tree: &UiTree) -> bool {
+  fn needsText(self: &Self, m: &Studio, scale: f32, tree: &UiTree, quality: bool) -> bool {
     // Complete overview bindings share hundreds of rasters across 100k labels.
     // Validate each current raster once instead of checking every instance.
     if self.allTextBound {
@@ -611,8 +618,9 @@ impl Canvas {
             f32.ceil(m.zoom * scale * f32.max(tile.stretchX, tile.stretchY) * 4.0) / 4.0,
           )
           let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0 && tile.naturalHeight <= 32.0
-          if tile.density < wanted
-            || tile.density > wanted * 4.0 && !(small && self.textPixels < 16000000) {
+          if quality
+            && (tile.density < wanted
+              || tile.density > wanted * 4.0 && !(small && self.textPixels < 16000000)) {
             return true
           }
         }
@@ -660,8 +668,9 @@ impl Canvas {
             )
             let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0
               && tile.naturalHeight <= 32.0
-            if tile.density < wanted
-              || tile.density > wanted * 4.0 && !(small && self.textPixels < 16000000) {
+            if quality
+              && (tile.density < wanted
+                || tile.density > wanted * 4.0 && !(small && self.textPixels < 16000000)) {
               return true
             }
 
@@ -791,7 +800,9 @@ impl Canvas {
   ) -> ()
     ! TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? &mut Allocator {
+    self.deferDensity = false
     run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, false)
+    self.refinePending = false
   }
 
   /// Prepares GPU-retained overview images and a separate chrome scene when eligible.
@@ -806,7 +817,52 @@ impl Canvas {
   ) -> ()
     ! TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? &mut Allocator {
+    self.deferDensity = false
     run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, true)
+    self.refinePending = false
+  }
+
+  /// Next idle text-quality frame, in seconds on the native event-loop clock.
+  /// The host must wake at this deadline even when no more input arrives.
+  pub fn nextTextDeadline(self: &Self) -> Option<f64> {
+    return if self.refinePending {
+      Option<f64>.some(self.refineAt)
+    } else {
+      Option<f64>.None
+    }
+  }
+
+  /// Whether the host should request the pending idle text-quality frame.
+  pub fn textRefinementDue(self: &Self, time: f64) -> bool {
+    return self.refinePending && time >= self.refineAt
+  }
+
+  /// Reuses text pixels during camera motion and refines density after 150ms idle.
+  /// Missing, evicted or newly exposed text still refreshes immediately. `time`
+  /// and `nextTextDeadline` share the host's monotonic seconds clock; captures
+  /// and exports use `frame` for immediate full-quality composition.
+  pub effect fn frameInteractive(
+    self: &mut Self,
+    m: &Studio,
+    tree: &mut UiTree,
+    textTree: &mut UiTree,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+    time: f64,
+    retain: bool,
+  ) -> ()
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let moving = self.cameraX != m.cameraX || self.cameraY != m.cameraY || self.width != m.width
+      || self.height != m.height
+      || self.zoom != m.zoom
+      || self.scale != scale
+    if moving {
+      self.refineAt = time + 0.150
+    }
+    self.deferDensity = !self.exporting && time < self.refineAt
+    run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, retain)
+    self.refinePending = self.deferDensity && self.needsText(m, scale, &tree.*, true)
   }
 
   /// Builds the visible document and chrome into one scene in physical pixels.
@@ -890,7 +946,8 @@ impl Canvas {
       self.zoom = m.zoom
       self.scale = scale
     }
-    let refreshText = !rebuild && cameraChanged && self.needsText(m, scale, &tree.*)
+    let refreshText = !rebuild && (cameraChanged || self.refinePending)
+      && self.needsText(m, scale, &tree.*, !self.deferDensity)
     if refreshText {
       run self.refreshText(m, &mut tree, &mut textTree, &mut snapshot, scale)
     }

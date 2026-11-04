@@ -19,6 +19,7 @@ import atlas.atlas { Atlas, AtlasError, AtlasOptions }
 import vector.geometry_error { GeometryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
+import silk.core.option { Option }
 import silk.json.scanner { JsonError }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.io.writer_native { StderrWriter }
@@ -422,6 +423,96 @@ effect fn panRasterBoundary() -> ()
   }
 }
 
+// Scroll zoom reuses available pixels during motion, then resolves text once idle.
+effect fn scrollZoomRaster() -> ()
+  ! Failed | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut text = run UiTree.make(&fonts)
+  run textResources(&mut text)
+  let mut m = Studio.make()
+  m.width = 800.0
+  m.height = 600.0
+  run tree.frame(FrameInput { width: m.width, height: m.height, scale: 2.0, time: 0.0 })
+  samples.page(&mut m, "Scroll zoom")
+  let id = m.add(2, "Make room", 0.0, 0.0, 300.0, 88.0, 0x263e30ff)
+  let at = m.index(id)
+  let mut e = m.elements.get(at)
+  e.fontSize = 56.0
+  e.fontFamily = 1
+  m.elements.set(at, e)
+  let mut canvas = Canvas.make()
+  let mut raster = CpuSnapshot.make()
+  drop run canvas.normalize(&mut m, &mut text)
+  m.zoom = 3.8
+  m.cameraX = 40.0
+  m.cameraY = 10.0
+  run canvas.frame(&m, &mut tree, &mut text, &mut raster, 2.0)
+  let before = text.frameNumber
+  let mut step: usize = 0
+  let mut time: f64 = 1.0
+  let wheelX = m.leftWidth() + 100.0
+  while step < 40 {
+    editing.wheel(&mut m, wheelX, 100.0, 0.0, -2.0, true)
+    time = time + 0.016
+    run canvas.frameInteractive(&m, &mut tree, &mut text, &mut raster, 2.0, time, false)
+    step = step + 1
+  }
+  run expect(text.frameNumber == before, "continuous scroll zoom must reuse available text pixels")
+  let deadline = match canvas.nextTextDeadline() {
+    Option<f64>.Some { value } => value
+    Option<f64>.None => 0.0
+  }
+  run expect(deadline > time + 0.1 && deadline < time + 0.2, "zoom schedules an idle quality frame")
+  run canvas.frameInteractive(&m, &mut tree, &mut text, &mut raster, 2.0, time + 0.1, false)
+  run expect(text.frameNumber == before, "unrelated frames do not refine text during the gesture")
+  run expect(canvas.textRefinementDue(deadline), "quality deadline wakes an idle window")
+  run canvas.frameInteractive(&m, &mut tree, &mut text, &mut raster, 2.0, deadline, false)
+  run expect(text.frameNumber == before + 1, "idle zoom refines the heading exactly once")
+  run expect(!canvas.textRefinementDue(deadline + 1.0), "settled text does not request more frames")
+  run canvas.frameInteractive(&m, &mut tree, &mut text, &mut raster, 2.0, deadline + 1.0, false)
+  run expect(text.frameNumber == before + 1, "idle frames reuse refined text")
+
+  let mut pixels = CpuSnapshot.make()
+  run pixels.sync(&mut tree)
+  let actual = run pixels.renderScene(&tree, &canvas.scene)
+  let mut fresh = Canvas.make()
+  run fresh.frame(&m, &mut tree, &mut text, &mut raster, 2.0)
+  run pixels.sync(&mut tree)
+  let expected = run pixels.renderScene(&tree, &fresh.scene)
+  let mut pixel: usize = 0
+  let mut equal = true
+  while pixel < actual.data().length {
+    equal = equal && actual.data()[pixel] == expected.data()[pixel]
+    pixel = pixel + 1
+  }
+  run expect(equal, "idle refinement pixels match a fresh full-quality render")
+  fresh.reset(&mut tree)
+
+  // A capture during motion must force quality even with no further camera change.
+  editing.wheel(&mut m, wheelX, 100.0, 0.0, -20.0, true)
+  run canvas.frameInteractive(&m, &mut tree, &mut text, &mut raster, 2.0, 4.0, false)
+  let deferred = text.frameNumber
+  run canvas.frame(&m, &mut tree, &mut text, &mut raster, 2.0)
+  run expect(text.frameNumber == deferred + 1, "captures resolve pending text quality immediately")
+  run expect(!canvas.textRefinementDue(10.0), "capture consumes the pending refinement")
+
+  // Deferring density must not defer missing pixels outside a retained crop.
+  m.zoom = 8.01
+  m.cameraX = 40.0
+  m.cameraY = 10.0
+  run canvas.frame(&m, &mut tree, &mut text, &mut raster, 2.0)
+  let cropped = text.frameNumber
+  m.cameraX = m.cameraX + m.canvasWidth() / m.zoom
+  run canvas.frameInteractive(&m, &mut tree, &mut text, &mut raster, 2.0, 5.0, false)
+  run expect(text.frameNumber > cropped, "camera motion immediately fills newly exposed text")
+  StderrWriter.print(
+    "ok: scroll zoom reuses text, refines on idle, preserves captures and crop coverage\n",
+    &(),
+  )
+}
+
 // Updating a shared raster must refresh every visible instance that still names its
 // old tile, including instances that enter the viewport after a pan.
 effect fn sharedTextPan() -> ()
@@ -654,6 +745,7 @@ effect fn program() -> i32
   run uiContract()
   run layerHierarchy()
   run marqueeRepaint()
+  run scrollZoomRaster()
   run panRasterBoundary()
   run zoomGlyphs()
   run sharedTextPan()

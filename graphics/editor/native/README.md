@@ -158,6 +158,11 @@ rasters, so old font sizes can be evicted without dropping letters. Shared label
 bindings carry the allocation generation and are refreshed when they enter view.
 Cropped rasters include overscan and remain valid while they cover the visible text;
 a small pan does not regenerate them solely because the preferred crop origin moved.
+During camera gestures, native composition reuses available text pixels and schedules
+full-density refinement after 150 ms without camera changes. Missing or newly exposed
+text still renders immediately. The event loop wakes for refinement even if no more
+input arrives; CPU captures through `Canvas.frame` and exports resolve text quality
+synchronously.
 The desktop atlas allocates up to eight 2048-pixel base pages per kind lazily;
 high-resolution tiles can request larger pages. Unused canvas text tiles are
 reclaimed under atlas pressure without evicting cached UI sprites. Shared renderer changes
