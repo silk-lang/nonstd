@@ -200,13 +200,24 @@ After building the release app:
 python3 graphics/editor/native/scripts/camera-check
 ```
 
-This runs the same 120 zoom and 40 pan inputs through the native UI dispatcher with
+This runs 120 zoom inputs, 40 wheel pans, and a 40-movement hand drag through the native UI dispatcher with
 and without retained geometry, then compares the two GPU outputs. Each run builds
 an in-memory challenge and exits without reading or saving a user design. Results
 and logs go to `build/native-camera-check`. The initial creation frame is excluded.
 The numbers are CPU frame preparation and submission times, not display FPS or GPU
 execution times. The executable also accepts `--profile` for frame-stage timings,
 `--benchmark` for the scripted workload, and `--no-retained` for the ordinary path.
+Use `camera-check --file /path/to/design.silkdesign` to measure a saved document without
+saving changes; the executable equivalent is `--benchmark-file /path/to/design.silkdesign`.
+The loader accepts documents up to 2 GiB and up to four million nodes per page.
+
+At a fixed zoom, panning reuses text validation for the overlapping part of the last
+viewport and checks newly exposed strips. Raster changes, atlas eviction, density
+requirements, and camera scale changes invalidate that reuse. Hand/space/middle-button
+panning does not copy layers for undo, and cancelling it preserves document geometry.
+The [four-copy measurement](benchmarks/four-copy-pan.json) records two runs on a
+1.2-million-layer document: median panning canvas preparation fell from about
+22.5–22.8 ms to 2.2 ms. These are CPU stage timings, not display FPS.
 
 The optional inspector requires a complete CPU scene for screenshots, so it uses
 ordinary composition. Use `camera-check` for performance of the normal native path;

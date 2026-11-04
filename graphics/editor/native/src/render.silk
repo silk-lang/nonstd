@@ -37,6 +37,7 @@ import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.geometry.insets { Insets }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
 import silk.num.f32
 import silk.num.u32
 import silk.num.usize
@@ -62,6 +63,12 @@ pub struct Canvas {
   probes: List<TextProbe>,
   allTextBound: bool,
   probeBounds: List<Rect<f32>>,
+  checkedViewport: Rect<f32>,
+  checkedRasterFrame: u64,
+  checkedZoom: f32,
+  checkedScale: f32,
+  checkedQuality: bool,
+  checkedMissingTiles: usize,
   pub scene: Scene,
   /// Image-only overview geometry, transformed by the GPU independently of chrome.
   pub retainedScene: Scene,
@@ -114,6 +121,12 @@ impl Canvas {
       probes: List<TextProbe>.make(),
       allTextBound: false,
       probeBounds: List<Rect<f32>>.make(),
+      checkedViewport: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      checkedRasterFrame: u64.MAX,
+      checkedZoom: 0.0,
+      checkedScale: 0.0,
+      checkedQuality: false,
+      checkedMissingTiles: 0,
       scene: Scene.make(),
       retainedScene: Scene.make(),
       retained: false,
@@ -297,7 +310,7 @@ impl Canvas {
 
   // Most camera changes need no document rebuild: all small labels already have
   // sufficient raster density. Check only text blocks intersecting the viewport.
-  fn needsText(self: &Self, m: &Studio, scale: f32, tree: &UiTree, quality: bool) -> bool {
+  fn needsText(self: &mut Self, m: &Studio, scale: f32, tree: &UiTree, quality: bool) -> bool {
     // Complete overview bindings share hundreds of rasters across 100k labels.
     // Validate each current raster once instead of checking every instance.
     if self.allTextBound {
@@ -329,11 +342,51 @@ impl Canvas {
       m.cameraX + m.canvasWidth() / m.zoom,
       m.cameraY + m.canvasHeight() / m.zoom,
     )
+    // Tile handles cannot become live again without a new raster/binding epoch.
+    // Counting missing handles therefore detects atlas invalidation in O(unique
+    // rasters), including UI allocations that evict a canvas tile between frames.
+    let mut missing: usize = 0
+    let mut at: usize = 0
+    while at < self.textCache.text.length() {
+      if tree.atlas.get(self.textCache.text.get(at).tile.id).isNone() {
+        missing = missing + 1
+      }
+      at = at + 1
+    }
+    let reusable = self.checkedRasterFrame == self.rasterFrame
+      && self.checkedZoom == m.zoom && self.checkedScale == scale
+      && (!quality || self.checkedQuality) && self.checkedMissingTiles == missing
+    let checked = if reusable {
+      self.checkedViewport
+    } else {
+      Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    if self.needsTextIn(m, scale, tree, quality, viewport, checked) {
+      return true
+    }
+    self.checkedViewport = viewport
+    self.checkedRasterFrame = self.rasterFrame
+    self.checkedZoom = m.zoom
+    self.checkedScale = scale
+    self.checkedQuality = quality || reusable && self.checkedQuality
+    self.checkedMissingTiles = missing
+    return false
+  }
+
+  fn needsTextIn(
+    self: &Self,
+    m: &Studio,
+    scale: f32,
+    tree: &UiTree,
+    quality: bool,
+    viewport: Rect<f32>,
+    checked: Rect<f32>,
+  ) -> bool {
     let mut block: usize = 0
     while block < self.probeBounds.length() {
       let b = self.probeBounds.get(block)
       if b.xMin < viewport.xMax && b.xMax > viewport.xMin && b.yMin < viewport.yMax
-        && b.yMax > viewport.yMin {
+        && b.yMax > viewport.yMin && !coveredIntersection(b, viewport, checked) {
         let mut at = block * 64
         let end = if at + 64 < self.probes.length() {
           at + 64
@@ -345,7 +398,12 @@ impl Canvas {
           let e = m.elements.get(probe.element)
           if e.shape.x < viewport.xMax && e.shape.x + e.shape.width > viewport.xMin
             && e.shape.y < viewport.yMax
-            && e.shape.y + e.shape.height > viewport.yMin {
+            && e.shape.y + e.shape.height > viewport.yMin
+            && !coveredIntersection(
+              Rect<f32>.new(e.shape.x, e.shape.y, e.shape.x + e.shape.width, e.shape.y + e.shape.height),
+              viewport,
+              checked,
+            ) {
             if probe.cache == usize.MAX {
               return true
             }
@@ -651,8 +709,9 @@ impl Canvas {
       self.zoom = m.zoom
       self.scale = scale
     }
+    let quality = !self.deferDensity
     let refreshText = !rebuild && (cameraChanged || self.refinePending)
-      && self.needsText(m, scale, &tree.*, !self.deferDensity)
+      && self.needsText(m, scale, &tree.*, quality)
     if refreshText {
       run self.refreshText(m, &mut tree, &mut textTree, &mut snapshot, scale)
     }
@@ -872,4 +931,14 @@ fn textViewport(m: &Studio) -> TextViewport {
 
 fn textCovered(tile: TextTile, m: &Studio, e: Element) -> bool {
   return textRaster.textCovered(tile, textViewport(m), textRequest(m, e))
+}
+
+// Only the part of a block/text box visible now needs to have been checked before.
+// This skips interior blocks during pans while retaining cropped-text edge checks.
+fn coveredIntersection(bounds: Rect<f32>, viewport: Rect<f32>, checked: Rect<f32>) -> bool {
+  return checked.xMax > checked.xMin && checked.yMax > checked.yMin
+    && f32.max(bounds.xMin, viewport.xMin) >= checked.xMin
+    && f32.max(bounds.yMin, viewport.yMin) >= checked.yMin
+    && f32.min(bounds.xMax, viewport.xMax) <= checked.xMax
+    && f32.min(bounds.yMax, viewport.yMax) <= checked.yMax
 }
