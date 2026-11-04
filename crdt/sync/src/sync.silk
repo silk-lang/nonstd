@@ -1,0 +1,326 @@
+//! Syncing documents with a server, one exchange at a time.
+//!
+//! A client sends a request and gets one response. The request says where the client is (its
+//! tips, plus a few older deltas it has, at log-spaced distances back) and carries the deltas it
+//! made or received since its last successful exchange. The server applies them and answers with
+//! every delta the client lacks, judged from the newest of those ids it knows. A client that was
+//! offline for a long time therefore gets only a little more than it misses, without the two
+//! sides comparing whole histories.
+//!
+//! How bytes reach a server is a [`Transport`]; what a server does with them is a
+//! [`SyncServer`]. [`MemoryServer`] keeps documents in memory and can save them to a `Store`.
+//! [`Loopback`] hands requests to a server in the same process, and can be switched offline.
+import core.clock { ActorId, DeltaId, Frontier }
+import core.codec { DecodeError, Reader, Writer }
+import core.doc { Applied, Delta, Document }
+import core.store { Store, StoreError, save }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// The protocol of requests and responses.
+pub const PROTOCOL: u64 = 1
+
+/// A request could not reach the server, or its response could not come back.
+pub struct TransportError {
+  pub code: i32,
+}
+
+/// Carries one request to a server and brings back its response.
+pub service Transport {
+  effect fn exchange(request: &[u8], response: &mut List<u8>) -> ()
+    ! TransportError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator
+}
+
+/// Answers sync requests.
+pub interface SyncServer {
+  effect fn handle(self: &mut Self, request: &[u8], response: &mut List<u8>) -> ()
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator
+}
+
+/// The ids a request names: the tips first, then older deltas at distances 1, 2, 4 and so on
+/// back in arrival order. Every delta a replica has comes with all its ancestors, so any id it
+/// names stands for that delta's whole past.
+effect fn whereIs(document: &Document) -> List<DeltaId>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ids = List<DeltaId>.make()
+  run ids.appendSlice(document.frontier().tips())
+  let count = document.deltaCount()
+  let mut back: usize = 1
+  while back <= count {
+    run ids.append(document.delta(count - back).id)
+    back = back * 2
+  }
+  return move ids
+}
+
+effect fn writeIds(out: &mut Writer, ids: &[DeltaId]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.size(ids.length)
+  let mut k: usize = 0
+  while k < ids.length {
+    run out.id(ids[k])
+    k = k + 1
+  }
+}
+
+effect fn readIds(input: &mut Reader) -> List<DeltaId>
+  ! DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let count = run input.size()
+  let mut ids = List<DeltaId>.make()
+  let mut k: usize = 0
+  while k < count {
+    let id = run input.id()
+    run ids.append(id)
+    k = k + 1
+  }
+  return move ids
+}
+
+// Writes the deltas of `document` with these sequence numbers.
+effect fn writeDeltas(out: &mut Writer, document: &Document, seqs: &[usize]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.size(seqs.length)
+  let mut k: usize = 0
+  while k < seqs.length {
+    run document.delta(seqs[k]).encode(&mut out)
+    k = k + 1
+  }
+}
+
+// Applies the deltas in `input`, retrying the ones whose parents come later in the batch, and
+// returns how many still lack a parent.
+effect fn applyDeltas(input: &mut Reader, document: &mut Document) -> usize
+  ! DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let count = run input.size()
+  let mut waiting = List<Delta>.make()
+  let mut k: usize = 0
+  while k < count {
+    let delta = run Delta.decode(&mut input)
+    if document.graph().containsAll(delta.parents.asSlice()) {
+      drop run document.apply(move delta)
+    } else {
+      run waiting.append(move delta)
+    }
+    k = k + 1
+  }
+  let mut progress = true
+  while progress && waiting.length() > 0 {
+    progress = false
+    let mut w: usize = 0
+    while w < waiting.length() {
+      if document.graph().containsAll(waiting.asSlice()[w].parents.asSlice()) {
+        let delta = waiting.remove(w)
+        drop run document.apply(move delta)
+        progress = true
+      } else {
+        w = w + 1
+      }
+    }
+  }
+  return waiting.length()
+}
+
+/// One replica's side of syncing one document.
+pub struct Client {
+  doc: u64,
+  // Deltas before this sequence number reached the server.
+  cursor: usize,
+  completed: u64,
+}
+
+impl Copy for Client {}
+
+impl Client {
+  /// A client for document `doc` that has never synced.
+  pub fn make(doc: u64) -> Client {
+    return Client { doc: doc, cursor: 0, completed: 0 }
+  }
+
+  /// The number of exchanges that completed.
+  pub fn exchanges(self: &Self) -> u64 {
+    return self.completed
+  }
+
+  /// Whether `document` has deltas the server may not have.
+  pub fn hasUnsent(self: &Self, document: &Document) -> bool {
+    return self.cursor < document.deltaCount() || document.hasPending()
+  }
+
+  /// The request to send for `document`, committing local edits first.
+  pub effect fn request(self: &Self, document: &mut Document) -> List<u8>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run document.commit()
+    let mut out = Writer.make()
+    run out.number(PROTOCOL)
+    run out.number(self.doc)
+    let ids = run whereIs(&document.*)
+    run writeIds(&mut out, ids.asSlice())
+    let mut seqs = List<usize>.make()
+    let mut seq = self.cursor
+    while seq < document.deltaCount() {
+      run seqs.append(seq)
+      seq = seq + 1
+    }
+    run writeDeltas(&mut out, &document.*, seqs.asSlice())
+    return move out.bytes
+  }
+
+  /// Applies the server's response to the last request.
+  pub effect fn receive(self: &mut Self, document: &mut Document, response: &[u8]) -> ()
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut input = Reader.of(response)
+    let protocol = run input.number()
+    if protocol != PROTOCOL {
+      fail DecodeError {}
+    }
+    drop run applyDeltas(&mut input, &mut document)
+    if !input.done() {
+      fail DecodeError {}
+    }
+
+    // The server has what this request carried and what it sent back.
+    self.cursor = document.deltaCount()
+    self.completed = self.completed + 1
+  }
+
+  /// Sends a request over the provided transport and applies the response.
+  pub effect fn sync(self: &mut Self, document: &mut Document) -> ()
+    ! TransportError | DecodeError | OutOfMemoryError
+    ? &mut Transport | &mut Allocator {
+    let request = run self.request(&mut document)
+    let mut response = List<u8>.make()
+    run Transport.exchange(request.asSlice(), &mut response)
+    run self.receive(&mut document, response.asSlice())
+  }
+}
+
+struct Hosted {
+  doc: u64,
+  document: Document,
+  saved: usize,
+}
+
+/// A server that keeps every document in memory.
+pub struct MemoryServer {
+  hosted: List<Hosted>,
+  actor: ActorId,
+  handled: u64,
+}
+
+impl MemoryServer {
+  /// An empty server. Its documents are edited only by clients; `actor` names the server's own
+  /// replicas and must differ from every client's.
+  pub fn make(actor: ActorId) -> MemoryServer {
+    return MemoryServer { hosted: List<Hosted>.make(), actor: actor, handled: 0 }
+  }
+
+  /// The number of requests handled.
+  pub fn requests(self: &Self) -> u64 {
+    return self.handled
+  }
+
+  /// The server's copy of `doc`, created empty when missing.
+  pub effect fn document(self: &mut Self, doc: u64) -> &Document
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = run self.slot(doc)
+    return &self.hosted.asSlice()[slot].document
+  }
+
+  /// Saves every delta not yet saved to the provided store.
+  pub effect fn persist(self: &mut Self) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Store | &mut Allocator {
+    let mut k: usize = 0
+    while k < self.hosted.length() {
+      let hosted = &mut self.hosted.asMutSlice()[k]
+      hosted.saved = run save(&hosted.document, hosted.doc, hosted.saved)
+      k = k + 1
+    }
+  }
+
+  effect fn slot(self: &mut Self, doc: u64) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut k: usize = 0
+    while k < self.hosted.length() {
+      if self.hosted.asSlice()[k].doc == doc {
+        return k
+      }
+      k = k + 1
+    }
+    let document = run Document.make(self.actor)
+    run self.hosted.append(Hosted { doc: doc, document: move document, saved: 0 })
+    return self.hosted.length() - 1
+  }
+}
+
+impl SyncServer for MemoryServer {
+  effect fn handle(self: &mut Self, request: &[u8], response: &mut List<u8>) -> ()
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut input = Reader.of(request)
+    let protocol = run input.number()
+    if protocol != PROTOCOL {
+      fail DecodeError {}
+    }
+    let doc = run input.number()
+    let ids = run readIds(&mut input)
+    let slot = run self.slot(doc)
+    let document = &mut self.hosted.asMutSlice()[slot].document
+    drop run applyDeltas(&mut input, &mut document)
+    if !input.done() {
+      fail DecodeError {}
+    }
+    let at = run Frontier.of(ids.asSlice())
+    let missing = run document.missingFor(&at)
+    let mut out = Writer.make()
+    run out.number(PROTOCOL)
+    run writeDeltas(&mut out, &document.*, missing.asSlice())
+    run response.appendSlice(out.bytes.asSlice())
+    self.handled = self.handled + 1
+  }
+}
+
+/// A transport to a server in the same process. While offline, every exchange fails.
+pub struct Loopback<'s, S> {
+  server: &'s mut S,
+  pub online: bool,
+}
+
+impl<'s, S: SyncServer> Loopback<'s, S> {
+  pub fn to(server: &'s mut S) -> Loopback<'s, S> {
+    return Loopback<'s, S> { server: move server, online: true }
+  }
+}
+
+impl<'s, S: SyncServer> Transport for Loopback<'s, S> {
+  effect fn exchange(self: &mut Self, request: &[u8], response: &mut List<u8>) -> ()
+    ! TransportError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.online {
+      fail TransportError { code: 1 }
+    }
+    let server = &mut self.server.*
+    let handled = run Effect.result(server.handle(request, &mut response))
+    let ok = match move handled {
+      Result<(), DecodeError | OutOfMemoryError>.Success { value: _ } => true
+      _ => false
+    }
+    if !ok {
+      fail TransportError { code: 2 }
+    }
+  }
+}
