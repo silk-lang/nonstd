@@ -36,3 +36,21 @@ ADDRESS uses the syntax of `SILK_UI_INSPECT` (`1`, `tcp:<port>` or a socket path
 snapshot and inspect print their text, screenshot writes the file, the rest print the reply
 line. Exit codes: 0 ok, 1 the command failed (the reason goes to stderr), 2 the app cannot be
 reached or the arguments are wrong.
+
+## Pointer/key phases and timed mosaics
+
+```sh
+ui-inspect-cli --connect /tmp/silk-ui.sock pointer --phase down --x 300 --y 120
+ui-inspect-cli --connect /tmp/silk-ui.sock pointer --phase move --x 500 --y 180
+ui-inspect-cli --connect /tmp/silk-ui.sock pointer --phase up --x 500 --y 180
+ui-inspect-cli --connect /tmp/silk-ui.sock key ' ' --phase down --code Space
+ui-inspect-cli --connect /tmp/silk-ui.sock key ' ' --phase up --code Space
+ui-inspect-cli --connect /tmp/silk-ui.sock capture sequence.png \
+  --count 10 --interval 100 --columns 5 --tile-width 480 --test-id canvas
+```
+
+`capture` uses the same implementation as MCP `ui_capture`. It saves one PNG mosaic and
+prints actual sample times and source frames. Waits happen in the client; the app handles
+input between screenshots. Repeated frame numbers remain visible. Omit `--test-id canvas`
+to capture the whole window. These CPU captures help diagnose transitions and stalls; they
+are not an FPS measurement. Capture limits and target semantics match the MCP tool.

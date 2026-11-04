@@ -44,6 +44,7 @@ import webgpu.descriptors {
 import webgpu_sys.generated_webgpu as flags
 import gpu_scene.renderer { entry, extent, storage, textureEntry, upload }
 import silk.color.rgba { Rgba }
+import ui_scene.color as color
 import gpu_scene.filter { FilterImage, FilterRenderer }
 import vector.filter { BlurPlan, Region }
 import ui_scene.effects { LayerEffects }
@@ -244,6 +245,7 @@ pub struct UiRenderer {
   offscreen: Pipelines,
   composite: RenderPipeline,
   copy: RenderPipeline,
+  overlay: RenderPipeline,
   text: TextSettings,
   instances: Instances,
   /// The globals uniform and the instance buffers (see GLOBALS .. RAMPS).
@@ -277,6 +279,7 @@ impl UiRenderer {
       offscreen: run makePipelines(device, &modules, LAYER_FORMAT),
       composite: run makePipeline(device, &layer, LAYER_FORMAT, false),
       copy: run makePipeline(device, &layer, format, false),
+      overlay: run makePipeline(device, &layer, format, true),
       text: TextSettings.default(),
       instances: Instances.make(),
       buffers: List<Buffer>.make(),
@@ -320,6 +323,126 @@ impl UiRenderer {
     let mut encoder = run gpu.createCommandEncoder(device, b"ui frame")
     run self.encode(device, queue, &mut encoder, scene, atlas, target, width, height, clear)
     let finished = run encoder.finish(b"ui frame")
+    queue.submit(&[finished.reference()])
+  }
+
+  /// Draws an overlay onto an existing target without clearing it.
+  /// Opacity and layer filters are supported. Backdrop filters and non-normal
+  /// blends must use `draw` with the underlying content in the same scene.
+  /// Use a separate renderer for the underlying retained geometry so its buffers survive.
+  pub effect fn drawOverlay(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    scene: &Scene,
+    atlas: &GpuAtlas,
+    target: &TextureView,
+    width: u32,
+    height: u32,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    if width == 0 || height == 0 || scene.layerCount() == 0 {
+      return
+    }
+    run self.upload(device, queue, scene, width, height)
+    let mut encoder = run gpu.createCommandEncoder(device, b"ui overlay")
+    if scene.layerCount() == 1 || compositesOf(scene, 0) == 0 {
+      run self.drawRange(
+        device,
+        &mut encoder,
+        target,
+        &self.direct,
+        scene,
+        atlas,
+        0,
+        0,
+        scene.batches(0).length,
+        true,
+        clearOf(color.transparent()),
+      )
+    } else {
+      run self.reserve(device, queue, scene, width, height)
+      let mut slot: usize = 0
+      run self.isolated(
+        device,
+        queue,
+        &mut encoder,
+        scene,
+        atlas,
+        0,
+        0,
+        clearOf(color.transparent()),
+        width,
+        height,
+        &mut slot,
+      )
+      run self.pass(
+        device,
+        queue,
+        &mut encoder,
+        &self.overlay,
+        target,
+        slot,
+        OP_COPY,
+        0,
+        255,
+        1,
+        0,
+        LayerEffects.none(),
+        Area { x: 0, y: 0, width: width, height: height },
+      )
+    }
+    let finished = run encoder.finish(b"ui overlay")
+    queue.submit(&[finished.reference()])
+  }
+
+  /// Draws a single-layer, image-only scene using a GPU camera transform.
+  /// Set `refresh` after any scene/atlas binding change or intervening ordinary draw.
+  /// The scene remains in its original coordinates; only the camera uniform is
+  /// uploaded on other frames. Scale must be positive and finite.
+  pub effect fn drawRetainedImages(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    scene: &Scene,
+    atlas: &GpuAtlas,
+    target: &TextureView,
+    width: u32,
+    height: u32,
+    clear: Rgba<f32>,
+    scale: f32,
+    x: f32,
+    y: f32,
+    refresh: bool,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    if refresh {
+      run self.upload(device, queue, scene, width, height)
+    }
+    let mut globals: [u8; 48] = [0; 48]
+    writeU32(&mut globals, 0, f32.toBits(u32.toF32(width)))
+    writeU32(&mut globals, 4, f32.toBits(u32.toF32(height)))
+    writeU32(&mut globals, 32, f32.toBits(scale))
+    writeU32(&mut globals, 40, f32.toBits(x))
+    writeU32(&mut globals, 44, f32.toBits(y))
+    queue.writeBuffer(&self.buffers.asSlice()[GLOBALS], 0, &globals)
+    let mut encoder = run gpu.createCommandEncoder(device, b"retained images")
+    run self.drawRange(
+      device,
+      &mut encoder,
+      target,
+      &self.direct,
+      scene,
+      atlas,
+      0,
+      0,
+      scene.batches(0).length,
+      false,
+      clearOf(clear),
+    )
+    let finished = run encoder.finish(b"retained images")
     queue.submit(&[finished.reference()])
   }
 
@@ -408,7 +531,7 @@ impl UiRenderer {
     ! GpuError | OutOfMemoryError
     ? &mut Allocator {
     run self.instances.pack(scene)
-    let mut globals: [u8; 32] = [0; 32]
+    let mut globals: [u8; 48] = [0; 48]
     writeU32(&mut globals, 0, f32.toBits(u32.toF32(width)))
     writeU32(&mut globals, 4, f32.toBits(u32.toF32(height)))
     writeU32(&mut globals, 8, f32.toBits(self.text.contrast))
@@ -418,6 +541,7 @@ impl UiRenderer {
       writeU32(&mut globals, 16 + r * 4, f32.toBits(ratios[r]))
       r = r + 1
     }
+    writeU32(&mut globals, 32, f32.toBits(1.0))
     let storage = flags.WGPUBufferUsage_Storage
     run upload(
       device,
@@ -859,7 +983,8 @@ impl UiRenderer {
     load: bool,
     clear: ClearColor,
   ) -> ()
-    ! GpuError {
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
     let mut color = RenderPassColorAttachment.default().withView(view)
     color.setClearValue(clear)
     color.setLoadOp(
@@ -876,6 +1001,9 @@ impl UiRenderer {
     )
     let b = self.buffers.asSlice()
     let batches = scene.batches(layer)
+    let mut imageGroups = List<BindGroup>.make()
+    let mut imageTextures = List<u32>.make()
+    let mut lastKind: u32 = 255
     let mut i = from
     while i < to {
       let batch = batches[i]
@@ -892,6 +1020,7 @@ impl UiRenderer {
             &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
           )
           pass.setPipeline(&pipelines.shadow)
+          lastKind = kind
           pass.setBindGroup(0, &group, &[])
           pass.draw(6, count, 0, first)
         }
@@ -903,6 +1032,7 @@ impl UiRenderer {
             &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
           )
           pass.setPipeline(&pipelines.quad)
+          lastKind = kind
           pass.setBindGroup(0, &group, &[])
           pass.draw(6, count, 0, first)
         }
@@ -914,6 +1044,7 @@ impl UiRenderer {
             &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
           )
           pass.setPipeline(&pipelines.underline)
+          lastKind = kind
           pass.setBindGroup(0, &group, &[])
           pass.draw(6, count, 0, first)
         }
@@ -930,24 +1061,36 @@ impl UiRenderer {
               &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
             )
             pass.setPipeline(&pipelines.mono)
+            lastKind = kind
             pass.setBindGroup(0, &group, &[])
             pass.draw(6, count, 0, first)
           }
         }
         PrimitiveKind.Image => {
           if u32.toUsize(batch.texture) < atlas.textureCount() {
-            let layout = run pipelines.poly.getBindGroupLayout(0)
-            let entries = [
-              entry(0, &b[GLOBALS]),
-              entry(1, &b[IMAGES]),
-              textureEntry(2, atlas.view(u32.toUsize(batch.texture))),
-            ]
-            let group = run gpu.createBindGroup(
-              device,
-              &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
-            )
-            pass.setPipeline(&pipelines.poly)
-            pass.setBindGroup(0, &group, &[])
+            let mut slot: usize = 0
+            while slot < imageTextures.length() && imageTextures.get(slot) != batch.texture {
+              slot = slot + 1
+            }
+            if slot == imageTextures.length() {
+              let layout = run pipelines.poly.getBindGroupLayout(0)
+              let entries = [
+                entry(0, &b[GLOBALS]),
+                entry(1, &b[IMAGES]),
+                textureEntry(2, atlas.view(u32.toUsize(batch.texture))),
+              ]
+              let group = run gpu.createBindGroup(
+                device,
+                &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
+              )
+              run imageGroups.append(move group)
+              run imageTextures.append(batch.texture)
+            }
+            if lastKind != kind {
+              pass.setPipeline(&pipelines.poly)
+              lastKind = kind
+            }
+            pass.setBindGroup(0, &imageGroups.asSlice()[slot], &[])
             pass.draw(6, count, 0, first)
           }
         }
@@ -967,6 +1110,7 @@ impl UiRenderer {
               &BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries),
             )
             pass.setPipeline(&pipelines.path)
+            lastKind = kind
             pass.setBindGroup(0, &group, &[])
             pass.draw(6, range[1] - range[0], 0, range[0])
           }

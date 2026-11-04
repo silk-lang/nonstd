@@ -1,5 +1,7 @@
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
+import layout.lib { Fragmentainers, computeFragmented }
+import inspect
 import mutation {
   Mutation,
   NodeKind,
@@ -15,6 +17,7 @@ import mutation {
   CanvasCommand,
   LISTEN_FOCUS,
   LISTEN_BLUR,
+  LISTEN_LAYOUT,
   NOT_FOCUSABLE,
   propertyKey
 }
@@ -51,11 +54,8 @@ import layout.lib {
   Tree,
   NodeId,
   LayoutTree,
-  LayoutStats,
   OptionalSize,
   InvalidNode,
-  TextError,
-  FragmentationError,
   NaturalDimensions,
   Style as CssStyle,
   Dimension
@@ -185,6 +185,8 @@ pub struct UiTree<'a> {
   pub seed: HashSeed,
   pub stylesDirty: bool,
   pub frameNumber: u64,
+  /// Changes to published semantics or allocated geometry.
+  pub semanticRevision: u64,
   pub input: FrameInput,
   laidOut: FrameInput,
   laidOutRevision: usize,
@@ -223,6 +225,7 @@ pub struct UiTree<'a> {
   pub reveal: List<u64>,
   /// Whether a mutation was applied since the last frame.
   applied: bool,
+  layoutObserversDirty: bool,
   /// Whether something only paint shows changed since the last frame (a caret moved).
   pub paintDirty: bool,
   /// Requests for the host (clipboard), oldest first.
@@ -269,6 +272,7 @@ impl<'a> UiTree<'a> {
       seed: seed,
       stylesDirty: true,
       frameNumber: 0,
+      semanticRevision: 0,
       input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
       laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       laidOutRevision: usize.MAX,
@@ -294,6 +298,7 @@ impl<'a> UiTree<'a> {
       pointerInside: false,
       reveal: List<u64>.make(),
       applied: false,
+      layoutObserversDirty: false,
       paintDirty: false,
       requests: List<HostRequest>.make(),
       keymap: NATIVE_KEYMAP,
@@ -407,6 +412,7 @@ impl<'a> UiTree<'a> {
   pub effect fn applyOne(self: &mut Self, index: usize, mutation: Mutation) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    self.semanticRevision = self.semanticRevision + 1
     self.applied = true
     match move mutation {
       Mutation.Create { id, kind } => {
@@ -480,6 +486,16 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
         match move attribute {
+          Attribute.ValueRange { min, max, value } => {
+            node.hasValueRange = true
+            node.valueMin = min
+            node.valueMax = max
+            node.valueNow = value
+          }
+          Attribute.ClearValueRange => {
+            node.hasValueRange = false
+          }
+
           Attribute.Role { value } => {
             node.accessRole = value
           }
@@ -542,7 +558,11 @@ impl<'a> UiTree<'a> {
       Mutation.SetListeners { id, flags } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
+        if u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 {
+          node.layoutReported = false
+        }
         node.listeners = flags
+        self.layoutObserversDirty = true
       }
       Mutation.SetRoot { id } => {
         let slot = run self.require(index, id)
@@ -562,6 +582,12 @@ impl<'a> UiTree<'a> {
       Mutation.ScrollIntoView { id } => {
         let slot = run self.require(index, id)
         run self.reveal.append(interact.pair(slot, id))
+      }
+      Mutation.SetGrid { id, value } => {
+        let slot = run self.require(index, id)
+        let css = self.node(slot).css
+        run Effect.catchAll(value.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        self.paintDirty = true
       }
       Mutation.SetSource { id, resource } => {
         let slot = run self.require(index, id)
@@ -613,7 +639,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.DefineImage { resource, data } => {
         let ok = run Effect.catch<ResourceError>(
-          defineImage(&mut self.resources, resource, Bytes.asSlice(&data)),
+          defineImage(&mut self.resources, &mut self.atlas, resource, Bytes.asSlice(&data)),
           resourceFailed,
         )
         if !ok {
@@ -621,9 +647,17 @@ impl<'a> UiTree<'a> {
         }
         run self.refreshSources(resource)
       }
+      Mutation.DefineDecodedImage { resource, image } => {
+        run self.resources.defineDecoded(&mut self.atlas, resource, move image)
+        run self.refreshSources(resource)
+      }
+      Mutation.ReleaseResource { resource } => {
+        run self.resources.release(&mut self.atlas, resource)
+        run self.refreshSources(resource)
+      }
       Mutation.DefineIcon { resource, data } => {
         let ok = run Effect.catch<ResourceError>(
-          defineIcon(&mut self.resources, resource, Bytes.asSlice(&data)),
+          defineIcon(&mut self.resources, &mut self.atlas, resource, Bytes.asSlice(&data)),
           resourceFailed,
         )
         if !ok {
@@ -691,6 +725,10 @@ impl<'a> UiTree<'a> {
       styled: false,
       text: String.make(),
       accessRole: Role.None,
+      hasValueRange: false,
+      valueMin: 0.0,
+      valueMax: 0.0,
+      valueNow: 0.0,
       label: String.make(),
       testId: String.make(),
       tabIndex: if kind == NodeKind.Input {
@@ -705,6 +743,8 @@ impl<'a> UiTree<'a> {
       selected: false,
       expanded: false,
       listeners: 0,
+      layoutReported: false,
+      reportedBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
       hovered: false,
       pressed: false,
       scrollX: 0.0,
@@ -910,6 +950,7 @@ impl<'a> UiTree<'a> {
     if slot == self.focused {
       return ()
     }
+    self.semanticRevision = self.semanticRevision + 1
     let previous = self.focused
     self.focused = slot
     run edit.focusChanged(&mut self, previous, slot)
@@ -1219,11 +1260,11 @@ impl<'a> UiTree<'a> {
     if node.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
       if node.edit.multiline {
-        computed.text.whiteSpace = WhiteSpace.PreWrap
+        computed.apply(Property.WhiteSpace { value: WhiteSpace.PreWrap })
         computed.overflowX = Overflow.Hidden
         computed.overflowY = Overflow.Auto
       } else {
-        computed.text.whiteSpace = WhiteSpace.Pre
+        computed.apply(Property.WhiteSpace { value: WhiteSpace.Pre })
         computed.overflowX = Overflow.Hidden
         computed.overflowY = Overflow.Hidden
       }
@@ -1315,11 +1356,67 @@ impl<'a> UiTree<'a> {
       run self.resolveStyles()
       run self.layoutFrame()
     }
+    run self.notifyLayout()
     edit.beginPaint(&mut self)
     run self.paintFrame()
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()
+  }
+
+  /// Lays out and paints pages or columns supplied by the host. Break policies, widows,
+  /// orphans and fixed page-positioned elements use the same styles as continuous frames.
+  /// Geometry queries describe this output until the next frame; `frame` resumes continuous
+  /// layout. Fragmentainer slices are borrowed only for this call.
+  pub effect fn frameFragmented(self: &mut Self, input: FrameInput, frames: Fragmentainers) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.frameNumber = self.frameNumber + 1
+    self.applied = false
+    self.input = input
+    self.stats = FrameStats.zero()
+    self.stats.frame = self.frameNumber
+    run self.resolveStyles()
+    let mut viewport = CssStyle.make()
+    let root = self.layout.root()
+    run Effect.catchAll(self.layout.setStyle(root, move viewport), layoutFailed)
+    run Effect.catchAll(
+      computeFragmented(
+        &self.layout,
+        &mut self.output,
+        &mut self.provider,
+        OptionalSize.none(),
+        move frames,
+      ),
+      layoutFailed,
+    )
+    self.output.fragments.resolveLocations()
+    self.semanticRevision = self.semanticRevision + 1
+    self.laidOutRevision = usize.MAX
+    self.stats.layout = self.output.stats
+    self.stats.layoutSkipped = false
+    run self.indexFragments()
+    self.layoutObserversDirty = true
+    run self.notifyLayout()
+    edit.beginPaint(&mut self)
+    run self.paintFrame()
+    self.paintDirty = false
+    self.stats.nodes = self.nodeCount()
+    self.stats.fragments = self.output.fragments.values.length()
+  }
+
+  /// The atlas tile for a registered image, for custom scene composition. Allocation and
+  /// re-upload after eviction are managed by the resource store and collected by `frame`.
+  pub effect fn imageTile(self: &mut Self, resource: u32) -> Option<AtlasTile>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.resources.get(resource) {
+      Option<Resource>.Some { value: Resource.Image { image, .. } } => run self.resources.imageTile(
+        &mut self.atlas,
+        image,
+      )
+      _ => Option<AtlasTile>.None
+    }
   }
 
   /// Whether a mutation or an edit changed styles or layout inputs since the last layout.
@@ -1362,12 +1459,50 @@ impl<'a> UiTree<'a> {
       layoutFailed,
     )
     self.output.fragments.resolveLocations()
+    self.semanticRevision = self.semanticRevision + 1
     self.laidOut = self.input
     self.laidOutRevision = self.layout.revision()
     self.laidOutScrolls = self.layout.scrollRevision()
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
     run self.indexFragments()
+    self.layoutObserversDirty = true
+  }
+
+  /// Reports changed geometry once after layout, including scrolling and first attachment.
+  effect fn notifyLayout(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.layoutObserversDirty {
+      return ()
+    }
+    self.layoutObserversDirty = false
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = &self.nodes.asSlice()[i]
+      if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0 {
+        let id = node.id
+        let before = node.reportedBounds
+        let reported = node.layoutReported
+        if let Option<inspect.NodeInfo>.Some { value } = run inspect.info(&self.*, id) {
+          let bounds = value.bounds
+          if !reported || before.xMin != bounds.xMin || before.yMin != bounds.yMin
+            || before.xMax != bounds.xMax
+            || before.yMax != bounds.yMax {
+            let slot = usize.toU32(i)
+            let target = self.nodeMut(slot)
+            target.layoutReported = true
+            target.reportedBounds = bounds
+            let mut path = List<u32>.make()
+            run self.pathTo(slot, &mut path)
+            let mut event = Event.make(EventKind.Layout, id, move path)
+            event.bounds = bounds
+            run self.queueEvent(move event)
+          }
+        }
+      }
+      i = i + 1
+    }
   }
 
   /// Fills `fragmentOf` from the last layout.
@@ -1607,17 +1742,27 @@ fn sameNatural(a: NaturalDimensions, b: NaturalDimensions) -> bool {
     && a.size.height == b.size.height
 }
 
-effect fn defineImage(resources: &mut Resources, resource: u32, data: &[u8]) -> bool
+effect fn defineImage(
+  resources: &mut Resources,
+  atlas: &mut Atlas,
+  resource: u32,
+  data: &[u8],
+) -> bool
   ! ResourceError | OutOfMemoryError
   ? &mut Allocator {
-  run resources.defineImage(resource, data)
+  run resources.defineImage(&mut atlas, resource, data)
   return true
 }
 
-effect fn defineIcon(resources: &mut Resources, resource: u32, data: &[u8]) -> bool
+effect fn defineIcon(
+  resources: &mut Resources,
+  atlas: &mut Atlas,
+  resource: u32,
+  data: &[u8],
+) -> bool
   ! ResourceError | OutOfMemoryError
   ? &mut Allocator {
-  run resources.defineIcon(resource, data)
+  run resources.defineIcon(&mut atlas, resource, data)
   return true
 }
 

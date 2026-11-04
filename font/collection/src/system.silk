@@ -1,0 +1,344 @@
+//! Native font discovery with explicit startup budgets. Scans standard system and user font
+//! directories, loads TTF/OTF/TTC files, and configures generic families. Missing directories,
+//! unreadable files and unsupported fonts are skipped; the report exposes budget truncation.
+//! Add bundled fallback fonts first when an app must work on machines without installed fonts.
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.path { WindowsPath }
+}
+
+import collection { FontCollection }
+import svg_fonts.database { Generic }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileSystem, Path, FileError, FileInfo, DirectoryInfo }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput }
+import silk.text.string { String }
+
+pub struct Options {
+  pub maxFiles: usize,
+  pub maxBytes: usize,
+  pub maxDepth: usize
+}
+
+impl Options {
+  pub fn defaults() -> Options {
+    return Options { maxFiles: 1024, maxBytes: 536870912, maxDepth: 8 }
+  }
+}
+
+pub struct Report {
+  loaded: List<String>,
+  pub files: usize,
+  pub bytes: usize,
+  pub skipped: usize,
+  pub truncated: bool
+}
+
+impl Report {
+  pub fn empty() -> Report {
+    return Report { loaded: List<String>.make(), files: 0, bytes: 0, skipped: 0, truncated: false }
+  }
+}
+
+fn fontPath(path: &Path) -> bool {
+  let bytes = Path.rawBytes(path)
+  if bytes.length < 4 {
+    return false
+  }
+  let i = bytes.length - 4
+  return bytes[i] == 46
+    && ((bytes[i + 1] == 116 || bytes[i + 1] == 84) && (bytes[i + 2] == 116 || bytes[i + 2] == 84)
+      && (bytes[i + 3] == 102 || bytes[i + 3] == 70 || bytes[i + 3] == 99 || bytes[i + 3] == 67)
+      || (bytes[i + 1] == 111 || bytes[i + 1] == 79) && (bytes[i + 2] == 116 || bytes[i + 2] == 84)
+        && (bytes[i + 3] == 102 || bytes[i + 3] == 70))
+}
+
+/// Loads a directory recursively through the supplied filesystem, useful for packaged fonts
+/// and deterministic tests too. Directory symlinks are not followed.
+pub effect fn directory(
+  collection: &mut FontCollection,
+  path: &Path,
+  options: &Options,
+  report: &mut Report,
+  depth: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if depth > options.maxDepth {
+    report.truncated = true
+    return ()
+  }
+  let result = run Effect.result(FileSystem.listDirectory(path))
+  match move result {
+    Result.Failure { error } => {
+      drop error
+      report.skipped = report.skipped + 1
+    }
+    Result.Success { value: entries } => {
+      let values = entries.asSlice()
+      let mut i: usize = 0
+      while i < values.length {
+        if report.files >= options.maxFiles || report.bytes >= options.maxBytes {
+          report.truncated = true
+          return ()
+        }
+        let entry = &values[i]
+        if entry.kind.code == 1 {
+          run directory(&mut collection, &entry.path, options, &mut report, depth + 1)
+        } else if fontPath(&entry.path) {
+          run file(&mut collection, &entry.path, options, &mut report)
+        }
+        i = i + 1
+      }
+    }
+  }
+}
+
+/// Adds one font file within the discovery budget. Files already loaded by this report are
+/// skipped, so priority families and subsequent directory discovery share their storage.
+pub effect fn file(
+  collection: &mut FontCollection,
+  path: &Path,
+  options: &Options,
+  report: &mut Report,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let name = Path.view(path).unwrapOr("")
+  let mut i: usize = 0
+  while i < report.loaded.length() {
+    if String.view(&report.loaded.asSlice()[i]) == name {
+      return ()
+    }
+    i = i + 1
+  }
+  if report.files >= options.maxFiles || report.bytes >= options.maxBytes {
+    report.truncated = true
+    return ()
+  }
+  let info = run Effect.result(FileSystem.stat(path))
+  match move info {
+    Result.Success { value } => match move value {
+      FileInfo file => {
+        if file.byteLength <= options.maxBytes - report.bytes {
+          let read = run Effect.result(FileSystem.readFile(path))
+          match move read {
+            Result.Success { value: bytes } => {
+              let length = bytes.length()
+              if length <= options.maxBytes - report.bytes {
+                let added = run Effect.result(collection.add(move bytes))
+                match move added {
+                  Result.Success { value: count } => {
+                    if count > 0 {
+                      report.files = report.files + 1
+                      report.bytes = report.bytes + length
+                      run report.loaded.append(run String.copy(Path.view(path).unwrapOr("")))
+                    } else {
+                      report.skipped = report.skipped + 1
+                    }
+                  }
+                  Result.Failure { error } => {
+                    drop error
+                    report.skipped = report.skipped + 1
+                  }
+                }
+              } else {
+                report.truncated = true
+              }
+            }
+            Result.Failure { error } => {
+              drop error
+              report.skipped = report.skipped + 1
+            }
+          }
+        } else {
+          report.truncated = true
+        }
+      }
+      DirectoryInfo _ => {}
+    }
+    Result.Failure { error } => {
+      drop error
+      report.skipped = report.skipped + 1
+    }
+  }
+}
+
+effect fn preferred(
+  collection: &mut FontCollection,
+  names: &[string],
+  options: &Options,
+  report: &mut Report,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut i: usize = 0
+  while i < names.length {
+    let path = run Effect.result(rootPath(names[i]))
+    if let Result.Success { value } = move path {
+      run file(&mut collection, &value, options, &mut report)
+    }
+    i = i + 1
+  }
+}
+
+effect fn scan(
+  collection: &mut FontCollection,
+  root: string,
+  options: &Options,
+  report: &mut Report,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let path = run Effect.result(rootPath(root))
+  if let Result.Success { value } = move path {
+    run directory(&mut collection, &value, options, &mut report, 0)
+  }
+}
+
+effect fn generic(collection: &mut FontCollection, kind: Generic, names: &[string]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < names.length {
+    run collection.addGeneric(kind, String.utf8Bytes(names[i]))
+    i = i + 1
+  }
+}
+
+/// Discovers fonts in platform directories and the current user's font directories. Existing
+/// bundled faces remain available. Pass a HostInput provider to choose which user's directories.
+pub effect fn load(collection: &mut FontCollection, options: Options) -> Report
+  ! OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let mut files = run MachineFileSystem.make()
+  let mut report = Report.empty()
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    // Load the platform's default UI/serif/mono families before large script collections
+    // consume a caller's budget. The directory pass still discovers all remaining faces.
+    run preferred(
+      &mut collection,
+      &[
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Georgia.ttf",
+        "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+      ],
+      &options,
+      &mut report,
+    )
+      |> Effect.provideMut<FileSystem>(&mut files)
+    run scan(&mut collection, "/System/Library/Fonts", &options, &mut report)
+      |> Effect.provideMut<FileSystem>(&mut files)
+    run scan(&mut collection, "/Library/Fonts", &options, &mut report)
+      |> Effect.provideMut<FileSystem>(&mut files)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let root = run Effect.result(HostInput.variableNamed("WINDIR"))
+      if let Result.Success { value } = move root {
+        if let Option<Bytes>.Some { value: bytes } = move value {
+          let mut path = run String.copy(String.fromUtf8(bytes.asSlice()).unwrapOr("C:/Windows"))
+          run path.append("/Fonts")
+          run scan(&mut collection, String.view(&path), &options, &mut report)
+            |> Effect.provideMut<FileSystem>(&mut files)
+        }
+      }
+    } else {
+      run scan(&mut collection, "/usr/share/fonts", &options, &mut report)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      run scan(&mut collection, "/usr/local/share/fonts", &options, &mut report)
+        |> Effect.provideMut<FileSystem>(&mut files)
+    }
+  }
+  let home = run Effect.result(
+    HostInput.variableNamed(
+      if platformName() == "windows" {
+        "LOCALAPPDATA"
+      } else {
+        "HOME"
+      },
+    ),
+  )
+  if let Result.Success { value } = move home {
+    if let Option<Bytes>.Some { value: bytes } = move value {
+      let base = String.fromUtf8(bytes.asSlice()).unwrapOr("")
+      if String.byteLength(base) > 0 {
+        let mut path = run String.copy(base)
+        run path.append(
+          if platformName() == "darwin" {
+            "/Library/Fonts"
+          } else if platformName() == "windows" {
+            "/Microsoft/Windows/Fonts"
+          } else {
+            "/.local/share/fonts"
+          },
+        )
+        run scan(&mut collection, String.view(&path), &options, &mut report)
+          |> Effect.provideMut<FileSystem>(&mut files)
+        static if Intrinsic.targetOperatingSystem() == "linux" {
+          let mut legacy = run String.copy(base)
+          run legacy.append("/.fonts")
+          run scan(&mut collection, String.view(&legacy), &options, &mut report)
+            |> Effect.provideMut<FileSystem>(&mut files)
+        }
+      }
+    }
+  }
+  run generic(
+    &mut collection,
+    Generic.SystemUi,
+    &[".AppleSystemUIFont", "Segoe UI", "Noto Sans", "DejaVu Sans", "Arial"],
+  )
+  run generic(
+    &mut collection,
+    Generic.SansSerif,
+    &["Arial", "Noto Sans", "DejaVu Sans", "Liberation Sans"],
+  )
+  run generic(
+    &mut collection,
+    Generic.Serif,
+    &["Georgia", "Times New Roman", "Noto Serif", "DejaVu Serif", "Liberation Serif"],
+  )
+  run generic(
+    &mut collection,
+    Generic.Monospace,
+    &["Courier New", "Menlo", "Consolas", "Noto Mono", "DejaVu Sans Mono"],
+  )
+  run generic(
+    &mut collection,
+    Generic.Emoji,
+    &["Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji"],
+  )
+  return move report
+}
+
+fn platformName() -> string<'static> {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return "darwin"
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      return "windows"
+    } else {
+      return "linux"
+    }
+  }
+}
+
+effect fn rootPath(value: string) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.fromNative(value)
+  } else {
+    return run Path.fromBytes(String.utf8Bytes(value))
+  }
+}

@@ -172,9 +172,9 @@ real window on X11 and Wayland, clicks Add and compares a frame.
 
 ## Limits
 
-- `runWindow` performs commands synchronously, so a slow command holds up the window. A loop
-  that runs inside a scheduler can run them on fibers with `Tasks` (above). There is no
-  cancellation by key.
+- `runWindow` performs commands synchronously. For native workers, use deferred commands and
+  `ui-app-window.commands.Commands`, or compose `Background` jobs in `WindowContent`. See the
+  [native primitives guide](window/README.md). There is no automatic cancellation by command key.
 - There is no `ui.map` for embedding a child app with its own message type, and no custom
   subscription kind.
 - Style and attribute calls a `lazy` body makes on its parent are not kept when the region is
@@ -188,3 +188,6 @@ real window on X11 and Wayland, clicks Add and compares a frame.
   running out of memory traps instead of failing with a typed error. Effect builders would need
   `run` on every call (`run ui.row(effect |ui| {...})`, with bodies typed
   `for<'call> fn(&'call mut Ui<M>) -> mut Effect<'call; ...>`), so plain functions were kept.
+
+The [native primitives guide](window/README.md) covers the full layout bridge, styled and
+managed images, measured bounds, custom GPU content, shared text caches and OS accessibility.

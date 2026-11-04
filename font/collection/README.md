@@ -28,3 +28,9 @@ run fonts.addScriptFallback(Script.Arabic, String.utf8Bytes("Amiri"))
 ```
 
 [ui-text](../../ui/text) builds css-layout text measurement on top of this.
+
+`system.load(collection, options)` discovers native font directories and registers generic
+families. Discovery is eager and bounded by file count, bytes and recursion depth; its report
+identifies skipped files and truncation. Add bundled fallback faces before discovery.
+`system.file` and `system.directory` use an injected filesystem and a shared report to avoid
+loading the same path twice. See the [native guide](../../ui/app/window/README.md).

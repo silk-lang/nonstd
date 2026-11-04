@@ -13,6 +13,7 @@
 //!   its target. The view runs again, but a node's children run only when the node is on that
 //!   path, and handlers (`on`, `onClick`, ...) are called only there. Their replies bubble from
 //!   the target up. Handlers are lambdas that are never stored.
+pub import ui_tree.grid { Grid }
 import equal
 import heap { Heap }
 import ui_tree.mutation {
@@ -40,7 +41,8 @@ import ui_tree.mutation {
   LISTEN_FOCUS,
   LISTEN_BLUR,
   LISTEN_INPUT,
-  LISTEN_SCROLL
+  LISTEN_SCROLL,
+  LISTEN_LAYOUT
 }
 import ui_tree.mutation { propertyKey as keyOf }
 import ui_tree.node { Event, EventKind }
@@ -124,6 +126,10 @@ pub struct Entry {
   pub label: Span,
   pub testId: Span,
   pub accessRole: Role,
+  pub hasValueRange: bool,
+  pub valueMin: f32,
+  pub valueMax: f32,
+  pub valueNow: f32,
   pub hasTabIndex: bool,
   pub tabIndex: i32,
   pub hasCursor: bool,
@@ -149,6 +155,7 @@ pub struct Entry {
   pub anchor: u64,
   /// The image or icon resource, or `NO_ENTRY`.
   pub source: u32,
+  pub grid: u32,
   pub hasCanvas: bool,
   pub canvas: Span,
   pub listeners: u32,
@@ -181,6 +188,10 @@ impl Entry {
       label: Span.empty(),
       testId: Span.empty(),
       accessRole: Role.None,
+      hasValueRange: false,
+      valueMin: 0.0,
+      valueMax: 0.0,
+      valueNow: 0.0,
       hasTabIndex: false,
       tabIndex: 0,
       hasCursor: false,
@@ -198,6 +209,7 @@ impl Entry {
       hasAnchor: false,
       anchor: 0,
       source: NO_ENTRY,
+      grid: NO_ENTRY,
       hasCanvas: false,
       canvas: Span.empty(),
       listeners: 0,
@@ -240,6 +252,7 @@ pub struct Arena {
   pub entries: List<Entry>,
   pub styles: List<StyleRecord>,
   pub bytes: List<u8>,
+  pub grids: List<Grid>,
   pub canvas: List<CanvasCommand>,
   pub lazies: List<LazyRecord>,
 }
@@ -250,6 +263,7 @@ impl Arena {
       entries: List<Entry>.make(),
       styles: List<StyleRecord>.make(),
       bytes: List<u8>.make(),
+      grids: List<Grid>.make(),
       canvas: List<CanvasCommand>.make(),
       lazies: List<LazyRecord>.make(),
     }
@@ -259,6 +273,7 @@ impl Arena {
     self.entries.clear()
     self.styles.clear()
     self.bytes.clear()
+    self.grids.clear()
     self.canvas.clear()
     self.lazies.clear()
   }
@@ -295,6 +310,11 @@ impl Arena {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.clear()
+    let mut g: usize = 0
+    while g < other.grids.length() {
+      run self.grids.append(run other.grids.asSlice()[g].copy())
+      g = g + 1
+    }
     run self.entries.appendSlice(other.entries.asSlice())
     run self.styles.appendSlice(other.styles.asSlice())
     run self.bytes.appendSlice(other.bytes.asSlice())
@@ -400,6 +420,7 @@ pub struct Ui<M> {
   pub reused: u32,
   /// The layout boxes of anchored nodes, filled by the runtime before each pass.
   pub anchors: List<AnchorRect>,
+  pub viewportBounds: Rect<f32>,
   /// The overlay host entry of this render, or `NO_ENTRY`.
   overlayHost: u32,
   /// How many times `overlay` ran this pass.
@@ -424,6 +445,7 @@ pub fn listenerFlag(kind: EventKind) -> u32 {
     EventKind.Focus => LISTEN_FOCUS
     EventKind.Blur => LISTEN_BLUR
     EventKind.Input => LISTEN_INPUT
+    EventKind.Layout => LISTEN_LAYOUT
     EventKind.Scroll => LISTEN_SCROLL
   }
 }
@@ -437,6 +459,7 @@ pub fn bubbles(kind: EventKind) -> bool {
     EventKind.PointerLeave => false
     EventKind.Focus => false
     EventKind.Blur => false
+    EventKind.Layout => false
     EventKind.Scroll => false
     _ => true
   }
@@ -490,6 +513,7 @@ impl<M> Ui<M> {
       answers: List<Answer<M>>.make(),
       reused: 0,
       anchors: List<AnchorRect>.make(),
+      viewportBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
       overlayHost: NO_ENTRY,
       overlays: 0,
       searching: false,
@@ -918,24 +942,77 @@ impl<M> Ui<M> {
     }
   }
 
-  /// An image node showing image resource `resource`.
-  pub fn image(self: &mut Self, resource: u32) -> () {
-    let index = self.leaf(NodeKind.Image)
-    if index != NO_ENTRY {
-      let mut entry = self.arena.entry(index)
-      entry.source = resource
-      self.arena.setEntry(index, entry)
+  /// Sets the open node’s Grid template, including grid-item placement.
+  pub fn gridTemplate(self: &mut Self, value: &Grid) -> () {
+    if self.dispatching || self.searching {
+      return ()
     }
+    let index = usize.toU32(self.arena.grids.length())
+    let copy = self.heap.alloc(value.copy())
+    self.heap.alloc(self.arena.grids.append(move copy))
+    let mut entry = self.arena.entry(self.current)
+    entry.grid = index
+    self.arena.setEntry(self.current, entry)
   }
 
-  /// An icon node showing icon resource `resource`.
-  pub fn icon(self: &mut Self, resource: u32) -> () {
-    let index = self.leaf(NodeKind.Icon)
-    if index != NO_ENTRY {
-      let mut entry = self.arena.entry(index)
-      entry.source = resource
-      self.arena.setEntry(index, entry)
+  /// A Grid container; the template owns tracks, names, repeats and areas.
+  pub fn grid(self: &mut Self, value: &Grid, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.box(
+      |ui| {
+        ui.style(&[Property.Display { value: Display.Grid }])
+        ui.gridTemplate(value)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// Delivers the measured viewport-relative border box after it changes. Does not bubble.
+  /// Keep the callback idempotent; changing layout from it can schedule another frame.
+  pub fn onLayout(self: &mut Self, handler: fn(Rect<f32>) -> M) -> () {
+    self.on(EventKind.Layout, |event| Reply<M>.Emit { message: handler(event.bounds) })
+  }
+
+  /// Sets the image or icon source on the open node.
+  pub fn source(self: &mut Self, resource: u32) -> () {
+    if self.dispatching || self.searching {
+      return ()
     }
+    let mut entry = self.arena.entry(self.current)
+    entry.source = resource
+    self.arena.setEntry(self.current, entry)
+  }
+
+  /// An image node showing a registered resource at its natural size.
+  pub fn image(self: &mut Self, resource: u32) -> () {
+    self.imageWith(resource, |ui| {})
+  }
+
+  /// An image with its own sizing, fit, accessibility label and input handlers.
+  pub fn imageWith(self: &mut Self, resource: u32, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Image,
+      |ui| {
+        ui.source(resource)
+        ui.accessRole(Role.Image)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// An SVG mask icon tinted with the inherited text color.
+  pub fn icon(self: &mut Self, resource: u32) -> () {
+    self.iconWith(resource, |ui| {})
+  }
+
+  /// An icon with its own dimensions and attributes.
+  pub fn iconWith(self: &mut Self, resource: u32, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Icon,
+      |ui| {
+        ui.source(resource)
+        body(&mut ui)
+      },
+    )
   }
 
   /// An input node with value `value`. The view controls the value.
@@ -1124,6 +1201,11 @@ impl<M> Ui<M> {
       entry.testId = shifted(entry.testId, byteShift)
       entry.placeholder = shifted(entry.placeholder, byteShift)
       entry.canvas = shifted(entry.canvas, canvasShift)
+      if entry.grid != NO_ENTRY {
+        let grid = self.heap.alloc(self.previous.grids.asSlice()[u32.toUsize(entry.grid)].copy())
+        entry.grid = usize.toU32(self.arena.grids.length())
+        self.heap.alloc(self.arena.grids.append(move grid))
+      }
       if inside(entry.parent) {
         entry.parent = u32.wrappingAdd(entry.parent, entryShift)
         if entry.next != NO_ENTRY {
@@ -1380,6 +1462,18 @@ impl<M> Ui<M> {
     }
   }
 
+  /// The numeric accessibility range of the open control. Omitting it in the next view clears it.
+  pub fn valueRange(self: &mut Self, min: f32, max: f32, value: f32) -> () {
+    if !self.dispatching {
+      let mut entry = self.arena.entry(self.current)
+      entry.hasValueRange = true
+      entry.valueMin = min
+      entry.valueMax = max
+      entry.valueNow = value
+      self.arena.setEntry(self.current, entry)
+    }
+  }
+
   /// A stable name for tests and inspectors.
   pub fn testId(self: &mut Self, value: string) -> () {
     if !self.dispatching {
@@ -1518,6 +1612,11 @@ impl<M> Ui<M> {
   /// The border box, in CSS pixels of the viewport, of the node anchored as `key` in the last
   /// render, as the tree last laid it out; none before it was laid out. A popup places itself
   /// next to it, and a slider maps a pointer position to a value with it.
+  /// The current window content bounds, in logical pixels, for collision-aware overlays.
+  pub fn viewport(self: &Self) -> Rect<f32> {
+    return self.viewportBounds
+  }
+
   pub fn anchorRect(self: &Self, key: u64) -> Option<Rect<f32>> {
     let anchors = self.anchors.asSlice()
     let mut i: usize = 0

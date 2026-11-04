@@ -324,15 +324,29 @@ impl Inspector {
     return Option<f64>.None
   }
 
-  /// Serves the requests that are waiting, unless input from an earlier one still waits for a
+  /// Serves at most one waiting request per poll, unless earlier input still waits for a
   /// frame. Returns true when the app has work: a command dispatched input (take the tree's
   /// event records and answer them, as for window input) or changed the highlight. Either
-  /// way, draw a frame and call [`Inspector.afterFrame`].
+  /// way, drain [`Inspector.dispatchNext`] with application handling between each input,
+  /// then compose a frame and call [`Inspector.afterFrame`].
   pub effect fn poll(self: &mut Self, tree: &mut UiTree) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
     if !self.enabled() || self.awaitingFrame {
       return false
+    }
+
+    // Hosts may drain a compound interaction immediately, or process one event per frame.
+    // In either case a subsequent request cannot overwrite unprocessed input.
+    if self.protocol.hasInput() {
+      drop run self.protocol.dispatchNext(&mut tree)
+      self.protocol.dispatched = true
+      self.awaitingFrame = true
+      return true
+    }
+    if tree.stats.frame == 0 {
+      self.protocol.repaint = true
+      return true
     }
     let mut changed = false
     while !self.awaitingFrame {
@@ -350,10 +364,43 @@ impl Inspector {
         changed = true
       }
       if self.protocol.dispatched {
+        drop run self.protocol.dispatchNext(&mut tree)
         self.awaitingFrame = true
       }
+
+      // Yield to native input and timers even when clients continuously request screenshots.
+      break
     }
     return changed
+  }
+
+  /// Dispatches the next input of a compound click, key press or text entry. Service host
+  /// requests and application messages after each true result, just as for native input.
+  pub effect fn dispatchNext(self: &mut Self, tree: &mut UiTree) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.protocol.dispatchNext(&mut tree)
+  }
+
+  /// Publishes the complete app scene for captures and highlighting, including custom drawing.
+  pub effect fn afterFrameScene(self: &mut Self, tree: &UiTree, scene: &Scene) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.afterFrameScene(tree, scene)
+    self.protocol.dispatched = false
+    self.protocol.repaint = false
+    self.awaitingFrame = false
+  }
+
+  /// The composed app scene with an optional inspector highlight.
+  pub fn sceneWith<'t>(self: &'t Self, scene: &'t Scene) -> &'t Scene {
+    if self.protocol.highlighting() {
+      return self.protocol.overlayScene()
+    }
+    return scene
   }
 
   /// Adds the event records waiting in the tree's queue to the inspector's event log (the
@@ -504,7 +551,12 @@ impl<'s, 't, 'f> Session<'s, 't, 'f> {
       }
     }
     run context.reply.append("\n")
-    run writeAll(&mut view.connection.*, context.reply.ownedUtf8Bytes(), &deadline)
+
+    // Rendering is application work, not socket I/O. A costly screenshot must not consume
+    // the client's entire write deadline before the first byte can be sent.
+    let ready = run MonotonicClock.now()
+    let writeDeadline = MonotonicClock.deadlineAfter(&ready, IO_TIMEOUT)
+    run writeAll(&mut view.connection.*, context.reply.ownedUtf8Bytes(), &writeDeadline)
   }
 }
 

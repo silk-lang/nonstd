@@ -1,3 +1,14 @@
+import ui_tree_window.lib { feed }
+import ui_tree.mutation { LISTEN_ALL }
+import window.event { Event as WindowEvent, MouseButton, Modifiers, Key }
+import window.keys { KeyCode }
+import window.types { WindowId }
+import silk.geometry.point { Point2 }
+import ui_tree.mutation { Attribute }
+import ui_scene.scene { Scene }
+import ui_scene.primitives { Quad, ContentMask, Background }
+import ui_scene.color as color
+import silk.geometry.rect { Rect }
 //! Inspector protocol tests over the inbox fixture: every command through `Protocol.handle`,
 //! and requests over a real Unix socket through `Inspector.poll`. Run from the repository root
 //! (the fixtures read fonts from there; the socket file is made there and removed). The MCP
@@ -82,6 +93,7 @@ effect fn ask(protocol: &mut Protocol, tree: &mut UiTree, line: string) -> Value
   let request = run Json.parse(String.utf8Bytes(line))
   let mut out = String.make()
   let outcome = run protocol.handle(&mut tree, &request, 0, &mut out)
+  while run protocol.dispatchNext(&mut tree) {}
   if outcome == Outcome.Pending {
     return run Json.parse(b"{\"pending\":true}")
   }
@@ -96,6 +108,7 @@ effect fn raw(protocol: &mut Protocol, tree: &mut UiTree, line: string) -> Strin
   let request = run Json.parse(String.utf8Bytes(line))
   let mut out = String.make()
   drop run protocol.handle(&mut tree, &request, 0, &mut out)
+  while run protocol.dispatchNext(&mut tree) {}
   return move out
 }
 
@@ -517,6 +530,7 @@ effect fn socketBody() -> ()
   let mut b = run send("{\"id\":2,\"cmd\":\"click\",\"node\":10}\n")
   let mut c = run send("{\"id\":3,\"cmd\":\"query\",\"role\":\"button\"}\n")
   run Testing.expect(run inspector.poll(&mut tree), "a click is work for the app")
+  while run inspector.dispatchNext(&mut tree) {}
   run Testing.expect(inspector.served == 2, "one request served")
   run Testing.expect(!run inspector.poll(&mut tree), "the next waits for a frame")
   run Testing.expect(inspector.served == 2, "still one")
@@ -591,10 +605,11 @@ effect fn mcp(
   let mut waited: u64 = 0
   while action == Action.Ask || action == Action.Retry {
     if action == Action.Retry {
-      waited = waited + 50
+      waited = waited + bridge.retryDelay(waited)
     }
     let request = run Json.parse(out.ownedUtf8Bytes())
     let outcome = run protocol.handle(&mut tree, &request, 0, &mut reply)
+    while run protocol.dispatchNext(&mut tree) {}
     if outcome == Outcome.Pending {
       reply.clear()
       run reply.append("{\"ok\":false,\"pending\":true,\"error\":\"not yet\"}")
@@ -729,7 +744,7 @@ effect fn mcpBody() -> ()
     &mut tree,
     "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
   )
-  run Testing.expect(toolCount(&tools) == 15, "fifteen tools")
+  run Testing.expect(toolCount(&tools) == 18, "eighteen tools")
   run Testing.expect(same(text(&tools, "id"), "t"), "string ids are echoed")
 
   // Snapshot is describe; inspect is the node view.
@@ -901,4 +916,249 @@ test effect fn mcpToolsDriveTheTree() -> ()
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run mcpBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// This exercises the actual bridge state machine, composed-scene capture, PNG decoder,
+// contact sheet composition and timing; a static UI frame must remain visible as a repeat.
+effect fn captureBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  let mut bridge = run Bridge.make("test")
+  let mut wire = String.make()
+  let mut reply = String.make()
+  let mut scene = Scene.make()
+  let full = Rect<f32>.new(0.0, 0.0, 720.0, 880.0)
+  drop run scene.quad(Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0xff0000))))
+  run scene.finish()
+  run protocol.afterFrameScene(&tree, &scene)
+  let started = run bridge.handle(
+    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_capture\",\"arguments\":{\"count\":2,\"intervalMs\":100,\"columns\":2,\"tileWidth\":160}}}",
+    &mut wire,
+  )
+  run Testing.expect(started == Action.Ask, "capture asks for the first screenshot immediately")
+  let request = run Json.parse(wire.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &request, 0, &mut reply)
+  let next = run bridge.answer(reply.ownedUtf8Bytes(), true, 12, &mut wire)
+  run Testing.expect(
+    next == Action.Retry && bridge.retryDelay(12) == 88 && bridge.retryDelay(99) == 1,
+    "capture interval accounts for screenshot latency",
+  )
+  scene.clear()
+  drop run scene.quad(Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0x0000ff))))
+  run scene.finish()
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrameScene(&tree, &scene)
+  let second = run Json.parse(wire.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &second, 0, &mut reply)
+  let done = run bridge.answer(reply.ownedUtf8Bytes(), true, 112, &mut wire)
+  run Testing.expect(done == Action.Respond, "capture returns a mosaic after exactly two samples")
+  run Testing.expect(
+    String.contains(String.view(&wire), "elapsedMs\\\":112"),
+    "actual sample timestamps are preserved",
+  )
+  let result = run Json.parse(wire.ownedUtf8Bytes())
+  run Testing.expect(
+    !isError(&result) && content(&result, "type") == "image",
+    "MCP returns an image, not a filename",
+  )
+  let encoded = String.utf8Bytes(content(&result, "data"))
+  let length = Base64.decodedLength(encoded).unwrapOr(0)
+  let mut bytes = run Bytes.zeroed(length)
+  drop Base64.decodeInto(bytes.asMutSlice(), encoded)
+  let image = run png.decode(bytes.asSlice())
+  run Testing.expect(image.width() == 344, "two requested columns plus gutters")
+  let pixels = image.data()
+  let firstAt: usize = (100 * 344 + 88) * 4
+  let secondAt: usize = (100 * 344 + 256) * 4
+  run Testing.expect(
+    pixels[firstAt] == 255 && pixels[firstAt + 2] == 0,
+    "first cell contains the composed red canvas",
+  )
+  run Testing.expect(
+    pixels[secondAt] == 0 && pixels[secondAt + 2] == 255,
+    "second cell contains the newer blue canvas",
+  )
+
+  let invalid = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_capture\",\"arguments\":{\"count\":100000}}}",
+  )
+  run Testing.expect(
+    errorCode(&invalid) == -32602,
+    "capture limits reject excessive allocation before requesting frames",
+  )
+}
+
+test effect fn timedCapturesReturnComposedMosaics() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run captureBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A click must give the host a chance to react to down before up is dispatched.
+effect fn orderedBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  tree.events.clear()
+  let request = run Json.parse(b"{\"cmd\":\"click\",\"node\":10}")
+  let mut reply = String.make()
+  drop run protocol.handle(&mut tree, &request, 0, &mut reply)
+  run Testing.expect(
+    tree.events.length() == 0,
+    "preparing input cannot bypass the host's event pump",
+  )
+  run Testing.expect(run protocol.dispatchNext(&mut tree), "move")
+  run Testing.expect(run protocol.dispatchNext(&mut tree), "down")
+
+  // Simulate the application's down handler disabling the button before the release.
+  let mut batch = Batch.make()
+  run batch.attribute(10, Attribute.Disabled { value: true })
+  run tree.apply(run batch.take())
+  tree.events.clear()
+  run Testing.expect(run protocol.dispatchNext(&mut tree), "up")
+  let events = tree.events.asSlice()
+  let mut i: usize = 0
+  while i < events.length {
+    run Testing.expect(
+      events[i].kind != EventKind.Click,
+      "up observes the view changed by the down handler",
+    )
+    i = i + 1
+  }
+  run Testing.expect(!run protocol.dispatchNext(&mut tree), "no extra input")
+}
+
+test effect fn compoundInputAllowsHostReactionsBetweenEvents() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run orderedBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn equivalentInputBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut nativeTree = run inbox(&collection)
+  let mut inspectTree = run inbox(&collection)
+  let mut nativeBatch = Batch.make()
+  let mut inspectBatch = Batch.make()
+  run nativeBatch.listen(1, LISTEN_ALL)
+  run inspectBatch.listen(1, LISTEN_ALL)
+  run nativeTree.apply(run nativeBatch.take())
+  run inspectTree.apply(run inspectBatch.take())
+  nativeTree.events.clear()
+  inspectTree.events.clear()
+  let mut nativeLog = Protocol.make()
+  let mut inspectLog = Protocol.make()
+  let owner = WindowId { value: 1 }
+  let modifiers = Modifiers.none()
+  let mut events = List<WindowEvent>.make()
+  run events.append(
+    WindowEvent.MouseMoved {
+      window: owner,
+      position: Point2<f64> { x: 40.0, y: 27.0 },
+      modifiers: modifiers,
+    },
+  )
+  run events.append(
+    WindowEvent.MouseDown {
+      window: owner,
+      button: MouseButton.Left,
+      position: Point2<f64> { x: 40.0, y: 27.0 },
+      modifiers: modifiers,
+      clickCount: 1,
+    },
+  )
+  run events.append(
+    WindowEvent.MouseMoved {
+      window: owner,
+      position: Point2<f64> { x: 320.0, y: 420.0 },
+      modifiers: modifiers,
+    },
+  )
+  run events.append(
+    WindowEvent.MouseUp {
+      window: owner,
+      button: MouseButton.Left,
+      position: Point2<f64> { x: 320.0, y: 420.0 },
+      modifiers: modifiers,
+    },
+  )
+  run events.append(
+    WindowEvent.KeyDown {
+      window: owner,
+      key: Key.Character { text: run String.copy(" ") },
+      code: KeyCode.Space,
+      modifiers: modifiers,
+      repeat: false,
+      imeHandled: false,
+    },
+  )
+  run events.append(
+    WindowEvent.KeyUp {
+      window: owner,
+      key: Key.Character { text: run String.copy(" ") },
+      code: KeyCode.Space,
+      modifiers: modifiers,
+    },
+  )
+  let commands: [string; 6] = [
+    r"""{"cmd":"pointer","phase":"move","x":40,"y":27}""",
+    r"""{"cmd":"pointer","phase":"down","x":40,"y":27}""",
+    r"""{"cmd":"pointer","phase":"move","x":320,"y":420}""",
+    r"""{"cmd":"pointer","phase":"up","x":320,"y":420}""",
+    r"""{"cmd":"key","phase":"down","key":" ","code":"Space"}""",
+    r"""{"cmd":"key","phase":"up","key":" ","code":"Space"}""",
+  ]
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < commands.length {
+    drop run feed(&mut nativeTree, &events.asSlice()[i])
+    let request = run Json.parse(String.utf8Bytes(commands[i]))
+    drop run inspectLog.handle(&mut inspectTree, &request, 0, &mut out)
+    run Testing.expect(
+      run inspectLog.dispatchNext(&mut inspectTree),
+      "one inspector input per phase",
+    )
+    run Testing.expect(
+      !run inspectLog.dispatchNext(&mut inspectTree),
+      "no hidden extra pointer moves",
+    )
+    run nativeLog.observe(&nativeTree)
+    run inspectLog.observe(&inspectTree)
+    nativeTree.events.clear()
+    inspectTree.events.clear()
+    i = i + 1
+  }
+  run Testing.expect(
+    nativeLog.log.length() == inspectLog.log.length() && nativeLog.log.length() > 0,
+    "native and inspector paths emit the same event count",
+  )
+  let left = nativeLog.log.asSlice()
+  let right = inspectLog.log.asSlice()
+  i = 0
+  while i < left.length {
+    run Testing.expect(
+      left[i].kind == right[i].kind && left[i].target == right[i].target && left[i].x == right[i].x
+        && left[i].y == right[i].y
+        && left[i].modifiers == right[i].modifiers
+        && String.view(&left[i].key) == String.view(&right[i].key),
+      "native mouse/key adapter and inspector produce indistinguishable routed records",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn inspectorInputMatchesNativeWindowAdapter() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run equivalentInputBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
