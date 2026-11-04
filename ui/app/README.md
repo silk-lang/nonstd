@@ -21,6 +21,8 @@ Packages:
   `SILK_UI_INSPECT` set), so ui-inspect-cli, ui-inspect-mcp and the
   [devtools window](../inspect/devtools) can look at the app.
 - `ui/app/examples`: a counter and a todo list. `ui/app/demo` runs the todo list in a window.
+- [`ui/app/scroll-demo`](scroll-demo): a fully mounted mixed-document scroll stress app,
+  with native controls and repeatable CPU benchmarks of the shared libraries.
 - `ui/app/tests`: unit tests and the golden scenes.
 
 ## An app
@@ -191,3 +193,20 @@ real window on X11 and Wayland, clicks Add and compares a frame.
 
 The [native primitives guide](window/README.md) covers the full layout bridge, styled and
 managed images, measured bounds, custom GPU content, shared text caches and OS accessibility.
+
+## Virtual lists
+
+`Ui.virtualItems` builds keyed content for the range requested by the backend.
+Variable-height measurements, overscan selection, scroll anchoring, focus retention,
+and private layout spacers live in `ui-tree`, available through its plain-data
+[mutation/query protocol](../tree/README.md#virtual-scrolling). The app runtime only
+forwards configuration and node bindings and reconciles new range requests.
+
+The [scroll demo](scroll-demo) is a complete example. This separation removes
+virtualization geometry from the app layer; the rest of `ui-app` still targets
+`UiTree`. A DOM backend would require a separate adapter.
+
+`Ui.anchored(key, options)` attaches the open popup to a node named with `Ui.anchor`.
+The runtime resolves view keys to tree IDs and emits `SetAnchor`; placement then
+follows tree layout and scrolling without rendering the view again. Popup hierarchy
+and event handlers remain part of the view. The anchor key must exist in that view.

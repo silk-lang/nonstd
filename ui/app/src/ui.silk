@@ -14,6 +14,8 @@
 //!   path, and handlers (`on`, `onClick`, ...) are called only there. Their replies bubble from
 //!   the target up. Handlers are lambdas that are never stored.
 pub import ui_tree.grid { Grid }
+import ui_tree.anchoring { AnchorOptions }
+import virtual_list { VirtualList, VirtualOptions, VirtualRow }
 import equal
 import heap { Heap }
 import ui_tree.mutation {
@@ -25,6 +27,7 @@ import ui_tree.mutation {
   Display,
   FlexDirection,
   Position,
+  Overflow,
   Role,
   Cursor,
   CanvasCommand,
@@ -153,6 +156,12 @@ pub struct Entry {
   /// `anchorRect`.
   pub hasAnchor: bool,
   pub anchor: u64,
+  /// Whether this node has tree-managed anchor placement.
+  pub hasPlacement: bool,
+  /// View key of the anchor used for placement.
+  pub placementTarget: u64,
+  /// Placement preferences forwarded to the backend.
+  pub placementOptions: AnchorOptions,
   /// The image or icon resource, or `NO_ENTRY`.
   pub source: u32,
   pub grid: u32,
@@ -208,6 +217,14 @@ impl Entry {
       wantsReveal: false,
       hasAnchor: false,
       anchor: 0,
+      hasPlacement: false,
+      placementTarget: 0,
+      placementOptions: AnchorOptions {
+        gap: 0.0,
+        preferredHeight: 0.0,
+        alignEnd: false,
+        matchWidth: false,
+      },
       source: NO_ENTRY,
       grid: NO_ENTRY,
       hasCanvas: false,
@@ -428,6 +445,10 @@ pub struct Ui<M> {
   /// A dispatch pass for an event in an overlay, outside that overlay's body: every node's
   /// body runs (to find the `overlay` call), and no handler does.
   searching: bool,
+  /// View identities and the last virtual ranges requested by the backend.
+  pub virtualLists: List<VirtualList>,
+  /// Backend containers whose virtual view was removed.
+  pub removedVirtualPorts: List<u32>,
 }
 
 /// The listener flag that records of `kind` need.
@@ -517,6 +538,8 @@ impl<M> Ui<M> {
       overlayHost: NO_ENTRY,
       overlays: 0,
       searching: false,
+      virtualLists: List<VirtualList>.make(),
+      removedVirtualPorts: List<u32>.make(),
     }
   }
 
@@ -536,6 +559,12 @@ impl<M> Ui<M> {
   pub effect fn beginRender(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let lists = self.virtualLists.asMutSlice()
+    let mut v: usize = 0
+    while v < lists.length {
+      lists[v].seen = false
+      v = v + 1
+    }
     run self.previous.copyFrom(&self.arena)
     self.arena.clear()
     self.lookup.clear()
@@ -566,6 +595,15 @@ impl<M> Ui<M> {
   /// Ends a render: the overlay layer, if any, moves after the root's other children so it is
   /// drawn (and hit) above them.
   pub fn endRender(self: &mut Self) -> () {
+    let mut v = self.virtualLists.length()
+    while v > 0 {
+      v = v - 1
+      if !self.virtualLists.asSlice()[v].seen {
+        let port = self.virtualLists.asSlice()[v].port
+        self.heap.alloc(self.removedVirtualPorts.append(self.previous.entry(port).id))
+        drop self.virtualLists.remove(v)
+      }
+    }
     let host = self.overlayHost
     if host == NO_ENTRY {
       return ()
@@ -784,6 +822,104 @@ impl<M> Ui<M> {
     body(&mut self)
     self.hasPendingKey = false
     self.current = parent
+  }
+
+  /// Mounts the visible items of a variable-height vertical list in the current column.
+  ///
+  /// # Details
+  ///
+  /// The current column must have a bounded height. This method owns its scrolling and
+  /// children. Do not add other children, gaps, or vertical padding to that column.
+  /// Item keys must be unique and stable. `listKey` must be unique in the view.
+  /// A focused item remains mounted outside the visible range until focus leaves it.
+  /// The tree measures heights after layout. Width changes and `options.revision` changes
+  /// discard measurements. Unmounted items retain no widget state; keep data in the model.
+  /// Inspection and native accessibility expose mounted items only.
+  /// Use `runtime.frame` in custom hosts to settle measurements before presentation.
+  pub fn virtualItems(
+    self: &mut Self,
+    listKey: u64,
+    count: usize,
+    options: VirtualOptions,
+    key: fn(usize) -> u64,
+    body: fn(&mut Ui<M>, usize) -> (),
+  ) -> () {
+    let mut v: usize = 0
+    while v < self.virtualLists.length() && self.virtualLists.asSlice()[v].key != listKey {
+      v = v + 1
+    }
+    if v == self.virtualLists.length() {
+      if self.dispatching || self.searching {
+        return ()
+      }
+      self.heap.alloc(self.virtualLists.append(VirtualList.make(listKey, options)))
+    }
+    if !self.dispatching && !self.searching {
+      let list = &mut self.virtualLists.asMutSlice()[v]
+      if list.count != count || list.options.revision != options.revision {
+        if list.pinned != usize.MAX {
+          let mut candidate: usize = 0
+          while candidate < count && key(candidate) != list.pinnedKey {
+            candidate = candidate + 1
+          }
+          list.pinned = if candidate < count {
+            candidate
+          } else {
+            usize.MAX
+          }
+        }
+      }
+      list.count = count
+      if list.first > count {
+        list.first = count
+      }
+      if list.end > count {
+        list.end = count
+      }
+      list.options = options
+      list.port = self.current
+      list.seen = true
+      list.rows.clear()
+    }
+    self.style(
+      &[
+        Property.OverflowY { value: Overflow.Auto },
+        Property.OverflowX { value: Overflow.Hidden },
+        Property.MinHeight { value: Length.px(0.0) },
+      ],
+    )
+    let first = self.virtualLists.asSlice()[v].first
+    let end = self.virtualLists.asSlice()[v].end
+    let pinned = self.virtualLists.asSlice()[v].pinned
+    let mut i = if pinned < first {
+      pinned
+    } else {
+      first
+    }
+    while i < end || (pinned < count && i == pinned) {
+      self.key(key(i))
+      self.column(
+        |ui| {
+          ui.style(&[Property.FlexShrink { value: 0.0 }])
+          if !ui.dispatching && !ui.searching {
+            ui.heap.alloc(
+              ui.virtualLists.asMutSlice()[v].rows.append(
+                VirtualRow { index: i, entry: ui.current },
+              ),
+            )
+          }
+          body(&mut ui, i)
+        },
+      )
+      let cursor = i + 1
+      if i < first {
+        i = first
+      } else if cursor == end && pinned >= end && pinned < count {
+        i = pinned
+      } else {
+        i = cursor
+      }
+    }
   }
 
   /// A leaf node of `kind` with no body.
@@ -1126,8 +1262,21 @@ impl<M> Ui<M> {
         let record = records[i]
         if record.parent == oldParent && record.ordinal == ordinal && record.hash == hash
           && self.unclaimedRange(record.entryStart, record.entryEnd) {
-          self.copyLazy(record, parent)
-          return ()
+          let mut containsVirtual = false
+          let mut v: usize = 0
+          while v < self.virtualLists.length() {
+            let list = &self.virtualLists.asSlice()[v]
+            if !list.seen
+              && (list.port == oldParent
+                || (list.port >= record.entryStart && list.port < record.entryEnd)) {
+              containsVirtual = true
+            }
+            v = v + 1
+          }
+          if !containsVirtual {
+            self.copyLazy(record, parent)
+            return ()
+          }
         }
         i = i + 1
       }
@@ -1606,6 +1755,18 @@ impl<M> Ui<M> {
       changed.hasAnchor = true
       changed.anchor = key
       self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Attaches this popup to the node named by `anchor(key)` in the same view.
+  /// The tree updates placement after scrolling and layout. The anchor key must exist.
+  pub fn anchored(self: &mut Self, key: u64, options: AnchorOptions) -> () {
+    if !self.dispatching && !self.searching {
+      let mut entry = self.arena.entry(self.current)
+      entry.hasPlacement = true
+      entry.placementTarget = key
+      entry.placementOptions = options
+      self.arena.setEntry(self.current, entry)
     }
   }
 
