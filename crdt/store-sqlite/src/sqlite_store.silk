@@ -1,0 +1,147 @@
+//! A [`Store`] kept in an SQLite database.
+//!
+//! One table holds every delta: the document, the delta id, its place in the order saved, and
+//! its bytes. The id is the primary key, so saving a delta twice keeps the first copy, and an
+//! index on the place makes reading delta `index` one lookup.
+import core.clock { DeltaId }
+import core.store { Store, StoreError }
+import sqlite.sqlite { Connection, SqliteError, Statement }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.u64
+import silk.num.usize
+
+const SCHEMA: string = "PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS crdt_deltas (doc INTEGER NOT NULL, lamport INTEGER NOT NULL, actor INTEGER NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY (doc, lamport, actor)) WITHOUT ROWID; CREATE UNIQUE INDEX IF NOT EXISTS crdt_deltas_position ON crdt_deltas (doc, position);"
+
+const INSERT: string = "INSERT OR IGNORE INTO crdt_deltas (doc, lamport, actor, position, bytes) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(position) + 1, 0) FROM crdt_deltas WHERE doc = ?1), ?4)"
+
+const COUNT: string = "SELECT COUNT(*) FROM crdt_deltas WHERE doc = ?1"
+
+const READ: string = "SELECT bytes FROM crdt_deltas WHERE doc = ?1 AND position = ?2"
+
+/// A store in an SQLite database, holding its connection and prepared statements.
+pub struct SqliteStore {
+  db: Connection,
+  insert: Statement,
+  count: Statement,
+  read: Statement,
+}
+
+fn toStore(error: SqliteError | OutOfMemoryError) -> StoreError | OutOfMemoryError {
+  return match move error {
+    SqliteError problem => StoreError { code: problem.code }
+    OutOfMemoryError problem => move problem
+  }
+}
+
+// SQLite integers are signed; ids keep all 64 bits by wrapping.
+fn signed(value: u64) -> i64 {
+  return u64.wrappingToI64(value)
+}
+
+impl SqliteStore {
+  /// The store in the database file at `path`, created when missing.
+  pub effect fn open(path: string) -> SqliteStore
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.mapError(SqliteStore.openRaw(path, false), toStore)
+  }
+
+  /// A store in a private in-memory database, gone when the store is dropped.
+  pub effect fn openMemory() -> SqliteStore
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.mapError(SqliteStore.openRaw("", true), toStore)
+  }
+
+  /// The connection, for applications that keep their own tables beside the deltas.
+  pub fn connection(self: &Self) -> &Connection {
+    return &self.db
+  }
+
+  effect fn openRaw(path: string, memory: bool) -> SqliteStore
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut connection = if memory {
+      run Connection.openMemory()
+    } else {
+      run Connection.open(path)
+    }
+    connection.busyTimeout(5000)
+    run connection.execute(SCHEMA)
+    let insert = run connection.prepare(INSERT)
+    let count = run connection.prepare(COUNT)
+    let read = run connection.prepare(READ)
+    return SqliteStore {
+      db: move connection,
+      insert: move insert,
+      count: move count,
+      read: move read,
+    }
+  }
+
+  effect fn putRaw(self: &mut Self, doc: u64, id: DeltaId, bytes: &[u8]) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.insert.reset()
+    run self.insert.bindInt(1, signed(doc))
+    run self.insert.bindInt(2, signed(id.lamport))
+    run self.insert.bindInt(3, signed(id.actor))
+    run self.insert.bindBlob(4, bytes)
+    drop run self.insert.execute()
+  }
+
+  effect fn countRaw(self: &mut Self, doc: u64) -> usize
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.count.reset()
+    run self.count.bindInt(1, signed(doc))
+    let mut total: i64 = 0
+    if run self.count.step() {
+      total = self.count.columnInt(0)
+    }
+    self.count.reset()
+    return u64.toUsize(i64.toU64(total))
+  }
+
+  effect fn readRaw(self: &mut Self, doc: u64, index: usize, out: &mut List<u8>) -> bool
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.read.reset()
+    run self.read.bindInt(1, signed(doc))
+    run self.read.bindInt(2, u64.toI64(usize.toU64(index)))
+    if run self.read.step() {
+      run out.appendSlice(self.read.columnBlob(0))
+      self.read.reset()
+      return true
+    }
+    self.read.reset()
+    return false
+  }
+}
+
+impl Store for SqliteStore {
+  effect fn putDelta(self: &mut Self, doc: u64, id: DeltaId, bytes: &[u8]) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.mapError(self.putRaw(doc, id, bytes), toStore)
+  }
+
+  effect fn deltaCount(self: &mut Self, doc: u64) -> usize
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.mapError(self.countRaw(doc), toStore)
+  }
+
+  effect fn readDelta(self: &mut Self, doc: u64, index: usize, out: &mut List<u8>) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run Effect.mapError(self.readRaw(doc, index, &mut out), toStore)
+    if !found {
+      // SQLITE_NOTFOUND.
+      fail StoreError { code: 12 }
+    }
+  }
+}
