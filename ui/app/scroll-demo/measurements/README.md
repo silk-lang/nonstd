@@ -1,5 +1,69 @@
 # Performance history
 
+
+## Built-in virtualization — November 4
+
+`virtualized.json` and `fully-mounted-comparison.json` use the same release binary,
+1280 × 900 CSS pixels, scale 2, and 120 wheel/frame steps. Timing includes input,
+app event handling, row mounting, measurement corrections, layout, and paint.
+
+| Document | Mode | Median CPU step | p95 CPU step | Initial mounted nodes |
+| --- | --- | ---: | ---: | ---: |
+| 1,000 sections | Fully mounted | 44.47 ms | 51.95 ms | 33,863 |
+| 100 sections | Virtualized | 0.97 ms | 5.15 ms | 91 |
+| 1,000 sections | Virtualized | 0.93 ms | 5.04 ms | 91 |
+| 10,000 sections | Virtualized | 0.92 ms | 4.88 ms | 91 |
+
+The 1,000-section median improves by about 48×. The initial virtualized tree has
+650 layout fragments. Its mounted size changes as different section variants enter
+overscan; it does not remain exactly 91 nodes. No timing thresholds are test gates.
+
+`virtualized-long.json` extends the 10,000-section run to 1,000 steps (48,000 pixels
+down, then back): median 0.96 ms, p95 5.61 ms, maximum 22.46 ms. This tests visiting
+more sections, not laying out all 10,000. Occasional outliers remain. Mount timings
+exclude initial font/resource registration and native window/GPU setup.
+
+The main improvement is `ui-app` virtualization: a measured-height prefix index,
+overscan with hysteresis, scroll anchoring, focus retention, and bounded layout,
+hit testing, and accessibility trees. `ui-tree` also skips entire subtrees behind
+an empty clip and preserves that exclusion when replaying cached paint. Fully
+mounted geometry and paint hashing still scale with total document size.
+
+The app tests exercise a distant jump, focus retention, width invalidation,
+content revision, an empty list, list removal, and a lazy ancestor. The tree test
+checks clipped traversal, cached paint order, and text returning into view.
+All 11 app tests and 27 tree tests pass, as do four existing UI goldens,
+WebAssembly checking, the macOS window smoke test, native 100→1,000 growth,
+and the 10,000-section native GPU/CPU image comparison.
+
+### Browser and native window pacing
+
+`browser-virtualization.json` records Chromium/Electron in the T3 preview using
+`content-visibility:auto`, the same fonts/photos/section variants, and a 1280 × 900
+viewport at scale 2. The 10-second pass scrolls at 5,000 CSS pixels per second.
+All 198,329 DOM elements remain mounted. Browser rAF interval median is 14.4 ms,
+p95 40.1 ms. Scroll setter/read timings are recorded separately and are **not**
+comparable to native layout/paint CPU times.
+
+`native-virtualized-window.json` records the actual native window with accessibility,
+uploads, drawing, and presentation enabled. The native frame log separates drawable
+acquisition waits from CPU work. Presentation-submission intervals and browser rAF
+intervals are pacing proxies with different observation points; neither measures
+GPU completion or display scanout. The final capture contains 116 samples after
+three startup frames: median CPU stages total 1.43 ms and p95 1.89 ms. Submission
+intervals have median 8.33 ms and p95 16.44 ms. The native host pauses when covered,
+so these are active-frame samples, not a sustained 12-second throughput result.
+Earlier longer captures were mostly near 60 Hz and spent substantial time waiting
+for a drawable. Display-link rate/lifetime experiments did not consistently remove
+that wait and were not retained. Sustained 120 Hz presentation is not established.
+
+Virtualization exposes mounted content to inspection and accessibility. It does
+not yet supply browser-style whole-document find or offscreen accessibility
+navigation. Preserve application state in the model when rows unmount.
+
+The sections below retain the earlier fully mounted measurements for comparison.
+
+
 ## Scroll and native stall fixes
 
 `scroll-fixes.json` records the next 120-frame run on the same machine and document.

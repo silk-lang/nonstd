@@ -32,13 +32,14 @@ import ui_tree.mutation {
   BoxSizing,
   LISTEN_KEY_DOWN
 }
-import ui_tree.node { Event, EventKind }
+import ui_tree.node { Event, EventKind, FrameInput, NONE }
 import ui_tree.inspect { NodeInfo, info }
 import ui_tree.tree { UiTree, TreeError }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
 import silk.num.u32
 import silk.num.usize
 import silk.text.string { String }
@@ -197,6 +198,17 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     }
     self.batch.clear()
     run diff(&mut self.ui.arena, &self.ui.previous, &mut self.diffState, &mut self.batch)
+    let mut v: usize = 0
+    while v < self.ui.virtualLists.length() {
+      let list = &mut self.ui.virtualLists.asMutSlice()[v]
+      if list.correction {
+        run self.batch.append(
+          Mutation.ScrollTo { id: self.ui.arena.entry(list.port).id, x: 0.0, y: list.scroll },
+        )
+        list.correction = false
+      }
+      v = v + 1
+    }
     self.stats.renders = self.stats.renders + 1
     self.stats.mutations = self.batch.length()
     self.stats.nodes = self.ui.arena.entries.length()
@@ -206,6 +218,90 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     // shifts the remaining array and makes mounting a large view quadratic.
     let batch = Intrinsic.replace(self.batch, List<Mutation>.make())
     run tree.apply(move batch)
+  }
+
+  /// Updates virtual list measurements and mounted ranges from the current tree.
+  /// Returns whether a new view was rendered. Call after input and after layout.
+  pub effect fn syncVirtual(self: &mut Self, tree: &mut UiTree) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let settled = !tree.layoutPending()
+    let mut v: usize = 0
+    while v < self.ui.virtualLists.length() {
+      let list = &mut self.ui.virtualLists.asMutSlice()[v]
+      let portId = self.ui.arena.entry(list.port).id
+      let mut pinned = usize.MAX
+      let mut focused = tree.focused
+      while focused != NONE && tree.node(focused).id != portId {
+        let focusId = tree.node(focused).id
+        let mut r: usize = 0
+        while r < list.rows.length() {
+          let row = list.rows.get(r)
+          let entry = self.ui.arena.entry(row.entry)
+          if entry.id == focusId {
+            pinned = row.index
+            list.pinnedKey = entry.identity.value
+          }
+          r = r + 1
+        }
+        focused = tree.node(focused).parent
+      }
+      if list.pinned != pinned {
+        list.pinned = pinned
+        changed = true
+      }
+      if let Option<NodeInfo>.Some { value: port } = run info(&tree, portId) {
+        if port.laidOut {
+          list.scroll = port.scrollY
+          list.height = port.bounds.yMax - port.bounds.yMin
+          let width = port.bounds.xMax - port.bounds.xMin
+          let anchor = list.locate(list.scroll)
+          let before = list.prefix(anchor)
+          if settled {
+            let mut measured = false
+            if list.width != 0.0 && f32.abs(list.width - width) > 0.5 {
+              let count = list.heights.length()
+              let options = list.options
+              run list.reset(count, options)
+              measured = true
+            }
+            list.width = width
+            let mut r: usize = 0
+            while r < list.rows.length() {
+              let row = list.rows.get(r)
+              if row.index < list.heights.length() {
+                if let Option<NodeInfo>.Some { value: item } = run info(
+                  &tree,
+                  self.ui.arena.entry(row.entry).id,
+                ) {
+                  if item.laidOut {
+                    if list.measure(row.index, item.bounds.yMax - item.bounds.yMin) {
+                      measured = true
+                    }
+                  }
+                }
+              }
+              r = r + 1
+            }
+            if measured {
+              let shift = list.prefix(anchor) - before
+              list.scroll = f32.max(0.0, list.scroll + shift)
+              list.correction = f32.abs(shift) > 0.01
+              changed = true
+            }
+          }
+          if list.range(false) {
+            changed = true
+          }
+        }
+      }
+      v = v + 1
+    }
+    if changed {
+      run self.render(&mut tree)
+    }
+    return changed
   }
 
   /// Reads the layout boxes of the last render's anchored nodes (`ui.anchor`) from `tree`, for
@@ -448,7 +544,8 @@ pub effect fn pump<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
     run runtime.dispatch(move record)
     run drain(&mut runtime, &mut tree)
   }
-  return handled
+  let virtualChanged = run runtime.syncVirtual(&mut tree)
+  return handled || virtualChanged
 }
 
 /// Moves the clock to `now` (seconds): fires the timers that are due and, when `frame` is
@@ -567,4 +664,30 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     i = i + 1
   }
   return true
+}
+
+/// Lays out and paints an app, including variable-height list measurements.
+///
+/// # Details
+///
+/// Processes layout events and repeats layout when handlers or virtual lists change the tree.
+/// Stops after eight passes so a cyclic layout handler cannot prevent presentation.
+/// If `tree.needsFrame()` remains true, the host must schedule another frame.
+/// Native `ui-app-window` hosts call this automatically.
+pub effect fn frame<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut UiTree,
+  input: FrameInput,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut pass: usize = 0
+  while pass < 8 {
+    run tree.frame(input)
+    drop run pump(&mut runtime, &mut tree)
+    if !tree.needsFrame() {
+      return ()
+    }
+    pass = pass + 1
+  }
 }

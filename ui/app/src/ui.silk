@@ -14,6 +14,7 @@
 //!   path, and handlers (`on`, `onClick`, ...) are called only there. Their replies bubble from
 //!   the target up. Handlers are lambdas that are never stored.
 pub import ui_tree.grid { Grid }
+import virtual_list { VirtualList, VirtualOptions, VirtualRow }
 import equal
 import heap { Heap }
 import ui_tree.mutation {
@@ -25,6 +26,7 @@ import ui_tree.mutation {
   Display,
   FlexDirection,
   Position,
+  Overflow,
   Role,
   Cursor,
   CanvasCommand,
@@ -428,6 +430,8 @@ pub struct Ui<M> {
   /// A dispatch pass for an event in an overlay, outside that overlay's body: every node's
   /// body runs (to find the `overlay` call), and no handler does.
   searching: bool,
+  /// Runtime-owned virtual list geometry.
+  pub virtualLists: List<VirtualList>,
 }
 
 /// The listener flag that records of `kind` need.
@@ -517,6 +521,7 @@ impl<M> Ui<M> {
       overlayHost: NO_ENTRY,
       overlays: 0,
       searching: false,
+      virtualLists: List<VirtualList>.make(),
     }
   }
 
@@ -536,6 +541,12 @@ impl<M> Ui<M> {
   pub effect fn beginRender(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let lists = self.virtualLists.asMutSlice()
+    let mut v: usize = 0
+    while v < lists.length {
+      lists[v].seen = false
+      v = v + 1
+    }
     run self.previous.copyFrom(&self.arena)
     self.arena.clear()
     self.lookup.clear()
@@ -566,6 +577,13 @@ impl<M> Ui<M> {
   /// Ends a render: the overlay layer, if any, moves after the root's other children so it is
   /// drawn (and hit) above them.
   pub fn endRender(self: &mut Self) -> () {
+    let mut v = self.virtualLists.length()
+    while v > 0 {
+      v = v - 1
+      if !self.virtualLists.asSlice()[v].seen {
+        drop self.virtualLists.remove(v)
+      }
+    }
     let host = self.overlayHost
     if host == NO_ENTRY {
       return ()
@@ -784,6 +802,138 @@ impl<M> Ui<M> {
     body(&mut self)
     self.hasPendingKey = false
     self.current = parent
+  }
+
+  /// Mounts the visible items of a variable-height vertical list in the current column.
+  ///
+  /// # Details
+  ///
+  /// The current column must have a bounded height. This method owns its scrolling and
+  /// children. Do not add other children, gaps, or vertical padding to that column.
+  /// Item keys must be unique and stable. `listKey` must be unique in the view.
+  /// A focused item remains mounted outside the visible range until focus leaves it.
+  /// Heights are measured after layout. Width changes and `options.revision` changes
+  /// discard measurements. Unmounted items retain no widget state; keep data in the model.
+  /// Inspection and native accessibility expose mounted items only.
+  /// Use `runtime.frame` in custom hosts to settle measurements before presentation.
+  pub fn virtualItems(
+    self: &mut Self,
+    listKey: u64,
+    count: usize,
+    options: VirtualOptions,
+    key: fn(usize) -> u64,
+    body: fn(&mut Ui<M>, usize) -> (),
+  ) -> () {
+    let mut v: usize = 0
+    while v < self.virtualLists.length() && self.virtualLists.asSlice()[v].key != listKey {
+      v = v + 1
+    }
+    if v == self.virtualLists.length() {
+      if self.dispatching || self.searching {
+        return ()
+      }
+      self.heap.alloc(self.virtualLists.append(VirtualList.make(listKey, options)))
+    }
+    if !self.dispatching && !self.searching {
+      let list = &mut self.virtualLists.asMutSlice()[v]
+      if list.heights.length() != count || list.options.revision != options.revision
+        || list.options.estimatedHeight != options.estimatedHeight
+        || list.options.gap != options.gap {
+        let oldAnchor = list.locate(list.scroll)
+        let anchorOffset = list.scroll - list.prefix(oldAnchor)
+        let anchor = if oldAnchor < count {
+          oldAnchor
+        } else {
+          count
+        }
+        if list.pinned != usize.MAX {
+          let mut candidate: usize = 0
+          while candidate < count && key(candidate) != list.pinnedKey {
+            candidate = candidate + 1
+          }
+          list.pinned = if candidate < count {
+            candidate
+          } else {
+            usize.MAX
+          }
+        }
+        self.heap.alloc(list.reset(count, options))
+        list.scroll = list.prefix(anchor) + anchorOffset
+        list.correction = true
+        drop list.range(true)
+      }
+      list.options = options
+      list.port = self.current
+      list.seen = true
+      list.rows.clear()
+      let mut entry = self.arena.entry(self.current)
+      entry.listeners = u32.bitOr(entry.listeners, u32.bitOr(LISTEN_SCROLL, LISTEN_LAYOUT))
+      self.arena.setEntry(self.current, entry)
+    }
+    self.style(
+      &[
+        Property.OverflowY { value: Overflow.Auto },
+        Property.OverflowX { value: Overflow.Hidden },
+        Property.MinHeight { value: Length.px(0.0) },
+      ],
+    )
+    let first = self.virtualLists.asSlice()[v].first
+    let end = self.virtualLists.asSlice()[v].end
+    let pinned = self.virtualLists.asSlice()[v].pinned
+    let mut cursor: usize = 0
+    let mut i = if pinned < first {
+      pinned
+    } else {
+      first
+    }
+    while i < end || (pinned < count && i == pinned) {
+      let spacer = self.virtualLists.asSlice()[v].prefix(i)
+        - self.virtualLists.asSlice()[v].prefix(cursor)
+      self.box(
+        |ui| {
+          ui.height(Length.px(spacer))
+          ui.style(&[Property.FlexShrink { value: 0.0 }])
+        },
+      )
+      self.key(key(i))
+      self.column(
+        |ui| {
+          ui.style(
+            &[
+              Property.FlexShrink { value: 0.0 },
+              Property.Padding { side: Side.Bottom, value: Length.px(options.gap) },
+            ],
+          )
+          if !ui.dispatching && !ui.searching {
+            let mut entry = ui.arena.entry(ui.current)
+            entry.listeners = u32.bitOr(entry.listeners, LISTEN_LAYOUT)
+            ui.arena.setEntry(ui.current, entry)
+            ui.heap.alloc(
+              ui.virtualLists.asMutSlice()[v].rows.append(
+                VirtualRow { index: i, entry: ui.current },
+              ),
+            )
+          }
+          body(&mut ui, i)
+        },
+      )
+      cursor = i + 1
+      if i < first {
+        i = first
+      } else if cursor == end && pinned >= end && pinned < count {
+        i = pinned
+      } else {
+        i = cursor
+      }
+    }
+    let bottom = self.virtualLists.asSlice()[v].prefix(count)
+      - self.virtualLists.asSlice()[v].prefix(cursor)
+    self.box(
+      |ui| {
+        ui.height(Length.px(bottom))
+        ui.style(&[Property.FlexShrink { value: 0.0 }])
+      },
+    )
   }
 
   /// A leaf node of `kind` with no body.
@@ -1126,8 +1276,21 @@ impl<M> Ui<M> {
         let record = records[i]
         if record.parent == oldParent && record.ordinal == ordinal && record.hash == hash
           && self.unclaimedRange(record.entryStart, record.entryEnd) {
-          self.copyLazy(record, parent)
-          return ()
+          let mut containsVirtual = false
+          let mut v: usize = 0
+          while v < self.virtualLists.length() {
+            let list = &self.virtualLists.asSlice()[v]
+            if !list.seen
+              && (list.port == oldParent
+                || (list.port >= record.entryStart && list.port < record.entryEnd)) {
+              containsVirtual = true
+            }
+            v = v + 1
+          }
+          if !containsVirtual {
+            self.copyLazy(record, parent)
+            return ()
+          }
         }
         i = i + 1
       }
