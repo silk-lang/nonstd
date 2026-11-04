@@ -1,0 +1,522 @@
+//! Rich text tests: marks grow or stay put at their edges as their expand choice says, concurrent
+//! marks settle the same way on every replica, embeds carry their data, and random edits with
+//! marks converge under causal delivery.
+import clock { DeltaId }
+import rich { Anchor, Attr, EMBED, Expand, MarkOp, RichText, Span }
+import text { CharId, CharRun, DeleteOp, InsertOp }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+import silk.testing.testing { AssertionError, Testing }
+
+type Failures = AssertionError<'static> | OutOfMemoryError
+
+const BOLD: u32 = 1
+
+const ITALIC: u32 = 2
+
+const LINK: u32 = 3
+
+fn id(lamport: u64, actor: u64) -> DeltaId {
+  return DeltaId.make(lamport, actor)
+}
+
+fn noBytes() -> &'static [u8] {
+  return Slice.view(String.utf8Bytes("x"), 0, 0)
+}
+
+// Whether the visible byte at `offset` has `key` set.
+fn has(spans: &List<Span>, offset: usize, key: u32) -> bool {
+  let mut s: usize = 0
+  while s < spans.length() {
+    let span = &spans.asSlice()[s]
+    if span.start <= offset && offset < span.start + span.length {
+      let mut a: usize = 0
+      while a < span.attrs.length() {
+        if span.attrs.get(a).key == key {
+          return true
+        }
+        a = a + 1
+      }
+      return false
+    }
+    s = s + 1
+  }
+  return false
+}
+
+// "0" for plain and "1" for marked, one per visible byte.
+effect fn pattern(rich: &RichText, key: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let spans = run rich.spans()
+  let mut out = String.make()
+  let mut k: usize = 0
+  while k < rich.length() {
+    if has(&spans, k, key) {
+      run out.append("1")
+    } else {
+      run out.append("0")
+    }
+    k = k + 1
+  }
+  return move out
+}
+
+effect fn editsAtEdges() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut rich = RichText.make()
+  drop run rich.insert(id(1, 1), 0, String.utf8Bytes("hello world"))
+  drop run rich.mark(id(2, 1), 0, 5, BOLD, noBytes(), Expand.End)
+  drop run rich.mark(id(3, 1), 6, 5, LINK, String.utf8Bytes("https://silk.dev"), Expand.None)
+
+  // Typing at the end of the bold word takes bold; typing before it does not.
+  drop run rich.insert(id(4, 1), 5, String.utf8Bytes("!"))
+  drop run rich.insert(id(5, 1), 0, String.utf8Bytes(">"))
+  let bold = run pattern(&rich, BOLD)
+  run Testing.expect(bold.view() == "0111111000000", "bold grows at its end only")
+
+  // Typing at either edge of the link leaves it alone.
+  drop run rich.insert(id(6, 1), 13, String.utf8Bytes("?"))
+  drop run rich.insert(id(7, 1), 8, String.utf8Bytes("_"))
+  let link = run pattern(&rich, LINK)
+  run Testing.expect(link.view() == "000000000111110", "a link keeps its range")
+  let read = run rich.read()
+  run Testing.expect(read.view() == ">hello! _world?", "the text is unchanged by marks")
+
+  // Spans cover every visible byte and carry the link's value.
+  let spans = run rich.spans()
+  let mut covered: usize = 0
+  let mut s: usize = 0
+  let mut sawLink = false
+  while s < spans.length() {
+    let span = &spans.asSlice()[s]
+    run Testing.expect(span.start == covered, "spans are contiguous")
+    covered = covered + span.length
+    let mut a: usize = 0
+    while a < span.attrs.length() {
+      let attr = span.attrs.get(a)
+      if attr.key == LINK {
+        let value = rich.value(attr.mark)
+        let expected = String.utf8Bytes("https://silk.dev")
+        run Testing.expect(value.length == expected.length, "the link value survives")
+        sawLink = true
+      }
+      a = a + 1
+    }
+    s = s + 1
+  }
+  run Testing.expect(covered == rich.length(), "spans cover the text")
+  run Testing.expect(sawLink, "a span carries the link")
+}
+
+// Peritext's overlapping example: one replica bolds a range while another unbolds the middle.
+// The later mark wins where they overlap, and both replicas agree.
+effect fn overlappingBoldAndUnbold() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut a = RichText.make()
+  let mut b = RichText.make()
+  let base = run a.insert(id(1, 1), 0, String.utf8Bytes("the quick fox"))
+  run b.applyInsert(&base)
+  let bold = run a.mark(id(2, 1), 0, 13, BOLD, noBytes(), Expand.End)
+  let unbold = run b.unmark(id(3, 2), 4, 5, BOLD, Expand.End)
+  run a.applyMark(&unbold)
+  run b.applyMark(&bold)
+  let left = run pattern(&a, BOLD)
+  let right = run pattern(&b, BOLD)
+  run Testing.expect(left.view() == right.view(), "both replicas agree")
+  run Testing.expect(left.view() == "1111000001111", "the later unbold wins over the middle")
+}
+
+// A word bolded on one replica while the other types right after it: the typed text joins the
+// bold run, because bold grows at its end. Italic over the same word typed into at the start
+// does not grow backwards.
+effect fn concurrentTypingAtAnEdge() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut a = RichText.make()
+  let mut b = RichText.make()
+  let base = run a.insert(id(1, 1), 0, String.utf8Bytes("fox jumps"))
+  run b.applyInsert(&base)
+  let bold = run a.mark(id(2, 1), 0, 3, BOLD, noBytes(), Expand.End)
+  let italic = run a.mark(id(3, 1), 4, 5, ITALIC, noBytes(), Expand.End)
+  let typed = run b.insert(id(2, 2), 3, String.utf8Bytes("es"))
+  let before = run b.insert(id(3, 2), 6, String.utf8Bytes("!"))
+  run a.applyInsert(&typed)
+  run a.applyInsert(&before)
+  run b.applyMark(&bold)
+  run b.applyMark(&italic)
+  let readA = run a.read()
+  let readB = run b.read()
+  run Testing.expect(readA.view() == "foxes !jumps", "both replicas read the same text")
+  run Testing.expect(readA.view() == readB.view(), "both replicas agree on the text")
+  let boldA = run pattern(&a, BOLD)
+  let boldB = run pattern(&b, BOLD)
+  run Testing.expect(boldA.view() == "111110000000", "bold takes the typed ending")
+  run Testing.expect(boldA.view() == boldB.view(), "both replicas agree on bold")
+  let italicA = run pattern(&a, ITALIC)
+  run Testing.expect(italicA.view() == "000000011111", "italic does not grow backwards")
+}
+
+effect fn embedsCarryData() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut a = RichText.make()
+  let mut b = RichText.make()
+  let base = run a.insert(id(1, 1), 0, String.utf8Bytes("ab"))
+  run b.applyInsert(&base)
+  let ops = run a.insertEmbed(id(2, 1), id(3, 1), 1, String.utf8Bytes("image:cat.png"))
+  run b.applyInsert(&ops.insert)
+  run b.applyMark(&ops.mark)
+  run Testing.expect(b.length() == 5, "the embed is one U+FFFC")
+  let spans = run b.spans()
+  run Testing.expect(spans.length() == 3, "the embed is a span of its own")
+  let middle = &spans.asSlice()[1]
+  run Testing.expect(middle.start == 1 && middle.length == 3, "the embed span holds U+FFFC")
+  let attr = middle.attrs.get(0)
+  run Testing.expect(attr.key == EMBED, "the span carries the embed key")
+  let data = b.value(attr.mark)
+  run Testing.expect(data.length == 13 && data[0] == 105, "the embed data arrives")
+}
+
+// Marks stay attached to their bytes when those bytes are deleted and others are typed nearby.
+effect fn marksSurviveDeletion() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut rich = RichText.make()
+  drop run rich.insert(id(1, 1), 0, String.utf8Bytes("abcdef"))
+  drop run rich.mark(id(2, 1), 1, 3, BOLD, noBytes(), Expand.None)
+  drop run rich.delete(3, 1)
+  drop run rich.delete(1, 1)
+  let bold = run pattern(&rich, BOLD)
+  run Testing.expect(bold.view() == "0100", "the surviving byte keeps bold")
+  drop run rich.insert(id(3, 1), 2, String.utf8Bytes("x"))
+  let after = run pattern(&rich, BOLD)
+  run Testing.expect(after.view() == "01100", "typing inside the range takes the mark")
+}
+
+// The convergence fuzzer: random inserts, deletes, marks and unmarks on several replicas,
+// delivered in random causal order.
+enum Kind {
+  Insert,
+  Delete,
+  Mark,
+}
+
+struct Envelope {
+  author: usize,
+  index: usize,
+  seen: List<usize>,
+  kind: Kind,
+  insert: InsertOp,
+  delete: DeleteOp,
+  mark: MarkOp,
+}
+
+struct Replica {
+  rich: RichText,
+  applied: List<usize>,
+  lamport: u64,
+}
+
+struct Random {
+  state: u64,
+}
+
+impl Random {
+  fn next(self: &mut Self) -> u64 {
+    let mut x = self.state
+    x = u64.bitXor(x, u64.shiftLeft(x, 13))
+    x = u64.bitXor(x, u64.shiftRight(x, 7))
+    x = u64.bitXor(x, u64.shiftLeft(x, 17))
+    self.state = x
+    return x
+  }
+
+  fn below(self: &mut Self, bound: usize) -> usize {
+    if bound == 0 {
+      return 0
+    }
+    return u64.toUsize(self.next() % usize.toU64(bound))
+  }
+}
+
+fn emptyInsert() -> InsertOp {
+  return InsertOp {
+    id: DeltaId.make(0, 0),
+    originLeft: CharId.none(),
+    originRight: CharId.none(),
+    bytes: List<u8>.make(),
+  }
+}
+
+fn emptyDelete() -> DeleteOp {
+  return DeleteOp { runs: List<CharRun>.make() }
+}
+
+fn emptyMark() -> MarkOp {
+  return MarkOp {
+    id: DeltaId.make(0, 0),
+    key: 0,
+    start: Anchor.start(),
+    end: Anchor.end(),
+    remove: true,
+    value: List<u8>.make(),
+  }
+}
+
+fn deliverable(replica: &Replica, envelope: &Envelope) -> bool {
+  if replica.applied.get(envelope.author) != envelope.index {
+    return false
+  }
+  let mut s: usize = 0
+  while s < envelope.seen.length() {
+    if s != envelope.author && replica.applied.get(s) < envelope.seen.get(s) {
+      return false
+    }
+    s = s + 1
+  }
+  return true
+}
+
+effect fn deliver(replica: &mut Replica, envelope: &Envelope) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lamport: u64 = 0
+  match envelope.kind {
+    Kind.Insert => {
+      run replica.rich.applyInsert(&envelope.insert)
+      lamport = envelope.insert.id.lamport
+    }
+    Kind.Delete => {
+      run replica.rich.applyDelete(&envelope.delete)
+    }
+    Kind.Mark => {
+      run replica.rich.applyMark(&envelope.mark)
+      lamport = envelope.mark.id.lamport
+    }
+  }
+  if lamport > replica.lamport {
+    replica.lamport = lamport
+  }
+  let next = replica.applied.get(envelope.author) + 1
+  replica.applied.set(envelope.author, next)
+}
+
+effect fn localEdit(replicas: &mut List<Replica>, author: usize, random: &mut Random) -> Envelope
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let replica = &mut replicas.asMutSlice()[author]
+  let length = replica.rich.length()
+  let mut seen = List<usize>.make()
+  run seen.appendSlice(replica.applied.asSlice())
+  let index = replica.applied.get(author)
+  replica.applied.set(author, index + 1)
+  replica.lamport = replica.lamport + 1
+  let next = DeltaId.make(replica.lamport, usize.toU64(author) + 1)
+  let choice = random.below(10)
+  if choice < 5 || length == 0 {
+    let at = random.below(length + 1)
+    let piece = Slice.view(String.utf8Bytes("abcdefghij"), random.below(8), 1 + random.below(2))
+    let op = run replica.rich.insert(next, at, piece)
+    return Envelope {
+      author: author,
+      index: index,
+      seen: move seen,
+      kind: Kind.Insert,
+      insert: move op,
+      delete: emptyDelete(),
+      mark: emptyMark(),
+    }
+  }
+  let at = random.below(length)
+  let mut count = 1 + random.below(4)
+  if at + count > length {
+    count = length - at
+  }
+  if choice < 7 {
+    let op = run replica.rich.delete(at, count)
+    return Envelope {
+      author: author,
+      index: index,
+      seen: move seen,
+      kind: Kind.Delete,
+      insert: emptyInsert(),
+      delete: move op,
+      mark: emptyMark(),
+    }
+  }
+  let mut key = BOLD
+  let pickKey = random.below(3)
+  if pickKey == 1 {
+    key = ITALIC
+  } else if pickKey == 2 {
+    key = LINK
+  }
+  let mut expand = Expand.None
+  let pickExpand = random.below(4)
+  if pickExpand == 1 {
+    expand = Expand.Start
+  } else if pickExpand == 2 {
+    expand = Expand.End
+  } else if pickExpand == 3 {
+    expand = Expand.Both
+  }
+  let mut op = emptyMark()
+  if choice < 9 {
+    op = run replica.rich.mark(
+      next,
+      at,
+      count,
+      key,
+      Slice.view(String.utf8Bytes("v"), 0, 1),
+      expand,
+    )
+  } else {
+    op = run replica.rich.unmark(next, at, count, key, expand)
+  }
+  return Envelope {
+    author: author,
+    index: index,
+    seen: move seen,
+    kind: Kind.Mark,
+    insert: emptyInsert(),
+    delete: emptyDelete(),
+    mark: move op,
+  }
+}
+
+fn sameSpans(left: &List<Span>, right: &List<Span>) -> bool {
+  if left.length() != right.length() {
+    return false
+  }
+  let mut s: usize = 0
+  while s < left.length() {
+    let a = &left.asSlice()[s]
+    let b = &right.asSlice()[s]
+    if a.start != b.start || a.length != b.length || a.attrs.length() != b.attrs.length() {
+      return false
+    }
+    let mut k: usize = 0
+    while k < a.attrs.length() {
+      let x: Attr = a.attrs.get(k)
+      let y: Attr = b.attrs.get(k)
+      if x.key != y.key || !x.mark.same(&y.mark) {
+        return false
+      }
+      k = k + 1
+    }
+    s = s + 1
+  }
+  return true
+}
+
+effect fn replicasConverge(seed: u64, count: usize, steps: usize) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut random = Random { state: seed }
+  let mut replicas = List<Replica>.make()
+  let mut r: usize = 0
+  while r < count {
+    let mut applied = List<usize>.make()
+    run applied.appendRepeated(0, count)
+    run replicas.append(Replica { rich: RichText.make(), applied: move applied, lamport: 0 })
+    r = r + 1
+  }
+  let mut log = List<Envelope>.make()
+  let mut step: usize = 0
+  while step < steps {
+    if random.below(2) == 0 {
+      let author = random.below(count)
+      let envelope = run localEdit(&mut replicas, author, &mut random)
+      run log.append(move envelope)
+    } else {
+      let target = random.below(count)
+      let mut tries: usize = 0
+      while tries < 8 && log.length() > 0 {
+        let envelope = &log.asSlice()[random.below(log.length())]
+        let replica = &mut replicas.asMutSlice()[target]
+        if deliverable(&replica.*, envelope) {
+          run deliver(&mut replica, envelope)
+          break
+        }
+        tries = tries + 1
+      }
+    }
+    step = step + 1
+  }
+  let mut progress = true
+  while progress {
+    progress = false
+    let mut r: usize = 0
+    while r < count {
+      let mut k: usize = 0
+      while k < log.length() {
+        let envelope = &log.asSlice()[k]
+        let replica = &mut replicas.asMutSlice()[r]
+        if deliverable(&replica.*, envelope) {
+          run deliver(&mut replica, envelope)
+          progress = true
+        }
+        k = k + 1
+      }
+      r = r + 1
+    }
+  }
+  let firstText = run replicas.asSlice()[0].rich.read()
+  let firstSpans = run replicas.asSlice()[0].rich.spans()
+  r = 1
+  while r < count {
+    let text = run replicas.asSlice()[r].rich.read()
+    run Testing.expect(text.view() == firstText.view(), "every replica reads the same text")
+    let spans = run replicas.asSlice()[r].rich.spans()
+    run Testing.expect(sameSpans(&firstSpans, &spans), "every replica shows the same marks")
+    r = r + 1
+  }
+}
+
+test effect fn editsAtEdgesTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run editsAtEdges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn overlappingBoldAndUnboldTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run overlappingBoldAndUnbold() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn concurrentTypingAtAnEdgeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run concurrentTypingAtAnEdge() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn embedsCarryDataTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run embedsCarryData() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn marksSurviveDeletionTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run marksSurviveDeletion() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn richReplicasConvergeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut seed: u64 = 5
+  while seed < 17 {
+    run replicasConverge(seed, 3, 400) |> Effect.provideMut<Allocator>(&mut allocator)
+    seed = seed + 1
+  }
+}
