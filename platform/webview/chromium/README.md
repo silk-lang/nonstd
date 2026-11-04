@@ -1,13 +1,15 @@
 # platform-webview-chromium
 
-Chromium web views for Silk UIs on Linux, through CEF (the Chromium Embedded Framework).
+Chromium web views for Silk UIs on Linux, macOS and Windows, through CEF (the Chromium Embedded Framework).
 `ChromiumWebViews` implements platform-webview's `WebViewHost`: pages render offscreen and the
 host hands each view's frames to `ui_renderer` as a surface texture, which the view's hosted node
 draws with a `SurfaceSprite`. So Silk UI can draw over a page, clip it and round its corners, and
 the page scrolls with the tree like any other node.
 
 This is its own package so that only apps that choose Chromium download and ship CEF (about
-1 GB unpacked). macOS and Windows come in W6.
+1 GB unpacked). On Linux it is the only web view; on macOS and Windows it is the optional
+alternative to the system web view (WKWebView, WebView2), for apps that want the same engine
+everywhere.
 
 ## Using it
 
@@ -50,21 +52,34 @@ views.shutdown()
 - **Helper processes.** CEF runs renderer, GPU and utility processes from `silk-cef-helper`, a
   small C program `install-cef` builds into the runtime directory. `ChromiumOptions.helperPath`
   can name another.
-- **Sandbox.** On by default; it needs unprivileged user namespaces or the setuid
-  `chrome-sandbox`. Containers and CI turn it off (`sandbox = false`).
+- **Sandbox.** On Linux it is on by default; it needs unprivileged user namespaces or the setuid
+  `chrome-sandbox`. Containers and CI turn it off (`sandbox = false`). On macOS and Windows it
+  is always off for now: CEF's sandbox there needs the helper linked against CEF's sandbox
+  library (and on macOS, an app bundle), which the bridge does not do yet.
+- **macOS and Windows.** The bridge is the same C file. CEF loads from the runtime directory
+  (`Chromium Embedded Framework.framework` on macOS, `libcef.dll` on Windows) and the helper is
+  a plain executable beside it. Frames always come through memory there (shared textures are
+  dma-buf, so Linux only). On Windows, Silk does not hand Clang the Windows SDK, so
+  `scripts/prepare-windows` builds the bridge into `silkcef.lib` (`scripts/windows native`) and
+  names it as the `win32-chromium` archive's override.
+- **Without CEF's headers** (`native/cef/include` missing) `native/entry.c` builds a stand-in
+  whose `start` says CEF is not installed. So apps that never open a Chromium view build on any
+  machine; run `install-cef` and rebuild to get the real bridge.
 
 ## Shipping CEF
 
-`python3 scripts/install-cef` downloads the minimal Linux distribution pinned in
+`python3 scripts/install-cef` downloads the minimal distribution for this machine (Linux x64 and
+arm64, macOS arm64 and x64, Windows x64) pinned in
 `toolchains.lock.json` (checked by SHA-256), copies its headers to `native/cef/include` (not
 committed; the bridge compiles against them, so run it before building) and puts the runtime
-directory together in `.cache/cef/<version>/<target>/runtime`: libcef.so and the files beside it,
+directory together in `.cache/cef/<version>/<target>/runtime`: CEF's library and the files beside it,
 Chromium's resources (`.pak` files, `icudtl.dat`, `locales/`) and `silk-cef-helper`. An app ships that directory and names it in
 `ChromiumOptions.runtimeDir`. libcef.so loads at run time (dlopen), so programs build and start
 without it, and `start` fails with `NoLibrary` (and `startError()` says why) when it is missing.
 
 To move to a newer CEF: the CI job "Newest stable CEF" prints lock entries for the newest stable
-build (`scripts/install-cef --latest`). Update `toolchains.lock.json` and the
+build (`scripts/install-cef --latest`), and lock entries for the pinned version on every platform
+(`--pinned`). Update `toolchains.lock.json` and the
 `-DCEF_API_VERSION` in `silk.toml` to the new version's API version together; install-cef refuses
 a mismatch.
 
@@ -74,6 +89,7 @@ a mismatch.
 python3 scripts/install-cef                                      # headers and runtime
 silkc test --root src/tests.silk                                 # from this directory
 python3 platform/webview/chromium/scripts/linux smoke            # under Xvfb; --backend wayland|all
+python3 platform/webview/chromium/scripts/smoke                  # macOS and Windows
 python3 platform/webview/chromium/scripts/generate-keys          # after platform-window's key list grows
 ```
 
