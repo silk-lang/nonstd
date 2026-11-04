@@ -13,11 +13,12 @@
 import core.clock { ActorId, DeltaId, Frontier }
 import core.codec { DecodeError, Reader, Writer }
 import core.doc { Applied, Delta, Document }
-import core.store { Store, StoreError, save }
+import core.store { Store, StoreError, load, save }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.ownership { Copy }
+import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 /// The protocol of requests and responses.
@@ -251,6 +252,29 @@ impl MemoryServer {
     }
   }
 
+  /// Whether the server holds `doc`.
+  pub fn hosts(self: &Self, doc: u64) -> bool {
+    let mut k: usize = 0
+    while k < self.hosted.length() {
+      if self.hosted.asSlice()[k].doc == doc {
+        return true
+      }
+      k = k + 1
+    }
+    return false
+  }
+
+  /// Takes `document` as the server's copy of `doc`, its first `saved` deltas already in a store.
+  /// Replaces nothing: a document the server already holds stays.
+  pub effect fn adopt(self: &mut Self, doc: u64, document: Document, saved: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.hosts(doc) {
+      return ()
+    }
+    run self.hosted.append(Hosted { doc: doc, document: move document, saved: saved })
+  }
+
   effect fn slot(self: &mut Self, doc: u64) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -321,6 +345,59 @@ impl<'s, S: SyncServer> Transport for Loopback<'s, S> {
     }
     if !ok {
       fail TransportError { code: 2 }
+    }
+  }
+}
+
+/// The document a request is for.
+pub effect fn requestDoc(request: &[u8]) -> u64
+  ! DecodeError {
+  let mut input = Reader.of(request)
+  let protocol = run input.number()
+  if protocol != PROTOCOL {
+    fail DecodeError {}
+  }
+  return run input.number()
+}
+
+/// A [`MemoryServer`] backed by a store: a document is loaded on its first request and every
+/// request's new deltas are saved before the response goes out.
+pub struct StoredServer<'s, P> {
+  pub memory: MemoryServer,
+  store: &'s mut P,
+}
+
+impl<'s, P: Store> StoredServer<'s, P> {
+  pub fn over(memory: MemoryServer, store: &'s mut P) -> StoredServer<'s, P> {
+    return StoredServer<'s, P> { memory: move memory, store: move store }
+  }
+}
+
+impl<'s, P: Store> SyncServer for StoredServer<'s, P> {
+  effect fn handle(self: &mut Self, request: &[u8], response: &mut List<u8>) -> ()
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let doc = run requestDoc(request)
+    if !self.memory.hosts(doc) {
+      let loaded = run Effect.result(load(doc, self.memory.actor))
+        |> Effect.provideMut<Store>(&mut self.store.*)
+      match move loaded {
+        Result<Document, StoreError | DecodeError | OutOfMemoryError>.Success { value } => {
+          let count = value.deltaCount()
+          run self.memory.adopt(doc, move value, count)
+        }
+        _ => StderrWriter.print(
+          "crdt-sync: a document could not be loaded; starting it empty\n",
+          &(),
+        )
+      }
+    }
+    run self.memory.handle(request, &mut response)
+    let saved = run Effect.result(self.memory.persist())
+      |> Effect.provideMut<Store>(&mut self.store.*)
+    match move saved {
+      Result<(), StoreError | OutOfMemoryError>.Success { value: _ } => {}
+      _ => StderrWriter.print("crdt-sync: new deltas could not be saved\n", &())
     }
   }
 }

@@ -1,0 +1,229 @@
+//! Sync over TCP: one connection per exchange, each message an 8-byte little-endian length and
+//! its bytes. The client sends a request, the server answers and closes.
+//!
+//! This is the simplest wire there is: no TLS, no persistent connection, no push. A client syncs
+//! by asking again. A WebSocket transport can replace it behind the same [`Transport`] and
+//! [`SyncServer`] interfaces.
+import sync { SyncServer, Transport, TransportError }
+import core.codec { DecodeError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.socket_native {
+  ConnectOptions,
+  Connection,
+  ListenOptions,
+  ListenOptionsError,
+  Listener,
+  NativeSocketError,
+  accept,
+  connectResolvedOwned,
+  listen
+}
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant }
+
+/// The port the sync server listens on unless told otherwise.
+pub const DEFAULT_PORT: u16 = 7470
+
+/// How long one exchange may take, in nanoseconds.
+pub const TIMEOUT: u64 = 30000000000
+
+/// The largest message either side accepts.
+pub const MAX_MESSAGE: u64 = 268435456
+
+fn local(port: u16) -> Endpoint {
+  return Endpoint.make(
+    IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+    Port.fromU16(port),
+  )
+}
+
+effect fn writeAll(connection: &mut Connection, bytes: &[u8], start: &Instant) -> ()
+  ! ByteIoError
+  ? &mut MonotonicClock {
+  let mut at: usize = 0
+  while at < bytes.length {
+    let n = run ByteDuplex.writeSome(
+      Slice.view(bytes, at, bytes.length - at),
+      Option<Instant>.some(MonotonicClock.deadlineAfter(start, TIMEOUT)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    at = at + n
+  }
+}
+
+/// Writes one message: its length, then its bytes.
+pub effect fn writeMessage(connection: &mut Connection, bytes: &[u8], start: &Instant) -> ()
+  ! ByteIoError
+  ? &mut MonotonicClock {
+  let mut header: [u8; 8] = [0; 8]
+  let mut length = usize.toU64(bytes.length)
+  let mut k: usize = 0
+  while k < 8 {
+    header[k] = u64.toU8(u64.bitAnd(length, 255))
+    length = u64.shiftRight(length, 8)
+    k = k + 1
+  }
+  run writeAll(&mut connection, &header, start)
+  run writeAll(&mut connection, bytes, start)
+  run ByteDuplex.flush(Option<Instant>.some(MonotonicClock.deadlineAfter(start, TIMEOUT)))
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+}
+
+/// Reads one message into `out`. False when the stream ended early or the message is too large.
+pub effect fn readMessage(connection: &mut Connection, out: &mut List<u8>, start: &Instant) -> bool
+  ! ByteIoError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut buffer = List<u8>.make()
+  let mut chunk: [u8; 65536] = [0; 65536]
+  let mut need: u64 = 8
+  let mut known = false
+  while usize.toU64(buffer.length()) < need {
+    let transfer = run ByteDuplex.readSome(
+      &mut chunk,
+      Option<Instant>.some(MonotonicClock.deadlineAfter(start, TIMEOUT)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    match move transfer {
+      ReadTransfer.Data { count } => {
+        run buffer.appendSlice(Slice.view(&chunk, 0, count))
+      }
+      ReadTransfer.End => {
+        return false
+      }
+    }
+    if !known && buffer.length() >= 8 {
+      let mut length: u64 = 0
+      let mut k: usize = 8
+      while k > 0 {
+        k = k - 1
+        length = u64.bitOr(u64.shiftLeft(length, 8), u8.toU64(buffer.get(k)))
+      }
+      if length > MAX_MESSAGE {
+        return false
+      }
+      need = 8 + length
+      known = true
+    }
+  }
+  if usize.toU64(buffer.length()) != need {
+    return false
+  }
+  run out.appendSlice(Slice.view(buffer.asSlice(), 8, buffer.length() - 8))
+  return true
+}
+
+/// A transport to a sync server on this machine at `port`.
+pub struct TcpTransport {
+  port: u16,
+  clock: OsMonotonicClock,
+}
+
+impl TcpTransport {
+  pub fn to(port: u16) -> TcpTransport {
+    return TcpTransport { port: port, clock: OsMonotonicClock.make() }
+  }
+}
+
+/// Opens a connection to the sync server on this machine at `port`.
+pub effect fn connectLocal(port: u16, start: &Instant) -> Connection
+  ! NativeSocketError
+  ? &mut MonotonicClock {
+  let endpoints = [local(port)]
+  return run connectResolvedOwned(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(MonotonicClock.deadlineAfter(start, TIMEOUT)),
+  )
+}
+
+effect fn exchangeOnce(port: u16, request: &[u8], response: &mut List<u8>) -> bool
+  ! NativeSocketError | ByteIoError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let start = run MonotonicClock.now()
+  let mut connection = run connectLocal(port, &start)
+  run writeMessage(&mut connection, request, &start)
+  let complete = run readMessage(&mut connection, &mut response, &start)
+  drop run Effect.result(connection.close())
+  return complete
+}
+
+impl Transport for TcpTransport {
+  effect fn exchange(self: &mut Self, request: &[u8], response: &mut List<u8>) -> ()
+    ! TransportError | OutOfMemoryError
+    ? &mut Allocator {
+    let outcome = run Effect.result(exchangeOnce(self.port, request, &mut response))
+      |> Effect.provideMut<MonotonicClock>(&mut self.clock)
+    let code = match move outcome {
+      Result<bool, NativeSocketError | ByteIoError | OutOfMemoryError>.Success {
+        value
+      } => if value {
+        0
+      } else {
+        3
+      }
+      Result<bool, NativeSocketError | ByteIoError | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
+        OutOfMemoryError problem => {
+          drop problem
+          4
+        }
+        _ => 5
+      }
+    }
+    if code != 0 {
+      fail TransportError { code: code }
+    }
+  }
+}
+
+/// Listens for sync clients on this machine at `port`.
+/// A restarted server can take its port back at once (no address reuse on Windows, where it would
+/// let two servers share the port).
+pub effect fn listenLocal(port: u16) -> Listener
+  ! NativeSocketError {
+  let mut reuse = true
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    reuse = false
+  }
+  let options = ListenOptions.make(128, reuse, 1000000)
+    |> Result<ListenOptions, ListenOptionsError>.unwrapOr(ListenOptions.defaults())
+  return run listen(local(port), options)
+}
+
+/// Waits for one client, answers its request with `server` and closes the connection. Returns
+/// false when the request was unreadable; the client then sees its exchange fail.
+pub effect fn serveOne<S: SyncServer>(listener: &mut Listener, server: &mut S) -> bool
+  ! NativeSocketError | ByteIoError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let accepted = run accept(&mut listener, Option<Instant>.None)
+  let mut connection = accepted.intoConnection()
+  let start = run MonotonicClock.now()
+  let mut request = List<u8>.make()
+  let complete = run readMessage(&mut connection, &mut request, &start)
+  let mut ok = complete
+  if complete {
+    let mut response = List<u8>.make()
+    let handled = run Effect.result(server.handle(request.asSlice(), &mut response))
+    ok = match move handled {
+      Result<(), DecodeError | OutOfMemoryError>.Success { value: _ } => true
+      _ => false
+    }
+    if ok {
+      run writeMessage(&mut connection, response.asSlice(), &start)
+    }
+  }
+  drop run Effect.result(connection.close())
+  return ok
+}
