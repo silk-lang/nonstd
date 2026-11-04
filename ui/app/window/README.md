@@ -138,3 +138,13 @@ Windows/Linux OS accessibility bridges are not implemented; `window.accessibilit
 reports this. This initial macOS bridge does not expose text-range navigation or selection
 through the full accessibility text protocol. It does not turn arbitrary canvas document
 shapes into accessible UI controls; applications must supply document semantics as UI nodes.
+
+## Shared tree host
+
+The native event/GPU loop now lives in `ui-tree-window.host`. This package retains
+its app-facing `runWindow`, `runWindowHosted`, and `WindowContent` API as an adapter.
+Direct tree clients can use the same host without creating an app runtime; see
+[the direct-tree example](../../tree/window/demo/src/main.silk).
+
+Image loading and native workers are implemented in `ui-tree-window.images` and
+`ui-tree-window.background`. Existing imports from this package remain compatible.

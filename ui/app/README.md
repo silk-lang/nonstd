@@ -205,3 +205,8 @@ forwards configuration and node bindings and reconciles new range requests.
 The [scroll demo](scroll-demo) is a complete example. This separation removes
 virtualization geometry from the app layer; the rest of `ui-app` still targets
 `UiTree`. A DOM backend would require a separate adapter.
+
+`Ui.anchored(key, options)` attaches the open popup to a node named with `Ui.anchor`.
+The runtime resolves view keys to tree IDs and emits `SetAnchor`; placement then
+follows tree layout and scrolling without rendering the view again. Popup hierarchy
+and event handlers remain part of the view. The anchor key must exist in that view.

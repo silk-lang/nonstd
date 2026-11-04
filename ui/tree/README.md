@@ -92,6 +92,47 @@ See [the direct-tree integration test](tests/src/virtual_lists.silk) for a compl
 client using only mutation batches and range queries, including distant jumps,
 focus retention, variable row heights, resize anchoring, and cleanup.
 
+## Anchored popups
+
+`Mutation.SetAnchor { id, target, options }` attaches a popup box to an anchor node.
+`AnchorOptions` specifies the gap, preferred height, end alignment, and whether to
+match the anchor width. The tree chooses above/below placement and viewport limits
+after continuous viewport layout, then updates them on scroll and resize without a framework render.
+The popup uses fixed viewport positioning; put it after ordinary content so it draws
+and receives hits above that content. This API does not change parentage or event
+bubbling. Menus and popovers in `ui-components` use it through `Ui.anchored`.
+Width matching includes the popup's padding and border; menus no longer add those
+on top of the trigger width.
+
+`ClearAnchor` restores the popup's client styles. An anchor that is detached or not
+laid out hides the popup until it has geometry again. Destroying the popup removes
+its relationship. The anchor must exist at configuration time; cyclic anchor
+relationships and anchors inside their own popup are rejected. Popup decoration,
+open/closed state, dismissal, and menu keyboard behavior remain client concerns.
+
+## Canvas text and image requests
+
+`canvas_text.TextCache` owns raster tiles and measurements. `canvas_view.TextBindings`
+tracks instance rectangles and validates visible coverage, raster generations, and
+density. Its checks skip regions already covered during panning and validate shared
+rasters once when all text has complete bindings. `canvas_view.Refinement` supplies
+the idle deadline for improving text density after motion. The native editor uses
+these APIs; they do not depend on its document model.
+
+Build bindings in scene order with `append`, using `usize.MAX` for a missing raster.
+Use `rebind` after refreshing an instance and `clear` before rebuilding geometry.
+Advance `TextCache.rasterFrame` for each raster/binding update epoch. Set
+`allTextBound` only when every instance has an uncropped raster in that epoch.
+A host can defer density changes during motion; missing or uncovered text must still
+refresh immediately. Wake at the refinement deadline even when input stops.
+
+`image_load.ImageLoad` is a portable request state machine. Capture the token returned
+by `begin`, test `accepts(token)` before installing pixels, then call `finish`.
+Replacement and cancellation invalidate old tokens. Native or browser hosts supply
+file/network I/O and decoding; the tree continues to accept `DefineImage` and
+`DefineDecodedImage` mutations. The native worker implementation is available through
+`ui-tree-window.images`, with compatibility exports from `ui-app-window.images`.
+
 ## Interaction
 
 Hosts feed plain-data `Input` records (`input.silk`) to `tree.dispatch`: pointer move, down, up,
