@@ -2815,7 +2815,7 @@ static uint32_t event_flags(uint32_t modifiers) {
     return flags;
 }
 
-static cef_mouse_event_t mouse_event(double x, double y, uint32_t modifiers) {
+static cef_mouse_event_t cef_mouse_at(double x, double y, uint32_t modifiers) {
     cef_mouse_event_t event;
     event.x = (int)floor(x);
     event.y = (int)floor(y);
@@ -2833,7 +2833,7 @@ static View *input_view(uint32_t id) {
 void silk_cef_mouse_move(uint32_t id, double x, double y, uint32_t modifiers, uint8_t leave) {
     View *view = input_view(id);
     if (!view) return;
-    cef_mouse_event_t event = mouse_event(x, y, modifiers);
+    cef_mouse_event_t event = cef_mouse_at(x, y, modifiers);
     view->host->send_mouse_move_event(view->host, &event, leave ? 1 : 0);
 }
 
@@ -2846,7 +2846,7 @@ void silk_cef_mouse_button(uint32_t id, double x, double y, uint32_t button, uin
         view->host->set_focus(view->host, 1);
         set_focused(view, true);
     }
-    cef_mouse_event_t event = mouse_event(x, y, modifiers);
+    cef_mouse_event_t event = cef_mouse_at(x, y, modifiers);
     cef_mouse_button_type_t type = button == 1 ? MBT_MIDDLE : button == 2 ? MBT_RIGHT : MBT_LEFT;
     view->host->send_mouse_click_event(view->host, &event, type, up ? 1 : 0,
                                        (int)(clickCount ? clickCount : 1));
@@ -2856,7 +2856,7 @@ void silk_cef_mouse_wheel(uint32_t id, double x, double y, double deltaX, double
                           uint32_t modifiers) {
     View *view = input_view(id);
     if (!view) return;
-    cef_mouse_event_t event = mouse_event(x, y, modifiers);
+    cef_mouse_event_t event = cef_mouse_at(x, y, modifiers);
     view->host->send_mouse_wheel_event(view->host, &event, (int)lround(deltaX), (int)lround(deltaY));
 }
 
