@@ -5,8 +5,10 @@ Each mesh is a grid of straight-edged rectangles, so the Coons map is affine and
 pixel centre has exact (u, v) coordinates. Expected colours come from an independent
 double-precision evaluation of the corner interpolation (bilinear, or bicubic with the
 monotone derivatives of #MeshPatchPainting) and are written as pixel rectangles in the
-reference SVGs. Cases are merged into tests/fixtures/painting/manifest.json.
+reference SVGs. The curved-seam case paints one colour, so its reference is a plain
+rectangle. Cases are merged into tests/fixtures/painting/manifest.json.
 """
+import math
 import json
 from pathlib import Path
 
@@ -190,6 +192,48 @@ def case(ident, input_svg, reference_svg, reason, anchor):
     })
 
 
+def curved_mesh(ident, color, rows=3, columns=4):
+    """A user-space mesh over (20, 20, 280, 200) with wavy inner corners and bent inner
+    edges, every stop one colour."""
+    x0, y0, width, height = 20, 20, 280, 200
+    corners = [[(x0 + width * j / columns + 9 * math.sin(i * 1.7 + j * 0.9) * (0 < j < columns),
+                 y0 + height * i / rows + 10 * math.cos(i * 1.1 + j * 1.9) * (0 < i < rows))
+                for j in range(columns + 1)] for i in range(rows + 1)]
+
+    def edge(a, b, bend):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        c1 = (a[0] + dx / 3 - dy * bend, a[1] + dy / 3 + dx * bend)
+        c2 = (a[0] + 2 * dx / 3 + dy * bend, a[1] + 2 * dy / 3 - dx * bend)
+        return 'C ' + ' '.join(f'{fmt(round(x, 2))},{fmt(round(y, 2))}' for x, y in (c1, c2, b))
+
+    def across(i, j):
+        return 0.0 if i in (0, rows) else 0.18 * math.sin(i * 2.3 + j * 1.3)
+
+    def down(i, j):
+        return 0.0 if j in (0, columns) else 0.2 * math.cos(i * 1.6 + j * 2.1)
+
+    out = [f'<meshgradient id="{ident}" x="{x0}" y="{y0}" gradientUnits="userSpaceOnUse">']
+    for i in range(rows):
+        out.append('  <meshrow>')
+        for j in range(columns):
+            tl, tr = corners[i][j], corners[i][j + 1]
+            br, bl = corners[i + 1][j + 1], corners[i + 1][j]
+            stops = []
+            if i == 0:
+                stops.append((edge(tl, tr, across(i, j)), j == 0))
+            stops.append((edge(tr, br, down(i, j + 1)), i == 0))
+            stops.append((edge(br, bl, -across(i + 1, j)), True))
+            if j == 0:
+                stops.append((edge(bl, tl, -down(i, j)), True))
+            out.append('    <meshpatch>')
+            for path, colored in stops:
+                out.append(f'      <stop path="{path}"' + (f' stop-color="{color}"' if colored else '') + '/>')
+            out.append('    </meshpatch>')
+        out.append('  </meshrow>')
+    out.append('</meshgradient>')
+    return '\n'.join(out)
+
+
 def main():
     # Two by two user-space mesh with unequal patch sizes and every edge form.
     grid = Mesh([4, 16, 36], [3, 13, 27], palette(
@@ -272,6 +316,18 @@ def main():
          'A row with fewer patches than the first, a stop path that is not c, C, l or L, and a '
          'patch with too few stops put the mesh in error; such meshes paint nothing.',
          'MeshStructure')
+
+    # Curved edges shared by patches of different sizes: neighbours must split each
+    # shared edge at the same points, or slivers between their triangles stay unpainted
+    # (this layout left pinholes at (87, 196) and (88, 203) when each patch picked its
+    # own grid).
+    case('mesh-curved-seam',
+         svg(320, 240, '<defs>\n' + curved_mesh('m', '#2878c8')
+             + '\n</defs>\n<rect x="22" y="22" width="276" height="196" fill="url(#m)"/>'),
+         svg(320, 240, '<rect x="22" y="22" width="276" height="196" fill="#2878c8"/>'),
+         'Neighbouring patches meet along their shared edges, curved or not: a one-colour mesh '
+         'paints every pixel it covers.',
+         'MeshPatchPainting')
 
     merge(ROOT / 'manifest.json', CASES)
 
