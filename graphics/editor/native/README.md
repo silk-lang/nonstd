@@ -38,6 +38,9 @@ sectioned inspector, palette, floating tool dock, zoom controls, and file menu. 
 Design heading stays fixed while its properties scroll. Palette colors are ordinary
 undoable edits; zoom buttons keep the canvas center fixed, and fit uses the same
 artwork margins as the browser. Desktop file operations use native dialogs.
+On macOS, the header extends behind the native traffic-light controls without a separate
+title bar. Drag passive header space to move the window; buttons and the document name
+keep their normal interactions.
 
 - Select, marquee-select, drag, resize, Shift-constrain, Alt-drag duplicate, and
   use H or hold Space to pan. Cmd/Ctrl + wheel and trackpad pinch zoom at the pointer.
