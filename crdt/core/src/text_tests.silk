@@ -1,0 +1,380 @@
+//! Text tests: local edits match a byte model, replicas converge under random causal delivery, and
+//! concurrent runs typed at one place never interleave.
+import clock { DeltaId }
+import text { CharId, CharRun, DeleteOp, InsertOp, Text }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+import silk.testing.testing { AssertionError, Testing }
+
+type Failures = AssertionError<'static> | OutOfMemoryError
+
+struct Random {
+  state: u64,
+}
+
+impl Random {
+  fn next(self: &mut Self) -> u64 {
+    let mut x = self.state
+    x = u64.bitXor(x, u64.shiftLeft(x, 13))
+    x = u64.bitXor(x, u64.shiftRight(x, 7))
+    x = u64.bitXor(x, u64.shiftLeft(x, 17))
+    self.state = x
+    return x
+  }
+
+  fn below(self: &mut Self, bound: usize) -> usize {
+    if bound == 0 {
+      return 0
+    }
+    return u64.toUsize(self.next() % usize.toU64(bound))
+  }
+}
+
+const LETTERS: string = "abcdefghijklmnopqrstuvwxyz"
+
+fn letter(k: usize) -> &'static [u8] {
+  return Slice.view(String.utf8Bytes(LETTERS), k % 26, 1)
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut k: usize = 0
+  while k < left.length {
+    if left[k] != right[k] {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+effect fn localEditsMatchAModel() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut text = Text.make()
+  let mut model = List<u8>.make()
+  let mut random = Random { state: 362436069 }
+  let mut step: usize = 0
+  while step < 3000 {
+    let length = model.length()
+    if random.below(3) < 2 || length == 0 {
+      let at = random.below(length + 1)
+      let count = 1 + random.below(5)
+      let mut piece = List<u8>.make()
+      let mut c: usize = 0
+      while c < count {
+        run piece.appendSlice(letter(step + c))
+        c = c + 1
+      }
+      drop run text.insert(DeltaId.make(usize.toU64(step) + 1, 1), at, piece.asSlice())
+      run model.insertSlice(at, piece.asSlice())
+    } else {
+      let at = random.below(length)
+      let mut count = 1 + random.below(6)
+      if at + count > length {
+        count = length - at
+      }
+      drop run text.delete(at, count)
+      let mut c: usize = 0
+      while c < count {
+        drop model.remove(at)
+        c = c + 1
+      }
+    }
+    step = step + 1
+  }
+  let mut read = List<u8>.make()
+  run text.readBytes(&mut read)
+  run Testing.expect(sameBytes(read.asSlice(), model.asSlice()), "the text matches the model")
+  run Testing.expect(text.length() == model.length(), "the visible length matches")
+}
+
+// One operation as the fuzzer delivers it, with the operations its author had seen.
+struct Envelope {
+  author: usize,
+  index: usize,
+  seen: List<usize>,
+  isInsert: bool,
+  insert: InsertOp,
+  delete: DeleteOp,
+}
+
+struct Replica {
+  text: Text,
+  applied: List<usize>,
+  lamport: u64,
+}
+
+effect fn makeReplicas(count: usize) -> List<Replica>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut replicas = List<Replica>.make()
+  let mut r: usize = 0
+  while r < count {
+    let mut applied = List<usize>.make()
+    run applied.appendRepeated(0, count)
+    run replicas.append(Replica { text: Text.make(), applied: move applied, lamport: 0 })
+    r = r + 1
+  }
+  return move replicas
+}
+
+fn deliverable(replica: &Replica, envelope: &Envelope) -> bool {
+  if replica.applied.get(envelope.author) != envelope.index {
+    return false
+  }
+  let mut s: usize = 0
+  while s < envelope.seen.length() {
+    if s != envelope.author && replica.applied.get(s) < envelope.seen.get(s) {
+      return false
+    }
+    s = s + 1
+  }
+  return true
+}
+
+effect fn deliver(replica: &mut Replica, envelope: &Envelope) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if envelope.isInsert {
+    run replica.text.applyInsert(&envelope.insert)
+    if envelope.insert.id.lamport > replica.lamport {
+      replica.lamport = envelope.insert.id.lamport
+    }
+  } else {
+    run replica.text.applyDelete(&envelope.delete)
+  }
+  let next = replica.applied.get(envelope.author) + 1
+  replica.applied.set(envelope.author, next)
+}
+
+effect fn localEdit(
+  replicas: &mut List<Replica>,
+  author: usize,
+  step: usize,
+  random: &mut Random,
+) -> Envelope
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let replica = &mut replicas.asMutSlice()[author]
+  let length = replica.text.length()
+  let mut seen = List<usize>.make()
+  run seen.appendSlice(replica.applied.asSlice())
+  let index = replica.applied.get(author)
+  if random.below(4) < 3 || length == 0 {
+    let at = random.below(length + 1)
+    let count = 1 + random.below(3)
+    let mut piece = List<u8>.make()
+    let mut c: usize = 0
+    while c < count {
+      run piece.appendSlice(letter(step + c))
+      c = c + 1
+    }
+    replica.lamport = replica.lamport + 1
+    let id = DeltaId.make(replica.lamport, usize.toU64(author) + 1)
+    let op = run replica.text.insert(id, at, piece.asSlice())
+    replica.applied.set(author, index + 1)
+    return Envelope {
+      author: author,
+      index: index,
+      seen: move seen,
+      isInsert: true,
+      insert: move op,
+      delete: DeleteOp { runs: List<CharRun>.make() },
+    }
+  }
+  let at = random.below(length)
+  let mut count = 1 + random.below(4)
+  if at + count > length {
+    count = length - at
+  }
+  let op = run replica.text.delete(at, count)
+  replica.applied.set(author, index + 1)
+  return Envelope {
+    author: author,
+    index: index,
+    seen: move seen,
+    isInsert: false,
+    insert: InsertOp {
+      id: DeltaId.make(0, 0),
+      originLeft: CharId.none(),
+      originRight: CharId.none(),
+      bytes: List<u8>.make(),
+    },
+    delete: move op,
+  }
+}
+
+effect fn replicasConverge(seed: u64, count: usize, steps: usize) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut random = Random { state: seed }
+  let mut replicas = run makeReplicas(count)
+  let mut log = List<Envelope>.make()
+  let mut step: usize = 0
+  while step < steps {
+    if random.below(2) == 0 {
+      let author = random.below(count)
+      let envelope = run localEdit(&mut replicas, author, step, &mut random)
+      run log.append(move envelope)
+    } else {
+      let target = random.below(count)
+      let mut tries: usize = 0
+      while tries < 8 && log.length() > 0 {
+        let pick = random.below(log.length())
+        let envelope = &log.asSlice()[pick]
+        let replica = &mut replicas.asMutSlice()[target]
+        if deliverable(&replica.*, envelope) {
+          run deliver(&mut replica, envelope)
+          break
+        }
+        tries = tries + 1
+      }
+    }
+    step = step + 1
+  }
+
+  // Deliver everything that is left.
+  let mut progress = true
+  while progress {
+    progress = false
+    let mut r: usize = 0
+    while r < count {
+      let mut k: usize = 0
+      while k < log.length() {
+        let envelope = &log.asSlice()[k]
+        let replica = &mut replicas.asMutSlice()[r]
+        if deliverable(&replica.*, envelope) {
+          run deliver(&mut replica, envelope)
+          progress = true
+        }
+        k = k + 1
+      }
+      r = r + 1
+    }
+  }
+  let mut first = List<u8>.make()
+  run replicas.asSlice()[0].text.readBytes(&mut first)
+  let mut r: usize = 1
+  while r < count {
+    let mut other = List<u8>.make()
+    run replicas.asSlice()[r].text.readBytes(&mut other)
+    run Testing.expect(
+      sameBytes(first.asSlice(), other.asSlice()),
+      "every replica reads the same text",
+    )
+    r = r + 1
+  }
+}
+
+effect fn typeForward(text: &mut Text, actor: u64, at: usize, word: string) -> List<InsertOp>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ops = List<InsertOp>.make()
+  let bytes = String.utf8Bytes(word)
+  let mut k: usize = 0
+  while k < bytes.length {
+    let id = DeltaId.make(usize.toU64(k) + 10, actor)
+    let op = run text.insert(id, at + k, Slice.view(bytes, k, 1))
+    run ops.append(move op)
+    k = k + 1
+  }
+  return move ops
+}
+
+effect fn typeBackward(text: &mut Text, actor: u64, at: usize, word: string) -> List<InsertOp>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ops = List<InsertOp>.make()
+  let bytes = String.utf8Bytes(word)
+  let mut k = bytes.length
+  while k > 0 {
+    k = k - 1
+    let id = DeltaId.make(usize.toU64(bytes.length - k) + 10, actor)
+    let op = run text.insert(id, at, Slice.view(bytes, k, 1))
+    run ops.append(move op)
+  }
+  return move ops
+}
+
+effect fn applyAll(text: &mut Text, ops: &List<InsertOp>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut k: usize = 0
+  while k < ops.length() {
+    run text.applyInsert(&ops.asSlice()[k])
+    k = k + 1
+  }
+}
+
+effect fn noInterleaving(backward: bool) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut a = Text.make()
+  let mut b = Text.make()
+  let base = run a.insert(DeltaId.make(1, 9), 0, String.utf8Bytes("[]"))
+  run b.applyInsert(&base)
+  let mut fromA = List<InsertOp>.make()
+  let mut fromB = List<InsertOp>.make()
+  if backward {
+    fromA = run typeBackward(&mut a, 1, 1, "abc")
+    fromB = run typeBackward(&mut b, 2, 1, "xyz")
+  } else {
+    fromA = run typeForward(&mut a, 1, 1, "abc")
+    fromB = run typeForward(&mut b, 2, 1, "xyz")
+  }
+  run applyAll(&mut a, &fromB)
+  run applyAll(&mut b, &fromA)
+  let readA = run a.read()
+  let readB = run b.read()
+  run Testing.expect(readA.view() == readB.view(), "both replicas agree")
+  let together = readA.view() == "[abcxyz]" || readA.view() == "[xyzabc]"
+  run Testing.expect(together, "each run stays in one piece")
+}
+
+test effect fn localEditsMatchAModelTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run localEditsMatchAModel() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn twoReplicasConvergeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run replicasConverge(1, 2, 400) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn threeReplicasConvergeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut seed: u64 = 11
+  while seed < 30 {
+    run replicasConverge(seed, 3, 300) |> Effect.provideMut<Allocator>(&mut allocator)
+    seed = seed + 1
+  }
+}
+
+test effect fn fiveReplicasConvergeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run replicasConverge(77, 5, 1500) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn forwardTypingDoesNotInterleaveTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run noInterleaving(false) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn backwardTypingDoesNotInterleaveTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run noInterleaving(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
