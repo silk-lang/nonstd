@@ -1,0 +1,157 @@
+//! Calls to the Claude Messages API on threads of their own, so a reply that takes a while never
+//! holds up the window. Each call posts the body with the API key, and its reply comes back
+//! through a mailbox the window loop drains; the thread wakes the loop when it is done.
+import silk.collections.list { List }
+import silk.concurrency.thread_native { NativeThread, JoinHandle }
+import silk.concurrency.work_queue { Mailbox, MailboxReceiver, MailboxSender }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.http.client { Http, HttpError, Request }
+import silk.http.client_native { NativeHttp }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.text.string { String }
+
+pub const ENDPOINT: string<'static> = "https://api.anthropic.com/v1/messages"
+
+/// A finished call: the HTTP status (0 when no answer arrived) and the body (or why it failed).
+pub struct Reply {
+  pub call: u32,
+  pub status: u32,
+  pub body: String,
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn silk_macos_wake() -> ()
+
+  fn wakeLoop() -> () {
+    unsafe silk_macos_wake()
+  }
+} else {
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "windows" {
+    unsafe extern "C" fn silk_window_wake() -> ()
+
+    fn wakeLoop() -> () {
+      unsafe silk_window_wake()
+    }
+  } else {
+    fn wakeLoop() -> () {
+      return ()
+    }
+  }
+}
+
+/// The calls in flight and the replies that came back.
+pub struct ClaudeLink {
+  key: String,
+  inbox: MailboxReceiver<Reply>,
+  threads: List<JoinHandle<()>>,
+}
+
+impl ClaudeLink {
+  pub effect fn make(key: string) -> ClaudeLink
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ClaudeLink {
+      key: run String.copy(key),
+      inbox: run Mailbox.make<Reply>(),
+      threads: List<JoinHandle<()>>.make(),
+    }
+  }
+
+  /// Starts call `call` with request `body`. A call that cannot start replies at once.
+  pub effect fn start(self: &mut Self, call: u32, body: String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let job = Job {
+      call: call,
+      key: run String.copy(self.key.view()),
+      body: move body,
+      sender: self.inbox.sender(),
+    }
+    let started = run Effect.result(
+      NativeThread.spawn(
+        fn() -> () {
+          return work(move job)
+        },
+      ),
+    )
+    match move started {
+      Result.Success { value } => {
+        run self.threads.append(move value)
+      }
+      Result.Failure { error } => {
+        drop error
+        run self.inbox.sender().send(
+          Reply { call: call, status: 0, body: run String.copy("could not start a thread") },
+        )
+      }
+    }
+  }
+
+  /// The next reply that came back.
+  pub fn receive(self: &mut Self) -> Option<Reply> {
+    return self.inbox.receive()
+  }
+}
+
+/// What a call's thread owns.
+struct Job {
+  call: u32,
+  key: String,
+  body: String,
+  sender: MailboxSender<Reply>,
+}
+
+/// A call's thread: post, hand the reply back, wake the window loop.
+fn work(job: Job) -> () {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut reply = run Effect.catchAll(post(job.key.view(), job.body.view()), unanswered)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  reply.call = job.call
+  drop run Effect.catchAll(sendReply(&job.sender, move reply), ignored)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  wakeLoop()
+}
+
+effect fn post(key: string, body: string) -> Reply
+  ! HttpError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut http = NativeHttp.make().timeoutSeconds(600).maxBodyBytes(64 * 1024 * 1024)
+  let request = Request.post(ENDPOINT).header("x-api-key", key).header(
+    "anthropic-version",
+    "2026-10-21",
+  ).header("anthropic-beta", "server-side-fallback-2026-07-01").bytes(
+    String.utf8Bytes(body),
+    "application/json",
+  )
+  let response = run Http.send(move request) |> Effect.provideMut<Http>(&mut http)
+  let text = match String.fromUtf8(response.body()) {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      ""
+    }
+  }
+  return Reply { call: 0, status: u16.toU32(response.status()), body: run String.copy(text) }
+}
+
+/// A call that got no answer (no connection, TLS, a timeout).
+effect fn unanswered<E>(error: E) -> Reply {
+  drop error
+  return Reply { call: 0, status: 0, body: String.make() }
+}
+
+effect fn sendReply(sender: &MailboxSender<Reply>, reply: Reply) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run sender.send(move reply)
+  return true
+}
+
+effect fn ignored(error: OutOfMemoryError) -> bool {
+  drop error
+  return false
+}

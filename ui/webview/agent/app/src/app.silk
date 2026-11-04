@@ -1,0 +1,580 @@
+//! The agent browser: a chat with an agent on the left, the browser the user and the agent share
+//! on the right. The user browses and types into the page as in any browser; the agent reads and
+//! drives the same page through its tools while the user watches, and either can take over.
+import ui_webview_agent.agent { Agent, Step }
+import ui_webview.lib { Page, PageMessage, WebViewRequests, WebViewApp, webView }
+import webview.command { Command, commandName }
+import webview.event { EventKind }
+import ui_app.app { App, Context, NoCommand }
+import ui_app.ui { Ui }
+import ui_components.theme { Theme, border, padding2, surface }
+import ui_components.button { button, primaryButton, buttonWith, Tone }
+import ui_components.field { textField, textArea }
+import ui_tree.mutation { Property, Length, Align, Overflow, Side, BorderStyle }
+import silk.collections.list { List }
+import silk.io.writer_native { StderrWriter }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.num.u8
+
+/// The shared page's view id.
+pub const VIEW: u32 = 1
+
+/// The font family id the app defines.
+pub const SANS: u32 = 1
+
+pub const HOME: string<'static> = "https://example.com/"
+
+/// The local page the scripted agent knows how to fill in.
+pub const GUEST_BOOK: string<
+  'static
+> = "<!doctype html><title>Agent demo</title><style>body{font:16px system-ui,sans-serif;margin:32px;color:#1f2937}input{font:inherit;padding:6px 8px;margin-right:8px}button{font:inherit;padding:6px 14px}#out{margin-top:20px;font-size:22px}</style><h1>Sign the guest book</h1><p>Type a name and press the button, or ask the agent to do it.</p><input id=name aria-label=Name placeholder=Name><button onclick=\"const n=document.getElementById('name').value;document.getElementById('out').textContent='Hello, '+n+'!';document.title='Signed by '+n;console.log('signed by '+n)\">Sign</button><div id=out></div>"
+
+/// The words the scripted check sends.
+pub const CHECK_PROMPT: string<'static> = "Sign the guest book as Silk agent"
+
+pub enum Who {
+  User,
+  Agent,
+  Tool,
+  Problem,
+  Info,
+}
+
+pub struct Line {
+  pub who: Who,
+  pub text: String,
+}
+
+/// A model call the host runs.
+pub struct Call {
+  pub call: u32,
+  pub body: String,
+}
+
+pub struct AgentBrowser {
+  pub page: Page,
+  pub agent: Agent,
+  pub chat: List<Line>,
+  pub address: String,
+  pub draft: String,
+  /// Model calls for the host to run.
+  pub calls: List<Call>,
+  /// Run as the scripted check: open the guest book, ask the agent to sign it, end when signed.
+  pub check: bool,
+  checkAsked: bool,
+  /// The exit code, once the check is over.
+  pub outcome: Option<i32>,
+  requests: WebViewRequests,
+  theme: Theme,
+}
+
+pub union Message {
+  Page { pub message: PageMessage },
+  Address { pub text: String },
+  Go,
+  Back,
+  Forward,
+  Reload,
+  GuestBook,
+  Draft { pub text: String },
+  Send,
+  Stop,
+  Replied { pub call: u32, pub status: u32, pub body: String },
+}
+
+impl AgentBrowser {
+  /// `scripted` says which brain answers (shown in the chat); `check` runs the scripted check.
+  pub effect fn make(model: string, scripted: bool, check: bool) -> AgentBrowser
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut app = AgentBrowser {
+      page: Page.make(VIEW),
+      agent: run Agent.make(model),
+      chat: List<Line>.make(),
+      address: run String.copy(HOME),
+      draft: String.make(),
+      calls: List<Call>.make(),
+      check: check,
+      checkAsked: false,
+      outcome: Option<i32>.None,
+      requests: WebViewRequests.make(),
+      theme: Theme.light(SANS),
+    }
+    if check {
+      // The check opens the guest book itself, as a data: URL (every backend loads those the
+      // same way, title included).
+      let url = run guestBookUrl()
+      run app.page.open(&mut app.requests, url.view())
+    } else {
+      run app.page.open(&mut app.requests, HOME)
+    }
+    if scripted {
+      run app.line(
+        Who.Info,
+        "No ANTHROPIC_API_KEY is set, so a scripted agent answers. It knows one job: open the guest book and ask it to sign it.",
+      )
+    } else {
+      let mut text = run String.copy("Claude (")
+      run text.append(model)
+      run text.append(") shares this browser with you. Ask it to do something on the web.")
+      run app.line(Who.Info, text.view())
+    }
+    return move app
+  }
+
+  effect fn line(self: &mut Self, who: Who, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.trace(text)
+    run self.chat.append(Line { who: who, text: run String.copy(text) })
+  }
+
+  /// In the check, prints what happens to standard error, so a failed run shows how far it got.
+  fn trace(self: &Self, text: string) -> () {
+    if self.check {
+      StderrWriter.print("check: {}\n", &(text,))
+    }
+  }
+
+  fn traceEvent(self: &Self, event: &EventKind) -> () {
+    if !self.check {
+      return ()
+    }
+    match &event.* {
+      EventKind.Created => self.trace("page: created")
+      EventKind.LoadStarted { url } => {
+        StderrWriter.print("check: page: load started {}\n", &(url.view(),))
+      }
+      EventKind.LoadFinished { url, ok, error } => {
+        StderrWriter.print(
+          "check: page: load finished ok={} {} {}\n",
+          &(ok, url.view(), error.view()),
+        )
+      }
+      EventKind.TitleChanged { title } => {
+        StderrWriter.print("check: page: title {}\n", &(title.view(),))
+      }
+      EventKind.Snapshot { text, .. } => {
+        StderrWriter.print("check: page: snapshot\n{}\n", &(text.view(),))
+      }
+      EventKind.ActionResult { ok, error, .. } => {
+        StderrWriter.print("check: page: action ok={} {}\n", &(ok, error.view()))
+      }
+      EventKind.Unsupported { command, .. } => {
+        StderrWriter.print("check: page: unsupported {}\n", &(command.view(),))
+      }
+      EventKind.Crashed { reason } => {
+        StderrWriter.print("check: page: crashed {}\n", &(reason.view(),))
+      }
+      EventKind.Console { message, .. } => {
+        StderrWriter.print("check: page: console {}\n", &(message.view(),))
+      }
+      _ => {}
+    }
+  }
+
+  /// Carries out the agent's steps.
+  effect fn steps(self: &mut Self, steps: List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut list = move steps
+    while list.length() != 0 {
+      match list.remove(0) {
+        Step.Say { text } => {
+          self.trace(text.view())
+          run self.chat.append(Line { who: Who.Agent, text: move text })
+        }
+        Step.Note { text } => {
+          self.trace(text.view())
+          run self.chat.append(Line { who: Who.Tool, text: move text })
+        }
+        Step.Failed { text } => {
+          self.trace(text.view())
+          run self.chat.append(Line { who: Who.Problem, text: move text })
+        }
+        Step.Call { call, body } => {
+          self.trace("agent: asks the model")
+          run self.calls.append(Call { call: call, body: move body })
+        }
+        Step.Send { command } => {
+          if self.check {
+            StderrWriter.print("check: agent: sends {}\n", &(commandName(&command),))
+          }
+          run self.page.send(&mut self.requests, move command)
+        }
+        Step.Finished => {
+          self.trace("agent: finished its turn")
+          self.judge()
+        }
+      }
+    }
+  }
+
+  /// In the check: the agent finished its turn, so it passed if the page was signed.
+  fn judge(self: &mut Self) -> () {
+    if self.check && self.checkAsked {
+      if String.startsWith(self.page.title.view(), "Signed by Silk agent") {
+        self.outcome = Option<i32>.some(0)
+      } else {
+        self.outcome = Option<i32>.some(1)
+      }
+    }
+  }
+
+  effect fn ask(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.line(Who.User, text)
+    let mut steps = List<Step>.make()
+    run self.agent.say(text, &mut steps)
+    run self.steps(move steps)
+  }
+
+  effect fn openGuestBook(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let url = run guestBookUrl()
+    run self.page.navigate(&mut self.requests, url.view())
+  }
+
+  effect fn pageMessage(self: &mut Self, message: PageMessage) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut steps = List<Step>.make()
+    if let PageMessage.Event { event } = &message {
+      self.traceEvent(&event)
+      run self.agent.observe(&event, &mut steps)
+    }
+    let answer = run self.page.update(move message, &mut self.requests)
+    if let Option<EventKind>.Some { value } = move answer {
+      match move value {
+        EventKind.NewWindowRequested { url } => {
+          run self.page.navigate(&mut self.requests, url.view())
+        }
+        EventKind.Console { message: text, .. } => {
+          drop text
+        }
+        _ => {}
+      }
+    }
+    run self.steps(move steps)
+    if self.check {
+      if !self.checkAsked && self.page.title.view() == "Agent demo" && !self.page.loading {
+        self.checkAsked = true
+        run self.ask(CHECK_PROMPT)
+      }
+    }
+    if !self.page.loading && String.byteLength(self.page.url.view()) != 0 && !self.page.focused {
+      self.address = run String.copy(self.page.url.view())
+    }
+  }
+}
+
+/// The guest book page as a data: URL, percent-encoded.
+effect fn guestBookUrl() -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let hex = "0123456789ABCDEF"
+  let mut url = run String.copy("data:text/html;charset=utf-8,")
+  let bytes = String.utf8Bytes(GUEST_BOOK)
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    let plain = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45
+      || b == 46
+      || b == 95
+      || b == 126
+    if plain {
+      run url.append(String.slice(GUEST_BOOK, i, 1))
+    } else {
+      run url.append("%")
+      run url.append(String.slice(hex, u8.toUsize(b / 16), 1))
+      run url.append(String.slice(hex, u8.toUsize(b % 16), 1))
+    }
+    i = i + 1
+  }
+  return move url
+}
+
+/// `text` as a URL: as it is with a scheme, else https://.
+effect fn urlOf(text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let trimmed = String.trim(text)
+  if String.contains(trimmed, "://") || String.startsWith(trimmed, "about:")
+    || String.startsWith(trimmed, "data:") {
+    return run String.copy(trimmed)
+  }
+  let mut url = run String.copy("https://")
+  run url.append(trimmed)
+  return move url
+}
+
+impl App<Message, NoCommand> for AgentBrowser {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    let theme = self.theme
+    surface(&mut ui, &theme)
+    ui.row(
+      |ui| {
+        ui.grow(1.0)
+        ui.style(&[Property.AlignItems { value: Align.Stretch }])
+        self.chatPanel(&mut ui)
+        self.browserPanel(&mut ui)
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Page { message: pageMessage } => {
+        cx.alloc(self.pageMessage(move pageMessage))
+      }
+      Message.Address { text } => {
+        self.address = move text
+      }
+      Message.Go => {
+        let url = cx.alloc(urlOf(self.address.view()))
+        cx.alloc(self.page.navigate(&mut self.requests, url.view()))
+      }
+      Message.Back => {
+        cx.alloc(self.page.back(&mut self.requests))
+      }
+      Message.Forward => {
+        cx.alloc(self.page.forward(&mut self.requests))
+      }
+      Message.Reload => {
+        cx.alloc(self.page.reloadOrStop(&mut self.requests))
+      }
+      Message.GuestBook => {
+        cx.alloc(self.openGuestBook())
+      }
+      Message.Draft { text } => {
+        self.draft = move text
+      }
+      Message.Send => {
+        let text = cx.copy(String.trim(self.draft.view()))
+        if String.byteLength(text.view()) != 0 && !self.agent.busy() {
+          self.draft = String.make()
+          cx.alloc(self.ask(text.view()))
+        }
+      }
+      Message.Stop => {
+        let mut steps = List<Step>.make()
+        cx.alloc(self.agent.stop(&mut steps))
+        cx.alloc(self.line(Who.Info, "Stopped."))
+        cx.alloc(self.steps(move steps))
+      }
+      Message.Replied { call, status, body } => {
+        let mut steps = List<Step>.make()
+        cx.alloc(self.agent.reply(call, status, body.view(), &mut self.requests, &mut steps))
+        cx.alloc(self.steps(move steps))
+      }
+    }
+  }
+}
+
+impl AgentBrowser {
+  fn chatPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    let theme = self.theme
+    ui.column(
+      |ui| {
+        ui.testId("chat")
+        ui.width(Length.px(360.0))
+        ui.style(&[Property.FlexShrink { value: 0.0 }])
+        ui.gap(8.0)
+        padding2(&mut ui, 12.0, 12.0)
+        ui.style(
+          &[
+            Property.BorderWidth { side: Side.Right, value: 1.0 },
+            Property.BorderStyle { value: BorderStyle.Solid },
+            Property.BorderColor { color: theme.border },
+          ],
+        )
+        ui.box(
+          |ui| {
+            ui.fontSize(theme.headingSize)
+            ui.style(&[Property.FontWeight { value: 700.0 }])
+            ui.text("Agent")
+          },
+        )
+        ui.column(
+          |ui| {
+            ui.testId("messages")
+            ui.grow(1.0)
+            ui.gap(6.0)
+            ui.style(
+              &[
+                Property.OverflowY { value: Overflow.Auto },
+                Property.OverflowX { value: Overflow.Hidden },
+                Property.Height { value: Length.px(0.0) },
+              ],
+            )
+            let lines = self.chat.asSlice()
+            let mut i: usize = 0
+            while i < lines.length {
+              chatLine(&mut ui, &theme, &lines[i], i + 1 == lines.length)
+              i = i + 1
+            }
+            if self.agent.busy() {
+              ui.box(
+                |ui| {
+                  ui.fontSize(theme.smallSize)
+                  ui.color(theme.mutedText)
+                  ui.text("Working…")
+                },
+              )
+            }
+          },
+        )
+        textArea(
+          &mut ui,
+          &theme,
+          "Message",
+          "Ask the agent to do something in the browser",
+          self.draft.view(),
+          3,
+          |text| Message.Draft { text: move text },
+          |ui| {
+            ui.testId("draft")
+            ui.onEnter(|| Message.Send)
+          },
+        )
+        ui.row(
+          |ui| {
+            ui.gap(8.0)
+            if self.agent.busy() {
+              button(&mut ui, &theme, "Stop", || Message.Stop)
+            } else {
+              primaryButton(&mut ui, &theme, "Send", || Message.Send)
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn browserPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    let theme = self.theme
+    ui.column(
+      |ui| {
+        ui.grow(1.0)
+        ui.row(
+          |ui| {
+            ui.gap(6.0)
+            padding2(&mut ui, 8.0, 8.0)
+            ui.style(&[Property.AlignItems { value: Align.Center }])
+            buttonWith(
+              &mut ui,
+              &theme,
+              Tone.Secondary,
+              !self.page.canGoBack,
+              "‹",
+              || Message.Back,
+            )
+            buttonWith(
+              &mut ui,
+              &theme,
+              Tone.Secondary,
+              !self.page.canGoForward,
+              "›",
+              || Message.Forward,
+            )
+            if self.page.loading {
+              button(&mut ui, &theme, "Stop", || Message.Reload)
+            } else {
+              button(&mut ui, &theme, "Reload", || Message.Reload)
+            }
+            ui.box(
+              |ui| {
+                ui.grow(1.0)
+                textField(
+                  &mut ui,
+                  &theme,
+                  "Address",
+                  "Search or type a URL",
+                  self.address.view(),
+                  |text| Message.Address { text: move text },
+                  |ui| {
+                    ui.testId("address")
+                    ui.onEnter(|| Message.Go)
+                  },
+                )
+              },
+            )
+            button(&mut ui, &theme, "Guest book", || Message.GuestBook)
+          },
+        )
+        webView(
+          &mut ui,
+          &self.page,
+          |message| Message.Page { message: move message },
+          |ui| {
+            ui.testId("page")
+            ui.grow(1.0)
+            ui.background(theme.surface)
+          },
+        )
+        ui.row(
+          |ui| {
+            ui.gap(12.0)
+            padding2(&mut ui, 4.0, 10.0)
+            ui.fontSize(theme.smallSize)
+            ui.color(theme.mutedText)
+            ui.box(|ui| ui.text(self.page.heading()))
+            if self.page.loading {
+              ui.box(|ui| ui.text("Loading…"))
+            } else if String.byteLength(self.page.error.view()) != 0 {
+              ui.box(|ui| ui.text(self.page.error.view()))
+            }
+          },
+        )
+      },
+    )
+  }
+}
+
+fn chatLine<M>(ui: &mut Ui<M>, theme: &Theme, line: &Line, last: bool) -> () {
+  ui.box(
+    |ui| {
+      padding2(&mut ui, 6.0, 10.0)
+      ui.style(&[Property.FlexShrink { value: 0.0 }])
+      match line.who {
+        Who.User => {
+          ui.background(theme.highlight)
+          border(&mut ui, 0.0, theme.border, theme.radius)
+        }
+        Who.Agent => {
+          ui.background(theme.surface)
+          border(&mut ui, 1.0, theme.border, theme.radius)
+        }
+        Who.Tool => {
+          ui.fontSize(theme.smallSize)
+          ui.color(theme.mutedText)
+        }
+        Who.Problem => {
+          ui.color(theme.danger)
+        }
+        Who.Info => {
+          ui.fontSize(theme.smallSize)
+          ui.color(theme.mutedText)
+        }
+      }
+      if last {
+        ui.reveal()
+      }
+      ui.text(line.text.view())
+    },
+  )
+}
+
+impl WebViewApp<Message> for AgentBrowser {
+  fn webViewRequests(self: &mut Self) -> &mut WebViewRequests {
+    return &mut self.requests
+  }
+
+  fn webViewMessage(self: &Self, view: u32, message: PageMessage) -> Message {
+    return Message.Page { message: move message }
+  }
+}

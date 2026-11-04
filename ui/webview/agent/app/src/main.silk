@@ -1,0 +1,267 @@
+//! The agent browser demo: a chat with an agent beside a browser the user and the agent share.
+//!
+//!   ui-webview-agent            (ANTHROPIC_API_KEY set: Claude; otherwise the scripted agent)
+//!   SILK_AGENT_CHECK=1 ui-webview-agent   the scripted check: exits 0 once the agent signed
+//!                                         the guest book in a real page, 1 if it did not
+//!
+//! Linux runs pages in Chromium (CEF): SILK_CEF_RUNTIME names the runtime directory
+//! (`python3 scripts/install-cef` prints it; `ui/webview/agent/scripts/run` sets it). macOS and
+//! Windows use the system web view. SILK_AGENT_MODEL picks another Claude model.
+import app { AgentBrowser, Message, SANS }
+import ui_webview_agent.agent { MODEL }
+import ui_webview_agent.claude { ClaudeLink, Reply }
+import ui_webview_agent.script { respond }
+import views { Views, startViews, stopViews }
+import ui_webview.lib { WebViewsHost }
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime }
+import ui_app_window.lib { RunOptions, WindowHost, runWindowHosting }
+import ui_inspect_server.lib { Inspector, InspectorOptions }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib { UiTree, TreeError, Batch }
+import ui_renderer.renderer { UiRenderer }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import window.event { Event }
+import window.types { Cursor, WindowError }
+import webgpu.resources { Queue }
+import webgpu.runtime { Device, GpuError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { SystemClock }
+import silk.num.i64
+import silk.text.string { String }
+
+/// How long the scripted check may take before it fails.
+const CHECK_SECONDS: f64 = 90.0
+
+/// The web views, plus the agent's model calls: to Claude on threads, or to the scripted brain.
+struct Host {
+  web: WebViewsHost<Views, AgentBrowser, Message>,
+  link: Option<ClaudeLink>,
+  /// Scripted replies, handed to the app on the next poll.
+  scripted: List<Reply>,
+  clock: OsMonotonicClock,
+  started: f64,
+  check: bool,
+  outcome: Option<i32>,
+}
+
+effect fn seconds(clock: &mut OsMonotonicClock) -> f64 {
+  let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+  return i64.toF64(SystemClock.seconds(&now))
+    + i64.toF64(SystemClock.nanoseconds(&now)) / 1000000000.0
+}
+
+impl WindowHost<AgentBrowser, Message> for Host {
+  effect fn opened(self: &mut Self, window: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.web.opened(window)
+  }
+
+  effect fn framed(self: &mut Self, tree: &UiTree) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.web.framed(tree)
+  }
+
+  effect fn poll(self: &mut Self, model: &mut AgentBrowser, out: &mut List<Message>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let before = out.length()
+    while model.calls.length() != 0 {
+      let call = model.calls.remove(0)
+      match &mut self.link {
+        Option<ClaudeLink>.Some { value: link } => {
+          run link.start(call.call, move call.body)
+        }
+        Option<ClaudeLink>.None => {
+          let body = run respond(call.body.view())
+          run self.scripted.append(Reply { call: call.call, status: 200, body: move body })
+        }
+      }
+    }
+    while self.scripted.length() != 0 {
+      let reply = self.scripted.remove(0)
+      run out.append(
+        Message.Replied { call: reply.call, status: reply.status, body: move reply.body },
+      )
+    }
+    if let Option<ClaudeLink>.Some { value: link } = &mut self.link {
+      while let Option<Reply>.Some { value: reply } = link.receive() {
+        run out.append(
+          Message.Replied { call: reply.call, status: reply.status, body: move reply.body },
+        )
+      }
+    }
+    drop run self.web.poll(&mut model, &mut out)
+    if Option<i32>.isSome(&model.outcome) {
+      self.outcome = model.outcome
+    } else if self.check && (run seconds(&mut self.clock)) - self.started > CHECK_SECONDS {
+      StderrWriter.print("check: the agent did not sign the guest book in time\n", &())
+      StderrWriter.print(
+        "check: page created={} loading={} title {}\n",
+        &(model.page.created, model.page.loading, model.page.title.view()),
+      )
+      self.outcome = Option<i32>.some(1)
+    }
+    return out.length() != before
+  }
+
+  effect fn input(self: &mut Self, event: &Event) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.web.input(event)
+  }
+
+  effect fn present(
+    self: &mut Self,
+    device: &Device,
+    queue: &Queue,
+    renderer: &mut UiRenderer,
+  ) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.web.present(device, queue, &mut renderer)
+  }
+
+  fn cursor(self: &Self) -> Option<Cursor> {
+    return self.web.cursor()
+  }
+
+  fn wantsFrame(self: &mut Self) -> bool {
+    return self.web.wantsFrame()
+  }
+
+  fn nextTurn(self: &Self) -> Option<f64> {
+    // The check also wakes once a second to watch its deadline.
+    if self.check {
+      return match self.web.nextTurn() {
+        Option<f64>.Some { value } => Option<f64>.some(
+          if value < 1.0 {
+            value
+          } else {
+            1.0
+          },
+        )
+        Option<f64>.None => Option<f64>.some(1.0)
+      }
+    }
+    return self.web.nextTurn()
+  }
+
+  fn exitCode(self: &Self) -> Option<i32> {
+    return self.outcome
+  }
+}
+
+effect fn variable(name: string) -> String
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some { value } = run HostInput.variableNamed(name) {
+    if let Result.Success { value: text } = String.fromUtf8(value.asSlice()) {
+      return run String.copy(text)
+    }
+  }
+  return String.make()
+}
+
+effect fn program() -> i32
+  ! WindowError
+    | GpuError
+    | TreeError
+    | AtlasError
+    | GeometryError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let check = (run variable("SILK_AGENT_CHECK")).view() == "1"
+  let key = run variable("ANTHROPIC_API_KEY")
+  let scripted = check || String.byteLength(key.view()) == 0
+  let chosen = run variable("SILK_AGENT_MODEL")
+  let model = if String.byteLength(chosen.view()) != 0 {
+    chosen.view()
+  } else {
+    MODEL
+  }
+  let runtime = run variable("SILK_CEF_RUNTIME")
+  let mut views = match run startViews(
+    runtime.view(),
+    check || (run variable("CI")).view() == "true",
+  ) {
+    Option<Views>.Some { value } => move value
+    Option<Views>.None => {
+      return 2
+    }
+  }
+
+  let collection = run fixtures.fonts()
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  let mut app = Runtime<AgentBrowser, Message, NoCommand>.make(
+    run AgentBrowser.make(model, scripted, check),
+  )
+  let options = RunOptions {
+    title: "Silk agent browser",
+    width: 1280.0,
+    height: 820.0,
+    check: false,
+    checkClick: "",
+    checkExpect: "",
+  }
+  let mut clock = OsMonotonicClock.make()
+  let started = run seconds(&mut clock)
+  let link = if scripted {
+    Option<ClaudeLink>.None
+  } else {
+    Option<ClaudeLink>.some(run ClaudeLink.make(key.view()))
+  }
+  let mut host = Host {
+    web: WebViewsHost<Views, AgentBrowser, Message>.make(move views),
+    link: move link,
+    scripted: List<Reply>.make(),
+    clock: move clock,
+    started: started,
+    check: check,
+    outcome: Option<i32>.None,
+  }
+  let inspector = run Inspector.start(InspectorOptions.make())
+  let status = run runWindowHosting(
+    &mut app,
+    &collection,
+    run batch.take(),
+    move options,
+    move inspector,
+    &mut host,
+  )
+  stopViews(&mut host.web.views)
+  if check {
+    if status == 0 {
+      StderrWriter.print("check: the agent signed the guest book\n", &())
+    } else {
+      StderrWriter.print("check: failed\n", &())
+    }
+  }
+  return status
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("agent browser: could not open the window or draw it\n", &())
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

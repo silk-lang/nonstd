@@ -1,0 +1,567 @@
+//! [`Agent`]: a conversation with Claude that drives the shared browser through tools, as plain
+//! data. It never does I/O: it asks for a model call (`Step.Call` with the request body), sends
+//! commands to the page (`Step.Send`), and takes the model's answer (`reply`) and the page's
+//! events (`observe`) as they arrive. The app runs the call (on a thread, or the scripted brain)
+//! and the commands (through its web view requests).
+//!
+//! The conversation is append-only: Claude's content blocks (thinking included) go back exactly as
+//! they came, and every `tool_use` gets its `tool_result` before the next user turn.
+import json { quote, write, count, item }
+import tools { TOOLS, Wait, Mapped, map }
+import webview.command { Command }
+import webview.event { EventKind }
+import ui_webview.requests { WebViewRequests }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.text.string { String }
+
+/// What the system prompt tells Claude about the browser it shares.
+pub const SYSTEM: string<
+  'static
+> = r"""You are a browsing agent inside a desktop app. The user and you share one web browser: the page shows next to this chat, the user can click and type in it at any time, and you act on it with the browser tools, which use real mouse and keyboard input. Start by taking a snapshot to see what the page shows, act on elements by the refs of the latest snapshot, and take a new snapshot after anything that changes the page. Keep replies to the user short and plain. When you finish, say what you did and what the page shows now. If a page needs the user (a login, a payment, a captcha), stop and ask them to do it in the browser."""
+
+/// The model the agent uses unless the app names another.
+pub const MODEL: string<'static> = "claude-opus-5-5"
+
+/// One step the app takes for the agent.
+pub union Step {
+  /// Claude's words for the user.
+  Say { pub text: String },
+  /// What the agent is doing in the page ("Clicking e7"), for the chat.
+  Note { pub text: String },
+  /// Something went wrong; the turn is over.
+  Failed { pub text: String },
+  /// Send `body` to the Messages API; answer with `reply(call, ...)`.
+  Call { pub call: u32, pub body: String },
+  /// A command for the shared page.
+  Send { pub command: Command },
+  /// The turn is over: the agent waits for the user.
+  Finished,
+}
+
+struct Message {
+  user: bool,
+  /// The content blocks, each as JSON text.
+  blocks: List<String>,
+}
+
+struct Pending {
+  id: String,
+  request: u32,
+  wait: Wait,
+  done: bool,
+  error: bool,
+  result: String,
+  /// The commands still to send; they go out once every earlier call of the round answered.
+  commands: List<Command>,
+  sent: bool,
+}
+
+pub struct Agent {
+  pub model: String,
+  /// `output_config.effort`.
+  pub effort: String,
+  /// Model rounds one user message may take before the agent stops.
+  pub maxRounds: u32,
+  messages: List<Message>,
+  pending: List<Pending>,
+  /// A model call or tool calls are in flight.
+  working: bool,
+  /// The call whose reply is awaited (replies to older calls are dropped).
+  call: u32,
+  waitingForModel: bool,
+  rounds: u32,
+}
+
+impl Agent {
+  pub effect fn make(model: string) -> Agent
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Agent {
+      model: run String.copy(model),
+      effort: run String.copy("medium"),
+      maxRounds: 40,
+      messages: List<Message>.make(),
+      pending: List<Pending>.make(),
+      working: false,
+      call: 0,
+      waitingForModel: false,
+      rounds: 0,
+    }
+  }
+
+  /// A model call or tool calls are in flight.
+  pub fn busy(self: &Self) -> bool {
+    return self.working
+  }
+
+  /// How many messages the conversation has.
+  pub fn length(self: &Self) -> usize {
+    return self.messages.length()
+  }
+
+  /// The user says `text`.
+  pub effect fn say(self: &mut Self, text: string, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.working {
+      run out.append(
+        Step.Failed { text: run String.copy("The agent is still working; stop it first.") },
+      )
+      return ()
+    }
+    let mut block = run String.copy("{\"type\":\"text\",\"text\":")
+    run quote(&mut block, text)
+    run block.append("}")
+    run self.add(true, move block)
+    self.rounds = 0
+    self.working = true
+    run self.ask(&mut out)
+  }
+
+  /// Stops the turn: tools still waiting answer that the user stopped them, a pending model reply
+  /// is dropped.
+  pub effect fn stop(self: &mut Self, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.working {
+      return ()
+    }
+    let list = self.pending.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if !list[i].done {
+        list[i].done = true
+        list[i].error = true
+        list[i].result = run String.copy("The user stopped the agent before this finished.")
+      }
+      i = i + 1
+    }
+    if self.pending.length() != 0 {
+      run self.addResults()
+    }
+    self.waitingForModel = false
+    self.working = false
+    run out.append(Step.Finished)
+  }
+
+  /// The Messages API answered call `call` with HTTP `status` and `body`.
+  pub effect fn reply(
+    self: &mut Self,
+    call: u32,
+    status: u32,
+    body: string,
+    requests: &mut WebViewRequests,
+    out: &mut List<Step>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.waitingForModel || call != self.call {
+      return ()
+    }
+    self.waitingForModel = false
+    if status == 0 {
+      run self.abandon(
+        run String.copy("Could not reach the Claude API (no connection, or it took too long)."),
+        &mut out,
+      )
+      return ()
+    }
+    let parsed = run Effect.result(Json.parse(String.utf8Bytes(body)))
+    let document = match move parsed {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        let mut text = run String.copy("The Claude API answered ")
+        run appendNumber(&mut text, status)
+        run text.append(" with something that is not JSON.")
+        run self.abandon(move text, &mut out)
+        return ()
+      }
+    }
+    if status != 200 {
+      let message = Json.field(&document, "error")
+        |> Json.fieldAt("message")
+        |> Json.asString
+        |> Option<string>.unwrapOr("no message")
+      let mut text = run String.copy("The Claude API answered ")
+      run appendNumber(&mut text, status)
+      run text.append(": ")
+      run text.append(message)
+      run self.abandon(move text, &mut out)
+      return ()
+    }
+    let stop = Json.field(&document, "stop_reason")
+      |> Json.asString
+      |> Option<string>.unwrapOr("")
+    let content = Json.field(&document, "content")
+    let blocks = count(content)
+    if blocks != 0 {
+      let mut message = Message { user: false, blocks: List<String>.make() }
+      let mut i: usize = 0
+      while i < blocks {
+        if let Option<&Value>.Some { value: block } = item(content, i) {
+          let mut text = String.make()
+          run write(&mut text, block)
+          run message.blocks.append(move text)
+        }
+        i = i + 1
+      }
+      run self.messages.append(move message)
+    }
+    if stop == "refusal" {
+      run self.abandon(run String.copy("Claude declined this request."), &mut out)
+      return ()
+    }
+    let mut tools: usize = 0
+    let mut i: usize = 0
+    while i < blocks {
+      if let Option<&Value>.Some { value: block } = item(content, i) {
+        let kind = Json.field(block, "type")
+          |> Json.asString
+          |> Option<string>.unwrapOr("")
+        if kind == "text" {
+          let said = Json.field(block, "text")
+            |> Json.asString
+            |> Option<string>.unwrapOr("")
+          if String.byteLength(String.trim(said)) != 0 {
+            run out.append(Step.Say { text: run String.copy(said) })
+          }
+        } else if kind == "tool_use" {
+          tools = tools + 1
+          let id = Json.field(block, "id")
+            |> Json.asString
+            |> Option<string>.unwrapOr("")
+          let name = Json.field(block, "name")
+            |> Json.asString
+            |> Option<string>.unwrapOr("")
+          let request = requests.request()
+          let mapped = match Json.field(block, "input") {
+            Option<&Value>.Some { value: input } => run map(name, input, request)
+            Option<&Value>.None => run map(name, &Value.Null, request)
+          }
+          run self.start(id, name, request, move mapped, &mut out)
+        }
+      }
+      i = i + 1
+    }
+    if tools == 0 {
+      if stop == "max_tokens" {
+        run out.append(Step.Note { text: run String.copy("(The answer hit the output limit.)") })
+      }
+      self.working = false
+      run out.append(Step.Finished)
+      return ()
+    }
+    run self.sendNext(&mut out)
+    run self.settle(&mut out)
+  }
+
+  /// An event of the shared page: answers the tool calls waiting for it.
+  pub effect fn observe(self: &mut Self, event: &EventKind, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.pending.length() == 0 {
+      return ()
+    }
+    let list = self.pending.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if !list[i].done && list[i].sent {
+        let pending = &mut list[i]
+        match &event.* {
+          EventKind.Snapshot { request, text } => {
+            if pending.wait == Wait.Answer && request == pending.request {
+              pending.result = run String.copy(String.view(&text))
+              pending.done = true
+            }
+          }
+          EventKind.ActionResult { request, ok, error } => {
+            if pending.wait == Wait.Answer && request == pending.request {
+              pending.done = true
+              pending.error = !ok
+              pending.result = if ok {
+                run String.copy("Done. Take a snapshot to see the page now.")
+              } else {
+                run String.copy(String.view(&error))
+              }
+            }
+          }
+          EventKind.ScriptResult { request, ok, value } => {
+            if pending.wait == Wait.Answer && request == pending.request {
+              pending.done = true
+              pending.error = !ok
+              pending.result = run String.copy(String.view(&value))
+            }
+          }
+          EventKind.Unsupported { request, command } => {
+            if pending.wait == Wait.Answer && request == pending.request {
+              pending.done = true
+              pending.error = true
+              let mut text = run String.copy("This browser cannot run ")
+              run text.append(String.view(&command))
+              pending.result = move text
+            }
+          }
+          EventKind.LoadFinished { url, ok, error } => {
+            if pending.wait == Wait.Load {
+              pending.done = true
+              pending.error = !ok
+              let mut text = if ok {
+                run String.copy("Loaded ")
+              } else {
+                run String.copy("The load failed: ")
+              }
+              if !ok {
+                run text.append(String.view(&error))
+                run text.append(" (")
+              }
+              run text.append(String.view(&url))
+              if !ok {
+                run text.append(")")
+              }
+              pending.result = move text
+            }
+          }
+          _ => {}
+        }
+      }
+      i = i + 1
+    }
+    run self.sendNext(&mut out)
+    run self.settle(&mut out)
+  }
+
+  /// Sends the commands of the round's calls in order, each once every earlier call answered:
+  /// WebKit can run a click before the keys typed just before it, so a fill and then a click
+  /// would type into the button.
+  effect fn sendNext(self: &mut Self, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = self.pending.asMutSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let pending = &mut list[i]
+      if !pending.sent {
+        pending.sent = true
+        while pending.commands.length() != 0 {
+          run out.append(Step.Send { command: pending.commands.remove(0) })
+        }
+      }
+      if !pending.done {
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  /// The request body for the conversation so far.
+  pub effect fn body(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut body = run String.copy("{\"model\":")
+    run quote(&mut body, self.model.view())
+    run body.append(",\"max_tokens\":16000,\"output_config\":{\"effort\":")
+    run quote(&mut body, self.effort.view())
+    run body.append(
+      "},\"fallbacks\":\"default\",\"cache_control\":{\"type\":\"ephemeral\"},\"system\":",
+    )
+    run quote(&mut body, SYSTEM)
+    run body.append(",\"tools\":")
+    run body.append(TOOLS)
+    run body.append(",\"messages\":[")
+    let list = self.messages.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if i > 0 {
+        run body.append(",")
+      }
+      if list[i].user {
+        run body.append("{\"role\":\"user\",\"content\":[")
+      } else {
+        run body.append("{\"role\":\"assistant\",\"content\":[")
+      }
+      let blocks = list[i].blocks.asSlice()
+      let mut j: usize = 0
+      while j < blocks.length {
+        if j > 0 {
+          run body.append(",")
+        }
+        run body.append(String.view(&blocks[j]))
+        j = j + 1
+      }
+      run body.append("]}")
+      i = i + 1
+    }
+    run body.append("]}")
+    return move body
+  }
+
+  /// Appends a block to the last message when it has the same role, or a new message.
+  effect fn add(self: &mut Self, user: bool, block: String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let length = self.messages.length()
+    if length != 0 && self.messages.asSlice()[length - 1].user == user {
+      run self.messages.asMutSlice()[length - 1].blocks.append(move block)
+      return ()
+    }
+    let mut message = Message { user: user, blocks: List<String>.make() }
+    run message.blocks.append(move block)
+    run self.messages.append(move message)
+  }
+
+  effect fn ask(self: &mut Self, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.call = u32.wrappingAdd(self.call, 1)
+    self.waitingForModel = true
+    run out.append(Step.Call { call: self.call, body: run self.body() })
+  }
+
+  effect fn abandon(self: &mut Self, text: String, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.working = false
+    self.waitingForModel = false
+    self.pending.clear()
+    run out.append(Step.Failed { text: move text })
+    run out.append(Step.Finished)
+  }
+
+  effect fn start(
+    self: &mut Self,
+    id: string,
+    name: string,
+    request: u32,
+    mapped: Mapped,
+    out: &mut List<Step>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut note = run String.copy(name)
+    let done = mapped.wait == Wait.None
+    let mut pending = Pending {
+      id: run String.copy(id),
+      request: request,
+      wait: mapped.wait,
+      done: done,
+      error: mapped.refused,
+      result: move mapped.result,
+      commands: List<Command>.make(),
+      sent: false,
+    }
+    if let Option<Command>.Some { value } = move mapped.command {
+      run noteCommand(&mut note, &value)
+      run pending.commands.append(move value)
+    }
+    if let Option<Command>.Some { value } = move mapped.then {
+      run pending.commands.append(move value)
+    }
+    run out.append(Step.Note { text: move note })
+    drop name
+    run self.pending.append(move pending)
+  }
+
+  /// When every tool call of the round has its result: send them all back in one message.
+  effect fn settle(self: &mut Self, out: &mut List<Step>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.pending.length() == 0 || !self.working {
+      return ()
+    }
+    let list = self.pending.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if !list[i].done {
+        return ()
+      }
+      i = i + 1
+    }
+    run self.addResults()
+    self.rounds = self.rounds + 1
+    if self.rounds >= self.maxRounds {
+      let mut text = run String.copy("The agent stopped after ")
+      run appendNumber(&mut text, self.rounds)
+      run text.append(" rounds of tool calls.")
+      run self.abandon(move text, &mut out)
+      return ()
+    }
+    run self.ask(&mut out)
+  }
+
+  effect fn addResults(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.pending.length() != 0 {
+      let pending = self.pending.remove(0)
+      let mut block = run String.copy("{\"type\":\"tool_result\",\"tool_use_id\":")
+      run quote(&mut block, pending.id.view())
+      run block.append(",\"content\":")
+      if String.byteLength(pending.result.view()) == 0 {
+        run quote(&mut block, "(empty)")
+      } else {
+        run quote(&mut block, pending.result.view())
+      }
+      if pending.error {
+        run block.append(",\"is_error\":true")
+      }
+      run block.append("}")
+      run self.add(true, move block)
+    }
+  }
+}
+
+/// A short description of what a command does, for the chat.
+effect fn noteCommand(note: &mut String, command: &Command) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &command.* {
+    Command.Navigate { url } => {
+      note.* = run String.copy("Opening ")
+      run note.append(String.view(&url))
+    }
+    Command.Snapshot { .. } => {
+      note.* = run String.copy("Reading the page")
+    }
+    Command.ClickElement { element, .. } => {
+      note.* = run String.copy("Clicking ")
+      run note.append(String.view(&element))
+    }
+    Command.FillElement { element, text, .. } => {
+      note.* = run String.copy("Typing \"")
+      run note.append(String.view(&text))
+      run note.append("\" into ")
+      run note.append(String.view(&element))
+    }
+    Command.PressKey { key, .. } => {
+      note.* = run String.copy("Pressing ")
+      run note.append(String.view(&key))
+    }
+    Command.Scroll { .. } => {
+      note.* = run String.copy("Scrolling")
+    }
+    Command.Back => {
+      note.* = run String.copy("Going back")
+    }
+    Command.Evaluate { .. } => {
+      note.* = run String.copy("Running a script in the page")
+    }
+    _ => {}
+  }
+}
+
+/// Appends `value` in decimal.
+pub effect fn appendNumber(text: &mut String, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendNumber(&mut text, value / 10)
+  }
+  run text.append(String.slice("0123456789", u32.toUsize(value % 10), 1))
+}

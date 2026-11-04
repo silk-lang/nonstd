@@ -1,0 +1,269 @@
+//! The agent loop against the scripted brain and a page that answers like a real one.
+import agent { Agent, Step }
+import script { respond }
+import ui_webview.requests { WebViewRequests }
+import webview.command { Command }
+import webview.event { EventKind }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.value { Json }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+const FORM: string<
+  'static
+> = "- document \"Agent demo\" [url=about:blank]\n  - heading \"Sign the guest book\" [level=1]\n  - textbox \"Name\" [ref=e3]\n  - button \"Sign\" [ref=e4]\n"
+
+const SIGNED: string<
+  'static
+> = "- document \"Signed by Ada\" [url=about:blank]\n  - heading \"Sign the guest book\" [level=1]\n  - textbox \"Name\" [ref=e3]: \"Ada\"\n  - button \"Sign\" [ref=e4]\n  - text \"Hello, Ada!\"\n"
+
+/// What the page and the app see of a list of steps.
+struct Seen {
+  call: u32,
+  body: String,
+  commands: List<Command>,
+  said: List<String>,
+  failed: List<String>,
+  finished: bool,
+}
+
+effect fn take(steps: &mut List<Step>, seen: &mut Seen) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while steps.length() != 0 {
+    match steps.remove(0) {
+      Step.Call { call, body } => {
+        seen.call = call
+        seen.body = move body
+      }
+      Step.Send { command } => {
+        run seen.commands.append(move command)
+      }
+      Step.Say { text } => {
+        run seen.said.append(move text)
+      }
+      Step.Failed { text } => {
+        run seen.failed.append(move text)
+      }
+      Step.Note { text } => {
+        drop text
+      }
+      Step.Finished => {
+        seen.finished = true
+      }
+    }
+  }
+}
+
+/// The scripted brain answers the last call.
+effect fn answer(agent: &mut Agent, requests: &mut WebViewRequests, seen: &mut Seen) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let response = run respond(seen.body.view())
+  let mut steps = List<Step>.make()
+  run agent.reply(seen.call, 200, response.view(), &mut requests, &mut steps)
+  run take(&mut steps, &mut seen)
+}
+
+effect fn page(agent: &mut Agent, event: EventKind, seen: &mut Seen) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut steps = List<Step>.make()
+  run agent.observe(&event, &mut steps)
+  run take(&mut steps, &mut seen)
+}
+
+fn snapshotRequest(command: &Command) -> u32 {
+  return match &command.* {
+    Command.Snapshot { request } => request
+    _ => 0
+  }
+}
+
+effect fn signBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let mut agent = run Agent.make("claude-opus-5-5")
+  let mut requests = WebViewRequests.make()
+  let mut seen = Seen {
+    call: 0,
+    body: String.make(),
+    commands: List<Command>.make(),
+    said: List<String>.make(),
+    failed: List<String>.make(),
+    finished: false,
+  }
+  let mut steps = List<Step>.make()
+  run agent.say("Sign the guest book as Ada", &mut steps)
+  run take(&mut steps, &mut seen)
+  run Testing.expect(seen.call == 1 && agent.busy(), "the first call starts")
+  let parsed = run Effect.result(Json.parse(String.utf8Bytes(seen.body.view())))
+  run Testing.expect(
+    match &parsed {
+      Result.Success { value } => (Json.field(&value, "model")
+        |> Json.asString
+        |> Option<string>.unwrapOr(""))
+        == "claude-opus-5-5"
+      Result.Failure { .. } => false
+    },
+    "the body is JSON naming the model",
+  )
+  run Testing.expect(
+    String.contains(seen.body.view(), "\"fallbacks\":\"default\""),
+    "with fallbacks on",
+  )
+
+  // Round 1: a snapshot.
+  run answer(&mut agent, &mut requests, &mut seen)
+  run Testing.expect(seen.commands.length() == 1, "the agent asks the page for a snapshot")
+  let first = snapshotRequest(&seen.commands.asSlice()[0])
+  run Testing.expect(first != 0, "with a request number")
+  run page(
+    &mut agent,
+    EventKind.Snapshot { request: first + 100, text: run String.copy(FORM) },
+    &mut seen,
+  )
+  run Testing.expect(seen.call == 1, "another request's snapshot answers nothing")
+  run page(
+    &mut agent,
+    EventKind.Snapshot { request: first, text: run String.copy(FORM) },
+    &mut seen,
+  )
+  run Testing.expect(seen.call == 2, "its own snapshot goes back to the model")
+  run Testing.expect(
+    String.contains(seen.body.view(), "\"type\":\"tool_result\""),
+    "as a tool result",
+  )
+
+  // Round 2: type the name and click Sign, with real input.
+  run answer(&mut agent, &mut requests, &mut seen)
+  run Testing.expect(seen.commands.length() == 2, "typing first")
+  let mut fill: u32 = 0
+  let mut click: u32 = 0
+  match &seen.commands.asSlice()[1] {
+    Command.FillElement { request, element, text } => {
+      fill = request
+      run Testing.expect(
+        String.view(&element) == "e3" && String.view(&text) == "Ada",
+        "fills e3 with Ada",
+      )
+    }
+    _ => {}
+  }
+  run Testing.expect(seen.said.length() == 1, "and says what it is doing")
+  run page(
+    &mut agent,
+    EventKind.ActionResult { request: fill, ok: true, error: String.make() },
+    &mut seen,
+  )
+  run Testing.expect(seen.call == 2, "one result is not the round")
+  run Testing.expect(seen.commands.length() == 3, "the click goes out once the typing answered")
+  match &seen.commands.asSlice()[2] {
+    Command.ClickElement { request, element } => {
+      click = request
+      run Testing.expect(String.view(&element) == "e4", "clicks e4")
+    }
+    _ => {}
+  }
+  run Testing.expect(fill != 0 && click != 0 && fill != click, "each with its own request")
+  run page(
+    &mut agent,
+    EventKind.ActionResult { request: click, ok: true, error: String.make() },
+    &mut seen,
+  )
+  run Testing.expect(seen.call == 3, "both are")
+
+  // Round 3: look again, then report.
+  run answer(&mut agent, &mut requests, &mut seen)
+  let again = snapshotRequest(&seen.commands.asSlice()[3])
+  run page(
+    &mut agent,
+    EventKind.Snapshot { request: again, text: run String.copy(SIGNED) },
+    &mut seen,
+  )
+  run answer(&mut agent, &mut requests, &mut seen)
+  run Testing.expect(seen.finished && !agent.busy(), "the turn is over")
+  run Testing.expect(seen.said.length() == 2, "with a final word")
+  run Testing.expect(
+    String.contains(seen.said.asSlice()[1].view(), "Hello, Ada!"),
+    "about what the page shows",
+  )
+  run Testing.expect(seen.failed.length() == 0, "and nothing failed")
+  run Testing.expect(agent.length() == 8, "user, then three tool rounds, then the answer")
+}
+
+effect fn errorBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let mut agent = run Agent.make("claude-opus-5-5")
+  let mut requests = WebViewRequests.make()
+  let mut steps = List<Step>.make()
+  run agent.say("Hi", &mut steps)
+  steps.clear()
+  run agent.reply(
+    1,
+    400,
+    "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad thing\"}}",
+    &mut requests,
+    &mut steps,
+  )
+  run Testing.expect(!agent.busy(), "an error ends the turn")
+  let mut failed = false
+  while steps.length() != 0 {
+    if let Step.Failed { text } = steps.remove(0) {
+      failed = String.contains(text.view(), "400: bad thing")
+    }
+  }
+  run Testing.expect(failed, "and says what the API said")
+
+  // Stop while a tool waits: the tool gets a result, so the conversation stays valid.
+  run agent.say("Look at the page", &mut steps)
+  let mut call: u32 = 0
+  let mut body = String.make()
+  while steps.length() != 0 {
+    if let Step.Call { call: c, body: b } = steps.remove(0) {
+      call = c
+      body = move b
+    }
+  }
+  let response = run respond(body.view())
+  run agent.reply(call, 200, response.view(), &mut requests, &mut steps)
+  run Testing.expect(agent.busy(), "a snapshot waits")
+  steps.clear()
+  run agent.stop(&mut steps)
+  run Testing.expect(!agent.busy(), "stop ends it")
+  let mut later = List<Step>.make()
+  run agent.say("Again", &mut later)
+  let mut text = String.make()
+  while later.length() != 0 {
+    if let Step.Call { body: b, .. } = later.remove(0) {
+      text = move b
+    }
+  }
+  run Testing.expect(
+    String.contains(text.view(), "stopped the agent"),
+    "the waiting tool got its result",
+  )
+  let parsed = run Effect.result(Json.parse(String.utf8Bytes(text.view())))
+  let valid = match &parsed {
+    Result.Success { .. } => true
+    Result.Failure { .. } => false
+  }
+  run Testing.expect(valid, "and the body is still JSON")
+}
+
+test effect fn agentSignsTheGuestBook() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run signBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn errorsAndStopping() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run errorBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -857,6 +857,33 @@ static void answer_after_input(WKWebView *webView, uint32_t view, uint32_t reque
               }];
 }
 
+// Answers a fill once the focused field holds the typed text (WebKit's script round trip can
+// overtake key events still queued for the page, so the next action would land first), or after
+// about two seconds, or at once when the focus is not on a field.
+static void answer_after_typing(WKWebView *webView, uint32_t view, uint32_t request, NSString *text,
+                                int tries) {
+    [webView callAsyncJavaScript:@"const e = document.activeElement;"
+                                 @"if (!e || !('value' in e)) return true;"
+                                 @"const v = String(e.value);"
+                                 @"return text.length ? v.endsWith(text) : v.length === 0;"
+                       arguments:@{@"text" : text}
+                         inFrame:nil
+                  inContentWorld:agentWorld
+               completionHandler:^(id result, NSError *error) {
+                 SilkWebViewRecord *current = find_view(view);
+                 if (!current) return;
+                 if (error || [result boolValue] || tries <= 0) {
+                     push_answer(SILK_WEBVIEW_ACTION_RESULT, view, request, YES, @"");
+                     return;
+                 }
+                 WKWebView *again = current.webView;
+                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC),
+                                dispatch_get_main_queue(), ^{
+                                  if (find_view(view)) answer_after_typing(again, view, request, text, tries - 1);
+                                });
+               }];
+}
+
 void silk_webview_agent(uint32_t view, uint32_t request, uint32_t operation, const uint8_t *call,
                         size_t callLength, const uint8_t *text, size_t textLength) {
     SilkWebViewRecord *record = find_view(view);
@@ -897,6 +924,8 @@ void silk_webview_agent(uint32_t view, uint32_t request, uint32_t operation, con
                } else {
                    press_key(webView, @"Delete", 0);
                }
+               answer_after_typing(webView, view, request, fill, 100);
+               return;
            }
            answer_after_input(webView, view, request);
          }];
