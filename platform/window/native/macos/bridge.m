@@ -279,6 +279,7 @@ static void check_appearance(void) {
 // ---------------------------------------------------------------------------------------
 // Windows.
 
+@class SilkAXNode;
 @interface SilkView : NSView <NSTextInputClient>
 @property(nonatomic) uint32_t windowId;
 @property(nonatomic) BOOL imeEnabled;
@@ -291,6 +292,13 @@ static void check_appearance(void) {
 @property(nonatomic, strong) CADisplayLink *displayLink;
 @property(nonatomic, strong) NSTrackingArea *tracking;
 @property(nonatomic) BOOL handlingKey;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, SilkAXNode *> *axNodes;
+@property(nonatomic, strong) NSMutableSet<NSNumber *> *axSeen;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *axOrder;
+@property(nonatomic, strong) NSMutableArray *axActions;
+@property(nonatomic, strong) NSDictionary *axAction;
+@property(nonatomic) uint32_t axFocused;
+@property(nonatomic) uint32_t axPreviousFocus;
 @end
 
 @interface SilkNSWindow : NSWindow
@@ -303,6 +311,90 @@ static void check_appearance(void) {
 @end
 
 static SilkWindow *find_window(uint32_t window) { return windows[@(window)]; }
+
+// Retained accessibility objects keep their identities across layout updates.
+@interface SilkAXNode : NSAccessibilityElement
+@property(nonatomic, weak) SilkView *owner;
+@property(nonatomic) uint32_t nodeId, parentId, roleCode, flags;
+@property(nonatomic) BOOL hasRange;
+@property(nonatomic) double rangeMin, rangeMax, rangeValue;
+@property(nonatomic) NSRect localFrame;
+@property(nonatomic, copy) NSString *labelText, *valueText;
+@end
+
+static void ax_action(SilkAXNode *node, uint32_t kind, NSString *value) {
+    SilkView *view = node.owner;
+    if (!view || (node.flags & 1)) return;
+    if (!view.axActions) view.axActions = [NSMutableArray new];
+    [view.axActions addObject:@{@"kind": @(kind), @"target": @(node.nodeId), @"text": value ?: @""}];
+    push(blank_event(SILK_EVENT_REQUEST_FRAME, view.windowId));
+}
+static NSString *ax_role(uint32_t role) {
+    switch (role) {
+    case 2: return NSAccessibilityButtonRole;
+    case 3: return NSAccessibilityLinkRole;
+    case 4: case 24: return NSAccessibilityCheckBoxRole;
+    case 5: return NSAccessibilityRadioButtonRole;
+    case 6: return NSAccessibilityTextFieldRole;
+    case 7: if (@available(macOS 26.0, *)) return NSAccessibilityHeadingRole;
+        return NSAccessibilityStaticTextRole;
+    case 8: return NSAccessibilityStaticTextRole;
+    case 9: case 25: return NSAccessibilityListRole;
+    case 10: case 26: return NSAccessibilityRowRole;
+    case 11: return NSAccessibilityImageRole;
+    case 13: return NSAccessibilityMenuRole;
+    case 14: return NSAccessibilityMenuItemRole;
+    case 15: return NSAccessibilityRadioButtonRole;
+    case 16: return NSAccessibilityTabGroupRole;
+    case 18: return NSAccessibilityToolbarRole;
+    case 23: return NSAccessibilitySliderRole;
+    default: return NSAccessibilityGroupRole;
+    }
+}
+@implementation SilkAXNode
+- (BOOL)isAccessibilityElement { return self.roleCode != 0 && self.roleCode != 1; }
+- (NSString *)accessibilityRole { return ax_role(self.roleCode); }
+- (NSString *)accessibilitySubrole { return self.roleCode == 12 ? NSAccessibilityDialogSubrole : nil; }
+- (id)accessibilityMinValue { return self.hasRange ? @(self.rangeMin) : nil; }
+- (id)accessibilityMaxValue { return self.hasRange ? @(self.rangeMax) : nil; }
+- (NSString *)accessibilityLabel { return self.labelText; }
+- (NSString *)accessibilityIdentifier { return [NSString stringWithFormat:@"silk-%u", self.nodeId]; }
+- (id)accessibilityParent { return self.owner.axNodes[@(self.parentId)] ?: self.owner; }
+- (NSArray *)accessibilityChildren {
+    NSMutableArray *children = [NSMutableArray new];
+    NSArray *keys = self.owner.axOrder;
+    for (NSNumber *key in keys) { SilkAXNode *node = self.owner.axNodes[key];
+        if (node.parentId == self.nodeId) [children addObject:node]; }
+    return NSAccessibilityUnignoredChildren(children);
+}
+- (NSRect)accessibilityFrame {
+    SilkView *view = self.owner;
+    return [view.window convertRectToScreen:[view convertRect:self.localFrame toView:nil]];
+}
+- (BOOL)isAccessibilityEnabled { return !(self.flags & 1); }
+- (BOOL)isAccessibilityFocused { return (self.flags & 2) != 0; }
+- (BOOL)isAccessibilitySelected { return (self.flags & 8) != 0; }
+- (BOOL)isAccessibilityExpanded { return (self.flags & 16) != 0; }
+- (id)accessibilityValue {
+    if (self.roleCode == 4 || self.roleCode == 5 || self.roleCode == 24) return @((self.flags & 4) != 0);
+    return self.hasRange ? @(self.rangeValue) : self.valueText;
+}
+- (void)setAccessibilityFocused:(BOOL)focused { if (focused) ax_action(self, 2, nil); }
+- (void)setAccessibilityValue:(id)value {
+    if (self.roleCode == 6 && !(self.flags & 32)) ax_action(self, 3, [value description]);
+}
+- (BOOL)accessibilityPerformPress { ax_action(self, 1, nil); return !(self.flags & 1); }
+- (BOOL)accessibilityPerformIncrement { ax_action(self, 4, nil); return !(self.flags & 1); }
+- (BOOL)accessibilityPerformDecrement { ax_action(self, 5, nil); return !(self.flags & 1); }
+- (BOOL)isAccessibilitySelectorAllowed:(SEL)selector {
+    if (selector == @selector(accessibilityPerformPress))
+        return !(self.flags & 1) && (self.flags & 64);
+    if (selector == @selector(setAccessibilityValue:)) return self.roleCode == 6 && !(self.flags & 33);
+    if (selector == @selector(accessibilityPerformIncrement) || selector == @selector(accessibilityPerformDecrement))
+        return self.roleCode == 23 && !(self.flags & 1);
+    return [super isAccessibilitySelectorAllowed:selector];
+}
+@end
 
 @implementation SilkNSWindow
 - (BOOL)canBecomeKeyWindow { return YES; }
@@ -334,6 +426,22 @@ static void push_resize(SilkView *view) {
 }
 
 @implementation SilkView
+- (BOOL)isAccessibilityElement { return NO; }
+- (NSArray *)accessibilityChildren {
+    NSMutableArray *roots = [NSMutableArray new];
+    NSArray *keys = self.axOrder;
+    for (NSNumber *key in keys) { SilkAXNode *node = self.axNodes[key];
+        if (!self.axNodes[@(node.parentId)]) [roots addObject:node]; }
+    return NSAccessibilityUnignoredChildren(roots);
+}
+- (id)accessibilityFocusedUIElement { return self.axNodes[@(self.axFocused)] ?: self; }
+- (id)accessibilityHitTest:(NSPoint)point {
+    NSArray *keys = self.axOrder;
+    for (NSNumber *key in [keys reverseObjectEnumerator]) { SilkAXNode *node = self.axNodes[key];
+        if ([node isAccessibilityElement] && NSPointInRect(point, [node accessibilityFrame])) return node; }
+    return self;
+}
+
 
 - (instancetype)initWithFrame:(NSRect)frame {
     self = [super initWithFrame:frame];
@@ -1476,3 +1584,55 @@ void silk_macos_test_ime_rect(uint32_t id, double *x, double *y, double *width,
 }
 
 uint8_t silk_macos_test_uses_fiber(void) { return fiberMode ? 1 : 0; }
+
+// UI-tree accessibility snapshot and action queue. Strings are copied before returning.
+void silk_macos_ax_begin(uint32_t id) {
+    SilkView *view = find_window(id).view;
+    if (!view.axNodes) view.axNodes = [NSMutableDictionary new];
+    view.axSeen = [NSMutableSet new];
+    view.axOrder = [NSMutableArray new];
+    view.axPreviousFocus = view.axFocused;
+    view.axFocused = 0;
+}
+void silk_macos_ax_node(uint32_t id, uint32_t nodeId, uint32_t parent, uint32_t role,
+    uint32_t flags, double x, double y, double width, double height,
+    const uint8_t *label, size_t labelLength, const uint8_t *value, size_t valueLength) {
+    SilkView *view = find_window(id).view;
+    SilkAXNode *node = view.axNodes[@(nodeId)];
+    if (!node) { node = [SilkAXNode new]; node.owner = view; node.nodeId = nodeId;
+        view.axNodes[@(nodeId)] = node; }
+    NSString *nextValue = string_from(value, valueLength);
+    BOOL changed = node.valueText && ![node.valueText isEqualToString:nextValue];
+    node.parentId = parent; node.roleCode = role; node.flags = flags; node.hasRange = NO;
+    node.localFrame = NSMakeRect(x, y, width, height);
+    node.labelText = string_from(label, labelLength); node.valueText = nextValue;
+    [view.axSeen addObject:@(nodeId)];
+    [view.axOrder addObject:@(nodeId)];
+    if (flags & 2) view.axFocused = nodeId;
+    if (changed) NSAccessibilityPostNotification(node, NSAccessibilityValueChangedNotification);
+}
+void silk_macos_ax_end(uint32_t id) {
+    SilkView *view = find_window(id).view;
+    for (NSNumber *key in [view.axNodes allKeys]) if (![view.axSeen containsObject:key]) [view.axNodes removeObjectForKey:key];
+    if (view.axFocused != view.axPreviousFocus)
+        NSAccessibilityPostNotification(view.axNodes[@(view.axFocused)] ?: view, NSAccessibilityFocusedUIElementChangedNotification);
+    NSAccessibilityPostNotification(view, NSAccessibilityLayoutChangedNotification);
+}
+void silk_macos_ax_range(uint32_t window, uint32_t id, double min, double max, double value) {
+    SilkAXNode *node = find_window(window).view.axNodes[@(id)];
+    BOOL changed = node.rangeValue != value;
+    node.hasRange = YES; node.rangeMin = min; node.rangeMax = max; node.rangeValue = value;
+    if (changed) NSAccessibilityPostNotification(node, NSAccessibilityValueChangedNotification);
+}
+uint32_t silk_macos_ax_poll(uint32_t id, uint32_t *target) {
+    SilkView *view = find_window(id).view;
+    if (!view.axActions.count) return 0;
+    view.axAction = view.axActions[0]; [view.axActions removeObjectAtIndex:0];
+    *target = [view.axAction[@"target"] unsignedIntValue];
+    return [view.axAction[@"kind"] unsignedIntValue];
+}
+size_t silk_macos_ax_text(uint32_t id, uint8_t *out, size_t capacity) {
+    NSData *data = [find_window(id).view.axAction[@"text"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (out && capacity >= data.length) memcpy(out, data.bytes, data.length);
+    return data.length;
+}

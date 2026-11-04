@@ -1,7 +1,9 @@
 //! Atomic local storage for Studio documents. Invalid imports never replace the open design.
+import font_collection.system as systemFonts
+import font_collection.system { Options as FontOptions }
 import silk.concurrency.thread { Transferable }
-import silk.concurrency.thread_native { NativeThread, JoinHandle, SpawnError }
-import silk.concurrency.sync { Arc, Mutex }
+import ui_app_window.background { Background }
+import silk.concurrency.thread_native { SpawnError }
 import font_collection.lib { FontCollection }
 import studio.model { Studio }
 import studio.editing as editing
@@ -22,15 +24,13 @@ import silk.system.host_input { HostInput, HostInputError }
 // borrowed from the window thread; the completion flag is protected by its mutex.
 struct SaveJob {
   document: Studio,
-  path: String,
-  done: Arc<Mutex<bool>>
+  path: String
 }
 
 impl Transferable for SaveJob {}
 
 struct PendingSave {
-  handle: JoinHandle<bool>,
-  done: Arc<Mutex<bool>>,
+  task: Background<bool>,
   revision: u64
 }
 
@@ -56,6 +56,10 @@ pub effect fn defaultPath() -> String
 }
 
 impl Storage {
+  pub fn saving(self: &Self) -> bool {
+    return self.pending.isSome()
+  }
+
   pub effect fn make(path: String) -> Storage
     ! FileError | OutOfMemoryError
     ? &mut Allocator {
@@ -160,7 +164,7 @@ impl Storage {
   /// Collects a completed background write. Waiting is reserved for explicit saves and close.
   pub fn collect(self: &mut Self, m: &mut Studio, wait: bool) -> bool {
     let ready = match &self.pending {
-      Option<PendingSave>.Some { value } => wait || value.done.get().lock().get().*
+      Option<PendingSave>.Some { value } => wait || value.task.ready()
       Option<PendingSave>.None => false
     }
     if !ready {
@@ -169,7 +173,8 @@ impl Storage {
     let pending = Intrinsic.replace(self.pending, Option<PendingSave>.None)
     if let Option<PendingSave>.Some { value } = move pending {
       let revision = value.revision
-      let ok = value.handle.join()
+      let mut pending = move value
+      let ok = pending.task.wait().unwrapOr(false)
       if ok {
         m.savedRevision = revision
       }
@@ -205,23 +210,22 @@ impl Storage {
     document.nextId = m.nextId
     document.page = m.page
     let path = run String.copy(String.view(&self.path))
-    let done = run Arc<Mutex<bool>>.make(run Mutex<bool>.make(false))
-    let job = SaveJob { document: move document, path: move path, done: done.clone() }
+    let job = SaveJob { document: move document, path: move path }
     let launched = run Effect.result(
-      NativeThread.spawn(
+      Background<bool>.start(
         fn() -> bool {
           return writeJob(move job)
         },
       ),
     )
     match move launched {
-      Result<JoinHandle<bool>, SpawnError | OutOfMemoryError>.Success { value: handle } => {
+      Result<Background<bool>, SpawnError | OutOfMemoryError>.Success { value: task } => {
         self.pending = Option<PendingSave>.some(
-          PendingSave { handle: move handle, done: move done, revision: m.revision },
+          PendingSave { task: move task, revision: m.revision },
         )
         m.saveRequested = false
       }
-      Result<JoinHandle<bool>, SpawnError | OutOfMemoryError>.Failure { error } => {
+      Result<Background<bool>, SpawnError | OutOfMemoryError>.Failure { error } => {
         drop error
         m.notice = run String.copy("Could not start autosave. Use Save to retry.")
         m.saveRequested = false
@@ -252,38 +256,10 @@ impl Storage {
   }
 }
 
-/// Adds installed desktop faces when available; bundled Noto remains the portable fallback.
+/// Discovers installed desktop fonts; the initial bundled collection remains a fallback.
 pub effect fn desktopFonts(collection: &mut FontCollection) -> ()
-  ? &mut Allocator {
-  let paths: [string; 10] = [
-    "/System/Library/Fonts/SFNS.ttf",
-    "/System/Library/Fonts/Apple Symbols.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Georgia.ttf",
-    "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Courier New.ttf",
-    "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
-    "images/svg/tests/fonts/NotoSerif-Regular.subset.ttf",
-    "images/svg/tests/fonts/NotoMono-Regular.subset.ttf",
-  ]
-  let result = run Effect.result(MachineFileSystem.make())
-  if let Result<MachineFileSystem, OutOfMemoryError>.Success { value } = move result {
-    let mut files = move value
-    let mut i: usize = 0
-    while i < paths.length {
-      let parsed = run Effect.result(Path.fromBytes(String.utf8Bytes(paths[i])))
-      if let Result<Path, FileError | OutOfMemoryError>.Success { value: path } = move parsed {
-        let read = run Effect.result(FileSystem.readFile(&path))
-          |> Effect.provideMut<FileSystem>(&mut files)
-        if let Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } = move read {
-          drop run Effect.result(collection.add(move bytes))
-        }
-      }
-      i = i + 1
-    }
-  }
-  drop run Effect.result(collection.addFallback(String.utf8Bytes("Apple Symbols")))
+  ? &mut HostInput | &mut Allocator {
+  drop run Effect.result(systemFonts.load(&mut collection, FontOptions.defaults()))
 }
 
 effect fn writeSnapshotEffect(document: Studio, path: String) -> bool
@@ -309,9 +285,5 @@ fn writeSnapshot(document: Studio, path: String) -> bool {
 }
 
 fn writeJob(job: SaveJob) -> bool {
-  let ok = writeSnapshot(move job.document, move job.path)
-  let mut guard = job.done.get().lock()
-  let state = guard.getMut()
-  state.* = true
-  return ok
+  return writeSnapshot(move job.document, move job.path)
 }
