@@ -21,6 +21,8 @@ Packages:
   `SILK_UI_INSPECT` set), so ui-inspect-cli, ui-inspect-mcp and the
   [devtools window](../inspect/devtools) can look at the app.
 - `ui/app/examples`: a counter and a todo list. `ui/app/demo` runs the todo list in a window.
+- [`ui/app/scroll-demo`](scroll-demo): a fully mounted mixed-document scroll stress app,
+  with native controls and repeatable CPU benchmarks of the shared libraries.
 - `ui/app/tests`: unit tests and the golden scenes.
 
 ## An app
