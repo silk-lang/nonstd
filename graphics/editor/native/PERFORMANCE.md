@@ -72,3 +72,17 @@ Close-up text changes update visible bindings in place, and power-of-two raster
 densities reduce repeated work during zoom. The optional inspector keeps a full
 CPU scene for screenshots and uses ordinary composition; its IPC timings do not
 measure the retained native path.
+
+### Panning across text raster boundaries
+
+The 400% → 401% slowdown on Explorations was caused by doubling the large text
+raster density, which crossed the 4096-pixel crop limit. The cropped-text cache
+then treated every camera movement as invalidation. Large text now uses finer
+raster-density steps; cropped rasters remain valid until the visible text leaves
+their cached bounds. Cropping is independent on each axis and includes overscan.
+
+The native contract checks a single heading at 400%, 401%, 801%, and 6400% on a
+2× viewport: small pans must not invoke the text rasterizer, while a pan beyond
+the cached crop must refresh it. The original Explorations interaction sequence
+also passes after the fix. Inspector latency includes IPC and scheduling and is
+not a presentation-FPS measurement.

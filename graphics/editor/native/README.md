@@ -150,11 +150,14 @@ preserve the browser's `image` and normalized `imageCrop` fields, including crop
 coordinates precise enough to survive a round trip to the same source pixels.
 
 Repeated labels share measurements and raster tiles by text, font, weight, color
-and dimensions. Small labels start with a bounded 4× density cache; larger zooms use power-of-two
-raster densities and refresh visible text bindings in place. Spatial blocks restrict
+and dimensions. Small labels start with a bounded 4× density cache and use power-of-two raster
+buckets. Large text uses finer density steps to avoid unnecessary viewport cropping
+at bucket boundaries. Visible text bindings refresh in place. Spatial blocks restrict
 quality checks to visible text. The scratch glyph atlas advances between label
 rasters, so old font sizes can be evicted without dropping letters. Shared label
 bindings carry the allocation generation and are refreshed when they enter view.
+Cropped rasters include overscan and remain valid while they cover the visible text;
+a small pan does not regenerate them solely because the preferred crop origin moved.
 The desktop atlas allocates up to eight 2048-pixel base pages per kind lazily;
 high-resolution tiles can request larger pages. Unused canvas text tiles are
 reclaimed under atlas pressure without evicting cached UI sprites. Shared renderer changes
