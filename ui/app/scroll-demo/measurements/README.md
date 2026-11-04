@@ -190,3 +190,33 @@ Validation for this change:
 The initial before harness only asserted the first downward movement; the final
 harness adds the mounted-count and return-to-top assertions. Document content and
 the scrolling sequence are otherwise unchanged.
+
+## Tree-owned virtualization
+
+`tree-virtualized.json` records the refactor that moves measurements, prefix sums,
+range selection, private layout spacers, scroll anchoring, and focus retention into
+`ui-tree`. The app adapter supplies keyed item nodes through the public tree protocol.
+The capture used the working tree based on `c6c30e8d7`; its binary hash is recorded.
+
+The 10,000-section run completed 120 scroll steps with a 0.972 ms median CPU total,
+5.640 ms p95, and 87 initially mounted UI nodes. These numbers exclude GPU work,
+accessibility, and presentation. The benchmark checks bounded mounting, downward
+movement, and return to the top. Run it with:
+
+    python3 ui/app/scroll-demo/scripts/run --bundle
+    python3 ui/app/scroll-demo/scripts/measure --sizes 1000 10000
+
+Validation includes 28 tree tests, 11 app tests, five inspector tests, all four app
+PNG/describe goldens, and wasm32 checks for tree, app, and inspector. Direct-tree
+coverage requires no app runtime and exercises variable heights, distant scrolling,
+focus retention, width invalidation, invalid bindings, and controller cleanup.
+The app test also checks focus through keyed reordering before layout, and removing
+virtual content while its ordinary container survives. The native 10,000-section
+CPU/GPU rendering comparison passes.
+
+Two existing golden checks still differ from their checked-in references:
+`ui/tree/tests/goldens/card-list.png` and `ui/inspect/tests/goldens/inspect.txt`.
+All ten tree/inspector output files generated from this change are byte-for-byte
+identical to those from `c6c30e8d7`. The baseline inspector needed the same two local
+pattern-binding alias fixes to compile; no rendering or inspection logic changed.
+The checked-in golden files were left intact.

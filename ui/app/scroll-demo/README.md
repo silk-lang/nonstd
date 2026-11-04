@@ -30,7 +30,7 @@ or pause it there. Resize the window to exercise text reflow and grid layout.
 
 The command line accepts `--sections=1` through `--sections=10000`.
 Virtualized mode keeps only nearby sections mounted, with measured heights and
-scroll anchoring managed by `ui-app`. Fully mounted mode remains a deliberate
+scroll anchoring managed by `ui-tree`. Fully mounted mode remains a deliberate
 stress test and can block the UI at large sizes. `--auto-scroll` starts motion on launch.
 
 The bundle is `build/Fieldnotes Scroll Lab.app`. `--profile` prints the standard
@@ -102,7 +102,7 @@ stable, unique list key and stable item keys. `VirtualOptions` provides an estim
 height, overscan distance, gap, and a revision for size-affecting content changes.
 The demo's `document.silk` is an executable example.
 
-The runtime measures mounted row heights, updates a prefix-sum index, and preserves
+The retained tree measures mounted row heights, updates a prefix-sum index, and preserves
 the visible item's offset when estimates change. Width changes discard old
 measurements. Height queries and updates take logarithmic time; the height index
 uses linear memory in the item count. Rendering, hit testing, and native
@@ -115,6 +115,10 @@ operations; this is not a complete browser document/search API. Changing the
 revision preserves the visible index, not the identity of a reordered item.
 Do not place unrelated children, a gap, or vertical padding on the list's scroll
 column; put decoration and spacing in the item body instead.
+
+`ui-app` only builds keyed nodes for the requested range and forwards configuration
+and item bindings. Direct tree clients can use the same functionality without the
+framework; see [the tree protocol](../../tree/README.md#virtual-scrolling).
 
 Native window hosts settle virtual lists automatically. Custom hosts should call
 `runtime.frame` instead of `tree.frame`, and continue to pump input events. It limits

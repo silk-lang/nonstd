@@ -5,7 +5,7 @@ The retained UI tree: nodes a client creates and changes with plain-data mutatio
 [ui_scene](../../graphics/ui_scene) `Scene` that the CPU reference or
 [ui_renderer](../../graphics/ui_renderer) draws. It has no closures and no callbacks: ids are
 integers the client chooses, and everything that crosses the boundary is a `Mutation` going in or
-an `Event` coming out, so a framework in Silk or a JavaScript host can drive it the same way.
+an `Event` or a plain-data query result coming out, so a framework in Silk or a JavaScript host can drive it the same way.
 
 ## Driving a tree
 
@@ -42,6 +42,55 @@ run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 2.0, time: 0.0 }
   payload (pointer position, modifiers, button, click count, wheel delta, key and code, and for
   input records the value, the DOM `inputType` and the selection).
   `takeEvents` drains them. See [Interaction](#interaction).
+
+## Virtual scrolling
+
+Variable-height virtualization belongs to the retained tree. `ui-app` uses the same
+mutation/query protocol available to a direct Silk client or a future JS binding;
+it does not maintain a separate geometry algorithm.
+
+1. Create a box with a bounded height, vertical flex layout, and scrolling enabled.
+   Configure it with `Mutation.SetVirtualList { id, count, options }`, or
+   `Batch.virtualList`. `VirtualOptions` supplies an estimated row height, overscan,
+   gap, and content revision.
+2. Read `tree.virtualRange(id)`. Mount ordinary child boxes for `[first, end)` and
+   the optional `pinned` index. The pin retains the row containing keyboard focus;
+   `pinnedId` identifies its existing wrapper. Destroy other rows, retaining durable
+   application state outside those nodes.
+3. Send `Mutation.SetVirtualItems { id, items }` (or `Batch.virtualItems`) with
+   `{ index, id }` records for **all** direct children in ascending logical order.
+   The tree owns the layout-only spacers between these nodes. These private nodes
+   never become client IDs, hit targets, or accessibility entries.
+4. Call `tree.frame`, then query the range again. Reconcile and frame again if the
+   requested range changed, before presenting. Repeat after scrolling, resizing,
+   changing content, or changing focus. `layoutNow` also updates measurements and
+   the range, but does not paint. `needsFrame` reports tree work; the host must
+   still check range requests after a completed frame.
+
+The tree measures mounted boxes, maintains a prefix-sum height index, and anchors
+the visible item while estimates change. Height lookup and updates are logarithmic;
+measurement storage is linear in logical item count. Width changes, count changes,
+changed estimates/gaps, or a changed `revision` reset measurements. Revisions retain
+the visible **index**, not the identity of an item moved in the model. A client that
+reorders content should preserve the focused node and bind it at its new index.
+
+The container must be a vertical, nonwrapping flex column with no unrelated children,
+vertical padding, or external row gap. Row wrappers must be in normal flow, in logical
+order, with no vertical margins and `flex-shrink: 0`; their contents can have natural,
+variable heights. Use `options.gap` for spacing. Estimates must be finite and positive;
+overscan and gaps must be finite and nonnegative. Zero-height rows are accounted for
+with a minimum one-pixel extent. Invalid configurations or bindings return
+`TreeError.BadVirtualList`; a rejected binding preserves the previous bindings.
+
+`ClearVirtualList` removes the controller and its private spacers while preserving
+ordinary child nodes. Destroying its container releases both. Virtual scrolling uses
+continuous layout: clear the controller before `frameFragmented`, which otherwise
+returns `TreeError.Layout`. Search, selection, tab navigation, and accessibility only
+see mounted nodes; document-wide operations still need model-level support.
+
+See [the direct-tree integration test](tests/src/virtual_lists.silk) for a complete
+client using only mutation batches and range queries, including distant jumps,
+focus retention, variable row heights, resize anchoring, and cleanup.
 
 ## Interaction
 

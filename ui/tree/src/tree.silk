@@ -1,6 +1,8 @@
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
 import layout.lib { Fragmentainers, computeFragmented }
+import virtual_list { VirtualList, VirtualRange }
+import virtual_list as virtual
 import inspect
 import mutation {
   Mutation,
@@ -93,6 +95,8 @@ pub union TreeError {
   BadResource { pub index: usize, pub resource: u32 },
   /// Layout or text shaping failed.
   Layout,
+  /// Virtual list configuration or bindings are invalid.
+  BadVirtualList { pub index: usize, pub id: u32 },
 }
 
 impl Copy for TreeError {}
@@ -156,6 +160,8 @@ fn applyAll(computed: &mut Computed, list: &List<Property>) -> () {
 /// [`UiTree.frame`], hand [`UiTree.scene`] and [`UiTree.uploads`] to a renderer, and drain
 /// [`UiTree.takeEvents`].
 pub struct UiTree<'a> {
+  /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
+  pub virtualLists: List<VirtualList>,
   pub layout: Tree,
   pub output: LayoutTree,
   pub provider: Provider<'a>,
@@ -252,6 +258,7 @@ impl<'a> UiTree<'a> {
     let resources = run Effect.catch<ResourceError>(Resources.make(), layoutFailed)
     let seed = Hash.seed(0x7569747265)
     return UiTree<'a> {
+      virtualLists: List<VirtualList>.make(),
       layout: move layout,
       output: LayoutTree.make(),
       provider: Provider<'a> {
@@ -355,6 +362,12 @@ impl<'a> UiTree<'a> {
     self.slotOfCss.set(index, slot)
   }
 
+  /// Returns the items a virtual container needs mounted after the latest configuration or frame.
+  /// Clients reconcile this range with ordinary node mutations, then call `frame` again.
+  pub fn virtualRange(self: &Self, id: u32) -> Option<VirtualRange> {
+    return virtual.request(&self, id)
+  }
+
   /// The number of live nodes.
   pub fn nodeCount(self: &Self) -> usize {
     return self.ids.length()
@@ -425,6 +438,15 @@ impl<'a> UiTree<'a> {
     self.semanticRevision = self.semanticRevision + 1
     self.applied = true
     match move mutation {
+      Mutation.SetVirtualList { id, count, options } => {
+        run virtual.configure(&mut self, index, id, count, options)
+      }
+      Mutation.SetVirtualItems { id, items } => {
+        run virtual.bind(&mut self, index, id, move items)
+      }
+      Mutation.ClearVirtualList { id } => {
+        run virtual.clear(&mut self, id)
+      }
       Mutation.Create { id, kind } => {
         run self.create(index, id, kind)
       }
@@ -877,6 +899,12 @@ impl<'a> UiTree<'a> {
       run self.childSlots(doomed.get(at), &mut children)
       run doomed.appendSlice(children.asSlice())
       at = at + 1
+    }
+    let mut v: usize = 0
+    while v < doomed.length() {
+      let id = self.node(doomed.get(v)).id
+      run virtual.clear(&mut self, id)
+      v = v + 1
     }
     let css = self.node(slot).css
     run Effect.catchAll(self.layout.destroy(NodeId { index: css }), layoutFailed)
@@ -1350,6 +1378,7 @@ impl<'a> UiTree<'a> {
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run self.resolveStyles()
+    run virtual.prepare(&mut self)
     run self.layoutFrame()
     if run interact.settleScrolls(&mut self) {
       run self.layoutFrame()
@@ -1366,6 +1395,7 @@ impl<'a> UiTree<'a> {
       run self.resolveStyles()
       run self.layoutFrame()
     }
+    run self.settleVirtual()
     run self.notifyLayout()
     edit.beginPaint(&mut self)
     run self.paintFrame()
@@ -1374,13 +1404,37 @@ impl<'a> UiTree<'a> {
     self.stats.fragments = self.output.fragments.values.length()
   }
 
+  effect fn settleVirtual(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass < 4 {
+      if !(run virtual.settle(&mut self)) {
+        break
+      }
+      run virtual.prepare(&mut self)
+      run self.layoutFrame()
+      if run interact.settleScrolls(&mut self) {
+        run self.layoutFrame()
+      }
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
   /// Lays out and paints pages or columns supplied by the host. Break policies, widows,
   /// orphans and fixed page-positioned elements use the same styles as continuous frames.
   /// Geometry queries describe this output until the next frame; `frame` resumes continuous
   /// layout. Fragmentainer slices are borrowed only for this call.
+  /// Virtual scroll containers require continuous layout; clear them first or this returns `TreeError.Layout`.
   pub effect fn frameFragmented(self: &mut Self, input: FrameInput, frames: Fragmentainers) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if self.virtualLists.length() != 0 {
+      fail TreeError.Layout
+    }
     self.frameNumber = self.frameNumber + 1
     self.applied = false
     self.input = input
@@ -1440,7 +1494,12 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     run self.resolveStyles()
+    run virtual.prepare(&mut self)
     run self.layoutFrame()
+    if run interact.settleScrolls(&mut self) {
+      run self.layoutFrame()
+    }
+    run self.settleVirtual()
   }
 
   effect fn layoutFrame(self: &mut Self) -> ()
