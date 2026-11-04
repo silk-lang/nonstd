@@ -42,6 +42,7 @@ import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.geometry.corners { Corners }
 import silk.geometry.insets { Insets }
 import silk.geometry.rect { Rect }
@@ -56,6 +57,32 @@ import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
 
+/// Conservative local device-pixel ink bounds of a horizontal raster glyph run.
+/// Bounds contain no atlas references and remain useful when tiles are evicted.
+pub struct TextInk {
+  pub valid: bool,
+  pub present: bool,
+  pub font: u32,
+  pub shape: u64,
+  pub scale: f32,
+  pub bounds: Rect<f32>,
+}
+
+impl Copy for TextInk {}
+
+impl TextInk {
+  pub fn empty() -> TextInk {
+    return TextInk {
+      valid: false,
+      present: false,
+      font: 0,
+      shape: 0,
+      scale: 0.0,
+      bounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+    }
+  }
+}
+
 /// Everything a frame's paint reads and writes, borrowed from the tree.
 pub struct Painter<'p, 'a> {
   pub nodes: &'p mut List<Node>,
@@ -66,6 +93,7 @@ pub struct Painter<'p, 'a> {
   pub faces: &'p List<FaceSlot<'a>>,
   pub atlas: &'p mut Atlas,
   pub glyphs: &'p mut GlyphCache,
+  pub textInk: &'p mut List<TextInk>,
   pub resources: &'p mut Resources,
   pub paths: &'p mut PathCache,
   pub scene: &'p mut Scene,
@@ -301,134 +329,192 @@ effect fn paintText(p: &mut Painter, index: usize, f: Fragment, mask: ContentMas
   let shaped = p.text.glyphRun(t.shapeKey)
   if t.fontKey < p.faces.length() {
     if let Option<FontFace>.Some { value: face } = &p.faces.asSlice()[t.fontKey].face {
-      let glyphs = p.text.runGlyphs(t.shapeKey)
-      let mut outline = GlyphRasterizer.make()
-      let mut i: usize = 0
-      while i < glyphs.length {
-        let g = glyphs[i]
-        if g.cluster >= limit {
-          i = i + 1
-          continue
-        }
-        let turn: u32 = if !vertical || g.upright {
-          0
-        } else if reverse {
-          3
-        } else {
-          1
-        }
-        let originX = if !vertical {
-          f.worldLocation.x + g.x
-        } else if g.upright {
-          f.worldLocation.x + f.size.width * 0.5 + g.y
-        } else if reverse {
-          baselineX + g.y
-        } else {
-          baselineX - g.y
-        }
-        let originY = if !vertical {
-          baseline + g.y
-        } else if reverse {
-          f.worldLocation.y + f.size.height - g.x
-        } else {
-          f.worldLocation.y + g.x
-        }
-        let pen = PenPosition.of(f32.toF64(originX * s), f32.toF64(originY * s))
+      let cacheable = !vertical && shaped.size * s < 256.0
+        && p.nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Input
+      let mut hidden = false
+      let mut ink = TextInk.empty()
+      ink.font = face.id
+      ink.shape = shaped.fingerprint()
+      ink.scale = s
+      ink.valid = cacheable
+      if cacheable && t.shapeKey < p.textInk.length() {
+        let cached = p.textInk.get(t.shapeKey)
+        if cached.valid && cached.font == ink.font && cached.shape == ink.shape
+          && cached.scale == s {
+          let x = f.worldLocation.x * s
+          let y = baseline * s
 
-        // Large monochrome glyphs use clipped vector coverage. This avoids both oversized
-        // atlas allocations and magnifying a capped bitmap at editor-style zoom levels.
-        if (vertical || shaped.size * s >= 256.0) && !face.colorTables().any() {
-          let drawn = run outline.outlinePath(&face, g.glyph, f32.toF64(shaped.size * s), 0.0, 0.0)
-          if drawn {
-            let transform = Affine.new(
-              if turn == 0 {
-                1.0
-              } else {
-                0.0
-              },
-              if turn == 1 {
-                1.0
-              } else if turn == 3 {
-                -1.0
-              } else {
-                0.0
-              },
-              if turn == 1 {
-                -1.0
-              } else if turn == 3 {
-                1.0
-              } else {
-                0.0
-              },
-              if turn == 0 {
-                1.0
-              } else {
-                0.0
-              },
-              f32.toF64(originX * s),
-              f32.toF64(originY * s),
-            )
-            drop run Effect.catchAll(
-              p.paths.fill(
-                &mut p.scene,
-                0,
-                outline.lastPath(),
-                &transform,
-                NONZERO,
-                Background.solid(color),
-                mask,
-              ),
-              noPath,
-            )
-            p.stats.glyphs = p.stats.glyphs + 1
+          // Cover raster phase changes and rounding at very large document offsets.
+          let pad = 2.0 + (f32.abs(x) + f32.abs(y)) * 0.00000024
+          hidden = !cached.present || x + cached.bounds.xMax + pad < mask.bounds.xMin
+            || x + cached.bounds.xMin - pad > mask.bounds.xMax
+            || y + cached.bounds.yMax + pad < mask.bounds.yMin
+            || y + cached.bounds.yMin - pad > mask.bounds.yMax
+        }
+      }
+      if !hidden {
+        let glyphs = p.text.runGlyphs(t.shapeKey)
+        let mut outline = GlyphRasterizer.make()
+        let mut i: usize = 0
+        while i < glyphs.length {
+          let g = glyphs[i]
+          if g.cluster >= limit {
             i = i + 1
             continue
           }
-        }
-        let key = GlyphKey {
-          font: face.id,
-          glyph: g.glyph,
-          size: shaped.size,
-          scale: s,
-          subpixel: pen.subpixel,
-          color: true,
-        }
-        let found = run Effect.catchAll(p.glyphs.glyph(&mut p.atlas, &face, key), noGlyph)
-        if let Option<RasterGlyph>.Some { value } = found {
-          let left = i32.toF32(value.left)
-          let top = i32.toF32(value.top)
-          let w = u32.toF32(value.width())
-          let h = u32.toF32(value.height())
-          let px = i32.toF32(pen.x)
-          let py = i32.toF32(pen.y)
-          let bounds = if turn == 1 {
-            Rect<f32>.new(px - top - h, py + left, px - top, py + left + w)
-          } else if turn == 3 {
-            Rect<f32>.new(px + top, py - left - w, px + top + h, py - left)
+          let turn: u32 = if !vertical || g.upright {
+            0
+          } else if reverse {
+            3
           } else {
-            Rect<f32>.new(px + left, py + top, px + left + w, py + top + h)
+            1
           }
-          if &value.kind == &Kind.Polychrome {
-            drop run p.scene.image(
-              ImageSprite {
-                quarterTurns: turn,
-                clipBounds: bounds,
-                bounds: bounds,
-                mask: mask,
-                tile: value.tile,
-                opacity: color.a,
-                cornerRadii: Corners<f32>.zero(),
-                grayscale: false,
-              },
-            )
+          let originX = if !vertical {
+            f.worldLocation.x + g.x
+          } else if g.upright {
+            f.worldLocation.x + f.size.width * 0.5 + g.y
+          } else if reverse {
+            baselineX + g.y
           } else {
-            drop run p.scene.glyph(
-              GlyphSprite { bounds: bounds, mask: mask, tile: value.tile, color: color },
-            )
+            baselineX - g.y
           }
-          p.stats.glyphs = p.stats.glyphs + 1
+          let originY = if !vertical {
+            baseline + g.y
+          } else if reverse {
+            f.worldLocation.y + f.size.height - g.x
+          } else {
+            f.worldLocation.y + g.x
+          }
+          let pen = PenPosition.of(f32.toF64(originX * s), f32.toF64(originY * s))
+
+          // Large monochrome glyphs use clipped vector coverage. This avoids both oversized
+          // atlas allocations and magnifying a capped bitmap at editor-style zoom levels.
+          if (vertical || shaped.size * s >= 256.0) && !face.colorTables().any() {
+            let drawn = run outline.outlinePath(
+              &face,
+              g.glyph,
+              f32.toF64(shaped.size * s),
+              0.0,
+              0.0,
+            )
+            if drawn {
+              let transform = Affine.new(
+                if turn == 0 {
+                  1.0
+                } else {
+                  0.0
+                },
+                if turn == 1 {
+                  1.0
+                } else if turn == 3 {
+                  -1.0
+                } else {
+                  0.0
+                },
+                if turn == 1 {
+                  -1.0
+                } else if turn == 3 {
+                  1.0
+                } else {
+                  0.0
+                },
+                if turn == 0 {
+                  1.0
+                } else {
+                  0.0
+                },
+                f32.toF64(originX * s),
+                f32.toF64(originY * s),
+              )
+              drop run Effect.catchAll(
+                p.paths.fill(
+                  &mut p.scene,
+                  0,
+                  outline.lastPath(),
+                  &transform,
+                  NONZERO,
+                  Background.solid(color),
+                  mask,
+                ),
+                noPath,
+              )
+              p.stats.glyphs = p.stats.glyphs + 1
+              i = i + 1
+              continue
+            }
+          }
+          let key = GlyphKey {
+            font: face.id,
+            glyph: g.glyph,
+            size: shaped.size,
+            scale: s,
+            subpixel: pen.subpixel,
+            color: true,
+          }
+          let found = run Effect.catchAll(p.glyphs.glyph(&mut p.atlas, &face, key), noGlyph)
+          if let Option<RasterGlyph>.Some { value } = found {
+            let left = i32.toF32(value.left)
+            let top = i32.toF32(value.top)
+            let w = u32.toF32(value.width())
+            let h = u32.toF32(value.height())
+            if cacheable {
+              let local = Rect<f32>.new(
+                g.x * s + left,
+                g.y * s + top,
+                g.x * s + left + w,
+                g.y * s + top + h,
+              )
+              if ink.present {
+                ink.bounds = Rect<f32>.new(
+                  f32.min(ink.bounds.xMin, local.xMin),
+                  f32.min(ink.bounds.yMin, local.yMin),
+                  f32.max(ink.bounds.xMax, local.xMax),
+                  f32.max(ink.bounds.yMax, local.yMax),
+                )
+              } else {
+                ink.bounds = local
+              }
+              ink.present = true
+            }
+            let px = i32.toF32(pen.x)
+            let py = i32.toF32(pen.y)
+            let bounds = if turn == 1 {
+              Rect<f32>.new(px - top - h, py + left, px - top, py + left + w)
+            } else if turn == 3 {
+              Rect<f32>.new(px + top, py - left - w, px + top + h, py - left)
+            } else {
+              Rect<f32>.new(px + left, py + top, px + left + w, py + top + h)
+            }
+            if &value.kind == &Kind.Polychrome {
+              drop run p.scene.image(
+                ImageSprite {
+                  quarterTurns: turn,
+                  clipBounds: bounds,
+                  bounds: bounds,
+                  mask: mask,
+                  tile: value.tile,
+                  opacity: color.a,
+                  cornerRadii: Corners<f32>.zero(),
+                  grayscale: false,
+                },
+              )
+            } else {
+              drop run p.scene.glyph(
+                GlyphSprite { bounds: bounds, mask: mask, tile: value.tile, color: color },
+              )
+            }
+            p.stats.glyphs = p.stats.glyphs + 1
+          } else {
+            ink.valid = false
+          }
+          i = i + 1
         }
-        i = i + 1
+        if cacheable {
+          while p.textInk.length() <= t.shapeKey {
+            run p.textInk.append(TextInk.empty())
+          }
+          p.textInk.set(t.shapeKey, ink)
+        }
       }
     }
   }

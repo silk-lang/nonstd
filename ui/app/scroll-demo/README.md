@@ -61,6 +61,10 @@ node/fragment counts, paint counts, and layout-skipped counts. CPU results exclu
 native accessibility, the event loop, GPU work, and presentation. A 16.7 ms CPU result
 alone does not establish 60 FPS.
 
+`fullLayoutsMax` distinguishes full box layout from scroll-only positioning, and
+`glyphsMax` counts glyphs processed by paint. A frame can update scroll geometry
+without performing full layouts, even when `layoutSkippedFrames` is zero.
+
 `--phases` explicitly resolves layout before calling `frame` to isolate layout from
 the remaining frame work. This changes the frame entry state; compare these runs
 only with other phase runs. In this mode `layoutSkippedFrames` counts the subsequent
@@ -71,10 +75,15 @@ construction from the first frame.
 
 ```sh
 python3 ui/app/scroll-demo/scripts/run --sections=100 --check
+python3 ui/app/scroll-demo/scripts/run --check-grow
 ```
 
 The native check clicks **Reverse**, verifies **Forward** appears, scrolls the document,
 and compares the GPU readback with the shared CPU reference using the window host's
 existing tolerance. It exits after the check. Run on a desktop with a supported GPU.
+
+`--check-grow` instead clicks **1,000 sections** from the default 100-section view,
+verifies that the model reached 1,000 sections, then checks the scrolled rendering.
+This exercises document growth through the app, including native accessibility.
 
 See [measurements](measurements/README.md) for the initial findings and captured runs.

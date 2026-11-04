@@ -38,7 +38,7 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { Painter, paintRoots, hashFragments }
+import paint { TextInk, Painter, paintRoots, hashFragments }
 import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
@@ -197,9 +197,15 @@ pub struct UiTree<'a> {
   pub paintOrder: List<u32>,
   /// Per fragment of the last layout: the hash of its subtree's paint inputs.
   pub fragmentHashes: List<u64>,
+  pub textInk: List<TextInk>,
+  facesDirty: bool,
   pub uploads: Pending,
   /// The first fragment of each css-layout node in the last layout, or NO_INDEX.
   pub fragmentOf: List<usize>,
+  /// Next fragment with the same CSS source, in arena order.
+  pub nextSourceFragment: List<usize>,
+  /// First paint-order index per node slot, or NONE.
+  pub paintIndexOf: List<u32>,
   /// Whether focus should show as focus-visible: the last focus change came from the keyboard.
   pub focusVisible: bool,
   /// The hovered nodes as (slot, id) pairs, the target first, then its ancestors.
@@ -281,8 +287,12 @@ impl<'a> UiTree<'a> {
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
       fragmentHashes: List<u64>.make(),
+      textInk: List<TextInk>.make(),
+      facesDirty: true,
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
+      nextSourceFragment: List<usize>.make(),
+      paintIndexOf: List<u32>.make(),
       focusVisible: false,
       hoverChain: List<u64>.make(),
       pressChain: List<u64>.make(),
@@ -1449,15 +1459,22 @@ impl<'a> UiTree<'a> {
       && self.input.height == self.laidOut.height {
       return ()
     }
-    run Effect.catchAll(
-      Engine.compute(
-        &self.layout,
-        &mut self.output,
-        &mut self.provider,
-        OptionalSize.definite(self.input.width, self.input.height),
-      ),
-      layoutFailed,
-    )
+    let viewport = OptionalSize.definite(self.input.width, self.input.height)
+    let moved = self.layout.revision() == self.laidOutRevision
+      && self.input.width == self.laidOut.width
+      && self.input.height == self.laidOut.height
+      && (run Engine.repositionScroll(&self.layout, &mut self.output, viewport))
+    if !moved {
+      run Effect.catchAll(
+        Engine.compute(
+          &self.layout,
+          &mut self.output,
+          &mut self.provider,
+          OptionalSize.definite(self.input.width, self.input.height),
+        ),
+        layoutFailed,
+      )
+    }
     self.output.fragments.resolveLocations()
     self.semanticRevision = self.semanticRevision + 1
     self.laidOut = self.input
@@ -1465,7 +1482,9 @@ impl<'a> UiTree<'a> {
     self.laidOutScrolls = self.layout.scrollRevision()
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
-    run self.indexFragments()
+    if !moved {
+      run self.indexFragments()
+    }
     self.layoutObserversDirty = true
   }
 
@@ -1509,14 +1528,18 @@ impl<'a> UiTree<'a> {
   effect fn indexFragments(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.facesDirty = true
     self.fragmentOf.clear()
     run self.fragmentOf.appendRepeated(NO_INDEX, self.layout.nodes.length())
     let values = self.output.fragments.values.asSlice()
+    self.nextSourceFragment.clear()
+    run self.nextSourceFragment.appendRepeated(NO_INDEX, values.length)
     let mut i = values.length
     while i > 0 {
       i = i - 1
       let source = values[i].source
       if source < self.fragmentOf.length() && !values[i].positioningShell {
+        self.nextSourceFragment.set(i, self.fragmentOf.get(source))
         self.fragmentOf.set(source, i)
       }
     }
@@ -1526,6 +1549,9 @@ impl<'a> UiTree<'a> {
   effect fn loadFaces(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if !self.facesDirty {
+      return ()
+    }
     let count = self.output.fragments.texts.length()
     let mut i: usize = 0
     while i < count {
@@ -1540,6 +1566,7 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+    self.facesDirty = false
   }
 
   effect fn paintFrame(self: &mut Self) -> ()
@@ -1576,6 +1603,7 @@ impl<'a> UiTree<'a> {
         faces: &self.faces,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
+        textInk: &mut self.textInk,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneB,
@@ -1606,6 +1634,7 @@ impl<'a> UiTree<'a> {
         faces: &self.faces,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
+        textInk: &mut self.textInk,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneA,
@@ -1627,6 +1656,16 @@ impl<'a> UiTree<'a> {
       self.stats.primitives = self.sceneA.primitiveCount()
     }
     self.replayable = true
+    self.paintIndexOf.clear()
+    run self.paintIndexOf.appendRepeated(NONE, self.nodes.length())
+    let mut orderIndex: usize = 0
+    while orderIndex < self.paintOrder.length() {
+      let slot = self.slotOf(self.paintOrder.get(orderIndex))
+      if slot != NONE && self.paintIndexOf.get(u32.toUsize(slot)) == NONE {
+        self.paintIndexOf.set(u32.toUsize(slot), usize.toU32(orderIndex))
+      }
+      orderIndex = orderIndex + 1
+    }
     run self.gatherUploads()
   }
 
@@ -1654,6 +1693,7 @@ impl<'a> UiTree<'a> {
       faces: &self.faces,
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
+      textInk: &mut self.textInk,
       resources: &mut self.resources,
       paths: &mut self.paths,
       scene: &mut scene,

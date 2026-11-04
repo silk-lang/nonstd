@@ -295,6 +295,8 @@ static void check_appearance(void) {
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, SilkAXNode *> *axNodes;
 @property(nonatomic, strong) NSMutableSet<NSNumber *> *axSeen;
 @property(nonatomic, strong) NSMutableArray<NSNumber *> *axOrder;
+@property(nonatomic, strong) NSDictionary<NSNumber *, NSArray<SilkAXNode *> *> *axChildren;
+@property(nonatomic, strong) NSArray<SilkAXNode *> *axRoots;
 @property(nonatomic, strong) NSMutableArray *axActions;
 @property(nonatomic, strong) NSDictionary *axAction;
 @property(nonatomic) uint32_t axFocused;
@@ -361,11 +363,7 @@ static NSString *ax_role(uint32_t role) {
 - (NSString *)accessibilityIdentifier { return [NSString stringWithFormat:@"silk-%u", self.nodeId]; }
 - (id)accessibilityParent { return self.owner.axNodes[@(self.parentId)] ?: self.owner; }
 - (NSArray *)accessibilityChildren {
-    NSMutableArray *children = [NSMutableArray new];
-    NSArray *keys = self.owner.axOrder;
-    for (NSNumber *key in keys) { SilkAXNode *node = self.owner.axNodes[key];
-        if (node.parentId == self.nodeId) [children addObject:node]; }
-    return NSAccessibilityUnignoredChildren(children);
+    return NSAccessibilityUnignoredChildren(self.owner.axChildren[@(self.nodeId)] ?: @[]);
 }
 - (NSRect)accessibilityFrame {
     SilkView *view = self.owner;
@@ -428,11 +426,7 @@ static void push_resize(SilkView *view) {
 @implementation SilkView
 - (BOOL)isAccessibilityElement { return NO; }
 - (NSArray *)accessibilityChildren {
-    NSMutableArray *roots = [NSMutableArray new];
-    NSArray *keys = self.axOrder;
-    for (NSNumber *key in keys) { SilkAXNode *node = self.axNodes[key];
-        if (!self.axNodes[@(node.parentId)]) [roots addObject:node]; }
-    return NSAccessibilityUnignoredChildren(roots);
+    return NSAccessibilityUnignoredChildren(self.axRoots ?: @[]);
 }
 - (id)accessibilityFocusedUIElement { return self.axNodes[@(self.axFocused)] ?: self; }
 - (id)accessibilityHitTest:(NSPoint)point {
@@ -1614,6 +1608,20 @@ void silk_macos_ax_node(uint32_t id, uint32_t nodeId, uint32_t parent, uint32_t 
 void silk_macos_ax_end(uint32_t id) {
     SilkView *view = find_window(id).view;
     for (NSNumber *key in [view.axNodes allKeys]) if (![view.axSeen containsObject:key]) [view.axNodes removeObjectForKey:key];
+    // Build child lists once per published snapshot. Scanning every node inside
+    // accessibilityChildren made a full accessibility traversal quadratic.
+    NSMutableDictionary<NSNumber *, NSMutableArray<SilkAXNode *> *> *children = [NSMutableDictionary new];
+    NSMutableArray<SilkAXNode *> *roots = [NSMutableArray new];
+    for (NSNumber *key in view.axOrder) {
+        SilkAXNode *node = view.axNodes[key];
+        NSNumber *parent = @(node.parentId);
+        if (!view.axNodes[parent]) { [roots addObject:node]; continue; }
+        NSMutableArray<SilkAXNode *> *siblings = children[parent];
+        if (!siblings) { siblings = [NSMutableArray new]; children[parent] = siblings; }
+        [siblings addObject:node];
+    }
+    view.axChildren = children;
+    view.axRoots = roots;
     if (view.axFocused != view.axPreviousFocus)
         NSAccessibilityPostNotification(view.axNodes[@(view.axFocused)] ?: view, NSAccessibilityFocusedUIElementChangedNotification);
     NSAccessibilityPostNotification(view, NSAccessibilityLayoutChangedNotification);

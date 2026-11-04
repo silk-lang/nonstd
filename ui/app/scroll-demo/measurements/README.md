@@ -1,4 +1,50 @@
-# Initial findings
+# Performance history
+
+## Scroll and native stall fixes
+
+`scroll-fixes.json` records the next 120-frame run on the same machine and document.
+The comparison below uses `after.json` (the original demo after its mounting fix).
+
+| Sections | Previous CPU frame median / p95 | Fixed CPU frame median / p95 |
+| ---: | ---: | ---: |
+| 100 | 89.9 / 114.5 ms | 3.9 / 4.4 ms |
+| 1,000 | 903.7 / 1,024.5 ms | 38.6 / 41.9 ms |
+
+These remain headless CPU measurements, excluding native accessibility, GPU work,
+and presentation. The 1,000-section case still exceeds a 16.7 ms frame budget.
+
+The shared-library changes are:
+
+- `css-layout` retains pre-scroll visual offsets and exposes `repositionScroll` for
+  callers whose measurement inputs are unchanged. `ui-tree` uses it for scroll-only
+  updates. Both workloads now perform zero full box layouts while scrolling.
+  Fragmented output and invalidated/changed geometry fall back to normal layout.
+- `ui-tree` retains conservative raster text ink bounds, keyed by run fingerprint,
+  raster face and scale. Invisible runs skip glyph-cache work while decorations
+  still paint normally. Both sizes process at most 1,332 glyphs in this pass.
+  Vertical/vector text and input text keep their existing paths.
+- Geometry and paint-order queries use indexes instead of scanning the document
+  for every node. Native accessibility publishing therefore avoids quadratic work.
+- macOS accessibility child lists are indexed per snapshot, so an accessibility
+  client traversing the document also avoids repeated full-node scans.
+
+The native 1,000-section window initially stalled for minutes while publishing
+accessibility. No process crash report was found. After these changes, the native
+`--check-grow` regression goes from 100 to 1,000 sections, scrolls, verifies the
+model update and compares GPU output with the CPU reference, completing in 2.5 s.
+
+Validation: 298 layout tests, 26 UI-tree tests, 10 app tests, all four existing app
+goldens, and the UI-tree WebAssembly check pass. Added differential tests compare
+retained positioning with fresh layout for nested scrolling, sticky, relative,
+absolute and fixed boxes, both automatic and explicit scrollbars, and clamping.
+Tree tests compare warm/cold pixels after fractional scrolling and validate the
+fragment and paint-order indexes.
+
+The tree still visits and hashes the full fragment hierarchy, and native
+accessibility still publishes every mounted node. Those linear costs remain
+visible at 1,000 sections; this change does not claim constant-time scrolling.
+
+## Initial findings
 
 Measured on an Apple M1 Max, macOS arm64, with the pinned dev.47 Silk compiler and
 a release build. Viewport: 1280 × 900, scale 2. The feature branch starts from
