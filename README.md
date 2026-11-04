@@ -28,6 +28,7 @@ GPUs. They are grouped by area, and every package is a member of one workspace t
 | [`gpu/metal`](gpu/metal) | `gpu-metal` | Metal bindings; a port of metal-rs |
 | [`platform/window`](platform/window) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames (macOS first) |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |
+| [`packages/typescript`](packages/typescript) | `silk-typescript` (npm) | Spike: import Silk functions from TypeScript 7.1 through a content mapper and wasm |
 
 Each library's README lists its helper packages (command-line tools, benchmarks, test runners).
 Package names follow their paths, with hyphens. `text/xml` and `packages/cli` are
