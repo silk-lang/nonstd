@@ -1,7 +1,7 @@
 //! Host-owned styling inputs. Font metrics and system palettes are explicit, not OS guesses.
 import svg_core.document_styles { StyledGraph }
 import svg_core.document_styles
-import svg_core.stylesheets { Catalog, HostStyles }
+import svg_core.stylesheets { Catalog, HostStyles, HostFonts, PreparedCatalog }
 import svg_core.resources { Resolver, ProcessingMode, Policy }
 import svg_geometry.geometry { Size }
 import svg_core.url { Url }
@@ -21,6 +21,8 @@ import svg_css.values { ValueId, Value, Mode }
 import svg_css.values
 import svg_css.text_values { TextValue }
 import svg_css.text_values
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.option { Option }
@@ -170,27 +172,10 @@ effect fn systemFont(catalog: &mut Catalog, source: &[u8], limits: &Limits) -> T
   }
 }
 
-effect fn sameFont(
-  catalog: &mut Catalog,
-  environment: &Environment,
-  index: usize,
-  first: &TextValue,
-) -> TextValue
+effect fn familyValue(catalog: &mut Catalog, source: &[u8], limits: &Limits) -> ValueId
   ! CssError | RenderError | OutOfMemoryError
   ? &mut Allocator {
-  let source = environment.systemFonts[index]
-  if tokens.equal(source, environment.systemFonts[0]) {
-    return run values.copyText(first)
-  }
-  return run systemFont(&mut catalog.*, source, &environment.cssLimits)
-}
-
-effect fn compute<'a, 'h>(graph: &mut Graph, environment: &Environment<'a, 'h>) -> StyledGraph<'h>
-  ! CssError | ComputedError | StructureError | RenderError | OutOfMemoryError
-  ? &mut Resolver | &mut Allocator {
-  run validate(environment)
-  let mut catalog = run HostStyles.catalogFor(environment.styles, &environment.cssLimits)
-  let tokens = run lexer.tokenize(environment.fontFamily, &environment.cssLimits)
+  let tokens = run lexer.tokenize(source, limits)
   let input = Input.Contiguous { buffer: &tokens, range: tokens.all() }
   let parsed = run values.parse(&mut catalog.engine.values, Property.FontFamily, &input, Mode.Css)
   let family = match &parsed {
@@ -212,6 +197,48 @@ effect fn compute<'a, 'h>(graph: &mut Graph, environment: &Environment<'a, 'h>) 
       fail RenderError.InvalidStyleContext
     }
   }
+  return family
+}
+
+effect fn sameFont(
+  catalog: &mut Catalog,
+  environment: &Environment,
+  index: usize,
+  first: &TextValue,
+) -> TextValue
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let source = environment.systemFonts[index]
+  if tokens.equal(source, environment.systemFonts[0]) {
+    return run values.copyText(first)
+  }
+  return run systemFont(&mut catalog.*, source, &environment.cssLimits)
+}
+
+effect fn compute<'a, 'h>(graph: &mut Graph, environment: &Environment<'a, 'h>) -> StyledGraph<'h>
+  ! CssError | ComputedError | StructureError | RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  run validate(environment)
+  let mut catalog = run HostStyles.catalogFor(environment.styles, &environment.cssLimits)
+
+  // The host's fonts, parsed once into the values this catalog reads in place.
+  if catalog.readsHost() {
+    if let Option<&HostStyles>.Some { value: styles } = &environment.styles {
+      if let Option<HostFonts>.Some { value: prepared } = &styles.fonts {
+        if prepared.matches(environment.fontFamily, &environment.systemFonts) {
+          let host = HostContext {
+            dimensions: environment.media.initial,
+            colors: environment.colors,
+            systemFonts: &prepared.fonts,
+            fontFamily: prepared.family,
+            revision: 0,
+          }
+          return run styledWith(&mut graph.*, environment, move catalog, &host)
+        }
+      }
+    }
+  }
+  let family = run familyValue(&mut catalog, environment.fontFamily, &environment.cssLimits)
 
   // Hosts often give one shorthand for all six; it is parsed once and the rest share its values.
   let first = run systemFont(&mut catalog, environment.systemFonts[0], &environment.cssLimits)
@@ -228,6 +255,18 @@ effect fn compute<'a, 'h>(graph: &mut Graph, environment: &Environment<'a, 'h>) 
     fontFamily: family,
     revision: 0,
   }
+  return run styledWith(&mut graph.*, environment, move catalog, &host)
+}
+
+effect fn styledWith<'a, 'h>(
+  graph: &mut Graph,
+  environment: &Environment<'a, 'h>,
+  catalog: Catalog<'h>,
+  host: &HostContext,
+) -> StyledGraph<'h>
+  ! CssError | ComputedError | StructureError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut catalog = move catalog
   let fragment = match &environment.structure.fragment {
     Option<&[u8]>.Some { value } => value
     _ => match &environment.base.fragment() {
@@ -244,12 +283,83 @@ effect fn compute<'a, 'h>(graph: &mut Graph, environment: &Environment<'a, 'h>) 
   return run document_styles.buildGraph(
     &mut graph.*,
     move catalog,
-    &host,
+    host,
     &environment.media,
     move selection,
     &environment.cssLimits,
     &environment.structure,
   )
+}
+
+/// Parses the host's font family and system fonts once into the prepared catalog of `styles`,
+/// for documents whose environment gives the same sources. Sources a document would reject
+/// are left for each document to parse and report.
+pub effect fn prepareFonts(
+  styles: &mut HostStyles,
+  fontFamily: &[u8],
+  systemFonts: &[&[u8]; 6],
+  limits: &Limits,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<PreparedCatalog>.Some { value: prepared } = &mut styles.catalog {
+    let parsed = run Effect.catch<CssError | RenderError>(
+      hostFonts(&mut prepared.catalog, fontFamily, systemFonts, limits),
+      unprepared,
+    )
+    styles.fonts = move parsed
+  }
+}
+
+effect fn unprepared(error: CssError | RenderError) -> Option<HostFonts> {
+  drop error
+  return Option<HostFonts>.None
+}
+
+effect fn hostFonts(
+  catalog: &mut Catalog,
+  fontFamily: &[u8],
+  systemFonts: &[&[u8]; 6],
+  limits: &Limits,
+) -> Option<HostFonts>
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  let family = run familyValue(&mut catalog.*, fontFamily, limits)
+  let first = run systemFont(&mut catalog.*, systemFonts[0], limits)
+  let second = run hostFont(&mut catalog.*, systemFonts, 1, &first, limits)
+  let third = run hostFont(&mut catalog.*, systemFonts, 2, &first, limits)
+  let fourth = run hostFont(&mut catalog.*, systemFonts, 3, &first, limits)
+  let fifth = run hostFont(&mut catalog.*, systemFonts, 4, &first, limits)
+  let sixth = run hostFont(&mut catalog.*, systemFonts, 5, &first, limits)
+  let mut sources = run List<Bytes>.makeWithCapacity(6)
+  let mut i: usize = 0
+  while i < 6 {
+    run sources.append(run Bytes.copy(systemFonts[i]))
+    i = i + 1
+  }
+  return Option<HostFonts>.some(
+    HostFonts {
+      familySource: run Bytes.copy(fontFamily),
+      fontSources: move sources,
+      family: family,
+      fonts: [move first, move second, move third, move fourth, move fifth, move sixth],
+    },
+  )
+}
+
+effect fn hostFont(
+  catalog: &mut Catalog,
+  systemFonts: &[&[u8]; 6],
+  index: usize,
+  first: &TextValue,
+  limits: &Limits,
+) -> TextValue
+  ! CssError | RenderError | OutOfMemoryError
+  ? &mut Allocator {
+  if tokens.equal(systemFonts[index], systemFonts[0]) {
+    return run values.copyText(first)
+  }
+  return run systemFont(&mut catalog.*, systemFonts[index], limits)
 }
 
 effect fn cssFailure(error: CssError) -> never
