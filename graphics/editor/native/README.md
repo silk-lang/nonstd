@@ -224,3 +224,8 @@ ordinary composition. Use `camera-check` for performance of the normal native pa
 `challenge-check` covers inspector-driven interactions. The contracts also check
 all 26 letters under glyph-atlas pressure and compare shared text after zoom/pan
 with fresh raster pixels.
+
+The native canvas uses `ui-tree.canvas_view.TextBindings` for pan/zoom cache validation
+and `Refinement` for idle text-quality deadlines. The editor retains document-node
+mapping and composition; viewport coverage checks and raster-validity policy are shared.
+The desktop host uses the common `ui-tree-window.host` through its app adapter.

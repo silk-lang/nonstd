@@ -1,5 +1,6 @@
 //! Composes a retained graphics document with native UI chrome.
 import ui_tree.canvas_text as textRaster
+import ui_tree.canvas_view { TextBindings, Refinement }
 import ui_tree.canvas_text { TextCache, TextTile, TextRequest, TextViewport, croppedText }
 import exports as exportDocument
 import tweet_asset
@@ -44,11 +45,8 @@ import silk.num.usize
 
 struct TextProbe {
   element: usize,
-  cache: usize,
   node: u32,
   kind: u32,
-  tileIndex: u32,
-  tileGeneration: u32,
 }
 
 impl Copy for TextProbe {}
@@ -61,14 +59,7 @@ pub struct Canvas {
   rasterFrame: u64,
   normalizedRevision: u64,
   probes: List<TextProbe>,
-  allTextBound: bool,
-  probeBounds: List<Rect<f32>>,
-  checkedViewport: Rect<f32>,
-  checkedRasterFrame: u64,
-  checkedZoom: f32,
-  checkedScale: f32,
-  checkedQuality: bool,
-  checkedMissingTiles: usize,
+  bindings: TextBindings,
   pub scene: Scene,
   /// Image-only overview geometry, transformed by the GPU independently of chrome.
   pub retainedScene: Scene,
@@ -83,8 +74,7 @@ pub struct Canvas {
   paintedRevision: u64,
   exporting: bool,
   deferDensity: bool,
-  refinePending: bool,
-  refineAt: f64,
+  refinement: Refinement,
   editing: u32,
   canvasBounds: Rect<f32>,
   cameraX: f32,
@@ -119,14 +109,7 @@ impl Canvas {
       rasterFrame: 0,
       normalizedRevision: 18446744073709551615,
       probes: List<TextProbe>.make(),
-      allTextBound: false,
-      probeBounds: List<Rect<f32>>.make(),
-      checkedViewport: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
-      checkedRasterFrame: u64.MAX,
-      checkedZoom: 0.0,
-      checkedScale: 0.0,
-      checkedQuality: false,
-      checkedMissingTiles: 0,
+      bindings: TextBindings.make(),
       scene: Scene.make(),
       retainedScene: Scene.make(),
       retained: false,
@@ -140,8 +123,7 @@ impl Canvas {
       paintedRevision: 18446744073709551615,
       exporting: false,
       deferDensity: false,
-      refinePending: false,
-      refineAt: 0.0,
+      refinement: Refinement.make(),
       editing: 0,
       canvasBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
       cameraX: 0.0,
@@ -259,186 +241,16 @@ impl Canvas {
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    if cache == usize.MAX {
-      self.allTextBound = false
-    } else {
-      let tile = self.textCache.text.get(cache)
-      if croppedText(tile) {
-        self.allTextBound = false
-      }
-    }
-    let block = self.probes.length() / 64
-    let bounds = Rect<f32>.new(
-      e.shape.x,
-      e.shape.y,
-      e.shape.x + e.shape.width,
-      e.shape.y + e.shape.height,
+    run self.bindings.append(
+      Rect<f32>.new(e.shape.x, e.shape.y, e.shape.x + e.shape.width, e.shape.y + e.shape.height),
+      cache,
+      &self.textCache,
     )
-    if block == self.probeBounds.length() {
-      run self.probeBounds.append(bounds)
-    } else {
-      let old = self.probeBounds.get(block)
-      self.probeBounds.set(
-        block,
-        Rect<f32>.new(
-          f32.min(old.xMin, bounds.xMin),
-          f32.min(old.yMin, bounds.yMin),
-          f32.max(old.xMax, bounds.xMax),
-          f32.max(old.yMax, bounds.yMax),
-        ),
-      )
-    }
-    run self.probes.append(
-      TextProbe {
-        element: element,
-        cache: cache,
-        node: node,
-        kind: kind,
-        tileIndex: if cache == usize.MAX {
-          0
-        } else {
-          self.textCache.text.get(cache).tile.id.index
-        },
-        tileGeneration: if cache == usize.MAX {
-          0
-        } else {
-          self.textCache.text.get(cache).tile.id.generation
-        },
-      },
-    )
+    run self.probes.append(TextProbe { element: element, node: node, kind: kind })
   }
 
-  // Most camera changes need no document rebuild: all small labels already have
-  // sufficient raster density. Check only text blocks intersecting the viewport.
   fn needsText(self: &mut Self, m: &Studio, scale: f32, tree: &UiTree, quality: bool) -> bool {
-    // Complete overview bindings share hundreds of rasters across 100k labels.
-    // Validate each current raster once instead of checking every instance.
-    if self.allTextBound {
-      let mut at: usize = 0
-      while at < self.textCache.text.length() {
-        let tile = self.textCache.text.get(at)
-        if tile.used == self.rasterFrame {
-          if let Option<AtlasTile>.None = tree.atlas.get(tile.tile.id) {
-            return true
-          }
-          let wanted = f32.max(
-            0.25,
-            f32.ceil(m.zoom * scale * f32.max(tile.stretchX, tile.stretchY) * 4.0) / 4.0,
-          )
-          let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0 && tile.naturalHeight <= 32.0
-          if quality
-            && (tile.density < wanted
-              || tile.density > wanted * 4.0 && !(small && self.textCache.textPixels < 16000000)) {
-            return true
-          }
-        }
-        at = at + 1
-      }
-      return false
-    }
-    let viewport = Rect<f32>.new(
-      m.cameraX,
-      m.cameraY,
-      m.cameraX + m.canvasWidth() / m.zoom,
-      m.cameraY + m.canvasHeight() / m.zoom,
-    )
-    // Tile handles cannot become live again without a new raster/binding epoch.
-    // Counting missing handles therefore detects atlas invalidation in O(unique
-    // rasters), including UI allocations that evict a canvas tile between frames.
-    let mut missing: usize = 0
-    let mut at: usize = 0
-    while at < self.textCache.text.length() {
-      if tree.atlas.get(self.textCache.text.get(at).tile.id).isNone() {
-        missing = missing + 1
-      }
-      at = at + 1
-    }
-    let reusable = self.checkedRasterFrame == self.rasterFrame
-      && self.checkedZoom == m.zoom && self.checkedScale == scale
-      && (!quality || self.checkedQuality) && self.checkedMissingTiles == missing
-    let checked = if reusable {
-      self.checkedViewport
-    } else {
-      Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
-    }
-    if self.needsTextIn(m, scale, tree, quality, viewport, checked) {
-      return true
-    }
-    self.checkedViewport = viewport
-    self.checkedRasterFrame = self.rasterFrame
-    self.checkedZoom = m.zoom
-    self.checkedScale = scale
-    self.checkedQuality = quality || reusable && self.checkedQuality
-    self.checkedMissingTiles = missing
-    return false
-  }
-
-  fn needsTextIn(
-    self: &Self,
-    m: &Studio,
-    scale: f32,
-    tree: &UiTree,
-    quality: bool,
-    viewport: Rect<f32>,
-    checked: Rect<f32>,
-  ) -> bool {
-    let mut block: usize = 0
-    while block < self.probeBounds.length() {
-      let b = self.probeBounds.get(block)
-      if b.xMin < viewport.xMax && b.xMax > viewport.xMin && b.yMin < viewport.yMax
-        && b.yMax > viewport.yMin && !coveredIntersection(b, viewport, checked) {
-        let mut at = block * 64
-        let end = if at + 64 < self.probes.length() {
-          at + 64
-        } else {
-          self.probes.length()
-        }
-        while at < end {
-          let probe = self.probes.get(at)
-          let e = m.elements.get(probe.element)
-          if e.shape.x < viewport.xMax && e.shape.x + e.shape.width > viewport.xMin
-            && e.shape.y < viewport.yMax
-            && e.shape.y + e.shape.height > viewport.yMin
-            && !coveredIntersection(
-              Rect<f32>.new(e.shape.x, e.shape.y, e.shape.x + e.shape.width, e.shape.y + e.shape.height),
-              viewport,
-              checked,
-            ) {
-            if probe.cache == usize.MAX {
-              return true
-            }
-            let tile = self.textCache.text.get(probe.cache)
-            if probe.tileIndex != tile.tile.id.index
-              || probe.tileGeneration != tile.tile.id.generation {
-              return true
-            }
-            if let Option<AtlasTile>.None = tree.atlas.get(tile.tile.id) {
-              return true
-            }
-            let wanted = f32.max(
-              0.25,
-              f32.ceil(m.zoom * scale * f32.max(tile.stretchX, tile.stretchY) * 4.0) / 4.0,
-            )
-            let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0
-              && tile.naturalHeight <= 32.0
-            if quality
-              && (tile.density < wanted
-                || tile.density > wanted * 4.0
-                  && !(small && self.textCache.textPixels < 16000000)) {
-              return true
-            }
-
-            // Keep the crop until the visible text leaves its cached pixel bounds.
-            if !textCovered(tile, m, e) {
-              return true
-            }
-          }
-          at = at + 1
-        }
-      }
-      block = block + 1
-    }
-    return false
+    return self.bindings.needsRaster(&self.textCache, textViewport(m), scale, tree, quality)
   }
 
   // Camera motion only refreshes visible text bindings, preserving the shape store,
@@ -459,8 +271,8 @@ impl Canvas {
     let right = m.cameraX + m.canvasWidth() / m.zoom
     let bottom = m.cameraY + m.canvasHeight() / m.zoom
     let mut block: usize = 0
-    while block < self.probeBounds.length() {
-      let b = self.probeBounds.get(block)
+    while block < self.bindings.blocks.length() {
+      let b = self.bindings.blocks.get(block)
       if b.xMin < right && b.xMax > m.cameraX && b.yMin < bottom && b.yMax > m.cameraY {
         let mut at = block * 64
         let end = if at + 64 < self.probes.length() {
@@ -490,9 +302,7 @@ impl Canvas {
             node.height = tile.pixelsHeight / tile.density * tile.stretchY
             node.fill = 0xffffffff
             drop self.document.set(probe.node, node)
-            probe.cache = tile.cache
-            probe.tileIndex = tile.tile.id.index
-            probe.tileGeneration = tile.tile.id.generation
+            self.bindings.rebind(at, tile.cache, &self.textCache)
             self.probes.set(at, probe)
           }
           at = at + 1
@@ -500,7 +310,7 @@ impl Canvas {
       }
       block = block + 1
     }
-    self.allTextBound = updated == self.probes.length() && !cropped
+    self.bindings.allTextBound = updated == self.probes.length() && !cropped
     self.retainedValid = false
     self.imageBounds = self.document.retainedImageBounds()
   }
@@ -556,7 +366,7 @@ impl Canvas {
     ? &mut Allocator {
     self.deferDensity = false
     run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, false)
-    self.refinePending = false
+    self.refinement.pending = false
   }
 
   /// Prepares GPU-retained overview images and a separate chrome scene when eligible.
@@ -573,22 +383,18 @@ impl Canvas {
     ? &mut Allocator {
     self.deferDensity = false
     run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, true)
-    self.refinePending = false
+    self.refinement.pending = false
   }
 
   /// Next idle text-quality frame, in seconds on the native event-loop clock.
   /// The host must wake at this deadline even when no more input arrives.
   pub fn nextTextDeadline(self: &Self) -> Option<f64> {
-    return if self.refinePending {
-      Option<f64>.some(self.refineAt)
-    } else {
-      Option<f64>.None
-    }
+    return self.refinement.nextDeadline()
   }
 
   /// Whether the host should request the pending idle text-quality frame.
   pub fn textRefinementDue(self: &Self, time: f64) -> bool {
-    return self.refinePending && time >= self.refineAt
+    return self.refinement.due(time)
   }
 
   fn canvasMoved(self: &Self, m: &Studio) -> bool {
@@ -619,12 +425,9 @@ impl Canvas {
       || self.height != m.height
       || self.zoom != m.zoom
       || self.scale != scale
-    if moving {
-      self.refineAt = time + 0.150
-    }
-    self.deferDensity = !self.exporting && time < self.refineAt
+    self.deferDensity = !self.exporting && self.refinement.defer(moving, time, 0.150)
     run self.prepare(m, &mut tree, &mut textTree, &mut snapshot, scale, retain)
-    self.refinePending = self.deferDensity && self.needsText(m, scale, &tree.*, true)
+    self.refinement.pending = self.deferDensity && self.needsText(m, scale, &tree.*, true)
   }
 
   /// Builds the visible document and chrome into one scene in physical pixels.
@@ -652,8 +455,7 @@ impl Canvas {
       self.rasterFrame = self.rasterFrame + 1
       self.document = Document.make()
       self.probes.clear()
-      self.allTextBound = true
-      self.probeBounds.clear()
+      self.bindings.clear()
       let imageKind = if let Option<AtlasTile>.Some { value: tile } = self.image {
         drop tree.atlas.touch(tile.id)
         run self.document.addTile(tile)
@@ -710,7 +512,7 @@ impl Canvas {
       self.scale = scale
     }
     let quality = !self.deferDensity
-    let refreshText = !rebuild && (cameraChanged || self.refinePending)
+    let refreshText = !rebuild && (cameraChanged || self.refinement.pending)
       && self.needsText(m, scale, &tree.*, quality)
     if refreshText {
       run self.refreshText(m, &mut tree, &mut textTree, &mut snapshot, scale)
@@ -927,18 +729,4 @@ fn textViewport(m: &Studio) -> TextViewport {
     height: m.canvasHeight(),
     zoom: m.zoom,
   }
-}
-
-fn textCovered(tile: TextTile, m: &Studio, e: Element) -> bool {
-  return textRaster.textCovered(tile, textViewport(m), textRequest(m, e))
-}
-
-// Only the part of a block/text box visible now needs to have been checked before.
-// This skips interior blocks during pans while retaining cropped-text edge checks.
-fn coveredIntersection(bounds: Rect<f32>, viewport: Rect<f32>, checked: Rect<f32>) -> bool {
-  return checked.xMax > checked.xMin && checked.yMax > checked.yMin
-    && f32.max(bounds.xMin, viewport.xMin) >= checked.xMin
-    && f32.max(bounds.yMin, viewport.yMin) >= checked.yMin
-    && f32.min(bounds.xMax, viewport.xMax) <= checked.xMax
-    && f32.min(bounds.yMax, viewport.yMax) <= checked.yMax
 }
