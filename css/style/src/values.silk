@@ -265,44 +265,98 @@ pub effect fn copyText(value: &TextValue) -> TextValue
   }
 }
 
-pub struct Store {
-  pub numerics: dimensions.Store,
+const NO_VALUES: [Value; 0] = []
+
+/// Parsed and computed values by [`ValueId`], with the numeric expressions and text they
+/// point at. A store made with [`Store.over`] reads the ids (and text spans) below its base's
+/// lengths from that base, without copying it, and adds its own after them.
+pub struct Store<'a> {
+  pub numerics: dimensions.Store<'a>,
+  base: &'a [Value],
   pub values: List<Value>,
-  pub strings: Bytes,
+  baseStrings: &'a [u8],
+  strings: Bytes,
   pub paths: List<Path>,
   pub iccColors: List<IccColor>,
 }
 
-impl Store {
-  pub fn make() -> Store {
-    return Store {
+impl<'a> Store<'a> {
+  pub fn make() -> Store<'a> {
+    return Store<'a> {
       numerics: NumericStore.make(),
+      base: Slice.view<Value>(&NO_VALUES, 0, 0),
       values: List<Value>.make(),
+      baseStrings: b"",
       strings: Bytes.make(),
       paths: List<Path>.make(),
       iccColors: List<IccColor>.make(),
     }
   }
 
-  pub fn get(self: &Store, id: ValueId) -> &Value {
-    return &self.values.asSlice()[id.index]
+  /// An empty store that reads `base`'s values, expressions and text with the same ids and
+  /// spans, or None when `base` holds a path or ICC colour (their ids are store-local) or
+  /// itself reads from another store.
+  pub fn over(base: &'a Store) -> Option<Store<'a>> {
+    if base.paths.length() != 0 || base.iccColors.length() != 0 || base.base.length != 0
+      || base.baseStrings.length != 0 {
+      return Option<Store<'a>>.None
+    }
+    let numerics = match move NumericStore.over(&base.numerics) {
+      Option<NumericStore<'a>>.Some { value } => move value
+      _ => {
+        return Option<Store<'a>>.None
+      }
+    }
+    return Option<Store<'a>>.some(
+      Store<'a> {
+        numerics: move numerics,
+        base: base.values.asSlice(),
+        values: List<Value>.make(),
+        baseStrings: Bytes.asSlice(&base.strings),
+        strings: Bytes.make(),
+        paths: List<Path>.make(),
+        iccColors: List<IccColor>.make(),
+      },
+    )
   }
 
-  pub fn icc(self: &Store, id: IccId) -> &IccColor {
+  pub fn get(self: &Self, id: ValueId) -> &Value {
+    let shared = self.base.length
+    if id.index < shared {
+      return &self.base[id.index]
+    }
+    return &self.values.asSlice()[id.index - shared]
+  }
+
+  /// The number of values, the base's included: the next added value's index.
+  pub fn length(self: &Self) -> usize {
+    return self.base.length + self.values.length()
+  }
+
+  pub fn icc(self: &Self, id: IccId) -> &IccColor {
     return &self.iccColors.asSlice()[id.index]
   }
 
-  pub fn text(self: &Store, span: Span) -> &[u8] {
-    return Slice.view<u8>(Bytes.asSlice(&self.strings), span.start, span.end - span.start)
+  pub fn text(self: &Self, span: Span) -> &[u8] {
+    let shared = self.baseStrings.length
+    if span.start < shared {
+      return Slice.view<u8>(self.baseStrings, span.start, span.end - span.start)
+    }
+    return Slice.view<u8>(Bytes.asSlice(&self.strings), span.start - shared, span.end - span.start)
   }
 
-  pub effect fn add(self: &mut Store, value: Value) -> ValueId
+  /// The length of the text arena, the base's included: where the next stored text starts.
+  pub fn textLength(self: &Self) -> usize {
+    return self.baseStrings.length + Bytes.asSlice(&self.strings).length
+  }
+
+  pub effect fn add(self: &mut Self, value: Value) -> ValueId
     ! OutOfMemoryError
     ? &mut Allocator {
-    let id = ValueId { index: self.values.length() }
+    let id = ValueId { index: self.length() }
 
-    // Every document's store takes the catalog's initial values (about 160), and Value is
-    // large, so doubling up from four elements copied the whole list several times.
+    // A document's own store takes the values it parses and computes, and Value is large,
+    // so doubling up from four elements copied the whole list several times.
     if self.values.capacity() == 0 {
       run self.values.reserve(256)
     }
@@ -311,42 +365,41 @@ impl Store {
   }
 
   /// Room for `additional` more values, so a store sized from its document grows once.
-  pub effect fn reserve(self: &mut Store, additional: usize) -> ()
+  pub effect fn reserve(self: &mut Self, additional: usize) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.values.reserve(additional)
   }
 
   /// The lengths of the store's arenas, to roll a parse back to with [`Store.truncate`].
-  pub fn mark(self: &Store) -> StoreMark {
+  pub fn mark(self: &Self) -> StoreMark {
     return StoreMark {
       numerics: self.numerics.length(),
-      values: self.values.length(),
-      strings: Bytes.asSlice(&self.strings).length,
+      values: self.length(),
+      strings: self.textLength(),
       paths: self.paths.length(),
       iccColors: self.iccColors.length(),
     }
   }
 
-  /// Drops everything added since `mark`.
-  pub fn truncate(self: &mut Store, mark: StoreMark) -> () {
+  /// Drops everything added since `mark`; the base's values and text stay.
+  pub fn truncate(self: &mut Self, mark: StoreMark) -> () {
     self.numerics.truncate(mark.numerics)
-    self.values.truncate(mark.values)
-    Bytes.truncate(&mut self.strings, mark.strings)
+    self.values.truncate(localLength(mark.values, self.base.length))
+    Bytes.truncate(&mut self.strings, localLength(mark.strings, self.baseStrings.length))
     self.paths.truncate(mark.paths)
     self.iccColors.truncate(mark.iccColors)
   }
 
-  /// Whether every value from `mark` on is one [`Store.copy`] can copy, and no path or ICC
+  /// Whether every value from `mark` on is one another engine can share, and no path or ICC
   /// colour was added.
-  pub fn simpleSince(self: &Store, mark: StoreMark) -> bool {
+  pub fn simpleSince(self: &Self, mark: StoreMark) -> bool {
     if self.paths.length() != mark.paths || self.iccColors.length() != mark.iccColors {
       return false
     }
-    let values = self.values.asSlice()
     let mut i = mark.values
-    while i < values.length {
-      if !simple(&values[i]) {
+    while i < self.length() {
+      if !simple(self.get(ValueId { index: i })) {
         return false
       }
       i = i + 1
@@ -354,16 +407,22 @@ impl Store {
     return true
   }
 
-  /// Whether Store.copy copies every value of this store.
-  pub fn copyable(self: &Store) -> bool {
-    return self.simpleSince(
-      StoreMark { numerics: 0, values: 0, strings: 0, paths: 0, iccColors: 0 },
-    )
+  /// Whether [`Store.over`] can share this store with another.
+  pub fn shareable(self: &Self) -> bool {
+    return self.paths.length() == 0 && self.iccColors.length() == 0 && self.base.length == 0
+      && self.baseStrings.length == 0
+      && self.numerics.unshared()
   }
 
-  /// A copy of a store whose values are all simple (see [`Store.simpleSince`]) and that holds no
-  /// path or ICC colour, with the same ids.
-  pub effect fn copy(self: &Store) -> Store
+  /// Whether [`Store.copy`] copies every value of this store.
+  pub fn copyable(self: &Self) -> bool {
+    return self.base.length == 0 && self.baseStrings.length == 0
+      && self.simpleSince(StoreMark { numerics: 0, values: 0, strings: 0, paths: 0, iccColors: 0 })
+  }
+
+  /// An owned copy of a store that reads no base and whose values are all simple (see
+  /// [`Store.simpleSince`]), with the same ids.
+  pub effect fn copy<'b>(self: &Self) -> Store<'b>
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut values = run List<Value>.makeWithCapacity(self.values.length() + 256)
@@ -373,21 +432,39 @@ impl Store {
       run values.append(run copySimple(&source[i]))
       i = i + 1
     }
-    return Store {
+    return Store<'b> {
       numerics: run self.numerics.copy(),
+      base: Slice.view<Value>(&NO_VALUES, 0, 0),
       values: move values,
+      baseStrings: b"",
       strings: run Bytes.copy(Bytes.asSlice(&self.strings)),
       paths: List<Path>.make(),
       iccColors: List<IccColor>.make(),
     }
   }
 
-  pub effect fn storeText(self: &mut Store, text: &[u8]) -> Span
+  pub effect fn storeText(self: &mut Self, text: &[u8]) -> Span
     ! OutOfMemoryError
     ? &mut Allocator {
-    let start = Bytes.asSlice(&self.strings).length
+    let start = self.textLength()
     run Bytes.append(&mut self.strings, text)
-    return Span { start: start, end: Bytes.asSlice(&self.strings).length }
+    return Span { start: start, end: self.textLength() }
+  }
+
+  // Appends to the text arena without making a span, for text assembled in pieces.
+  effect fn appendText(self: &mut Self, text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run Bytes.append(&mut self.strings, text)
+  }
+}
+
+// The part of an arena length past a base of `shared` entries.
+fn localLength(length: usize, shared: usize) -> usize {
+  return if length > shared {
+    length - shared
+  } else {
+    0
   }
 }
 
@@ -461,7 +538,7 @@ effect fn url(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<
 effect fn iccProfile(store: &mut Store, source: &Input, cursor: &mut Cursor) -> Option<Span>
   ! OutOfMemoryError
   ? &mut Allocator {
-  let start = Bytes.asSlice(&store.strings).length
+  let start = store.textLength()
   while cursor.position < cursor.end {
     let next = source.at(cursor.position)
     match &next {
@@ -489,7 +566,7 @@ effect fn iccProfile(store: &mut Store, source: &Input, cursor: &mut Cursor) -> 
           }
           i = i + 1
         }
-        run Bytes.append(&mut store.strings, text)
+        run store.appendText(text)
         cursor.position = cursor.position + 1
       }
       _ => {
@@ -497,7 +574,7 @@ effect fn iccProfile(store: &mut Store, source: &Input, cursor: &mut Cursor) -> 
       }
     }
   }
-  let end = Bytes.asSlice(&store.strings).length
+  let end = store.textLength()
   return if end > start {
     Option<Span>.some(Span { start: start, end: end })
   } else {
@@ -1686,7 +1763,13 @@ pub effect fn compute(store: &mut Store, id: ValueId, context: &ComputeContext) 
   ! OutOfMemoryError
   ? &mut Allocator {
   // Immutable nodes can share the specified-value handle. Only context-dependent nodes allocate.
-  let value = &store.values.asSlice()[id.index]
+  // The value is read through the arena fields so store.numerics stays free to borrow.
+  let shared = store.base.length
+  let value = if id.index < shared {
+    &store.base[id.index]
+  } else {
+    &store.values.asSlice()[id.index - shared]
+  }
   let computed = match &value.* {
     Value.Numeric { expression, range, basis } => {
       let resolved = run dimensions.compute(&mut store.numerics, expression, &context.dimensions)
