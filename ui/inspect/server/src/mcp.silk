@@ -34,6 +34,10 @@ pub const SERVER_NAME: string = "silk-ui-inspect"
 /// How long `ui_wait` waits when the call names no `timeout`, in milliseconds.
 pub const WAIT_TIMEOUT: u64 = 5000
 
+/// How long a host tool (`webview_*`) may take when the call names no `timeout`, in
+/// milliseconds: long enough for a page load.
+pub const HOST_TIMEOUT: u64 = 60000
+
 /// How long to pause before asking a pending `wait` again, in milliseconds.
 pub const RETRY_PAUSE: u64 = 50
 
@@ -44,7 +48,7 @@ const KNOWN_VERSIONS: [string<'static>; 4] = [
   "2025-11-25",
 ]
 
-const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG."""
+const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG. Pages inside the app's web views are read and driven with the webview_* tools: webview_list, then webview_snapshot for an outline with element refs that webview_click and webview_type take."""
 
 /// The target members every node-picking tool takes.
 const TARGET: string = r"""
@@ -203,11 +207,19 @@ impl Bridge {
     run self.cmd.append(cmd)
     self.timeout = match Json.asU64(Json.fieldAt(arguments, "timeout")) {
       Option<u64>.Some { value } => value
-      Option<u64>.None => WAIT_TIMEOUT
+      Option<u64>.None => if cmd == "host" {
+        HOST_TIMEOUT
+      } else {
+        WAIT_TIMEOUT
+      }
     }
     self.request.clear()
     run self.request.append("{\"cmd\":")
     run writeString(&mut self.request, cmd)
+    if cmd == "host" {
+      run self.request.append(",\"tool\":")
+      run writeString(&mut self.request, name)
+    }
     match arguments {
       Option<&Value>.Some { value } => {
         match &value.* {
@@ -219,7 +231,7 @@ impl Bridge {
               match &items[i] {
                 JsonChild.Member { entry } => {
                   let key = String.view(&entry.key)
-                  if key != "cmd" && key != "id" {
+                  if key != "cmd" && key != "id" && key != "tool" && key != "ticket" {
                     run self.request.append(",")
                     run writeString(&mut self.request, key)
                     run self.request.append(":")
@@ -281,8 +293,22 @@ impl Bridge {
     if !flag(&document, "ok") {
       if flag(&document, "pending") {
         if waited < self.timeout {
+          if let Option<u64>.Some { value: ticket } = Json.asU64(Json.field(&document, "ticket")) {
+            // A host job: ask for its answer by ticket from now on.
+            self.request.clear()
+            run self.request.append("{\"cmd\":\"host\",\"ticket\":")
+            run writeInt(&mut self.request, ticket)
+            run self.request.append("}")
+          }
           run out.append(String.view(&self.request))
           return Action.Retry
+        }
+        if String.view(&self.cmd) == "host" {
+          let mut message = run String.copy("Timed out after ")
+          run writeInt(&mut message, self.timeout)
+          run message.append(" ms: the app did not finish the call.")
+          run toolText(&mut out, id, String.view(&message), true)
+          return Action.Respond
         }
         let mut message = run String.copy("Timed out after ")
         run writeInt(&mut message, self.timeout)
@@ -298,7 +324,7 @@ impl Bridge {
       return Action.Respond
     }
     let cmd = String.view(&self.cmd)
-    if cmd == "snapshot" || cmd == "inspect" {
+    if cmd == "snapshot" || cmd == "inspect" || cmd == "host" {
       match Json.asString(Json.field(&document, "text")) {
         Option<string>.Some { value } => {
           run toolText(&mut out, id, value, false)
@@ -337,6 +363,9 @@ impl Bridge {
 
 /// The inspector command for tool `name`, or "" when there is no such tool.
 pub fn commandOf(name: string) -> string<'static> {
+  if isHostTool(name) {
+    return "host"
+  }
   let mut i: usize = 0
   while i < TOOLS.length {
     if TOOLS[i] == name {
@@ -382,6 +411,30 @@ const COMMANDS: [string<'static>; 15] = [
   "stats",
   "events",
 ]
+
+/// The tools the app's window host answers (a ui-webview host serves these).
+const HOST_TOOLS: [string<'static>; 9] = [
+  "webview_list",
+  "webview_snapshot",
+  "webview_navigate",
+  "webview_click",
+  "webview_type",
+  "webview_press_key",
+  "webview_scroll",
+  "webview_back",
+  "webview_evaluate",
+]
+
+fn isHostTool(name: string) -> bool {
+  let mut i: usize = 0
+  while i < HOST_TOOLS.length {
+    if HOST_TOOLS[i] == name {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
 
 fn has(value: Option<&Value>, key: string) -> bool {
   return match Json.fieldAt(value, key) {
@@ -859,5 +912,135 @@ effect fn toolList(out: &mut String) -> ()
     "",
     true,
   )
+  run webViewTools(&mut out)
   run out.append("]")
+}
+
+const VIEW: string = r""" "view":{"type":"integer","description":"The web view's id from webview_list; defaults to the first one."}"""
+
+/// The `webview_*` tools: the pages inside the app's web views (see ui-webview), read and
+/// driven the way the app's own agent does it.
+effect fn webViewTools(out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let none = String.make()
+  let view = run props(&[VIEW])
+  run tool(
+    &mut out,
+    false,
+    "webview_list",
+    "List web views",
+    "The web views open in the app, one per line: id, whether it is loading, its URL and title. ui_snapshot shows each one as a hosted node.",
+    &none,
+    "",
+    true,
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_snapshot",
+    "Snapshot a web page",
+    "The page inside a web view as a text outline (roles, names, values, states) with a [ref=eN] on every element webview_click and webview_type can act on. Take a fresh one after anything that changes the page.",
+    &view,
+    "",
+    true,
+  )
+  let navigate = run props(
+    &[r""" "url":{"type":"string","description":"An absolute URL."}""", VIEW],
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_navigate",
+    "Load a URL",
+    "Loads a URL in a web view and waits until it finishes loading.",
+    &navigate,
+    "\"url\"",
+    false,
+  )
+  let click = run props(
+    &[
+      r""" "ref":{"type":"string","description":"The element's ref from the latest webview_snapshot, such as e12."}""",
+      VIEW,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_click",
+    "Click an element",
+    "Scrolls an element of the page into view and clicks its center with real mouse input.",
+    &click,
+    "\"ref\"",
+    false,
+  )
+  let typed = run props(
+    &[
+      r""" "ref":{"type":"string","description":"The field's ref from the latest webview_snapshot."},"text":{"type":"string"},"submit":{"type":"boolean","description":"Press Enter afterwards."}""",
+      VIEW,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_type",
+    "Type into a field",
+    "Focuses a text field of the page, selects its value and types over it with real key input.",
+    &typed,
+    "\"ref\",\"text\"",
+    false,
+  )
+  let key = run props(
+    &[
+      r""" "key":{"type":"string","description":"DOM key value: Enter, Tab, Escape, ArrowDown, a, ..."}""",
+      VIEW,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_press_key",
+    "Press a key in the page",
+    "Presses and releases one key in whatever has focus inside the web view.",
+    &key,
+    "\"key\"",
+    false,
+  )
+  let scroll = run props(&[r""" "direction":{"type":"string","enum":["up","down"]}""", VIEW])
+  run tool(
+    &mut out,
+    false,
+    "webview_scroll",
+    "Scroll the page",
+    "Scrolls the page with the mouse wheel by about one screen.",
+    &scroll,
+    "\"direction\"",
+    false,
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_back",
+    "Go back",
+    "Goes back one page in the web view's history.",
+    &view,
+    "",
+    false,
+  )
+  let script = run props(
+    &[
+      r""" "script":{"type":"string","description":"A JavaScript expression; promises are awaited."}""",
+      VIEW,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "webview_evaluate",
+    "Run JavaScript in the page",
+    "Runs a JavaScript expression in the page and returns its value as JSON.",
+    &script,
+    "\"script\"",
+    false,
+  )
 }

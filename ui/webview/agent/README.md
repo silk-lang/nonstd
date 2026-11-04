@@ -25,9 +25,11 @@ Everything is plain data, so the agent runs in tests without a window or a netwo
 - `agent.reply(call, status, body, requests, out)` takes the HTTP answer, `agent.observe(event,
   out)` takes the page's events (snapshots, loads, unsupported commands) and answers the tool
   calls waiting on them, and `agent.stop(out)` gives every pending call an error result.
-- `tools.silk` lists the browser tools (`browser_snapshot`, `browser_navigate`, `browser_click`,
+- ui-webview's `tools` module lists the browser tools (`browser_snapshot`, `browser_navigate`, `browser_click`,
   `browser_type`, `browser_press_key`, `browser_scroll`, `browser_back`, `browser_evaluate`) and
   maps each call to a `webview.command.Command`. Refs come from the page's snapshot outline.
+  The inspector's `webview_*` tools (ui-inspect-mcp) use the same mapping, so an agent outside
+  the app drives the page the same way.
 - `ClaudeLink` posts requests on a thread and wakes the window when the answer is in. The
   request uses adaptive thinking, `effort: "medium"`, prompt caching, and server-side model
   fallbacks (`fallbacks: "default"`), so an overloaded model answers through another one.

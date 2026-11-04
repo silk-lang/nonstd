@@ -11,7 +11,10 @@ import ui_app.ui { Ui }
 import ui_app_window.lib { WindowHost }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.lib { UiTree, TreeError, FrameInput, NodeInfo, Length }
+import ui_inspect_server.lib { HostJobs }
 import silk.collections.list { List }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -169,8 +172,57 @@ effect fn idOf(tree: &mut UiTree, value: string) -> u32
   }
 }
 
+/// Runs host tool `request` the way the inspector does (a job, then asking by ticket) for up to
+/// ten turns of the loop, and returns the reply.
+effect fn hostCall(
+  app: &mut Runtime<Browser, Message, NoCommand>,
+  tree: &mut UiTree,
+  host: &mut Host,
+  request: string,
+) -> Value
+  ! TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut jobs = HostJobs.make()
+  let mut reply = String.make()
+  let first = run Json.parse(String.utf8Bytes(request))
+  run jobs.serve(&first, &mut reply)
+  let asked = run Json.parse(b"{\"cmd\":\"host\",\"ticket\":1}")
+  let mut i = 0
+  while i < 10 {
+    run host.serveJobs(&mut jobs)
+    run turn(&mut app, &mut tree, &mut host)
+    run host.serveJobs(&mut jobs)
+    run jobs.serve(&asked, &mut reply)
+    let answer = run Json.parse(reply.ownedUtf8Bytes())
+    let pending = match Json.field(&answer, "pending") {
+      Option<&Value>.Some { value } => true
+      Option<&Value>.None => false
+    }
+    if !pending {
+      return move answer
+    }
+    i = i + 1
+  }
+  return run Json.parse(reply.ownedUtf8Bytes())
+}
+
+fn textOf<'a>(reply: &'a Value, key: string) -> string<'a> {
+  return Json.field(reply, key)
+    |> Json.asString
+    |> Option<string>.unwrapOr("")
+}
+
+fn succeeded(reply: &Value) -> bool {
+  if let Option<&Value>.Some { value } = Json.field(reply, "ok") {
+    if let Value.Bool { value: on } = &value.* {
+      return on
+    }
+  }
+  return false
+}
+
 effect fn pageBody() -> ()
-  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
   ? &mut Allocator {
   let collection = run fixtures.fonts()
   let mut tree = run UiTree.make(&collection)
@@ -254,6 +306,63 @@ effect fn pageBody() -> ()
   run turn(&mut app, &mut tree, &mut host)
   run Testing.expect(app.model.answers.length() == 2, "the orphan command was answered")
 
+  // The inspector's host tools read and drive the same page, and their answers skip the app.
+  let listed = run hostCall(
+    &mut app,
+    &mut tree,
+    &mut host,
+    "{\"cmd\":\"host\",\"tool\":\"webview_list\"}",
+  )
+  run Testing.expect(succeeded(&listed), "webview_list answers")
+  run Testing.expect(
+    String.startsWith(
+      textOf(&listed, "text"),
+      "view 3: data:text/html,<title>Home</title><p>hi \"Home\"",
+    ),
+    "with the view, its URL and title",
+  )
+  let outline = run hostCall(
+    &mut app,
+    &mut tree,
+    &mut host,
+    "{\"cmd\":\"host\",\"tool\":\"webview_snapshot\"}",
+  )
+  run Testing.expect(
+    String.startsWith(textOf(&outline, "text"), "- document \"Home\""),
+    "webview_snapshot reads the page",
+  )
+  run Testing.expect(app.model.answers.length() == 2, "and its answer did not reach the app")
+  let loaded = run hostCall(
+    &mut app,
+    &mut tree,
+    &mut host,
+    "{\"cmd\":\"host\",\"tool\":\"webview_navigate\",\"view\":3,\"url\":\"data:text/html,<title>Third</title>\"}",
+  )
+  run Testing.expect(
+    String.startsWith(textOf(&loaded, "text"), "Loaded data:text/html"),
+    "webview_navigate waits for the load",
+  )
+  run Testing.expect(String.view(&app.model.page.title) == "Third", "and the app's page follows")
+  let clicked = run hostCall(
+    &mut app,
+    &mut tree,
+    &mut host,
+    "{\"cmd\":\"host\",\"tool\":\"webview_click\",\"ref\":\"e1\"}",
+  )
+  run Testing.expect(!succeeded(&clicked), "a click the backend refuses fails")
+  run Testing.expect(
+    textOf(&clicked, "error") == "the headless backend has no page elements",
+    "with its reason",
+  )
+  let missing = run hostCall(
+    &mut app,
+    &mut tree,
+    &mut host,
+    "{\"cmd\":\"host\",\"tool\":\"webview_back\",\"view\":8}",
+  )
+  run Testing.expect(!succeeded(&missing), "an unknown view fails")
+  run Testing.expect(app.model.answers.length() == 2, "none of it reached the app as an answer")
+
   // The node goes away: the view hides.
   app.send(Message.Hide)
   run drain(&mut app, &mut tree)
@@ -271,7 +380,7 @@ effect fn pageBody() -> ()
 }
 
 test effect fn pagesFollowTheirViews() -> ()
-  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run pageBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

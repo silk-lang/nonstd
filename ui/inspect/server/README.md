@@ -91,6 +91,14 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
 
+| `host` | `tool` and its arguments, or `ticket` | a job for the app's window host: `"pending": true` and a `ticket` until the host answers, then `text` (or `ok` false and the `error`) |
+
+`host` requests go to the app's window host instead of the tree (see `host.silk`). The first
+request queues a job and replies with its ticket; ask again with `{"cmd":"host","ticket":N}`
+until the answer is in. The window loop hands the jobs to `WindowHost.serve` once per turn:
+ui-webview's host serves the `webview_*` tools, and hosts without web views answer every job
+with an error. At most 64 jobs are kept.
+
 `modifiers` is a list of `shift`, `control` (or `ctrl`), `alt`, `meta`. Pointer input goes to
 the point `pointOf` finds (the centre of the node's visible box, or a grid point that hit
 testing reaches); a node that is hidden, scrolled out of view or covered is an error.

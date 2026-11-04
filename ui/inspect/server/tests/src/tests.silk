@@ -13,6 +13,7 @@ import ui_inspect_server.lib {
   roleNamed,
   Bridge,
   Action,
+  HostJob,
   writeValue
 }
 import ui_inspect.lib { InspectOptions, inspectNode }
@@ -729,7 +730,7 @@ effect fn mcpBody() -> ()
     &mut tree,
     "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
   )
-  run Testing.expect(toolCount(&tools) == 15, "fifteen tools")
+  run Testing.expect(toolCount(&tools) == 24, "fifteen ui tools and nine webview tools")
   run Testing.expect(same(text(&tools, "id"), "t"), "string ids are echoed")
 
   // Snapshot is describe; inspect is the node view.
@@ -901,4 +902,117 @@ test effect fn mcpToolsDriveTheTree() -> ()
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run mcpBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Host tools: the bridge asks, the protocol queues a job, the host answers it later and the
+// bridge asks again by ticket.
+
+effect fn hostBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  let mut bridge = run Bridge.make("unix:/tmp/test.sock")
+  let mut out = String.make()
+  let mut reply = String.make()
+  let mut action = run bridge.handle(
+    b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"webview_click\",\"arguments\":{\"ref\":\"e3\",\"view\":2}}}",
+    &mut out,
+  )
+  run Testing.expect(action == Action.Ask, "a host tool asks the app")
+  let first = run Json.parse(out.ownedUtf8Bytes())
+  run Testing.expect(
+    same(Json.asString(Json.field(&first, "cmd")) |> Option<string>.unwrapOr(""), "host"),
+    "with the host command",
+  )
+  run Testing.expect(
+    same(Json.asString(Json.field(&first, "tool")) |> Option<string>.unwrapOr(""), "webview_click"),
+    "naming the tool",
+  )
+  run Testing.expect(
+    same(Json.asString(Json.field(&first, "ref")) |> Option<string>.unwrapOr(""), "e3"),
+    "and passing its arguments",
+  )
+  drop run protocol.handle(&mut tree, &first, 0, &mut reply)
+  let pending = run Json.parse(reply.ownedUtf8Bytes())
+  run Testing.expect(
+    (Json.asU64(Json.field(&pending, "ticket")) |> Option<u64>.unwrapOr(0)) == 1,
+    "the app answers with a ticket",
+  )
+  run Testing.expect(protocol.jobs.waiting(), "and a job waits for the host")
+
+  // Not answered yet: the bridge asks again by ticket, and the job stays pending.
+  action = run bridge.answer(reply.ownedUtf8Bytes(), true, 50, &mut out)
+  run Testing.expect(action == Action.Retry, "pending, the bridge retries")
+  run Testing.expect(same(String.view(&out), "{\"cmd\":\"host\",\"ticket\":1}"), "by ticket")
+  let job = run protocol.jobs.take()
+  run Testing.expect(Option<HostJob>.isSome(&job), "the host takes the job")
+  run Testing.expect(!protocol.jobs.waiting(), "once")
+  let again = run Json.parse(out.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &again, 0, &mut reply)
+  action = run bridge.answer(reply.ownedUtf8Bytes(), true, 100, &mut out)
+  run Testing.expect(action == Action.Retry, "still pending while the host works")
+
+  // The host answers.
+  if let Option<HostJob>.Some { value } = move job {
+    let request = run Json.parse(String.utf8Bytes(String.view(&value.request)))
+    run Testing.expect(
+      same(Json.asString(Json.field(&request, "ref")) |> Option<string>.unwrapOr(""), "e3"),
+      "the job carries the request",
+    )
+    run protocol.jobs.answer(value.ticket, true, "Done.")
+  }
+  let last = run Json.parse(out.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &last, 0, &mut reply)
+  action = run bridge.answer(reply.ownedUtf8Bytes(), true, 150, &mut out)
+  run Testing.expect(action == Action.Respond, "answered, the bridge responds")
+  let response = run Json.parse(out.ownedUtf8Bytes())
+  run Testing.expect(same(content(&response, "text"), "Done."), "with the host's text")
+  run Testing.expect(!isError(&response), "as a result")
+  run Testing.expect(protocol.jobs.length() == 0, "and the job is gone")
+
+  // A failed job, and a ticket nobody knows.
+  drop run protocol.handle(&mut tree, &first, 0, &mut reply)
+  if let Option<HostJob>.Some { value } = run protocol.jobs.take() {
+    run protocol.jobs.answer(value.ticket, false, "No web view is open.")
+    let mut ask = run String.copy("{\"cmd\":\"host\",\"ticket\":")
+    run writeInt(&mut ask, value.ticket)
+    run ask.append("}")
+    let asked = run Json.parse(ask.ownedUtf8Bytes())
+    drop run protocol.handle(&mut tree, &asked, 0, &mut reply)
+    let failed = run Json.parse(reply.ownedUtf8Bytes())
+    run Testing.expect(
+      same(
+        Json.asString(Json.field(&failed, "error")) |> Option<string>.unwrapOr(""),
+        "No web view is open.",
+      ),
+      "a failed job replies its error",
+    )
+  }
+  let unknown = run Json.parse(b"{\"cmd\":\"host\",\"ticket\":99}")
+  drop run protocol.handle(&mut tree, &unknown, 0, &mut reply)
+  let none = run Json.parse(reply.ownedUtf8Bytes())
+  run Testing.expect(
+    !Option<&Value>.isSome(&Json.field(&none, "pending")),
+    "an unknown ticket is not pending",
+  )
+
+  // A host that never answers times out.
+  drop run bridge.handle(
+    b"{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"webview_list\",\"arguments\":{\"timeout\":100}}}",
+    &mut out,
+  )
+  let listed = run Json.parse(out.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &listed, 0, &mut reply)
+  action = run bridge.answer(reply.ownedUtf8Bytes(), true, 200, &mut out)
+  run Testing.expect(action == Action.Respond, "past its timeout the call ends")
+  let timedOut = run Json.parse(out.ownedUtf8Bytes())
+  run Testing.expect(isError(&timedOut), "as an error")
+}
+
+test effect fn hostToolsWaitForTheHost() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hostBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
