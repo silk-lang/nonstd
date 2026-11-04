@@ -1,0 +1,393 @@
+//! Document tests: maps resolve concurrent edits, deltas survive encoding, replicas that trade
+//! encoded deltas in random order converge, and a checkout rebuilds an earlier version.
+import clock { DeltaId, Frontier }
+import codec { DecodeError }
+import doc { Applied, Delta, Document }
+import map { Map }
+import rich { Expand, RichText, Span }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+import silk.testing.testing { AssertionError, Testing }
+
+type Failures = AssertionError<'static> | OutOfMemoryError
+
+const BODY: u64 = 1
+
+const META: u64 = 2
+
+fn bytes(text: string) -> &[u8] {
+  return String.utf8Bytes(text)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut k: usize = 0
+  while k < left.length {
+    if left[k] != right[k] {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+fn valueIs(document: &Document, key: string, expected: string) -> bool {
+  return match document.map(META) {
+    Option<&Map>.Some { value: found } => match found.get(bytes(key)) {
+      Option<&[u8]>.Some { value } => same(value, bytes(expected))
+      Option<&[u8]>.None => false
+    }
+    Option<&Map>.None => false
+  }
+}
+
+fn hasKey(document: &Document, key: string) -> bool {
+  return match document.map(META) {
+    Option<&Map>.Some { value } => value.has(bytes(key))
+    Option<&Map>.None => false
+  }
+}
+
+// Sends every delta `from` has that `to` lacks, through bytes.
+effect fn sync(from: &Document, to: &mut Document) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let seqs = run from.missingFor(to.frontier())
+  let mut k: usize = 0
+  while k < seqs.length() {
+    let encoded = run from.delta(seqs.get(k)).toBytes()
+    let decoded = run Effect.result(Delta.fromBytes(encoded.asSlice()))
+    match move decoded {
+      Result<Delta, DecodeError | OutOfMemoryError>.Success { value } => {
+        let applied = run to.apply(move value)
+        let ok = match applied {
+          Applied.Missing => false
+          _ => true
+        }
+        run Testing.expect(ok, "a delta sent in order applies or is already here")
+      }
+      _ => run Testing.expect(false, "a delta decodes")
+    }
+    k = k + 1
+  }
+}
+
+effect fn mapsResolveConcurrentEdits() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut a = run Document.make(1)
+  let mut b = run Document.make(2)
+  run a.set(META, bytes("title"), bytes("draft"))
+  run a.set(META, bytes("owner"), bytes("julia"))
+  drop run a.commit()
+  run sync(&a, &mut b)
+  run Testing.expect(valueIs(&b, "title", "draft"), "a set arrives")
+
+  // A removes the title while B sets it: the set wins.
+  run a.remove(META, bytes("title"))
+  drop run a.commit()
+  run b.set(META, bytes("title"), bytes("final"))
+  drop run b.commit()
+  run sync(&a, &mut b)
+  run sync(&b, &mut a)
+  run Testing.expect(valueIs(&a, "title", "final"), "a concurrent set beats a removal")
+  run Testing.expect(valueIs(&b, "title", "final"), "both replicas keep the set")
+
+  // Both set the owner at once: the higher delta id wins on both.
+  run a.set(META, bytes("owner"), bytes("a"))
+  drop run a.commit()
+  run b.set(META, bytes("owner"), bytes("b"))
+  drop run b.commit()
+  run sync(&a, &mut b)
+  run sync(&b, &mut a)
+  let agree = valueIs(&a, "owner", "a") == valueIs(&b, "owner", "a")
+  run Testing.expect(agree, "concurrent sets settle the same way")
+
+  // A removal that saw the set removes it.
+  run a.remove(META, bytes("owner"))
+  drop run a.commit()
+  run sync(&a, &mut b)
+  run Testing.expect(!hasKey(&b, "owner"), "a removal that saw the set removes it")
+}
+
+effect fn readText(document: &Document) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match document.text(BODY) {
+    Option<&RichText>.Some { value } => run value.read()
+    Option<&RichText>.None => String.make()
+  }
+}
+
+effect fn spansOf(document: &Document) -> List<Span>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match document.text(BODY) {
+    Option<&RichText>.Some { value } => run value.spans()
+    Option<&RichText>.None => List<Span>.make()
+  }
+}
+
+fn sameSpans(left: &List<Span>, right: &List<Span>) -> bool {
+  if left.length() != right.length() {
+    return false
+  }
+  let mut s: usize = 0
+  while s < left.length() {
+    let a = &left.asSlice()[s]
+    let b = &right.asSlice()[s]
+    if a.start != b.start || a.length != b.length || a.attrs.length() != b.attrs.length() {
+      return false
+    }
+    let mut k: usize = 0
+    while k < a.attrs.length() {
+      if a.attrs.get(k).key != b.attrs.get(k).key
+        || !a.attrs.get(k).mark.same(&b.attrs.get(k).mark) {
+        return false
+      }
+      k = k + 1
+    }
+    s = s + 1
+  }
+  return true
+}
+
+effect fn transactionsAreOneDelta() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut a = run Document.make(1)
+  run a.insertText(BODY, 0, bytes("hello"))
+  run a.mark(BODY, 0, 5, 1, bytes(""), Expand.End)
+  run a.set(META, bytes("title"), bytes("greeting"))
+  run a.insertEmbed(BODY, 5, bytes("image"))
+  let seq = run a.commit()
+  let committed = match seq {
+    Option<usize>.Some { value } => value == 0
+    Option<usize>.None => false
+  }
+  run Testing.expect(committed, "the commit is the first delta")
+  run Testing.expect(a.deltaCount() == 1, "four edits make one delta")
+  run Testing.expect(a.delta(0).ops.length() == 5, "the embed is two operations")
+  let empty = run a.commit()
+  let none = match empty {
+    Option<usize>.Some { value: _ } => false
+    Option<usize>.None => true
+  }
+  run Testing.expect(none, "an empty commit makes no delta")
+
+  // A truncated delta fails to decode instead of trapping.
+  let encoded = run a.delta(0).toBytes()
+  let cut = Slice.view(encoded.asSlice(), 0, encoded.length() - 1)
+  let decoded = run Effect.result(Delta.fromBytes(cut))
+  let failed = match move decoded {
+    Result<Delta, DecodeError | OutOfMemoryError>.Success { value: _ } => false
+    _ => true
+  }
+  run Testing.expect(failed, "a truncated delta does not decode")
+}
+
+struct Random {
+  state: u64,
+}
+
+impl Random {
+  fn next(self: &mut Self) -> u64 {
+    let mut x = self.state
+    x = u64.bitXor(x, u64.shiftLeft(x, 13))
+    x = u64.bitXor(x, u64.shiftRight(x, 7))
+    x = u64.bitXor(x, u64.shiftLeft(x, 17))
+    self.state = x
+    return x
+  }
+
+  fn below(self: &mut Self, bound: usize) -> usize {
+    if bound == 0 {
+      return 0
+    }
+    return u64.toUsize(self.next() % usize.toU64(bound))
+  }
+}
+
+effect fn randomEdit(document: &mut Document, random: &mut Random) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let length = document.textLength(BODY)
+  let choice = random.below(10)
+  if choice < 5 || length == 0 {
+    let piece = Slice.view(bytes("abcdefghij"), random.below(8), 1 + random.below(2))
+    run document.insertText(BODY, random.below(length + 1), piece)
+    return ()
+  }
+  let at = random.below(length)
+  let mut count = 1 + random.below(3)
+  if at + count > length {
+    count = length - at
+  }
+  if choice < 7 {
+    run document.deleteText(BODY, at, count)
+  } else if choice < 9 {
+    run document.mark(
+      BODY,
+      at,
+      count,
+      u64.toU32(usize.toU64(random.below(3))),
+      bytes("v"),
+      Expand.End,
+    )
+  } else {
+    let key = Slice.view(bytes("abc"), random.below(3), 1)
+    run document.set(META, key, Slice.view(bytes("xyz"), random.below(3), 1))
+  }
+}
+
+// Replicas edit at random and trade deltas through bytes in random order, holding back the ones
+// whose parents have not arrived. One replica checks out a version it passed through.
+effect fn documentsConverge(seed: u64) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut random = Random { state: seed }
+  let mut replicas = List<Document>.make()
+  let mut r: usize = 0
+  while r < 3 {
+    let replica = run Document.make(usize.toU64(r) + 1)
+    run replicas.append(move replica)
+    r = r + 1
+  }
+  let mut inbox = List<List<u8>>.make()
+  let mut inboxTarget = List<usize>.make()
+  let mut savedVersion = Frontier.empty()
+  let mut savedText = String.make()
+  let mut step: usize = 0
+  while step < 300 {
+    let pick = random.below(3)
+    if random.below(3) > 0 {
+      let document = &mut replicas.asMutSlice()[pick]
+      let edits = 1 + random.below(3)
+      let mut e: usize = 0
+      while e < edits {
+        run randomEdit(&mut document, &mut random)
+        e = e + 1
+      }
+      let committed = run document.commit()
+      match committed {
+        Option<usize>.Some { value } => {
+          let encoded = run document.delta(value).toBytes()
+          let mut t: usize = 0
+          while t < 3 {
+            if t != pick {
+              let mut copy = List<u8>.make()
+              run copy.appendSlice(encoded.asSlice())
+              run inbox.append(move copy)
+              run inboxTarget.append(t)
+            }
+            t = t + 1
+          }
+        }
+        Option<usize>.None => {}
+      }
+    } else if inbox.length() > 0 {
+      let at = random.below(inbox.length())
+      let target = inboxTarget.get(at)
+      let decoded = run Effect.result(Delta.fromBytes(inbox.asSlice()[at].asSlice()))
+      let delta = match move decoded {
+        Result<Delta, DecodeError | OutOfMemoryError>.Success { value } => move value
+        _ => Intrinsic.trap("documentsConverge: a delta does not decode")
+      }
+      let applied = run replicas.asMutSlice()[target].apply(move delta)
+      let keep = match applied {
+        Applied.Missing => true
+        _ => false
+      }
+      if !keep {
+        drop inbox.remove(at)
+        drop inboxTarget.remove(at)
+      }
+    }
+    if step == 150 {
+      savedVersion = run replicas.asSlice()[0].frontier().copy()
+      savedText = run readText(&replicas.asSlice()[0])
+    }
+    step = step + 1
+  }
+
+  // Deliver what is left, retrying held-back deltas until none applies.
+  let mut progress = true
+  while progress && inbox.length() > 0 {
+    progress = false
+    let mut at: usize = 0
+    while at < inbox.length() {
+      let target = inboxTarget.get(at)
+      let decoded = run Effect.result(Delta.fromBytes(inbox.asSlice()[at].asSlice()))
+      let delta = match move decoded {
+        Result<Delta, DecodeError | OutOfMemoryError>.Success { value } => move value
+        _ => Intrinsic.trap("documentsConverge: a delta does not decode")
+      }
+      let applied = run replicas.asMutSlice()[target].apply(move delta)
+      let keep = match applied {
+        Applied.Missing => true
+        _ => false
+      }
+      if keep {
+        at = at + 1
+      } else {
+        drop inbox.remove(at)
+        drop inboxTarget.remove(at)
+        progress = true
+      }
+    }
+  }
+  run Testing.expect(inbox.length() == 0, "every delta applies in the end")
+  let first = run readText(&replicas.asSlice()[0])
+  let firstSpans = run spansOf(&replicas.asSlice()[0])
+  r = 1
+  while r < 3 {
+    let other = run readText(&replicas.asSlice()[r])
+    run Testing.expect(first.view() == other.view(), "replicas read the same text")
+    let spans = run spansOf(&replicas.asSlice()[r])
+    run Testing.expect(sameSpans(&firstSpans, &spans), "replicas show the same marks")
+    let keys: [string; 3] = ["a", "b", "c"]
+    let mut k: usize = 0
+    while k < 3 {
+      let left = hasKey(&replicas.asSlice()[0], keys[k])
+      let right = hasKey(&replicas.asSlice()[r], keys[k])
+      run Testing.expect(left == right, "replicas hold the same keys")
+      k = k + 1
+    }
+    r = r + 1
+  }
+  let past = run replicas.asSlice()[0].checkout(&savedVersion, 9)
+  let pastText = run readText(&past)
+  run Testing.expect(pastText.view() == savedText.view(), "a checkout rebuilds the old text")
+  run Testing.expect(past.frontier().same(&savedVersion), "a checkout is at the old version")
+}
+
+test effect fn mapsResolveConcurrentEditsTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run mapsResolveConcurrentEdits() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn transactionsAreOneDeltaTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run transactionsAreOneDelta() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn documentsConvergeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut seed: u64 = 3
+  while seed < 9 {
+    run documentsConverge(seed) |> Effect.provideMut<Allocator>(&mut allocator)
+    seed = seed + 1
+  }
+}
