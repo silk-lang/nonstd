@@ -100,6 +100,8 @@ pub struct Painter<'p, 'a> {
   pub previous: &'p Scene,
   pub replayable: bool,
   pub hashes: &'p List<u64>,
+  /// Per fragment: the bounds of its subtree's ink, from [`inkFragments`].
+  pub ink: &'p List<Rect<f32>>,
   pub stats: &'p mut FrameStats,
   pub order: &'p mut List<u32>,
   pub frame: u64,
@@ -859,10 +861,121 @@ effect fn noteOrder(p: &mut Painter, f: &Fragment) -> ()
   }
 }
 
+/// Fragments whose ink cannot be bounded: canvas commands draw against the parent's mask.
+const UNBOUNDED_INK: f32 = 1.0e30
+
+fn unboundedInk() -> Rect<f32> {
+  return Rect<f32>.new(-UNBOUNDED_INK, -UNBOUNDED_INK, UNBOUNDED_INK, UNBOUNDED_INK)
+}
+
+fn grow(rect: Rect<f32>, by: f32) -> Rect<f32> {
+  return Rect<f32>.new(rect.xMin - by, rect.yMin - by, rect.xMax + by, rect.yMax + by)
+}
+
+fn unite(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+/// Where fragment `index` itself may put ink, in CSS pixels of the viewport, not counting its
+/// descendants. Generous on purpose: text gets its line height again on every side for
+/// overhanging glyphs, and a shadow its offset, spread and twice its blur.
+fn ownInk(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+) -> Rect<f32> {
+  let f = output.fragments.values.asSlice()[index]
+  let box = borderBox(&f)
+  if f.kind == FragmentKind.Text {
+    return grow(box, f32.max(f.size.height, 16.0))
+  }
+  let slot = styleSlot(slots, css, nodes, f.source)
+  if slot == NONE {
+    return grow(box, 2.0)
+  }
+  let node = &nodes.asSlice()[u32.toUsize(slot)]
+  if node.kind == NodeKind.Canvas {
+    return unboundedInk()
+  }
+  let c = node.computed
+  let mut reach: f32 = 2.0
+  if c.hasShadow && !c.shadow.inset {
+    let offset = f32.max(f32.abs(c.shadow.offsetX), f32.abs(c.shadow.offsetY))
+    reach = reach + offset + f32.max(c.shadow.spread, 0.0) + 2.0 * c.shadow.blur
+  }
+  return grow(box, reach)
+}
+
+/// Bounds every fragment's ink together with its descendants', children before parents, in CSS
+/// pixels of the viewport. A clipping box keeps only its own ink, since its content cannot draw
+/// outside it. [`paintFragment`] skips a subtree whose bounds miss the current clip.
+pub effect fn inkFragments(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  out: &mut List<Rect<f32>>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = output.fragments.values.length()
+  out.clear()
+  let empty = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
+  run out.appendRepeated(empty, count)
+  let mut index = count
+  while index > 0 {
+    index = index - 1
+    let f = output.fragments.values.asSlice()[index]
+    let own = ownInk(output, slots, css, nodes, index)
+    let below = out.get(index)
+    let mut clips = false
+    if f.kind == FragmentKind.Box && !f.positioningShell {
+      let slot = slotIn(slots, f.source)
+      if slot != NONE {
+        clips = nodes.asSlice()[u32.toUsize(slot)].computed.clips()
+      }
+    }
+    let total = if clips {
+      own
+    } else {
+      unite(own, below)
+    }
+    out.set(index, total)
+    let parent = f.parent
+    if parent != NO_INDEX {
+      let above = out.get(parent)
+      out.set(parent, unite(above, total))
+    }
+  }
+}
+
+/// Whether the subtree of fragment `index` can show inside `mask`.
+fn inkVisible(p: &Painter, index: usize, mask: ContentMask) -> bool {
+  if index >= p.ink.length() {
+    return true
+  }
+  let ink = p.ink.get(index)
+  let s = p.scale
+  return ink.xMin * s < mask.bounds.xMax && ink.xMax * s > mask.bounds.xMin
+    && ink.yMin * s < mask.bounds.yMax
+    && ink.yMax * s > mask.bounds.yMin
+}
+
 /// Paints fragment `index` and its descendants.
 pub effect fn paintFragment(p: &mut Painter, index: usize, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  if !inkVisible(&p.*, index, mask) {
+    p.stats.culledSubtrees = p.stats.culledSubtrees + 1
+    return ()
+  }
   let f = p.output.fragments.values.asSlice()[index]
   if f.positioningShell {
     run paintChildren(&mut p, index, mask)
