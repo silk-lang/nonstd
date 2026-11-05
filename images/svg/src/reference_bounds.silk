@@ -4,7 +4,7 @@ import scene { Style, LineCap, LineJoin, RenderError, StrokeSpace }
 import mapping { Mapping }
 import mapping
 import vector_path
-import svg_geometry.geometry { Path, Rect, isValidRect }
+import svg_geometry.geometry { Path, Rect, Transform, isValidRect }
 import svg_geometry.bounds { Result as BoundsResult }
 import svg_geometry.bounds
 import vector.path { Path as VectorPath }
@@ -24,6 +24,7 @@ import silk.core.ownership { Copy }
 import silk.collections.hash { Hash, HashKey, HashSeed }
 import silk.collections.hash_map { HashMap }
 import silk.num.usize
+import silk.num.u32
 
 struct MetricKey {
   path: usize,
@@ -90,10 +91,32 @@ struct Entry {
   path: VectorPath
 }
 
+// A path's analytic bounds under one affine transform: 0 empty, 1 finite, 2 limited.
+struct AffineBounds {
+  transform: Transform,
+  kind: u8,
+  rect: Rect,
+}
+
+impl Copy for AffineBounds {}
+
+fn sameTransform(a: Transform, b: Transform) -> bool {
+  return f64.toBits(a.xx) == f64.toBits(b.xx) && f64.toBits(a.yx) == f64.toBits(b.yx)
+    && f64.toBits(a.xy) == f64.toBits(b.xy)
+    && f64.toBits(a.yy) == f64.toBits(b.yy)
+    && f64.toBits(a.dx) == f64.toBits(b.dx)
+    && f64.toBits(a.dy) == f64.toBits(b.dy)
+}
+
 pub struct Cache {
   paths: List<Entry>,
   metrics: HashMap<MetricKey, f64>,
-  stroker: Stroker
+  stroker: Stroker,
+  // Each path's last affine fill bounds, since several consumers ask for the same box. A
+  // path's slot is 0 for none or 1 + its index in affine.
+  affineSlots: List<u32>,
+  affine: List<AffineBounds>,
+  remember: bool
 }
 
 impl Cache {
@@ -102,7 +125,16 @@ impl Cache {
       paths: List<Entry>.make(),
       metrics: HashMap<MetricKey, f64>.make(Hash.seed(0)),
       stroker: Stroker.make(),
+      affineSlots: List<u32>.make(),
+      affine: List<AffineBounds>.make(),
+      remember: false,
     }
+  }
+
+  // While on, affine fill bounds are kept per path, for a caller that is about to ask for the
+  // same boxes again.
+  pub fn rememberAffine(self: &mut Self, on: bool) -> () {
+    self.remember = on
   }
 
   effect fn prepare(self: &mut Cache, paths: &[Path], index: usize) -> ()
@@ -221,12 +253,55 @@ impl Cache {
     }
     match &transform.* {
       Mapping.Affine { value } => {
-        return match &bounds.pathTransformed(&paths[index], value) {
-          BoundsResult.Finite { rect } => Option<Rect>.some(rect)
-          BoundsResult.Empty => Option<Rect>.None
-          BoundsResult.Limited => {
-            fail RenderError.InvalidGeometry
+        if !self.remember {
+          return match &bounds.pathTransformed(&paths[index], value) {
+            BoundsResult.Finite { rect } => Option<Rect>.some(rect)
+            BoundsResult.Empty => Option<Rect>.None
+            BoundsResult.Limited => {
+              fail RenderError.InvalidGeometry
+            }
           }
+        }
+        let mut memo = AffineBounds {
+          transform: value,
+          kind: 2,
+          rect: Rect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 },
+        }
+        let have = self.affineSlots.length()
+        if have < paths.length {
+          run self.affineSlots.appendRepeated(0, paths.length - have)
+        }
+        let slot = u32.toUsize(self.affineSlots.asSlice()[index])
+        if slot != 0 && sameTransform(self.affine.asSlice()[slot - 1].transform, value) {
+          memo = self.affine.asSlice()[slot - 1]
+        } else {
+          match &bounds.pathTransformed(&paths[index], value) {
+            BoundsResult.Finite { rect } => {
+              memo.kind = 1
+              memo.rect = rect
+            }
+            BoundsResult.Empty => {
+              memo.kind = 0
+            }
+            BoundsResult.Limited => {}
+          }
+          if slot != 0 {
+            let mut entries = self.affine.asMutSlice()
+            entries[slot - 1] = memo
+          } else {
+            let mut slots = self.affineSlots.asMutSlice()
+            slots[index] = usize.toU32(self.affine.length() + 1)
+            drop slots
+            run self.affine.append(memo)
+          }
+        }
+        if memo.kind == 2 {
+          fail RenderError.InvalidGeometry
+        }
+        return if memo.kind == 1 {
+          Option<Rect>.some(memo.rect)
+        } else {
+          Option<Rect>.None
         }
       }
       Mapping.Projective { value } => {
