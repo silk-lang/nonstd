@@ -38,6 +38,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`crdt/store-sqlite`](crdt/store-sqlite) | `crdt-store-sqlite` | A crdt-core Store kept in SQLite through db/sqlite |  |
 | [`crdt/sync`](crdt/sync) | `crdt-sync` | CRDT sync in one exchange: transports, clients, memory and stored servers, TCP |  |
 | [`db/sqlite`](db/sqlite) | `db-sqlite` | SQLite bindings with prepared statements and transactions, built from the pinned amalgamation |  |
+| [`crdt/bench`](crdt/bench) | `crdt-bench` | | |
 
 ### native
 
