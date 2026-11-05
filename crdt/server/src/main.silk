@@ -1,0 +1,105 @@
+//! The CRDT sync server: answers sync requests on a local TCP port and keeps every document in
+//! an SQLite file.
+//!
+//! `CRDT_SERVER_PORT` sets the port (7470 by default) and `CRDT_SERVER_DB` the database file
+//! (`crdt-server.db` in the working directory by default). One request is served at a time.
+import core.store { StoreError }
+import store_sqlite.sqlite_store { SqliteStore }
+import sync.sync { MemoryServer, StoredServer }
+import sync.tcp { DEFAULT_PORT, listenLocal, serveOne }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.byte_duplex { ByteIoError }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native { NativeSocketError }
+import silk.num.u64
+import silk.num.u8
+import silk.core.result { Result }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.text.string { InvalidUtf8, String }
+
+/// The actor id of the server's own replicas; clients must use other ids.
+const SERVER_ACTOR: u64 = 18446744073709551615
+
+type Failures = StoreError | NativeSocketError | ByteIoError | HostInputError | OutOfMemoryError
+
+fn digits(bytes: &[u8]) -> Option<u16> {
+  if bytes.length == 0 || bytes.length > 5 {
+    return Option<u16>.None
+  }
+  let mut value: u64 = 0
+  let mut k: usize = 0
+  while k < bytes.length {
+    let digit = bytes[k]
+    if digit < 48 || digit > 57 {
+      return Option<u16>.None
+    }
+    value = value * 10 + u8.toU64(digit - 48)
+    k = k + 1
+  }
+  if value == 0 || value > 65535 {
+    return Option<u16>.None
+  }
+  return Option<u16>.Some { value: u64.toU16(value) }
+}
+
+effect fn serve() -> i32
+  ! Failures
+  ? &mut HostInput | &mut Allocator {
+  let mut port = DEFAULT_PORT
+  match run HostInput.variableNamed("CRDT_SERVER_PORT") {
+    Option<Bytes>.Some { value } => match digits(value.asSlice()) {
+      Option<u16>.Some { value: parsed } => {
+        port = parsed
+      }
+      Option<u16>.None => {
+        StderrWriter.print("crdt-server: CRDT_SERVER_PORT is not a port number\n", &())
+        return 2
+      }
+    }
+    Option<Bytes>.None => {}
+  }
+  let mut path = run String.copy("crdt-server.db")
+  match run HostInput.variableNamed("CRDT_SERVER_DB") {
+    Option<Bytes>.Some { value } => {
+      let text = String.fromUtf8(value.asSlice()) |> Result<string, InvalidUtf8>.unwrapOr("")
+      if text != "" {
+        path = run String.copy(text)
+      }
+    }
+    Option<Bytes>.None => {}
+  }
+  let mut store = run SqliteStore.open(String.view(&path))
+  let mut listener = run listenLocal(port)
+  StderrWriter.print(
+    "crdt-server: listening on 127.0.0.1:{}, saving to {}\n",
+    &(port, String.view(&path)),
+  )
+  let mut server = StoredServer.over(MemoryServer.make(SERVER_ACTOR), &mut store)
+  let mut clock = OsMonotonicClock.make()
+  while true {
+    let served = run Effect.result(serveOne(&mut listener, &mut server))
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+    drop served
+  }
+  return 0
+}
+
+effect fn failed(error: Failures) -> i32 {
+  drop error
+  StderrWriter.print(
+    "crdt-server: could not start (the port may be taken, or the database unreadable)\n",
+    &(),
+  )
+  return 1
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(serve(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

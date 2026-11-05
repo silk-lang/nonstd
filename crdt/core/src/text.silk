@@ -1,0 +1,512 @@
+//! Collaborative plain text: a sequence CRDT over a persistent fragment tree.
+//!
+//! Every inserted run of bytes is named by the delta that inserted it, so a byte is named by that
+//! delta and its offset in the run (a [`CharId`]). An insertion records the byte to its left and
+//! the byte to its right when it was made. Replicas place concurrent insertions between the same
+//! neighbours with the YATA rule (the one Yjs uses), so every replica orders them the same way and
+//! a run typed by one person is never interleaved with a run typed by another. Deleted bytes stay
+//! in the tree as tombstones so later insertions can still name them.
+//!
+//! The unit of offsets is the UTF-8 byte. Editors must insert and delete at scalar boundaries.
+import btree.tree { Item, Root, Summary, Tree }
+import clock { DeltaId }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.result { Result }
+import silk.text.string { InvalidUtf8, String }
+
+/// The name of one byte: the delta that inserted it and its offset in that insertion.
+///
+/// A zero `id.lamport` names no byte: the start or the end of the text.
+pub struct CharId {
+  pub id: DeltaId,
+  pub offset: usize,
+}
+
+impl Copy for CharId {}
+
+impl CharId {
+  /// No byte: the start of the text as a left origin, the end as a right origin.
+  pub fn none() -> CharId {
+    return CharId { id: DeltaId.make(0, 0), offset: 0 }
+  }
+
+  /// Byte `offset` of the insertion `id`.
+  pub fn of(id: DeltaId, offset: usize) -> CharId {
+    return CharId { id: id, offset: offset }
+  }
+
+  /// Whether this names no byte.
+  pub fn isNone(self: &Self) -> bool {
+    return self.id.lamport == 0
+  }
+
+  /// Whether both name the same byte, or both name none.
+  pub fn same(self: &Self, other: &CharId) -> bool {
+    return self.id.same(&other.id) && self.offset == other.offset
+  }
+}
+
+/// A run of bytes from one insertion: bytes `start` to `start + length` of insertion `id`.
+pub struct CharRun {
+  pub id: DeltaId,
+  pub start: usize,
+  pub length: usize,
+}
+
+impl Copy for CharRun {}
+
+/// An insertion as replicas exchange it: the bytes and the neighbours they were typed between.
+pub struct InsertOp {
+  pub id: DeltaId,
+  pub originLeft: CharId,
+  pub originRight: CharId,
+  pub bytes: List<u8>,
+}
+
+/// A deletion as replicas exchange it: the runs of bytes it removes.
+pub struct DeleteOp {
+  pub runs: List<CharRun>,
+}
+
+struct Fragment {
+  id: DeltaId,
+  start: usize,
+  length: usize,
+  deleted: bool,
+}
+
+impl Copy for Fragment {}
+
+/// What a fragment tree knows about a run of fragments: its visible and total bytes.
+pub struct TextSummary {
+  pub visible: usize,
+  pub total: usize,
+}
+
+impl Copy for TextSummary {}
+
+impl Summary for TextSummary {
+  fn zero() -> TextSummary {
+    return TextSummary { visible: 0, total: 0 }
+  }
+
+  fn add(self: &mut Self, other: &TextSummary) -> () {
+    self.visible = self.visible + other.visible
+    self.total = self.total + other.total
+  }
+}
+
+impl Item<TextSummary> for Fragment {
+  fn summary(self: &Self) -> TextSummary {
+    if self.deleted {
+      return TextSummary { visible: 0, total: self.length }
+    }
+    return TextSummary { visible: self.length, total: self.length }
+  }
+}
+
+fn visible(summary: &TextSummary) -> usize {
+  return summary.visible
+}
+
+fn total(summary: &TextSummary) -> usize {
+  return summary.total
+}
+
+/// One fragment of a text: a run of bytes from one insertion, all deleted or all visible.
+pub struct Piece {
+  pub chars: CharRun,
+  pub deleted: bool,
+}
+
+impl Copy for Piece {}
+
+struct Insertion {
+  originLeft: CharId,
+  originRight: CharId,
+  buffer: usize,
+  length: usize,
+}
+
+impl Copy for Insertion {}
+
+/// One replica of a text.
+pub struct Text {
+  tree: Tree<Fragment, TextSummary>,
+  root: Root,
+  insertions: HashMap<DeltaId, Insertion>,
+  bytes: List<u8>,
+}
+
+impl Text {
+  /// An empty text.
+  pub fn make() -> Text {
+    let filler = Fragment { id: DeltaId.make(0, 0), start: 0, length: 0, deleted: true }
+    return Text {
+      tree: Tree<Fragment, TextSummary>.make(filler),
+      root: Root.empty(),
+      insertions: HashMap<DeltaId, Insertion>.make(Hash.seed(1099511628211)),
+      bytes: List<u8>.make(),
+    }
+  }
+
+  /// The number of visible bytes.
+  pub fn length(self: &Self) -> usize {
+    return self.tree.summary(self.root).visible
+  }
+
+  /// The number of fragments, tombstones included, for tests and memory accounting.
+  pub fn fragmentCount(self: &Self) -> usize {
+    return self.tree.length(self.root)
+  }
+
+  /// The visible text.
+  pub effect fn read(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<u8>.make()
+    run self.readBytes(&mut out)
+    let copied = run String.copyUtf8(out.asSlice())
+    return match move copied {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      _ => String.make()
+    }
+  }
+
+  /// Appends the visible bytes to `out`.
+  pub effect fn readBytes(self: &Self, out: &mut List<u8>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.tree.length(self.root)
+    let mut k: usize = 0
+    while k < count {
+      let fragment = self.tree.get(self.root, k)
+      if !fragment.deleted {
+        let insertion = self.insertionOf(fragment.id)
+        let piece = Slice.view(
+          self.bytes.asSlice(),
+          insertion.buffer + fragment.start,
+          fragment.length,
+        )
+        run out.appendSlice(piece)
+      }
+      k = k + 1
+    }
+  }
+
+  /// Inserts `bytes` at visible offset `offset` as delta `id`, and returns the operation to send.
+  ///
+  /// Traps if `offset` is past the end.
+  pub effect fn insert(self: &mut Self, id: DeltaId, offset: usize, bytes: &[u8]) -> InsertOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if offset > self.length() {
+      Intrinsic.trap("Text.insert: the offset is past the end")
+    }
+    let mut at: usize = 0
+    let mut left = CharId.none()
+    if offset > 0 {
+      let place = self.tree.seek(self.root, visible, offset - 1)
+      let fragment = self.tree.get(self.root, place.index)
+      let inside = offset - place.before
+      left = CharId.of(fragment.id, fragment.start + inside - 1)
+      if inside < fragment.length {
+        run self.split(place.index, inside)
+      }
+      at = place.index + 1
+    }
+    let mut right = CharId.none()
+    if at < self.tree.length(self.root) {
+      let next = self.tree.get(self.root, at)
+      right = CharId.of(next.id, next.start)
+    }
+    let mut copy = List<u8>.make()
+    run copy.appendSlice(bytes)
+    let op = InsertOp { id: id, originLeft: left, originRight: right, bytes: move copy }
+    run self.place(&op, at)
+    return move op
+  }
+
+  /// Deletes `length` visible bytes from offset `offset`, and returns the operation to send.
+  ///
+  /// Traps if the range runs past the end.
+  pub effect fn delete(self: &mut Self, offset: usize, length: usize) -> DeleteOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if offset + length > self.length() {
+      Intrinsic.trap("Text.delete: the range runs past the end")
+    }
+    let mut runs = List<CharRun>.make()
+    let mut left = length
+    while left > 0 {
+      let place = self.tree.seek(self.root, visible, offset)
+      let mut index = place.index
+      let inside = offset - place.before
+      if inside > 0 {
+        run self.split(index, inside)
+        index = index + 1
+      }
+      let fragment = self.tree.get(self.root, index)
+      if fragment.length > left {
+        run self.split(index, left)
+      }
+      let mut target = self.tree.get(self.root, index)
+      target.deleted = true
+      run self.tree.set(&mut self.root, index, target)
+      run runs.append(CharRun { id: target.id, start: target.start, length: target.length })
+      left = left - target.length
+    }
+    return DeleteOp { runs: move runs }
+  }
+
+  /// Applies an insertion made by another replica. Its origins must already be applied here.
+  pub effect fn applyInsert(self: &mut Self, op: &InsertOp) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.insertions.contains(op.id) {
+      return ()
+    }
+
+    // The fragment just after the left origin, splitting it if the origin is inside a fragment.
+    let mut start: usize = 0
+    if !op.originLeft.isNone() {
+      let index = run self.splitAfter(op.originLeft)
+      start = index + 1
+    }
+    let mut stop = self.tree.length(self.root)
+    if !op.originRight.isNone() {
+      stop = run self.splitBefore(op.originRight)
+    }
+
+    // YATA: walk the fragments between the origins, which are all concurrent insertions, and
+    // settle after every one that must come first.
+    let mut at = start
+    let mut scan = start
+    let mut before = List<CharRun>.make()
+    let mut conflicting = List<CharRun>.make()
+    while scan < stop {
+      let o = self.tree.get(self.root, scan)
+      let oRun = CharRun { id: o.id, start: o.start, length: o.length }
+      run before.append(oRun)
+      run conflicting.append(oRun)
+      let oLeft = self.leftOriginOf(&o)
+      let oRight = self.rightOriginOf(&o)
+      if oLeft.same(&op.originLeft) {
+        if o.id.actor < op.id.actor || (o.id.actor == op.id.actor && o.id.lamport < op.id.lamport) {
+          at = scan + 1
+          conflicting.clear()
+        } else if oRight.same(&op.originRight) {
+          break
+        }
+      } else if !oLeft.isNone() && runsHold(&before, oLeft) {
+        if !runsHold(&conflicting, oLeft) {
+          at = scan + 1
+          conflicting.clear()
+        }
+      } else {
+        break
+      }
+      scan = scan + 1
+    }
+    run self.place(op, at)
+  }
+
+  /// Applies a deletion made by another replica. Deleting a byte twice is harmless.
+  pub effect fn applyDelete(self: &mut Self, op: &DeleteOp) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut r: usize = 0
+    while r < op.runs.length() {
+      let run_ = op.runs.get(r)
+      let mut done: usize = 0
+      while done < run_.length {
+        let first = CharId.of(run_.id, run_.start + done)
+        let index = run self.splitBefore(first)
+        let fragment = self.tree.get(self.root, index)
+        if fragment.length > run_.length - done {
+          run self.split(index, run_.length - done)
+        }
+        let mut target = self.tree.get(self.root, index)
+        target.deleted = true
+        run self.tree.set(&mut self.root, index, target)
+        done = done + target.length
+      }
+      r = r + 1
+    }
+  }
+
+  /// The name of the byte at visible offset `offset`. Traps if `offset` is not before the end.
+  pub fn charAt(self: &Self, offset: usize) -> CharId {
+    if offset >= self.length() {
+      Intrinsic.trap("Text.charAt: the offset is not before the end")
+    }
+    let place = self.tree.seek(self.root, visible, offset)
+    let fragment = self.tree.get(self.root, place.index)
+    return CharId.of(fragment.id, fragment.start + offset - place.before)
+  }
+
+  /// The number of bytes, deleted ones included.
+  pub fn totalLength(self: &Self) -> usize {
+    return self.tree.summary(self.root).total
+  }
+
+  /// Where `char` is among all bytes, deleted ones included. Traps if `char` is unknown.
+  pub fn indexOf(self: &Self, char: CharId) -> usize {
+    let index = self.find(char)
+    let fragment = self.tree.get(self.root, index)
+    return self.tree.measureBefore(self.root, total, index) + char.offset - fragment.start
+  }
+
+  /// Whether this replica has seen the byte `char`, deleted or not.
+  pub fn knows(self: &Self, char: CharId) -> bool {
+    return match self.locate(char) {
+      Option<usize>.Some { value: _ } => true
+      Option<usize>.None => false
+    }
+  }
+
+  /// The visible offset just after `char`: where a caret placed after it sits. A deleted byte
+  /// gives the offset of the next visible one. Traps if `char` is unknown.
+  pub fn offsetAfter(self: &Self, char: CharId) -> usize {
+    let index = self.find(char)
+    let fragment = self.tree.get(self.root, index)
+    let before = self.tree.measureBefore(self.root, visible, index)
+    if fragment.deleted {
+      return before
+    }
+    return before + char.offset - fragment.start + 1
+  }
+
+  /// Fragment `index` in text order as a run of bytes, and whether those bytes are deleted.
+  pub fn pieceAt(self: &Self, index: usize) -> Piece {
+    let fragment = self.tree.get(self.root, index)
+    return Piece {
+      chars: CharRun { id: fragment.id, start: fragment.start, length: fragment.length },
+      deleted: fragment.deleted,
+    }
+  }
+
+  fn insertionOf(self: &Self, id: DeltaId) -> Insertion {
+    return match move self.insertions.get(id) {
+      Option<Insertion>.Some { value } => value
+      Option<Insertion>.None => Intrinsic.trap("Text: an insertion is unknown")
+    }
+  }
+
+  fn leftOriginOf(self: &Self, fragment: &Fragment) -> CharId {
+    if fragment.start > 0 {
+      return CharId.of(fragment.id, fragment.start - 1)
+    }
+    return self.insertionOf(fragment.id).originLeft
+  }
+
+  fn rightOriginOf(self: &Self, fragment: &Fragment) -> CharId {
+    return self.insertionOf(fragment.id).originRight
+  }
+
+  // Records the insertion and puts its one fragment at index `at`.
+  effect fn place(self: &mut Self, op: &InsertOp, at: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let buffer = self.bytes.length()
+    run self.bytes.appendSlice(op.bytes.asSlice())
+    let insertion = Insertion {
+      originLeft: op.originLeft,
+      originRight: op.originRight,
+      buffer: buffer,
+      length: op.bytes.length(),
+    }
+    drop run self.insertions.insert(op.id, insertion)
+    let fragment = Fragment { id: op.id, start: 0, length: op.bytes.length(), deleted: false }
+    run self.tree.insert(&mut self.root, at, fragment)
+  }
+
+  // Splits fragment `index` after its first `at` bytes.
+  effect fn split(self: &mut Self, index: usize, at: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let fragment = self.tree.get(self.root, index)
+    let head = Fragment {
+      id: fragment.id,
+      start: fragment.start,
+      length: at,
+      deleted: fragment.deleted,
+    }
+    let tail = Fragment {
+      id: fragment.id,
+      start: fragment.start + at,
+      length: fragment.length - at,
+      deleted: fragment.deleted,
+    }
+    run self.tree.set(&mut self.root, index, head)
+    run self.tree.insert(&mut self.root, index + 1, tail)
+  }
+
+  // The index of the fragment holding `char`.
+  fn find(self: &Self, char: CharId) -> usize {
+    return match self.locate(char) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => Intrinsic.trap("Text: a byte is unknown")
+    }
+  }
+
+  // The index of the fragment that ends with `char`, splitting as needed.
+  effect fn splitAfter(self: &mut Self, char: CharId) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let index = self.find(char)
+    let fragment = self.tree.get(self.root, index)
+    let keep = char.offset - fragment.start + 1
+    if keep < fragment.length {
+      run self.split(index, keep)
+    }
+    return index
+  }
+
+  // The index of the fragment holding `char`, or `None` when this replica has not seen it.
+  fn locate(self: &Self, char: CharId) -> Option<usize> {
+    let count = self.tree.length(self.root)
+    let mut k: usize = 0
+    while k < count {
+      let fragment = self.tree.get(self.root, k)
+      if fragment.id.same(&char.id) && fragment.start <= char.offset
+        && char.offset < fragment.start + fragment.length {
+        return Option<usize>.some(k)
+      }
+      k = k + 1
+    }
+    return Option<usize>.none()
+  }
+
+  // The index of the fragment that starts with `char`, splitting as needed.
+  effect fn splitBefore(self: &mut Self, char: CharId) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let index = self.find(char)
+    let fragment = self.tree.get(self.root, index)
+    let skip = char.offset - fragment.start
+    if skip > 0 {
+      run self.split(index, skip)
+      return index + 1
+    }
+    return index
+  }
+}
+
+fn runsHold(runs: &List<CharRun>, char: CharId) -> bool {
+  let mut k: usize = 0
+  while k < runs.length() {
+    let r = runs.get(k)
+    if r.id.same(&char.id) && r.start <= char.offset && char.offset < r.start + r.length {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}

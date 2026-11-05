@@ -1,0 +1,227 @@
+//! Causal graph tests: diffs and reachability match a brute-force closure on random graphs.
+import clock { DeltaId, Frontier }
+import graph { CausalGraph, NONE }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing { AssertionError, Testing }
+
+type Failures = AssertionError<'static> | OutOfMemoryError
+
+struct Random {
+  state: u64,
+}
+
+impl Random {
+  fn next(self: &mut Self) -> u64 {
+    let mut x = self.state
+    x = u64.bitXor(x, u64.shiftLeft(x, 13))
+    x = u64.bitXor(x, u64.shiftRight(x, 7))
+    x = u64.bitXor(x, u64.shiftLeft(x, 17))
+    self.state = x
+    return x
+  }
+
+  fn below(self: &mut Self, bound: usize) -> usize {
+    if bound == 0 {
+      return 0
+    }
+    return u64.toUsize(self.next() % usize.toU64(bound))
+  }
+}
+
+// closure[i * n + j] is whether j is i or an ancestor of i.
+effect fn closureOf(graph: &CausalGraph) -> List<bool>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = graph.length()
+  let mut closure = List<bool>.make()
+  run closure.appendRepeated(false, n * n)
+  let mut i: usize = 0
+  while i < n {
+    closure.set(i * n + i, true)
+    let mut p: usize = 0
+    while p < graph.parentCount(i) {
+      let parent = graph.parentAt(i, p)
+      let mut j: usize = 0
+      while j < n {
+        if closure.get(parent * n + j) {
+          closure.set(i * n + j, true)
+        }
+        j = j + 1
+      }
+      p = p + 1
+    }
+    i = i + 1
+  }
+  return move closure
+}
+
+fn inVersion(closure: &List<bool>, n: usize, tips: &[usize], j: usize) -> bool {
+  let mut k: usize = 0
+  while k < tips.length {
+    if closure.get(tips[k] * n + j) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+effect fn randomGraphs() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut random = Random { state: 2463534242 }
+  let mut round: usize = 0
+  while round < 5 {
+    let mut graph = CausalGraph.make()
+    let n: usize = 120
+    let mut i: usize = 0
+    while i < n {
+      let mut parents = List<DeltaId>.make()
+      if i > 0 {
+        let count = 1 + random.below(3)
+        let mut c: usize = 0
+        while c < count {
+          let mut reach = i
+          if reach > 8 {
+            reach = 8
+          }
+          let back = 1 + random.below(reach)
+          let candidate = graph.idAt(i - back)
+          let mut dup = false
+          let mut d: usize = 0
+          while d < parents.length() {
+            if parents.get(d).same(&candidate) {
+              dup = true
+            }
+            d = d + 1
+          }
+          if !dup {
+            run parents.append(candidate)
+          }
+          c = c + 1
+        }
+      }
+      let id = DeltaId.make(usize.toU64(i) + 1, usize.toU64(random.below(4)))
+      let seq = run graph.add(id, parents.asSlice())
+      run Testing.expect(seq == i, "deltas are numbered in arrival order")
+      i = i + 1
+    }
+    let missingParent = [DeltaId.make(5000, 1)]
+    let unknown = run graph.add(DeltaId.make(999, 9), &missingParent)
+    run Testing.expect(unknown == NONE, "an unknown parent is refused")
+    let closure = run closureOf(&graph)
+    let mut trial: usize = 0
+    while trial < 60 {
+      let mut from = List<usize>.make()
+      let mut to = List<usize>.make()
+      let fromCount = random.below(3)
+      let toCount = 1 + random.below(2)
+      let mut c: usize = 0
+      while c < fromCount {
+        run from.append(random.below(n))
+        c = c + 1
+      }
+      c = 0
+      while c < toCount {
+        run to.append(random.below(n))
+        c = c + 1
+      }
+      let diff = run graph.diff(from.asSlice(), to.asSlice())
+      let mut expected = List<usize>.make()
+      let mut j: usize = 0
+      while j < n {
+        let inTo = inVersion(&closure, n, to.asSlice(), j)
+        let inFrom = inVersion(&closure, n, from.asSlice(), j)
+        if inTo && !inFrom {
+          run expected.append(j)
+        }
+        let reached = run graph.reaches(to.asSlice(), j)
+        run Testing.expect(reached == inTo, "reaches matches the closure")
+        j = j + 1
+      }
+      run Testing.expect(diff.length() == expected.length(), "the diff has the right size")
+      let mut k: usize = 0
+      while k < diff.length() && k < expected.length() {
+        run Testing.expect(
+          diff.get(k) == expected.get(k),
+          "the diff lists the right deltas in order",
+        )
+        k = k + 1
+      }
+      trial = trial + 1
+    }
+    round = round + 1
+  }
+}
+
+// A fork that interleaves on one clock and merges back leaves a frontier of one tip, where a version vector would over-claim.
+effect fn subagentForkMerges() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let me: u64 = 1
+  let mut graph = CausalGraph.make()
+  let mut main = Frontier.empty()
+  let mut lamport: u64 = 1
+  while lamport <= 3 {
+    let id = DeltaId.make(lamport, me)
+    drop run graph.add(id, main.tips())
+    let parents = run main.copy()
+    run main.advance(parents.tips(), id)
+    lamport = lamport + 1
+  }
+  let mut sub = run main.copy()
+  let d4 = DeltaId.make(4, me)
+  drop run graph.add(d4, main.tips())
+  let p4 = run main.copy()
+  run main.advance(p4.tips(), d4)
+  let d5 = DeltaId.make(5, 2)
+  drop run graph.add(d5, sub.tips())
+  let p5 = run sub.copy()
+  run sub.advance(p5.tips(), d5)
+  let d6 = DeltaId.make(6, me)
+  drop run graph.add(d6, main.tips())
+  let p6 = run main.copy()
+  run main.advance(p6.tips(), d6)
+  let d7 = DeltaId.make(7, 2)
+  drop run graph.add(d7, sub.tips())
+  let p7 = run sub.copy()
+  run sub.advance(p7.tips(), d7)
+  run Testing.expect(main.length() == 1 && main.has(d6), "main's version is its own tip")
+  let mainSeqs = run graph.seqs(main.tips())
+  let subSeqs = run graph.seqs(sub.tips())
+  run Testing.expect(
+    !(run graph.reaches(mainSeqs.asSlice(), graph.seqOf(d5))),
+    "main does not contain the subagent's work",
+  )
+  let missing = run graph.diff(mainSeqs.asSlice(), subSeqs.asSlice())
+  run Testing.expect(missing.length() == 2, "main lacks exactly the subagent's two deltas")
+  let mut merged = run main.copy()
+  let mut k: usize = 0
+  while k < sub.length() {
+    run merged.add(sub.tips()[k])
+    k = k + 1
+  }
+  run Testing.expect(merged.length() == 2, "the merged version has two tips")
+  let d8 = DeltaId.make(merged.nextLamport(), me)
+  run Testing.expect(d8.lamport == 8, "the merge delta sorts after both branches")
+  drop run graph.add(d8, merged.tips())
+  let pm = run merged.copy()
+  run merged.advance(pm.tips(), d8)
+  run Testing.expect(merged.length() == 1, "after the merge delta the version is one tip again")
+}
+
+test effect fn randomGraphsTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run randomGraphs() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn subagentForkMergesTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run subagentForkMerges() |> Effect.provideMut<Allocator>(&mut allocator)
+}

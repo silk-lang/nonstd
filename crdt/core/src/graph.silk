@@ -1,0 +1,263 @@
+//! The causal graph: every known delta, numbered in a local causal order, with its parents.
+//!
+//! A delta's local number (its *seq*) is always greater than the numbers of its parents, so the
+//! graph is stored in topological order and causal questions are walks toward lower numbers.
+import clock { DeltaId }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+/// No delta: returned where a lookup finds nothing.
+pub const NONE: usize = usize.MAX
+
+struct Entry {
+  id: DeltaId,
+  parentStart: usize,
+  parentCount: usize,
+}
+
+impl Copy for Entry {}
+
+/// Every delta a replica knows, in a local causal order.
+pub struct CausalGraph {
+  entries: List<Entry>,
+  parents: List<usize>,
+  index: HashMap<DeltaId, usize>,
+}
+
+impl CausalGraph {
+  /// An empty graph.
+  pub fn make() -> CausalGraph {
+    return CausalGraph {
+      entries: List<Entry>.make(),
+      parents: List<usize>.make(),
+      index: HashMap<DeltaId, usize>.make(Hash.seed(1469598103934665603)),
+    }
+  }
+
+  /// The number of deltas.
+  pub fn length(self: &Self) -> usize {
+    return self.entries.length()
+  }
+
+  /// The local number of `id`, or [`NONE`] when it is unknown.
+  pub fn seqOf(self: &Self, id: DeltaId) -> usize {
+    return match move self.index.get(id) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => NONE
+    }
+  }
+
+  /// Whether `id` is known.
+  pub fn contains(self: &Self, id: DeltaId) -> bool {
+    return self.index.contains(id)
+  }
+
+  /// Whether every tip of `frontier` is known.
+  pub fn containsAll(self: &Self, frontier: &[DeltaId]) -> bool {
+    let mut k: usize = 0
+    while k < frontier.length {
+      if !self.index.contains(frontier[k]) {
+        return false
+      }
+      k = k + 1
+    }
+    return true
+  }
+
+  /// The id of the delta numbered `seq`.
+  pub fn idAt(self: &Self, seq: usize) -> DeltaId {
+    return self.entries.get(seq).id
+  }
+
+  /// The number of parents of the delta numbered `seq`.
+  pub fn parentCount(self: &Self, seq: usize) -> usize {
+    return self.entries.get(seq).parentCount
+  }
+
+  /// The local number of parent `k` of the delta numbered `seq`.
+  pub fn parentAt(self: &Self, seq: usize, k: usize) -> usize {
+    let entry = self.entries.get(seq)
+    return self.parents.get(entry.parentStart + k)
+  }
+
+  /// Records delta `id` built on `parents` and returns its local number.
+  ///
+  /// Returns the existing number when `id` is already known, and [`NONE`] when a parent is
+  /// unknown: the caller must add that parent first.
+  pub effect fn add(self: &mut Self, id: DeltaId, parents: &[DeltaId]) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let known = self.seqOf(id)
+    if known != NONE {
+      return known
+    }
+    if !self.containsAll(parents) {
+      return NONE
+    }
+    let start = self.parents.length()
+    let mut k: usize = 0
+    while k < parents.length {
+      let parentSeq = self.seqOf(parents[k])
+      run self.parents.append(parentSeq)
+      k = k + 1
+    }
+    let seq = self.entries.length()
+    run self.entries.append(Entry { id: id, parentStart: start, parentCount: parents.length })
+    drop run self.index.insert(id, seq)
+    return seq
+  }
+
+  /// The local numbers of the tips of `frontier`. Every tip must be known.
+  pub effect fn seqs(self: &Self, frontier: &[DeltaId]) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<usize>.make()
+    let mut k: usize = 0
+    while k < frontier.length {
+      run out.append(self.seqOf(frontier[k]))
+      k = k + 1
+    }
+    return move out
+  }
+
+  /// The deltas in version `to` that are not in version `from`, in ascending local order.
+  ///
+  /// Both versions are given as local numbers of their tips. Applying the result in order to a
+  /// replica at `from` brings it to the merge of `from` and `to`.
+  pub effect fn diff(self: &Self, from: &[usize], to: &[usize]) -> List<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<usize>.make()
+    let mut highest: usize = 0
+    let mut any = false
+    let mut k: usize = 0
+    while k < to.length {
+      if !any || to[k] > highest {
+        highest = to[k]
+        any = true
+      }
+      k = k + 1
+    }
+    if !any {
+      return move out
+    }
+    k = 0
+    while k < from.length {
+      if from[k] > highest {
+        highest = from[k]
+      }
+      k = k + 1
+    }
+    let mut flags = List<u8>.make()
+    run flags.appendRepeated(0, highest + 1)
+    k = 0
+    while k < from.length {
+      flags.set(from[k], 1)
+      k = k + 1
+    }
+    let mut pending: usize = 0
+    k = 0
+    while k < to.length {
+      let old = flags.get(to[k])
+      if old == 0 {
+        pending = pending + 1
+        flags.set(to[k], 2)
+      } else if old == 1 {
+        flags.set(to[k], 3)
+      }
+      k = k + 1
+    }
+    let mut s = highest + 1
+    while s > 0 && pending > 0 {
+      s = s - 1
+      let f = flags.get(s)
+      if f == 0 {
+        continue
+      }
+      if f == 2 {
+        pending = pending - 1
+        run out.append(s)
+      }
+      let entry = self.entries.get(s)
+      let mut p: usize = 0
+      while p < entry.parentCount {
+        let parent = self.parents.get(entry.parentStart + p)
+        let old = flags.get(parent)
+        let mut merged = old
+        if f == 1 || f == 3 {
+          if merged == 0 || merged == 2 {
+            merged = merged + 1
+          }
+        }
+        if f == 2 || f == 3 {
+          if merged < 2 {
+            merged = merged + 2
+          }
+        }
+        if merged != old {
+          if old == 2 {
+            pending = pending - 1
+          }
+          if merged == 2 {
+            pending = pending + 1
+          }
+          flags.set(parent, merged)
+        }
+        p = p + 1
+      }
+    }
+
+    // `out` was filled from high to low numbers.
+    let mut low: usize = 0
+    let mut high = out.length()
+    while low + 1 < high {
+      high = high - 1
+      let a = out.get(low)
+      let b = out.get(high)
+      out.set(low, b)
+      out.set(high, a)
+      low = low + 1
+    }
+    return move out
+  }
+
+  /// Whether the delta numbered `seq` is in the version whose tips are `frontier`.
+  pub effect fn reaches(self: &Self, frontier: &[usize], seq: usize) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut stack = List<usize>.make()
+    let mut seen = HashMap<usize, bool>.make(Hash.seed(7))
+    let mut k: usize = 0
+    while k < frontier.length {
+      run stack.append(frontier[k])
+      k = k + 1
+    }
+    while true {
+      let next = match move stack.pop() {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          break
+        }
+      }
+      if next == seq {
+        return true
+      }
+      if next < seq || seen.contains(next) {
+        continue
+      }
+      drop run seen.insert(next, true)
+      let entry = self.entries.get(next)
+      let mut p: usize = 0
+      while p < entry.parentCount {
+        run stack.append(self.parents.get(entry.parentStart + p))
+        p = p + 1
+      }
+    }
+    return false
+  }
+}

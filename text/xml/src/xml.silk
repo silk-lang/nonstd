@@ -706,6 +706,13 @@ fn asciiNameChar(c: u8) -> bool {
 
 effect fn name<'a>(r: &mut Reader<'a>) -> Span
   ! XmlError {
+  let mut colon = false
+  return run scanName(&mut r.*, &mut colon)
+}
+
+// Reads a name, noting whether it has a colon (only ASCII bytes can be one).
+effect fn scanName<'a>(r: &mut Reader<'a>, colon: &mut bool) -> Span
+  ! XmlError {
   let start = r.pos
   if r.pos == r.data.length {
     fail XmlError { offset: offset(&r.*), kind: XmlErrorKind.UnexpectedEnd }
@@ -719,6 +726,9 @@ effect fn name<'a>(r: &mut Reader<'a>) -> Span
     let byte = r.data[r.pos]
     if byte < 128 {
       if asciiNameChar(byte) {
+        if byte == 58 {
+          colon.* = true
+        }
         r.pos = r.pos + 1
         continue
       }
@@ -738,6 +748,38 @@ effect fn qualifiedName<'a>(r: &mut Reader<'a>) -> Span
   let span = run name(&mut r.*)
   drop run localOffset(Slice.view<u8>(r.data, span.start, span.end - span.start), offset(&r.*))
   return span
+}
+
+struct Prefixed {
+  span: Span,
+  local: usize,
+}
+
+// A qualified name and its local part's offset in it (0 when unprefixed), checked once.
+effect fn prefixedName<'a>(r: &mut Reader<'a>) -> Prefixed
+  ! XmlError {
+  let mut colon = false
+  let span = run scanName(&mut r.*, &mut colon)
+  if !colon && r.data[span.start] != 58 {
+    return Prefixed { span: span, local: 0 }
+  }
+  let local = run localOffset(
+    Slice.view<u8>(r.data, span.start, span.end - span.start),
+    offset(&r.*),
+  )
+  return Prefixed { span: span, local: local }
+}
+
+// The local part's offset in a qualified name that has already been checked.
+fn checkedLocal(data: &[u8]) -> usize {
+  let mut i: usize = 0
+  while i < data.length {
+    if data[i] == 58 {
+      return i + 1
+    }
+    i = i + 1
+  }
+  return 0
 }
 
 effect fn ncname<'a>(r: &mut Reader<'a>) -> Span
@@ -1635,6 +1677,7 @@ impl Copy for Binding {}
 
 struct RawAttribute {
   qualified: Span,
+  local: usize,
   value: Span,
   isId: bool,
 }
@@ -1650,19 +1693,17 @@ struct Parser {
   xmlnsUri: Span,
 }
 
-effect fn qname(doc: &Document, qualified: Span, at: usize) -> Name
-  ! XmlError {
-  let local = qualified.start + (run localOffset(view(&doc.storage, qualified), at))
+fn named(qualified: Span, local: usize) -> Name {
   return Name {
     qualified: qualified,
-    local: Span { start: local, end: qualified.end },
+    local: Span { start: qualified.start + local, end: qualified.end },
     uri: empty(),
   }
 }
 
-effect fn resolve(p: &Parser, qualified: Span, attribute: bool, at: usize) -> Name
+effect fn resolve(p: &Parser, qualified: Span, local: usize, attribute: bool, at: usize) -> Name
   ! XmlError {
-  let mut n = run qname(&p.doc, qualified, at)
+  let mut n = named(qualified, local)
   if same(view(&p.doc.storage, qualified), b"xmlns") && attribute {
     n.uri = p.xmlnsUri
     return n
@@ -1912,6 +1953,7 @@ effect fn rawAttribute(
   dtd: &Dtd,
   attrs: &mut List<RawAttribute>,
   key: &[u8],
+  local: usize,
   value: &[u8],
   kind: AttributeType,
   at: usize,
@@ -1943,7 +1985,7 @@ effect fn rawAttribute(
     let v = run store(&mut p.doc.storage, value, &p.limits, at)
     run List<RawAttribute>.append(
       &mut attrs.*,
-      RawAttribute { qualified: q, value: v, isId: false },
+      RawAttribute { qualified: q, local: local, value: v, isId: false },
     )
     return ()
   }
@@ -1957,7 +1999,7 @@ effect fn rawAttribute(
   let v = run store(&mut p.doc.storage, Bytes.asSlice(&normalized), &p.limits, at)
   run List<RawAttribute>.append(
     &mut attrs.*,
-    RawAttribute { qualified: q, value: v, isId: kind == AttributeType.Id },
+    RawAttribute { qualified: q, local: local, value: v, isId: kind == AttributeType.Id },
   )
 }
 
@@ -1996,7 +2038,16 @@ effect fn defaultAttributes(
       }
       drop raw
       if !found {
-        run rawAttribute(&mut p.*, dtd, &mut attrs.*, key, view(&dtd.storage, d.value), d.kind, at)
+        run rawAttribute(
+          &mut p.*,
+          dtd,
+          &mut attrs.*,
+          key,
+          checkedLocal(key),
+          view(&dtd.storage, d.value),
+          d.kind,
+          at,
+        )
       }
     }
     i = i + 1
@@ -2009,7 +2060,7 @@ effect fn bindNamespaces(p: &mut Parser, attrs: &[RawAttribute], at: usize) -> (
   let mut i: usize = 0
   while i < attrs.length {
     let attr = attrs[i]
-    let n = run qname(&p.doc, attr.qualified, at)
+    let n = named(attr.qualified, attr.local)
     let mut declaration = same(view(&p.doc.storage, attr.qualified), b"xmlns")
     let mut prefix = empty()
     if n.local.start != attr.qualified.start {
@@ -2049,7 +2100,8 @@ effect fn element<'a>(
   }
   let start = offset(&r.*)
   run require(&mut r.*, b"<")
-  let elementName = run qualifiedName(&mut r.*)
+  let prefixed = run prefixedName(&mut r.*)
+  let elementName = prefixed.span
   let mut raw = List<RawAttribute>.make()
   let mut closed = false
   while true {
@@ -2064,7 +2116,8 @@ effect fn element<'a>(
     if !separated {
       fail XmlError { offset: offset(&r.*), kind: XmlErrorKind.Syntax }
     }
-    let key = run qualifiedName(&mut r.*)
+    let keyName = run prefixedName(&mut r.*)
+    let key = keyName.span
     drop whitespace(&mut r.*)
     run require(&mut r.*, b"=")
     drop whitespace(&mut r.*)
@@ -2080,6 +2133,7 @@ effect fn element<'a>(
       dtd,
       &mut raw,
       keyBytes,
+      keyName.local,
       Slice.view<u8>(r.data, value.start, value.end - value.start),
       attributeKind,
       start,
@@ -2100,7 +2154,7 @@ effect fn element<'a>(
     &p.limits,
     start,
   )
-  let expandedName = run resolve(&p.*, q, false, start)
+  let expandedName = run resolve(&p.*, q, prefixed.local, false, start)
   let nameId = run intern(&mut p.doc, expandedName)
   let attrStart = List<Attribute>.length(&p.doc.attrs)
   let attrs = List<RawAttribute>.asSlice(&raw)
@@ -2109,7 +2163,7 @@ effect fn element<'a>(
     if List<Attribute>.length(&p.doc.attrs) >= p.limits.maxAttributes {
       fail XmlError { offset: start, kind: XmlErrorKind.Limit }
     }
-    let n = run resolve(&p.*, attrs[i].qualified, true, start)
+    let n = run resolve(&p.*, attrs[i].qualified, attrs[i].local, true, start)
     let mut j = attrStart
     while j < List<Attribute>.length(&p.doc.attrs) {
       let old = List<Name>.get(&p.doc.names, List<Attribute>.get(&p.doc.attrs, j).name)

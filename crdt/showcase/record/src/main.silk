@@ -1,0 +1,114 @@
+//! Records the CRDT showcase without a window: the stage runs headless through ui-app's runtime,
+//! the script plays on a fixed clock, and every frame is drawn by the CPU reference renderer.
+//!
+//!   crdt-showcase-record WIDTH HEIGHT SCALE FPS FRAMES > frames.rgba
+//!
+//! Frames go to standard output as raw RGBA (WIDTH*SCALE x HEIGHT*SCALE pixels each, opaque),
+//! for `ffmpeg -f rawvideo`; `scripts/record` turns them into a video and stills. Progress goes
+//! to standard error. Exit code 0 on success, 2 on an error.
+import crdt_showcase.stage { Message, Stage }
+import showcase.assets as assets
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime, resize, tick }
+import ui_tree.lib { Batch, CpuSnapshot, FrameInput, TreeError, UiTree }
+import vector.geometry_error { GeometryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter, StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u64
+import silk.num.u8
+import silk.system.host_input { HostInput, HostInputError }
+
+/// `text` as a number: digits with an optional fraction.
+fn parse(text: &[u8]) -> f64 {
+  let mut value: f64 = 0.0
+  let mut scale: f64 = 0.0
+  let mut i: usize = 0
+  while i < text.length {
+    let c = text[i]
+    if c == 46 {
+      scale = 1.0
+    } else if c >= 48 && c <= 57 {
+      let digit = u8.toF64(c - 48)
+      if scale > 0.0 {
+        scale = scale / 10.0
+        value = value + digit * scale
+      } else {
+        value = value * 10.0 + digit
+      }
+    }
+    i = i + 1
+  }
+  return value
+}
+
+effect fn argument(index: usize) -> f64
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match run HostInput.argument(index) {
+    Option<Bytes>.Some { value } => parse(Bytes.asSlice(&value))
+    Option<Bytes>.None => 0.0
+  }
+}
+
+effect fn record() -> i32
+  ! TreeError | GeometryError | OutOfMemoryError | HostInputError | WriterError
+  ? &mut HostInput | &mut Allocator {
+  if (run HostInput.argumentCount()) < 6 {
+    StderrWriter.print(
+      "usage: crdt-showcase-record WIDTH HEIGHT SCALE FPS FRAMES > frames.rgba\n",
+      &(),
+    )
+    return 2
+  }
+  let width = f64.toF32(run argument(1))
+  let height = f64.toF32(run argument(2))
+  let scale = f64.toF32(run argument(3))
+  let fps = run argument(4)
+  let frames = f64.toU64(run argument(5))
+
+  let collection = run assets.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run assets.resources(&mut batch)
+  run tree.apply(run batch.take())
+  let mut app = Runtime<Stage, Message, NoCommand>.make(run Stage.make(width, height))
+  run app.start(&mut tree, 0.0)
+  run resize(&mut app, &mut tree, width, height)
+
+  let mut snapshot = CpuSnapshot.make()
+  let mut out = StdoutWriter.make()
+  let mut frame: u64 = 0
+  while frame < frames {
+    let time = u64.toF64(frame) / fps
+    run tick(&mut app, &mut tree, time, true)
+    run tree.frame(FrameInput { width: width, height: height, scale: scale, time: time })
+    run snapshot.sync(&mut tree)
+    let pixels = run snapshot.render(&tree)
+    run Writer.writeAll(pixels.data()) |> Effect.provideMut<Writer>(&mut out)
+    if frame % 30 == 0 {
+      StderrWriter.print(
+        "frame {}: {} deltas on the server, {} copies in sync\n",
+        &(frame, app.model.serverDeltas(), app.model.inSync()),
+      )
+    }
+    frame = frame + 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("crdt-showcase-record: running, drawing or writing a frame failed\n", &())
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(record(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
