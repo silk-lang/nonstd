@@ -4,7 +4,7 @@ An SVG renderer for Silk, written from the specifications (SVG 1.1 Second Editio
 rather than ported from another engine. It parses a document and computes CSS over it. It then
 resolves geometry, records a backend-neutral display list, and rasterizes that list to
 premultiplied RGBA through [graphics-vector](../graphics/vector). Browsers and resvg are used as
-diagnostic references; [SPECIFICATIONS.md](SPECIFICATIONS.md) records the authority, scope and
+diagnostic references; [SPECIFICATIONS.md](core/SPECIFICATIONS.md) records the authority, scope and
 coverage.
 
 ## What renders today
@@ -39,7 +39,7 @@ geometry through final placement.
 every primitive and input, including `feImage` and the background and paint inputs.
 Text lays out with font matching, bidi, vertical writing, `textPath` and `inline-size` wrapping.
 SMIL animation is sampled at a chosen time, and embedded ICC profiles are applied when images
-decode. [Status](docs/status.md) describes what each phase delivered.
+decode. [Status](core/docs/status.md) describes what each phase delivered.
 
 ## Example
 
@@ -72,7 +72,7 @@ External resources go through the `Resolver` service, so the host decides what m
 fetched. `render` is the one-step entry point. `parse`, `record` and `renderDisplayList` expose
 the render tree with its computed styles, and a reusable display list. For animation,
 `parseAnimated` parses once and `Animated.frame` records the display list at each frame's
-`RenderOptions.time` without parsing again. The [API notes](docs/api.md)
+`RenderOptions.time` without parsing again. The [API notes](core/docs/api.md)
 cover the environment, processing modes, resource policy and the geometry API.
 
 ## Command line
@@ -93,7 +93,7 @@ writes nothing unless parsing, rendering and encoding all succeed.
 | `svg` | `svg` | Document styling, structure and geometry resolution (imported as `svg_core`) |
 | `svg/render` | `svg-render` | Render tree, display list and the rendering entry points (`svg_render`) |
 | `svg/raster` | `svg-raster` | Executes display lists on the CPU through `vector`, or lowers them onto a canvas |
-| `svg/gpu` | `svg-gpu` | Draws display lists through `gpu_scene` ([README](native/gpu/README.md)) |
+| `svg/gpu` | `svg-gpu` | Draws display lists through `gpu_scene` ([README](core/native/gpu/README.md)) |
 | `graphics/geometry` | `graphics-geometry` | f64 geometry, path and points parsing, arcs, transforms |
 | `graphics/codec` | `graphics-codec` | PNG/JPEG decoding, orientation, premultiplied RGBA storage and PNG encoding |
 | `svg/filters` | `svg-filters` | Filter programs and their execution over `vector.filter` |
@@ -111,15 +111,15 @@ uses [font-parse](../fonts/parse).
 From the repository root:
 
 ```sh
-svg/scripts/check
+svg/core/scripts/check
 ```
 
 The gate type-checks and tests every SVG package. It then builds the release CLI and renders the
 project's own reference tests (including 53 exact-RGBA painting tests), malformed inputs, and a
 curated subset of the resvg suite. Every result is compared with a reviewed expectation, so a
 known failure is recorded as one and never counted as a pass. It runs in the `svg` CI
-workflow, and `svg/scripts/check-vector` runs the vector and GPU scene tests in
-`graphics-vector`. [Testing](docs/testing.md) covers the specification and suite caches,
+workflow, and `svg/core/scripts/check-vector` runs the vector and GPU scene tests in
+`graphics-vector`. [Testing](core/docs/testing.md) covers the specification and suite caches,
 expectation files and the reftest runner.
 
 ## Conformance
@@ -142,24 +142,24 @@ differs from Chrome, and the skipped cases need scripting. Most WPT cases are sk
 they are HTML documents or need script; of the SVG reftests that remain, the failures are mostly
 tentative features and text that needs fonts the suite does not ship. A spec difference means
 the specification and resvg or the browsers disagree, and this renderer follows the specification.
-[SPECIFICATIONS.md](SPECIFICATIONS.md) lists each of those decisions.
+[SPECIFICATIONS.md](core/SPECIFICATIONS.md) lists each of those decisions.
 
-The coverage checklist in [SPECIFICATIONS.md](SPECIFICATIONS.md) is complete except for some
+The coverage checklist in [SPECIFICATIONS.md](core/SPECIFICATIONS.md) is complete except for some
 text features: `shape-padding`, vertical text in `shape-inside`, `vkern` and external SVG
 fonts.
-`hitTest` finds the element under a point by `pointer-events` (see [docs/api.md](docs/api.md)).
+`hitTest` finds the element under a point by `pointer-events` (see [docs/api.md](core/docs/api.md)).
 The renderer also builds for wasm32; see [wasm/README.md](tools/wasm/README.md).
 
 ## Performance
 
 The renderer is correct first and not yet fast. Against resvg, end-to-end time ranges from
 0.66× on a 2,048-rule stylesheet workload to about 5× on icon and curve-heavy workloads. Parsing
-and recording dominate. [Performance](docs/performance.md) has the per-stage tables, the A/B
+and recording dominate. [Performance](core/docs/performance.md) has the per-stage tables, the A/B
 method and how to reproduce them.
 
 ## Limitations
 
-[LIMITATIONS.md](LIMITATIONS.md) records workarounds for gaps in the compiler and standard
+[LIMITATIONS.md](core/LIMITATIONS.md) records workarounds for gaps in the compiler and standard
 library.
 
 ## License

@@ -11,7 +11,9 @@ own layer or a lower one, and layers of the same rank may not depend on each oth
 could later move to a repository of its own. `python3 scripts/check-layers` reports violations,
 and CI fails on them. Top-level folders follow the layers: `native` (GPU and windows), `graphics`,
 `fonts`, `css`, `svg`, `ui` and `examples`, plus the standalone `packages/cli`, `text/xml`, `db`
-and `crdt`. Inside a library, helpers live in `tests`, `bench` and `tools/<name>`.
+and `crdt`. A folder is either one package or a namespace, never both: when a library has
+helpers (`tests`, `bench`, `tools/<name>`, demos) or sub-libraries, the library itself lives in
+`<folder>/core` beside them.
 
 ## Libraries
 
@@ -26,7 +28,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |  |
-| [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser | `conformance` |
+| [`text/xml/core`](text/xml/core) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser | `conformance` |
 | [`examples/git`](examples/git) | `git` | | |
 | [`examples/greet`](examples/greet) | `greet` | | |
 | [`examples/serve`](examples/serve) | `serve` | | |
@@ -36,21 +38,20 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
 | [`crdt/btree`](crdt/btree) | `crdt-btree` | A persistent copy-on-write B+ tree with summaries and seeks; versions share nodes |  |
-| [`crdt/core`](crdt/core) | `crdt-core` | CRDT documents: causal delta graph, rich text, add-wins maps, byte encoding and the Store service |  |
+| [`crdt/core`](crdt/core) | `crdt-core` | CRDT documents: causal delta graph, rich text, add-wins maps, byte encoding and the Store service | `bench` |
 | [`crdt/server`](crdt/server) | `crdt-server` | The CRDT sync server executable: TCP on localhost, documents in SQLite (not a workspace member, see layers.toml) |  |
 | [`crdt/store-sqlite`](crdt/store-sqlite) | `crdt-store-sqlite` | A crdt-core Store kept in SQLite through db/sqlite (not a workspace member, see layers.toml) |  |
 | [`crdt/sync`](crdt/sync) | `crdt-sync` | CRDT sync in one exchange: transports, clients, memory and stored servers, TCP (not a workspace member, see layers.toml) |  |
 | [`db/sqlite`](db/sqlite) | `db-sqlite` | SQLite bindings with prepared statements and transactions, built from the pinned amalgamation |  |
-| [`crdt/bench`](crdt/bench) | `crdt-bench` | | |
 
 ### native
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`native/gpu/metal`](native/gpu/metal) | `gpu-metal` | Metal bindings for programs that talk to Apple GPUs directly; a port of metal-rs | `examples/compute`, `examples/headless-render` |
-| [`native/gpu/webgpu`](native/gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and navigator.gpu in browsers, with one API | `bench`, `examples`, `examples-window`, `tests/native` |
-| [`native/gpu/webgpu/sys`](native/gpu/webgpu/sys) | `gpu-webgpu-sys` | The raw WebGPU C ABI under gpu-webgpu | `abi` |
-| [`native/platform/window`](native/platform/window) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames | `examples/demo`, `tests/browser`, `tests/linux`, `tests/macos`, `tests/smoke`, `tests/windows` |
+| [`native/gpu/metal/core`](native/gpu/metal/core) | `gpu-metal` | Metal bindings for programs that talk to Apple GPUs directly; a port of metal-rs | `examples/compute`, `examples/headless-render` |
+| [`native/gpu/webgpu/core`](native/gpu/webgpu/core) | `gpu-webgpu` | WebGPU through Dawn natively and navigator.gpu in browsers, with one API | `bench`, `examples`, `examples-window`, `tests/native` |
+| [`native/gpu/webgpu/sys/core`](native/gpu/webgpu/sys/core) | `gpu-webgpu-sys` | The raw WebGPU C ABI under gpu-webgpu | `abi` |
+| [`native/platform/window/core`](native/platform/window/core) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames | `examples/demo`, `tests/browser`, `tests/linux`, `tests/macos`, `tests/smoke`, `tests/windows` |
 
 ### graphics
 
@@ -60,10 +61,10 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`graphics/codec`](graphics/codec) | `graphics-codec` | PNG and JPEG decoding, PNG encoding and premultiplied RGBA images |  |
 | [`graphics/editor`](graphics/editor) | `graphics-editor` | Retained editor documents: shapes and image tiles with stable IDs, hit tests and viewport painting |  |
 | [`graphics/geometry`](graphics/geometry) | `graphics-geometry` | Geometry shared by the SVG renderer and CSS |  |
-| [`graphics/gpu_scene`](graphics/gpu_scene) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU renderer's output | `tests` |
-| [`graphics/ui_renderer`](graphics/ui_renderer) | `graphics-ui-renderer` | Draws a finished UI scene with WebGPU, natively and in the browser | `bench`, `browser`, `fixtures`, `tests` |
-| [`graphics/ui_scene`](graphics/ui_scene) | `graphics-ui-scene` | UI frame primitives ordered and batched for a GPU, with a CPU reference renderer | `tests` |
-| [`graphics/vector`](graphics/vector) | `graphics-vector` | A pure-Silk 2D vector rasterizer | `bench`, `filter-bench` |
+| [`graphics/gpu_scene/core`](graphics/gpu_scene/core) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU renderer's output | `tests` |
+| [`graphics/ui_renderer/core`](graphics/ui_renderer/core) | `graphics-ui-renderer` | Draws a finished UI scene with WebGPU, natively and in the browser | `bench`, `browser`, `fixtures`, `tests` |
+| [`graphics/ui_scene/core`](graphics/ui_scene/core) | `graphics-ui-scene` | UI frame primitives ordered and batched for a GPU, with a CPU reference renderer | `tests` |
+| [`graphics/vector/core`](graphics/vector/core) | `graphics-vector` | A pure-Silk 2D vector rasterizer | `bench`, `filter-bench` |
 
 ### fonts
 
@@ -72,25 +73,25 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`fonts/collection`](fonts/collection) | `font-collection` | An application's fonts and the order to fall back through them per character |  |
 | [`fonts/faces`](fonts/faces) | `font-faces` | Font faces for text: a host-filled face database and CSS Fonts 4 matching |  |
 | [`fonts/outline`](fonts/outline) | `font-outline` | Glyph outlines (glyf, gvar, CFF, CFF2) drawn into any path sink or a vector path |  |
-| [`fonts/parse`](fonts/parse) | `font-parse` | Font file parsing and a font model; a port of read-fonts and parts of skrifa | `bench`, `tools/dump` |
+| [`fonts/parse/core`](fonts/parse/core) | `font-parse` | Font file parsing and a font model; a port of read-fonts and parts of skrifa | `bench`, `tools/dump` |
 | [`fonts/raster`](fonts/raster) | `font-raster` | The UI glyph cache: unhinted glyphs in atlas tiles, shaped lines and text gamma |  |
-| [`fonts/shape`](fonts/shape) | `font-shape` | Text shaping, from a string and a font to positioned glyphs; a port of harfrust | `tools/cli`, `tools/wasm` |
+| [`fonts/shape/core`](fonts/shape/core) | `font-shape` | Text shaping, from a string and a font to positioned glyphs; a port of harfrust | `tools/cli`, `tools/wasm` |
 | [`fonts/types`](fonts/types) | `font-types` | The scalar types OpenType tables are built from; a port of fontations' font-types |  |
 
 ### css
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`css/layout`](css/layout) | `css-layout` | CSS block, flex and grid layout with replaceable intrinsic measurement | `tools/cli` |
+| [`css/layout/core`](css/layout/core) | `css-layout` | CSS block, flex and grid layout with replaceable intrinsic measurement | `tools/cli` |
 | [`css/style`](css/style) | `css-style` | CSS parsing, selectors and the cascade, from bytes to computed values |  |
 
 ### svg
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`svg`](svg) | `svg` | An SVG renderer written from the SVG 1.1 and SVG 2 specifications | `bench`, `tests`, `tools/cli`, `tools/wasm` |
+| [`svg/core`](svg/core) | `svg` | An SVG renderer written from the SVG 1.1 and SVG 2 specifications | `bench`, `tests`, `tools/cli`, `tools/wasm` |
 | [`svg/filters`](svg/filters) | `svg-filters` | The SVG filter graph and its execution |  |
-| [`svg/gpu`](svg/gpu) | `svg-gpu` | Draws SVG display lists on the GPU through graphics-gpu-scene | `tests` |
+| [`svg/gpu/core`](svg/gpu/core) | `svg-gpu` | Draws SVG display lists on the GPU through graphics-gpu-scene | `tests` |
 | [`svg/raster`](svg/raster) | `svg-raster` | CPU execution of backend-neutral SVG display lists |  |
 | [`svg/render`](svg/render) | `svg-render` | Parses, resolves and renders SVG with the vector CPU backend |  |
 | [`svg/text`](svg/text) | `svg-text` | SVG text layout: font selection, shaping, positioning and glyph outlines |  |
@@ -99,29 +100,29 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`ui/app`](ui/app) | `ui-app` | An Elm-style UI framework on ui-tree: model, messages, view, update, commands | `demo`, `examples`, `tests` |
-| [`ui/app/window`](ui/app/window) | `ui-app-window` | Runs a ui-app application in a native window | `tests` |
+| [`ui/app/core`](ui/app/core) | `ui-app` | An Elm-style UI framework on ui-tree: model, messages, view, update, commands | `demo`, `examples`, `tests` |
+| [`ui/app/window/core`](ui/app/window/core) | `ui-app-window` | Runs a ui-app application in a native window | `tests` |
 | [`ui/assets`](ui/assets) | `ui-assets` | Embedded fonts, icons and photos for UI fixtures, tests and demos |  |
-| [`ui/components`](ui/components) | `ui-components` | Components for ui-app views: buttons, fields, lists, menus, dialogs and more | `demo`, `gallery`, `tests` |
-| [`ui/inspect`](ui/inspect) | `ui-inspect` | The inspector core for ui-tree: snapshots, queries and input for people, tests and agents | `cli`, `mcp`, `tests` |
-| [`ui/inspect/devtools`](ui/inspect/devtools) | `ui-inspect-devtools` | A devtools window for a running Silk UI | `app`, `tests` |
-| [`ui/inspect/server`](ui/inspect/server) | `ui-inspect-server` | The inspector protocol: a running UI answers JSON requests on a local socket | `tests` |
+| [`ui/components/core`](ui/components/core) | `ui-components` | Components for ui-app views: buttons, fields, lists, menus, dialogs and more | `demo`, `gallery`, `tests` |
+| [`ui/inspect/core`](ui/inspect/core) | `ui-inspect` | The inspector core for ui-tree: snapshots, queries and input for people, tests and agents | `cli`, `mcp`, `tests` |
+| [`ui/inspect/devtools/core`](ui/inspect/devtools/core) | `ui-inspect-devtools` | A devtools window for a running Silk UI | `app`, `tests` |
+| [`ui/inspect/server/core`](ui/inspect/server/core) | `ui-inspect-server` | The inspector protocol: a running UI answers JSON requests on a local socket | `tests` |
 | [`ui/sprites`](ui/sprites) | `ui-sprites` | SVG icons and decoded images as atlas tiles for the UI renderer |  |
-| [`ui/text`](ui/text) | `ui-text` | css-layout's TextMeasure over real fonts, with line breaking, bidi and fallback from std | `tools/cli` |
-| [`ui/tree`](ui/tree) | `ui-tree` | The retained UI tree: plain-data mutations, CSS layout, painting into a UI scene | `browser`, `demo`, `fixtures`, `tests` |
-| [`ui/tree/window`](ui/tree/window) | `ui-tree-window` | Hosts a ui-tree in a platform window | `demo`, `tests` |
+| [`ui/text/core`](ui/text/core) | `ui-text` | css-layout's TextMeasure over real fonts, with line breaking, bidi and fallback from std | `tools/cli` |
+| [`ui/tree/core`](ui/tree/core) | `ui-tree` | The retained UI tree: plain-data mutations, CSS layout, painting into a UI scene | `browser`, `demo`, `fixtures`, `tests` |
+| [`ui/tree/window/core`](ui/tree/window/core) | `ui-tree-window` | Hosts a ui-tree in a platform window | `demo`, `tests` |
 
 ### examples
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`examples/crdt-demo`](examples/crdt-demo) | `crdt-demo` | Two people editing one rich-text document through an in-process sync server (not a workspace member, see layers.toml) | `app`, `tests` |
-| [`examples/crdt-showcase`](examples/crdt-showcase) | `crdt-showcase` | Six scripted people writing one rich-text document at once, drawn live (not a workspace member, see layers.toml) | `record` |
-| [`examples/graphics-demo`](examples/graphics-demo) | `graphics-demo` | The UI drawing layer's integration demo, natively and in the browser | `app`, `browser`, `screenshot`, `tests` |
+| [`examples/crdt-demo/core`](examples/crdt-demo/core) | `crdt-demo` | Two people editing one rich-text document through an in-process sync server (not a workspace member, see layers.toml) | `app`, `tests` |
+| [`examples/crdt-showcase/core`](examples/crdt-showcase/core) | `crdt-showcase` | Six scripted people writing one rich-text document at once, drawn live (not a workspace member, see layers.toml) | `record` |
+| [`examples/graphics-demo/core`](examples/graphics-demo/core) | `graphics-demo` | The UI drawing layer's integration demo, natively and in the browser | `app`, `browser`, `screenshot`, `tests` |
 | [`examples/graphics-demo/host`](examples/graphics-demo/host) | `graphics-demo-host` | The shared native host that draws a UI scene in a platform window |  |
-| [`examples/notes`](examples/notes) | `ui-notes` | The example notes app of the UI stack | `app`, `tests` |
+| [`examples/notes/core`](examples/notes/core) | `ui-notes` | The example notes app of the UI stack | `app`, `tests` |
 | [`examples/scroll-demo`](examples/scroll-demo) | `silk-scroll-demo` | Fieldnotes Scroll Lab, a native scrolling stress demo built on ui-app |  |
-| [`examples/showcase`](examples/showcase) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack | `app`, `record` |
+| [`examples/showcase/core`](examples/showcase/core) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack | `app`, `record` |
 
 <!-- package-index:end -->
 
@@ -182,7 +183,7 @@ for the toolchain installers. Apple's linker from the active Xcode toolchain lin
 executables; a separate LLD installation is not required.
 
 `native/gpu/webgpu/examples-window`, the dev-only GLFW host, is not a workspace member because it needs
-GLFW 3.4 installed: build it with `native/gpu/webgpu/scripts/window`. C/Rust benchmark comparison
+GLFW 3.4 installed: build it with `native/gpu/webgpu/core/scripts/window`. C/Rust benchmark comparison
 programs are built only by their area-specific benchmark script.
 
 Commands run from the root unless a README says otherwise:
@@ -194,7 +195,7 @@ silk run --manifest-path examples/greet/silk.toml -- --name Julia --times 2
 ```
 
 Each area has its own gate script and CI workflow, for example
-`svg/scripts/check`, `native/gpu/webgpu/scripts/check` and `css/layout/scripts/check`.
+`svg/core/scripts/check`, `native/gpu/webgpu/core/scripts/check` and `css/layout/core/scripts/check`.
 
 To add a package, run `silk init <area>/<name> --lib` from the root. It is added to `members` in
 `silk.toml`.

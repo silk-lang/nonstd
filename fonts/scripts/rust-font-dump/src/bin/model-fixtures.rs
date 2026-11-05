@@ -36,7 +36,7 @@ fn main() {
         _ => panic!("unknown fixture"),
     };
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../parse/upstream/font-test-data/test_data/ttf")
+        .join("../../parse/core/upstream/font-test-data/test_data/ttf")
         .join(relative);
     let mut bytes = std::fs::read(path).unwrap();
     if kind == "color-v0" {

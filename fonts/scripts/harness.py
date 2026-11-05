@@ -16,10 +16,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CORPUS_ROOTS = (
-    "fonts/parse/upstream/font-test-data/test_data/ttf",
-    "fonts/parse/upstream/font-test-data/test_data/ttc",
-    "fonts/parse/upstream/font-test-data/test_data/extracted",
-    "fonts/shape/test-data/harfrust/harfrust/tests/fonts",
+    "fonts/parse/core/upstream/font-test-data/test_data/ttf",
+    "fonts/parse/core/upstream/font-test-data/test_data/ttc",
+    "fonts/parse/core/upstream/font-test-data/test_data/extracted",
+    "fonts/shape/core/test-data/harfrust/harfrust/tests/fonts",
 )
 # Unsupported containers are still oracle inputs: their upstream errors are observations.
 FONT_SUFFIXES = {".ttf", ".otf", ".ttc", ".otc", ".dfont", ".woff", ".woff2"}

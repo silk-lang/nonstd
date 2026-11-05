@@ -52,8 +52,8 @@ level differently per mask. On the reftest inputs every render is currently byte
 From the repository root, with a Vulkan, Metal or D3D driver (CI uses lavapipe):
 
 ```sh
-svg/scripts/test-gpu            # every suite
-svg/scripts/test-gpu painting   # some suites
+svg/core/scripts/test-gpu            # every suite
+svg/core/scripts/test-gpu painting   # some suites
 ```
 
 It renders every input under `svg/tests/fixtures/<suite>/inputs` with the CPU executor,

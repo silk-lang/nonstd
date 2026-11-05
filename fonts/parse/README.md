@@ -71,10 +71,10 @@ Dependents import the package as `read_fonts`.
 | Path | Package | What it is |
 | --- | --- | --- |
 | `fonts/parse` | `font-parse` | The library |
-| `fonts/parse/tools/dump` | `font-parse-dump` | Prints every parsed field of a font as text ([format](docs/dump-format.md)) |
+| `fonts/parse/tools/dump` | `font-parse-dump` | Prints every parsed field of a font as text ([format](core/docs/dump-format.md)) |
 | `fonts/parse/bench` | `font-parse-bench` | Library workloads timed against a Rust twin |
 | `fonts/parse/tools/font-codegen-silk` | (Rust) | The fontations codegen grammar parser with Silk backends |
-| `fonts/parse/upstream` | | The pinned fontations checkout. It is the codegen input and the Rust baseline, and is never modified |
+| `fonts/parse/core/upstream` | | The pinned fontations checkout. It is the codegen input and the Rust baseline, and is never modified |
 
 Shared scripts for the font packages live in [`fonts/scripts`](../scripts). All of them run
 from the repository root.
@@ -91,7 +91,7 @@ is stale.
 From the repository root:
 
 ```sh
-silk test --manifest-path fonts/parse/silk.toml --root src/tests.silk
+silk test --manifest-path fonts/parse/core/silk.toml --root src/tests.silk
 fonts/scripts/generate --check
 python3 -m unittest discover -s fonts/scripts/tests
 silk build --release --manifest-path fonts/parse/tools/dump/silk.toml

@@ -37,13 +37,13 @@ Native, in a window (the bridge for this OS is built first; see the native/platf
 its prerequisites):
 
 ```sh
-examples/graphics-demo/scripts/app --release
+examples/graphics-demo/core/scripts/app --release
 ```
 
 In a browser with WebGPU, at http://127.0.0.1:8040/:
 
 ```sh
-examples/graphics-demo/scripts/browser serve
+examples/graphics-demo/core/scripts/browser serve
 ```
 
 Move the pointer over the buttons and photos, click a photo to toggle its heart, scroll the grid
@@ -60,9 +60,9 @@ build/llvm/<target>/release/graphics-demo-screenshot build/demo.png 1024 720 2 0
 ## Tests
 
 ```sh
-examples/graphics-demo/scripts/check                         # generated modules, packages, goldens, GPU vs CPU
-examples/graphics-demo/scripts/app check --backend all       # the app in a window, read back and compared
-examples/graphics-demo/scripts/browser test                  # the page in Chromium: check and interaction runs
+examples/graphics-demo/core/scripts/check                         # generated modules, packages, goldens, GPU vs CPU
+examples/graphics-demo/core/scripts/app check --backend all       # the app in a window, read back and compared
+examples/graphics-demo/core/scripts/browser test                  # the page in Chromium: check and interaction runs
 ```
 
 - **Goldens.** Three frames (`desktop` at 1x, `retina` at 2x with hover and a favorite,

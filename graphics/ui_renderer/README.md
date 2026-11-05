@@ -45,7 +45,7 @@ hue arcs, wide gamut spaces) gets a 256-entry ramp of premultiplied RGBA8 words,
 CPU with the same `color.mix` the CPU reference uses, in a storage buffer the quad and path
 shaders read. Either way the parameter steps in 1/255, as the CPU reference's ramp does.
 Content masks clip by pixel area. `shaders/common.wgsl` holds what the pipelines share; edit the
-`.wgsl` files and run `native/gpu/webgpu/scripts/embed-shaders`, never the generated module.
+`.wgsl` files and run `native/gpu/webgpu/core/scripts/embed-shaders`, never the generated module.
 
 All instances of a frame go into one storage buffer per kind (every layer's sorted list, in layer
 order), uploaded with `queue.writeBuffer`. The buffers persist across frames and are replaced
@@ -58,7 +58,7 @@ blend modes.
 
 ### Layer effects and atlas uploads
 
-`Scene.pushEffectLayer` carries the shared [`LayerEffects`](../ui_scene/src/effects.silk)
+`Scene.pushEffectLayer` carries the shared [`LayerEffects`](../ui_scene/core/src/effects.silk)
 settings into the renderer. Gaussian blur and color matrices reuse `gpu_scene.FilterRenderer`;
 filter scratch textures and uniforms are pooled between frames. A scene without isolated layers
 keeps the direct rendering path. Backdrop blur currently copies and filters the full viewport.
@@ -116,9 +116,9 @@ The test allows 48, 0.6% and 0.5 (exact for the text ramp).
 From the repository root, with a Vulkan, Metal or D3D driver (CI uses lavapipe):
 
 ```sh
-python3 graphics/ui_renderer/scripts/check          # shaders, packages, wasm32, GPU comparison
-python3 graphics/ui_renderer/scripts/test-browser   # the comparison in installed Chromium
-python3 graphics/ui_renderer/scripts/bench          # dense scene against bench/budget.json
+python3 graphics/ui_renderer/core/scripts/check          # shaders, packages, wasm32, GPU comparison
+python3 graphics/ui_renderer/core/scripts/test-browser   # the comparison in installed Chromium
+python3 graphics/ui_renderer/core/scripts/bench          # dense scene against bench/budget.json
 ```
 
 The comparison renders eight fixtures (the four `ui_scene` golden scenes, nested isolated layers

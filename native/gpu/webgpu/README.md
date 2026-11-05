@@ -71,7 +71,7 @@ Windows. Browsers use Chromium's WebGPU.
 
 Windows builds require LLVM 22 and an x64 Visual Studio 2026 developer shell with
 the Windows SDK and current Visual C++ Redistributable. Invoke helpers as
-`python native/gpu/webgpu/scripts/check`. The build wraps Dawn's pinned static archive
+`python native/gpu/webgpu/core/scripts/check`. The build wraps Dawn's pinned static archive
 in `nonstd_dawn.dll` so Windows initializes its C++ runtime, then copies the DLL
 and checksum-pinned DXC shader compiler beside each executable. The window helper
 also installs pinned GLFW unless `GLFW_PREFIX` supplies its DLL and import library.
@@ -82,9 +82,9 @@ Keep those DLLs beside executables when moving them.
 From the repository root:
 
 ```sh
-python3 native/gpu/webgpu/scripts/check              # everything native
-python3 native/gpu/webgpu/scripts/check --skip-native  # freshness and package checks only
-python3 native/gpu/webgpu/scripts/check --browser      # also runs the wasm samples in Chromium
+python3 native/gpu/webgpu/core/scripts/check              # everything native
+python3 native/gpu/webgpu/core/scripts/check --skip-native  # freshness and package checks only
+python3 native/gpu/webgpu/core/scripts/check --browser      # also runs the wasm samples in Chromium
 ```
 
 The gate checks that the generated bindings, browser glue and embedded shaders are fresh. It
@@ -97,12 +97,12 @@ the instruction-count benchmarks.
 
 On the CPU-side workloads (encoding and submitting 10,000 draws, buffer writes or bind-group
 switches, or one instanced draw of 10k–100k rectangles), Silk on Dawn runs between 11% faster and
-5% slower than the same program in C on the same Dawn binary (median wall time, macOS arm64). [The reference](docs/reference.md#cpu-side-benchmarks)
+5% slower than the same program in C on the same Dawn binary (median wall time, macOS arm64). [The reference](core/docs/reference.md#cpu-side-benchmarks)
 has the tables, the instruction-count method and the Rust/wgpu comparison.
 
 ## More
 
-- [Reference](docs/reference.md): implementation selection, header compatibility, toolchain
+- [Reference](core/docs/reference.md): implementation selection, header compatibility, toolchain
   prerequisites, CI, callback ownership, surfaces, samples, the browser ABI and benchmarks.
-- [LIMITATIONS.md](LIMITATIONS.md): workarounds for compiler and standard-library gaps.
+- [LIMITATIONS.md](core/LIMITATIONS.md): workarounds for compiler and standard-library gaps.
 - [GPU scene renderer](../../../graphics/gpu_scene): 2D vector drawing on top of this package.

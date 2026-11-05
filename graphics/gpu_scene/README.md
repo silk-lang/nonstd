@@ -9,7 +9,7 @@ It covers what `vector` paints: solid, gradient and image paints, layers with ma
 opacity and blend modes, and all of the filter primitives. The renderer pools its textures,
 buffers and uniforms across frames.
 
-[docs/scene-renderer.md](docs/scene-renderer.md) explains the pipeline, the buffer layouts and how
+[docs/scene-renderer.md](core/docs/scene-renderer.md) explains the pipeline, the buffer layouts and how
 exactness is kept between CPU and GPU.
 
 ## Packages
@@ -19,7 +19,7 @@ exactness is kept between CPU and GPU.
 | `graphics/gpu_scene` | `graphics-gpu-scene` | The renderer |
 | `graphics/gpu_scene/tests` | `graphics-gpu-scene-tests` | Renders each scene on the CPU and the GPU and compares bytes |
 
-The WGSL shaders live in `shaders/`, and `native/gpu/webgpu/scripts/embed-shaders` embeds them in
+The WGSL shaders live in `shaders/`, and `native/gpu/webgpu/core/scripts/embed-shaders` embeds them in
 `src/generated_shaders.silk`. Edit the `.wgsl` files, never the generated module.
 
 ## Tests
@@ -27,7 +27,7 @@ The WGSL shaders live in `shaders/`, and `native/gpu/webgpu/scripts/embed-shader
 From the repository root, with a Vulkan, Metal or D3D driver available (CI uses lavapipe):
 
 ```sh
-svg/scripts/check-vector
+svg/core/scripts/check-vector
 ```
 
 Every scene comparison requires identical bytes. The one exception is a single specular lighting

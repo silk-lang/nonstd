@@ -50,7 +50,7 @@ SILK_UI_INSPECT=1 python3 examples/scroll-demo/scripts/run --debug
 From another terminal in the same repository checkout, open the devtools window:
 
 ```sh
-python3 ui/inspect/devtools/scripts/devtools --connect 1
+python3 ui/inspect/devtools/core/scripts/devtools --connect 1
 ```
 
 The demo prints `ui-inspect: listening on ...` when ready. Inspection is disabled

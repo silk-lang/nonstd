@@ -112,7 +112,7 @@ leaves Unicode mapping, contextual/bidi checks and internationalized-name
 conversion to callers. It is not a complete UTS #46 implementation.
 The [real-API probe](https://github.com/silk-lang/silk/issues/2578) distinguishes this
 documented contract from the WHATWG acceptance condition; it is not a claim that
-the RFC 3986 API is broken. `svg/src/url*.silk` owns URL parsing/resolution/
+the RFC 3986 API is broken. `svg/core/src/url*.silk` owns URL parsing/resolution/
 serialization and IDNA mapping/Punycode, reusing `silk.text` normalization/properties.
 Replace those general-purpose parts together when released URL/IDNA semantics
 and resource bounds match; SVG resource authorization remains local.

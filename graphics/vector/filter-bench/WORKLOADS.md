@@ -21,7 +21,7 @@ median render time minus the median time of the same image drawn without the fil
 | lighting | `feDiffuseLighting surfaceScale="3"` with `fePointLight x="150" y="120" z="100"` |
 | displace | `feDisplacementMap` of the source by itself, `scale="20"`, R and G channels |
 
-`svg/scripts/bench-filters` prints both timings and how far the images differ. Known semantic
+`svg/core/scripts/bench-filters` prints both timings and how far the images differ. Known semantic
 differences, where `vector.filter` follows the spec and browsers:
 
 - blur: resvg derives its three boxes from a different formula than the spec's `d`.

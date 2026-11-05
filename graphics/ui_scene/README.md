@@ -121,7 +121,7 @@ byte for byte. Paths match `vector`'s own fill byte for byte.
 ## Tests
 
 ```sh
-silk test --manifest-path graphics/ui_scene/silk.toml --root src/tests.silk
+silk test --manifest-path graphics/ui_scene/core/silk.toml --root src/tests.silk
 silk build --manifest-path graphics/ui_scene/tests/silk.toml
 build/llvm/<target>/debug/graphics-ui-scene-tests graphics/ui_scene/tests/goldens
 ```

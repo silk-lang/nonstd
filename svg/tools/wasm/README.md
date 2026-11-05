@@ -5,7 +5,7 @@ The SVG renderer built for `wasm32-unknown-unknown`, with a small JavaScript wra
 Build and check from the repository root (linking needs `wasm-ld` on `PATH`):
 
 ```sh
-svg/scripts/build-wasm   # prints build/llvm/wasm32-unknown-unknown/release/svg-wasm
+svg/core/scripts/build-wasm   # prints build/llvm/wasm32-unknown-unknown/release/svg-wasm
 node svg/tools/wasm/js/compare.mjs <svg-wasm> <svg-cli> svg/tests/fixtures/*/manifest.json
 ```
 

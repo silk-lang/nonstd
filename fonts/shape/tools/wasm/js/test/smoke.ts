@@ -1,12 +1,12 @@
 // Shapes a few strings with the wasm build and compares them with the native font-shape-cli output.
-// Run `fonts/scripts/build-wasm` first; fonts come from the fonts/shape/test-data/harfrust submodule.
+// Run `fonts/scripts/build-wasm` first; fonts come from the fonts/shape/core/test-data/harfrust submodule.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 import { Harfrust, type ShapeResult } from '../src/index.ts'
 
 const root = new URL('../../../../../../', import.meta.url)
-const fonts = new URL('fonts/shape/test-data/harfrust/harfrust/benches/fonts/', root)
+const fonts = new URL('fonts/shape/core/test-data/harfrust/harfrust/benches/fonts/', root)
 const harfrust = await Harfrust.instantiate(readFileSync(new URL('fonts/shape/tools/wasm/js/dist/harfrust.wasm', root)))
 
 // The native runner's format: name=cluster@x,y+advance, with clusters as character indices.

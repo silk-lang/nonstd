@@ -69,7 +69,7 @@ import the package as `vector`.
 From the repository root:
 
 ```sh
-svg/scripts/check-vector
+svg/core/scripts/check-vector
 ```
 
 This runs the 170 unit tests, checks the packages, and renders every GPU scene test on both the
@@ -78,7 +78,7 @@ part. It runs in the `graphics-vector` CI workflow.
 
 ## Performance
 
-`svg/scripts/bench-vector` and `svg/scripts/bench-filters` compare against tiny-skia
+`svg/core/scripts/bench-vector` and `svg/core/scripts/bench-filters` compare against tiny-skia
 and resvg on the same scenes, and also report how far the images differ. As of 2026-10-29,
 vector takes 0.17–0.63× tiny-skia's time on fills, strokes, gradients, polygons and icons, and
 matches it on image patterns. Every filter primitive beats resvg; blur, for example, takes

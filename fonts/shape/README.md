@@ -54,7 +54,7 @@ pub effect fn advance<'a>(font: &FontRef<'a>, text: string) -> i32
 
 `Buffer.glyphInfos` gives the glyph IDs and clusters. A buffer can be cleared and reused, and
 it keeps its capacity. Malformed layout tables are skipped instead of trapping, and
-allocation goes through the `Allocator` effect. The [API notes](docs/api.md) cover plans,
+allocation goes through the `Allocator` effect. The [API notes](core/docs/api.md) cover plans,
 variations, scaling, custom callbacks, tracing and serialization.
 
 The package is still imported as `harfrust` by its dependents, so the dependency key in their
@@ -68,7 +68,7 @@ manifests is `harfrust`.
 | `fonts/shape/tools/cli` | `font-shape-cli` | Command-line shaper and the runner for the pinned test suite |
 | `fonts/shape/tools/wasm` | `font-shape-wasm` | WebAssembly build with a typed JavaScript wrapper ([README](tools/wasm/README.md)) |
 
-`fonts/shape/test-data/harfrust` is the pinned harfrust checkout. It supplies the test fonts
+`fonts/shape/core/test-data/harfrust` is the pinned harfrust checkout. It supplies the test fonts
 and expectations and is never modified.
 
 The CLI takes a font and text and prints the glyph string:
@@ -87,9 +87,9 @@ All 6,090 data-driven cases of the pinned suite pass, with no skip list. The 129
 need Apple system fonts are excluded. From the repository root:
 
 ```sh
-silk test --release --manifest-path fonts/shape/silk.toml --root src/tests.silk
+silk test --release --manifest-path fonts/shape/core/silk.toml --root src/tests.silk
 silk build --release --manifest-path fonts/shape/tools/cli/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/release/font-shape-cli --suite fonts/shape/tests/shaping.bin
+build/llvm/x86_64-unknown-linux-gnu/release/font-shape-cli --suite fonts/shape/core/tests/shaping.bin
 build/llvm/x86_64-unknown-linux-gnu/release/font-shape-cli --regressions
 fonts/scripts/check-shaping-trace
 fonts/scripts/check-shaping-malformed
@@ -97,7 +97,7 @@ fonts/scripts/check-shaping-malformed
 
 These run in the `font` CI workflow. Every week the same workflow also compares all cases
 against the pinned Rust harfrust, mutates every corpus font, and runs the benchmarks.
-[Validation](docs/validation.md) has the details.
+[Validation](core/docs/validation.md) has the details.
 
 ## Performance
 
@@ -107,13 +107,13 @@ took **0.89×** Rust's wall time and **0.85×** its instruction count, as geomet
 seven workloads. Every workload except Roboto with long Latin text, which is at parity
 (1.01× wall), was faster than Rust.
 
-[Performance history](docs/performance.md) records how the port got there from 11.25×.
+[Performance history](core/docs/performance.md) records how the port got there from 11.25×.
 
 ## Differences from harfrust
 
 No glyph differences are known on the pinned suite. The API is native Silk rather than a
 transliteration: `ShaperData` borrows the font bytes, and custom font functions are interface
-implementations, not closures. [Differences](docs/differences.md) lists the rest.
+implementations, not closures. [Differences](core/docs/differences.md) lists the rest.
 
 ## License
 

@@ -31,18 +31,18 @@ In a window (Metal on macOS, D3D12 on Windows, Vulkan on Linux), from the reposi
 
 ```sh
 python3 scripts/install-silk && python3 scripts/install-llvm   # once
-examples/showcase/scripts/app --release
+examples/showcase/core/scripts/app --release
 ```
 
 Move the pointer through the threads, click anywhere for a ripple, press "Reweave" (or `R`) for
 the next palette and `Space` to pause. The first build compiles the window bridge and fetches
-Dawn, as `examples/graphics-demo/scripts/app` does; see the native/platform/window README for prerequisites.
+Dawn, as `examples/graphics-demo/core/scripts/app` does; see the native/platform/window README for prerequisites.
 
 ## Record it
 
 ```sh
-examples/showcase/scripts/record            # build/showcase/silk-loom.mp4, .gif and PNG stills
-examples/showcase/scripts/record --scale 2  # 2560x1440
+examples/showcase/core/scripts/record            # build/showcase/silk-loom.mp4, .gif and PNG stills
+examples/showcase/core/scripts/record --scale 2  # 2560x1440
 ```
 
 The recorder (`record/src/main.silk`) runs the app through the runtime and the tree's real

@@ -7,7 +7,7 @@ Text and replaced content are measured by a provider you supply, so the engine h
 backend of its own.
 
 Full CSS conformance is the goal, not the verified status today.
-[SPECIFICATIONS.md](SPECIFICATIONS.md) lists the normative references, what is implemented and
+[SPECIFICATIONS.md](core/SPECIFICATIONS.md) lists the normative references, what is implemented and
 the known gaps.
 
 ## Example
@@ -89,11 +89,11 @@ wall time.
 
 ## More
 
-- [Reference](docs/reference.md): incremental layout, display and measurement, scrolling and
+- [Reference](core/docs/reference.md): incremental layout, display and measurement, scrolling and
   sticky positioning, scrollbars, the JSON adapter schema, and the conformance and benchmark
   tools.
-- [SPECIFICATIONS.md](SPECIFICATIONS.md): standards, coverage and policies.
-- [LIMITATIONS.md](LIMITATIONS.md): workarounds for compiler gaps.
+- [SPECIFICATIONS.md](core/SPECIFICATIONS.md): standards, coverage and policies.
+- [LIMITATIONS.md](core/LIMITATIONS.md): workarounds for compiler gaps.
 
 ## License
 

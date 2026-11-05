@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "fonts/shape/test-data/harfrust/harfrust/src"
+SOURCE = ROOT / "fonts/shape/core/test-data/harfrust/harfrust/src"
 
 
 def array(source, name):

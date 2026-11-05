@@ -112,7 +112,7 @@ String getters expose NSString's UTF-8 storage without the upstream UTF-16-lengt
 
 Callback context must remain valid until Metal finishes using it, including asynchronous notification and buffer deallocation. Callbacks can run on Metal/dispatch threads. Do not suspend, unwind, or perform unsynchronized access to shared storage. An unretained-reference command buffer additionally requires every referenced resource to outlive GPU execution.
 
-[Migrating from the dev.14 port](docs/migrating-from-dev14.md) covers the record-by-value ABI change.
+[Migrating from the dev.14 port](core/docs/migrating-from-dev14.md) covers the record-by-value ABI change.
 
 ## Deliberate corrections and adaptations
 

@@ -18,7 +18,7 @@ Packages:
 ## Using them
 
 A component is a function generic over the app's message type. It takes the builder, the
-[`Theme`](src/theme.silk), what it shows, and how to make the app's messages:
+[`Theme`](core/src/theme.silk), what it shows, and how to make the app's messages:
 
 ```silk
 let theme = self.theme
@@ -51,7 +51,7 @@ scroll offsets, the caret, the selection and input method state.
 
 Components with more state keep it in a small struct the app stores in its model:
 
-- [`MenuState`](src/menu.silk) for `menu` and `select`, with a `MenuMessage` union and
+- [`MenuState`](core/src/menu.silk) for `menu` and `select`, with a `MenuMessage` union and
   `update`, which returns the chosen item (`MenuState.endAligned()` for a menu at the right edge
   of the window, whose list lines up with the button's right edge, and `.ghosted()` for a
   borderless button in a toolbar):
@@ -64,7 +64,7 @@ Components with more state keep it in a small struct the app stores in its model
   }
   ```
 
-- [`Disclosure`](src/dialog.silk) (`open`, and whether focus goes back to the button) for
+- [`Disclosure`](core/src/dialog.silk) (`open`, and whether focus goes back to the button) for
   `dialog` and `popover`, with `show`, `hide` and `set`.
 
 This is the submodel pattern of the F1 design without `ui.map`: the component takes the

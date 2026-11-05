@@ -21,8 +21,8 @@ Packages:
 
 ```sh
 python3 scripts/install-silk && python3 scripts/install-llvm   # once, see the repository README
-examples/notes/scripts/notes                       # debug build, notes in ~/.silk-notes.json
-examples/notes/scripts/notes --release --file my-notes.json
+examples/notes/core/scripts/notes                       # debug build, notes in ~/.silk-notes.json
+examples/notes/core/scripts/notes --release --file my-notes.json
 ```
 
 On Linux it needs `libx11-dev libxkbcommon-dev libwayland-dev` (see
@@ -42,7 +42,7 @@ that is not a notes file is left alone: the app says so and exits.
 To look inside it while it runs, start it with the devtools window next to it:
 
 ```sh
-ui/inspect/devtools/scripts/devtools notes
+ui/inspect/devtools/core/scripts/devtools notes
 ```
 
 `ui-inspect-cli` and `ui-inspect-mcp` reach it the same way (debug build, `SILK_UI_INSPECT`
@@ -96,8 +96,8 @@ too.
 silk test --manifest-path examples/notes/tests/silk.toml --root src/tests.silk
 silk build --manifest-path examples/notes/tests/silk.toml
 examples/notes/tests/build/llvm/x86_64-unknown-linux-gnu/debug/ui-notes-tests examples/notes/tests/goldens
-examples/notes/scripts/notes check                # the app in X11 and Wayland windows (Linux)
-ui/inspect/devtools/scripts/devtools check  # the devtools window inspecting the app
+examples/notes/core/scripts/notes check                # the app in X11 and Wayland windows (Linux)
+ui/inspect/devtools/core/scripts/devtools check  # the devtools window inspecting the app
 ```
 
 The tests drive the app through the tree's real input path with the ui-app harness (clicks by

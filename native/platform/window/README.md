@@ -139,16 +139,16 @@ python3 scripts/check --package platform-window
 On macOS 14+ with the Xcode or Command Line Tools SDK:
 
 ```sh
-python3 native/platform/window/scripts/macos smoke   # real window: frames, resize, IME, keys, clipboard
-python3 native/platform/window/scripts/macos demo    # WebGPU demo for the checks below
+python3 native/platform/window/core/scripts/macos smoke   # real window: frames, resize, IME, keys, clipboard
+python3 native/platform/window/core/scripts/macos demo    # WebGPU demo for the checks below
 ```
 
 Smoke tests for the other backends, all running the shared checks in `tests/smoke`:
 
 ```sh
-python3 native/platform/window/scripts/linux smoke     # under Xvfb and a headless Weston
-python3 native/platform/window/scripts/windows smoke   # from an x64 Visual Studio developer shell
-python3 native/platform/window/scripts/browser smoke   # in the installed Playwright Chromium
+python3 native/platform/window/core/scripts/linux smoke     # under Xvfb and a headless Weston
+python3 native/platform/window/core/scripts/windows smoke   # from an x64 Visual Studio developer shell
+python3 native/platform/window/core/scripts/browser smoke   # in the installed Playwright Chromium
 ```
 
 `silk.toml` declares each bridge, and its libraries reach every program that depends on the

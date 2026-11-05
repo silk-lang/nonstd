@@ -260,7 +260,7 @@ For people and agents looking at a running UI (`inspect.silk`):
 silk test --manifest-path ui/tree/tests/silk.toml --root src/tests.silk
 silk build --manifest-path ui/tree/tests/silk.toml
 build/llvm/x86_64-unknown-linux-gnu/debug/ui-tree-tests ui/tree/tests/goldens [--update]
-python3 ui/tree/scripts/test-browser
+python3 ui/tree/core/scripts/test-browser
 silk test --manifest-path ui/tree/window/tests/silk.toml --root src/tests.silk
 python3 ui/tree/demo/scripts/demo [check]
 ```

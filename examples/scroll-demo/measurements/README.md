@@ -114,7 +114,7 @@ Measured on an Apple M1 Max, macOS arm64, with the pinned dev.47 Silk compiler a
 a release build. Viewport: 1280 × 900, scale 2. The feature branch starts from
 `acaf8d5b3`; the before runs use the new demo with the original `ui-app` runtime.
 The after runs use the same document with the mutation-batch transfer fix in
-`ui/app/src/runtime.silk`. All runs were local, not on an isolated benchmark machine.
+`ui/app/core/src/runtime.silk`. All runs were local, not on an isolated benchmark machine.
 
 ## Fixed: quadratic app construction
 

@@ -26,10 +26,10 @@ The app to inspect must be a debug build started with `SILK_UI_INSPECT` set (see
 (ui/app/demo), the component gallery (ui/components/demo) and the inbox demo (ui/tree/demo) do.
 
 ```sh
-ui/inspect/devtools/scripts/devtools notes                 # the notes app and the devtools on it
-ui/inspect/devtools/scripts/devtools todo                  # the same with the todo demo
+ui/inspect/devtools/core/scripts/devtools notes                 # the notes app and the devtools on it
+ui/inspect/devtools/core/scripts/devtools todo                  # the same with the todo demo
 SILK_UI_INSPECT=1 ui-app-demo &                            # or any app, then:
-ui/inspect/devtools/scripts/devtools --connect 1           # 1, tcp:<port> or a socket path
+ui/inspect/devtools/core/scripts/devtools --connect 1           # 1, tcp:<port> or a socket path
 ```
 
 `ui-devtools [--connect ADDRESS]` takes the address in the syntax of `SILK_UI_INSPECT` (default
@@ -74,7 +74,7 @@ Besides `hello`, `inspect`, `highlight` and `stats`, two commands came with the 
 silk test --manifest-path ui/inspect/devtools/tests/silk.toml --root src/tests.silk
 silk build --manifest-path ui/inspect/devtools/tests/silk.toml
 ui/inspect/devtools/tests/build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-devtools-tests ui/inspect/devtools/tests/goldens [--update]
-python3 ui/inspect/devtools/scripts/devtools check
+python3 ui/inspect/devtools/core/scripts/devtools check
 ```
 
 - The devtools run headless against the todo example through `Protocol.handle`: the first

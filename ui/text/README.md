@@ -32,7 +32,7 @@ with Chrome on the same font files, and compares the rectangle of every text fra
 
 ```sh
 silk build --manifest-path ui/text/tools/cli/silk.toml
-node ui/text/scripts/chrome-text.mjs --cli build/llvm/x86_64-unknown-linux-gnu/debug/ui-text-cli
+node ui/text/core/scripts/chrome-text.mjs --cli build/llvm/x86_64-unknown-linux-gnu/debug/ui-text-cli
 ```
 
 The cases cover wrapping, kerning, mixed styles, line heights, alignment and justification,

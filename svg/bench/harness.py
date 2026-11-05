@@ -250,7 +250,7 @@ def emit(report, output):
 def bench_main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--silk", type=Path, required=True, help="release native svg-bench executable")
-    parser.add_argument("--rust", type=Path, default=ROOT / "svg/scripts/rust-bench/target/release/svg-reference-bench")
+    parser.add_argument("--rust", type=Path, default=ROOT / "svg/core/scripts/rust-bench/target/release/svg-reference-bench")
     parser.add_argument("--baseline", type=Path, default=HERE / "baseline.json")
     parser.add_argument("--record-baseline", action="store_true", help="explicitly write actual measurements; default only compares")
     options(parser)

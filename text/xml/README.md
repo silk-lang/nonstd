@@ -50,7 +50,7 @@ are byte slices borrowed from the document.
 
 ## Conformance
 
-`text/xml/scripts/check-xmlconf` downloads the W3C XML Conformance Test Suite (2013-09-23,
+`text/xml/core/scripts/check-xmlconf` downloads the W3C XML Conformance Test Suite (2013-09-23,
 pinned by SHA-256), runs the parser on every applicable case and compares accept/reject with
 the expected outcome. **1899 of 1899** selected cases pass. The skipped cases are:
 
@@ -69,11 +69,11 @@ directory, not from a package-local build directory.
 From the repository root:
 
 ```sh
-silk test --manifest-path text/xml/silk.toml --root src/tests.silk
-text/xml/scripts/check-xmlconf
+silk test --manifest-path text/xml/core/silk.toml --root src/tests.silk
+text/xml/core/scripts/check-xmlconf
 ```
 
-Both run in the `text-xml` CI workflow. The SVG gate (`svg/scripts/check`) also exercises the
+Both run in the `text-xml` CI workflow. The SVG gate (`svg/core/scripts/check`) also exercises the
 parser on every SVG test input.
 
 ## License
