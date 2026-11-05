@@ -71,7 +71,8 @@ fn run_plan(path: &Path) -> miette::Result<()> {
 
 fn ensure_correct_working_directory() -> miette::Result<()> {
     if !(Path::new("read-fonts").is_dir() && Path::new("resources").is_dir()
-        || Path::new("fonts/parse").is_dir() && Path::new("fonts/parse/upstream/resources").is_dir())
+        || Path::new("fonts/parse").is_dir()
+            && Path::new("fonts/parse/upstream/resources").is_dir())
     {
         return Err(miette!(
             "codegen tool must be run from the root of the workspace"
