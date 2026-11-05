@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const webgpu = resolve(dirname(fileURLToPath(import.meta.url)), '../../../native/gpu/webgpu');
+const webgpu = resolve(dirname(fileURLToPath(import.meta.url)), '../../../native/gpu/webgpu/core');
 const wasmIndex = process.argv.indexOf('--wasm');
 if (wasmIndex < 0 || !process.argv[wasmIndex + 1]) throw new Error('Usage: node browser/test.mjs --wasm FILE');
 const wasm = await readFile(resolve(process.argv[wasmIndex + 1]));
