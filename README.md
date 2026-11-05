@@ -96,9 +96,9 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`graphics/demo/host`](graphics/demo/host) | `graphics-demo-host` | The shared native host that draws a UI scene in a platform window |  |
 | [`ui/app`](ui/app) | `ui-app` | An Elm-style UI framework on ui-tree: model, messages, view, update, commands | `demo`, `examples`, `scroll-demo`, `tests` |
 | [`ui/app/window`](ui/app/window) | `ui-app-window` | Runs a ui-app application in a native window | `tests` |
+| [`ui/assets`](ui/assets) | `ui-assets` | Embedded fonts, icons and photos for UI fixtures, tests and demos |  |
 | [`ui/components`](ui/components) | `ui-components` | Components for ui-app views: buttons, fields, lists, menus, dialogs and more | `demo`, `gallery`, `tests` |
 | [`ui/inspect`](ui/inspect) | `ui-inspect` | The inspector core for ui-tree: snapshots, queries and input for people, tests and agents | `cli`, `mcp`, `tests` |
 | [`ui/inspect/devtools`](ui/inspect/devtools) | `ui-inspect-devtools` | A devtools window for a running Silk UI | `app`, `tests` |
@@ -115,6 +115,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`crdt/demo`](crdt/demo) | `crdt-demo` | Two people editing one rich-text document through an in-process sync server (not a workspace member, see layers.toml) | `app`, `tests` |
 | [`crdt/showcase`](crdt/showcase) | `crdt-showcase` | Six scripted people writing one rich-text document at once, drawn live (not a workspace member, see layers.toml) | `record` |
 | [`graphics/demo`](graphics/demo) | `graphics-demo` | The UI drawing layer's integration demo, natively and in the browser | `app`, `browser`, `screenshot`, `tests` |
+| [`graphics/demo/host`](graphics/demo/host) | `graphics-demo-host` | The shared native host that draws a UI scene in a platform window |  |
 | [`ui/notes`](ui/notes) | `ui-notes` | The example notes app of the UI stack | `app`, `tests` |
 | [`ui/showcase`](ui/showcase) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack | `app`, `record` |
 
