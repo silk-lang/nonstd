@@ -1,6 +1,6 @@
-# graphics-sprites
+# ui-sprites
 
-SVG icons and decoded images as [graphics-atlas](../atlas) tiles, for the UI scene's glyph and
+SVG icons and decoded images as [graphics-atlas](../../graphics/atlas) tiles, for the UI scene's glyph and
 image sprites. This is phase 6 of the UI drawing layer. It holds no GPU code: like the glyph
 cache in [font-raster](../../font/raster), it allocates tiles and queues their pixels, and the
 renderer copies the queued pixels into its textures (`queue.writeTexture` on WebGPU,
@@ -55,7 +55,7 @@ mode they render at time zero.
 ## Tests
 
 ```sh
-silk test --manifest-path graphics/sprites/silk.toml --root src/tests.silk
+silk test --manifest-path ui/sprites/silk.toml --root src/tests.silk
 ```
 
 The icon tests check that color tiles equal `svg_render.lib.render` at the same size byte for

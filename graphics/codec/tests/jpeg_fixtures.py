@@ -1,7 +1,7 @@
 from pathlib import Path
 import io
 from PIL import Image
-p=Path('images/codec/tests/jpeg')
+p=Path('graphics/codec/tests/jpeg')
 files=[]
 for name,mode,color,progressive,orientation in [('baselineGray','L',128,False,1),('progressiveGray','L',128,True,1),('baselineRgb','RGB',(180,50,90),False,1),('progressiveRgb','RGB',(180,50,90),True,1),('orientedRgb','RGB',(180,50,90),False,6)]:
  im=Image.new(mode,(9,7),color);e=Image.Exif();e[274]=orientation;buf=io.BytesIO();im.save(buf,format='JPEG',quality=95,progressive=progressive,exif=e);data=buf.getvalue();(p/(name+'.jpg')).write_bytes(data);files.append((name,data,progressive,orientation,1 if mode=='L' else 3))
@@ -22,9 +22,9 @@ test effect fn {name}() -> () ! JpegError | ImageError | AssertionError<'static>
   run Testing.expect(header.componentCount == {components} && header.jfif, "component count and JFIF declaration")
 }}
 '''
-Path('images/codec/src/jpeg_header_tests.silk').write_text(s)
+Path('graphics/codec/src/jpeg_header_tests.silk').write_text(s)
 from pathlib import Path
-p=Path('images/codec/tests/jpeg/baselineRgb.jpg');valid=p.read_bytes();sof=valid.index(b'\xff\xc0');sos=valid.index(b'\xff\xda');header_end=sos+2+int.from_bytes(valid[sos+2:sos+4],'big')
+p=Path('graphics/codec/tests/jpeg/baselineRgb.jpg');valid=p.read_bytes();sof=valid.index(b'\xff\xc0');sos=valid.index(b'\xff\xda');header_end=sos+2+int.from_bytes(valid[sos+2:sos+4],'big')
 def change(at,value):
  data=bytearray(valid);data[at]=value;return bytes(data)
 bad=[('zeroSampling',change(sof+11,0)),('unknownScanComponent',change(sos+5,99)),('invalidHuffmanSelector',change(sos+6,0x44)),('emptyScan',change(sos+4,0)),('duplicateComponent',change(sof+13,valid[sof+10]))]
@@ -57,4 +57,4 @@ test effect fn truncatedHeaders() -> () ! AssertionError<'static> {{
   }}
 }}
 '''
-Path('images/codec/src/jpeg_invalid_tests.silk').write_text(s)
+Path('graphics/codec/src/jpeg_invalid_tests.silk').write_text(s)

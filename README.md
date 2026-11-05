@@ -54,25 +54,25 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
 | [`graphics/atlas`](graphics/atlas) | `graphics-atlas` | A texture atlas allocator for glyphs, icons and images, evicting by last use |  |
+| [`graphics/codec`](graphics/codec) | `graphics-codec` | PNG and JPEG decoding, PNG encoding and premultiplied RGBA images |  |
 | [`graphics/editor`](graphics/editor) | `graphics-editor` | Retained editor documents: shapes and image tiles with stable IDs, hit tests and viewport painting |  |
+| [`graphics/geometry`](graphics/geometry) | `graphics-geometry` | Geometry shared by the SVG renderer and CSS |  |
 | [`graphics/gpu_scene`](graphics/gpu_scene) | `graphics-gpu-scene` | Draws vector scenes on WebGPU, matching the CPU renderer's output | `tests` |
 | [`graphics/ui_renderer`](graphics/ui_renderer) | `graphics-ui-renderer` | Draws a finished UI scene with WebGPU, natively and in the browser | `bench`, `browser`, `fixtures`, `tests` |
 | [`graphics/ui_scene`](graphics/ui_scene) | `graphics-ui-scene` | UI frame primitives ordered and batched for a GPU, with a CPU reference renderer | `tests` |
 | [`graphics/vector`](graphics/vector) | `graphics-vector` | A pure-Silk 2D vector rasterizer | `bench`, `filter-bench` |
-| [`images/codec`](images/codec) | `images-codec` | PNG and JPEG decoding, PNG encoding and premultiplied RGBA images |  |
-| [`images/svg/geometry`](images/svg/geometry) | `images-svg-geometry` | Geometry shared by the SVG renderer and CSS |  |
 
 ### fonts
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
 | [`font/collection`](font/collection) | `font-collection` | An application's fonts and the order to fall back through them per character |  |
+| [`font/faces`](font/faces) | `font-faces` | Font faces for text: a host-filled face database and CSS Fonts 4 matching |  |
 | [`font/outline`](font/outline) | `font-outline` | Glyph outlines (glyf, gvar, CFF, CFF2) drawn into any path sink or a vector path |  |
 | [`font/parse`](font/parse) | `font-parse` | Font file parsing and a font model; a port of read-fonts and parts of skrifa | `bench`, `dump` |
 | [`font/raster`](font/raster) | `font-raster` | The UI glyph cache: unhinted glyphs in atlas tiles, shaped lines and text gamma |  |
 | [`font/shape`](font/shape) | `font-shape` | Text shaping, from a string and a font to positioned glyphs; a port of harfrust | `cli`, `wasm` |
 | [`font/types`](font/types) | `font-types` | The scalar types OpenType tables are built from; a port of fontations' font-types |  |
-| [`images/svg/fonts`](images/svg/fonts) | `images-svg-fonts` | Font faces for text: a host-filled face database and CSS Fonts 4 matching |  |
 
 ### css
 
@@ -97,13 +97,13 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
 | [`graphics/demo/host`](graphics/demo/host) | `graphics-demo-host` | The shared native host that draws a UI scene in a platform window |  |
-| [`graphics/sprites`](graphics/sprites) | `graphics-sprites` | SVG icons and decoded images as atlas tiles for the UI renderer |  |
 | [`ui/app`](ui/app) | `ui-app` | An Elm-style UI framework on ui-tree: model, messages, view, update, commands | `demo`, `examples`, `scroll-demo`, `tests` |
 | [`ui/app/window`](ui/app/window) | `ui-app-window` | Runs a ui-app application in a native window | `tests` |
 | [`ui/components`](ui/components) | `ui-components` | Components for ui-app views: buttons, fields, lists, menus, dialogs and more | `demo`, `gallery`, `tests` |
 | [`ui/inspect`](ui/inspect) | `ui-inspect` | The inspector core for ui-tree: snapshots, queries and input for people, tests and agents | `cli`, `mcp`, `tests` |
 | [`ui/inspect/devtools`](ui/inspect/devtools) | `ui-inspect-devtools` | A devtools window for a running Silk UI | `app`, `tests` |
 | [`ui/inspect/server`](ui/inspect/server) | `ui-inspect-server` | The inspector protocol: a running UI answers JSON requests on a local socket | `tests` |
+| [`ui/sprites`](ui/sprites) | `ui-sprites` | SVG icons and decoded images as atlas tiles for the UI renderer |  |
 | [`ui/text`](ui/text) | `ui-text` | css-layout's TextMeasure over real fonts, with line breaking, bidi and fallback from std | `cli` |
 | [`ui/tree`](ui/tree) | `ui-tree` | The retained UI tree: plain-data mutations, CSS layout, painting into a UI scene | `browser`, `demo`, `fixtures`, `tests` |
 | [`ui/tree/window`](ui/tree/window) | `ui-tree-window` | Hosts a ui-tree in a platform window | `demo`, `tests` |

@@ -2,7 +2,7 @@
 
 The fonts an application draws text with, and the order to fall back through them when a
 font has no glyph for a character. Face reading and CSS Fonts 4 matching come from
-[images-svg-fonts](../../images/svg/fonts); this package adds family lists with generic names,
+[font-faces](../faces); this package adds family lists with generic names,
 fallback families and per-character face selection.
 
 - `collection.FontCollection` holds the faces. `add(bytes)` reads a font file (collections add

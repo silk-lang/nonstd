@@ -23,7 +23,7 @@ chosen API boundary, not a compiler correctness workaround.
 [silk-lang/silk#2539](https://github.com/silk-lang/silk/issues/2539) already covers
 the missing `atan2`, `hypot`, trigonometric and color/filter math APIs. A minimal
 dev.27 manifest/source reproduction was added to that issue; `f64.atan2`
-produces `SEM0014`. `images/svg/geometry/src/math.silk` supplies finite-input,
+produces `SEM0014`. `graphics/geometry/src/math.silk` supplies finite-input,
 range-reduced `atan2`, scaled `hypot` and bounded degree reduction in pure Silk,
 without libc or per-target imports. Arc/transform tests exercise these paths.
 Replace the helpers when released stdlib equivalents are available.
@@ -151,7 +151,7 @@ Required backend changes stay upstream; there is no second local rasterizer.
 
 No JPEG codec was present in the dev.32 stdlib inspected for the original report. The baseline/progressive
 codec request is tracked in [silk-lang/silk#2617](https://github.com/silk-lang/silk/issues/2617).
-The general-purpose `images/codec` package is implementing bounded marker,
+The general-purpose `graphics/codec` package is implementing bounded marker,
 metadata and entropy decoding locally; its API contains no SVG types.
 
 ## LIMITATION-10 — native NaN constant reference

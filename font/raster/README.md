@@ -56,7 +56,7 @@ With `color: true`, `color.colorGlyph` draws the glyph's color rendering into a 
 premultiplied RGBA: COLR version 0 layers in CPAL palette 0 colors (filled by `vector`, so they
 get subpixel positioning; foreground layers take the cache's `withForeground` color, black by
 default), else an `sbix` or `CBDT` PNG from the strike nearest the requested size, decoded by
-[images-codec](../../images/codec) and box-filtered to size with the subpixel offset applied. A
+[graphics-codec](../../graphics/codec) and box-filtered to size with the subpixel offset applied. A
 glyph with none of these gets its outline. COLR version 1 paint graphs are not drawn yet.
 
 ## Tests
