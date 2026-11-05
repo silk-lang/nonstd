@@ -8,6 +8,11 @@
 //! in the tree as tombstones so later insertions can still name them.
 //!
 //! The unit of offsets is the UTF-8 byte. Editors must insert and delete at scalar boundaries.
+//!
+//! Finding a byte by its name takes O(log n): every fragment carries an order label that grows
+//! along the text, each insertion lists the labels of its pieces, and the tree seeks by label.
+//! Labels are spread out, and when two neighbours leave no room, the smallest range of labels
+//! around them that is sparse enough is relabelled evenly.
 import btree.tree { Item, Root, Summary, Tree }
 import clock { DeltaId }
 import silk.collections.hash { Hash }
@@ -18,6 +23,8 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.result { Result }
+import silk.num.u64
+import silk.num.usize
 import silk.text.string { InvalidUtf8, String }
 
 /// The name of one byte: the delta that inserted it and its offset in that insertion.
@@ -79,35 +86,42 @@ struct Fragment {
   start: usize,
   length: usize,
   deleted: bool,
+  // Grows along the text; see `Text.labelFor`.
+  label: u64,
 }
 
 impl Copy for Fragment {}
 
-/// What a fragment tree knows about a run of fragments: its visible and total bytes.
+/// What a fragment tree knows about a run of fragments: its visible and total bytes, and its
+/// largest order label.
 pub struct TextSummary {
   pub visible: usize,
   pub total: usize,
+  pub label: u64,
 }
 
 impl Copy for TextSummary {}
 
 impl Summary for TextSummary {
   fn zero() -> TextSummary {
-    return TextSummary { visible: 0, total: 0 }
+    return TextSummary { visible: 0, total: 0, label: 0 }
   }
 
   fn add(self: &mut Self, other: &TextSummary) -> () {
     self.visible = self.visible + other.visible
     self.total = self.total + other.total
+    if other.label > self.label {
+      self.label = other.label
+    }
   }
 }
 
 impl Item<TextSummary> for Fragment {
   fn summary(self: &Self) -> TextSummary {
     if self.deleted {
-      return TextSummary { visible: 0, total: self.length }
+      return TextSummary { visible: 0, total: self.length, label: self.label }
     }
-    return TextSummary { visible: self.length, total: self.length }
+    return TextSummary { visible: self.length, total: self.length, label: self.label }
   }
 }
 
@@ -118,6 +132,21 @@ fn visible(summary: &TextSummary) -> usize {
 fn total(summary: &TextSummary) -> usize {
   return summary.total
 }
+
+fn label(summary: &TextSummary) -> u64 {
+  return summary.label
+}
+
+// The room left after the last fragment when a fragment is added at the end.
+const STEP: u64 = 4294967296
+
+// Where one piece of an insertion starts, and the label of its fragment.
+struct Split {
+  start: usize,
+  label: u64,
+}
+
+impl Copy for Split {}
 
 /// One fragment of a text: a run of bytes from one insertion, all deleted or all visible.
 pub struct Piece {
@@ -132,9 +161,18 @@ struct Insertion {
   originRight: CharId,
   buffer: usize,
   length: usize,
+  // Its pieces in `Text.splits`, sorted by start.
+  splits: usize,
 }
 
 impl Copy for Insertion {}
+
+/// A version of a text kept with [`Text.version`], to rebuild with [`Text.restore`].
+pub struct TextVersion {
+  root: Root,
+}
+
+impl Copy for TextVersion {}
 
 /// One replica of a text.
 pub struct Text {
@@ -142,23 +180,71 @@ pub struct Text {
   root: Root,
   insertions: HashMap<DeltaId, Insertion>,
   bytes: List<u8>,
+  splits: List<List<Split>>,
 }
 
 impl Text {
   /// An empty text.
   pub fn make() -> Text {
-    let filler = Fragment { id: DeltaId.make(0, 0), start: 0, length: 0, deleted: true }
+    let filler = Fragment { id: DeltaId.make(0, 0), start: 0, length: 0, deleted: true, label: 0 }
     return Text {
       tree: Tree<Fragment, TextSummary>.make(filler),
       root: Root.empty(),
       insertions: HashMap<DeltaId, Insertion>.make(Hash.seed(1099511628211)),
       bytes: List<u8>.make(),
+      splits: List<List<Split>>.make(),
     }
   }
 
   /// The number of visible bytes.
   pub fn length(self: &Self) -> usize {
     return self.tree.summary(self.root).visible
+  }
+
+  /// Keeps this text as it is now, to rebuild later with [`Text.restore`]. Later edits copy only
+  /// the tree nodes they change, so a kept version costs little. It is kept as long as this text.
+  pub fn version(self: &mut Self) -> TextVersion {
+    return TextVersion { root: self.tree.retain(self.root) }
+  }
+
+  /// A new text holding `version` of this one, as a replica that applied only the operations
+  /// before it would hold it. `version` must come from this text.
+  pub effect fn restore(self: &Self, version: TextVersion) -> Text
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut past = Text.make()
+    let count = self.tree.length(version.root)
+    if usize.toU64(count) >= u64.MAX / STEP {
+      Intrinsic.trap("Text.restore: too many fragments to label")
+    }
+    let mut k: usize = 0
+    while k < count {
+      let mut fragment = self.tree.get(version.root, k)
+      if !past.insertions.contains(fragment.id) {
+        let insertion = self.insertionOf(fragment.id)
+        let buffer = past.bytes.length()
+        run past.bytes.appendSlice(
+          Slice.view(self.bytes.asSlice(), insertion.buffer, insertion.length),
+        )
+        run past.splits.append(List<Split>.make())
+        let copied = Insertion {
+          originLeft: insertion.originLeft,
+          originRight: insertion.originRight,
+          buffer: buffer,
+          length: insertion.length,
+          splits: past.splits.length() - 1,
+        }
+        drop run past.insertions.insert(fragment.id, copied)
+      }
+      fragment.label = usize.toU64(k + 1) * STEP
+      let owner = past.insertionOf(fragment.id).splits
+      run past.splits.asMutSlice()[owner].append(
+        Split { start: fragment.start, label: fragment.label },
+      )
+      run past.tree.insert(&mut past.root, k, fragment)
+      k = k + 1
+    }
+    return move past
   }
 
   /// The number of fragments, tombstones included, for tests and memory accounting.
@@ -416,14 +502,25 @@ impl Text {
     ? &mut Allocator {
     let buffer = self.bytes.length()
     run self.bytes.appendSlice(op.bytes.asSlice())
+    let label = run self.labelFor(at)
+    let mut pieces = List<Split>.make()
+    run pieces.append(Split { start: 0, label: label })
+    run self.splits.append(move pieces)
     let insertion = Insertion {
       originLeft: op.originLeft,
       originRight: op.originRight,
       buffer: buffer,
       length: op.bytes.length(),
+      splits: self.splits.length() - 1,
     }
     drop run self.insertions.insert(op.id, insertion)
-    let fragment = Fragment { id: op.id, start: 0, length: op.bytes.length(), deleted: false }
+    let fragment = Fragment {
+      id: op.id,
+      start: 0,
+      length: op.bytes.length(),
+      deleted: false,
+      label: label,
+    }
     run self.tree.insert(&mut self.root, at, fragment)
   }
 
@@ -431,21 +528,28 @@ impl Text {
   effect fn split(self: &mut Self, index: usize, at: usize) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let label = run self.labelFor(index + 1)
     let fragment = self.tree.get(self.root, index)
     let head = Fragment {
       id: fragment.id,
       start: fragment.start,
       length: at,
       deleted: fragment.deleted,
+      label: fragment.label,
     }
     let tail = Fragment {
       id: fragment.id,
       start: fragment.start + at,
       length: fragment.length - at,
       deleted: fragment.deleted,
+      label: label,
     }
     run self.tree.set(&mut self.root, index, head)
     run self.tree.insert(&mut self.root, index + 1, tail)
+    let owner = self.insertionOf(fragment.id).splits
+    let pieces = &mut self.splits.asMutSlice()[owner]
+    let after = splitAt(&pieces.*, fragment.start) + 1
+    run pieces.insertRepeated(after, Split { start: tail.start, label: label }, 1)
   }
 
   // The index of the fragment holding `char`.
@@ -471,17 +575,100 @@ impl Text {
 
   // The index of the fragment holding `char`, or `None` when this replica has not seen it.
   fn locate(self: &Self, char: CharId) -> Option<usize> {
-    let count = self.tree.length(self.root)
-    let mut k: usize = 0
-    while k < count {
-      let fragment = self.tree.get(self.root, k)
-      if fragment.id.same(&char.id) && fragment.start <= char.offset
-        && char.offset < fragment.start + fragment.length {
-        return Option<usize>.some(k)
-      }
-      k = k + 1
+    if !self.insertions.contains(char.id) {
+      return Option<usize>.none()
     }
-    return Option<usize>.none()
+    let insertion = self.insertionOf(char.id)
+    if char.offset >= insertion.length {
+      return Option<usize>.none()
+    }
+    let pieces = &self.splits.asSlice()[insertion.splits]
+    let piece = pieces.get(splitAt(pieces, char.offset))
+    let index = self.tree.seekKey(self.root, label, piece.label)
+    if index >= self.tree.length(self.root)
+      || self.tree.get(self.root, index).label != piece.label {
+      Intrinsic.trap("Text: the label index is out of step with the fragments")
+    }
+    return Option<usize>.some(index)
+  }
+
+  // A label for a fragment about to be inserted at `at`: above the label of the fragment before
+  // and below the label of the fragment now at `at`. Relabels a range when there is no room.
+  effect fn labelFor(self: &mut Self, at: usize) -> u64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut low: u64 = 0
+    if at > 0 {
+      low = self.tree.get(self.root, at - 1).label
+    }
+    let mut high = u64.MAX
+    let atEnd = at == self.tree.length(self.root)
+    if !atEnd {
+      high = self.tree.get(self.root, at).label
+    }
+    let gap = high - low
+    if atEnd && gap > STEP {
+      return low + STEP
+    }
+    if gap >= 2 {
+      return low + gap / 2
+    }
+    run self.relabel(at)
+    return run self.labelFor(at)
+  }
+
+  // Spreads out the labels near a full gap at `at`: the smallest block of labels around it,
+  // aligned to a power of two, whose fragments can sit at least the square root of the block
+  // apart is relabelled evenly. This keeps the cost of a label amortized logarithmic.
+  effect fn relabel(self: &mut Self, at: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut anchor: u64 = 0
+    if at > 0 {
+      anchor = self.tree.get(self.root, at - 1).label
+    } else if at < self.tree.length(self.root) {
+      anchor = self.tree.get(self.root, at).label
+    }
+    let mut bits: u64 = 1
+    while bits <= 64 {
+      let mut lowest: u64 = 0
+      let mut highest = u64.MAX
+      if bits < 64 {
+        let size = u64.shiftLeft(1, bits)
+        lowest = anchor - anchor % size
+        highest = lowest + (size - 1)
+      }
+      let first = self.tree.seekKey(self.root, label, lowest)
+      let mut stop = self.tree.length(self.root)
+      if highest < u64.MAX {
+        stop = self.tree.seekKey(self.root, label, highest + 1)
+      }
+      let members = usize.toU64(stop - first)
+
+      // Room for every member, the new fragment, and a gap at the top.
+      let slots = members + 2
+      let half = u64.shiftLeft(1, bits - bits / 2)
+      let roomy = slots <= half && (highest - lowest) / slots >= 2
+      if roomy || bits == 64 {
+        if !roomy {
+          Intrinsic.trap("Text: too many fragments to label")
+        }
+        let spacing = (highest - lowest) / slots
+        let mut k = first
+        while k < stop {
+          let mut fragment = self.tree.get(self.root, k)
+          fragment.label = lowest + usize.toU64(k - first + 1) * spacing
+          run self.tree.set(&mut self.root, k, fragment)
+          let owner = self.insertionOf(fragment.id).splits
+          let pieces = &mut self.splits.asMutSlice()[owner]
+          let p = splitAt(&pieces.*, fragment.start)
+          pieces.set(p, Split { start: fragment.start, label: fragment.label })
+          k = k + 1
+        }
+        return ()
+      }
+      bits = bits + 1
+    }
   }
 
   // The index of the fragment that starts with `char`, splitting as needed.
@@ -497,6 +684,21 @@ impl Text {
     }
     return index
   }
+}
+
+// The index of the last piece that starts at or before `offset`.
+fn splitAt(pieces: &List<Split>, offset: usize) -> usize {
+  let mut low: usize = 0
+  let mut high = pieces.length()
+  while high - low > 1 {
+    let middle = low + (high - low) / 2
+    if pieces.get(middle).start <= offset {
+      low = middle
+    } else {
+      high = middle
+    }
+  }
+  return low
 }
 
 fn runsHold(runs: &List<CharRun>, char: CharId) -> bool {

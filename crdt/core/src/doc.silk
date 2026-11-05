@@ -6,15 +6,21 @@
 //! there. A delta from another replica applies once every parent is known here; operations name
 //! bytes and entries, not offsets, so deltas apply in any causal order.
 //!
+//! Every [`SNAPSHOT_EVERY`] deltas (see [`Document.setSnapshotInterval`]) the document keeps a
+//! snapshot of its objects. [`Document.checkout`] starts from the latest snapshot inside the
+//! version it rebuilds and applies only the deltas after it. Text snapshots share tree nodes with
+//! the live text, so one costs about the nodes later edits copy.
+//!
 //! Objects are named by [`ObjectId`] and come into being on first use. An application picks the
 //! ids, usually constants or hashes of names.
 import clock { ActorId, DeltaId, Frontier }
 import codec { DecodeError, Reader, VERSION, Writer }
 import graph { CausalGraph, NONE }
 import map { Map, SetOp }
-import rich { Anchor, Expand, MarkOp, RichText, Side }
+import rich { Anchor, Expand, MarkOp, RichText, RichVersion, Side }
 import text { CharId, CharRun, DeleteOp, InsertOp }
 import silk.collections.list { List }
+import silk.core.ownership { Copy }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
@@ -57,6 +63,24 @@ struct MapSlot {
   map: Map,
 }
 
+/// How many deltas a document applies between snapshots, unless set otherwise.
+pub const SNAPSHOT_EVERY: usize = 256
+
+struct TextSnapshot {
+  object: ObjectId,
+  version: RichVersion,
+}
+
+impl Copy for TextSnapshot {}
+
+// The objects after the first `deltas` deltas, numbered as the causal graph numbers them.
+struct Snapshot {
+  deltas: usize,
+  lamport: u64,
+  texts: List<TextSnapshot>,
+  maps: List<MapSlot>,
+}
+
 /// One replica of a document.
 pub struct Document {
   owner: ActorId,
@@ -68,6 +92,8 @@ pub struct Document {
   maps: List<MapSlot>,
   pending: List<Op>,
   pendingId: DeltaId,
+  snapshots: List<Snapshot>,
+  snapshotEvery: usize,
 }
 
 impl Document {
@@ -88,6 +114,8 @@ impl Document {
       maps: List<MapSlot>.make(),
       pending: List<Op>.make(),
       pendingId: DeltaId.make(0, 0),
+      snapshots: List<Snapshot>.make(),
+      snapshotEvery: SNAPSHOT_EVERY,
     }
   }
 
@@ -112,6 +140,16 @@ impl Document {
   /// Delta `seq`, numbered as the causal graph numbers it.
   pub fn delta(self: &Self, seq: usize) -> &Delta {
     return &self.deltas.asSlice()[seq]
+  }
+
+  /// Takes a snapshot every `deltas` deltas from now on; 0 takes none.
+  pub fn setSnapshotInterval(self: &mut Self, deltas: usize) -> () {
+    self.snapshotEvery = deltas
+  }
+
+  /// The number of snapshots kept.
+  pub fn snapshotCount(self: &Self) -> usize {
+    return self.snapshots.length()
   }
 
   /// Whether local edits wait for a commit.
@@ -252,6 +290,7 @@ impl Document {
     }
     run self.deltas.append(Delta { id: id, parents: move parents, ops: move ops })
     self.pendingId = DeltaId.make(0, 0)
+    run self.snapshotIfDue()
     return Option<usize>.Some { value: seq }
   }
 
@@ -280,6 +319,7 @@ impl Document {
     drop run self.history.add(delta.id, delta.parents.asSlice())
     run self.heads.advance(delta.parents.asSlice(), delta.id)
     run self.deltas.append(move delta)
+    run self.snapshotIfDue()
     return Applied.Applied
   }
 
@@ -303,7 +343,8 @@ impl Document {
   }
 
   /// A new document holding exactly the deltas `version` reaches, as a replica that saw only those
-  /// would. Every tip of `version` must be here.
+  /// would. Every tip of `version` must be here. It starts from the latest snapshot whose deltas
+  /// all lie inside `version` and applies the rest.
   pub effect fn checkout(self: &Self, version: &Frontier, actor: ActorId) -> Document
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -311,13 +352,130 @@ impl Document {
     let target = run self.history.seqs(version.tips())
     let none = List<usize>.make()
     let seqs = run self.history.diff(none.asSlice(), target.asSlice())
+
+    // The longest run of deltas 0, 1, 2, ... that `version` reaches.
+    let mut inside = List<bool>.make()
+    run inside.appendRepeated(false, self.deltas.length())
     let mut k: usize = 0
     while k < seqs.length() {
-      let copy = run self.delta(seqs.get(k)).copy()
-      drop run past.apply(move copy)
+      inside.set(seqs.get(k), true)
+      k = k + 1
+    }
+    let mut prefix: usize = 0
+    while prefix < inside.length() && inside.get(prefix) {
+      prefix = prefix + 1
+    }
+
+    let mut start: usize = 0
+    let mut s = self.snapshots.length()
+    while s > 0 {
+      s = s - 1
+      let snapshot = &self.snapshots.asSlice()[s]
+      if snapshot.deltas <= prefix {
+        run self.restoreInto(snapshot, &mut past)
+        start = snapshot.deltas
+        break
+      }
+    }
+    let mut d: usize = 0
+    while d < start {
+      let copy = run self.delta(d).copy()
+      run past.adopt(move copy)
+      d = d + 1
+    }
+    k = 0
+    while k < seqs.length() {
+      let seq = seqs.get(k)
+      if seq >= start {
+        let copy = run self.delta(seq).copy()
+        drop run past.apply(move copy)
+      }
       k = k + 1
     }
     return move past
+  }
+
+  // Puts the objects of `snapshot` into the empty document `past`.
+  effect fn restoreInto(self: &Self, snapshot: &Snapshot, past: &mut Document) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    past.lamport = snapshot.lamport
+    let mut t: usize = 0
+    while t < snapshot.texts.length() {
+      let kept = snapshot.texts.get(t)
+      let live = self.slotOf(kept.object)
+      let rich = run self.texts.asSlice()[live].rich.restore(kept.version)
+      run past.texts.append(TextSlot { object: kept.object, rich: move rich })
+      t = t + 1
+    }
+    let mut m: usize = 0
+    while m < snapshot.maps.length() {
+      let slot = &snapshot.maps.asSlice()[m]
+      let map = run slot.map.copy()
+      run past.maps.append(MapSlot { object: slot.object, map: move map })
+      m = m + 1
+    }
+  }
+
+  // Records a delta whose effects are already in the objects, as a restored snapshot's are.
+  effect fn adopt(self: &mut Self, delta: Delta) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.history.add(delta.id, delta.parents.asSlice())
+    run self.heads.advance(delta.parents.asSlice(), delta.id)
+    run self.deltas.append(move delta)
+  }
+
+  // Takes a snapshot when enough deltas have arrived since the last and no local edit waits, so
+  // the objects hold exactly the deltas so far.
+  effect fn snapshotIfDue(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.snapshotEvery == 0 || self.pending.length() > 0 {
+      return ()
+    }
+    let mut last: usize = 0
+    if self.snapshots.length() > 0 {
+      last = self.snapshots.asSlice()[self.snapshots.length() - 1].deltas
+    }
+    if self.deltas.length() - last < self.snapshotEvery {
+      return ()
+    }
+    let mut texts = List<TextSnapshot>.make()
+    let mut t: usize = 0
+    while t < self.texts.length() {
+      let slot = &mut self.texts.asMutSlice()[t]
+      run texts.append(TextSnapshot { object: slot.object, version: slot.rich.version() })
+      t = t + 1
+    }
+    let mut maps = List<MapSlot>.make()
+    let mut m: usize = 0
+    while m < self.maps.length() {
+      let slot = &self.maps.asSlice()[m]
+      let map = run slot.map.copy()
+      run maps.append(MapSlot { object: slot.object, map: move map })
+      m = m + 1
+    }
+    run self.snapshots.append(
+      Snapshot {
+        deltas: self.deltas.length(),
+        lamport: self.lamport,
+        texts: move texts,
+        maps: move maps,
+      },
+    )
+  }
+
+  // The index of the live text slot for `object`, which a snapshot names so it exists.
+  fn slotOf(self: &Self, object: ObjectId) -> usize {
+    let mut k: usize = 0
+    while k < self.texts.length() {
+      if self.texts.asSlice()[k].object == object {
+        return k
+      }
+      k = k + 1
+    }
+    Intrinsic.trap("Document: a snapshot names an unknown text")
   }
 
   fn nextId(self: &mut Self) -> DeltaId {

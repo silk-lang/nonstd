@@ -250,22 +250,26 @@ effect fn randomEdit(document: &mut Document, random: &mut Random) -> ()
 }
 
 // Replicas edit at random and trade deltas through bytes in random order, holding back the ones
-// whose parents have not arrived. One replica checks out a version it passed through.
-effect fn documentsConverge(seed: u64) -> ()
+// whose parents have not arrived. Replicas take a snapshot every `every` deltas. One replica
+// checks out versions it passed through, and the checkouts match what it showed then and what a
+// replica without snapshots rebuilds by replay.
+effect fn documentsConverge(seed: u64, every: usize) -> ()
   ! Failures
   ? &mut Allocator {
   let mut random = Random { state: seed }
   let mut replicas = List<Document>.make()
   let mut r: usize = 0
   while r < 3 {
-    let replica = run Document.make(usize.toU64(r) + 1)
+    let mut replica = run Document.make(usize.toU64(r) + 1)
+    replica.setSnapshotInterval(every)
     run replicas.append(move replica)
     r = r + 1
   }
   let mut inbox = List<List<u8>>.make()
   let mut inboxTarget = List<usize>.make()
-  let mut savedVersion = Frontier.empty()
-  let mut savedText = String.make()
+  let mut savedVersions = List<Frontier>.make()
+  let mut savedTexts = List<String>.make()
+  let mut savedSpans = List<List<Span>>.make()
   let mut step: usize = 0
   while step < 300 {
     let pick = random.below(3)
@@ -312,9 +316,13 @@ effect fn documentsConverge(seed: u64) -> ()
         drop inboxTarget.remove(at)
       }
     }
-    if step == 150 {
-      savedVersion = run replicas.asSlice()[0].frontier().copy()
-      savedText = run readText(&replicas.asSlice()[0])
+    if step % 70 == 69 && !replicas.asSlice()[0].hasPending() {
+      let version = run replicas.asSlice()[0].frontier().copy()
+      run savedVersions.append(move version)
+      let text = run readText(&replicas.asSlice()[0])
+      run savedTexts.append(move text)
+      let spans = run spansOf(&replicas.asSlice()[0])
+      run savedSpans.append(move spans)
     }
     step = step + 1
   }
@@ -364,10 +372,64 @@ effect fn documentsConverge(seed: u64) -> ()
     }
     r = r + 1
   }
-  let past = run replicas.asSlice()[0].checkout(&savedVersion, 9)
-  let pastText = run readText(&past)
-  run Testing.expect(pastText.view() == savedText.view(), "a checkout rebuilds the old text")
-  run Testing.expect(past.frontier().same(&savedVersion), "a checkout is at the old version")
+
+  // A replica that never snapshots, fed replica 0's deltas in its order.
+  let mut replay = run Document.make(8)
+  replay.setSnapshotInterval(0)
+  let mut d: usize = 0
+  while d < replicas.asSlice()[0].deltaCount() {
+    let copy = run replicas.asSlice()[0].delta(d).copy()
+    drop run replay.apply(move copy)
+    d = d + 1
+  }
+  run Testing.expect(replay.snapshotCount() == 0, "a zero interval takes no snapshot")
+  if every < 50 {
+    run Testing.expect(replicas.asSlice()[0].snapshotCount() > 0, "replicas take snapshots")
+  }
+  let mut v: usize = 0
+  while v < savedVersions.length() {
+    let version = &savedVersions.asSlice()[v]
+    let mut past = run replicas.asSlice()[0].checkout(version, 9)
+    let pastText = run readText(&past)
+    run Testing.expect(
+      pastText.view() == savedTexts.asSlice()[v].view(),
+      "a checkout rebuilds the old text",
+    )
+    let pastSpans = run spansOf(&past)
+    run Testing.expect(
+      sameSpans(&pastSpans, &savedSpans.asSlice()[v]),
+      "a checkout rebuilds the old marks",
+    )
+    run Testing.expect(past.frontier().same(version), "a checkout is at the old version")
+    let replayed = run replay.checkout(version, 10)
+    let keys: [string; 3] = ["a", "b", "c"]
+    let mut k: usize = 0
+    while k < 3 {
+      run Testing.expect(
+        hasKey(&past, keys[k]) == hasKey(&replayed, keys[k]),
+        "a checkout holds the old keys",
+      )
+      k = k + 1
+    }
+
+    // The checkout edits on, and its delta applies to the replica it came from.
+    run past.insertText(BODY, 0, bytes("new"))
+    let committed = run past.commit()
+    match committed {
+      Option<usize>.Some { value } => {
+        let copy = run past.delta(value).copy()
+        let applied = run replicas.asMutSlice()[0].apply(move copy)
+        let fits = match applied {
+          Applied.Applied => true
+          _ => false
+        }
+        run Testing.expect(fits, "a delta made on a checkout applies to the live replica")
+      }
+      Option<usize>.None => {}
+    }
+    v = v + 1
+  }
+  run Testing.expect(savedVersions.length() >= 2, "the run saved versions to check out")
 }
 
 test effect fn mapsResolveConcurrentEditsTest() -> ()
@@ -387,7 +449,18 @@ test effect fn documentsConvergeTest() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut seed: u64 = 3
   while seed < 9 {
-    run documentsConverge(seed) |> Effect.provideMut<Allocator>(&mut allocator)
+    run documentsConverge(seed, 256) |> Effect.provideMut<Allocator>(&mut allocator)
+    seed = seed + 1
+  }
+}
+
+test effect fn checkoutsFromSnapshotsMatchReplayTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut seed: u64 = 11
+  while seed < 17 {
+    run documentsConverge(seed, 1 + u64.toUsize(seed % 6))
+      |> Effect.provideMut<Allocator>(&mut allocator)
     seed = seed + 1
   }
 }

@@ -38,8 +38,16 @@ holding its data. `RichText.spans` gives the runs of equal attributes for a rend
 A `Document` holds rich texts and maps by object id. Local edits apply at once and gather in a
 pending delta until `commit`, so a transaction is the edits between two commits. `apply` takes a
 delta from another replica once its parents are here. `checkout(version)` rebuilds the document as
-a replica that saw only that version's past would have it (by replay; snapshots are not
-implemented yet).
+a replica that saw only that version's past would have it.
+
+Every 256 deltas (`setSnapshotInterval` changes it) a document keeps a snapshot of its objects.
+A text snapshot is a retained root of the persistent fragment tree, so it shares nodes with the
+live text and costs only the nodes later edits copy. A checkout starts from the latest snapshot
+whose deltas all lie in the version and applies only the deltas after it.
+
+Each fragment carries an order label that grows along the text, and each insertion lists the
+labels of its pieces, so finding a byte by id is one tree seek. When two neighbours leave no room
+for a label, the smallest block of labels around them that is sparse enough is spread out again.
 
 ## Persistence and sync
 
@@ -64,9 +72,7 @@ silk run --manifest-path crdt/demo/app/silk.toml          # the demo in a window
 
 ## Not done yet
 
-- Snapshots: checking out a version replays its whole past.
-- Finding a byte by id is a linear scan of the fragments; an index would make remote edits on
-  long texts faster.
+- Snapshots live in memory only; `load` still replays every saved delta.
 - The server answers one request at a time and clients poll; there is no push or WebSocket.
 - Lists and moves, a `replicate` derive for user types, and a background store writer.
 - Windows is not tested: `crdt/sync`'s socket test needs a Silk release with
