@@ -28,6 +28,46 @@ development binary; `--build-only` compiles without opening a window.
 The default renderer and the check use a white window background. CPU snapshots
 also expose `renderSceneOver` for reference rendering with an explicit clear color.
 
+## In the browser
+
+The same host runs in a browser tab: a wasm32 build of the program draws on a canvas through
+`navigator.gpu`, with native/platform/window's browser backend for input and the input method.
+From the repository root:
+
+    python3 ui/tree/window/scripts/browser serve                       # the notes app
+    python3 ui/tree/window/scripts/browser serve ui/tree/window/demo   # the counter above
+    python3 ui/tree/window/scripts/browser test examples/notes/browser
+
+`serve` builds the package for `wasm32-unknown-unknown` (release unless `--debug`) and prints
+the page's address, by default http://127.0.0.1:8050/. It needs WebGPU and WebAssembly JSPI:
+Chrome or Edge 137 or later. The server reads the module on each request, so after
+`scripts/browser build` a reload shows the new build. Add `?check` to the address for the
+rendering check of `--check`. `test` runs that check and then real input in the installed
+Chromium (see [browser/test.mjs](browser/test.mjs) for its options).
+
+How it differs from a native window:
+
+- **One thread.** The host's loop runs in the module as it does natively. The page calls
+  `main` through JSPI ([browser/app-host.js](browser/app-host.js)), so a wait for input
+  suspends the module and gives the page its turn. Frames are drawn on the same thread by
+  [render_inline.silk](src/render_inline.silk), which has `RenderThread`'s API; while WebGPU
+  answers a request it yields to the page through the `silk_browser#yield` import. There is
+  no platform thread and no compositor scroll: wheel scrolling goes through the tree.
+- **The program brings its fonts and data.** There are no system fonts and no files; pass a
+  bundled collection (for example `ui_fixtures.fixtures.fonts()`) to `runWindow`. The
+  inspector is always off.
+- **`main` takes no arguments.** Read `browser.checkRequested()` for `?check`, and print with
+  `console.StderrWriter`: standard error natively, the browser console in the page.
+- **Two modules in the program's own package.** A dependency exports no wasm symbols, so the
+  program's package holds `generated_webgpu_exports.silk` (written by
+  `native/gpu/webgpu/scripts/generate-browser`; add the new path to its list) and `libm.silk`,
+  and imports both under `static if Intrinsic.targetArchitecture() == "wasm32"`. See
+  [demo/src/main.silk](demo/src/main.silk) and
+  [examples/notes/browser](../../../examples/notes/browser/src/main.silk).
+
+To put an app on another page, serve the module with `app-host.js` and the two hosts it
+imports, and call `runApp({ wasm, container })`.
+
 ## Background images
 
 `images.Images` queues file or HTTP(S) requests, decodes on native workers, installs

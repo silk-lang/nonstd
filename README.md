@@ -119,7 +119,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`examples/crdt-showcase`](examples/crdt-showcase) | `crdt-showcase` | Six scripted people writing one rich-text document at once, drawn live (not a workspace member, see layers.toml) | `record` |
 | [`examples/graphics-demo`](examples/graphics-demo) | `graphics-demo` | The UI drawing layer's integration demo, natively and in the browser | `app`, `browser`, `screenshot`, `tests` |
 | [`examples/graphics-demo/host`](examples/graphics-demo/host) | `graphics-demo-host` | The shared native host that draws a UI scene in a platform window |  |
-| [`examples/notes`](examples/notes) | `ui-notes` | The example notes app of the UI stack | `app`, `tests` |
+| [`examples/notes`](examples/notes) | `ui-notes` | The example notes app of the UI stack | `app`, `browser`, `tests` |
 | [`examples/scroll-demo`](examples/scroll-demo) | `silk-scroll-demo` | Fieldnotes Scroll Lab, a native scrolling stress demo built on ui-app |  |
 | [`examples/showcase`](examples/showcase) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack | `app`, `record` |
 
