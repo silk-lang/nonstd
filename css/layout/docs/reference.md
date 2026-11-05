@@ -9,7 +9,7 @@ Commands below run from `css/layout`:
 
 ```sh
 scripts/check
-(cd cli && silk build)
+(cd tools/cli && silk build)
 python3 scripts/fetch-specs.py
 ```
 
@@ -24,7 +24,7 @@ python3 -m venv .cache/font-tools
 
 The oracle uses that interpreter automatically; `SILK_FONT_PYTHON` selects another installation. Native layout and spec checks do not depend on Python font tooling.
 
-`css/layout` is the library; `cli/` is a native JSON adapter used by the conformance and benchmark scripts. The package exports `layout.lib`. Source-tree ownership, node handles and result storage are separate; layout borrows the input tree and writes into a reusable `LayoutTree`.
+`css/layout` is the library; `tools/cli/` is a native JSON adapter used by the conformance and benchmark scripts. The package exports `layout.lib`. Source-tree ownership, node handles and result storage are separate; layout borrows the input tree and writes into a reusable `LayoutTree`.
 
 ## Incremental layout
 

@@ -27,7 +27,7 @@ Layout handles justification (extra space on word separators, or on every cluste
 
 ## Agreement with Chrome
 
-`scripts/chrome-text.mjs` lays out the cases in `tests/chrome/cases.json` with `cli/` and
+`scripts/chrome-text.mjs` lays out the cases in `tests/chrome/cases.json` with `tools/cli/` and
 with Chrome on the same font files, and compares the rectangle of every text fragment:
 
 ```sh
