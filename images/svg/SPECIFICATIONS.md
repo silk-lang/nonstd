@@ -772,7 +772,7 @@ interpretation/conversion remains incomplete; PNG samples are integrated into SV
 
 ### Font database and matching
 
-`images/svg/fonts` holds the faces text layout may use. The host fills it with font
+`font/faces` holds the faces text layout may use. The host fills it with font
 data. CSS Fonts 4 #font-matching-algorithm leaves the set of installed fonts undefined.
 Generic families resolve to the first configured family that has faces. The CLI
 configures `serif`, `sans-serif`, `monospace` and their `ui-` forms (and `system-ui`

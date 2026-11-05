@@ -6,7 +6,7 @@ with no elements or layout: positions are computed by hand in `src/demo.silk`.
 - An Oklab gradient background and rounded cards with soft drop shadows and borders.
 - Text through [`font/raster`](../../font/raster): two Noto Sans faces, lines shaped once by the
   line cache, glyph tiles from the glyph cache, straight and wavy underlines.
-- Icons from SVG through [`graphics/sprites`](../sprites), with hover highlights in the top bar.
+- Icons from SVG through [`ui/sprites`](../../ui/sprites), with hover highlights in the top bar.
 - An animated SVG (`assets/icons/orbit.svg`: SMIL `animate`, `animateMotion`,
   `animateTransform` and a CSS `@keyframes` halo) rasterized each frame at the frame's time.
 - A chart drawn as `vector` paths through the path cache, with an animated marker.

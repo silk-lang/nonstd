@@ -68,13 +68,13 @@ those modules, and `text/ucd` was removed. The original report was
 The dev.27 numeric modules lack `atan2`, `hypot` and the wider transcendental
 surface required by SVG arcs, CSS colors and filters. Existing request
 [silk-lang/silk#2539](https://github.com/silk-lang/silk/issues/2539) now includes
-a minimal SVG reproduction. `images/svg/geometry/src/math.silk` supplies pure-Silk
+a minimal SVG reproduction. `graphics/geometry/src/math.silk` supplies pure-Silk
 finite-input geometry helpers; no libc shim, compiler or stdlib patch is used.
 
 ## 009 — checked DEFLATE output bound
 
 `Deflate.encode` takes caller-owned storage without exposing a capacity bound.
-`images/codec/src/png.silk` derives the zlib bound from the pinned fixed-Huffman
+`graphics/codec/src/png.silk` derives the zlib bound from the pinned fixed-Huffman
 algorithm and validates dimensions before allocation. Filed with a self-contained
 reproducer as [silk-lang/silk#2565](https://github.com/silk-lang/silk/issues/2565).
 
