@@ -1,0 +1,219 @@
+//! A map from byte-string keys to byte-string values where a concurrent set beats a removal.
+//!
+//! Each set adds an entry named by its delta and retires the entries for that key its author had
+//! seen. A removal only retires entries. A set made concurrently with a removal was not seen by
+//! it, so it survives (add wins). When concurrent sets leave several entries for a key, the one
+//! with the highest delta id is the value, so a map key is also a last-writer-wins register.
+import clock { DeltaId }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+/// A set or a removal as replicas exchange it.
+pub struct SetOp {
+  pub id: DeltaId,
+  pub key: List<u8>,
+  pub value: List<u8>,
+  pub remove: bool,
+  /// The entries for `key` this op retires.
+  pub observed: List<DeltaId>,
+}
+
+struct Entry {
+  id: DeltaId,
+  keyStart: usize,
+  keyLength: usize,
+  valueStart: usize,
+  valueLength: usize,
+  live: bool,
+}
+
+impl Copy for Entry {}
+
+/// One replica of a map.
+pub struct Map {
+  entries: List<Entry>,
+  bytes: List<u8>,
+}
+
+impl Map {
+  pub fn make() -> Map {
+    return Map { entries: List<Entry>.make(), bytes: List<u8>.make() }
+  }
+
+  /// The value of `key`, if it has one.
+  pub fn get(self: &Self, key: &[u8]) -> Option<&[u8]> {
+    let found = self.winner(key)
+    if found == NONE {
+      return Option<&[u8]>.None
+    }
+    let entry = self.entries.get(found)
+    return Option<&[u8]>.Some {
+      value: Slice.view(self.bytes.asSlice(), entry.valueStart, entry.valueLength),
+    }
+  }
+
+  /// Whether `key` has a value.
+  pub fn has(self: &Self, key: &[u8]) -> bool {
+    return self.winner(key) != NONE
+  }
+
+  /// The number of keys with a value.
+  pub fn length(self: &Self) -> usize {
+    let mut count: usize = 0
+    let mut e: usize = 0
+    while e < self.entries.length() {
+      let entry = self.entries.get(e)
+      if entry.live && self.winner(self.keyOf(entry)) == e {
+        count = count + 1
+      }
+      e = e + 1
+    }
+    return count
+  }
+
+  /// Key `index` of the keys with a value, in the order they were first set here.
+  pub fn keyAt(self: &Self, index: usize) -> &[u8] {
+    let mut seen: usize = 0
+    let mut e: usize = 0
+    while e < self.entries.length() {
+      let entry = self.entries.get(e)
+      if entry.live && self.winner(self.keyOf(entry)) == e {
+        if seen == index {
+          return self.keyOf(entry)
+        }
+        seen = seen + 1
+      }
+      e = e + 1
+    }
+    Intrinsic.trap("Map.keyAt: the index is past the end")
+    return self.keyOf(self.entries.get(0))
+  }
+
+  /// Sets `key` to `value` as delta `id`, and returns the operation to send.
+  pub effect fn set(self: &mut Self, id: DeltaId, key: &[u8], value: &[u8]) -> SetOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let op = run self.local(id, key, value, false)
+    run self.apply(&op)
+    return move op
+  }
+
+  /// Removes `key` as delta `id`, and returns the operation to send.
+  pub effect fn remove(self: &mut Self, id: DeltaId, key: &[u8]) -> SetOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let op = run self.local(id, key, Slice.view(key, 0, 0), true)
+    run self.apply(&op)
+    return move op
+  }
+
+  /// Applies a set or removal made here or by another replica. Applying one twice is harmless.
+  pub effect fn apply(self: &mut Self, op: &SetOp) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut e: usize = 0
+    while e < self.entries.length() {
+      let mut entry = self.entries.get(e)
+      if entry.id.same(&op.id) {
+        return ()
+      }
+      if entry.live && holds(&op.observed, entry.id) {
+        entry.live = false
+        self.entries.set(e, entry)
+      }
+      e = e + 1
+    }
+    if op.remove {
+      return ()
+    }
+    let keyStart = self.bytes.length()
+    run self.bytes.appendSlice(op.key.asSlice())
+    let valueStart = self.bytes.length()
+    run self.bytes.appendSlice(op.value.asSlice())
+    let entry = Entry {
+      id: op.id,
+      keyStart: keyStart,
+      keyLength: op.key.length(),
+      valueStart: valueStart,
+      valueLength: op.value.length(),
+      live: true,
+    }
+    run self.entries.append(entry)
+  }
+
+  effect fn local(self: &Self, id: DeltaId, key: &[u8], value: &[u8], remove: bool) -> SetOp
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut observed = List<DeltaId>.make()
+    let mut e: usize = 0
+    while e < self.entries.length() {
+      let entry = self.entries.get(e)
+      if entry.live && same(self.keyOf(entry), key) {
+        run observed.append(entry.id)
+      }
+      e = e + 1
+    }
+    let mut keyCopy = List<u8>.make()
+    run keyCopy.appendSlice(key)
+    let mut valueCopy = List<u8>.make()
+    run valueCopy.appendSlice(value)
+    return SetOp {
+      id: id,
+      key: move keyCopy,
+      value: move valueCopy,
+      remove: remove,
+      observed: move observed,
+    }
+  }
+
+  fn keyOf(self: &Self, entry: Entry) -> &[u8] {
+    return Slice.view(self.bytes.asSlice(), entry.keyStart, entry.keyLength)
+  }
+
+  // The live entry for `key` with the highest id, or NONE.
+  fn winner(self: &Self, key: &[u8]) -> usize {
+    let mut best = NONE
+    let mut e: usize = 0
+    while e < self.entries.length() {
+      let entry = self.entries.get(e)
+      if entry.live && same(self.keyOf(entry), key) {
+        if best == NONE || self.entries.get(best).id.before(&entry.id) {
+          best = e
+        }
+      }
+      e = e + 1
+    }
+    return best
+  }
+}
+
+const NONE: usize = usize.MAX
+
+fn holds(ids: &List<DeltaId>, id: DeltaId) -> bool {
+  let mut k: usize = 0
+  while k < ids.length() {
+    if ids.get(k).same(&id) {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut k: usize = 0
+  while k < left.length {
+    if left[k] != right[k] {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}

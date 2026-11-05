@@ -1,0 +1,529 @@
+//! The CRDT demo: two people edit one rich-text document through a server in the same process.
+//!
+//! Each pane is a replica with its own document and sync client. Typing in a pane turns the
+//! change into CRDT operations; Bold and Underline style what is typed next, the way a word
+//! processor's toolbar does. A pane that is online syncs after every change, and the other online
+//! pane syncs right after, so edits show up live. Switch a pane offline, edit both, switch it back,
+//! and the edits merge. The history bar steps the server's copy back through its deltas.
+import core.clock { DeltaId, Frontier }
+import core.doc { Document }
+import core.rich { Expand, RichText, Span }
+import examples.look { button, rgb, surface }
+import sync.sync { Client, Loopback, MemoryServer, Transport }
+import ui_app.app { App, Context, NoCommand }
+import ui_app.ui { Ui }
+import ui_tree.mutation {
+  Align,
+  BorderStyle,
+  Display,
+  DecorationLine,
+  Length,
+  Property,
+  Side,
+  WhiteSpace
+}
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { InvalidUtf8, String }
+
+/// The document both panes edit.
+pub const DOC: u64 = 1
+
+/// The rich text in that document.
+pub const BODY: u64 = 1
+
+/// Mark keys.
+pub const BOLD: u32 = 1
+
+pub const UNDERLINE: u32 = 2
+
+/// One person's replica.
+pub struct Pane {
+  pub name: string<'static>,
+  pub document: Document,
+  pub client: Client,
+  pub online: bool,
+  /// Whether what is typed next is bold or underlined.
+  pub bold: bool,
+  pub underline: bool,
+}
+
+pub union Message {
+  Typed { pub pane: usize, pub value: String },
+  ToggleBold { pub pane: usize },
+  ToggleUnderline { pub pane: usize },
+  ToggleOnline { pub pane: usize },
+  /// One delta further back in the server's history.
+  Back,
+  Forward,
+  Live,
+}
+
+/// The demo: the server and the panes.
+pub struct Editor {
+  pub server: MemoryServer,
+  pub panes: List<Pane>,
+  /// How many of the server's deltas the history view leaves out; 0 shows the latest version.
+  pub back: usize,
+}
+
+impl Editor {
+  pub effect fn make() -> Editor
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut panes = List<Pane>.make()
+    let ada = run Document.make(1)
+    run panes.append(
+      Pane {
+        name: "Ada",
+        document: move ada,
+        client: Client.make(DOC),
+        online: true,
+        bold: false,
+        underline: false,
+      },
+    )
+    let grace = run Document.make(2)
+    run panes.append(
+      Pane {
+        name: "Grace",
+        document: move grace,
+        client: Client.make(DOC),
+        online: true,
+        bold: false,
+        underline: false,
+      },
+    )
+    return Editor { server: MemoryServer.make(1000), panes: move panes, back: 0 }
+  }
+
+  /// The number of deltas the server holds.
+  pub fn serverDeltas(self: &Self) -> usize {
+    return match self.server.find(DOC) {
+      Option<&Document>.Some { value } => value.deltaCount()
+      Option<&Document>.None => 0
+    }
+  }
+
+  // Syncs pane `index` if it is online. A failed exchange keeps its deltas for the next one.
+  effect fn syncPane(self: &mut Self, index: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pane = &mut self.panes.asMutSlice()[index]
+    if !pane.online {
+      return ()
+    }
+    let mut link = Loopback.to(&mut self.server)
+    let synced = run Effect.result(pane.client.sync(&mut pane.document))
+      |> Effect.provideMut<Transport>(&mut link)
+    drop synced
+  }
+
+  // Syncs `first`, then every other pane, so a change reaches everyone online.
+  effect fn syncFrom(self: &mut Self, first: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.syncPane(first)
+    let mut k: usize = 0
+    while k < self.panes.length() {
+      if k != first {
+        run self.syncPane(k)
+      }
+      k = k + 1
+    }
+  }
+
+  // Turns the input's new value into operations on pane `index`'s text.
+  effect fn typed(self: &mut Self, index: usize, value: &String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pane = &mut self.panes.asMutSlice()[index]
+    let old = run textOf(&pane.document)
+    let before = String.utf8Bytes(old.view())
+    let after = String.utf8Bytes(value.view())
+    let mut prefix: usize = 0
+    while prefix < before.length && prefix < after.length && before[prefix] == after[prefix] {
+      prefix = prefix + 1
+    }
+    let mut suffix: usize = 0
+    while suffix < before.length - prefix && suffix < after.length - prefix
+      && before[before.length - 1 - suffix] == after[after.length - 1 - suffix] {
+      suffix = suffix + 1
+    }
+    let removed = before.length - prefix - suffix
+    let added = after.length - prefix - suffix
+    if removed > 0 {
+      run pane.document.deleteText(BODY, prefix, removed)
+    }
+    if added > 0 {
+      run pane.document.insertText(BODY, prefix, Slice.view(after, prefix, added))
+
+      // Typed text takes the toolbar's styles: a style that is on marks it, and a style that is
+      // off clears what the text took from its neighbour (bold grows at its end).
+      run styleTyped(&mut pane.document, prefix, added, BOLD, pane.bold)
+      run styleTyped(&mut pane.document, prefix, added, UNDERLINE, pane.underline)
+    }
+    drop run pane.document.commit()
+  }
+}
+
+// Gives `length` bytes from `offset` the style `key` when `on`, or clears it when they took it
+// from a neighbour.
+effect fn styleTyped(
+  document: &mut Document,
+  offset: usize,
+  length: usize,
+  key: u32,
+  on: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let none: [u8; 0] = []
+  if on {
+    run document.mark(BODY, offset, length, key, &none, Expand.End)
+    return ()
+  }
+  if run hasStyle(&document.*, offset, length, key) {
+    run document.unmark(BODY, offset, length, key, Expand.End)
+  }
+}
+
+// Whether any of `length` bytes from `offset` has style `key`.
+effect fn hasStyle(document: &Document, offset: usize, length: usize, key: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let spans = match document.text(BODY) {
+    Option<&RichText>.Some { value } => run value.spans()
+    Option<&RichText>.None => List<Span>.make()
+  }
+  let mut s: usize = 0
+  while s < spans.length() {
+    let span = &spans.asSlice()[s]
+    if span.start < offset + length && offset < span.start + span.length {
+      let mut a: usize = 0
+      while a < span.attrs.length() {
+        if span.attrs.get(a).key == key {
+          return true
+        }
+        a = a + 1
+      }
+    }
+    s = s + 1
+  }
+  return false
+}
+
+/// The server's copy of the document without its last `back` deltas, in arrival order: what the
+/// history bar shows.
+pub effect fn historyOf(server: &MemoryServer, back: usize) -> Document
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let document = match server.find(DOC) {
+    Option<&Document>.Some { value } => value
+    Option<&Document>.None => {
+      return run Document.make(999)
+    }
+  }
+  let count = document.deltaCount()
+  let keep = if back > count {
+    0
+  } else {
+    count - back
+  }
+  let mut version = Frontier.empty()
+  let mut seq: usize = 0
+  while seq < keep {
+    let delta = document.delta(seq)
+    run version.advance(delta.parents.asSlice(), delta.id)
+    seq = seq + 1
+  }
+  return run document.checkout(&version, 999)
+}
+
+/// The visible text of `document`'s body.
+pub effect fn textOf(document: &Document) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match document.text(BODY) {
+    Option<&RichText>.Some { value } => run value.read()
+    Option<&RichText>.None => String.make()
+  }
+}
+
+/// A run of text and its look, cut from a document's spans for the view.
+pub struct Run {
+  pub start: usize,
+  pub length: usize,
+  pub bold: bool,
+  pub underline: bool,
+}
+
+impl Copy for Run {}
+
+/// The runs of `document`'s body.
+pub effect fn runsOf(document: &Document) -> List<Run>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut runs = List<Run>.make()
+  match document.text(BODY) {
+    Option<&RichText>.Some { value } => {
+      let spans = run value.spans()
+      let mut s: usize = 0
+      while s < spans.length() {
+        let span = &spans.asSlice()[s]
+        let mut bold = false
+        let mut underline = false
+        let mut a: usize = 0
+        while a < span.attrs.length() {
+          let key = span.attrs.get(a).key
+          if key == BOLD {
+            bold = true
+          }
+          if key == UNDERLINE {
+            underline = true
+          }
+          a = a + 1
+        }
+        run runs.append(
+          Run { start: span.start, length: span.length, bold: bold, underline: underline },
+        )
+        s = s + 1
+      }
+    }
+    Option<&RichText>.None => {}
+  }
+  return move runs
+}
+
+fn card<M>(ui: &mut Ui<M>) -> () {
+  ui.style(
+    &[
+      Property.BackgroundColor { color: rgb(0xFFFFFF) },
+      Property.BorderWidth { side: Side.Top, value: 1.0 },
+      Property.BorderWidth { side: Side.Right, value: 1.0 },
+      Property.BorderWidth { side: Side.Bottom, value: 1.0 },
+      Property.BorderWidth { side: Side.Left, value: 1.0 },
+      Property.BorderStyle { value: BorderStyle.Solid },
+      Property.BorderColor { color: rgb(0xE5E7EB) },
+    ],
+  )
+  ui.padding(12.0)
+  ui.gap(8.0)
+}
+
+// The document's text with its formatting, read-only.
+fn formatted<M>(ui: &mut Ui<M>, text: &String, runs: &List<Run>, testId: string) -> () {
+  ui.box(
+    |ui| {
+      ui.testId(testId)
+      ui.style(
+        &[
+          Property.WhiteSpace { value: WhiteSpace.PreWrap },
+          Property.MinHeight { value: Length.px(20.0) },
+        ],
+      )
+      let bytes = String.utf8Bytes(text.view())
+      let mut r: usize = 0
+      while r < runs.length() {
+        let piece = runs.get(r)
+        let part = String.fromUtf8(Slice.view(bytes, piece.start, piece.length))
+          |> Result<string, InvalidUtf8>.unwrapOr("")
+        ui.box(
+          |ui| {
+            ui.style(&[Property.Display { value: Display.Inline }])
+            if piece.bold {
+              ui.style(&[Property.FontWeight { value: 700.0 }])
+            }
+            if piece.underline {
+              let line = DecorationLine { underline: true, overline: false, lineThrough: false }
+              ui.style(&[Property.TextDecorationLine { value: line }])
+            }
+            ui.text(part)
+          },
+        )
+        r = r + 1
+      }
+    },
+  )
+}
+
+fn paneView(ui: &mut Ui<Message>, pane: &Pane, index: usize) -> () {
+  let text = ui.alloc(textOf(&pane.document))
+  let runs = ui.alloc(runsOf(&pane.document))
+  ui.column(
+    |ui| {
+      card(&mut ui)
+      ui.grow(1.0)
+      ui.style(&[Property.FlexBasis { value: Length.px(0.0) }])
+      ui.row(
+        |ui| {
+          ui.gap(8.0)
+          ui.style(&[Property.AlignItems { value: Align.Center }])
+          ui.box(
+            |ui| {
+              ui.style(&[Property.FontWeight { value: 700.0 }])
+              ui.grow(1.0)
+              ui.text(pane.name)
+            },
+          )
+          button(&mut ui, "Bold", pane.bold, || Message.ToggleBold { pane: index })
+          button(&mut ui, "Underline", pane.underline, || Message.ToggleUnderline { pane: index })
+          let status = if pane.online {
+            "Online"
+          } else {
+            "Offline"
+          }
+          button(&mut ui, status, pane.online, || Message.ToggleOnline { pane: index })
+        },
+      )
+      ui.input(
+        text.view(),
+        |ui| {
+          ui.testId(
+            if index == 0 {
+              "editor-0"
+            } else {
+              "editor-1"
+            },
+          )
+          ui.label(pane.name)
+          ui.multiline(true)
+          ui.placeholder("Type here")
+          ui.height(Length.px(96.0))
+          ui.padding(8.0)
+          ui.style(
+            &[
+              Property.BorderWidth { side: Side.Top, value: 1.0 },
+              Property.BorderWidth { side: Side.Right, value: 1.0 },
+              Property.BorderWidth { side: Side.Bottom, value: 1.0 },
+              Property.BorderWidth { side: Side.Left, value: 1.0 },
+              Property.BorderStyle { value: BorderStyle.Solid },
+              Property.BorderColor { color: rgb(0xD1D5DB) },
+            ],
+          )
+          ui.onInput(|value| Message.Typed { pane: index, value: move value })
+        },
+      )
+      formatted(
+        &mut ui,
+        &text,
+        &runs,
+        if index == 0 {
+          "formatted-0"
+        } else {
+          "formatted-1"
+        },
+      )
+    },
+  )
+}
+
+impl App<Message, NoCommand> for Editor {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    surface(&mut ui)
+    ui.box(
+      |ui| {
+        ui.style(&[Property.FontWeight { value: 700.0 }])
+        ui.fontSize(18.0)
+        ui.text("Silk CRDT demo")
+      },
+    )
+    ui.row(
+      |ui| {
+        ui.gap(12.0)
+        ui.style(&[Property.AlignItems { value: Align.Stretch }])
+        let mut k: usize = 0
+        while k < self.panes.length() {
+          paneView(&mut ui, &self.panes.asSlice()[k], k)
+          k = k + 1
+        }
+      },
+    )
+    let total = self.serverDeltas()
+    let past = ui.alloc(historyOf(&self.server, self.back))
+    let pastText = ui.alloc(textOf(&past))
+    let pastRuns = ui.alloc(runsOf(&past))
+    ui.column(
+      |ui| {
+        card(&mut ui)
+        ui.row(
+          |ui| {
+            ui.gap(8.0)
+            ui.style(&[Property.AlignItems { value: Align.Center }])
+            ui.box(
+              |ui| {
+                ui.style(&[Property.FontWeight { value: 700.0 }])
+                ui.grow(1.0)
+                ui.text("Server history")
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.testId("history-status")
+                if self.back == 0 {
+                  ui.text("Latest version")
+                } else {
+                  let shown = if self.back > total {
+                    0
+                  } else {
+                    total - self.back
+                  }
+                  ui.text("Delta ")
+                  ui.number(u64.toI64(usize.toU64(shown)))
+                  ui.text(" of ")
+                  ui.number(u64.toI64(usize.toU64(total)))
+                }
+              },
+            )
+            button(&mut ui, "Back", false, || Message.Back)
+            button(&mut ui, "Forward", false, || Message.Forward)
+            button(&mut ui, "Latest", self.back == 0, || Message.Live)
+          },
+        )
+        formatted(&mut ui, &pastText, &pastRuns, "history")
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Typed { pane, value } => {
+        cx.alloc(self.typed(pane, &value))
+        cx.alloc(self.syncFrom(pane))
+      }
+      Message.ToggleBold { pane } => {
+        let target = &mut self.panes.asMutSlice()[pane]
+        target.bold = !target.bold
+      }
+      Message.ToggleUnderline { pane } => {
+        let target = &mut self.panes.asMutSlice()[pane]
+        target.underline = !target.underline
+      }
+      Message.ToggleOnline { pane } => {
+        let target = &mut self.panes.asMutSlice()[pane]
+        target.online = !target.online
+        cx.alloc(self.syncFrom(pane))
+      }
+      Message.Back => {
+        if self.back < self.serverDeltas() {
+          self.back = self.back + 1
+        }
+      }
+      Message.Forward => {
+        if self.back > 0 {
+          self.back = self.back - 1
+        }
+      }
+      Message.Live => {
+        self.back = 0
+      }
+    }
+  }
+}

@@ -1,0 +1,192 @@
+//! Sync tests: clients converge through a server, an offline client catches up with little more
+//! than it missed, a failed exchange loses nothing, and a server saves to a store.
+import core.codec { DecodeError }
+import core.doc { Document }
+import core.rich { RichText }
+import core.store { MemoryStore, Store, StoreError, load }
+import sync { Client, Loopback, MemoryServer, StoredServer, SyncServer, Transport, TransportError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.testing.testing { AssertionError, Testing }
+
+type Failures = AssertionError<'static>
+  | TransportError
+  | DecodeError
+  | StoreError
+  | OutOfMemoryError
+
+const DOC: u64 = 42
+
+const BODY: u64 = 1
+
+effect fn sync(client: &mut Client, document: &mut Document, server: &mut MemoryServer) -> ()
+  ! TransportError | DecodeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut link = Loopback.to(&mut server)
+  run client.sync(&mut document) |> Effect.provideMut<Transport>(&mut link)
+}
+
+effect fn readBody(document: &Document) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match document.text(BODY) {
+    Option<&RichText>.Some { value } => run value.read()
+    Option<&RichText>.None => String.make()
+  }
+}
+
+effect fn clientsConverge() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut server = MemoryServer.make(100)
+  let mut a = run Document.make(1)
+  let mut b = run Document.make(2)
+  let mut clientA = Client.make(DOC)
+  let mut clientB = Client.make(DOC)
+  run a.insertText(BODY, 0, String.utf8Bytes("hello"))
+  run sync(&mut clientA, &mut a, &mut server)
+  run sync(&mut clientB, &mut b, &mut server)
+  let first = run readBody(&b)
+  run Testing.expect(first.view() == "hello", "a client gets another's edit")
+
+  // Concurrent edits meet through the server after one round each way.
+  run a.insertText(BODY, 5, String.utf8Bytes(" world"))
+  run b.insertText(BODY, 0, String.utf8Bytes("> "))
+  run sync(&mut clientA, &mut a, &mut server)
+  run sync(&mut clientB, &mut b, &mut server)
+  run sync(&mut clientA, &mut a, &mut server)
+  let readA = run readBody(&a)
+  let readB = run readBody(&b)
+  run Testing.expect(readA.view() == "> hello world", "edits merge")
+  run Testing.expect(readA.view() == readB.view(), "both clients agree")
+  run Testing.expect(a.frontier().same(b.frontier()), "both clients are at one version")
+  run Testing.expect(clientA.exchanges() == 3, "every exchange completed")
+}
+
+effect fn offlineCatchUp() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut server = MemoryServer.make(100)
+  let mut a = run Document.make(1)
+  let mut b = run Document.make(2)
+  let mut clientA = Client.make(DOC)
+  let mut clientB = Client.make(DOC)
+  let mut k: usize = 0
+  while k < 100 {
+    let end = a.textLength(BODY)
+    run a.insertText(BODY, end, String.utf8Bytes("a"))
+    run sync(&mut clientA, &mut a, &mut server)
+    k = k + 1
+  }
+  run sync(&mut clientB, &mut b, &mut server)
+
+  // B goes offline and edits; its exchange fails and keeps the edit for later.
+  run b.insertText(BODY, 0, String.utf8Bytes("B"))
+  let mut link = Loopback.to(&mut server)
+  link.online = false
+  let failed = run Effect.result(clientB.sync(&mut b) |> Effect.provideMut<Transport>(&mut link))
+  let refused = match move failed {
+    Result<(), TransportError | DecodeError | OutOfMemoryError>.Success { value: _ } => false
+    _ => true
+  }
+  run Testing.expect(refused, "an offline exchange fails")
+  run Testing.expect(clientB.hasUnsent(&b), "the offline edit waits")
+
+  // A makes 20 more deltas meanwhile.
+  k = 0
+  while k < 20 {
+    let end = a.textLength(BODY)
+    run a.insertText(BODY, end, String.utf8Bytes("z"))
+    run sync(&mut clientA, &mut a, &mut server)
+    k = k + 1
+  }
+
+  // Back online, B's request gets about the 20 it missed, not the whole history.
+  let request = run clientB.request(&mut b)
+  let mut caughtUp = List<u8>.make()
+  run server.handle(request.asSlice(), &mut caughtUp)
+  let mut fresh = run Document.make(3)
+  let freshRequest = run Client.make(DOC).request(&mut fresh)
+  let mut everything = List<u8>.make()
+  run server.handle(freshRequest.asSlice(), &mut everything)
+  run Testing.expect(
+    caughtUp.length() * 3 < everything.length(),
+    "catching up sends what was missed",
+  )
+  run clientB.receive(&mut b, caughtUp.asSlice())
+  run sync(&mut clientA, &mut a, &mut server)
+  let readA = run readBody(&a)
+  let readB = run readBody(&b)
+  run Testing.expect(readA.view() == readB.view(), "the offline client converges")
+  run Testing.expect(a.textLength(BODY) == 121, "every edit is there")
+}
+
+effect fn serverPersists() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut server = MemoryServer.make(100)
+  let mut a = run Document.make(1)
+  let mut clientA = Client.make(DOC)
+  run a.insertText(BODY, 0, String.utf8Bytes("saved by the server"))
+  run sync(&mut clientA, &mut a, &mut server)
+  let mut store = MemoryStore.make()
+  run server.persist() |> Effect.provideMut<Store>(&mut store)
+  run server.persist() |> Effect.provideMut<Store>(&mut store)
+  let loaded = run load(DOC, 7) |> Effect.provideMut<Store>(&mut store)
+  let text = run readBody(&loaded)
+  run Testing.expect(text.view() == "saved by the server", "the store holds the server's deltas")
+}
+
+// A stored server that restarts loads the document back from its store.
+effect fn storedServerRestarts() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut store = MemoryStore.make()
+  let mut a = run Document.make(1)
+  run a.insertText(BODY, 0, String.utf8Bytes("survives a restart"))
+  let mut clientA = Client.make(DOC)
+  let requestA = run clientA.request(&mut a)
+  let mut first = StoredServer.over(MemoryServer.make(100), &mut store)
+  let mut answerA = List<u8>.make()
+  run first.handle(requestA.asSlice(), &mut answerA)
+  run clientA.receive(&mut a, answerA.asSlice())
+  drop first
+
+  let mut b = run Document.make(2)
+  let mut clientB = Client.make(DOC)
+  let requestB = run clientB.request(&mut b)
+  let mut second = StoredServer.over(MemoryServer.make(100), &mut store)
+  let mut answerB = List<u8>.make()
+  run second.handle(requestB.asSlice(), &mut answerB)
+  run clientB.receive(&mut b, answerB.asSlice())
+  let text = run readBody(&b)
+  run Testing.expect(text.view() == "survives a restart", "the restarted server still has it")
+}
+
+test effect fn storedServerRestartsTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run storedServerRestarts() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn clientsConvergeTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clientsConverge() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn offlineCatchUpTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run offlineCatchUp() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn serverPersistsTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run serverPersists() |> Effect.provideMut<Allocator>(&mut allocator)
+}

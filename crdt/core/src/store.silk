@@ -1,0 +1,211 @@
+//! Persistence as a service: where a replica keeps its deltas between runs.
+//!
+//! A [`Store`] holds encoded deltas per document, in the order they were saved. Deltas are saved
+//! in an order that applies (each after its parents), so loading replays them in that order.
+//! [`MemoryStore`] keeps them in memory for tests and for replicas that need no disk;
+//! `crdt-store-sqlite` keeps them in SQLite. Any other store passes [`conformance`] to stand in.
+import clock { ActorId, DeltaId }
+import codec { DecodeError }
+import doc { Delta, Document }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { AssertionError, Testing }
+import silk.text.string { String }
+
+/// A store could not save or read; `code` is the store's own, such as an SQLite result code.
+pub struct StoreError {
+  pub code: i32,
+}
+
+/// The documents and deltas a replica keeps.
+pub service Store {
+  /// Saves the encoded delta `id` of document `doc`. Saving an id a second time keeps the first.
+  effect fn putDelta(doc: u64, id: DeltaId, bytes: &[u8]) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Store | &mut Allocator
+
+  /// The number of deltas saved for `doc`.
+  effect fn deltaCount(doc: u64) -> usize
+    ! StoreError | OutOfMemoryError
+    ? &mut Store | &mut Allocator
+
+  /// Appends delta `index` of `doc`, counting in the order saved, to `out`.
+  effect fn readDelta(doc: u64, index: usize, out: &mut List<u8>) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Store | &mut Allocator
+}
+
+/// Saves the deltas of `document` from sequence number `from` on as document `doc`, and returns
+/// the sequence number to save from next time.
+pub effect fn save(document: &Document, doc: u64, from: usize) -> usize
+  ! StoreError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let mut seq = from
+  while seq < document.deltaCount() {
+    let delta = document.delta(seq)
+    let bytes = run delta.toBytes()
+    run Store.putDelta(doc, delta.id, bytes.asSlice())
+    seq = seq + 1
+  }
+  return seq
+}
+
+/// The document `doc` as saved, edited from now on by `actor`.
+pub effect fn load(doc: u64, actor: ActorId) -> Document
+  ! StoreError | DecodeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let mut document = run Document.make(actor)
+  let count = run Store.deltaCount(doc)
+  let mut index: usize = 0
+  let mut bytes = List<u8>.make()
+  while index < count {
+    bytes.clear()
+    run Store.readDelta(doc, index, &mut bytes)
+    let delta = run Delta.fromBytes(bytes.asSlice())
+    drop run document.apply(move delta)
+    index = index + 1
+  }
+  return move document
+}
+
+struct Saved {
+  doc: u64,
+  id: DeltaId,
+  start: usize,
+  length: usize,
+}
+
+impl Copy for Saved {}
+
+/// A store in memory.
+pub struct MemoryStore {
+  saved: List<Saved>,
+  bytes: List<u8>,
+}
+
+impl MemoryStore {
+  pub fn make() -> MemoryStore {
+    return MemoryStore { saved: List<Saved>.make(), bytes: List<u8>.make() }
+  }
+
+  fn find(self: &Self, doc: u64, index: usize) -> usize {
+    let mut seen: usize = 0
+    let mut k: usize = 0
+    while k < self.saved.length() {
+      if self.saved.get(k).doc == doc {
+        if seen == index {
+          return k
+        }
+        seen = seen + 1
+      }
+      k = k + 1
+    }
+    return self.saved.length()
+  }
+}
+
+impl Store for MemoryStore {
+  effect fn putDelta(self: &mut Self, doc: u64, id: DeltaId, bytes: &[u8]) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut k: usize = 0
+    while k < self.saved.length() {
+      let saved = self.saved.get(k)
+      if saved.doc == doc && saved.id.same(&id) {
+        return ()
+      }
+      k = k + 1
+    }
+    let start = self.bytes.length()
+    run self.bytes.appendSlice(bytes)
+    run self.saved.append(Saved { doc: doc, id: id, start: start, length: bytes.length })
+  }
+
+  effect fn deltaCount(self: &mut Self, doc: u64) -> usize
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut count: usize = 0
+    let mut k: usize = 0
+    while k < self.saved.length() {
+      if self.saved.get(k).doc == doc {
+        count = count + 1
+      }
+      k = k + 1
+    }
+    return count
+  }
+
+  effect fn readDelta(self: &mut Self, doc: u64, index: usize, out: &mut List<u8>) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let k = self.find(doc, index)
+    if k == self.saved.length() {
+      fail StoreError { code: 1 }
+    }
+    let saved = self.saved.get(k)
+    run out.appendSlice(Slice.view(self.bytes.asSlice(), saved.start, saved.length))
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut k: usize = 0
+  while k < left.length {
+    if left[k] != right[k] {
+      return false
+    }
+    k = k + 1
+  }
+  return true
+}
+
+/// Checks that the provided store behaves as a [`Store`] must, starting empty. Every store's
+/// tests run this.
+pub effect fn conformance() -> ()
+  ! AssertionError<'static> | StoreError | DecodeError | OutOfMemoryError
+  ? &mut Store | &mut Allocator {
+  let none = run Store.deltaCount(7)
+  run Testing.expect(none == 0, "a new store holds no deltas")
+
+  // Deltas keep their order and their bytes, per document.
+  let one: [u8; 3] = [1, 2, 3]
+  let two: [u8; 0] = []
+  let three: [u8; 4] = [250, 0, 128, 7]
+  run Store.putDelta(7, DeltaId.make(1, 1), &one)
+  run Store.putDelta(8, DeltaId.make(1, 1), &three)
+  run Store.putDelta(7, DeltaId.make(2, 1), &two)
+  run Store.putDelta(7, DeltaId.make(3, 2), &three)
+  run Store.putDelta(7, DeltaId.make(1, 1), &three)
+  let count = run Store.deltaCount(7)
+  run Testing.expect(count == 3, "a repeated id is saved once")
+  let other = run Store.deltaCount(8)
+  run Testing.expect(other == 1, "documents are kept apart")
+  let mut out = List<u8>.make()
+  run Store.readDelta(7, 0, &mut out)
+  run Testing.expect(sameBytes(out.asSlice(), &one), "the first delta reads back")
+  out.clear()
+  run Store.readDelta(7, 1, &mut out)
+  run Testing.expect(out.length() == 0, "an empty delta reads back empty")
+  out.clear()
+  run Store.readDelta(7, 2, &mut out)
+  run Testing.expect(sameBytes(out.asSlice(), &three), "the last delta reads back")
+
+  // A document saved and loaded again is the same document.
+  let mut document = run Document.make(3)
+  run document.insertText(1, 0, String.utf8Bytes("stored text"))
+  run document.set(2, String.utf8Bytes("k"), String.utf8Bytes("v"))
+  drop run document.commit()
+  run document.deleteText(1, 0, 7)
+  drop run document.commit()
+  let next = run save(&document, 9, 0)
+  run Testing.expect(next == 2, "save returns where to continue")
+  let again = run save(&document, 9, next)
+  run Testing.expect(again == 2, "saving nothing new saves nothing")
+  let loaded = run load(9, 4)
+  run Testing.expect(loaded.frontier().same(document.frontier()), "a load reaches the version")
+  run Testing.expect(loaded.textLength(1) == 4, "a load rebuilds the text")
+}
