@@ -6,11 +6,13 @@
 //! `Scene.replay`.
 import layout.lib { WritingMode }
 import mutation { ObjectFit, Length }
-import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand }
+import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position }
 import style { Computed, Fill }
 import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache }
 import resources { Resources, Resource }
-import scrollbar { thumbOf, Thumb }
+import scrollbar { thumbOf, Thumb, rangeOf, ScrollRange, scrolls, usedOverflow }
+import layers
+import layers { Sticky }
 import edit
 import ui_text.system { TextSystem }
 import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
@@ -31,6 +33,7 @@ import ui_scene.primitives {
   Underline
 }
 import ui_scene.scene { Scene }
+import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition, UNBOUNDED as UNBOUNDED_OFFSET }
 import ui_scene.effects { LayerEffects }
 import ui_scene.path_cache { PathCache }
 import vector.geometry { Affine }
@@ -99,9 +102,22 @@ pub struct Painter<'p, 'a> {
   pub scene: &'p mut Scene,
   pub previous: &'p Scene,
   pub replayable: bool,
+  /// Whether no scroll offset changed since the previous frame: then subtrees holding scroll
+  /// containers can be replayed too.
+  pub scrollsStill: bool,
   pub hashes: &'p List<u64>,
   /// Per fragment: the bounds of its subtree's ink, from [`inkFragments`].
   pub ink: &'p List<Rect<f32>>,
+  /// Per fragment: whether its subtree holds a scroll container, which paint never replays.
+  pub scrollers: &'p List<bool>,
+  /// What paint keeps, in device pixels of the current scroll group: subtrees whose ink misses it
+  /// are skipped. Inside a scroll container it reaches `lead` past the scrollport, so a renderer
+  /// that scrolls on its own has content to show.
+  pub cull: Rect<f32>,
+  pub lead: f32,
+  /// The viewport in CSS pixels, for sticky boxes without a scroll container.
+  pub width: f32,
+  pub height: f32,
   pub stats: &'p mut FrameStats,
   pub order: &'p mut List<u32>,
   pub frame: u64,
@@ -916,42 +932,79 @@ fn ownInk(
 /// Bounds every fragment's ink together with its descendants', children before parents, in CSS
 /// pixels of the viewport. A clipping box keeps only its own ink, since its content cannot draw
 /// outside it. [`paintFragment`] skips a subtree whose bounds miss the current clip.
+///
+/// A sticky box's bounds cover everywhere it can move. `scrollers` gets, per fragment, whether its
+/// subtree holds a scroll container. Ink is in layout coordinates: it does not change as
+/// anything scrolls.
 pub effect fn inkFragments(
   output: &LayoutTree,
   slots: &List<u32>,
   css: &Tree,
   nodes: &List<Node>,
+  width: f32,
+  height: f32,
   out: &mut List<Rect<f32>>,
+  scrollers: &mut List<bool>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let count = output.fragments.values.length()
   out.clear()
+  scrollers.clear()
   let empty = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
   run out.appendRepeated(empty, count)
+  run scrollers.appendRepeated(false, count)
   let mut index = count
   while index > 0 {
     index = index - 1
-    let f = output.fragments.values.asSlice()[index]
+    let f = &output.fragments.values.asSlice()[index]
     let own = ownInk(output, slots, css, nodes, index)
     let below = out.get(index)
     let mut clips = false
-    if f.kind == FragmentKind.Box && !f.positioningShell {
+    let mut sticky = false
+    if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
       let slot = slotIn(slots, f.source)
       if slot != NONE {
-        clips = nodes.asSlice()[u32.toUsize(slot)].computed.clips()
+        let c = &nodes.asSlice()[u32.toUsize(slot)].computed
+        clips = f.kind == FragmentKind.Box && c.clips()
+        sticky = c.position == Position.Sticky
+        if f.kind == FragmentKind.Box && layers.scroller(c) {
+          scrollers.set(index, true)
+        }
       }
     }
-    let total = if clips {
+    let mut total = if clips {
       own
     } else {
       unite(own, below)
+    }
+    if sticky {
+      if let Option<Sticky>.Some { value } = layers.stickyOf(
+        output,
+        slots,
+        css,
+        nodes,
+        index,
+        width,
+        height,
+      ) {
+        let reach = value.reach()
+        total = Rect<f32>.new(
+          total.xMin + reach.xMin,
+          total.yMin + reach.yMin,
+          total.xMax + reach.xMax,
+          total.yMax + reach.yMax,
+        )
+      }
     }
     out.set(index, total)
     let parent = f.parent
     if parent != NO_INDEX {
       let above = out.get(parent)
       out.set(parent, unite(above, total))
+      if scrollers.get(index) {
+        scrollers.set(parent, true)
+      }
     }
   }
 }
@@ -963,9 +1016,32 @@ fn inkVisible(p: &Painter, index: usize, mask: ContentMask) -> bool {
   }
   let ink = p.ink.get(index)
   let s = p.scale
-  return ink.xMin * s < mask.bounds.xMax && ink.xMax * s > mask.bounds.xMin
-    && ink.yMin * s < mask.bounds.yMax
-    && ink.yMax * s > mask.bounds.yMin
+  let cull = ContentMask.new(p.cull).intersect(mask).bounds
+  return ink.xMin * s < cull.xMax && ink.xMax * s > cull.xMin && ink.yMin * s < cull.yMax
+    && ink.yMax * s > cull.yMin
+}
+
+/// Whether the ink of fragment `index` lies inside `area` (device pixels).
+fn inkInside(p: &Painter, index: usize, area: Rect<f32>) -> bool {
+  if index >= p.ink.length() {
+    return false
+  }
+  let ink = p.ink.get(index)
+  let s = p.scale
+  return ink.xMin * s >= area.xMin && ink.xMax * s <= area.xMax && ink.yMin * s >= area.yMin
+    && ink.yMax * s <= area.yMax
+}
+
+fn everywhere() -> Rect<f32> {
+  return Rect<f32>.new(-UNBOUNDED_INK, -UNBOUNDED_INK, UNBOUNDED_INK, UNBOUNDED_INK)
+}
+
+/// The id a scroll group links to for slot `slot`, NONE for the unscrolled viewport.
+fn linkNode(p: &Painter, slot: u32) -> u32 {
+  if slot == NONE {
+    return NONE
+  }
+  return p.nodes.asSlice()[u32.toUsize(slot)].id
 }
 
 /// Paints fragment `index` and its descendants.
@@ -976,6 +1052,34 @@ pub effect fn paintFragment(p: &mut Painter, index: usize, mask: ContentMask) ->
     p.stats.culledSubtrees = p.stats.culledSubtrees + 1
     return ()
   }
+  let sticky = layers.stickyOf(p.output, p.slotOfCss, p.css, &p.nodes.*, index, p.width, p.height)
+  if let Option<Sticky>.Some { value } = sticky {
+    // A sticky box draws in a group that follows its scrollport, over everywhere it can go.
+    let s = p.scale
+    let ink = if index < p.ink.length() {
+      device(p.ink.get(index), s)
+    } else {
+      everywhere()
+    }
+    let link = ScrollLink {
+      node: linkNode(&p.*, value.port),
+      x: value.x.inDevice(s),
+      y: value.y.inDevice(s),
+    }
+    drop run p.scene.pushScrollGroup(link, everywhere(), ink)
+    let saved = p.cull
+    p.cull = everywhere()
+    run paintFragmentIn(&mut p, index, mask)
+    p.cull = saved
+    run p.scene.popScrollGroup()
+    return ()
+  }
+  run paintFragmentIn(&mut p, index, mask)
+}
+
+effect fn paintFragmentIn(p: &mut Painter, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let f = p.output.fragments.values.asSlice()[index]
   if f.positioningShell {
     run paintChildren(&mut p, index, mask)
@@ -985,9 +1089,24 @@ pub effect fn paintFragment(p: &mut Painter, index: usize, mask: ContentMask) ->
     let slot = slotIn(p.slotOfCss, f.source)
     if slot == p.only {
       p.inside = true
-      run paintFragment(&mut p, index, mask)
+      run paintFragmentIn(&mut p, index, mask)
       p.inside = false
       return ()
+    }
+
+    // Scroll containers above the subtree still move it.
+    if slot != NONE && f.kind == FragmentKind.Box
+      && p.nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Text {
+      let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+      if layers.scroller(&c) {
+        let inner = mask.intersect(ContentMask.new(device(paddingBox(&f), p.scale)))
+        let saved = p.cull
+        let content = run openScroller(&mut p, slot, &c, &f, inner)
+        run paintChildren(&mut p, index, content)
+        p.cull = saved
+        run p.scene.popScrollGroup()
+        return ()
+      }
     }
     run paintChildren(&mut p, index, mask)
     return ()
@@ -1076,7 +1195,9 @@ effect fn paintBox(p: &mut Painter, index: usize, f: Fragment, mask: ContentMask
     run paintChildren(&mut p, index, mask)
     return ()
   }
+  let holdsScroller = index < p.scrollers.length() && p.scrollers.get(index)
   let cacheable = p.only == NONE && f.first && f.last && !f.repeated
+    && (!holdsScroller || p.scrollsStill)
   let hash = if index < p.hashes.length() {
     p.hashes.get(index)
   } else {
@@ -1084,8 +1205,11 @@ effect fn paintBox(p: &mut Painter, index: usize, f: Fragment, mask: ContentMask
   }
   if cacheable && p.replayable {
     let cache = p.nodes.asSlice()[u32.toUsize(slot)].cache
+    let culledAlike = sameRect(cache.cull, p.cull)
+      || (inkInside(&p.*, index, cache.cull) && inkInside(&p.*, index, p.cull))
     if cache.frame + 1 == p.frame && cache.hash == hash && sameRect(cache.mask, mask.bounds)
-      && cache.scale == p.scale {
+      && cache.scale == p.scale
+      && culledAlike {
       let start = p.scene.operationCount()
       run p.scene.replay(p.previous, cache.start, cache.end)
       let end = p.scene.operationCount()
@@ -1099,6 +1223,7 @@ effect fn paintBox(p: &mut Painter, index: usize, f: Fragment, mask: ContentMask
         frame: p.frame,
         mask: mask.bounds,
         scale: p.scale,
+        cull: p.cull,
       }
       p.stats.replayedSubtrees = p.stats.replayedSubtrees + 1
       p.stats.replayedOperations = p.stats.replayedOperations + (end - start)
@@ -1135,12 +1260,24 @@ effect fn paintBox(p: &mut Painter, index: usize, f: Fragment, mask: ContentMask
       inner = mask.intersect(ContentMask.new(device(paddingBox(&f), p.scale)))
     }
     let input = kind == NodeKind.Input && c.text.visible
-    if input {
-      run edit.paintSelection(&mut p, slot, index, inner)
+    let scrolled = layers.scroller(&c)
+    let open = inner.bounds.xMax > inner.bounds.xMin && inner.bounds.yMax > inner.bounds.yMin
+    let saved = p.cull
+    if scrolled && open {
+      inner = run openScroller(&mut p, slot, &c, &f, inner)
     }
-    run paintChildren(&mut p, index, inner)
-    if input {
-      run edit.paintCaret(&mut p, slot, index, inner)
+    if !scrolled || open {
+      if input {
+        run edit.paintSelection(&mut p, slot, index, inner)
+      }
+      run paintChildren(&mut p, index, inner)
+      if input {
+        run edit.paintCaret(&mut p, slot, index, inner)
+      }
+    }
+    if scrolled && open {
+      p.cull = saved
+      run p.scene.popScrollGroup()
     }
     if c.clips() && c.text.visible {
       run paintThumbs(&mut p, slot, &c, &f, mask)
@@ -1159,6 +1296,7 @@ effect fn paintBox(p: &mut Painter, index: usize, f: Fragment, mask: ContentMask
       frame: p.frame,
       mask: mask.bounds,
       scale: p.scale,
+      cull: p.cull,
     }
     p.stats.repaintedSubtrees = p.stats.repaintedSubtrees + 1
   }
@@ -1177,11 +1315,111 @@ effect fn paintThumbs(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let range = rangeOf(c, f)
+  let id = p.nodes.asSlice()[u32.toUsize(slot)].id
+  let port = device(paddingBox(f), p.scale)
+  run paintThumbIn(&mut p, id, thumbOf(c, f, range.minY, true), range.minY, port, true, mask)
+  run paintThumbIn(&mut p, id, thumbOf(c, f, range.minX, false), range.minX, port, false, mask)
+}
+
+/// Opens the scroll group of the content of scroll container `slot` (fragment `f`), cut to
+/// `inner`, records its scroll, and narrows the cull to its scrollport plus the lead. Returns the
+/// content mask inside: the content's extent, which does not move as it scrolls.
+effect fn openScroller(
+  p: &mut Painter,
+  slot: u32,
+  c: &Computed,
+  f: &Fragment,
+  inner: ContentMask,
+) -> ContentMask
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
   let node = &p.nodes.asSlice()[u32.toUsize(slot)]
-  let vertical = thumbOf(c, f, node.scrollY, true)
-  let horizontal = thumbOf(c, f, node.scrollX, false)
-  run paintThumb(&mut p, vertical, mask)
-  run paintThumb(&mut p, horizontal, mask)
+  let id = node.id
+  let sx: f32 = f32.round(node.scrollX * s)
+  let sy: f32 = f32.round(node.scrollY * s)
+  let range = rangeOf(c, f)
+  run p.scene.setScroll(
+    ScrollPosition {
+      node: id,
+      x: sx,
+      y: sy,
+      minX: f32.round(range.minX * s),
+      maxX: f32.round(range.maxX * s),
+      minY: f32.round(range.minY * s),
+      maxY: f32.round(range.maxY * s),
+    },
+  )
+  drop run p.scene.pushScrollGroup(
+    ScrollLink { node: id, x: ScrollAxis.content(), y: ScrollAxis.content() },
+    inner.bounds,
+    inner.bounds,
+  )
+  let seen = ContentMask.new(p.cull).intersect(inner).bounds
+  let lead: f32 = p.lead
+  let leadX: f32 = if scrolls(usedOverflow(c, true)) {
+    lead
+  } else {
+    0.0
+  }
+  let leadY: f32 = if scrolls(usedOverflow(c, false)) {
+    lead
+  } else {
+    0.0
+  }
+  p.cull = Rect<f32>.new(
+    seen.xMin + sx - leadX,
+    seen.yMin + sy - leadY,
+    seen.xMax + sx + leadX,
+    seen.yMax + sy + leadY,
+  )
+  let box = borderBox(f)
+  let o = f.scrollableOverflow
+  let extent = Rect<f32>.new(
+    f32.min(box.xMin, box.xMin + o.x) - 1.0,
+    f32.min(box.yMin, box.yMin + o.y) - 1.0,
+    f32.max(box.xMax, box.xMin + o.x + o.width) + 1.0,
+    f32.max(box.yMax, box.yMin + o.y + o.height) + 1.0,
+  )
+  return ContentMask.new(device(extent, s))
+}
+
+/// Paints `thumb` (laid out at scroll `start`, the start of its range) in a group that follows
+/// the scroll of node `id` along the thumb's axis.
+effect fn paintThumbIn(
+  p: &mut Painter,
+  id: u32,
+  thumb: Thumb,
+  start: f32,
+  port: Rect<f32>,
+  vertical: bool,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !thumb.visible {
+    return ()
+  }
+  let s = p.scale
+  let mut axis = ScrollAxis.fixed()
+  if thumb.ratio > 0.0 {
+    let rate = 1.0 / thumb.ratio
+    let travel = if vertical {
+      port.height() / s
+    } else {
+      port.width() / s
+    }
+    axis = ScrollAxis { factor: rate, base: -start * s * rate, low: 0.0, high: travel * s }
+  }
+  let link = if vertical {
+    ScrollLink { node: id, x: ScrollAxis.fixed(), y: axis }
+  } else {
+    ScrollLink { node: id, x: axis, y: ScrollAxis.fixed() }
+  }
+  drop run p.scene.pushScrollGroup(link, mask.bounds, port)
+  run paintThumb(&mut p, thumb, mask)
+  run p.scene.popScrollGroup()
 }
 
 effect fn paintThumb(p: &mut Painter, thumb: Thumb, mask: ContentMask) -> ()
@@ -1274,8 +1512,6 @@ fn ownHash(
     if f.kind == FragmentKind.Box {
       h = Hash.combine(h, node.content)
       h = Hash.combine(h, u32.toU64(node.resource))
-      h = floatHash(h, node.scrollX)
-      h = floatHash(h, node.scrollY)
     }
   }
   return h

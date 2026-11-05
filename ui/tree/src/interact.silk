@@ -28,6 +28,7 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
+import layers
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.i32
@@ -101,12 +102,17 @@ fn targetable(tree: &UiTree, slot: u32) -> bool {
   return c.text.visible && c.pointerEvents
 }
 
-/// The topmost target under (`x`, `y`) in fragment `index` and its descendants, or NONE.
-/// Fragments paint in tree order, so later siblings and children are on top.
-fn hitFragment(tree: &UiTree, index: usize, x: f32, y: f32) -> u32 {
+/// The topmost target under (`x`, `y`) in fragment `index` and its descendants, or NONE. The
+/// point is in the fragment's layout coordinates: where it is against the fragment as laid out,
+/// with the scroll and sticky offsets above already taken off. Fragments paint in tree order,
+/// so later siblings and children are on top.
+fn hitFragment(tree: &UiTree, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+  if pruned && !inside(tree.fragmentInk.get(index), x, y) {
+    return NONE
+  }
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
-    return hitChildren(tree, index, x, y)
+    return hitChildren(tree, index, x, y, pruned)
   }
   if f.kind == FragmentKind.Text {
     if !inside(borderBox(&f), x, y) {
@@ -122,11 +128,11 @@ fn hitFragment(tree: &UiTree, index: usize, x: f32, y: f32) -> u32 {
   }
   let slot = slotIn(&tree.slotOfCss, f.source)
   if slot == NONE {
-    return hitChildren(tree, index, x, y)
+    return hitChildren(tree, index, x, y, pruned)
   }
   let clips = f.kind == FragmentKind.Box && tree.node(slot).computed.clips()
   if !clips || inside(paddingBox(&f), x, y) {
-    let below = hitChildren(tree, index, x, y)
+    let below = hitChildren(tree, index, x, y, pruned)
     if below != NONE {
       return below
     }
@@ -137,11 +143,21 @@ fn hitFragment(tree: &UiTree, index: usize, x: f32, y: f32) -> u32 {
   return NONE
 }
 
-fn hitChildren(tree: &UiTree, index: usize, x: f32, y: f32) -> u32 {
+fn hitChildren(tree: &UiTree, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
   let values = tree.output.fragments.values.asSlice()
   let mut child = values[index].lastChild
   while child != NO_INDEX {
-    let found = hitFragment(tree, child, x, y)
+    let own = layers.ownShift(
+      &tree.output,
+      &tree.slotOfCss,
+      &tree.layout,
+      &tree.nodes,
+      child,
+      tree.input.width,
+      tree.input.height,
+      tree.input.scale,
+    )
+    let found = hitFragment(tree, child, x - own.x, y - own.y, pruned)
     if found != NONE {
       return found
     }
@@ -157,7 +173,17 @@ pub fn hitSlot(tree: &UiTree, x: f32, y: f32) -> u32 {
   while index > 0 {
     index = index - 1
     if values[index].parent == NO_INDEX {
-      let found = hitFragment(tree, index, x, y)
+      let own = layers.ownShift(
+        &tree.output,
+        &tree.slotOfCss,
+        &tree.layout,
+        &tree.nodes,
+        index,
+        tree.input.width,
+        tree.input.height,
+        tree.input.scale,
+      )
+      let found = hitFragment(tree, index, x - own.x, y - own.y, tree.inkCurrent())
       if found != NONE {
         return found
       }
@@ -632,11 +658,10 @@ effect fn setOffset(tree: &mut UiTree, slot: u32, x: f32, y: f32) -> bool
   }
   node.scrollX = x
   node.scrollY = y
-  let css = node.css
-  run Effect.catch<InvalidNode>(
-    tree.layout.setScrollOffset(NodeId { index: css }, Point { x: x, y: y }),
-    ignoreInvalid,
-  )
+
+  // Layout never sees scroll offsets: paint and the geometry queries apply them (see `layers`).
+  tree.scrolled = true
+  tree.layoutObserversDirty = true
   return true
 }
 
@@ -721,14 +746,14 @@ effect fn revealSlot(tree: &mut UiTree, slot: u32) -> ()
   if index == NO_INDEX {
     return ()
   }
-  let mut rect = borderBox(&tree.output.fragments.values.asSlice()[index])
+  let mut rect = borderBox(&tree.visualFragment(index))
   let mut at = tree.node(slot).parent
   while at != NONE {
     let c = tree.node(at).computed
     let containerIndex = fragmentIndex(&tree.*, at)
     if (scrolls(usedOverflow(&c, true)) || scrolls(usedOverflow(&c, false)))
       && containerIndex != NO_INDEX {
-      let f = tree.output.fragments.values.asSlice()[containerIndex]
+      let f = tree.visualFragment(containerIndex)
       let port = paddingBox(&f)
       let range = rangeOf(&c, &f)
       let x = tree.node(at).scrollX
@@ -766,7 +791,7 @@ fn nearest(min: f32, max: f32, portMin: f32, portMax: f32) -> f32 {
 pub effect fn settleScrolls(tree: &mut UiTree) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  if tree.stats.layoutSkipped && tree.reveal.length() == 0 {
+  if tree.stats.layoutSkipped && tree.reveal.length() == 0 && !tree.scrolled {
     return false
   }
   let mut changed = false
@@ -776,7 +801,6 @@ pub effect fn settleScrolls(tree: &mut UiTree) -> bool
     run waiting.append(tree.reveal.get(last))
     tree.reveal.truncate(last)
   }
-  let start = tree.layout.scrollRevision()
   let mut i = waiting.length()
   while i > 0 {
     i = i - 1
@@ -795,11 +819,11 @@ pub effect fn settleScrolls(tree: &mut UiTree) -> bool
       let y = range.clampY(node.scrollY)
       if run setOffset(&mut tree, slot, x, y) {
         run scrollRecord(&mut tree, slot)
+        changed = true
       }
     }
     slot = slot + 1
   }
-  changed = tree.layout.scrollRevision() != start
   return changed
 }
 
@@ -811,7 +835,7 @@ fn startThumb(tree: &mut UiTree, slot: u32, x: f32, y: f32) -> bool {
   while at != NONE {
     let index = fragmentIndex(&tree.*, at)
     if index != NO_INDEX && tree.node(at).computed.clips() {
-      let f = tree.output.fragments.values.asSlice()[index]
+      let f = tree.visualFragment(index)
       let c = tree.node(at).computed
       let vertical = thumbOf(&c, &f, tree.node(at).scrollY, true)
       if vertical.visible && inside(vertical.rect, x, y) {
