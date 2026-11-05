@@ -40,6 +40,7 @@
 enum {
     WM_SILK_RUN = WM_APP + 1,       // run a deferred task on the pump fiber
     WM_SILK_KEYSTATE = WM_APP + 2,  // test hook: restore the keyboard state
+    WM_SILK_WAKE = WM_APP + 3,      // silk_window_wake: return to Silk
     TIMER_MODAL = 1,
     MENU_ACTION_BASE = 0x1000,
     MENU_SYSTEM_BASE = 0x100,
@@ -245,10 +246,15 @@ static void check_vblank(void) {
 
 // From the pump fiber: hands control back to Silk when there is something to return or
 // the wait is over. Safe to call from inside the system's modal loops.
+// Set by silk_window_wake from any thread, cleared when silk_window_next_event returns.
+static volatile LONG woken;
+
+static bool wake_pending(void) { return InterlockedCompareExchange(&woken, 0, 0) != 0; }
+
 static void yield_if_ready(void) {
     if (!fiberMode || !onPump) return;
     deliver_frames(false);
-    if (!silk_queue_empty() || silk_now() >= deadline) {
+    if (!silk_queue_empty() || silk_now() >= deadline || wake_pending()) {
         onPump = false;
         SwitchToFiber(mainFiber);
         onPump = true;
@@ -285,7 +291,8 @@ static void CALLBACK pump_fiber(void *unused) {
     (void)unused;
     for (;;) {
         onPump = true;
-        while (silk_queue_empty() && silk_now() < deadline) pump_once(wait_millis());
+        while (silk_queue_empty() && silk_now() < deadline && !wake_pending())
+            pump_once(wait_millis());
         onPump = false;
         SwitchToFiber(mainFiber);
     }
@@ -340,22 +347,34 @@ uint32_t silk_window_backend(void) { return started ? SILK_BACKEND_WIN32 : SILK_
 
 uint32_t silk_window_appearance(void) { return appearanceValue; }
 
-uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
-    if (!started) return 0;
-    deadline = timeout < 0 ? INFINITY : silk_now() + timeout;
+static uint8_t next_event(SilkWindowEvent *event) {
     for (;;) {
         if (silk_queue_pop(event)) return 1;
+        if (wake_pending()) return 0;
         if (fiberMode) {
             SwitchToFiber(pumpFiber);
             if (silk_queue_pop(event)) return 1;
-            if (silk_now() >= deadline) return 0;
+            if (silk_now() >= deadline || wake_pending()) return 0;
         } else {
             pump_once(0);
             if (silk_queue_pop(event)) return 1;
-            if (silk_now() >= deadline) return 0;
+            if (silk_now() >= deadline || wake_pending()) return 0;
             pump_once(wait_millis());
         }
     }
+}
+
+uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
+    if (!started) return 0;
+    deadline = timeout < 0 ? INFINITY : silk_now() + timeout;
+    uint8_t got = next_event(event);
+    InterlockedExchange(&woken, 0);
+    return got;
+}
+
+void silk_window_wake(void) {
+    if (!started) return;
+    if (InterlockedExchange(&woken, 1) == 0) PostMessageW(helper, WM_SILK_WAKE, 0, 0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -882,6 +901,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPAR
     if (hwnd == helper) {
         if (message == WM_SILK_RUN) {
             run_task((Task *)lParam);
+            yield_if_ready();
+            return 0;
+        }
+        if (message == WM_SILK_WAKE) {
             yield_if_ready();
             return 0;
         }

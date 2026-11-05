@@ -9,9 +9,17 @@
 //! has not taken yet is replaced, and its uploads are kept in front of the new frame's, so no
 //! atlas pixels are lost. The replaced scene's storage is reused for the next copy.
 //!
+//! The render thread also scrolls on its own, as a browser compositor does: the window host
+//! hands each frame's [`FastScroll`] (which scrollers the user may scroll, and where wheel
+//! listeners are) with it, and the platform thread scrolls through a [`Compositor`] when a wheel
+//! event can go no further than a scroller. The render thread draws the last frame again with the
+//! new offsets and the UI thread learns them afterwards. Offsets a frame of the UI thread already
+//! took ([`RenderThread.submit`]'s `fastSeq`) are dropped.
+//!
 //! Everything a frame carries lives in the process heap, never in a caller's arena: the copies
 //! are made with the system allocator, whatever allocator the caller provides.
 import ui_scene.scene { Scene }
+import ui_scene.scroll { Placements, ScrollGroup, ScrollPosition }
 import ui_scene.color as color
 import ui_tree.lib { Pending }
 import atlas.atlas { Atlas, TextureInfo }
@@ -45,6 +53,10 @@ import silk.num.f64
 import silk.num.i64
 import silk.num.u64
 import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.num.f32
+import silk.geometry.rect { Rect }
 
 /// How the render thread sets up the surface.
 pub struct RenderSettings {
@@ -107,12 +119,71 @@ struct FrameJob {
   /// The CPU reference to compare the drawn surface with, when `compare` is set.
   expected: List<u8>,
   compare: bool,
+  fast: FastScroll,
+  /// The last compositor scroll the UI thread took before painting this frame.
+  fastSeq: u64,
 }
 
 impl Transferable for FrameJob {}
 
+/// Which scrollers of a frame the compositor may scroll, and where it must not.
+pub struct FastScroll {
+  /// The scroll containers the user can scroll, with the axes they scroll on.
+  pub scrollers: List<ScrollerAxes>,
+  /// Window rectangles, in device pixels, where a wheel listener must see the event first.
+  pub blocked: List<Rect<f32>>,
+}
+
+impl FastScroll {
+  pub fn make() -> FastScroll {
+    return FastScroll { scrollers: List<ScrollerAxes>.make(), blocked: List<Rect<f32>>.make() }
+  }
+
+  fn axes(self: &Self, node: u32) -> ScrollerAxes {
+    let list = self.scrollers.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].node == node {
+        return list[i]
+      }
+      i = i + 1
+    }
+    return ScrollerAxes { node: node, x: false, y: false }
+  }
+}
+
+/// A scroll container the user can scroll: on `x`, on `y`, or both.
+pub struct ScrollerAxes {
+  pub node: u32,
+  pub x: bool,
+  pub y: bool,
+}
+
+impl Copy for ScrollerAxes {}
+
+/// An offset the compositor gave node `node`, in device pixels, as its `seq`th scroll.
+pub struct FastScrolled {
+  pub node: u32,
+  pub x: f32,
+  pub y: f32,
+  pub seq: u64,
+}
+
+impl Copy for FastScrolled {}
+
 struct State {
   job: Option<FrameJob>,
+  /// Draw the current frame again: the compositor moved a scroller.
+  redraw: bool,
+  /// The current frame's scroll groups and offsets, for the compositor's hit test.
+  groups: List<ScrollGroup>,
+  painted: List<ScrollPosition>,
+  fast: FastScroll,
+  /// Offsets the compositor set since the frames it was told about, with their sequence.
+  newer: List<ScrollPosition>,
+  newerSeq: List<u64>,
+  seq: u64,
+  placements: Placements,
   /// Storage of a drawn or replaced scene, reused for the next copy.
   spare: Option<Scene>,
   quit: bool,
@@ -213,6 +284,8 @@ impl RenderThread {
     height: u32,
     compare: bool,
     expected: &[u8],
+    fast: FastScroll,
+    fastSeq: u64,
   ) -> ()
     ! GpuError | OutOfMemoryError {
     run raise(&self.shared)
@@ -240,9 +313,16 @@ impl RenderThread {
       height: height,
       expected: move reference,
       compare: compare,
+      fast: move fast,
+      fastSeq: fastSeq,
     }
     run post(&self.shared, move job, uploads) |> Effect.provideMut<Allocator>(&mut heap)
     self.wake.unpark()
+  }
+
+  /// The handle the platform thread scrolls through.
+  pub fn compositor(self: &Self) -> Compositor {
+    return Compositor { shared: self.shared.clone(), wake: self.wake.clone() }
   }
 
   /// What the render thread last reported.
@@ -336,7 +416,9 @@ effect fn post(shared: &Arc<Mutex<State>>, job: FrameJob, uploads: &Pending) -> 
         width: w,
         height: h,
         expected: e,
-        compare: c
+        compare: c,
+        fast: f,
+        fastSeq: q
       } = move value
       drop t
       drop u
@@ -354,6 +436,14 @@ effect fn makeShared() -> Arc<Mutex<State>>
   ? &mut Allocator {
   let state = State {
     job: Option<FrameJob>.None,
+    redraw: false,
+    groups: List<ScrollGroup>.make(),
+    painted: List<ScrollPosition>.make(),
+    fast: FastScroll.make(),
+    newer: List<ScrollPosition>.make(),
+    newerSeq: List<u64>.make(),
+    seq: 0,
+    placements: Placements.make(),
     spare: Option<Scene>.None,
     quit: false,
     ready: false,
@@ -402,41 +492,81 @@ fn recordFailure(shared: &Arc<Mutex<State>>, failure: GpuError) -> () {
   values.quit = true
 }
 
-/// Waits for the next job, or None when the thread should stop.
-fn nextJob(shared: &Arc<Mutex<State>>, parker: &Parker) -> Option<FrameJob> {
+/// What the render thread does next.
+union Work {
+  /// Draw a new frame.
+  Job { job: FrameJob },
+  /// Draw the current frame again at newer scroll offsets.
+  Redraw,
+  Quit
+}
+
+/// Waits for the next work.
+fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker) -> Work {
   while true {
-    let taken = takeJob(shared)
+    let taken = takeWork(shared)
     match move taken {
-      Taken.Job { job } => {
-        return Option<FrameJob>.some(move job)
+      Option<Work>.Some { value } => {
+        return move value
       }
-      Taken.Quit => {
-        return Option<FrameJob>.None
-      }
-      Taken.Empty => {
+      Option<Work>.None => {
         parker.park()
       }
     }
   }
-  return Option<FrameJob>.None
+  return Work.Quit
 }
 
-union Taken {
-  Job { job: FrameJob },
-  Quit,
-  Empty
-}
-
-fn takeJob(shared: &Arc<Mutex<State>>) -> Taken {
+fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
   let mut guard = shared.get().lock()
   let state = guard.getMut()
   if state.quit {
-    return Taken.Quit
+    return Option<Work>.some(Work.Quit)
   }
   return match move Intrinsic.replace(state.job, Option<FrameJob>.None) {
-    Option<FrameJob>.Some { value } => Taken.Job { job: move value }
-    Option<FrameJob>.None => Taken.Empty
+    Option<FrameJob>.Some { value } => {
+      state.redraw = false
+      Option<Work>.some(Work.Job { job: move value })
+    }
+    Option<FrameJob>.None => if state.redraw {
+      state.redraw = false
+      Option<Work>.some(Work.Redraw)
+    } else {
+      Option<Work>.None
+    }
   }
+}
+
+/// Makes `job` the frame the compositor scrolls: its groups and offsets, and the offsets it
+/// already took dropped from the compositor's.
+effect fn adopt(shared: &Arc<Mutex<State>>, job: &mut FrameJob) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  state.groups.clear()
+  run state.groups.appendSlice(job.scene.scrollGroups())
+  state.painted.clear()
+  run state.painted.appendSlice(job.scene.scrolls())
+  state.fast = Intrinsic.replace(job.fast, FastScroll.make())
+  let mut i: usize = 0
+  while i < state.newer.length() {
+    if state.newerSeq.get(i) <= job.fastSeq {
+      drop state.newer.remove(i)
+      drop state.newerSeq.remove(i)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+/// The compositor's offsets, to draw with.
+effect fn newerScrolls(shared: &Arc<Mutex<State>>, out: &mut List<ScrollPosition>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let guard = shared.get().lock()
+  run out.appendSlice(guard.get().newer.asSlice())
 }
 
 fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
@@ -446,8 +576,8 @@ fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
   values.ready = true
 }
 
-/// Records a presented frame and keeps the scene's storage for the next copy.
-fn finished(shared: &Arc<Mutex<State>>, job: FrameJob, report: RenderReport) -> () {
+/// Records a presented frame.
+fn recordFrame(shared: &Arc<Mutex<State>>, report: RenderReport) -> () {
   let mut guard = shared.get().lock()
   let values = guard.getMut()
   let previous = values.report
@@ -456,6 +586,12 @@ fn finished(shared: &Arc<Mutex<State>>, job: FrameJob, report: RenderReport) -> 
   if report.status < 0 {
     values.report.status = previous.status
   }
+}
+
+/// Keeps the storage of a frame that is no longer drawn for the next copy.
+fn retire(shared: &Arc<Mutex<State>>, job: FrameJob) -> () {
+  let mut guard = shared.get().lock()
+  let values = guard.getMut()
   if Option<Scene>.isNone(&values.spare) {
     let FrameJob {
       scene: used,
@@ -464,11 +600,14 @@ fn finished(shared: &Arc<Mutex<State>>, job: FrameJob, report: RenderReport) -> 
       width: w,
       height: h,
       expected: e,
-      compare: c
+      compare: c,
+      fast: f,
+      fastSeq: q
     } = move job
     drop t
     drop u
     drop e
+    drop f
     values.spare = Option<Scene>.some(move used)
   } else {
     drop job
@@ -551,15 +690,35 @@ effect fn renderLoop(
   let mut configuredWidth: u32 = 0
   let mut configuredHeight: u32 = 0
   let mut previousPresented = 0.0
+  let mut current = Option<FrameJob>.None
+  let mut newer = List<ScrollPosition>.make()
   while true {
-    let job = match move nextJob(shared, parker) {
-      Option<FrameJob>.Some { value } => move value
-      Option<FrameJob>.None => {
+    let work = nextWork(shared, parker)
+    let fresh = match move work {
+      Work.Job { job } => {
+        let mut next = move job
+        run adopt(shared, &mut next)
+        match move Intrinsic.replace(current, Option<FrameJob>.some(move next)) {
+          Option<FrameJob>.Some { value } => retire(shared, move value)
+          Option<FrameJob>.None => ()
+        }
+        true
+      }
+      Work.Redraw => false
+      Work.Quit => {
         break
       }
     }
+    run newerScrolls(shared, &mut newer)
+    let mut job = match move Intrinsic.replace(current, Option<FrameJob>.None) {
+      Option<FrameJob>.Some { value } => move value
+      Option<FrameJob>.None => {
+        continue
+      }
+    }
     if job.width == 0 || job.height == 0 {
-      finished(shared, move job, RenderReport.none())
+      current = Option<FrameJob>.some(move job)
+      recordFrame(shared, RenderReport.none())
       wakeUi.unpark()
       continue
     }
@@ -569,17 +728,21 @@ effect fn renderLoop(
       configuredHeight = job.height
     }
     let start = run seconds(&mut clock)
-    run textures.syncInfos(&device, job.textures.asSlice())
-    let list = job.uploads.entries()
-    let mut i: usize = 0
-    while i < list.length {
-      textures.write(&queue, list[i].tile, job.uploads.pixels(list[i]))
-      i = i + 1
+    if fresh {
+      run textures.syncInfos(&device, job.textures.asSlice())
+      let list = job.uploads.entries()
+      let mut i: usize = 0
+      while i < list.length {
+        textures.write(&queue, list[i].tile, job.uploads.pixels(list[i]))
+        i = i + 1
+      }
+      job.uploads.clear()
     }
     let uploaded = run seconds(&mut clock)
     let texture = run gpuSurface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run seconds(&mut clock)
+    run renderer.setScrolls(newer.asSlice())
     run renderer.draw(
       &device,
       &queue,
@@ -592,7 +755,7 @@ effect fn renderLoop(
     )
     let drawn = run seconds(&mut clock)
     let mut status: i32 = -1
-    if job.compare {
+    if fresh && job.compare {
       status = run checkFrame(
         &device,
         &queue,
@@ -619,7 +782,8 @@ effect fn renderLoop(
         (presented - previousPresented) * 1000.0
       },
     }
-    finished(shared, move job, report)
+    current = Option<FrameJob>.some(move job)
+    recordFrame(shared, report)
     wakeUi.unpark()
     previousPresented = presented
   }
@@ -667,4 +831,160 @@ effect fn checkFrame(
   } else {
     1
   }
+}
+
+/// The platform thread's handle to the render thread's compositor: it scrolls the last frame
+/// without the UI thread.
+pub struct Compositor {
+  shared: Arc<Mutex<State>>,
+  wake: Unparker,
+}
+
+impl Transferable for Compositor {}
+
+impl Compositor {
+  pub fn clone(self: &Self) -> Compositor {
+    return Compositor { shared: self.shared.clone(), wake: self.wake.clone() }
+  }
+
+  /// Frames the render thread presented so far.
+  pub fn presented(self: &Self) -> u64 {
+    return self.shared.get().lock().get().report.frames
+  }
+
+  /// Scrolls by (`dx`, `dy`) device pixels the scrollers under (`x`, `y`) (window device pixels)
+  /// of the frame on screen, the innermost first, as far as each goes; then draws the frame
+  /// again. Appends each offset it set to `moved`. Returns false, scrolling nothing, when a
+  /// wheel listener is there or no scroller under the point can move: the UI thread must see
+  /// the event.
+  pub effect fn scroll(
+    self: &Self,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+    moved: &mut List<FastScrolled>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    let blocked = state.fast.blocked.asSlice()
+    let mut b: usize = 0
+    while b < blocked.length {
+      let r = blocked[b]
+      if x >= r.xMin && x < r.xMax && y >= r.yMin && y < r.yMax {
+        return false
+      }
+      b = b + 1
+    }
+    run state.placements.resolve(
+      state.groups.asSlice(),
+      state.painted.asSlice(),
+      state.newer.asSlice(),
+    )
+    let count = state.groups.length()
+
+    // The innermost content group under the point: the last one in paint order.
+    let mut at: usize = count
+    let mut g: usize = count
+    while g > 1 {
+      g = g - 1
+      if isContent(&state.groups.get(g)) {
+        let clip = state.placements.get(usize.toU32(g)).clip
+        if x >= clip.xMin && x < clip.xMax && y >= clip.yMin && y < clip.yMax {
+          at = g
+          break
+        }
+      }
+    }
+    if at == count {
+      return false
+    }
+    let mut restX = dx
+    let mut restY = dy
+    let mut any = false
+    let start = moved.length()
+    while at != 0 && (restX != 0.0 || restY != 0.0) {
+      let group = state.groups.get(at)
+      if isContent(&group) {
+        let node = group.link.node
+        let axes = state.fast.axes(node)
+        if let Option<ScrollPosition>.Some { value: position } = current(&state.*, node) {
+          let wantX: f32 = if axes.x {
+            restX
+          } else {
+            0.0
+          }
+          let wantY: f32 = if axes.y {
+            restY
+          } else {
+            0.0
+          }
+          let next = position.movedBy(wantX, wantY)
+          if next.x != position.x || next.y != position.y {
+            restX = restX - (next.x - position.x)
+            restY = restY - (next.y - position.y)
+            let seq = state.seq + 1
+            state.seq = seq
+            run setNewer(&mut state, next, seq)
+            run moved.append(FastScrolled { node: node, x: next.x, y: next.y, seq: seq })
+            any = true
+          }
+        }
+      }
+      at = u32.toUsize(group.parent)
+    }
+    if !any {
+      moved.truncate(start)
+      return false
+    }
+    state.redraw = true
+    drop guard
+    self.wake.unpark()
+    return true
+  }
+}
+
+/// Whether `group` is the scrolled content of a scroll container (not a sticky box or thumb).
+fn isContent(group: &ScrollGroup) -> bool {
+  return group.link.x.factor == -1.0 && group.link.y.factor == -1.0
+}
+
+/// Node `node`'s offset now: the compositor's, else the frame's.
+fn current(state: &State, node: u32) -> Option<ScrollPosition> {
+  let newer = state.newer.asSlice()
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == node {
+      return Option<ScrollPosition>.some(newer[i])
+    }
+    i = i + 1
+  }
+  let painted = state.painted.asSlice()
+  i = 0
+  while i < painted.length {
+    if painted[i].node == node {
+      return Option<ScrollPosition>.some(painted[i])
+    }
+    i = i + 1
+  }
+  return Option<ScrollPosition>.None
+}
+
+effect fn setNewer(state: &mut State, position: ScrollPosition, seq: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let newer = state.newer.asMutSlice()
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == position.node {
+      newer[i] = position
+      state.newerSeq.set(i, seq)
+      return ()
+    }
+    i = i + 1
+  }
+  run state.newer.append(position)
+  run state.newerSeq.append(seq)
 }

@@ -17,6 +17,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/message.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -165,6 +166,8 @@ static BOOL inFiber;
 static BOOL topLevelWait;
 static BOOL pollWait;
 static BOOL timedOut;
+// Set by silk_macos_wake from any thread; the loop returns to Silk when it sees it.
+static atomic_int woken;
 static void *userStack;
 static void *appStack;
 static NSMutableArray<SilkQueued *> *queue;
@@ -854,6 +857,39 @@ static void deadline_fired(CFRunLoopTimerRef timer, void *info) {
     }
 }
 
+// On the main thread, in any run loop mode: ends the wait as the deadline does.
+static void wake_fired(void) {
+    timedOut = YES;
+    if (!topLevelWait && fiberMode && inFiber) {
+        inFiber = NO;
+        silk_macos_switch(&appStack, userStack);
+        inFiber = YES;
+    }
+}
+
+void silk_macos_wake(void) {
+    if (!started) return;
+    if (atomic_exchange(&woken, 1)) return;
+    // A block for nested loops (live resize, menus) and an event for the top-level wait.
+    CFRunLoopRef loop = CFRunLoopGetMain();
+    CFRunLoopPerformBlock(loop, kCFRunLoopCommonModes, ^{
+        if (atomic_load(&woken)) wake_fired();
+    });
+    CFRunLoopWakeUp(loop);
+    @autoreleasepool {
+        NSEvent *event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                            location:NSZeroPoint
+                                       modifierFlags:0
+                                           timestamp:0
+                                        windowNumber:0
+                                             context:nil
+                                             subtype:0x5157
+                                               data1:0
+                                               data2:0];
+        [NSApp postEvent:event atStart:NO];
+    }
+}
+
 static void arm_deadline(double timeout) {
     timedOut = NO;
     pollWait = timeout == 0;
@@ -894,8 +930,9 @@ static void appkit_main(void *unused) {
         @autoreleasepool {
             @try {
                 BOOL got = pump_one(wait_until());
-                BOOL expired = !got && (pollWait || timedOut ||
-                                        CFAbsoluteTimeGetCurrent() >= deadline);
+                BOOL expired = (!got && (pollWait || timedOut ||
+                                         CFAbsoluteTimeGetCurrent() >= deadline)) ||
+                               atomic_load(&woken);
                 if (queue.count > 0 || expired) {
                     inFiber = NO;
                     silk_macos_switch(&appStack, userStack);
@@ -913,7 +950,7 @@ static void pump_on_caller(void) {
     @autoreleasepool {
         NSDate *until = wait_until();
         while (queue.count == 0) {
-            if (!pump_one(until)) break;
+            if (!pump_one(until) || atomic_load(&woken)) break;
             until = [NSDate distantPast];
             if (queue.count == 0 && !pollWait && !isinf(deadline) &&
                 CFAbsoluteTimeGetCurrent() >= deadline) {
@@ -1063,6 +1100,7 @@ uint8_t silk_macos_next_event(double timeout, SilkWindowEvent *out) {
         }
         CFRunLoopTimerSetNextFireDate(deadlineTimer, CFAbsoluteTimeGetCurrent() + 1.0e10);
     }
+    atomic_store(&woken, 0);
     if (queue.count == 0) {
         currentTexts = @[];
         return 0;

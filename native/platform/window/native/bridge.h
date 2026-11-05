@@ -121,6 +121,9 @@ uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event);
 // Copies up to `capacity` bytes of the `index`th string of the event last returned and
 // returns its whole length. Valid until the next silk_window_next_event.
 size_t silk_window_event_text(size_t index, uint8_t *destination, size_t capacity);
+// From any thread: makes the current or next silk_window_next_event return soon, with or
+// without an event. Does nothing before silk_window_start.
+void silk_window_wake(void);
 
 void silk_window_request_frame(uint32_t window);
 void silk_window_content_size(uint32_t window, double *width, double *height);

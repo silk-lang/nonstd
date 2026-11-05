@@ -2,13 +2,20 @@
 //! pixels; wheel notches become [`LINE_PIXELS`] each. native/platform/window's scroll deltas are
 //! positive when content moves down, the tree's when it scrolls down, so the sign flips.
 import accessibility
+import accessibility { AxAction, AxNode }
+import platform_thread { AccessLink, HostPlatform }
+import silk.core.effect { Effect }
 import keys { codeName, keyName }
 import window.event { Event, Key, MouseButton, Phase, ScrollDelta, Modifiers }
 import window.types { Wait }
 import silk.geometry.vector { Vector2 }
 import window.types { Cursor as WindowCursor, ImeState, WindowId }
 import window.platform { Platform }
-import ui_tree.lib { UiTree, Input, Cursor, HostRequest, ImeArea }
+import ui_tree.lib { UiTree, Input, Cursor, HostRequest, ImeArea, NodeInfo }
+import ui_tree.inspect
+import ui_tree.mutation { LISTEN_WHEEL, NodeKind }
+import ui_tree.scrollbar { usedOverflow, userScrolls }
+import render_thread { FastScroll, ScrollerAxes }
 import silk.collections.list { List }
 import silk.geometry.rect { Rect }
 import silk.num.f32
@@ -165,6 +172,8 @@ pub struct HostState {
   pub ime: ImeArea,
   pub imeSet: bool,
   accessibilityFrame: u64,
+  /// The platform thread's accessibility link, when the platform runs on its own thread.
+  access: Option<AccessLink>,
 }
 
 impl HostState {
@@ -173,7 +182,15 @@ impl HostState {
       ime: ImeArea.none(),
       imeSet: false,
       accessibilityFrame: 18446744073709551615,
+      access: Option<AccessLink>.None,
     }
+  }
+
+  /// The state for a host whose platform is `platform`.
+  pub fn of(platform: &HostPlatform) -> HostState {
+    let mut state = HostState.make()
+    state.access = platform.accessLink()
+    return move state
   }
 }
 
@@ -188,10 +205,28 @@ pub effect fn serve<P: Platform>(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  run accessibility.poll(&mut tree, window)
-  if state.accessibilityFrame != tree.semanticRevision && !tree.layoutPending() {
-    run accessibility.sync(&tree.*, window)
-    state.accessibilityFrame = tree.semanticRevision
+  match &state.access {
+    Option<AccessLink>.Some { value } => {
+      // The platform thread talks to the OS; this side sends snapshots and answers actions.
+      let mut actions = List<AxAction>.make()
+      run value.take(&mut actions)
+      run accessibility.apply(&mut tree, &mut actions)
+      if accessibility.supported() && state.accessibilityFrame != tree.semanticRevision
+        && !tree.layoutPending() {
+        let mut heap = Allocator.systemAllocatorProvider()
+        let mut nodes = List<AxNode>.make()
+        run accessibility.snapshot(&tree.*, &mut nodes) |> Effect.provideMut<Allocator>(&mut heap)
+        run value.publish(window, move nodes)
+        state.accessibilityFrame = tree.semanticRevision
+      }
+    }
+    Option<AccessLink>.None => {
+      run accessibility.poll(&mut tree, window)
+      if state.accessibilityFrame != tree.semanticRevision && !tree.layoutPending() {
+        run accessibility.sync(&tree.*, window)
+        state.accessibilityFrame = tree.semanticRevision
+      }
+    }
   }
   let mut requests = List<HostRequest>.make()
   run tree.takeRequests(&mut requests)
@@ -355,4 +390,40 @@ fn sum(left: ScrollDelta, right: ScrollDelta) -> Option<ScrollDelta> {
       _ => Option<ScrollDelta>.None
     }
   }
+}
+
+/// What the compositor needs to scroll `tree`'s frame on its own, at `scale` device pixels per
+/// CSS pixel: the scroll containers the user can scroll, and the bounds of nodes that listen for
+/// wheel events (a wheel there goes to the app first). Allocated with the system allocator, to
+/// cross to the render thread.
+pub effect fn fastScrollOf(tree: &UiTree, scale: f32) -> FastScroll
+  ! OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let mut fast = FastScroll.make()
+  let count = tree.nodes.length()
+  let mut slot: usize = 0
+  while slot < count {
+    let node = tree.node(usize.toU32(slot))
+    slot = slot + 1
+    if !node.live || node.kind == NodeKind.Text {
+      continue
+    }
+    let x = userScrolls(usedOverflow(&node.computed, true))
+    let y = userScrolls(usedOverflow(&node.computed, false))
+    if x || y {
+      run fast.scrollers.append(ScrollerAxes { node: node.id, x: x, y: y })
+        |> Effect.provideMut<Allocator>(&mut heap)
+    }
+    if (node.listeners & LISTEN_WHEEL) != 0 {
+      let found = run inspect.info(tree, node.id) |> Effect.provideMut<Allocator>(&mut heap)
+      if let Option<NodeInfo>.Some { value } = found {
+        let b = value.bounds
+        run fast.blocked.append(
+          Rect<f32>.new(b.xMin * scale, b.yMin * scale, b.xMax * scale, b.yMax * scale),
+        )
+          |> Effect.provideMut<Allocator>(&mut heap)
+      }
+    }
+  }
+  return move fast
 }

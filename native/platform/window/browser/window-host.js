@@ -326,6 +326,9 @@ export class WindowHost {
     });
   }
 
+  // The browser loop is single-threaded: nothing waits on another thread to wake it.
+  silk_window_wake() {}
+
   silk_window_request_frame(id) {
     const window = this.windows.get(id);
     if (window) this.frame(window);

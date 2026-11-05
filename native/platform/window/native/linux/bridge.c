@@ -12,10 +12,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include "linux.h"
 
 static int backend = SILK_BACKEND_NONE;
 static uint32_t appearanceValue;
+// silk_window_wake writes here from any thread; the event loop polls it with the connection.
+static int wakeFd = -1;
 
 // Builds without the Wayland headers define SILK_WINDOW_NO_WAYLAND and get X11 only.
 #ifdef SILK_WINDOW_NO_WAYLAND
@@ -53,7 +57,22 @@ int32_t silk_window_start(void) {
         return 3;
     }
     appearanceValue = detect_appearance();
+    wakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     return 0;
+}
+
+void silk_window_wake(void) {
+    if (wakeFd < 0) return;
+    uint64_t one = 1;
+    ssize_t written = write(wakeFd, &one, sizeof one);
+    (void)written;
+}
+
+// Whether a wake came, consuming it.
+static bool take_wake(void) {
+    if (wakeFd < 0) return false;
+    uint64_t count = 0;
+    return read(wakeFd, &count, sizeof count) == (ssize_t)sizeof count && count > 0;
 }
 
 uint32_t silk_window_backend(void) { return (uint32_t)backend; }
@@ -83,6 +102,7 @@ uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
         double now = silk_now();
         double nextFrame = DISPATCH(frames)(now);
         if (silk_queue_pop(event)) return 1;
+        if (take_wake()) return 0;
         now = silk_now();
         if (now >= deadline) return 0;
         double wake = deadline < nextFrame ? deadline : nextFrame;
@@ -96,7 +116,13 @@ uint8_t silk_window_next_event(double timeout, SilkWindowEvent *event) {
         fds[0].fd = DISPATCH(fd)();
         fds[0].events = POLLIN;
         fds[0].revents = 0;
-        int count = 1 + silk_dialog_fds(fds + 1, 16);
+        int count = 1 + silk_dialog_fds(fds + 1, 15);
+        if (wakeFd >= 0) {
+            fds[count].fd = wakeFd;
+            fds[count].events = POLLIN;
+            fds[count].revents = 0;
+            count++;
+        }
         int ready = poll(fds, (nfds_t)count, milliseconds);
         if (ready < 0 && errno != EINTR) {
             DISPATCH(cancel_wait)();

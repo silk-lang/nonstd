@@ -5,9 +5,13 @@ import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.lib { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
 import lib { feed, windowCursor, HostState, serve, coalesce }
-import render_thread { RenderThread, RenderSettings }
+import adapter { fastScrollOf }
+import render_thread { FastScroll, FastScrolled, RenderThread, RenderSettings }
+import platform_thread { HostPlatform, Launched }
 import vector.pixmap { Pixmap }
-import ui_inspect_server.lib { Inspector }
+import ui_inspect_server.lib { Inspector, InspectorOptions }
+import silk.core.result { Result }
+import silk.system.host_input { HostInput, HostInputError }
 import font_collection.lib { FontCollection }
 import ui_renderer.compare { Tolerance, compare }
 import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
@@ -58,7 +62,7 @@ pub interface WindowClient<S, E, ? R> {
   effect fn opened(
     self: &mut Self,
     state: &mut S,
-    platform: &mut NativePlatform,
+    platform: &mut HostPlatform,
     window: WindowId,
   ) -> ()
     ! WindowError | OutOfMemoryError
@@ -77,7 +81,7 @@ pub interface WindowClient<S, E, ? R> {
     self: &mut Self,
     state: &mut S,
     tree: &mut UiTree,
-    platform: &mut NativePlatform,
+    platform: &mut HostPlatform,
     window: WindowId,
   ) -> bool
     ! WindowError | TreeError | OutOfMemoryError
@@ -242,6 +246,9 @@ pub struct RunOptions {
   /// between input and pixels (games, drawing) over input that never waits for the display.
   /// Frames are drawn on the render thread either way.
   pub lowestLatency: bool,
+  /// The platform thread of an app started with `platform_thread.launch`, or None to run the
+  /// platform on this thread.
+  pub platform: Option<Launched>,
 }
 
 /// The frame `check` reads back: the scripted input goes in after frame 1.
@@ -294,18 +301,32 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   run content.start(&mut state, &mut tree)
   let mut snapshot = CpuSnapshot.make()
 
-  let mut platform = run NativePlatform.start()
+  let mut options = move options
+  let launched = Intrinsic.replace(options.platform, Option<Launched>.None)
+  let mut platform = match move launched {
+    Option<Launched>.Some { value } => HostPlatform.proxied(move value)
+    Option<Launched>.None => HostPlatform.direct(run NativePlatform.start())
+  }
   let mut windowOptions = WindowOptions.make(options.title, options.width, options.height)
   windowOptions.minSize = Option<Size2<f64>>.some(Size2<f64>.new(240.0, 200.0))
   content.configure(&state.*, &mut windowOptions)
   let window = run platform.openWindow(&windowOptions)
   let owner = window
   run content.opened(&mut state, &mut platform, owner)
-  let mut host = HostState.make()
+  let mut host = HostState.of(&platform)
   let raw = platform.rawSurface(window)
 
   // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
   let mut renderer = run RenderThread.start(raw, owner, RenderSettings { check: check })
+
+  // With a platform thread, wheels scroll the frame on screen at once (render_thread.silk);
+  // the tree takes the offsets on its next pass.
+  let compositing = platform.threaded() && !check
+  if compositing {
+    platform.setCompositor(renderer.compositor())
+  }
+  let mut fastScrolls = List<FastScrolled>.make()
+  let mut fastSeq: u64 = 0
 
   let initial = platform.contentSize(window)
   let mut width = initial.width
@@ -365,6 +386,24 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
           run coalesce(&mut platform, move value, &mut pending),
         )
         Option<Event>.None => Option<Event>.None
+      }
+    }
+    if compositing {
+      run platform.takeFastScrolls(&mut fastScrolls)
+      if fastScrolls.length() != 0 {
+        let list = fastScrolls.asSlice()
+        let s = f64.toF32(scale)
+        let mut f: usize = 0
+        while f < list.length {
+          run tree.scrolledElsewhere(list[f].node, list[f].x / s, list[f].y / s)
+          if list[f].seq > fastSeq {
+            fastSeq = list[f].seq
+          }
+          f = f + 1
+        }
+        fastScrolls.clear()
+        run content.pump(&mut state, &mut tree)
+        platform.requestFrame(owner)
       }
     }
     let time = (run seconds(&mut clock)) - started
@@ -441,6 +480,12 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
                 deviceHeight,
                 compared,
                 reference.data(),
+                if compositing {
+                  run fastScrollOf(&tree, f64.toF32(scale))
+                } else {
+                  FastScroll.make()
+                },
+                fastSeq,
               )
               tree.clearUploads()
               drawn = drawn + 1
@@ -541,7 +586,77 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
     }
   }
   run inspector.close()
+  platform.clearCompositor()
   renderer.stop()
   platform.closeWindow(owner)
   return status
+}
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_input { WindowsHostInput }
+} else {
+  static if Intrinsic.targetOperatingSystem() == "darwin"
+    || Intrinsic.targetOperatingSystem() == "linux" {
+    import silk.platform.native.host_input { NativeHostInput }
+    import silk.system.host_input_native { OsHostInput }
+  }
+}
+
+/// `Inspector.start` with this process's environment, for code that has no `HostInput`, such
+/// as an app on the UI thread of `platform_thread.launch`. Off when the environment cannot be
+/// read.
+pub effect fn startInspector(options: InspectorOptions) -> Inspector
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let captured = run Effect.result(WindowsHostInput.capture())
+    let mut inputs = match move captured {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        HostInputError failure => {
+          return Inspector.off()
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+    return run inspectorWith(move options) |> Effect.provideMut<HostInput>(&mut inputs)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin"
+      || Intrinsic.targetOperatingSystem() == "linux" {
+      let captured = run Effect.result(unsafe NativeHostInput.environmentSnapshot())
+      let snapshot = match move captured {
+        Result.Success { value } => move value
+        Result.Failure { error } => match move error {
+          HostInputError failure => {
+            return Inspector.off()
+          }
+          OutOfMemoryError failure => {
+            fail move failure
+          }
+        }
+      }
+      let mut inputs = OsHostInput.make(move snapshot)
+      return run inspectorWith(move options) |> Effect.provideMut<HostInput>(&mut inputs)
+    } else {
+      drop options
+      return Inspector.off()
+    }
+  }
+}
+
+effect fn inspectorWith(options: InspectorOptions) -> Inspector
+  ! OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let started = run Effect.result(Inspector.start(move options))
+  return match move started {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      HostInputError failure => Inspector.off()
+      OutOfMemoryError failure => {
+        fail move failure
+      }
+    }
+  }
 }
