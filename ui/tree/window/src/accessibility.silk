@@ -46,13 +46,91 @@ fn disabled(tree: &UiTree, slot: u32) -> bool {
   return false
 }
 
+/// One node of an accessibility snapshot, as the OS sees it.
+pub struct AxNode {
+  pub id: u32,
+  pub parent: u32,
+  pub accessRole: u32,
+  pub flags: u32,
+  pub x: f64,
+  pub y: f64,
+  pub width: f64,
+  pub height: f64,
+  pub label: String,
+  pub value: String,
+  pub hasRange: bool,
+  pub min: f64,
+  pub max: f64,
+  pub now: f64,
+}
+
+/// An action the OS asked for: 1 press, 2 focus, 3 replace text (`text`), 4 increment, 5
+/// decrement.
+pub struct AxAction {
+  pub kind: u32,
+  pub target: u32,
+  pub text: String,
+}
+
+impl AxAction {
+  pub fn none() -> AxAction {
+    return AxAction { kind: 0, target: 0, text: String.make() }
+  }
+}
+
+/// Whether this platform has an accessibility tree to publish.
+pub fn supported() -> bool {
+  return native.supported()
+}
+
+/// Publishes the tree's accessibility snapshot to the OS for `window`, on the thread that
+/// runs the platform.
 pub effect fn sync(tree: &UiTree, window: WindowId) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if !native.supported() {
     return ()
   }
+  let mut nodes = List<AxNode>.make()
+  run snapshot(tree, &mut nodes)
+  publish(window, nodes.asSlice())
+}
+
+/// Hands `nodes` to the OS for `window`.
+pub fn publish(window: WindowId, nodes: &[AxNode]) -> () {
+  if !native.supported() {
+    return ()
+  }
   native.begin(window)
+  let mut i: usize = 0
+  while i < nodes.length {
+    let n = &nodes[i]
+    native.node(
+      window,
+      n.id,
+      n.parent,
+      n.accessRole,
+      n.flags,
+      n.x,
+      n.y,
+      n.width,
+      n.height,
+      String.view(&n.label),
+      String.view(&n.value),
+    )
+    if n.hasRange {
+      native.range(window, n.id, n.min, n.max, n.now)
+    }
+    i = i + 1
+  }
+  native.end(window)
+}
+
+/// The tree's accessibility snapshot, in the order the OS reads it, appended to `out`. Its
+/// strings use the selected allocator.
+pub effect fn snapshot(tree: &UiTree, out: &mut List<AxNode>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut stack = List<u32>.make()
   let mut children = List<u32>.make()
   let root = scope(tree)
@@ -105,38 +183,37 @@ pub effect fn sync(tree: &UiTree, window: WindowId) -> ()
       if (node.listeners & LISTEN_CLICK) != 0 {
         flags = flags | 64
       }
-      native.node(
-        window,
-        node.id,
-        if slot == root {
-          0
-        } else {
-          geometry.parent
+      let label = run String.copy(String.view(&node.label))
+      let value = run String.copy(String.view(&node.text))
+      run out.append(
+        AxNode {
+          id: node.id,
+          parent: if slot == root {
+            0
+          } else {
+            geometry.parent
+          },
+          accessRole: u8.toU32(Role.value(accessRole)),
+          flags: flags,
+          x: f32.toF64(bounds.xMin),
+          y: f32.toF64(bounds.yMin),
+          width: f32.toF64(bounds.width()),
+          height: f32.toF64(bounds.height()),
+          label: move label,
+          value: move value,
+          hasRange: node.hasValueRange,
+          min: f32.toF64(node.valueMin),
+          max: f32.toF64(node.valueMax),
+          now: f32.toF64(node.valueNow),
         },
-        u8.toU32(Role.value(accessRole)),
-        flags,
-        f32.toF64(bounds.xMin),
-        f32.toF64(bounds.yMin),
-        f32.toF64(bounds.width()),
-        f32.toF64(bounds.height()),
-        String.view(&node.label),
-        String.view(&node.text),
       )
-      if node.hasValueRange {
-        native.range(
-          window,
-          node.id,
-          f32.toF64(node.valueMin),
-          f32.toF64(node.valueMax),
-          f32.toF64(node.valueNow),
-        )
-      }
     }
   }
-  native.end(window)
 }
 
-pub effect fn poll(tree: &mut UiTree, window: WindowId) -> ()
+/// Moves the actions the OS asked for on `window` into `out`, on the thread that runs the
+/// platform.
+pub effect fn nativeActions(window: WindowId, out: &mut List<AxAction>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   while true {
@@ -144,6 +221,33 @@ pub effect fn poll(tree: &mut UiTree, window: WindowId) -> ()
     if action.kind == 0 {
       return ()
     }
+    let text = if action.kind == 3 {
+      run native.actionText(window)
+    } else {
+      String.make()
+    }
+    run out.append(AxAction { kind: action.kind, target: action.target, text: move text })
+  }
+}
+
+/// Answers the actions the OS asked for on `window`.
+pub effect fn poll(tree: &mut UiTree, window: WindowId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut actions = List<AxAction>.make()
+  run nativeActions(window, &mut actions)
+  run apply(&mut tree, &mut actions)
+}
+
+/// Answers `actions`, which it empties.
+pub effect fn apply(tree: &mut UiTree, actions: &mut List<AxAction>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let list = actions.asMutSlice()
+  let mut index: usize = 0
+  while index < list.length {
+    let action = Intrinsic.replace(list[index], AxAction.none())
+    index = index + 1
     let slot = tree.slotOf(action.target)
     if slot == NONE || !within(&tree.*, slot, scope(&tree.*)) || disabled(&tree.*, slot)
       || !tree.node(slot).computed.text.visible {
@@ -170,7 +274,7 @@ pub effect fn poll(tree: &mut UiTree, window: WindowId) -> ()
       }
       run tree.focusSlot(slot)
       run edit.selectAll(&mut tree, slot)
-      let text = run native.actionText(window)
+      let text = run String.copy(String.view(&action.text))
       run tree.dispatch(Input.TextInput { text: move text })
     } else if action.kind == 4 || action.kind == 5 {
       run tree.focusSlot(slot)

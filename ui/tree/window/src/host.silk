@@ -4,8 +4,14 @@
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.lib { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
-import lib { feed, windowCursor, HostState, serve }
-import ui_inspect_server.lib { Inspector }
+import lib { feed, windowCursor, HostState, serve, coalesce }
+import adapter { fastScrollOf }
+import render_thread { FastScroll, FastScrolled, RenderThread, RenderSettings }
+import platform_thread { HostPlatform, Launched }
+import vector.pixmap { Pixmap }
+import ui_inspect_server.lib { Inspector, InspectorOptions }
+import silk.core.result { Result }
+import silk.system.host_input { HostInput, HostInputError }
 import font_collection.lib { FontCollection }
 import ui_renderer.compare { Tolerance, compare }
 import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
@@ -56,15 +62,10 @@ pub interface WindowClient<S, E, ? R> {
   effect fn opened(
     self: &mut Self,
     state: &mut S,
-    platform: &mut NativePlatform,
+    platform: &mut HostPlatform,
     window: WindowId,
   ) -> ()
     ! WindowError | OutOfMemoryError
-    ? &mut Allocator {}
-
-  /// Initializes custom GPU resources for the selected surface format.
-  effect fn gpu(self: &mut Self, state: &mut S, device: &Device, format: u32) -> ()
-    ! GpuError | OutOfMemoryError
     ? &mut Allocator {}
 
   /// Native menus and dialogs; true consumes the event before ordinary input dispatch.
@@ -80,7 +81,7 @@ pub interface WindowClient<S, E, ? R> {
     self: &mut Self,
     state: &mut S,
     tree: &mut UiTree,
-    platform: &mut NativePlatform,
+    platform: &mut HostPlatform,
     window: WindowId,
   ) -> bool
     ! WindowError | TreeError | OutOfMemoryError
@@ -136,34 +137,6 @@ pub interface WindowClient<S, E, ? R> {
   /// Returns the completed tree scene or a client composition.
   fn scene<'s>(self: &'s Self, state: &'s S, tree: &'s UiTree) -> &'s Scene {
     return tree.scene()
-  }
-
-  /// Draws the completed scene into the acquired surface texture.
-  effect fn draw(
-    self: &mut Self,
-    state: &mut S,
-    renderer: &mut UiRenderer,
-    device: &Device,
-    queue: &Queue,
-    tree: &UiTree,
-    inspector: &Inspector,
-    textures: &GpuAtlas,
-    view: &TextureView,
-    width: u32,
-    height: u32,
-  ) -> ()
-    ! GpuError | OutOfMemoryError
-    ? &mut Allocator {
-    run renderer.draw(
-      device,
-      queue,
-      inspector.sceneWith(self.scene(&state.*, tree)),
-      textures,
-      view,
-      width,
-      height,
-      color.white(),
-    )
   }
 
   /// Initializes client nodes after the host applies resource definitions.
@@ -269,29 +242,17 @@ pub struct RunOptions {
   pub checkClick: string<'static>,
   /// The test id, label or text of a node that must exist after the click.
   pub checkExpect: string<'static>,
+  /// Wait on this thread until each frame is presented, for apps that want the lowest latency
+  /// between input and pixels (games, drawing) over input that never waits for the display.
+  /// Frames are drawn on the render thread either way.
+  pub lowestLatency: bool,
+  /// The platform thread of an app started with `platform_thread.launch`, or None to run the
+  /// platform on this thread.
+  pub platform: Option<Launched>,
 }
 
 /// The frame `check` reads back: the scripted input goes in after frame 1.
 const CHECK_FRAME: u64 = 3
-
-/// The window's surface target, by backend.
-unsafe fn targetOf<'w>(owner: &'w WindowId, raw: RawSurface) -> Option<SurfaceTarget<'w>> {
-  return match raw {
-    RawSurface.MetalLayer { layer } => Option<SurfaceTarget<'w>>.some(
-      unsafe SurfaceTarget.metalLayer(owner, layer),
-    )
-    RawSurface.Win32 { hwnd, hinstance } => Option<SurfaceTarget<'w>>.some(
-      unsafe SurfaceTarget.windows(owner, hwnd, hinstance),
-    )
-    RawSurface.Wayland { display, surface } => Option<SurfaceTarget<'w>>.some(
-      unsafe SurfaceTarget.wayland(owner, display, surface),
-    )
-    RawSurface.Xlib { display, window } => Option<SurfaceTarget<'w>>.some(
-      unsafe SurfaceTarget.x11(owner, display, window),
-    )
-    _ => Option<SurfaceTarget<'w>>.None
-  }
-}
 
 fn deviceSize(logical: f64, scale: f64) -> u32 {
   return f64.toU32(f64.floor(logical * scale + 0.5))
@@ -311,48 +272,6 @@ effect fn exists(tree: &UiTree, value: string) -> bool
   let mut found = List<u32>.make()
   run findAll(tree, value, &mut found)
   return found.length() != 0
-}
-
-/// Compares the drawn surface with the CPU reference of the same frame. Returns the exit code.
-effect fn checkFrame(
-  device: &Device,
-  queue: &Queue,
-  surfaceTexture: &Texture,
-  bgra: bool,
-  expected: &[u8],
-  width: u32,
-  height: u32,
-) -> i32
-  ! GpuError | OutOfMemoryError
-  ? &mut Allocator {
-  let buffer = run copyOut(device, queue, surfaceTexture, width, height)
-  let padded = run runtime.mapRead(device, &buffer, 0, readbackSize(width, height))
-  let pixels = run unpack(padded.asSlice(), width, height, bgra)
-  let result = compare(expected, pixels.asSlice(), width)
-  let ok = result.within(Tolerance.frame())
-  StderrWriter.print(
-    "check: {} x {} surface, max delta {} at ({}, {}), {} of {} channels over 8, mean {}: {}\n",
-    &(
-      width,
-      height,
-      result.max,
-      result.worstX,
-      result.worstY,
-      result.over,
-      result.channels,
-      result.mean,
-      if ok {
-        "pass"
-      } else {
-        "FAIL"
-      }
-    ),
-  )
-  return if ok {
-    0
-  } else {
-    1
-  }
 }
 
 /// Runs a retained-tree client until close or until the scripted rendering check completes.
@@ -382,58 +301,40 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   run content.start(&mut state, &mut tree)
   let mut snapshot = CpuSnapshot.make()
 
-  let mut platform = run NativePlatform.start()
+  let mut options = move options
+  let launched = Intrinsic.replace(options.platform, Option<Launched>.None)
+  let mut platform = match move launched {
+    Option<Launched>.Some { value } => HostPlatform.proxied(move value)
+    Option<Launched>.None => HostPlatform.direct(run NativePlatform.start())
+  }
   let mut windowOptions = WindowOptions.make(options.title, options.width, options.height)
   windowOptions.minSize = Option<Size2<f64>>.some(Size2<f64>.new(240.0, 200.0))
   content.configure(&state.*, &mut windowOptions)
   let window = run platform.openWindow(&windowOptions)
   let owner = window
   run content.opened(&mut state, &mut platform, owner)
-  let mut host = HostState.make()
+  let mut host = HostState.of(&platform)
   let raw = platform.rawSurface(window)
-  let target = match unsafe targetOf(&owner, raw) {
-    Option<SurfaceTarget>.Some { value } => move value
-    Option<SurfaceTarget>.None => {
-      StderrWriter.print("ui-tree: this backend has no GPU surface\n", &())
-      return 2
-    }
+
+  // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
+  let mut renderer = run RenderThread.start(raw, owner, RenderSettings { check: check })
+
+  // With a platform thread, wheels scroll the frame on screen at once (render_thread.silk);
+  // the tree takes the offsets on its next pass.
+  let compositing = platform.threaded() && !check
+  if compositing {
+    platform.setCompositor(renderer.compositor())
   }
-  let instance = run Instance.create()
-  let surface = run Surface.create(&instance, &target, String.utf8Bytes("ui tree"))
-  let adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&surface))
-  let capabilities = run surface.getCapabilities(&adapter)
-  let format = pickFormat(capabilities.formats())
-  if format == 0 {
-    StderrWriter.print("ui-tree: the surface offers neither BGRA8 nor RGBA8 unorm\n", &())
-    return 2
-  }
-  let device = run adapter.requestDevice(&DeviceDescriptor.default())
-  let queue = run getQueue(&device)
-  let mut renderer = run UiRenderer.make(&device, format)
-  run content.gpu(&mut state, &device, format)
-  let mut textures = GpuAtlas.make()
-  let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
-  if check {
-    let canCopy = u64.bitAnd(capabilities.usages(), flags.WGPUTextureUsage_CopySrc) != 0
-    if !canCopy {
-      StderrWriter.print("ui-tree: the surface cannot be read back\n", &())
-      return 2
-    }
-    configuration.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
-    renderer.setTextSettings(TextSettings.none())
-  }
-  if capabilities.alphaModes().length != 0 {
-    configuration.setAlphaMode(capabilities.alphaModes()[0])
-  }
+  let mut fastScrolls = List<FastScrolled>.make()
+  let mut fastSeq: u64 = 0
 
   let initial = platform.contentSize(window)
   let mut width = initial.width
   let mut height = initial.height
   let mut scale = platform.scaleFactor(window)
-  let mut configured = false
   let mut drawn: u64 = 0
-  let mut previousPresented = 0.0
   let mut status: i32 = 0
+  let mut pending = Option<Event>.None
   run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
   platform.requestFrame(owner)
   while true {
@@ -474,7 +375,37 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
         }
       }
     }
-    let mut next = run platform.nextEvent(wait)
+    let mut next = match move Intrinsic.replace(pending, Option<Event>.None) {
+      Option<Event>.Some { value } => Option<Event>.some(move value)
+      Option<Event>.None => run platform.nextEvent(wait)
+    }
+    if !check {
+      let taken = move next
+      next = match move taken {
+        Option<Event>.Some { value } => Option<Event>.some(
+          run coalesce(&mut platform, move value, &mut pending),
+        )
+        Option<Event>.None => Option<Event>.None
+      }
+    }
+    if compositing {
+      run platform.takeFastScrolls(&mut fastScrolls)
+      if fastScrolls.length() != 0 {
+        let list = fastScrolls.asSlice()
+        let s = f64.toF32(scale)
+        let mut f: usize = 0
+        while f < list.length {
+          run tree.scrolledElsewhere(list[f].node, list[f].x / s, list[f].y / s)
+          if list[f].seq > fastSeq {
+            fastSeq = list[f].seq
+          }
+          f = f + 1
+        }
+        fastScrolls.clear()
+        run content.pump(&mut state, &mut tree)
+        platform.requestFrame(owner)
+      }
+    }
     let time = (run seconds(&mut clock)) - started
     if check && next.isNone() {
       next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
@@ -504,15 +435,7 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       } else {
         match &value {
           Event.RequestFrame { window: which, targetTime } => {
-            if configured || deviceSize(width, scale) > 0 {
-              if !configured {
-                surface.resize(
-                  &mut configuration,
-                  deviceSize(width, scale),
-                  deviceSize(height, scale),
-                )
-                configured = true
-              }
+            if deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
               let viewport = FrameInput {
                 width: f64.toF32(width),
                 height: f64.toF32(height),
@@ -534,77 +457,63 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               run content.frame(&mut state, &mut tree, viewport, &inspector)
               let canvasEnd = run seconds(&mut clock)
               run serve(&mut platform, owner, &mut tree, &mut host)
-              run textures.sync(&device, &tree.atlas)
-              let pending = tree.pendingUploads()
-              let list = pending.entries()
-              let mut i: usize = 0
-              while i < list.length {
-                textures.write(&queue, list[i].tile, pending.pixels(list[i]))
-                i = i + 1
-              }
               run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
-              run snapshot.sync(&mut tree)
+              run snapshot.copyUploads(&tree)
               let deviceWidth = deviceSize(width, scale)
               let deviceHeight = deviceSize(height, scale)
-              let prepared = run seconds(&mut clock)
-              let texture = run surface.getCurrentTexture()
-              let view = run texture.texture.createView(&TextureViewDescriptor.default())
-              let uploadEnd = run seconds(&mut clock)
-              run content.draw(
-                &mut state,
-                &mut renderer,
-                &device,
-                &queue,
-                &tree,
-                &inspector,
-                &textures,
-                &view,
-                deviceWidth,
-                deviceHeight,
-              )
-              let drawEnd = run seconds(&mut clock)
-              drawn = drawn + 1
-              if check && drawn == CHECK_FRAME && !(run exists(&tree, options.checkExpect)) {
+              let checked = check && drawn + 1 == CHECK_FRAME
+              if checked && !(run exists(&tree, options.checkExpect)) {
                 StderrWriter.print("check: the scripted click did not reach the client\n", &())
                 status = 1
-              } else if check && drawn == CHECK_FRAME {
-                let reference = run snapshot.renderSceneOver(
-                  &tree,
-                  content.scene(&state.*, &tree),
-                  color.white(),
-                )
-                status = run checkFrame(
-                  &device,
-                  &queue,
-                  &texture.texture,
-                  isBgra(format),
-                  reference.data(),
-                  deviceWidth,
-                  deviceHeight,
-                )
               }
-              run surface.present()
-              run device.checkErrors()
-              let presented = run seconds(&mut clock)
+              let compared = checked && status == 0
+              let reference = if compared {
+                run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
+              } else {
+                run Pixmap.make(0, 0)
+              }
+              run renderer.submit(
+                inspector.sceneWith(content.scene(&state.*, &tree)),
+                &tree.atlas,
+                tree.pendingUploads(),
+                deviceWidth,
+                deviceHeight,
+                compared,
+                reference.data(),
+                if compositing {
+                  run fastScrollOf(&tree, f64.toF32(scale))
+                } else {
+                  FastScroll.make()
+                },
+                fastSeq,
+              )
+              tree.clearUploads()
+              drawn = drawn + 1
+              let submitted = run seconds(&mut clock)
+
+              // Check mode and lowest-latency apps wait for each frame on this thread.
+              if check || options.lowestLatency {
+                let report = run renderer.waitFrames(drawn)
+                if compared {
+                  status = report.status
+                }
+              }
               if content.profile(&state.*) {
+                let report = renderer.report()
                 StderrWriter.print(
-                  "frame-ms: layout={} canvas={} upload={} draw={} present={} interval={} acquire={}\n",
+                  "frame-ms: layout={} canvas={} upload={} draw={} present={} interval={} acquire={} submit={}\n",
                   &(
                     (layoutEnd - frameStart) * 1000.0,
                     (canvasEnd - layoutEnd) * 1000.0,
-                    (prepared - canvasEnd) * 1000.0,
-                    (drawEnd - uploadEnd) * 1000.0,
-                    (presented - drawEnd) * 1000.0,
-                    if previousPresented == 0.0 {
-                      0.0
-                    } else {
-                      (presented - previousPresented) * 1000.0
-                    },
-                    (uploadEnd - prepared) * 1000.0
+                    report.upload,
+                    report.draw,
+                    report.present,
+                    report.interval,
+                    report.acquire,
+                    (submitted - canvasEnd) * 1000.0
                   ),
                 )
               }
-              previousPresented = presented
               if check && drawn >= CHECK_FRAME {
                 break
               }
@@ -647,12 +556,6 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
         }
       }
       if resized {
-        let w = deviceSize(width, scale)
-        let h = deviceSize(height, scale)
-        if w > 0 && h > 0 {
-          surface.resize(&mut configuration, w, h)
-          configured = true
-        }
         run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
         redraw = true
       }
@@ -683,7 +586,77 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
     }
   }
   run inspector.close()
-  surface.unconfigure()
+  platform.clearCompositor()
+  renderer.stop()
   platform.closeWindow(owner)
   return status
+}
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_input { WindowsHostInput }
+} else {
+  static if Intrinsic.targetOperatingSystem() == "darwin"
+    || Intrinsic.targetOperatingSystem() == "linux" {
+    import silk.platform.native.host_input { NativeHostInput }
+    import silk.system.host_input_native { OsHostInput }
+  }
+}
+
+/// `Inspector.start` with this process's environment, for code that has no `HostInput`, such
+/// as an app on the UI thread of `platform_thread.launch`. Off when the environment cannot be
+/// read.
+pub effect fn startInspector(options: InspectorOptions) -> Inspector
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let captured = run Effect.result(WindowsHostInput.capture())
+    let mut inputs = match move captured {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        HostInputError failure => {
+          return Inspector.off()
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+    return run inspectorWith(move options) |> Effect.provideMut<HostInput>(&mut inputs)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin"
+      || Intrinsic.targetOperatingSystem() == "linux" {
+      let captured = run Effect.result(unsafe NativeHostInput.environmentSnapshot())
+      let snapshot = match move captured {
+        Result.Success { value } => move value
+        Result.Failure { error } => match move error {
+          HostInputError failure => {
+            return Inspector.off()
+          }
+          OutOfMemoryError failure => {
+            fail move failure
+          }
+        }
+      }
+      let mut inputs = OsHostInput.make(move snapshot)
+      return run inspectorWith(move options) |> Effect.provideMut<HostInput>(&mut inputs)
+    } else {
+      drop options
+      return Inspector.off()
+    }
+  }
+}
+
+effect fn inspectorWith(options: InspectorOptions) -> Inspector
+  ! OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let started = run Effect.result(Inspector.start(move options))
+  return match move started {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      HostInputError failure => Inspector.off()
+      OutOfMemoryError failure => {
+        fail move failure
+      }
+    }
+  }
 }

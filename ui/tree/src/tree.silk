@@ -27,6 +27,7 @@ import mutation {
 }
 import input { Input }
 import interact
+import layers
 import edit
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import style { Computed, TextStyle }
@@ -42,7 +43,7 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, hashFragments }
+import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments }
 import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
@@ -56,6 +57,7 @@ import ui_scene.primitives { ContentMask }
 import ui_scene.path_cache { PathCache }
 import layout.lib {
   Tree,
+  Fragment,
   NodeId,
   LayoutTree,
   OptionalSize,
@@ -207,6 +209,17 @@ pub struct UiTree<'a> {
   pub paintOrder: List<u32>,
   /// Per fragment of the last layout: the hash of its subtree's paint inputs.
   pub fragmentHashes: List<u64>,
+  /// Per fragment of the last layout: the bounds of its subtree's ink in CSS pixels.
+  pub fragmentInk: List<Rect<f32>>,
+  /// Per fragment of the last layout: whether its subtree holds a scroll container.
+  pub fragmentScrollers: List<bool>,
+  /// Whether the fragment hashes and ink are out of date: layout, styles or mutations changed
+  /// since they were computed. Scrolling leaves them as they are.
+  paintCachesStale: bool,
+  /// Whether a scroll offset changed since the last frame.
+  pub scrolled: bool,
+  /// Whether no scroll offset changed between the previous frame and this one.
+  scrollsStill: bool,
   pub textInk: List<TextInk>,
   facesDirty: bool,
   pub uploads: Pending,
@@ -241,7 +254,7 @@ pub struct UiTree<'a> {
   pub reveal: List<u64>,
   /// Whether a mutation was applied since the last frame.
   applied: bool,
-  layoutObserversDirty: bool,
+  pub layoutObserversDirty: bool,
   /// Whether something only paint shows changed since the last frame (a caret moved).
   pub paintDirty: bool,
   /// Requests for the host (clipboard), oldest first.
@@ -258,7 +271,10 @@ impl<'a> UiTree<'a> {
     let mut viewport = CssStyle.make()
     viewport.width = Dimension.px(0.0)
     viewport.height = Dimension.px(0.0)
-    let layout = run Tree.make(move viewport)
+    let mut layout = run Tree.make(move viewport)
+
+    // Scroll and sticky offsets are applied when painting, so scrolling needs no layout.
+    layout.stickyDeferred = true
     let resources = run Effect.catch<ResourceError>(Resources.make(), layoutFailed)
     let seed = Hash.seed(0x7569747265)
     return UiTree<'a> {
@@ -299,6 +315,11 @@ impl<'a> UiTree<'a> {
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
       fragmentHashes: List<u64>.make(),
+      fragmentInk: List<Rect<f32>>.make(),
+      fragmentScrollers: List<bool>.make(),
+      paintCachesStale: true,
+      scrolled: false,
+      scrollsStill: false,
       textInk: List<TextInk>.make(),
       facesDirty: true,
       uploads: Pending.make(),
@@ -1077,6 +1098,19 @@ impl<'a> UiTree<'a> {
   }
 
   /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.
+  /// Node `id` was scrolled to (`x`, `y`) outside the tree, as a compositor scrolls the last
+  /// frame without the tree: the tree takes the offset and tells scroll listeners, as a wheel
+  /// scroll does.
+  pub effect fn scrolledElsewhere(self: &mut Self, id: u32, x: f32, y: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return ()
+    }
+    run interact.scrolledElsewhere(&mut self, slot, x, y)
+  }
+
   pub fn scrollOffset(self: &Self, id: u32) -> Vector2<f32> {
     let slot = self.slotOf(id)
     if slot == NONE {
@@ -1184,6 +1218,7 @@ impl<'a> UiTree<'a> {
       if matches {
         let node = self.nodeMut(slot)
         node.content = node.content + 1
+        self.paintCachesStale = true
         run self.updateNatural(slot)
       }
       slot = slot + 1
@@ -1276,6 +1311,7 @@ impl<'a> UiTree<'a> {
       return ()
     }
     self.stylesDirty = false
+    self.paintCachesStale = true
     if self.root == NONE {
       return ()
     }
@@ -1366,7 +1402,7 @@ impl<'a> UiTree<'a> {
   /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
-    return self.applied || self.stylesDirty || self.paintDirty
+    return self.applied || self.stylesDirty || self.paintDirty || self.scrolled
       || self.layout.revision() != self.laidOutRevision
       || self.layout.scrollRevision() != self.laidOutScrolls
       || self.reveal.length() != 0
@@ -1386,6 +1422,9 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
+    if self.applied || self.paintDirty {
+      self.paintCachesStale = true
+    }
     self.applied = false
     self.input = input
     self.stats = FrameStats.zero()
@@ -1403,7 +1442,7 @@ impl<'a> UiTree<'a> {
 
     // Scrolling and relayout move content under a still pointer: hover follows, and a hover
     // variant that changes layout is laid out in the same frame.
-    if !self.stats.layoutSkipped {
+    if !self.stats.layoutSkipped || self.scrolled {
       run interact.refreshHover(&mut self)
       run self.resolveStyles()
       run self.layoutFrame()
@@ -1412,7 +1451,9 @@ impl<'a> UiTree<'a> {
     run self.settleAnchors()
     run self.notifyLayout()
     edit.beginPaint(&mut self)
+    self.scrollsStill = !self.scrolled
     run self.paintFrame()
+    self.scrolled = false
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()
@@ -1489,6 +1530,7 @@ impl<'a> UiTree<'a> {
       layoutFailed,
     )
     self.output.fragments.resolveLocations()
+    self.paintCachesStale = true
     self.semanticRevision = self.semanticRevision + 1
     self.laidOutRevision = usize.MAX
     self.stats.layout = self.output.stats
@@ -1497,6 +1539,7 @@ impl<'a> UiTree<'a> {
     self.layoutObserversDirty = true
     run self.notifyLayout()
     edit.beginPaint(&mut self)
+    self.scrollsStill = false
     run self.paintFrame()
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
@@ -1570,6 +1613,7 @@ impl<'a> UiTree<'a> {
       )
     }
     self.output.fragments.resolveLocations()
+    self.paintCachesStale = true
     self.semanticRevision = self.semanticRevision + 1
     self.laidOut = self.input
     self.laidOutRevision = self.layout.revision()
@@ -1663,10 +1707,16 @@ impl<'a> UiTree<'a> {
     self.facesDirty = false
   }
 
-  effect fn paintFrame(self: &mut Self) -> ()
+  /// Hashes and bounds every fragment again when layout, styles or mutations changed since they
+  /// were last computed. A frame that only scrolled keeps them.
+  effect fn refreshPaintCaches(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.loadFaces()
+    let count = self.output.fragments.values.length()
+    if !self.paintCachesStale && self.fragmentHashes.length() == count
+      && self.fragmentInk.length() == count {
+      return ()
+    }
     run hashFragments(
       &self.seed,
       &self.output,
@@ -1675,6 +1725,54 @@ impl<'a> UiTree<'a> {
       &self.nodes,
       &mut self.fragmentHashes,
     )
+    run inkFragments(
+      &self.output,
+      &self.slotOfCss,
+      &self.layout,
+      &self.nodes,
+      self.input.width,
+      self.input.height,
+      &mut self.fragmentInk,
+      &mut self.fragmentScrollers,
+    )
+    self.paintCachesStale = false
+  }
+
+  /// Whether the fragment ink describes the last layout, so hit testing can skip by it.
+  pub fn inkCurrent(self: &Self) -> bool {
+    return !self.paintCachesStale
+      && self.fragmentInk.length() == self.output.fragments.values.length()
+  }
+
+  /// Where fragment `index` of the last layout draws against where the layout put it, in CSS
+  /// pixels: the scroll offsets and sticky offsets above it (see `layers`).
+  pub fn shiftOf(self: &Self, index: usize) -> Vector2<f32> {
+    return layers.shiftOf(
+      &self.output,
+      &self.slotOfCss,
+      &self.layout,
+      &self.nodes,
+      index,
+      self.input.width,
+      self.input.height,
+      self.input.scale,
+    )
+  }
+
+  /// Fragment `index` of the last layout, moved to where it draws.
+  pub fn visualFragment(self: &Self, index: usize) -> Fragment {
+    let values = self.output.fragments.values.asSlice()
+    return layers.visual(&values[index], self.shiftOf(index))
+  }
+
+  effect fn paintFrame(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.loadFaces()
+    if self.paintDirty {
+      self.paintCachesStale = true
+    }
+    run self.refreshPaintCaches()
     run self.paths.beginFrame()
     self.paintOrder.clear()
     let window = ContentMask.new(
@@ -1703,7 +1801,14 @@ impl<'a> UiTree<'a> {
         scene: &mut self.sceneB,
         previous: &self.sceneA,
         replayable: self.replayable,
+        scrollsStill: self.scrollsStill,
         hashes: &self.fragmentHashes,
+        ink: &self.fragmentInk,
+        scrollers: &self.fragmentScrollers,
+        cull: window.bounds,
+        lead: self.input.height * self.input.scale,
+        width: self.input.width,
+        height: self.input.height,
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         frame: self.frameNumber,
@@ -1734,7 +1839,14 @@ impl<'a> UiTree<'a> {
         scene: &mut self.sceneA,
         previous: &self.sceneB,
         replayable: self.replayable,
+        scrollsStill: self.scrollsStill,
         hashes: &self.fragmentHashes,
+        ink: &self.fragmentInk,
+        scrollers: &self.fragmentScrollers,
+        cull: window.bounds,
+        lead: self.input.height * self.input.scale,
+        width: self.input.width,
+        height: self.input.height,
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         frame: self.frameNumber,
@@ -1793,7 +1905,14 @@ impl<'a> UiTree<'a> {
       scene: &mut scene,
       previous: &self.sceneA,
       replayable: false,
+      scrollsStill: false,
       hashes: &self.fragmentHashes,
+      ink: &self.fragmentInk,
+      scrollers: &self.fragmentScrollers,
+      cull: window.bounds,
+      lead: 0.0,
+      width: self.input.width,
+      height: self.input.height,
       stats: &mut stats,
       order: &mut order,
       frame: self.frameNumber,

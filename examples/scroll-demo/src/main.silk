@@ -3,15 +3,35 @@ import document { Document, Message, resources }
 import benchmark
 import ui_app.app { NoCommand }
 import ui_app.runtime { Runtime }
-import ui_app_window.lib { WindowContent, RunOptions, runWindowHosted }
+import ui_app_window.lib {
+  Driver,
+  HostPlatform,
+  Launched,
+  launch,
+  RunOptions,
+  WindowContent,
+  runWindowHosted,
+  startInspector,
+}
 import ui_tree.lib { UiTree, TreeError, Batch, Input, FrameInput }
 import ui_fixtures.fixtures as fixtures
 import ui_inspect_server.lib { Inspector, InspectorOptions }
+import silk.collections.list { List }
+import silk.concurrency.sync { Parker }
+import silk.concurrency.thread_native { JoinHandle, NativeThread }
+import silk.num.usize
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { SystemClock }
+import silk.num.i64
+import silk.num.u64
+import window.types { WindowId }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
 import window.types { WindowError, WindowOptions }
 import webgpu.runtime { GpuError }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.core.effect { Effect }
 import silk.collections.bytes { Bytes }
@@ -29,6 +49,18 @@ struct Host {
   running: bool,
   lastScroll: f64,
   frames: u64,
+  /// Milliseconds `update` sleeps each pass (`--slow-update=`), to show that input, resize
+  /// and scrolling do not wait for slow app code. 0 never sleeps.
+  slowUpdate: u64,
+  sleeper: Parker,
+  clock: OsMonotonicClock,
+}
+
+/// Seconds on the monotonic clock.
+effect fn seconds(clock: &mut OsMonotonicClock) -> f64 {
+  let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+  return i64.toF64(SystemClock.seconds(&now))
+    + i64.toF64(SystemClock.nanoseconds(&now)) / 1000000000.0
 }
 
 impl WindowContent<Document, Message, NoCommand> for Host {
@@ -38,6 +70,29 @@ impl WindowContent<Document, Message, NoCommand> for Host {
 
   fn profile(self: &Self) -> bool {
     return self.profiling
+  }
+
+  effect fn update(
+    self: &mut Self,
+    app: &mut Runtime<Document, Message, NoCommand>,
+    tree: &mut UiTree,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.slowUpdate == 0 {
+      return false
+    }
+    let until = (run seconds(&mut self.clock)) + u64.toF64(self.slowUpdate) / 1000.0
+    while true {
+      let left = until - (run seconds(&mut self.clock))
+      if left <= 0.0 {
+        break
+      }
+      drop self.sleeper.parkTimeout(f64.toU64(left * 1000000000.0))
+    }
+    return false
   }
 
   fn wakeAfter(self: &Self) -> Option<f64> {
@@ -121,14 +176,25 @@ impl WindowContent<Document, Message, NoCommand> for Host {
   }
 }
 
-effect fn program() -> i32
-  ! HostInputError
-    | TreeError
-    | AtlasError
-    | GeometryError
-    | WindowError
-    | GpuError
-    | OutOfMemoryError
+/// What the command line asks for.
+struct Settings {
+  count: usize,
+  steps: usize,
+  bench: bool,
+  check: bool,
+  checkGrow: bool,
+  profile: bool,
+  automatic: bool,
+  virtualized: bool,
+  phases: bool,
+  slowUpdate: u64,
+  exitTest: bool,
+}
+
+impl Copy for Settings {}
+
+effect fn settings() -> Settings
+  ! HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator {
   let mut count: usize = 100
   let mut steps: usize = 120
@@ -139,6 +205,8 @@ effect fn program() -> i32
   let mut automatic = false
   let mut virtualized = true
   let mut phases = false
+  let mut slowUpdate: u64 = 0
+  let mut exitTest = false
   let arguments = run HostInput.argumentCount()
   let mut i: usize = 1
   while i < arguments {
@@ -155,6 +223,8 @@ effect fn program() -> i32
         checkGrow = true
       } else if arg == "--check" {
         check = true
+      } else if arg == "--exit-test" {
+        exitTest = true
       } else if arg == "--phases" {
         phases = true
       } else if arg == "--profile" {
@@ -163,6 +233,10 @@ effect fn program() -> i32
         let parsed = Format.f64Value(String.slice(arg, 11, String.byteLength(arg) - 11))
           |> Result<f64, ParseError>.unwrapOr(100.0)
         count = f64.toUsize(f64.max(1.0, f64.min(10000.0, parsed)))
+      } else if String.startsWith(arg, "--slow-update=") {
+        let parsed = Format.f64Value(String.slice(arg, 14, String.byteLength(arg) - 14))
+          |> Result<f64, ParseError>.unwrapOr(0.0)
+        slowUpdate = f64.toU64(f64.max(0.0, f64.min(10000.0, parsed)))
       } else if String.startsWith(arg, "--steps=") {
         let parsed = Format.f64Value(String.slice(arg, 8, String.byteLength(arg) - 8))
           |> Result<f64, ParseError>.unwrapOr(120.0)
@@ -171,9 +245,30 @@ effect fn program() -> i32
     }
     i = i + 1
   }
-  if bench {
-    return run benchmark.measure(count, steps, phases, virtualized)
+  return Settings {
+    count: count,
+    steps: steps,
+    bench: bench,
+    check: check,
+    checkGrow: checkGrow,
+    profile: profile,
+    automatic: automatic,
+    virtualized: virtualized,
+    phases: phases,
+    slowUpdate: slowUpdate,
+    exitTest: exitTest,
   }
+}
+
+effect fn program(given: Settings, platform: Option<Launched>) -> i32
+  ! TreeError | AtlasError | GeometryError | WindowError | GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let count = given.count
+  let automatic = given.automatic
+  let virtualized = given.virtualized
+  let check = given.check
+  let checkGrow = given.checkGrow
+  let profile = given.profile
   let collection = run fixtures.fonts()
   let mut batch = Batch.make()
   run resources(&mut batch)
@@ -192,8 +287,11 @@ effect fn program() -> i32
     running: false,
     lastScroll: 0.0,
     frames: 0,
+    slowUpdate: given.slowUpdate,
+    sleeper: run Parker.make(),
+    clock: OsMonotonicClock.make(),
   }
-  let inspector = run Inspector.start(InspectorOptions.make())
+  let inspector = run startInspector(InspectorOptions.make())
   return run runWindowHosted(
     &mut app,
     &collection,
@@ -213,6 +311,8 @@ effect fn program() -> i32
       } else {
         "Forward"
       },
+      lowestLatency: false,
+      platform: move platform,
     },
     move inspector,
     &mut host,
@@ -225,8 +325,180 @@ effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
+/// The app, on the UI thread `launch` made. With `--exit-test`, a driver thread scrolls it
+/// through the platform thread meanwhile.
+fn runApp(given: Settings, platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut driving = Option<JoinHandle<i32>>.None
+  if given.exitTest {
+    if let Option<Launched>.Some { value } = &platform {
+      let driver = value.driver()
+      let spawned = run Effect.result(
+        NativeThread.spawn(
+          fn() -> i32 {
+            let handle = move driver
+            return drive(move handle)
+          },
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      match move spawned {
+        Result.Success { value: thread } => {
+          driving = Option<JoinHandle<i32>>.some(move thread)
+        }
+        Result.Failure { error } => {
+          drop error
+          StderrWriter.print("exit-test: the driver thread could not start\n", &())
+          return 2
+        }
+      }
+    } else {
+      StderrWriter.print("exit-test: needs a native window system\n", &())
+      return 2
+    }
+  }
+  let code = run Effect.catchAll(program(given, move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move driving {
+    Option<JoinHandle<i32>>.Some { value } => {
+      let driven = value.join()
+      if code != 0 {
+        code
+      } else {
+        driven
+      }
+    }
+    Option<JoinHandle<i32>>.None => code
+  }
+}
+
+/// Seconds the exit test waits for the first frames, and scrolls for.
+const EXIT_TIMEOUT: f64 = 120.0
+
+const EXIT_SCROLL: f64 = 3.0
+
+/// Seconds between wheel steps: a fast mouse wheel.
+const EXIT_STEP: f64 = 0.008
+
+/// The exit test's driver: once the window shows, sends a wheel step every [`EXIT_STEP`] for
+/// [`EXIT_SCROLL`] seconds, as the OS would, and reports how often frames reached the screen
+/// meanwhile. Closes the window after. Returns 0, or 2 when the window never showed.
+fn drive(driver: Driver) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let code = run Effect.catchAll(driveWith(&driver), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  drop run Effect.result(driver.close())
+  return code
+}
+
+effect fn driveWith(driver: &Driver) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let sleeper = run Parker.make()
+  let mut clock = OsMonotonicClock.make()
+  let started = run seconds(&mut clock)
+  while !driver.ready() || driver.presented() < 1 {
+    if (run seconds(&mut clock)) - started > EXIT_TIMEOUT {
+      StderrWriter.print("exit-test: the window did not show\n", &())
+      return 2
+    }
+    drop sleeper.parkTimeout(10000000)
+  }
+
+  StderrWriter.print("exit-test: the window shows\n", &())
+
+  // Let the first slow updates settle.
+  let settle = (run seconds(&mut clock)) + 1.0
+  while (run seconds(&mut clock)) < settle {
+    drop sleeper.parkTimeout(10000000)
+  }
+  let size = driver.size()
+  let x = size.width * 0.7
+  let y = size.height * 0.5
+  let mut gaps = List<f64>.make()
+  let begin = run seconds(&mut clock)
+  let firstFrames = driver.presented()
+  let mut frames = firstFrames
+  let mut lastFrame = begin
+  let mut nextStep = begin
+  let mut steps: u64 = 0
+  while true {
+    let now = run seconds(&mut clock)
+    if now - begin >= EXIT_SCROLL {
+      break
+    }
+    if now >= nextStep {
+      run driver.wheel(x, y, 1.0)
+      steps = steps + 1
+      nextStep = nextStep + EXIT_STEP
+    }
+    let seen = driver.presented()
+    if seen != frames {
+      run gaps.append((now - lastFrame) * 1000.0)
+      frames = seen
+      lastFrame = now
+    }
+    drop sleeper.parkTimeout(500000)
+  }
+  let end = run seconds(&mut clock)
+  run gaps.append((end - lastFrame) * 1000.0)
+  sortF64(gaps.asMutSlice())
+  let sorted = gaps.asSlice()
+  let p95 = sorted[f64.toUsize(f64.floor(usize.toF64(sorted.length - 1) * 0.95))]
+  let longest = sorted[sorted.length - 1]
+  let presented = frames - firstFrames
+  StderrWriter.print(
+    "exit-test: steps={} frames={} fps={} gap-p95-ms={} gap-max-ms={}\n",
+    &(steps, presented, u64.toF64(presented) / (end - begin), p95, longest),
+  )
+  return 0
+}
+
+fn sortF64(values: &mut [f64]) -> () {
+  let mut i: usize = 1
+  while i < values.length {
+    let value = values[i]
+    let mut j = i
+    while j > 0 && values[j - 1] > value {
+      values[j] = values[j - 1]
+      j = j - 1
+    }
+    values[j] = value
+    i = i + 1
+  }
+}
+
+effect fn measure(given: Settings) -> i32
+  ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  return run benchmark.measure(given.count, given.steps, given.phases, given.virtualized)
+}
+
 pub effect fn main() -> i32
   ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  let read = run Effect.result(settings()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let given = match move read {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      StderrWriter.print("Scroll Lab: could not read the arguments\n", &())
+      return 2
+    }
+  }
+  if given.bench {
+    return run Effect.catchAll(measure(given), failed)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  // The main thread keeps the OS event loop; the app runs on its own thread.
+  return run Effect.catchAll(
+    launch(
+      fn(platform: Option<Launched>) -> i32 {
+        return runApp(given, move platform)
+      },
+    ),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
 }

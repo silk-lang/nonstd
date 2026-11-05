@@ -13,10 +13,9 @@
 //! inspector too when its own `SILK_UI_INSPECT` is set (to another address than the app's).
 import ui_devtools.lib { Devtools, Message, Command, Link }
 import ui_app.runtime { Runtime }
-import ui_app_window.lib { RunOptions, runWindowWith }
+import ui_app_window.lib { Launched, launch, RunOptions, runWindowWith, startInspector }
 import ui_inspect_server.server {
   Address,
-  Inspector,
   InspectorOptions,
   parseAddress,
   resolved,
@@ -116,16 +115,24 @@ effect fn connectArgument() -> String
   return run String.copy("1")
 }
 
-effect fn program() -> i32
-  ! WindowError
-    | GpuError
-    | TreeError
-    | AtlasError
-    | GeometryError
-    | OutOfMemoryError
-    | HostInputError
+/// What `main` reads on the main thread for the app.
+struct Launch {
+  connect: String,
+  cwd: Bytes,
+}
+
+effect fn prepare() -> Launch
+  ! HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator {
   let connect = run connectArgument()
+  let cwd = run HostInput.workingDirectory()
+  return Launch { connect: move connect, cwd: move cwd }
+}
+
+effect fn program(args: Launch, platform: Option<Launched>) -> i32
+  ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let Launch { connect, cwd } = move args
   let parsed = match run parseAddress(String.view(&connect)) {
     Option<Address>.Some { value } => move value
     Option<Address>.None => {
@@ -133,7 +140,6 @@ effect fn program() -> i32
       return 2
     }
   }
-  let cwd = run HostInput.workingDirectory()
   let address = run resolved(move parsed, cwd.asSlice())
   let mut target = String.make()
   run describeAddress(&address, &mut target)
@@ -155,8 +161,10 @@ effect fn program() -> i32
     check: false,
     checkClick: "",
     checkExpect: "",
+    lowestLatency: false,
+    platform: move platform,
   }
-  let inspector = run Inspector.start(InspectorOptions.make())
+  let inspector = run startInspector(InspectorOptions.make())
   return run runWindowWith(&mut app, &collection, run batch.take(), move options, move inspector)
     |> Effect.provideMut<Link>(&mut link)
 }
@@ -178,11 +186,39 @@ effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
+/// The app, on the UI thread `launch` made.
+fn runApp(args: Launch, platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    Effect.catch<GpuError>(
+      Effect.catch<WindowError>(program(move args, move platform), windowFailed),
+      gpuFailed,
+    ),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 pub effect fn main() -> i32
   ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
+  let prepared = run Effect.result(prepare()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let args = match move prepared {
+    Result.Success { value } => move value
+    Result.Failure { error } => {
+      drop error
+      StderrWriter.print("ui-devtools: could not read the arguments\n", &())
+      return 2
+    }
+  }
+
+  // The main thread keeps the OS event loop; the app runs on its own thread.
   return run Effect.catchAll(
-    Effect.catch<GpuError>(Effect.catch<WindowError>(program(), windowFailed), gpuFailed),
+    launch(
+      fn(platform: Option<Launched>) -> i32 {
+        return runApp(move args, move platform)
+      },
+    ),
     failed,
   )
     |> Effect.provideMut<Allocator>(&mut allocator)

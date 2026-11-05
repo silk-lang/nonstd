@@ -77,6 +77,9 @@ uint8_t silk_macos_next_event(double timeout, SilkWindowEvent *event);
 // The `index`th string of the event last returned, valid until the next call to
 // silk_macos_next_event. NULL past the last one.
 const uint8_t *silk_macos_event_text(size_t index, size_t *length);
+// From any thread: makes the current or next silk_macos_next_event return soon, with or
+// without an event.
+void silk_macos_wake(void);
 
 void silk_macos_request_frame(uint32_t window);
 void silk_macos_content_size(uint32_t window, double *width, double *height);
