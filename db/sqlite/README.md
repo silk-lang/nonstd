@@ -47,14 +47,20 @@ effect fn demo() -> () ! SqliteError | OutOfMemoryError ? &mut Allocator {
 - `changes`, `totalChanges`, `lastInsertRowId`, `isAutocommit`, `busyTimeout`, `version` and
   `versionNumber`.
 
-The `sys` module has the raw C functions for anything the safe API does not cover yet.
+The `sys` module has the raw C functions for anything the safe API does not cover yet: user
+functions and window functions, the authorizer, sessions and changesets, backups, serialization,
+column metadata, limits and extension loading. Calls that can run a registered callback are marked
+`@invokesDeferredCallbacks`, so Silk callbacks can be registered with them.
 
 ## Build options
 
 SQLite is built thread-safe (`SQLITE_THREADSAFE=1`) with FTS5, R*Tree and the math functions, plus
-the JSON functions that are always on. Double-quoted string literals are off (`SQLITE_DQS=0`), as
-SQLite recommends, so `"name"` is always an identifier. Loadable extensions and shared cache are
-left out.
+the JSON functions that are always on. It also has the session extension (changesets and
+patchsets, with the pre-update hook it needs), column metadata (`sqlite3_column_table_name` and the
+rest) and `sqlite3_load_extension`; loading through the SQL `load_extension()` function stays off
+until a connection turns it on with `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION`. Double-quoted string
+literals are off (`SQLITE_DQS=0`), as SQLite recommends, so `"name"` is always an identifier.
+Shared cache is left out.
 
 ## Platforms
 
