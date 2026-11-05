@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 // Runs the compiled ui_tree browser test in the already installed Chromium (WebGPU through
-// navigator.gpu) with gpu/webgpu's host, and compares each fixture tree's GPU pixels with the CPU
+// navigator.gpu) with native/gpu/webgpu's host, and compares each fixture tree's GPU pixels with the CPU
 // reference rendered by the same wasm module. Never downloads a browser. The runner is
-// gpu/webgpu's runSamples plus the `math` imports browser/src/libm.silk forwards to.
+// native/gpu/webgpu's runSamples plus the `math` imports browser/src/libm.silk forwards to.
 import { createRequire } from 'node:module';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const webgpu = resolve(dirname(fileURLToPath(import.meta.url)), '../../../gpu/webgpu');
+const webgpu = resolve(dirname(fileURLToPath(import.meta.url)), '../../../native/gpu/webgpu');
 const wasmIndex = process.argv.indexOf('--wasm');
 if (wasmIndex < 0 || !process.argv[wasmIndex + 1]) throw new Error('Usage: node browser/test.mjs --wasm FILE');
 const wasm = await readFile(resolve(process.argv[wasmIndex + 1]));
@@ -18,7 +18,7 @@ let chromium;
 try { ({ chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')); }
 catch (error) { throw new Error('An existing Playwright installation is required (set PLAYWRIGHT_MODULE to its installed absolute module path); do not run playwright install', { cause: error }); }
 
-// The fixture trees of ui/tree/fixtures, in order. The limits are graphics/demo's: whole UI
+// The fixture trees of ui/tree/fixtures, in order. The limits are examples/graphics-demo's: whole UI
 // frames with text, icons, an image and a gradient.
 const fixtures = [
   { name: 'card-list', max: 96, share: 0.002, mean: 0.25 },

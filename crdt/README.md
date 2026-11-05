@@ -11,9 +11,9 @@ and converge without a central authority deciding order.
 | `crdt/store-sqlite` (`crdt-store-sqlite`) | A `Store` in SQLite through `db/sqlite`. macOS and Linux. |
 | `crdt/sync` (`crdt-sync`) | Sync in one exchange: the `Transport` service and `SyncServer` interface, `Client`, `MemoryServer`, `StoredServer`, an in-process `Loopback` with an offline switch, and a TCP transport (`tcp`). |
 | `crdt/server` (`crdt-server`) | The sync server executable: TCP on 127.0.0.1, documents kept in SQLite. |
-| `crdt/demo` (`crdt-demo`) | Two people editing one rich-text document through an in-process server, with an offline switch and a history bar. `demo/app` runs it in a window, `demo/tests` drives it through the real tree. |
+| `examples/crdt-demo` (`crdt-demo`) | Two people editing one rich-text document through an in-process server, with an offline switch and a history bar. `demo/app` runs it in a window, `demo/tests` drives it through the real tree. |
 | `crdt/bench` (`crdt-bench`) | Timings for typing, remote edits, checkouts, old versions of a text, spans and save plus load: `crdt/bench/run [SIZE]`. |
-| `crdt/showcase` (`crdt-showcase`) | Six scripted people writing one rich-text document at once, two of them offline for a while, drawn as six live copies with carets, author colors and the server's history. `showcase/record` renders it without a window and `showcase/scripts/record` encodes the video. |
+| `examples/crdt-showcase` (`crdt-showcase`) | Six scripted people writing one rich-text document at once, two of them offline for a while, drawn as six live copies with carets, author colors and the server's history. `showcase/record` renders it without a window and `showcase/scripts/record` encodes the video. |
 
 ## Text
 
@@ -73,10 +73,10 @@ server can replace the TCP and in-memory ones.
 ```sh
 silk test --manifest-path crdt/core/silk.toml --root src/tests.silk
 silk test --manifest-path crdt/sync/silk.toml --root src/tests.silk
-silk test --manifest-path crdt/demo/tests/silk.toml --root src/tests.silk
+silk test --manifest-path examples/crdt-demo/tests/silk.toml --root src/tests.silk
 crdt/bench/run                                            # release timings
 silk run --manifest-path crdt/server/silk.toml            # CRDT_SERVER_PORT, CRDT_SERVER_DB
-silk run --manifest-path crdt/demo/app/silk.toml          # the demo in a window
+silk run --manifest-path examples/crdt-demo/app/silk.toml          # the demo in a window
 ```
 
 ## Not done yet

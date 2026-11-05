@@ -2,7 +2,7 @@
 
 Native user interfaces in Silk: a retained UI tree, an Elm-style framework on top of it,
 components, inspection tools for people and agents, and an example app. Everything runs in a
-native window (macOS, Windows, X11, Wayland) through [platform/window](../platform/window) and
+native window (macOS, Windows, X11, Wayland) through [native/platform/window](../native/platform/window) and
 [ui_renderer](../graphics/ui_renderer), and headless on the CPU for tests.
 
 | Package | What it is |
@@ -12,10 +12,10 @@ native window (macOS, Windows, X11, Wayland) through [platform/window](../platfo
 | [ui/app](app) | The framework: model, messages, `view`, `update`, commands and subscriptions; the view is diffed into tree mutations |
 | [ui/components](components) | Buttons, checkboxes, switches, sliders, fields, lists, tabs, menus, selects, dialogs, popovers, tooltips, and a theme |
 | [ui/inspect](inspect) | Queries, highlights and recording; a socket protocol with a CLI, an MCP server for agents, and a devtools window |
-| [ui/notes](notes) | The example app: a notes app with a file, search, sorting, an editor, a dialog, shortcuts and a dark theme |
-| [ui/showcase](showcase) | Silk Loom, a showcase of the drawing layer |
+| [examples/notes](../examples/notes) | The example app: a notes app with a file, search, sorting, an editor, a dialog, shortcuts and a dark theme |
+| [examples/showcase](../examples/showcase) | Silk Loom, a showcase of the drawing layer |
 
-Start with [ui/notes](notes): it is a complete app, and its README walks through how it is
+Start with [examples/notes](../examples/notes): it is a complete app, and its README walks through how it is
 built. Then the [ui-app README](app/README.md) for the framework and the
 [ui-components README](components/README.md) for the components.
 
@@ -62,7 +62,7 @@ impl App<Message, NoCommand> for Counter {
 }
 ```
 
-Run it in a window with `runWindow` from `ui-app-window` (see `ui/notes/app/src/main.silk` for
+Run it in a window with `runWindow` from `ui-app-window` (see `examples/notes/app/src/main.silk` for
 a complete `main`: fonts, the runtime, the inspector, error handling), or headless with the
 runtime and the `harness` functions, which is how the tests drive apps.
 
@@ -97,5 +97,5 @@ let text = run snapshot(&mut tree, viewport)        // the describe snapshot
 ```
 
 Golden tests render a scene with `CpuSnapshot` and compare its PNG and `describe` text; see
-`ui/notes/tests/src/main.silk`. A window check (`--check` in the apps, `scripts/notes check`)
+`examples/notes/tests/src/main.silk`. A window check (`--check` in the apps, `scripts/notes check`)
 compares a real GPU frame against the CPU reference.

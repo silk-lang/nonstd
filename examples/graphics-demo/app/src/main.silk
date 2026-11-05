@@ -1,0 +1,378 @@
+//! The drawing layer demo in a native window: native/platform/window for the window and input,
+//! WebGPU (Dawn) for the surface, ui_renderer for the frame. One program for macOS (AppKit and
+//! Metal), Windows (Win32 and D3D12) and Linux (Wayland or X11, and Vulkan).
+//!
+//!   graphics-demo-app [--check] [--frames N]
+//!
+//! Hover and click the photos, scroll the grid with the wheel, press Space to pause the
+//! animation and G to switch the photos to grayscale. Frames are drawn only when something
+//! changed or while the animation runs.
+//!
+//! `--check` draws frames at a fixed time without input, reads the window's surface back after
+//! the third one, compares it with the CPU reference and exits: 0 within tolerance, 1 outside,
+//! 2 on an error. `--frames N` quits after N frames.
+import demo.demo { Demo, DemoError, Frame }
+import demo.cpu { CpuFrames }
+import ui_renderer.compare { Tolerance, compare }
+import demo_host.frames { GpuFrames }
+import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
+import demo_host.events { Reaction, WindowSize, apply, track }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import window.event { Event }
+import window.menu { MenuBar, Shortcut, SystemItem }
+import window.native { NativePlatform }
+import window.platform { Platform }
+import window.types { RawSurface, Wait, WindowError, WindowId, WindowOptions }
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources { Queue, Texture, getQueue }
+import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
+import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.size { Size2 }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.format { Format, ParseError }
+import silk.text.string { String }
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+
+const CHECK_FRAME: u64 = 3
+
+const CHECK_TIME: f64 = 0.75
+
+struct Options {
+  check: bool,
+  frames: u64,
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn options() -> Options
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let mut result = Options { check: false, frames: 0 }
+  let count = run HostInput.argumentCount()
+  let mut i: usize = 1
+  while i < count {
+    if let Option<Bytes>.Some { value } = run HostInput.argument(i) {
+      if same(Bytes.asSlice(&value), b"--check") {
+        result.check = true
+      } else if same(Bytes.asSlice(&value), b"--frames") && i + 1 < count {
+        i = i + 1
+        if let Option<Bytes>.Some { value: number } = run HostInput.argument(i) {
+          let text = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&number))
+          if let Result<f64, ParseError>.Success { value: parsed } = Format.f64Value(text) {
+            result.frames = f64.toU64(parsed)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return move result
+}
+
+effect fn menus(platform: &mut NativePlatform) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bar = MenuBar.make()
+  run bar.begin("Demo")
+  run bar.system(SystemItem.About)
+  run bar.separator()
+  run bar.system(SystemItem.Hide)
+  run bar.system(SystemItem.Quit)
+  run bar.end()
+  run bar.begin("View")
+  run bar.system(SystemItem.ToggleFullScreen)
+  run bar.end()
+  run bar.begin("Window")
+  run bar.system(SystemItem.Minimize)
+  run bar.system(SystemItem.CloseWindow)
+  run bar.end()
+  run platform.setMenuBar(&bar)
+}
+
+/// The window's surface target, by backend.
+unsafe fn targetOf<'w>(owner: &'w WindowId, raw: RawSurface) -> Option<SurfaceTarget<'w>> {
+  return match raw {
+    RawSurface.MetalLayer { layer } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.metalLayer(owner, layer),
+    )
+    RawSurface.Win32 { hwnd, hinstance } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.windows(owner, hwnd, hinstance),
+    )
+    RawSurface.Wayland { display, surface } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.wayland(owner, display, surface),
+    )
+    RawSurface.Xlib { display, window } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.x11(owner, display, window),
+    )
+    _ => Option<SurfaceTarget<'w>>.None
+  }
+}
+
+/// Compares the drawn surface with the CPU reference. Returns the exit code.
+effect fn checkFrame(
+  device: &Device,
+  queue: &Queue,
+  surfaceTexture: &Texture,
+  bgra: bool,
+  cpu: &mut CpuFrames,
+  frame: Frame,
+  width: u32,
+  height: u32,
+) -> i32
+  ! GpuError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run copyOut(device, queue, surfaceTexture, width, height)
+  let padded = run runtime.mapRead(device, &buffer, 0, readbackSize(width, height))
+  let pixels = run unpack(padded.asSlice(), width, height, bgra)
+  let expected = run cpu.render(frame)
+  let result = compare(expected.data(), pixels.asSlice(), width)
+  let ok = result.within(Tolerance.frame())
+  StderrWriter.print(
+    "check: {} x {} surface, max delta {} at ({}, {}), {} of {} channels over 8, mean {}: {}\n",
+    &(
+      width,
+      height,
+      result.max,
+      result.worstX,
+      result.worstY,
+      result.over,
+      result.channels,
+      result.mean,
+      if ok {
+        "pass"
+      } else {
+        "FAIL"
+      }
+    ),
+  )
+  return if ok {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn program() -> i32
+  ! WindowError
+    | GpuError
+    | DemoError
+    | AtlasError
+    | GeometryError
+    | OutOfMemoryError
+    | HostInputError
+  ? &mut HostInput | &mut Allocator {
+  let settings = run options()
+  let mut app = run Demo.make()
+
+  // `--check` keeps a second app in step on the CPU reference.
+  let mut referenceApp = run Demo.make()
+  let mut cpu = CpuFrames.make()
+
+  let mut platform = run NativePlatform.start()
+  run menus(&mut platform)
+  let mut windowOptions = WindowOptions.make("Silk drawing layer", 1024.0, 720.0)
+  windowOptions.minSize = Option<Size2<f64>>.some(Size2<f64>.new(480.0, 360.0))
+  let window = run platform.openWindow(&windowOptions)
+  let owner = window
+  let raw = platform.rawSurface(window)
+  let target = match unsafe targetOf(&owner, raw) {
+    Option<SurfaceTarget>.Some { value } => move value
+    Option<SurfaceTarget>.None => {
+      StderrWriter.print("graphics-demo-app: this backend has no GPU surface\n", &())
+      return 2
+    }
+  }
+  let instance = run Instance.create()
+  let surface = run Surface.create(&instance, &target, String.utf8Bytes("demo"))
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&surface))
+  let capabilities = run surface.getCapabilities(&adapter)
+  let format = pickFormat(capabilities.formats())
+  if format == 0 {
+    StderrWriter.print("graphics-demo-app: the surface offers neither BGRA8 nor RGBA8 unorm\n", &())
+    return 2
+  }
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run getQueue(&device)
+  let mut frames = run GpuFrames.make(&device, format)
+  let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
+  let canCopy = u64.bitAnd(capabilities.usages(), flags.WGPUTextureUsage_CopySrc) != 0
+  if settings.check {
+    if !canCopy {
+      StderrWriter.print("graphics-demo-app: the surface cannot be read back\n", &())
+      return 2
+    }
+    configuration.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+    frames.useReferenceText()
+  }
+  if capabilities.alphaModes().length != 0 {
+    configuration.setAlphaMode(capabilities.alphaModes()[0])
+  }
+
+  let initial = platform.contentSize(window)
+  let mut size = WindowSize {
+    width: initial.width,
+    height: initial.height,
+    scale: platform.scaleFactor(window),
+  }
+  let mut configured = false
+  let mut startTime: f64 = -1.0
+  let mut pausedAt: f64 = 0.0
+  let mut pausedFor: f64 = 0.0
+  let mut wasAnimating = true
+  let mut drawn: u64 = 0
+  let mut status: i32 = 0
+  while true {
+    let next = run platform.nextEvent(Wait.Forever)
+    if let Option<Event>.Some { value } = &next {
+      match &value {
+        Event.RequestFrame { window: which, targetTime } => {
+          if !configured {
+            let width = size.deviceWidth()
+            let height = size.deviceHeight()
+            if width > 0 && height > 0 {
+              surface.resize(&mut configuration, width, height)
+              configured = true
+            }
+          }
+          if configured {
+            // Animation time: seconds since the first frame, minus time spent paused.
+            if startTime < 0.0 {
+              startTime = targetTime
+            }
+            if app.isAnimating() != wasAnimating {
+              if app.isAnimating() {
+                pausedFor = pausedFor + (targetTime - pausedAt)
+              } else {
+                pausedAt = targetTime
+              }
+              wasAnimating = app.isAnimating()
+            }
+            let now = if app.isAnimating() {
+              targetTime - startTime - pausedFor
+            } else {
+              pausedAt - startTime - pausedFor
+            }
+            let frame = Frame {
+              width: f64.toF32(size.width),
+              height: f64.toF32(size.height),
+              scale: f64.toF32(size.scale),
+              time: if settings.check {
+                CHECK_TIME
+              } else {
+                now
+              },
+            }
+            let width = size.deviceWidth()
+            let height = size.deviceHeight()
+            run frames.prepare(&device, &queue, &mut app, frame)
+            let texture = run surface.getCurrentTexture()
+            let view = run texture.texture.createView(&TextureViewDescriptor.default())
+            run frames.draw(&device, &queue, &view, width, height)
+            drawn = drawn + 1
+            if settings.check {
+              run cpu.prepare(&mut referenceApp, frame)
+              if drawn == CHECK_FRAME {
+                status = run checkFrame(
+                  &device,
+                  &queue,
+                  &texture.texture,
+                  isBgra(format),
+                  &mut cpu,
+                  frame,
+                  width,
+                  height,
+                )
+              }
+            }
+            run surface.present()
+            run device.checkErrors()
+            if settings.check && drawn >= CHECK_FRAME {
+              break
+            }
+            if settings.frames > 0 && drawn >= settings.frames {
+              break
+            }
+          }
+          if app.isAnimating() || settings.check {
+            platform.requestFrame(which)
+          }
+        }
+        _ => {
+          let reaction = if settings.check {
+            track(&mut size, &value)
+          } else {
+            apply(&mut app, &mut size, &value)
+          }
+          if reaction.quit {
+            break
+          }
+          if reaction.resized {
+            let width = size.deviceWidth()
+            let height = size.deviceHeight()
+            if width > 0 && height > 0 {
+              surface.resize(&mut configuration, width, height)
+              configured = true
+            }
+          }
+          if reaction.redraw {
+            platform.requestFrame(owner)
+          }
+        }
+      }
+    }
+  }
+  surface.unconfigure()
+  platform.closeWindow(owner)
+  return status
+}
+
+effect fn windowFailed(error: WindowError) -> i32 {
+  drop error
+  StderrWriter.print("graphics-demo-app: could not open a window (no display server?)\n", &())
+  return 2
+}
+
+effect fn gpuFailed(error: GpuError) -> i32 {
+  StderrWriter.print("graphics-demo-app: GPU error {}\n", &(error.code,))
+  return 2
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("graphics-demo-app: failed (assets, atlas, geometry or allocation)\n", &())
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    Effect.catch<GpuError>(Effect.catch<WindowError>(program(), windowFailed), gpuFailed),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -2,7 +2,7 @@
 
 Embedded fonts, icons and photos for UI fixtures, tests and demos: two Noto Sans subsets, the
 toolbar and card icons, an animated orbit SVG, and procedural photos. They were the
-[graphics demo](../../graphics/demo)'s assets, and moved here because ui-tree's fixtures,
+[graphics demo](../../examples/graphics-demo)'s assets, and moved here because ui-tree's fixtures,
 ui-app tests and several demos use them too. Import `assets` for typed accessors (`regularFont`,
 `icon(index)`, `photo(index)` and the icon constants).
 

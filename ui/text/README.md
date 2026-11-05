@@ -2,8 +2,8 @@
 
 Text for the retained UI: css-layout's `TextMeasure` over real fonts. It breaks lines with
 UAX #14, orders bidirectional text with UAX #9, picks fonts per character from a
-[font-collection](../../font/collection), shapes with [font-shape](../../font/shape) and keeps
-the shaped glyphs of every fragment for [font-raster](../../font/raster) to draw.
+[font-collection](../../fonts/collection), shapes with [font-shape](../../fonts/shape) and keeps
+the shaped glyphs of every fragment for [font-raster](../../fonts/raster) to draw.
 
 - `system.TextSystem` is the provider. `TextSystem.make(&collection)` borrows the fonts;
   `addStyle(TextStyle.make(families, size))` registers a text style and returns the key to put
@@ -31,7 +31,7 @@ Layout handles justification (extra space on word separators, or on every cluste
 with Chrome on the same font files, and compares the rectangle of every text fragment:
 
 ```sh
-silk build --manifest-path ui/text/cli/silk.toml
+silk build --manifest-path ui/text/tools/cli/silk.toml
 node ui/text/scripts/chrome-text.mjs --cli build/llvm/x86_64-unknown-linux-gnu/debug/ui-text-cli
 ```
 

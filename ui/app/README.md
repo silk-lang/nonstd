@@ -7,7 +7,7 @@ tree the fewest `Mutation`s it can. It uses only the tree's public `Mutation` an
 anything this package does, another client of the tree can do too.
 
 Components (buttons, fields, lists, tabs, menus, dialogs and more) are in
-[ui-components](../components), built on this package, and [ui/notes](../notes) is a complete
+[ui-components](../components), built on this package, and [examples/notes](../../examples/notes) is a complete
 example app. [ui/README.md](../README.md) is the overview of the whole UI stack.
 
 Packages:
@@ -16,12 +16,12 @@ Packages:
   (`app.silk`), the runtime (`runtime.silk`), headless driving for tests (`harness.silk`) and
   loop helpers (`seq.silk`), and commands on fibers (`tasks.silk`).
 - `ui/app/window` (`ui-app-window`): `runWindow`, the loop that runs an app in a native window
-  through [platform/window](../../platform/window) and [ui_renderer](../../graphics/ui_renderer).
+  through [native/platform/window](../../native/platform/window) and [ui_renderer](../../graphics/ui_renderer).
   `runWindowWith` also serves an [inspector](../inspect/server) (debug builds with
   `SILK_UI_INSPECT` set), so ui-inspect-cli, ui-inspect-mcp and the
   [devtools window](../inspect/devtools) can look at the app.
 - `ui/app/examples`: a counter and a todo list. `ui/app/demo` runs the todo list in a window.
-- [`ui/app/scroll-demo`](scroll-demo): a fully mounted mixed-document scroll stress app,
+- [`examples/scroll-demo`](../../examples/scroll-demo): a fully mounted mixed-document scroll stress app,
   with native controls and repeatable CPU benchmarks of the shared libraries.
 - `ui/app/tests`: unit tests and the golden scenes.
 
@@ -202,7 +202,7 @@ and private layout spacers live in `ui-tree`, available through its plain-data
 [mutation/query protocol](../tree/README.md#virtual-scrolling). The app runtime only
 forwards configuration and node bindings and reconciles new range requests.
 
-The [scroll demo](scroll-demo) is a complete example. This separation removes
+The [scroll demo](../../examples/scroll-demo) is a complete example. This separation removes
 virtualization geometry from the app layer; the rest of `ui-app` still targets
 `UiTree`. A DOM backend would require a separate adapter.
 

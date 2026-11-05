@@ -13,7 +13,7 @@ pixel parity.
 | --- | --- | --- |
 | `vector` | Pure Silk, no GPU: geometry, paths, flattening, stroking, coverage strips, paints, CPU reference pixmap | stdlib only |
 | `gpu_scene` | Packs strips, alphas and paints into storage buffers and draws them in one instanced render pass | `vector`, `webgpu` |
-| `scene_tests` | Renders the same scenes on the CPU and the GPU and compares bytes (`images/svg/scripts/test-scene`, in the gate) | all of the above |
+| `scene_tests` | Renders the same scenes on the CPU and the GPU and compares bytes (`svg/scripts/test-scene`, in the gate) | all of the above |
 
 `vector` has no WebGPU dependency, so an SVG renderer, a test suite or a headless tool can use it
 without Dawn.
@@ -362,7 +362,7 @@ without Dawn.
    go through a 256 x 256 table of `(alpha, channel)` so the GPU applies exactly the CPU's
    result. On the GPU each primitive is a full-target pass of `shaders/filter.wgsl` (blur takes
    one pass per box or kernel and ping-pongs through a scratch image); `blend.wgsl` holds the
-   blend math shared with `compose.wgsl`, and `gpu/webgpu/scripts/embed-shaders` prepends it.
+   blend math shared with `compose.wgsl`, and `native/gpu/webgpu/scripts/embed-shaders` prepends it.
    `FilterRenderer` keeps one uniform (and table) buffer per pass and reuses them after
    `reset()`, which the caller makes once the encoders holding the passes are submitted. The scene test
    runs every primitive, operator, blend mode and several blur sizes on both sides and matches
@@ -382,7 +382,7 @@ without Dawn.
 
 ## Benchmarks
 
-`images/svg/scripts/bench-vector` (scheduled weekly in the benchmarks workflow, not in PR CI) renders the
+`svg/scripts/bench-vector` (scheduled weekly in the benchmarks workflow, not in PR CI) renders the
 six scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
 frame time of each, and compares the two images. Latest run (2026-10-29, x86_64 container, release
 builds, 512 x 512):
@@ -413,7 +413,7 @@ reduce it if it matters for real content.
 
 ### Filters
 
-`images/svg/scripts/bench-filters` (same schedule) runs nine filter primitives of
+`svg/scripts/bench-filters` (same schedule) runs nine filter primitives of
 `bench/filters/WORKLOADS.md` with `vector.filter` and with resvg 0.45.1 on a 512 x 512 source.
 
 Latest run (2026-10-29, x86_64 container, release builds; resvg's times exclude drawing the

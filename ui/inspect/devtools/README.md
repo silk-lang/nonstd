@@ -22,7 +22,7 @@ Packages:
 
 The app to inspect must be a debug build started with `SILK_UI_INSPECT` set (see
 [ui-inspect-server](../server/README.md#turning-it-on)). Every ui-app app run with
-`runWindowWith` and an `Inspector` serves it; the notes app (ui/notes/app), the todo demo
+`runWindowWith` and an `Inspector` serves it; the notes app (examples/notes/app), the todo demo
 (ui/app/demo), the component gallery (ui/components/demo) and the inbox demo (ui/tree/demo) do.
 
 ```sh
@@ -86,7 +86,7 @@ python3 ui/inspect/devtools/scripts/devtools check
 - Goldens (`describe` text and PNG, tolerance 2 per channel): the styles panel, the box model
   panel, the event log, and the todo app with the highlight the devtools asked for.
 - `check` (CI job `demo` in ui-inspect.yml) is the exit test in real windows: it starts the
-  [notes app](../../notes) (with a fresh notes file) and the devtools window under Xvfb and
+  [notes app](../../../examples/notes) (with a fresh notes file) and the devtools window under Xvfb and
   drives the devtools through their own inspector socket with ui-inspect-cli: it waits for the
   New note button's row, clicks it, checks the notes app highlights the button and the styles
   panel shows `padding-left: 8px`, opens the box model, clicks New note in the notes app, finds

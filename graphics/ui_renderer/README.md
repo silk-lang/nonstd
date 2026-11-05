@@ -1,7 +1,7 @@
 # graphics-ui-renderer
 
 Draws a finished [`graphics/ui_scene`](../ui_scene) `Scene` with WebGPU, natively through Dawn
-and in the browser through `navigator.gpu` ([gpu-webgpu](../../gpu/webgpu)). This is phase 3 of
+and in the browser through `navigator.gpu` ([gpu-webgpu](../../native/gpu/webgpu)). This is phase 3 of
 the UI drawing layer: the GPU counterpart of `ui_scene.cpu.CpuRenderer`.
 
 ## Use
@@ -45,7 +45,7 @@ hue arcs, wide gamut spaces) gets a 256-entry ramp of premultiplied RGBA8 words,
 CPU with the same `color.mix` the CPU reference uses, in a storage buffer the quad and path
 shaders read. Either way the parameter steps in 1/255, as the CPU reference's ramp does.
 Content masks clip by pixel area. `shaders/common.wgsl` holds what the pipelines share; edit the
-`.wgsl` files and run `gpu/webgpu/scripts/embed-shaders`, never the generated module.
+`.wgsl` files and run `native/gpu/webgpu/scripts/embed-shaders`, never the generated module.
 
 All instances of a frame go into one storage buffer per kind (every layer's sorted list, in layer
 order), uploaded with `queue.writeBuffer`. The buffers persist across frames and are replaced
