@@ -68,4 +68,5 @@ silk run --manifest-path crdt/demo/app/silk.toml          # the demo in a window
   long texts faster.
 - The server answers one request at a time and clients poll; there is no push or WebSocket.
 - Lists and moves, a `replicate` derive for user types, and a background store writer.
-- Windows for the SQLite store and the server, like `db/sqlite`.
+- Windows is not tested: `crdt/sync`'s socket test needs a Silk release with
+  silk-lang/silk#2769, and the SQLite store and the server are not set up for it yet.
