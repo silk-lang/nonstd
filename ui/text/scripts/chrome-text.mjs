@@ -133,7 +133,7 @@ class Chrome {
     const exited = new Promise(done => this.child.once('exit', done));
     this.child.kill('SIGTERM');
     await exited;
-    await rm(this.profile, { recursive: true, force: true });
+    await rm(this.profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
