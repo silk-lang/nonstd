@@ -4,10 +4,19 @@
 //! in an order that applies (each after its parents), so loading replays them in that order.
 //! [`MemoryStore`] keeps them in memory for tests and for replicas that need no disk;
 //! `crdt-store-sqlite` keeps them in SQLite. Any other store passes [`conformance`] to stand in.
+//!
+//! A store also keeps one snapshot per document, so [`load`] records the deltas a snapshot holds
+//! instead of applying them again. [`save`] writes the document's latest snapshot when it holds
+//! deltas the last save had not.
 import clock { ActorId, DeltaId }
 import codec { DecodeError }
 import doc { Delta, Document }
+import codec { Writer }
+import rich { Expand, RichText }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
+import silk.core.option { Option }
 import silk.collections.slice { Slice }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -35,6 +44,18 @@ pub service Store {
   effect fn readDelta(doc: u64, index: usize, out: &mut List<u8>) -> ()
     ! StoreError | OutOfMemoryError
     ? &mut Store | &mut Allocator
+
+  /// Saves a snapshot of `doc` that holds its first `deltas` deltas. It replaces the snapshot
+  /// kept so far only when it holds more deltas.
+  effect fn putSnapshot(doc: u64, deltas: usize, bytes: &[u8]) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Store | &mut Allocator
+
+  /// Appends the snapshot kept for `doc` to `out`, and returns how many deltas it holds: 0, with
+  /// nothing appended, when there is none.
+  effect fn readSnapshot(doc: u64, out: &mut List<u8>) -> usize
+    ! StoreError | OutOfMemoryError
+    ? &mut Store | &mut Allocator
 }
 
 /// Saves the deltas of `document` from sequence number `from` on as document `doc`, and returns
@@ -49,6 +70,11 @@ pub effect fn save(document: &Document, doc: u64, from: usize) -> usize
     run Store.putDelta(doc, delta.id, bytes.asSlice())
     seq = seq + 1
   }
+  if document.latestSnapshot() > from {
+    let mut out = Writer.make()
+    let deltas = run document.encodeLatestSnapshot(&mut out)
+    run Store.putSnapshot(doc, deltas, out.bytes.asSlice())
+  }
   return seq
 }
 
@@ -56,53 +82,77 @@ pub effect fn save(document: &Document, doc: u64, from: usize) -> usize
 pub effect fn load(doc: u64, actor: ActorId) -> Document
   ! StoreError | DecodeError | OutOfMemoryError
   ? &mut Store | &mut Allocator {
-  let mut document = run Document.make(actor)
   let count = run Store.deltaCount(doc)
+  let mut deltas = List<Delta>.make()
   let mut index: usize = 0
   let mut bytes = List<u8>.make()
   while index < count {
     bytes.clear()
     run Store.readDelta(doc, index, &mut bytes)
     let delta = run Delta.fromBytes(bytes.asSlice())
-    drop run document.apply(move delta)
+    run deltas.append(move delta)
     index = index + 1
   }
-  return move document
+  let mut snapshot = List<u8>.make()
+  drop run Store.readSnapshot(doc, &mut snapshot)
+  return run Document.fromSaved(actor, snapshot.asSlice(), move deltas)
 }
 
 struct Saved {
-  doc: u64,
-  id: DeltaId,
   start: usize,
   length: usize,
 }
 
 impl Copy for Saved {}
 
+// The deltas and the snapshot of one document.
+struct Log {
+  doc: u64,
+  saved: List<Saved>,
+  ids: HashMap<DeltaId, usize>,
+  snapshot: List<u8>,
+  snapshotDeltas: usize,
+}
+
 /// A store in memory.
 pub struct MemoryStore {
-  saved: List<Saved>,
+  logs: List<Log>,
   bytes: List<u8>,
 }
 
 impl MemoryStore {
   pub fn make() -> MemoryStore {
-    return MemoryStore { saved: List<Saved>.make(), bytes: List<u8>.make() }
+    return MemoryStore { logs: List<Log>.make(), bytes: List<u8>.make() }
   }
 
-  fn find(self: &Self, doc: u64, index: usize) -> usize {
-    let mut seen: usize = 0
+  fn find(self: &Self, doc: u64) -> usize {
     let mut k: usize = 0
-    while k < self.saved.length() {
-      if self.saved.get(k).doc == doc {
-        if seen == index {
-          return k
-        }
-        seen = seen + 1
+    while k < self.logs.length() {
+      if self.logs.asSlice()[k].doc == doc {
+        return k
       }
       k = k + 1
     }
-    return self.saved.length()
+    return self.logs.length()
+  }
+
+  effect fn logFor(self: &mut Self, doc: u64) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let k = self.find(doc)
+    if k < self.logs.length() {
+      return k
+    }
+    run self.logs.append(
+      Log {
+        doc: doc,
+        saved: List<Saved>.make(),
+        ids: HashMap<DeltaId, usize>.make(Hash.seed(1181783497276652981)),
+        snapshot: List<u8>.make(),
+        snapshotDeltas: 0,
+      },
+    )
+    return k
   }
 }
 
@@ -110,42 +160,61 @@ impl Store for MemoryStore {
   effect fn putDelta(self: &mut Self, doc: u64, id: DeltaId, bytes: &[u8]) -> ()
     ! StoreError | OutOfMemoryError
     ? &mut Allocator {
-    let mut k: usize = 0
-    while k < self.saved.length() {
-      let saved = self.saved.get(k)
-      if saved.doc == doc && saved.id.same(&id) {
-        return ()
-      }
-      k = k + 1
+    let k = run self.logFor(doc)
+    if self.logs.asSlice()[k].ids.contains(id) {
+      return ()
     }
     let start = self.bytes.length()
     run self.bytes.appendSlice(bytes)
-    run self.saved.append(Saved { doc: doc, id: id, start: start, length: bytes.length })
+    let log = &mut self.logs.asMutSlice()[k]
+    drop run log.ids.insert(id, log.saved.length())
+    run log.saved.append(Saved { start: start, length: bytes.length })
   }
 
   effect fn deltaCount(self: &mut Self, doc: u64) -> usize
     ! StoreError | OutOfMemoryError
     ? &mut Allocator {
-    let mut count: usize = 0
-    let mut k: usize = 0
-    while k < self.saved.length() {
-      if self.saved.get(k).doc == doc {
-        count = count + 1
-      }
-      k = k + 1
+    let k = self.find(doc)
+    if k == self.logs.length() {
+      return 0
     }
-    return count
+    return self.logs.asSlice()[k].saved.length()
   }
 
   effect fn readDelta(self: &mut Self, doc: u64, index: usize, out: &mut List<u8>) -> ()
     ! StoreError | OutOfMemoryError
     ? &mut Allocator {
-    let k = self.find(doc, index)
-    if k == self.saved.length() {
+    let k = self.find(doc)
+    if k == self.logs.length() || index >= self.logs.asSlice()[k].saved.length() {
       fail StoreError { code: 1 }
     }
-    let saved = self.saved.get(k)
+    let saved = self.logs.asSlice()[k].saved.get(index)
     run out.appendSlice(Slice.view(self.bytes.asSlice(), saved.start, saved.length))
+  }
+
+  effect fn putSnapshot(self: &mut Self, doc: u64, deltas: usize, bytes: &[u8]) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let k = run self.logFor(doc)
+    let log = &mut self.logs.asMutSlice()[k]
+    if deltas <= log.snapshotDeltas {
+      return ()
+    }
+    log.snapshot.clear()
+    run log.snapshot.appendSlice(bytes)
+    log.snapshotDeltas = deltas
+  }
+
+  effect fn readSnapshot(self: &mut Self, doc: u64, out: &mut List<u8>) -> usize
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    let k = self.find(doc)
+    if k == self.logs.length() {
+      return 0
+    }
+    let log = &self.logs.asSlice()[k]
+    run out.appendSlice(log.snapshot.asSlice())
+    return log.snapshotDeltas
   }
 }
 
@@ -208,4 +277,80 @@ pub effect fn conformance() -> ()
   let loaded = run load(9, 4)
   run Testing.expect(loaded.frontier().same(document.frontier()), "a load reaches the version")
   run Testing.expect(loaded.textLength(1) == 4, "a load rebuilds the text")
+
+  // Snapshots: none at first, then the one holding the most deltas.
+  let mut snapshot = List<u8>.make()
+  let absent = run Store.readSnapshot(7, &mut snapshot)
+  run Testing.expect(absent == 0 && snapshot.length() == 0, "a new document has no snapshot")
+  run Store.putSnapshot(7, 2, &one)
+  run Store.putSnapshot(7, 1, &three)
+  let kept = run Store.readSnapshot(7, &mut snapshot)
+  run Testing.expect(
+    kept == 2 && sameBytes(snapshot.asSlice(), &one),
+    "a smaller snapshot does not replace a larger one",
+  )
+  snapshot.clear()
+  run Store.putSnapshot(7, 3, &three)
+  let larger = run Store.readSnapshot(7, &mut snapshot)
+  run Testing.expect(
+    larger == 3 && sameBytes(snapshot.asSlice(), &three),
+    "a larger snapshot replaces it",
+  )
+  snapshot.clear()
+  let elsewhere = run Store.readSnapshot(8, &mut snapshot)
+  run Testing.expect(elsewhere == 0, "snapshots are kept per document")
+
+  // A document with snapshots loads from its snapshot and matches one that replays.
+  let mut busy = run Document.make(5)
+  busy.setSnapshotInterval(3)
+  let mut step: usize = 0
+  while step < 20 {
+    let middle = busy.textLength(1) / 2
+    run busy.insertText(1, middle, String.utf8Bytes("ab"))
+    if step % 4 == 3 {
+      run busy.mark(1, 0, 2, 1, String.utf8Bytes("x"), Expand.End)
+      run busy.set(2, String.utf8Bytes("k"), String.utf8Bytes("w"))
+    }
+    if step % 5 == 4 {
+      run busy.deleteText(1, 1, 2)
+    }
+    drop run busy.commit()
+    step = step + 1
+  }
+  drop run save(&busy, 10, 0)
+  let mut stored = List<u8>.make()
+  let held = run Store.readSnapshot(10, &mut stored)
+  run Testing.expect(held == busy.latestSnapshot() && held > 0, "save keeps the latest snapshot")
+  let fromSnapshot = run load(10, 6)
+  run Testing.expect(
+    fromSnapshot.frontier().same(busy.frontier()),
+    "a load from a snapshot reaches the version",
+  )
+  let busyText = run readBody(&busy)
+  let loadedText = run readBody(&fromSnapshot)
+  run Testing.expect(
+    busyText.view() == loadedText.view(),
+    "a load from a snapshot rebuilds the text",
+  )
+  run Testing.expect(
+    fromSnapshot.snapshotCount() > 0,
+    "a load from a snapshot keeps it for checkouts",
+  )
+  run Testing.expect(fromSnapshot.map(2).isSome(), "a load from a snapshot rebuilds the maps")
+
+  // A snapshot of other deltas is ignored, and the load replays instead.
+  drop run save(&document, 11, 0)
+  run Store.putSnapshot(11, 1, stored.asSlice())
+  let replayed = run load(11, 7)
+  run Testing.expect(replayed.frontier().same(document.frontier()), "a stray snapshot is ignored")
+  run Testing.expect(replayed.textLength(1) == 4, "a load past a stray snapshot rebuilds the text")
+}
+
+effect fn readBody(document: &Document) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match document.text(1) {
+    Option<&RichText>.Some { value } => run value.read()
+    Option<&RichText>.None => String.make()
+  }
 }

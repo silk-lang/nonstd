@@ -15,6 +15,7 @@
 //! around them that is sparse enough is relabelled evenly.
 import btree.tree { Item, Root, Summary, Tree }
 import clock { DeltaId }
+import codec { DecodeError, Reader, Writer }
 import silk.collections.hash { Hash }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
@@ -196,6 +197,110 @@ impl Text {
     }
   }
 
+  /// Appends `version` of this text to `out`, to rebuild with [`Text.decode`]: the insertions it
+  /// holds and its fragments in order.
+  pub effect fn encodeVersion(self: &Self, version: TextVersion, out: &mut Writer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.tree.length(version.root)
+    let mut seen = HashMap<DeltaId, bool>.make(Hash.seed(3935559000370003845))
+    let mut order = List<DeltaId>.make()
+    let mut k: usize = 0
+    while k < count {
+      let fragment = self.tree.get(version.root, k)
+      if !seen.contains(fragment.id) {
+        drop run seen.insert(fragment.id, true)
+        run order.append(fragment.id)
+      }
+      k = k + 1
+    }
+    run out.size(order.length())
+    let mut i: usize = 0
+    while i < order.length() {
+      let id = order.get(i)
+      let insertion = self.insertionOf(id)
+      run out.id(id)
+      run encodeChar(insertion.originLeft, &mut out)
+      run encodeChar(insertion.originRight, &mut out)
+      run out.data(Slice.view(self.bytes.asSlice(), insertion.buffer, insertion.length))
+      i = i + 1
+    }
+    run out.size(count)
+    k = 0
+    while k < count {
+      let fragment = self.tree.get(version.root, k)
+      run out.id(fragment.id)
+      run out.size(fragment.start)
+      run out.size(fragment.length)
+      run out.flag(fragment.deleted)
+      k = k + 1
+    }
+  }
+
+  /// A text read from what [`Text.encodeVersion`] wrote.
+  pub effect fn decode(input: &mut Reader) -> Text
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = Text.make()
+    let insertions = run input.size()
+    let mut i: usize = 0
+    while i < insertions {
+      let id = run input.id()
+      let left = run decodeChar(&mut input)
+      let right = run decodeChar(&mut input)
+      let bytes = run input.data()
+      if id.lamport == 0 || text.insertions.contains(id) {
+        fail DecodeError {}
+      }
+      let buffer = text.bytes.length()
+      run text.bytes.appendSlice(bytes)
+      run text.splits.append(List<Split>.make())
+      let insertion = Insertion {
+        originLeft: left,
+        originRight: right,
+        buffer: buffer,
+        length: bytes.length,
+        splits: text.splits.length() - 1,
+      }
+      drop run text.insertions.insert(id, insertion)
+      i = i + 1
+    }
+    let count = run input.size()
+    if usize.toU64(count) >= u64.MAX / STEP {
+      fail DecodeError {}
+    }
+    let mut fragments = List<Fragment>.make()
+    let mut k: usize = 0
+    while k < count {
+      let id = run input.id()
+      let start = run input.size()
+      let length = run input.size()
+      let deleted = run input.flag()
+      if !text.insertions.contains(id) || length == 0 {
+        fail DecodeError {}
+      }
+      let insertion = text.insertionOf(id)
+      let pieces = &text.splits.asSlice()[insertion.splits]
+
+      // Pieces of one insertion come in order, so each starts past the one before.
+      let mut previous: usize = 0
+      if pieces.length() > 0 {
+        previous = pieces.get(pieces.length() - 1).start
+      }
+      if start + length > insertion.length || (pieces.length() > 0 && start <= previous) {
+        fail DecodeError {}
+      }
+      let label = usize.toU64(k + 1) * STEP
+      run text.splits.asMutSlice()[insertion.splits].append(Split { start: start, label: label })
+      run fragments.append(
+        Fragment { id: id, start: start, length: length, deleted: deleted, label: label },
+      )
+      k = k + 1
+    }
+    text.root = run text.tree.build(fragments.asSlice())
+    return move text
+  }
+
   /// The number of visible bytes.
   pub fn length(self: &Self) -> usize {
     return self.tree.summary(self.root).visible
@@ -214,6 +319,7 @@ impl Text {
     ? &mut Allocator {
     let mut past = Text.make()
     let count = self.tree.length(version.root)
+    let mut fragments = List<Fragment>.make()
     if usize.toU64(count) >= u64.MAX / STEP {
       Intrinsic.trap("Text.restore: too many fragments to label")
     }
@@ -241,9 +347,10 @@ impl Text {
       run past.splits.asMutSlice()[owner].append(
         Split { start: fragment.start, label: fragment.label },
       )
-      run past.tree.insert(&mut past.root, k, fragment)
+      run fragments.append(fragment)
       k = k + 1
     }
+    past.root = run past.tree.build(fragments.asSlice())
     return move past
   }
 
@@ -317,6 +424,46 @@ impl Text {
     let op = InsertOp { id: id, originLeft: left, originRight: right, bytes: move copy }
     run self.place(&op, at)
     return move op
+  }
+
+  /// Appends `bytes` to insertion `id` when they are typed at visible offset `offset` right after
+  /// its last byte, and returns whether it did. Typing one byte at a time then grows one insertion
+  /// and one fragment instead of making one of each per byte.
+  ///
+  /// It does so only when an insertion of `bytes` at `offset` would be named after that last
+  /// byte and before the same right neighbour as `id`, and `id` is the newest insertion here.
+  /// Then every replica places the longer insertion where it would place the two, so the caller
+  /// may send the longer one instead of both.
+  pub effect fn extend(self: &mut Self, id: DeltaId, offset: usize, bytes: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if offset == 0 || offset > self.length() || !self.insertions.contains(id) {
+      return false
+    }
+    let mut insertion = self.insertionOf(id)
+    if insertion.buffer + insertion.length != self.bytes.length() {
+      return false
+    }
+    let last = CharId.of(id, insertion.length - 1)
+    if !self.charAt(offset - 1).same(&last) {
+      return false
+    }
+    let index = self.find(last)
+    let mut fragment = self.tree.get(self.root, index)
+    let mut right = CharId.none()
+    if index + 1 < self.tree.length(self.root) {
+      let next = self.tree.get(self.root, index + 1)
+      right = CharId.of(next.id, next.start)
+    }
+    if !right.same(&insertion.originRight) {
+      return false
+    }
+    run self.bytes.appendSlice(bytes)
+    insertion.length = insertion.length + bytes.length
+    drop run self.insertions.insert(id, insertion)
+    fragment.length = fragment.length + bytes.length
+    run self.tree.set(&mut self.root, index, fragment)
+    return true
   }
 
   /// Deletes `length` visible bytes from offset `offset`, and returns the operation to send.
@@ -711,4 +858,20 @@ fn runsHold(runs: &List<CharRun>, char: CharId) -> bool {
     k = k + 1
   }
   return false
+}
+
+/// Appends the name of a byte to `out`.
+pub effect fn encodeChar(char: CharId, out: &mut Writer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.id(char.id)
+  run out.size(char.offset)
+}
+
+/// Reads a name written by [`encodeChar`].
+pub effect fn decodeChar(input: &mut Reader) -> CharId
+  ! DecodeError {
+  let id = run input.id()
+  let offset = run input.number()
+  return CharId.of(id, u64.toUsize(offset))
 }

@@ -2,7 +2,8 @@
 //!
 //! One table holds every delta: the document, the delta id, its place in the order saved, and
 //! its bytes. The id is the primary key, so saving a delta twice keeps the first copy, and an
-//! index on the place makes reading delta `index` one lookup.
+//! index on the place makes reading delta `index` one lookup. A second table keeps one snapshot
+//! per document, replaced only by a snapshot that holds more deltas.
 import core.clock { DeltaId }
 import core.store { Store, StoreError }
 import sqlite.sqlite { Connection, SqliteError, Statement }
@@ -13,7 +14,7 @@ import silk.num.i64
 import silk.num.u64
 import silk.num.usize
 
-const SCHEMA: string = "PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS crdt_deltas (doc INTEGER NOT NULL, lamport INTEGER NOT NULL, actor INTEGER NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY (doc, lamport, actor)) WITHOUT ROWID; CREATE UNIQUE INDEX IF NOT EXISTS crdt_deltas_position ON crdt_deltas (doc, position);"
+const SCHEMA: string = "PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS crdt_deltas (doc INTEGER NOT NULL, lamport INTEGER NOT NULL, actor INTEGER NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY (doc, lamport, actor)) WITHOUT ROWID; CREATE UNIQUE INDEX IF NOT EXISTS crdt_deltas_position ON crdt_deltas (doc, position); CREATE TABLE IF NOT EXISTS crdt_snapshots (doc INTEGER PRIMARY KEY, deltas INTEGER NOT NULL, bytes BLOB NOT NULL);"
 
 const INSERT: string = "INSERT OR IGNORE INTO crdt_deltas (doc, lamport, actor, position, bytes) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(position) + 1, 0) FROM crdt_deltas WHERE doc = ?1), ?4)"
 
@@ -21,12 +22,18 @@ const COUNT: string = "SELECT COUNT(*) FROM crdt_deltas WHERE doc = ?1"
 
 const READ: string = "SELECT bytes FROM crdt_deltas WHERE doc = ?1 AND position = ?2"
 
+const PUT_SNAPSHOT: string = "INSERT INTO crdt_snapshots (doc, deltas, bytes) VALUES (?1, ?2, ?3) ON CONFLICT (doc) DO UPDATE SET deltas = excluded.deltas, bytes = excluded.bytes WHERE excluded.deltas > crdt_snapshots.deltas"
+
+const READ_SNAPSHOT: string = "SELECT deltas, bytes FROM crdt_snapshots WHERE doc = ?1"
+
 /// A store in an SQLite database, holding its connection and prepared statements.
 pub struct SqliteStore {
   db: Connection,
   insert: Statement,
   count: Statement,
   read: Statement,
+  putSnapshot: Statement,
+  readSnapshot: Statement,
 }
 
 fn toStore(error: SqliteError | OutOfMemoryError) -> StoreError | OutOfMemoryError {
@@ -74,11 +81,15 @@ impl SqliteStore {
     let insert = run connection.prepare(INSERT)
     let count = run connection.prepare(COUNT)
     let read = run connection.prepare(READ)
+    let putSnapshot = run connection.prepare(PUT_SNAPSHOT)
+    let readSnapshot = run connection.prepare(READ_SNAPSHOT)
     return SqliteStore {
       db: move connection,
       insert: move insert,
       count: move count,
       read: move read,
+      putSnapshot: move putSnapshot,
+      readSnapshot: move readSnapshot,
     }
   }
 
@@ -120,6 +131,30 @@ impl SqliteStore {
     self.read.reset()
     return false
   }
+
+  effect fn putSnapshotRaw(self: &mut Self, doc: u64, deltas: usize, bytes: &[u8]) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.putSnapshot.reset()
+    run self.putSnapshot.bindInt(1, signed(doc))
+    run self.putSnapshot.bindInt(2, u64.toI64(usize.toU64(deltas)))
+    run self.putSnapshot.bindBlob(3, bytes)
+    drop run self.putSnapshot.execute()
+  }
+
+  effect fn readSnapshotRaw(self: &mut Self, doc: u64, out: &mut List<u8>) -> usize
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.readSnapshot.reset()
+    run self.readSnapshot.bindInt(1, signed(doc))
+    let mut deltas: usize = 0
+    if run self.readSnapshot.step() {
+      deltas = u64.toUsize(i64.toU64(self.readSnapshot.columnInt(0)))
+      run out.appendSlice(self.readSnapshot.columnBlob(1))
+    }
+    self.readSnapshot.reset()
+    return deltas
+  }
 }
 
 impl Store for SqliteStore {
@@ -143,5 +178,17 @@ impl Store for SqliteStore {
       // SQLITE_NOTFOUND.
       fail StoreError { code: 12 }
     }
+  }
+
+  effect fn putSnapshot(self: &mut Self, doc: u64, deltas: usize, bytes: &[u8]) -> ()
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.mapError(self.putSnapshotRaw(doc, deltas, bytes), toStore)
+  }
+
+  effect fn readSnapshot(self: &mut Self, doc: u64, out: &mut List<u8>) -> usize
+    ! StoreError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.mapError(self.readSnapshotRaw(doc, &mut out), toStore)
   }
 }
