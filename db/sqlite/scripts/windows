@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Build SQLite and the Silk shim into .cache/db-sqlite/windows/silksqlite.lib.
+
+  python db/sqlite/scripts/windows
+
+SQLite's Windows code needs the Windows SDK headers, which Silk does not pass to Clang, so this
+script compiles the amalgamation pinned in db/sqlite/silk.toml itself. scripts/prepare-windows runs
+it and names the directory, with the import libraries it needs, as the override of the `sqlite`
+archive, so plain `silk build` links it.
+
+Run from an x64 Visual Studio developer shell with the Windows SDK, so clang finds the SDK headers.
+"""
+import hashlib
+import io
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tarfile
+import tomllib
+import urllib.request
+
+PACKAGE = Path(__file__).resolve().parent.parent
+REPO = PACKAGE.parent.parent
+sys.path.insert(0, str(REPO / "gpu/webgpu/scripts"))
+from _build import command_path, executable  # noqa: E402
+
+OUT = REPO / ".cache/db-sqlite/windows"
+# Silk links without the C runtime defaults, so SQLite uses the DLL runtime (ucrt and vcruntime,
+# which prepare-windows copies beside the library), which initializes itself.
+FLAGS = ["--target=x86_64-pc-windows-msvc", "-fms-runtime-lib=dll", "-O2",
+         "-D_CRT_SECURE_NO_WARNINGS"]
+
+
+def sqlite_flags():
+    """The SQLite defines the manifest compiles sqlite3.c with on macOS and Linux."""
+    manifest = tomllib.loads((PACKAGE / "silk.toml").read_text(encoding="utf-8"))
+    for entry in manifest["native"]["sources"]:
+        if entry.get("c") == "sqlite:sqlite3.c":
+            return [flag for flag in entry["flags"] if flag.startswith("-D")]
+    raise SystemExit("db/sqlite/silk.toml has no sqlite:sqlite3.c source entry")
+
+
+def amalgamation():
+    """Fetch the pinned archive (once) and extract sqlite3.c and sqlite3.h into OUT."""
+    archive = tomllib.loads((PACKAGE / "silk.toml").read_text(encoding="utf-8"))["native"]["archive"]["sqlite"]
+    stamp = OUT / "sqlite.sha256"
+    if stamp.is_file() and stamp.read_text().strip() == archive["sha256"]:
+        return
+    with urllib.request.urlopen(archive["url"]) as response:
+        data = response.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != archive["sha256"]:
+        raise SystemExit(f"{archive['url']} has SHA-256 {digest}, but silk.toml pins {archive['sha256']}")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            name = member.name.split("/", 1)[-1]
+            if name in ("sqlite3.c", "sqlite3.h") and member.isfile():
+                (OUT / name).write_bytes(tar.extractfile(member).read())
+    for name in ("sqlite3.c", "sqlite3.h"):
+        if not (OUT / name).is_file():
+            raise SystemExit(f"{archive['url']} holds no {name}")
+    stamp.write_text(archive["sha256"] + "\n")
+
+
+def native():
+    if os.name != "nt":
+        raise SystemExit("db/sqlite's Windows library builds only on Windows.")
+    clang = Path(os.environ.get("SILK_CLANG") or command_path("install-llvm"))
+    OUT.mkdir(parents=True, exist_ok=True)
+    amalgamation()
+    sources = [
+        (OUT / "sqlite3.c", ["-w", *sqlite_flags()]),
+        (PACKAGE / "native/shim.c", ["-std=c11", "-Wall", "-Wextra", "-Werror", f"-I{OUT}"]),
+    ]
+    objects = []
+    for source, flags in sources:
+        obj = OUT / (source.stem + ".obj")
+        subprocess.run([str(clang), *FLAGS, *flags, "-c", str(source), "-o", str(obj)], check=True)
+        objects.append(obj)
+    library = OUT / "silksqlite.lib"
+    if library.exists():
+        library.unlink()
+    lib = clang.parent / executable("llvm-lib")
+    if lib.exists():
+        subprocess.run([str(lib), f"/out:{library}", *map(str, objects)], check=True)
+    else:
+        ar = clang.parent / executable("llvm-ar")
+        subprocess.run([str(ar), "rcs", str(library), *map(str, objects)], check=True)
+    return library
+
+
+if __name__ == "__main__":
+    print(native())

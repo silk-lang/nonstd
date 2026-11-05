@@ -1,6 +1,6 @@
 # crdt
 
-A collaborative document store in the style of Zed's DeltaDB, with rich text. Every change is a
+A collaborative document store with rich text. Every change is a
 delta in a causal graph; a version is a frontier (the tips of the graph); replicas exchange deltas
 and converge without a central authority deciding order.
 
@@ -20,8 +20,8 @@ the bytes it was typed between. Concurrent insertions at one place are ordered w
 (as Yjs does), so runs typed by different people never interleave. Deletions leave tombstones.
 Offsets are UTF-8 bytes.
 
-Unlike DeltaDB, an operation does not carry an offset plus the version it was made at: it carries
-the ids of its neighbours. A replica applies it without rebuilding an old version first.
+An operation does not carry an offset plus the version it was made at: it carries the ids of its
+neighbours, so a replica applies it without rebuilding an old version first.
 
 ## Rich text
 

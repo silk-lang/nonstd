@@ -166,6 +166,13 @@ pub struct Engine<'a> {
   // declared slots, the only ones a new style can leave unset. Relisted when stale.
   pendingCount: usize,
   pendingStale: bool,
+  // The parent of the last style built, usize.MAX for none, and whether template holds
+  // its children's starting entries (made for the second child in a row). Cleared
+  // whenever initialEntries may have changed (pendingStale) or styles are dropped.
+  // A list of at most one, so engines that never use it allocate and copy nothing.
+  templateParent: usize,
+  templateReady: bool,
+  template: List<Template>,
   // The slot position of each entry index, u8.MAX for entries without a slot.
   // Styles by the hash of their build inputs, with the candidates they were built from.
   shareKeys: HashMap<u64, usize>,
@@ -179,6 +186,8 @@ struct Tables {
   initialComputed: [u32; 172],
   contextFree: [bool; 172],
   covered: [bool; 172],
+  // Cascade winner per covered index in the last build, before any revert (a candidates index).
+  winners: [u32; 172],
   slots: [Slot; 172],
   inheritedIndices: [u16; 172],
   initialEntries: [Entry; 172],
@@ -187,6 +196,13 @@ struct Tables {
 }
 
 impl Copy for Tables {}
+
+// initialEntries with one parent's inherited entries laid over (see Engine.template).
+struct Template {
+  entries: [Entry; 172],
+}
+
+impl Copy for Template {}
 
 struct Slot {
   property: Property,
@@ -341,7 +357,7 @@ effect fn unchangedWhenComputed(store: &mut Store, id: ValueId, property: Proper
       [host; 19],
     )
     let computeContext = ComputeContext {
-      dimensions: dimensions,
+      dimensions: &dimensions,
       colors: &palette,
       systemFonts: &fonts,
     }
@@ -410,6 +426,9 @@ impl<'a> Engine<'a> {
         inheritedCount: base.inheritedCount,
         pendingCount: base.pendingCount,
         pendingStale: base.pendingStale,
+        templateParent: usize.MAX,
+        templateReady: false,
+        template: List<Template>.make(),
         shareKeys: HashMap<u64, usize>.make(Hash.seed(0)),
         shared: List<Shared>.make(),
         sharedCandidates: List<Candidate>.make(),
@@ -444,10 +463,16 @@ impl<'a> Engine<'a> {
     }
     drop run self.build(buffers, &[], &[], Option<StyleId>.None, host, limits)
     self.styles.clear()
+    self.templateParent = usize.MAX
     self.shared.clear()
     self.sharedCandidates.clear()
     self.shareKeys.clear()
     self.variables = VariableStore.make(closingBuffer)
+
+    // List the slots still pending now, so engines made by `over` start with the list.
+    if self.pendingStale {
+      self.listPending()
+    }
     return true
   }
 
@@ -474,6 +499,7 @@ impl<'a> Engine<'a> {
       initialComputed: [u32.MAX; 172],
       contextFree: [false; 172],
       covered: [false; 172],
+      winners: [0; 172],
     }
     return Engine {
       tables: run Box<Tables>.make(tables),
@@ -481,6 +507,9 @@ impl<'a> Engine<'a> {
       inheritedCount: inheritedCount,
       pendingCount: 0,
       pendingStale: true,
+      templateParent: usize.MAX,
+      templateReady: false,
+      template: List<Template>.make(),
       shareKeys: HashMap<u64, usize>.make(Hash.seed(0)),
       shared: List<Shared>.make(),
       sharedCandidates: List<Candidate>.make(),
@@ -648,6 +677,7 @@ impl<'a> Engine<'a> {
     }
     if self.pendingStale {
       self.listPending()
+      self.templateParent = usize.MAX
     }
     let shareKey = self.shareKey(declarations, candidates, parent)
     if let Option<u64>.Some { value: key } = shareKey {
@@ -674,6 +704,8 @@ impl<'a> Engine<'a> {
       if candidates[c].declaration < declarations.length {
         match &declarations[candidates[c].declaration].target {
           Target.Property { property: source } => {
+            let mut priority = candidates[c].priority
+            priority.important = declarations[candidates[c].declaration].important
             let count = properties.longhandCount(source)
             let mut l: usize = 0
             while l < count {
@@ -681,8 +713,17 @@ impl<'a> Engine<'a> {
               if !self.tables.get()[0].covered[index] {
                 let tables = self.tables.getMut()
                 tables[0].covered[index] = true
+                tables[0].winners[index] = usize.toU32(c)
                 coveredIndices[coveredCount] = usize.toU16(index)
                 coveredCount = coveredCount + 1
+              } else {
+                let best = u32.toUsize(self.tables.get()[0].winners[index])
+                let mut current = candidates[best].priority
+                current.important = declarations[candidates[best].declaration].important
+                if cascade.compare(priority, current) >= 0 {
+                  let tables = self.tables.getMut()
+                  tables[0].winners[index] = usize.toU32(c)
+                }
               }
               l = l + 1
             }
@@ -757,17 +798,34 @@ impl<'a> Engine<'a> {
     }
 
     // Undeclared inherited longhands take the parent's entry, as
-    // defaultValue(Wide.Unset) would; declared ones are resolved below.
+    // defaultValue(Wide.Unset) would; declared ones are resolved below. Runs of
+    // siblings share the result through the template.
     match &parent {
       Option<StyleId>.Some { value } => {
         if value.index < self.styles.length() {
-          let inherited = &self.styles.asSlice()[value.index].entries
-          let mut n: usize = 0
-          while n < self.inheritedCount {
-            let index = u16.toUsize(self.tables.get()[0].inheritedIndices[n])
-            n = n + 1
-            if inherited[index].value != u32.MAX {
-              style.entries[index] = inherited[index]
+          if self.templateParent == value.index && self.templateReady {
+            style.entries = self.template.asSlice()[0].entries
+          } else {
+            let inherited = &self.styles.asSlice()[value.index].entries
+            let mut n: usize = 0
+            while n < self.inheritedCount {
+              let index = u16.toUsize(self.tables.get()[0].inheritedIndices[n])
+              n = n + 1
+              if inherited[index].value != u32.MAX {
+                style.entries[index] = inherited[index]
+              }
+            }
+            if self.templateParent == value.index {
+              if self.template.length() == 0 {
+                run self.template.append(Template { entries: style.entries })
+              } else {
+                let mut templates = self.template.asMutSlice()
+                templates[0].entries = style.entries
+              }
+              self.templateReady = true
+            } else {
+              self.templateParent = value.index
+              self.templateReady = false
             }
           }
         }
@@ -1249,14 +1307,14 @@ effect fn computeIn(
     let mut own = palette.*
     own.currentColor = parentColor(&engine.*, parent, host)
     let context = ComputeContext {
-      dimensions: style.dimensions,
+      dimensions: &style.dimensions,
       colors: &own,
       systemFonts: host.systemFonts,
     }
     return run computeValue(&mut engine.values, id, property, &context)
   }
   let context = ComputeContext {
-    dimensions: style.dimensions,
+    dimensions: &style.dimensions,
     colors: palette,
     systemFonts: host.systemFonts,
   }
@@ -1300,12 +1358,21 @@ effect fn resolve(
   }
   let mut excluded: u8 = 0
   while true {
-    let winner = if engine.tables.get()[0].covered[properties.index(
-      properties.canonical(property),
-    )] {
-      cascade.select(declarations, candidates, property, excluded)
-    } else {
+    let canonicalIndex = properties.index(properties.canonical(property))
+    let winner = if !engine.tables.get()[0].covered[canonicalIndex] {
       Option<Candidate>.None
+    } else if excluded == 0 {
+      let best = u32.toUsize(engine.tables.get()[0].winners[canonicalIndex])
+      let mut stored = candidates[best]
+      let declaration = &declarations[stored.declaration]
+      if cascade.reverted(declaration) {
+        cascade.select(declarations, candidates, property, excluded)
+      } else {
+        stored.priority.important = declaration.important
+        Option<Candidate>.some(stored)
+      }
+    } else {
+      cascade.select(declarations, candidates, property, excluded)
     }
     let candidate = match &winner {
       Option<Candidate>.Some { value } => value
@@ -1660,7 +1727,7 @@ effect fn computeValue(
         let result = run dimensions.compute(
           &mut store.numerics,
           original,
-          &computeContext.dimensions,
+          computeContext.dimensions,
         )
         if result.index == original.index {
           return id

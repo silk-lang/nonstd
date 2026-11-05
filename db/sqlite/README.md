@@ -58,9 +58,10 @@ left out.
 
 ## Platforms
 
-macOS and Linux. Windows needs the amalgamation built with the Windows SDK, which Silk does not pass
-to Clang; that will go through `scripts/prepare-windows` like the other native code. The browser is
-not supported.
+macOS, Linux and Windows. On Windows, run `python scripts/prepare-windows` once from an x64 Visual
+Studio developer shell: SQLite needs the Windows SDK headers, which Silk does not pass to Clang, so
+that script builds SQLite and the shim into a library (`db/sqlite/scripts/windows`) and points the
+`sqlite` archive at it. The browser is not supported.
 
 ## Tests
 
