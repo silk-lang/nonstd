@@ -1,0 +1,991 @@
+//! The showcase stage: six replicas of one document on one screen, each driven by the script.
+//!
+//! Every card is a person with their own copy of the document and their own sync client. A key
+//! they press becomes CRDT operations on their copy; when they are online the copy syncs through
+//! the server right away and everyone else online syncs after, so edits ripple across the cards.
+//! An offline card keeps its edits, counts them, and merges them when it comes back.
+//!
+//! Text is colored by who wrote it, read from the ids the CRDT gives every byte. Each person's
+//! caret is kept as the byte before it, so it stays put while others type around it.
+import script { Action, BOLD, LENGTH, PLAYERS, Step, UNDERLINE, playerHue, playerName, steps }
+import core.clock { Frontier }
+import core.doc { Document }
+import core.rich { Expand, RichText, Span }
+import core.text { CharId, Text }
+import sync.sync { Client, Loopback, MemoryServer, Transport }
+import showcase.assets { MONO, SANS }
+import showcase.palette { hsv, rgb, rgba, white, ease }
+import ui_app.app { App, Context, NoCommand, Subscriptions }
+import ui_app.ui { Ui }
+import ui_tree.mutation {
+  Align,
+  BorderStyle,
+  BoxShadow,
+  DecorationLine,
+  Display,
+  FlexWrap,
+  Length,
+  LineHeight,
+  Overflow,
+  Position,
+  Property,
+  Side,
+  WhiteSpace
+}
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.geometry.corners { Corners }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { InvalidUtf8, String }
+
+/// The document everyone edits, and its text.
+pub const DOC: u64 = 1
+
+pub const BODY: u64 = 1
+
+const HEX: string = "0123456789abcdef"
+
+/// One person: their copy of the document, their client and their caret.
+pub struct Player {
+  pub document: Document,
+  pub client: Client,
+  pub online: bool,
+  /// The byte just before the caret, or none at the very start.
+  pub caret: CharId,
+  /// When this copy last took in someone else's edits.
+  pub receivedAt: f64,
+}
+
+pub union Message {
+  Frame { pub time: f64 },
+  Resize { pub width: f32, pub height: f32 },
+  Restart,
+}
+
+/// The whole showcase.
+pub struct Stage {
+  pub server: MemoryServer,
+  pub players: List<Player>,
+  pub steps: List<Step>,
+  /// The next step to play.
+  pub next: usize,
+  /// Seconds since the script started.
+  pub clock: f64,
+  start: f64,
+  started: bool,
+  pub width: f32,
+  pub height: f32,
+}
+
+impl Stage {
+  pub effect fn make(width: f32, height: f32) -> Stage
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut players = List<Player>.make()
+    let mut p: usize = 0
+    while p < PLAYERS {
+      let document = run Document.make(usize.toU64(p + 1))
+      run players.append(
+        Player {
+          document: move document,
+          client: Client.make(DOC),
+          online: true,
+          caret: CharId.none(),
+          receivedAt: -10.0,
+        },
+      )
+      p = p + 1
+    }
+    return Stage {
+      server: MemoryServer.make(1000),
+      players: move players,
+      steps: run steps(),
+      next: 0,
+      clock: 0.0,
+      start: 0.0,
+      started: false,
+      width: width,
+      height: height,
+    }
+  }
+
+  /// Plays every step due by `clock` seconds.
+  pub effect fn advance(self: &mut Self, clock: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.clock = clock
+    while self.next < self.steps.length() && self.steps.get(self.next).time <= clock {
+      let step = self.steps.get(self.next)
+      self.next = self.next + 1
+      run self.play(step)
+    }
+  }
+
+  /// The number of deltas the server holds.
+  pub fn serverDeltas(self: &Self) -> usize {
+    return match self.server.find(DOC) {
+      Option<&Document>.Some { value } => value.deltaCount()
+      Option<&Document>.None => 0
+    }
+  }
+
+  /// How many copies are at the server's version.
+  pub fn inSync(self: &Self) -> usize {
+    let count = match self.server.find(DOC) {
+      Option<&Document>.Some { value } => {
+        let mut same: usize = 0
+        let mut p: usize = 0
+        while p < self.players.length() {
+          let player = &self.players.asSlice()[p]
+          if player.document.frontier().same(value.frontier()) && !player.document.hasPending() {
+            same = same + 1
+          }
+          p = p + 1
+        }
+        same
+      }
+      Option<&Document>.None => 0
+    }
+    return count
+  }
+
+  fn offline(self: &Self) -> usize {
+    let mut count: usize = 0
+    let mut p: usize = 0
+    while p < self.players.length() {
+      if !self.players.asSlice()[p].online {
+        count = count + 1
+      }
+      p = p + 1
+    }
+    return count
+  }
+
+  effect fn play(self: &mut Self, step: Step) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let p = step.player
+    let player = &mut self.players.asMutSlice()[p]
+    let mut changed = false
+    match step.action {
+      Action.Key { byte } => {
+        let offset = caretOffset(&player.document, player.caret)
+        let bytes = [byte]
+        run player.document.insertText(BODY, offset, &bytes)
+        player.caret = charAt(&player.document, offset)
+        changed = true
+      }
+      Action.End => {
+        let length = player.document.textLength(BODY)
+        player.caret = if length == 0 {
+          CharId.none()
+        } else {
+          charAt(&player.document, length - 1)
+        }
+      }
+      Action.After { text } => {
+        if let Option<usize>.Some { value } = run find(&player.document, text) {
+          player.caret = charAt(&player.document, value + String.byteLength(text) - 1)
+        }
+      }
+      Action.Erase { text } => {
+        if let Option<usize>.Some { value } = run find(&player.document, text) {
+          run player.document.deleteText(BODY, value, String.byteLength(text))
+          changed = true
+        }
+      }
+      Action.Style { text, key } => {
+        if let Option<usize>.Some { value } = run find(&player.document, text) {
+          let none: [u8; 0] = []
+          run player.document.mark(BODY, value, String.byteLength(text), key, &none, Expand.None)
+          changed = true
+        }
+      }
+      Action.Offline => {
+        player.online = false
+      }
+      Action.Online => {
+        player.online = true
+        changed = true
+      }
+    }
+    if changed {
+      drop run self.players.asMutSlice()[p].document.commit()
+      run self.syncFrom(p)
+    }
+  }
+
+  // Syncs `first`, then everyone else, so a change reaches every copy that is online.
+  effect fn syncFrom(self: &mut Self, first: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.syncPlayer(first)
+    let mut k: usize = 0
+    while k < self.players.length() {
+      if k != first {
+        run self.syncPlayer(k)
+      }
+      k = k + 1
+    }
+  }
+
+  effect fn syncPlayer(self: &mut Self, index: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let player = &mut self.players.asMutSlice()[index]
+    if !player.online {
+      return ()
+    }
+    let before = player.document.deltaCount()
+    let mut link = Loopback.to(&mut self.server)
+    let synced = run Effect.result(player.client.sync(&mut player.document))
+      |> Effect.provideMut<Transport>(&mut link)
+    drop synced
+    if player.document.deltaCount() > before {
+      player.receivedAt = self.clock
+    }
+  }
+}
+
+fn textOf(document: &Document) -> Option<&RichText> {
+  return document.text(BODY)
+}
+
+// Where a caret after `caret` sits in `document`.
+fn caretOffset(document: &Document, caret: CharId) -> usize {
+  if caret.isNone() {
+    return 0
+  }
+  return match textOf(document) {
+    Option<&RichText>.Some { value } => {
+      let text = value.text()
+      if text.knows(caret) {
+        text.offsetAfter(caret)
+      } else {
+        0
+      }
+    }
+    Option<&RichText>.None => 0
+  }
+}
+
+fn charAt(document: &Document, offset: usize) -> CharId {
+  return match textOf(document) {
+    Option<&RichText>.Some { value } => value.text().charAt(offset)
+    Option<&RichText>.None => CharId.none()
+  }
+}
+
+effect fn readOf(document: &Document) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match textOf(document) {
+    Option<&RichText>.Some { value } => run value.read()
+    Option<&RichText>.None => String.make()
+  }
+}
+
+effect fn find(document: &Document, needle: string) -> Option<usize>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = run readOf(document)
+  return String.find(text.view(), needle)
+}
+
+/// A run of text with one look: who wrote it and its styles. A caret run has no text.
+pub struct Run {
+  pub start: usize,
+  pub length: usize,
+  pub author: usize,
+  pub bold: bool,
+  pub underline: bool,
+  /// For a caret: whose it is.
+  pub caret: Option<usize>,
+}
+
+impl Copy for Run {}
+
+struct Caret {
+  offset: usize,
+  player: usize,
+}
+
+impl Copy for Caret {}
+
+/// The runs of `owner`'s copy, with the carets of everyone online whose caret byte it has.
+effect fn runsFor(players: &List<Player>, owner: usize) -> List<Run>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut runs = List<Run>.make()
+  let document = &players.asSlice()[owner].document
+  let rich = match textOf(document) {
+    Option<&RichText>.Some { value } => value
+    Option<&RichText>.None => {
+      return move runs
+    }
+  }
+  let text = rich.text()
+  let length = text.length()
+
+  // Who wrote each visible byte, from the ids of the fragments.
+  let mut author = List<usize>.make()
+  let mut k: usize = 0
+  while k < text.fragmentCount() {
+    let piece = text.pieceAt(k)
+    if !piece.deleted {
+      let who = u64.toUsize(piece.chars.id.actor) - 1
+      let mut b: usize = 0
+      while b < piece.chars.length {
+        run author.append(who)
+        b = b + 1
+      }
+    }
+    k = k + 1
+  }
+
+  // The styles of each byte, from the marks.
+  let mut bold = List<bool>.make()
+  let mut underline = List<bool>.make()
+  k = 0
+  while k < length {
+    run bold.append(false)
+    run underline.append(false)
+    k = k + 1
+  }
+  let spans = run rich.spans()
+  let mut s: usize = 0
+  while s < spans.length() {
+    let span = &spans.asSlice()[s]
+    let mut a: usize = 0
+    while a < span.attrs.length() {
+      let key = span.attrs.get(a).key
+      let mut b = span.start
+      while b < span.start + span.length && b < length {
+        if key == BOLD {
+          bold.set(b, true)
+        }
+        if key == UNDERLINE {
+          underline.set(b, true)
+        }
+        b = b + 1
+      }
+      a = a + 1
+    }
+    s = s + 1
+  }
+
+  // The carets this copy can place: its owner's always, others' while they are online.
+  let mut carets = List<Caret>.make()
+  let mut p: usize = 0
+  while p < players.length() {
+    let player = &players.asSlice()[p]
+    if (p == owner || (player.online && players.asSlice()[owner].online))
+      && (player.caret.isNone() || text.knows(player.caret)) {
+      let at = if player.caret.isNone() {
+        0
+      } else {
+        text.offsetAfter(player.caret)
+      }
+      if !player.caret.isNone() || p == owner {
+        run carets.append(Caret { offset: at, player: p })
+      }
+    }
+    p = p + 1
+  }
+
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= length {
+    let mut c: usize = 0
+    let mut boundary = at == length
+    while c < carets.length() {
+      if carets.get(c).offset == at {
+        boundary = true
+      }
+      c = c + 1
+    }
+    if at > start && at < length {
+      if author.get(at) != author.get(start) || bold.get(at) != bold.get(start)
+        || underline.get(at) != underline.get(start) {
+        boundary = true
+      }
+    }
+    if boundary {
+      if at > start {
+        run runs.append(
+          Run {
+            start: start,
+            length: at - start,
+            author: author.get(start),
+            bold: bold.get(start),
+            underline: underline.get(start),
+            caret: Option<usize>.none(),
+          },
+        )
+        start = at
+      }
+      c = 0
+      while c < carets.length() {
+        let caret = carets.get(c)
+        if caret.offset == at {
+          run runs.append(
+            Run {
+              start: at,
+              length: 0,
+              author: caret.player,
+              bold: false,
+              underline: false,
+              caret: Option<usize>.some(caret.player),
+            },
+          )
+        }
+        c = c + 1
+      }
+    }
+    at = at + 1
+  }
+  return move runs
+}
+
+fn px(value: f32) -> Length {
+  return Length.Px { value: value }
+}
+
+fn round(radius: f32) -> Corners<f32> {
+  return Corners<f32> { topLeft: radius, topRight: radius, bottomRight: radius, bottomLeft: radius }
+}
+
+fn padding(ui: &mut Ui<Message>, vertical: f32, horizontal: f32) -> () {
+  ui.style(
+    &[
+      Property.Padding { side: Side.Top, value: px(vertical) },
+      Property.Padding { side: Side.Bottom, value: px(vertical) },
+      Property.Padding { side: Side.Left, value: px(horizontal) },
+      Property.Padding { side: Side.Right, value: px(horizontal) },
+    ],
+  )
+}
+
+fn border(ui: &mut Ui<Message>, width: f32, color: Rgba<f32>) -> () {
+  ui.style(
+    &[
+      Property.BorderWidth { side: Side.Top, value: width },
+      Property.BorderWidth { side: Side.Right, value: width },
+      Property.BorderWidth { side: Side.Bottom, value: width },
+      Property.BorderWidth { side: Side.Left, value: width },
+      Property.BorderStyle { value: BorderStyle.Solid },
+      Property.BorderColor { color: color },
+    ],
+  )
+}
+
+/// Person `index`'s color at `value` brightness.
+fn tint(index: usize, saturation: f32, value: f32, alpha: f32) -> Rgba<f32> {
+  return hsv(playerHue(index), saturation, value, alpha)
+}
+
+// A short name for a version: four hex digits folded from its tips.
+fn versionDigits(frontier: &Frontier) -> u64 {
+  // 32-bit FNV-1a over the tips' numbers; products stay below 2^56.
+  let mut hash: u64 = 2166136261
+  let tips = frontier.tips()
+  let mut k: usize = 0
+  while k < tips.length {
+    hash = u64.bitAnd(
+      u64.bitXor(hash, u64.bitAnd(tips[k].lamport, 4294967295)) * 16777619,
+      4294967295,
+    )
+    hash = u64.bitAnd(
+      u64.bitXor(hash, u64.bitAnd(tips[k].actor, 4294967295)) * 16777619,
+      4294967295,
+    )
+    k = k + 1
+  }
+  return u64.bitAnd(u64.bitXor(hash, u64.shiftRight(hash, 16)), 65535)
+}
+
+fn hexText(ui: &mut Ui<Message>, value: u64) -> () {
+  let mut shift: u64 = 12
+  while true {
+    let digit = u64.toUsize(u64.bitAnd(u64.shiftRight(value, shift), 15))
+    ui.text(String.slice(HEX, digit, 1))
+    if shift == 0 {
+      break
+    }
+    shift = shift - 4
+  }
+}
+
+fn pill(ui: &mut Ui<Message>, background: Rgba<f32>, color: Rgba<f32>) -> () {
+  padding(&mut ui, 3.0, 9.0)
+  ui.style(
+    &[
+      Property.BorderRadius { value: round(999.0) },
+      Property.BackgroundColor { color: background },
+      Property.Color { color: color },
+      Property.FontSize { value: 12.0 },
+      Property.FontWeight { value: 700.0 },
+    ],
+  )
+}
+
+fn caretView(ui: &mut Ui<Message>, player: usize, own: bool, time: f32) -> () {
+  ui.box(
+    |ui| {
+      let blink: f32 = if own {
+        0.55 + 0.45 * f32.cos(time * 6.0)
+      } else {
+        1.0
+      }
+      ui.style(
+        &[
+          Property.Display { value: Display.InlineBlock },
+          Property.Position { value: Position.Relative },
+          Property.Width { value: px(2.0) },
+          Property.Height { value: px(19.0) },
+          Property.Margin { side: Side.Left, value: px(-1.0) },
+          Property.Margin { side: Side.Right, value: px(-1.0) },
+          Property.BackgroundColor { color: tint(player, 0.75, 1.0, blink) },
+        ],
+      )
+      if !own {
+        ui.box(
+          |ui| {
+            ui.style(
+              &[
+                Property.Position { value: Position.Absolute },
+                Property.Inset { side: Side.Bottom, value: px(17.0) },
+                Property.Inset { side: Side.Left, value: px(0.0) },
+                Property.Padding { side: Side.Left, value: px(4.0) },
+                Property.Padding { side: Side.Right, value: px(4.0) },
+                Property.BorderRadius {
+                  value: Corners<f32> {
+                    topLeft: 4.0,
+                    topRight: 4.0,
+                    bottomRight: 4.0,
+                    bottomLeft: 0.0,
+                  },
+                },
+                Property.BackgroundColor { color: tint(player, 0.75, 1.0, 1.0) },
+                Property.Color { color: rgb(0x0B0A14) },
+                Property.FontSize { value: 9.5 },
+                Property.FontWeight { value: 800.0 },
+                Property.LineHeight { value: LineHeight.Number { value: 1.4 } },
+                Property.WhiteSpace { value: WhiteSpace.Pre },
+              ],
+            )
+            ui.text(playerName(player))
+          },
+        )
+      }
+    },
+  )
+}
+
+fn documentView(
+  ui: &mut Ui<Message>,
+  text: &String,
+  runs: &List<Run>,
+  owner: usize,
+  time: f32,
+) -> () {
+  ui.box(
+    |ui| {
+      ui.grow(1.0)
+      ui.style(
+        &[
+          Property.WhiteSpace { value: WhiteSpace.PreWrap },
+          Property.FontSize { value: 15.0 },
+          Property.LineHeight { value: LineHeight.Number { value: 1.4 } },
+          Property.Padding { side: Side.Top, value: px(6.0) },
+          Property.OverflowY { value: Overflow.Hidden },
+        ],
+      )
+      let bytes = String.utf8Bytes(text.view())
+      let mut r: usize = 0
+      while r < runs.length() {
+        let piece = runs.get(r)
+        match piece.caret {
+          Option<usize>.Some { value } => caretView(&mut ui, value, value == owner, time)
+          Option<usize>.None => {
+            let part = String.fromUtf8(Slice.view(bytes, piece.start, piece.length))
+              |> Result<string, InvalidUtf8>.unwrapOr("")
+            ui.box(
+              |ui| {
+                ui.style(
+                  &[
+                    Property.Display { value: Display.Inline },
+                    Property.Color { color: tint(piece.author, 0.42, 1.0, 1.0) },
+                  ],
+                )
+                if piece.bold {
+                  ui.style(&[Property.FontWeight { value: 800.0 }])
+                }
+                if piece.underline {
+                  let line = DecorationLine { underline: true, overline: false, lineThrough: false }
+                  ui.style(&[Property.TextDecorationLine { value: line }])
+                }
+                ui.text(part)
+              },
+            )
+          }
+        }
+        r = r + 1
+      }
+    },
+  )
+}
+
+fn cardView(ui: &mut Ui<Message>, stage: &Stage, index: usize) -> () {
+  let player = &stage.players.asSlice()[index]
+  let time = f64.toF32(stage.clock)
+  let text = ui.alloc(readOf(&player.document))
+  let runs = ui.alloc(runsFor(&stage.players, index))
+  let intro = ease((time - 0.08 * usize.toF32(index)) / 0.6)
+  let flash = f32.max(0.0, 1.0 - f64.toF32(stage.clock - player.receivedAt) / 0.7)
+  ui.column(
+    |ui| {
+      ui.style(
+        &[
+          Property.Width { value: px(356.0) },
+          Property.Height { value: px(238.0) },
+          Property.BorderRadius { value: round(18.0) },
+          Property.BackgroundGradient {
+            angle: 160.0,
+            from: rgba(0x1F1A3A, 0.92),
+            to: rgba(0x0E0C1C, 0.92),
+          },
+          Property.BoxShadow {
+            value: BoxShadow {
+              offsetX: 0.0,
+              offsetY: 0.0,
+              blur: 6.0 + 28.0 * flash,
+              spread: 0.0,
+              color: tint(index, 0.8, 1.0, 0.15 + 0.5 * flash),
+              inset: false,
+            },
+          },
+          Property.OverflowX { value: Overflow.Hidden },
+          Property.OverflowY { value: Overflow.Hidden },
+        ],
+      )
+      if player.online {
+        border(&mut ui, 1.0, tint(index, 0.5, 1.0, 0.22 + 0.6 * flash))
+        ui.style(&[Property.Opacity { value: intro }])
+      } else {
+        border(&mut ui, 1.0, rgba(0xF5B041, 0.55))
+        ui.style(&[Property.Opacity { value: 0.78 * intro }])
+      }
+      if intro < 1.0 {
+        ui.style(&[Property.Margin { side: Side.Top, value: px(18.0 * (1.0 - intro)) }])
+      }
+      padding(&mut ui, 12.0, 16.0)
+      ui.gap(4.0)
+      ui.row(
+        |ui| {
+          ui.gap(10.0)
+          ui.style(&[Property.AlignItems { value: Align.Center }])
+          ui.box(
+            |ui| {
+              ui.style(
+                &[
+                  Property.Width { value: px(28.0) },
+                  Property.Height { value: px(28.0) },
+                  Property.BorderRadius { value: round(14.0) },
+                  Property.BackgroundGradient {
+                    angle: 135.0,
+                    from: tint(index, 0.55, 1.0, 1.0),
+                    to: tint(index, 0.85, 0.85, 1.0),
+                  },
+                  Property.Color { color: rgb(0x0B0A14) },
+                  Property.FontWeight { value: 900.0 },
+                  Property.FontSize { value: 14.0 },
+                  Property.JustifyContent { value: Align.Center },
+                  Property.AlignItems { value: Align.Center },
+                  Property.Display { value: Display.Flex },
+                ],
+              )
+              ui.text(String.slice(playerName(index), 0, 1))
+            },
+          )
+          ui.box(
+            |ui| {
+              ui.grow(1.0)
+              ui.style(&[Property.FontWeight { value: 700.0 }, Property.FontSize { value: 15.0 }])
+              ui.text(playerName(index))
+            },
+          )
+          ui.box(
+            |ui| {
+              ui.style(
+                &[
+                  Property.FontFamily { family: MONO },
+                  Property.FontSize { value: 11.0 },
+                  Property.Color { color: white(0.42) },
+                ],
+              )
+              ui.text("v ")
+              hexText(&mut ui, versionDigits(player.document.frontier()))
+            },
+          )
+          ui.box(
+            |ui| {
+              if player.online {
+                pill(&mut ui, rgba(0x2ECC71, 0.16), rgb(0x6EE7A0))
+                ui.text("live")
+              } else {
+                pill(&mut ui, rgba(0xF5B041, 0.18), rgb(0xF8C471))
+                ui.text("offline  ")
+                ui.number(u64.toI64(usize.toU64(player.client.unsent(&player.document))))
+                ui.text(" unsent")
+              }
+            },
+          )
+        },
+      )
+      documentView(&mut ui, &text, &runs, index, time)
+    },
+  )
+}
+
+fn statView(ui: &mut Ui<Message>, label: string, value: usize, color: Rgba<f32>) -> () {
+  ui.column(
+    |ui| {
+      ui.style(&[Property.AlignItems { value: Align.End }])
+      ui.box(
+        |ui| {
+          ui.style(
+            &[
+              Property.FontFamily { family: MONO },
+              Property.FontSize { value: 26.0 },
+              Property.Color { color: color },
+            ],
+          )
+          ui.number(u64.toI64(usize.toU64(value)))
+        },
+      )
+      ui.box(
+        |ui| {
+          ui.style(
+            &[
+              Property.FontSize { value: 11.0 },
+              Property.FontWeight { value: 700.0 },
+              Property.Color { color: white(0.45) },
+            ],
+          )
+          ui.text(label)
+        },
+      )
+    },
+  )
+}
+
+fn historyView(ui: &mut Ui<Message>, stage: &Stage) -> () {
+  let document = match stage.server.find(DOC) {
+    Option<&Document>.Some { value } => value
+    Option<&Document>.None => {
+      return ()
+    }
+  }
+  let count = document.deltaCount()
+  let room: f32 = 1208.0
+  let width: f32 = if count == 0 {
+    8.0
+  } else {
+    f32.min(8.0, room / usize.toF32(count))
+  }
+  ui.row(
+    |ui| {
+      ui.style(
+        &[
+          Property.Height { value: px(18.0) },
+          Property.AlignItems { value: Align.End },
+          Property.OverflowX { value: Overflow.Hidden },
+        ],
+      )
+      let mut seq: usize = 0
+      while seq < count {
+        let delta = document.delta(seq)
+        let who = u64.toUsize(delta.id.actor) - 1
+        let fresh = f32.max(0.0, 1.0 - usize.toF32(count - 1 - seq) / 12.0)
+        ui.box(
+          |ui| {
+            ui.style(
+              &[
+                Property.Width { value: px(width) },
+                Property.Height { value: px(10.0 + 8.0 * fresh) },
+                Property.FlexShrink { value: 0.0 },
+                Property.BackgroundColor { color: tint(who, 0.7, 1.0, 0.55 + 0.45 * fresh) },
+              ],
+            )
+          },
+        )
+        seq = seq + 1
+      }
+    },
+  )
+}
+
+impl App<Message, NoCommand> for Stage {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.style(
+      &[
+        Property.FontFamily { family: SANS },
+        Property.Color { color: white(1.0) },
+        Property.BackgroundGradient { angle: 160.0, from: rgb(0x150E33), to: rgb(0x05040C) },
+        Property.OverflowX { value: Overflow.Hidden },
+        Property.OverflowY { value: Overflow.Hidden },
+      ],
+    )
+    padding(&mut ui, 26.0, 36.0)
+    ui.gap(14.0)
+
+    // The title and the numbers.
+    ui.row(
+      |ui| {
+        ui.style(&[Property.AlignItems { value: Align.End }])
+        ui.gap(28.0)
+        ui.column(
+          |ui| {
+            ui.grow(1.0)
+            ui.gap(4.0)
+            ui.box(
+              |ui| {
+                ui.style(
+                  &[
+                    Property.FontSize { value: 12.0 },
+                    Property.FontWeight { value: 700.0 },
+                    Property.Color { color: white(0.55) },
+                  ],
+                )
+                ui.text("SILK  ·  RICH TEXT CRDT")
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.style(
+                  &[
+                    Property.FontSize { value: 34.0 },
+                    Property.FontWeight { value: 900.0 },
+                    Property.LineHeight { value: LineHeight.Number { value: 1.1 } },
+                  ],
+                )
+                ui.text("Six people. One document. No locks.")
+              },
+            )
+          },
+        )
+        let synced = self.inSync()
+        let total = self.serverDeltas()
+        let away = self.offline()
+        statView(&mut ui, "DELTAS", total, white(0.92))
+        statView(
+          &mut ui,
+          "OFFLINE",
+          away,
+          if away > 0 {
+            rgb(0xF8C471)
+          } else {
+            white(0.92)
+          },
+        )
+        statView(
+          &mut ui,
+          "IN SYNC",
+          synced,
+          if synced == PLAYERS {
+            rgb(0x6EE7A0)
+          } else {
+            white(0.92)
+          },
+        )
+      },
+    )
+
+    // The six copies.
+    ui.row(
+      |ui| {
+        ui.gap(14.0)
+        ui.style(&[Property.FlexWrap { value: FlexWrap.Wrap }])
+        let mut p: usize = 0
+        while p < self.players.length() {
+          cardView(&mut ui, &self, p)
+          p = p + 1
+        }
+      },
+    )
+
+    // The server's history, one bar per delta in its author's color.
+    ui.column(
+      |ui| {
+        ui.gap(6.0)
+        ui.row(
+          |ui| {
+            ui.style(
+              &[
+                Property.FontSize { value: 11.0 },
+                Property.FontWeight { value: 700.0 },
+                Property.Color { color: white(0.45) },
+              ],
+            )
+            ui.box(
+              |ui| {
+                ui.grow(1.0)
+                ui.text("SERVER HISTORY  ·  ONE BAR PER DELTA, IN ITS AUTHOR'S COLOR")
+              },
+            )
+            ui.box(
+              |ui| {
+                let done = self.inSync() == PLAYERS && self.next >= self.steps.length()
+                if done {
+                  ui.style(&[Property.Color { color: rgb(0x6EE7A0) }])
+                  ui.text("ALL SIX COPIES MATCH")
+                } else {
+                  ui.style(&[Property.Opacity { value: 0.0 }])
+                  ui.text("-")
+                }
+              },
+            )
+          },
+        )
+        historyView(&mut ui, &self)
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Frame { time } => {
+        if !self.started {
+          self.started = true
+          self.start = time
+        }
+        let clock = f64.min(time - self.start, LENGTH)
+        cx.alloc(self.advance(clock))
+      }
+      Message.Resize { width, height } => {
+        self.width = width
+        self.height = height
+      }
+      Message.Restart => {
+        let fresh = cx.alloc(Stage.make(self.width, self.height))
+        self.* = move fresh
+      }
+    }
+  }
+
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
+    subs.animationFrame(1, |time| Message.Frame { time: time })
+    subs.resize(2, |width, height| Message.Resize { width: width, height: height })
+    subs.keyBinding(3, "r", 0, || Message.Restart)
+  }
+}
