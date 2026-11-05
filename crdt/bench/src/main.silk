@@ -1,0 +1,217 @@
+//! `crdt-bench [SIZE]` times the crdt workloads on a document typed by a seeded script and prints
+//! one line per workload: its name, milliseconds, and a checksum that must not change when only
+//! speed does. Build with `--release`; `crdt/bench/run` does.
+import core.clock { Frontier }
+import core.doc { Document }
+import core.rich { Expand, RichText }
+import core.store { load, MemoryStore, save, Store, StoreError }
+import core.codec { DecodeError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.format { Format }
+import silk.text.string { String }
+
+const BODY: u64 = 1
+
+type Failures = OutOfMemoryError | WriterError | StoreError | DecodeError | HostInputError
+
+struct Random {
+  state: u64,
+}
+
+impl Random {
+  fn next(self: &mut Self) -> u64 {
+    let mut x = self.state
+    x = u64.bitXor(x, u64.shiftLeft(x, 13))
+    x = u64.bitXor(x, u64.shiftRight(x, 7))
+    x = u64.bitXor(x, u64.shiftLeft(x, 17))
+    self.state = x
+    return x
+  }
+
+  fn below(self: &mut Self, bound: usize) -> usize {
+    if bound == 0 {
+      return 0
+    }
+    return u64.toUsize(self.next() % usize.toU64(bound))
+  }
+}
+
+// Someone writing: words typed a byte at a time at a place picked now and then, a few
+// backspaces, and a bold or underline over a recent word. One commit per word.
+effect fn write(size: usize, actor: u64, seed: u64) -> Document
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut document = run Document.make(actor)
+  let mut random = Random { state: seed }
+  let letters = String.utf8Bytes("etaoinshrdlucmfwypvbgkjqxz")
+  let mut caret: usize = 0
+  while document.textLength(BODY) < size {
+    if random.below(8) == 0 {
+      caret = random.below(document.textLength(BODY) + 1)
+    }
+    let word = 2 + random.below(8)
+    let mut k: usize = 0
+    while k < word {
+      run document.insertText(BODY, caret, Slice.view(letters, random.below(26), 1))
+      caret = caret + 1
+      k = k + 1
+    }
+    run document.insertText(BODY, caret, String.utf8Bytes(" "))
+    caret = caret + 1
+    let choice = random.below(10)
+    if choice == 0 && caret > 2 {
+      run document.deleteText(BODY, caret - 2, 2)
+      caret = caret - 2
+    } else if choice == 1 && caret > word {
+      run document.mark(
+        BODY,
+        caret - word - 1,
+        word,
+        1 + u64.toU32(usize.toU64(random.below(2))),
+        String.utf8Bytes("1"),
+        Expand.End,
+      )
+    }
+    drop run document.commit()
+  }
+  return move document
+}
+
+effect fn millisecondsSince(start: &Instant) -> i64
+  ? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  let seconds = SystemClock.seconds(&now) - SystemClock.seconds(start)
+  let nanoseconds = SystemClock.nanoseconds(&now) - SystemClock.nanoseconds(start)
+  return seconds * 1000 + nanoseconds / 1000000
+}
+
+effect fn report(name: string, start: &Instant, checksum: usize) -> ()
+  ! WriterError
+  ? &mut MonotonicClock {
+  let ms = run millisecondsSince(start)
+  let mut out = StdoutWriter.make()
+  run Format.format(
+    "{name} {ms} ms  checksum {checksum}\n",
+    &.{ name: name, ms: ms, checksum: checksum },
+  )
+    |> Effect.provideMut<Writer>(&mut out)
+}
+
+effect fn sizeArgument() -> usize
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  if (run HostInput.argumentCount()) < 2 {
+    return 20000
+  }
+  let raw = run HostInput.argument(1)
+  if let Option<Bytes>.Some { value } = move raw {
+    let digits = Bytes.asSlice(&value)
+    let mut number: usize = 0
+    let mut k: usize = 0
+    while k < digits.length {
+      number = number * 10 + u8.toUsize(digits[k]) - 48
+      k = k + 1
+    }
+    return number
+  }
+  return 20000
+}
+
+effect fn workloads() -> ()
+  ! Failures
+  ? &mut HostInput | &mut Allocator | &mut MonotonicClock {
+  let size = run sizeArgument()
+
+  let mut start = run MonotonicClock.now()
+  let document = run write(size, 1, 88172645463325252)
+  run report("type", &start, document.textLength(BODY))
+
+  start = run MonotonicClock.now()
+  let mut other = run Document.make(2)
+  let mut d: usize = 0
+  while d < document.deltaCount() {
+    let copy = run document.delta(d).copy()
+    drop run other.apply(move copy)
+    d = d + 1
+  }
+  run report("remote", &start, other.textLength(BODY))
+
+  start = run MonotonicClock.now()
+  let mut total: usize = 0
+  let mut c: usize = 0
+  while c < 50 {
+    let seq = document.deltaCount() - 1 - (c * 7919) % document.deltaCount()
+    let version = run Frontier.single(document.delta(seq).id)
+    let past = run document.checkout(&version, 9)
+    total = total + past.textLength(BODY)
+    c = c + 1
+  }
+  run report("checkout x50", &start, total)
+
+  start = run MonotonicClock.now()
+  let mut shown: usize = 0
+  let mut t: usize = 0
+  while t < 50 {
+    let seq = document.deltaCount() - 1 - (t * 7919) % document.deltaCount()
+    let version = run Frontier.single(document.delta(seq).id)
+    let rich = run document.textAt(BODY, &version)
+    shown = shown + rich.length()
+    t = t + 1
+  }
+  run report("textAt x50", &start, shown)
+
+  start = run MonotonicClock.now()
+  let mut spans: usize = 0
+  let mut s: usize = 0
+  while s < 100 {
+    let rich = match document.text(BODY) {
+      Option<&RichText>.Some { value } => value
+      Option<&RichText>.None => Intrinsic.trap("bench: no text")
+    }
+    let list = run rich.spans()
+    spans = spans + list.length()
+    s = s + 1
+  }
+  run report("spans x100", &start, spans)
+
+  start = run MonotonicClock.now()
+  let mut memory = MemoryStore.make()
+  drop run save(&document, 1, 0) |> Effect.provideMut<Store>(&mut memory)
+  let loaded = run load(1, 3) |> Effect.provideMut<Store>(&mut memory)
+  run report("save+load", &start, loaded.textLength(BODY))
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+effect fn guarded() -> i32
+  ! Failures
+  ? &mut HostInput | &mut Allocator | &mut MonotonicClock {
+  run workloads()
+  return 0
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catchAll(guarded(), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

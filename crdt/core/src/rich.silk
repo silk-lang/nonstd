@@ -15,7 +15,8 @@
 //! object replacement character (U+FFFC) carrying a mark under [`EMBED`] whose value is the
 //! embed's data.
 import clock { DeltaId }
-import text { CharId, DeleteOp, InsertOp, Text }
+import codec { DecodeError, Reader, Writer }
+import text { CharId, decodeChar, DeleteOp, encodeChar, InsertOp, Text, TextVersion }
 import silk.collections.hash { Hash }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
@@ -23,6 +24,8 @@ import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
 
@@ -133,12 +136,22 @@ struct Cover {
 
 impl Copy for Cover {}
 
+/// A version of a rich text kept with [`RichText.version`].
+pub struct RichVersion {
+  text: TextVersion,
+  marks: usize,
+  values: usize,
+}
+
+impl Copy for RichVersion {}
+
 /// One replica of a rich text.
 pub struct RichText {
   plain: Text,
   marks: List<Mark>,
   known: HashMap<DeltaId, usize>,
   values: List<u8>,
+  changes: u64,
 }
 
 impl RichText {
@@ -149,7 +162,98 @@ impl RichText {
       marks: List<Mark>.make(),
       known: HashMap<DeltaId, usize>.make(Hash.seed(14695981039346656037)),
       values: List<u8>.make(),
+      changes: 0,
     }
+  }
+
+  /// A number that grows with every change to this rich text, so a caller can keep the result
+  /// of [`RichText.spans`] or [`RichText.read`] until it moves.
+  pub fn revision(self: &Self) -> u64 {
+    return self.changes
+  }
+
+  /// Keeps this rich text as it is now; see [`Text.version`].
+  pub fn version(self: &mut Self) -> RichVersion {
+    return RichVersion {
+      text: self.plain.version(),
+      marks: self.marks.length(),
+      values: self.values.length(),
+    }
+  }
+
+  /// A new rich text holding `version` of this one; see [`Text.restore`].
+  pub effect fn restore(self: &Self, version: RichVersion) -> RichText
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut past = RichText.make()
+    past.plain = run self.plain.restore(version.text)
+    run past.marks.appendSlice(Slice.view(self.marks.asSlice(), 0, version.marks))
+    run past.values.appendSlice(Slice.view(self.values.asSlice(), 0, version.values))
+    let mut k: usize = 0
+    while k < version.marks {
+      drop run past.known.insert(past.marks.get(k).id, k)
+      k = k + 1
+    }
+    return move past
+  }
+
+  /// Appends `version` of this rich text to `out`, to rebuild with [`RichText.decode`].
+  pub effect fn encodeVersion(self: &Self, version: RichVersion, out: &mut Writer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.plain.encodeVersion(version.text, &mut out)
+    run out.size(version.marks)
+    let mut k: usize = 0
+    while k < version.marks {
+      let mark = self.marks.get(k)
+      run out.id(mark.id)
+      run out.number(u32ToU64(mark.key))
+      run encodeAnchor(mark.start, &mut out)
+      run encodeAnchor(mark.end, &mut out)
+      run out.flag(mark.remove)
+      run out.data(Slice.view(self.values.asSlice(), mark.valueStart, mark.valueLength))
+      k = k + 1
+    }
+  }
+
+  /// A rich text read from what [`RichText.encodeVersion`] wrote.
+  pub effect fn decode(input: &mut Reader) -> RichText
+    ! DecodeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut rich = RichText.make()
+    rich.plain = run Text.decode(&mut input)
+    let count = run input.size()
+    let mut k: usize = 0
+    while k < count {
+      let id = run input.id()
+      let key = run input.number()
+      if key > 4294967295 {
+        fail DecodeError {}
+      }
+      let start = run decodeAnchor(&mut input)
+      let end = run decodeAnchor(&mut input)
+      let remove = run input.flag()
+      let value = run input.data()
+      if rich.known.contains(id) {
+        fail DecodeError {}
+      }
+      let valueStart = rich.values.length()
+      run rich.values.appendSlice(value)
+      drop run rich.known.insert(id, rich.marks.length())
+      run rich.marks.append(
+        Mark {
+          id: id,
+          key: u64ToU32(key),
+          start: start,
+          end: end,
+          remove: remove,
+          valueStart: valueStart,
+          valueLength: value.length,
+        },
+      )
+      k = k + 1
+    }
+    return move rich
   }
 
   /// The plain text under the marks.
@@ -178,25 +282,37 @@ impl RichText {
   pub effect fn insert(self: &mut Self, id: DeltaId, offset: usize, bytes: &[u8]) -> InsertOp
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.changes = self.changes + 1
     return run self.plain.insert(id, offset, bytes)
+  }
+
+  /// Grows insertion `id` with bytes typed right after it; see [`Text.extend`].
+  pub effect fn extend(self: &mut Self, id: DeltaId, offset: usize, bytes: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.changes = self.changes + 1
+    return run self.plain.extend(id, offset, bytes)
   }
 
   /// Deletes visible bytes; see [`Text.delete`]. Marks over them stay and cover nothing visible.
   pub effect fn delete(self: &mut Self, offset: usize, length: usize) -> DeleteOp
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.changes = self.changes + 1
     return run self.plain.delete(offset, length)
   }
 
   pub effect fn applyInsert(self: &mut Self, op: &InsertOp) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.changes = self.changes + 1
     run self.plain.applyInsert(op)
   }
 
   pub effect fn applyDelete(self: &mut Self, op: &DeleteOp) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.changes = self.changes + 1
     run self.plain.applyDelete(op)
   }
 
@@ -261,6 +377,7 @@ impl RichText {
     if self.known.contains(op.id) {
       return ()
     }
+    self.changes = self.changes + 1
     let valueStart = self.values.length()
     run self.values.appendSlice(op.value.asSlice())
     let mark = Mark {
@@ -311,9 +428,11 @@ impl RichText {
 
     // Where each mark starts and stops among all bytes, and every place the attributes may change.
     let mut covers = List<Cover>.make()
+    let mut froms = List<usize>.make()
+    let mut tos = List<usize>.make()
     let mut cuts = List<usize>.make()
-    run insertSorted(&mut cuts, 0)
-    run insertSorted(&mut cuts, total)
+    run cuts.append(0)
+    run cuts.append(total)
     let mut m: usize = 0
     while m < self.marks.length() {
       let mark = self.marks.get(m)
@@ -323,12 +442,21 @@ impl RichText {
         to = from
       }
       run covers.append(Cover { from: from, to: to })
-      run insertSorted(&mut cuts, from)
-      run insertSorted(&mut cuts, to)
+      run froms.append(from)
+      run tos.append(to)
+      run cuts.append(from)
+      run cuts.append(to)
       m = m + 1
     }
+    run cuts.sort()
+    let byStart = run orderBy(&froms)
+    let byEnd = run orderBy(&tos)
 
-    // Walk the cuts and the fragments together, turning each piece between cuts into visible bytes.
+    // Sweep the cuts in order, keeping the marks that cover the current piece, and walk the
+    // fragments alongside, turning each piece between cuts into visible bytes.
+    let mut active = List<usize>.make()
+    let mut nextStart: usize = 0
+    let mut nextEnd: usize = 0
     let mut spans = List<Span>.make()
     let mut piece: usize = 0
     let mut pieceStart: usize = 0
@@ -338,6 +466,26 @@ impl RichText {
     while c + 1 < cuts.length() {
       let from = cuts.get(c)
       let to = cuts.get(c + 1)
+      c = c + 1
+      if to == from {
+        continue
+      }
+      while nextStart < byStart.length() && froms.get(byStart.get(nextStart)) <= from {
+        run active.append(byStart.get(nextStart))
+        nextStart = nextStart + 1
+      }
+      while nextEnd < byEnd.length() && tos.get(byEnd.get(nextEnd)) <= from {
+        let ended = byEnd.get(nextEnd)
+        let mut a: usize = 0
+        while a < active.length() {
+          if active.get(a) == ended {
+            drop active.remove(a)
+            break
+          }
+          a = a + 1
+        }
+        nextEnd = nextEnd + 1
+      }
       let first = visible
       while position < to {
         let fragment = self.plain.pieceAt(piece)
@@ -356,42 +504,84 @@ impl RichText {
         }
       }
       if visible > first {
-        let attrs = run self.attrsOver(&covers, from)
+        let attrs = run self.attrsOf(&active)
         run appendSpan(&mut spans, first, visible - first, move attrs)
       }
-      c = c + 1
     }
     return move spans
   }
 
   // The winning attributes on bytes from `at` up to the next cut, sorted by key.
-  effect fn attrsOver(self: &Self, covers: &List<Cover>, at: usize) -> List<Attr>
+  /// The same runs as [`RichText.spans`], found by checking every mark at every byte. It is slow
+  /// and exists so tests can check `spans` against it.
+  pub effect fn spansByScan(self: &Self) -> List<Span>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let total = self.plain.totalLength()
+    let mut froms = List<usize>.make()
+    let mut tos = List<usize>.make()
+    let mut m: usize = 0
+    while m < self.marks.length() {
+      let mark = self.marks.get(m)
+      run froms.append(clamp(self.pointOf(mark.start) / 2, total))
+      run tos.append(clamp(self.pointOf(mark.end) / 2, total))
+      m = m + 1
+    }
+    let mut spans = List<Span>.make()
+    let mut index: usize = 0
+    let mut visible: usize = 0
+    let mut piece: usize = 0
+    while index < total {
+      let fragment = self.plain.pieceAt(piece)
+      let mut k: usize = 0
+      while k < fragment.chars.length {
+        if !fragment.deleted {
+          let mut active = List<usize>.make()
+          let mut n: usize = 0
+          while n < self.marks.length() {
+            if froms.get(n) <= index + k && index + k < tos.get(n) {
+              run active.append(n)
+            }
+            n = n + 1
+          }
+          let attrs = run self.attrsOf(&active)
+          run appendSpan(&mut spans, visible, 1, move attrs)
+          visible = visible + 1
+        }
+        k = k + 1
+      }
+      index = index + fragment.chars.length
+      piece = piece + 1
+    }
+    return move spans
+  }
+
+  // The attributes the marks in `active` give: on each key, the mark with the highest id.
+  effect fn attrsOf(self: &Self, active: &List<usize>) -> List<Attr>
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut winners = List<usize>.make()
-    let mut m: usize = 0
-    while m < self.marks.length() {
-      let cover = covers.get(m)
-      if cover.from <= at && at < cover.to {
-        let mark = self.marks.get(m)
-        let mut found = false
-        let mut w: usize = 0
-        while w < winners.length() {
-          let other = self.marks.get(winners.get(w))
-          if other.key == mark.key {
-            found = true
-            if other.id.before(&mark.id) {
-              winners.set(w, m)
-            }
-            break
+    let mut k: usize = 0
+    while k < active.length() {
+      let m = active.get(k)
+      let mark = self.marks.get(m)
+      let mut found = false
+      let mut w: usize = 0
+      while w < winners.length() {
+        let other = self.marks.get(winners.get(w))
+        if other.key == mark.key {
+          found = true
+          if other.id.before(&mark.id) {
+            winners.set(w, m)
           }
-          w = w + 1
+          break
         }
-        if !found {
-          run winners.append(m)
-        }
+        w = w + 1
       }
-      m = m + 1
+      if !found {
+        run winners.append(m)
+      }
+      k = k + 1
     }
     let mut attrs = List<Attr>.make()
     let mut w: usize = 0
@@ -468,17 +658,49 @@ fn clamp(value: usize, limit: usize) -> usize {
   return value
 }
 
-effect fn insertSorted(list: &mut List<usize>, value: usize) -> ()
+// The indexes of `values` in the order of their values, ties in index order (a merge sort).
+effect fn orderBy(values: &List<usize>) -> List<usize>
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut at = list.length()
-  while at > 0 && list.get(at - 1) > value {
-    at = at - 1
+  let count = values.length()
+  let mut order = List<usize>.make()
+  let mut spare = List<usize>.make()
+  let mut k: usize = 0
+  while k < count {
+    run order.append(k)
+    run spare.append(k)
+    k = k + 1
   }
-  if at > 0 && list.get(at - 1) == value {
-    return ()
+  let mut width: usize = 1
+  while width < count {
+    let mut low: usize = 0
+    while low < count {
+      let middle = clamp(low + width, count)
+      let high = clamp(low + 2 * width, count)
+      let mut left = low
+      let mut right = middle
+      let mut out = low
+      while out < high {
+        if left < middle
+          && (right >= high || values.get(order.get(left)) <= values.get(order.get(right))) {
+          spare.set(out, order.get(left))
+          left = left + 1
+        } else {
+          spare.set(out, order.get(right))
+          right = right + 1
+        }
+        out = out + 1
+      }
+      low = high
+    }
+    let mut copy: usize = 0
+    while copy < count {
+      order.set(copy, spare.get(copy))
+      copy = copy + 1
+    }
+    width = width * 2
   }
-  run list.insert(at, value)
+  return move order
 }
 
 fn sameAttrs(left: &List<Attr>, right: &List<Attr>) -> bool {
@@ -510,4 +732,35 @@ effect fn appendSpan(spans: &mut List<Span>, start: usize, length: usize, attrs:
     }
   }
   run spans.append(Span { start: start, length: length, attrs: move attrs })
+}
+
+/// Appends an anchor to `out`.
+pub effect fn encodeAnchor(anchor: Anchor, out: &mut Writer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run encodeChar(anchor.char, &mut out)
+  let after = match anchor.side {
+    Side.Before => false
+    Side.After => true
+  }
+  run out.flag(after)
+}
+
+/// Reads an anchor written by [`encodeAnchor`].
+pub effect fn decodeAnchor(input: &mut Reader) -> Anchor
+  ! DecodeError {
+  let char = run decodeChar(&mut input)
+  let after = run input.flag()
+  if after {
+    return Anchor.after(char)
+  }
+  return Anchor.before(char)
+}
+
+fn u32ToU64(value: u32) -> u64 {
+  return u32.toU64(value)
+}
+
+fn u64ToU32(value: u64) -> u32 {
+  return u64.toU32(value)
 }
