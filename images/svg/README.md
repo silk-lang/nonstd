@@ -103,7 +103,7 @@ writes nothing unless parsing, rendering and encoding all succeed.
 | `graphics/vector` | `graphics-vector` | The pure-Silk 2D rasterizer ([README](../../graphics/vector/README.md)) |
 | `graphics/gpu_scene` | `graphics-gpu-scene` | Draws `vector` scenes on WebGPU, byte-identical to the CPU ([README](../../graphics/gpu_scene/README.md)) |
 
-XML parsing is [text-xml](../../text/xml) and CSS is [css-style](../../css/style). Text measurement
+XML parsing is the standard library's `silk.xml.document` and CSS is [css-style](../../css/style). Text measurement
 uses [font-parse](../../font/parse).
 
 ## Tests

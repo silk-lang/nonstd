@@ -39,13 +39,6 @@ directly into the final IDAT payload, without copying a compressed buffer.
 The bound depends on the documented dev.27 algorithm and must be reconsidered
 when upgrading; replace it with a checked stdlib API when available.
 
-## LIMITATION-4 — no stdlib XML parser
-
-Filed [silk-lang/silk#2563](https://github.com/silk-lang/silk/issues/2563).
-`svg_xml` owns the bounded, nonvalidating XML/namespace implementation. It uses
-stdlib collections and UTF-8 support, not a C parser. Resource and error policies
-are in [SPECIFICATIONS.md](SPECIFICATIONS.md#xml-error-and-resource-policy).
-
 ## LIMITATION-5 — no stdlib PNG codec
 
 Filed [silk-lang/silk#2564](https://github.com/silk-lang/silk/issues/2564).

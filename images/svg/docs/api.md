@@ -53,8 +53,8 @@ animations at `RenderOptions.time` (`--time` on the CLI).
 
 To render many frames, `parseAnimated(data, host)` parses the XML, builds the
 document graph and resolves SMIL intervals once. `Animated.frame(options, host)`
-then restores the parsed attribute values (`Document.snapshot` and `restore` in
-`text/xml`), writes the animated values at `options.time`, and styles, resolves
+then restores the parsed attribute values (`XmlDocument.snapshot` and `restore` in
+`silk.xml.document`), writes the animated values at `options.time`, and styles, resolves
 and records again; its display list equals a fresh `parse` and `record` at that
 time, in any time order, and document storage does not grow with the frame count.
 Each image URL is fetched and decoded once and kept while frames use it

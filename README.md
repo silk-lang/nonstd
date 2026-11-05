@@ -23,7 +23,6 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
 | [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |  |
-| [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser | `conformance` |
 | [`examples/git`](examples/git) | `git` | | |
 | [`examples/greet`](examples/greet) | `greet` | | |
 | [`examples/serve`](examples/serve) | `serve` | | |
@@ -121,8 +120,9 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 
 <!-- package-index:end -->
 
-`text/xml` and `packages/cli` are headed for the standard library. The Unicode library that
-lived in `text/ucd` is now part of the standard library as `silk.text`. Programs that use `cli`
+`packages/cli` is headed for the standard library. The Unicode library that lived in `text/ucd`
+is now part of the standard library as `silk.text`, and the XML parser that lived in `text/xml`
+is `silk.xml.document`. Programs that use `cli`
 are in [`examples`](examples).
 
 ## Working in the workspace

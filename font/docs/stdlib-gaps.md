@@ -80,8 +80,8 @@ reproducer as [silk-lang/silk#2565](https://github.com/silk-lang/silk/issues/256
 
 ## 010 — XML and PNG APIs
 
-The pinned stdlib has no XML parser or PNG codec. The original `svg_xml` and
-`svg_image` implementations isolate those responsibilities, reusing stdlib
+The pinned stdlib has no PNG codec (XML is now `silk.xml.document`). The
+`svg_image` implementation isolates that responsibility, reusing stdlib
 collections, Unicode, compression and checksums. Requests with minimal manifests
 and observed missing-module diagnostics:
 [XML #2563](https://github.com/silk-lang/silk/issues/2563) and
