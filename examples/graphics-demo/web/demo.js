@@ -4,8 +4,8 @@
 //
 // Served from the repository root (scripts/browser does that), so the hosts load from their
 // own packages.
-import { WindowHost } from '/platform/window/browser/window-host.js';
-import { WebGPUHost } from '/gpu/webgpu/browser/host.ts';
+import { WindowHost } from '/native/platform/window/browser/window-host.js';
+import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
 
 const STATUS = { RUNNING: 0, PASSED: 1, FAILED: 2, CLOSED: 3 };
 
