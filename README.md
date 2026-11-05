@@ -34,9 +34,9 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | --- | --- | --- | --- |
 | [`crdt/btree`](crdt/btree) | `crdt-btree` | A persistent copy-on-write B+ tree with summaries and seeks; versions share nodes |  |
 | [`crdt/core`](crdt/core) | `crdt-core` | CRDT documents: causal delta graph, rich text, add-wins maps, byte encoding and the Store service |  |
-| [`crdt/server`](crdt/server) | `crdt-server` | The CRDT sync server executable: TCP on localhost, documents in SQLite |  |
-| [`crdt/store-sqlite`](crdt/store-sqlite) | `crdt-store-sqlite` | A crdt-core Store kept in SQLite through db/sqlite |  |
-| [`crdt/sync`](crdt/sync) | `crdt-sync` | CRDT sync in one exchange: transports, clients, memory and stored servers, TCP |  |
+| [`crdt/server`](crdt/server) | `crdt-server` | The CRDT sync server executable: TCP on localhost, documents in SQLite (not a workspace member, see layers.toml) |  |
+| [`crdt/store-sqlite`](crdt/store-sqlite) | `crdt-store-sqlite` | A crdt-core Store kept in SQLite through db/sqlite (not a workspace member, see layers.toml) |  |
+| [`crdt/sync`](crdt/sync) | `crdt-sync` | CRDT sync in one exchange: transports, clients, memory and stored servers, TCP (not a workspace member, see layers.toml) |  |
 | [`db/sqlite`](db/sqlite) | `db-sqlite` | SQLite bindings with prepared statements and transactions, built from the pinned amalgamation |  |
 | [`crdt/bench`](crdt/bench) | `crdt-bench` | | |
 
@@ -112,8 +112,8 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`crdt/demo`](crdt/demo) | `crdt-demo` | Two people editing one rich-text document through an in-process sync server | `app`, `tests` |
-| [`crdt/showcase`](crdt/showcase) | `crdt-showcase` | Six scripted people writing one rich-text document at once, drawn live | `record` |
+| [`crdt/demo`](crdt/demo) | `crdt-demo` | Two people editing one rich-text document through an in-process sync server (not a workspace member, see layers.toml) | `app`, `tests` |
+| [`crdt/showcase`](crdt/showcase) | `crdt-showcase` | Six scripted people writing one rich-text document at once, drawn live (not a workspace member, see layers.toml) | `record` |
 | [`graphics/demo`](graphics/demo) | `graphics-demo` | The UI drawing layer's integration demo, natively and in the browser | `app`, `browser`, `screenshot`, `tests` |
 | [`ui/notes`](ui/notes) | `ui-notes` | The example notes app of the UI stack | `app`, `tests` |
 | [`ui/showcase`](ui/showcase) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack | `app`, `record` |
