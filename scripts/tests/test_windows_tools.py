@@ -7,7 +7,7 @@ from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "gpu/webgpu/scripts"))
+sys.path.insert(0, str(ROOT / "native/gpu/webgpu/scripts"))
 import _build
 
 spec = importlib.util.spec_from_file_location("shared_install", ROOT / "scripts/_install.py")
@@ -53,8 +53,8 @@ class NativePinTests(unittest.TestCase):
         import json
         import tomllib
         lock = json.loads((ROOT / "toolchains.lock.json").read_text())["webgpu"]["platforms"]
-        manifests = {"gpu/webgpu/sys/silk.toml": "dawn", "gpu/webgpu/sys/abi/silk.toml": "dawn-headers",
-                     "gpu/webgpu/bench/silk.toml": "dawn-headers"}
+        manifests = {"native/gpu/webgpu/sys/silk.toml": "dawn", "native/gpu/webgpu/sys/abi/silk.toml": "dawn-headers",
+                     "native/gpu/webgpu/bench/silk.toml": "dawn-headers"}
         for path, name in manifests.items():
             targets = dict(tomllib.loads((ROOT / path).read_text())["native"]["archive"][name]["targets"])
             # wasm32 builds never fetch Dawn; its entry only satisfies Silk's reference check.

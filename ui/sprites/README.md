@@ -2,11 +2,11 @@
 
 SVG icons and decoded images as [graphics-atlas](../../graphics/atlas) tiles, for the UI scene's glyph and
 image sprites. This is phase 6 of the UI drawing layer. It holds no GPU code: like the glyph
-cache in [font-raster](../../font/raster), it allocates tiles and queues their pixels, and the
+cache in [font-raster](../../fonts/raster), it allocates tiles and queues their pixels, and the
 renderer copies the queued pixels into its textures (`queue.writeTexture` on WebGPU,
 `AtlasPixels.write` for the CPU reference).
 
-- `icons.IconCache` renders SVG icons with [svg_render](../../images/svg/render) at the device
+- `icons.IconCache` renders SVG icons with [svg_render](../../svg/render) at the device
   pixel size they are drawn at. `register(data, host)` parses an icon once;
   `icon(atlas, host, id, width, height, style, time)` returns its tile, rendering on a miss.
   `IconStyle.Mask` keeps the rendering's alpha in a monochrome tile, to draw tinted as a
@@ -17,7 +17,7 @@ renderer copies the queued pixels into its textures (`queue.writeTexture` on Web
   atlas evicts frames that stop being drawn; `prune(atlas)` drops their entries. Frames come
   from `svg_render.lib.Animated`, so the document is parsed once and its images decoded once.
   This suits small animated icons; a large animated SVG should be lowered into `gpu_scene`
-  instead (`images/svg/gpu`), which keeps no texture per frame.
+  instead (`svg/gpu`), which keeps no texture per frame.
 - `images.ImageStore` decodes PNG and JPEG files once with `codec.decode.decodeSrgb` (ICC
   profiles and PNG gamma converted to sRGB, EXIF orientation applied) or takes samples made
   elsewhere with `insert`. `tile(atlas, id)` uploads an image the first time it is drawn and only

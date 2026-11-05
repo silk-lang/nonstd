@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Runs the compiled ui_renderer browser test in the already installed Chromium (WebGPU through
-// navigator.gpu) with gpu/webgpu's host and runner, and compares each fixture's GPU pixels with
+// navigator.gpu) with native/gpu/webgpu's host and runner, and compares each fixture's GPU pixels with
 // the CPU reference rendered by the same wasm module. Never downloads a browser.
 import { createRequire } from 'node:module';
 import { createServer } from 'node:http';
@@ -8,7 +8,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const webgpu = resolve(dirname(fileURLToPath(import.meta.url)), '../../../gpu/webgpu');
+const webgpu = resolve(dirname(fileURLToPath(import.meta.url)), '../../../native/gpu/webgpu');
 const wasmIndex = process.argv.indexOf('--wasm');
 if (wasmIndex < 0 || !process.argv[wasmIndex + 1]) throw new Error('Usage: node browser/test.mjs --wasm FILE');
 const wasm = await readFile(resolve(process.argv[wasmIndex + 1]));

@@ -1,7 +1,7 @@
 # graphics-vector
 
 A 2D vector rasterizer in pure Silk. It has no GPU and no C, and depends only on the standard
-library. It is the drawing core under the [SVG renderer](../../images/svg). It follows the sparse-strips design
+library. It is the drawing core under the [SVG renderer](../../svg). It follows the sparse-strips design
 of [vello_cpu](https://github.com/linebender/vello/tree/main/sparse_strips): coverage is computed
 once as strips, and paints are composited through them. The [GPU scene renderer](../gpu_scene)
 consumes the same coverage and produces byte-identical images.
@@ -69,7 +69,7 @@ import the package as `vector`.
 From the repository root:
 
 ```sh
-images/svg/scripts/check-vector
+svg/scripts/check-vector
 ```
 
 This runs the 170 unit tests, checks the packages, and renders every GPU scene test on both the
@@ -78,7 +78,7 @@ part. It runs in the `graphics-vector` CI workflow.
 
 ## Performance
 
-`images/svg/scripts/bench-vector` and `images/svg/scripts/bench-filters` compare against tiny-skia
+`svg/scripts/bench-vector` and `svg/scripts/bench-filters` compare against tiny-skia
 and resvg on the same scenes, and also report how far the images differ. As of 2026-10-29,
 vector takes 0.17–0.63× tiny-skia's time on fills, strokes, gradients, polygons and icons, and
 matches it on image patterns. Every filter primitive beats resvg; blur, for example, takes

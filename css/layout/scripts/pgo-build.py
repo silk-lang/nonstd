@@ -39,7 +39,7 @@ TRAINING = ["deep-random-1k", "flex-grow-1k", "flex-wrap-10k", "block-stack-10k"
 
 def build(env):
     silk = os.environ.get("SILK", "silk")
-    subprocess.run([silk, "build", "--release"], cwd=ROOT / "cli", env=env, check=True)
+    subprocess.run([silk, "build", "--release"], cwd=ROOT / "tools" / "cli", env=env, check=True)
 
 
 def profdata():

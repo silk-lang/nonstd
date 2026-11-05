@@ -52,5 +52,5 @@ reuse, idle refinement, atlas eviction, and anchored popup placement.
 The direct-tree counter passes its scripted input and CPU/GPU comparison. The
 10,000-section scroll demo passes both its normal and growing-content GPU checks.
 Core tree and app code check for wasm32. CPU scroll measurements are recorded in
-[shared-primitives.json](../../app/scroll-demo/measurements/shared-primitives.json);
+[shared-primitives.json](../../../examples/scroll-demo/measurements/shared-primitives.json);
 they exclude GPU work and presentation.

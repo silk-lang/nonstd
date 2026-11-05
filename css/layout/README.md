@@ -64,7 +64,7 @@ shaping of text. Dependents import the package as `layout`.
 | Path | Package | What it is |
 | --- | --- | --- |
 | `css/layout` | `css-layout` | The engine |
-| `css/layout/cli` | `css-layout-cli` | A JSON adapter: one layout request on stdin, one result on stdout |
+| `css/layout/tools/cli` | `css-layout-cli` | A JSON adapter: one layout request on stdin, one result on stdout |
 
 ## Tests
 

@@ -1,6 +1,6 @@
 # graphics-gpu-scene
 
-Draws [graphics-vector](../vector) scenes on the GPU through [gpu-webgpu](../../gpu/webgpu),
+Draws [graphics-vector](../vector) scenes on the GPU through [gpu-webgpu](../../native/gpu/webgpu),
 producing the same bytes as the CPU renderer. Geometry and coverage are still computed on the
 CPU. The GPU packs strips, alphas and paints into storage buffers and paints and composites them
 in instanced render passes, as in [vello_hybrid](https://github.com/linebender/vello/tree/main/sparse_strips).
@@ -19,7 +19,7 @@ exactness is kept between CPU and GPU.
 | `graphics/gpu_scene` | `graphics-gpu-scene` | The renderer |
 | `graphics/gpu_scene/tests` | `graphics-gpu-scene-tests` | Renders each scene on the CPU and the GPU and compares bytes |
 
-The WGSL shaders live in `shaders/`, and `gpu/webgpu/scripts/embed-shaders` embeds them in
+The WGSL shaders live in `shaders/`, and `native/gpu/webgpu/scripts/embed-shaders` embeds them in
 `src/generated_shaders.silk`. Edit the `.wgsl` files, never the generated module.
 
 ## Tests
@@ -27,7 +27,7 @@ The WGSL shaders live in `shaders/`, and `gpu/webgpu/scripts/embed-shaders` embe
 From the repository root, with a Vulkan, Metal or D3D driver available (CI uses lavapipe):
 
 ```sh
-images/svg/scripts/check-vector
+svg/scripts/check-vector
 ```
 
 Every scene comparison requires identical bytes. The one exception is a single specular lighting

@@ -73,7 +73,7 @@ silk test --manifest-path text/xml/silk.toml --root src/tests.silk
 text/xml/scripts/check-xmlconf
 ```
 
-Both run in the `text-xml` CI workflow. The SVG gate (`images/svg/scripts/check`) also exercises the
+Both run in the `text-xml` CI workflow. The SVG gate (`svg/scripts/check`) also exercises the
 parser on every SVG test input.
 
 ## License
