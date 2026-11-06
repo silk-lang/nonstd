@@ -15,6 +15,7 @@ Packages:
   `format` (the notes file as JSON) and `text` (word counts, search matching, previews).
 - `examples/notes/app` (`ui-notes-app`): the window. It reads and writes the notes file and serves the
   inspector in debug builds.
+- `examples/notes/browser` (`ui-notes-browser`): the same app built for wasm32, in a browser tab.
 - `examples/notes/tests`: scripted tests through the real tree, and `describe` and PNG goldens.
 
 ## Running it
@@ -38,6 +39,15 @@ that is not a notes file is left alone: the app says so and exits.
 | Ctrl+S, Cmd+S | save now |
 | Up, Down, Home, End | in the list, move the selection |
 | Tab, Shift+Tab | through the sidebar (search, New note, Sort, the list, Dark mode), then the Note menu, title and body |
+
+In a browser tab, with WebGPU and JSPI (Chrome or Edge 137 or later), at http://127.0.0.1:8050/:
+
+```sh
+python3 ui/tree/window/scripts/browser serve    # builds examples/notes/browser for wasm32
+```
+
+The browser build (`examples/notes/browser`) starts from the sample notes and keeps them in
+memory, so a reload starts over.
 
 To look inside it while it runs, start it with the devtools window next to it:
 
