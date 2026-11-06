@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Measure native camera CPU submission time and compare retained/ordinary GPU pixels.
+
+Build the release app first. The executable creates an isolated in-memory challenge,
+uses the real window/GPU loop, and exits without reading or saving a user design.
+These are wall times through CPU submission, including surface waits, not GPU timestamps or display FPS.
+"""
+import argparse
+import datetime
+import json
+from pathlib import Path
+import platform
+import re
+import statistics
+import subprocess
+
+REPO = Path(__file__).resolve().parents[3]
+PATTERN = re.compile(r"frame-ms: layout=(\S+) canvas=(\S+) upload=(\S+) draw=(\S+) present=(\S+)")
+STAGES = ['inputModelLayout', 'canvas', 'atlasAndSurface', 'drawSubmission', 'presentCall']
+
+
+def summary(values):
+    ordered = sorted(values)
+    return dict(samples=len(values), medianMs=statistics.median(values),
+                p95Ms=ordered[int((len(ordered)-1)*.95)], maxMs=max(values))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--file', type=Path, help='benchmark an existing design without saving it')
+    parser.add_argument('--directory', type=Path, default=REPO / 'build/native-camera-check')
+    args = parser.parse_args()
+    if args.file and not args.file.is_file():
+        parser.error("--file must name an existing design")
+    args.directory.mkdir(parents=True, exist_ok=True)
+    binaries = list((REPO / 'build/llvm').glob('*/release/silk-studio-native-app'))
+    if len(binaries) != 1:
+        raise SystemExit('Build a release native app first')
+    result = dict(date=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  machine=platform.machine(), os=platform.platform(),
+                  viewport=dict(width=1440, height=960),
+                  workload=('Saved design: ' + args.file.name) if args.file else '100k image/text cards, 300004 editable layers',
+                  metric='Native input/model/layout/scene/upload/draw/present-call wall time, including surface waits; not GPU timestamps or display FPS')
+    for name, flags in [('ordinary', ['--no-retained']), ('retained', []), ('gpuParity', ['--check'])]:
+        log = args.directory / (name + '.log')
+        with log.open('w') as stream:
+            subprocess.run([str(binaries[0]), *(['--benchmark-file', str(args.file.resolve())] if args.file else ['--benchmark']), *flags], cwd=REPO,
+                           stdout=stream, stderr=subprocess.STDOUT, check=True, timeout=180)
+        text = log.read_text()
+        rows = [list(map(float, row)) for row in PATTERN.findall(text)]
+        assert len(rows) == 203, (name, len(rows))
+        if name == 'gpuParity':
+            assert ': pass' in text, text[-1000:]
+            result[name] = next(line for line in text.splitlines() if line.startswith('check:'))
+            surface = re.search(r'check: (\d+) x (\d+) surface', result[name])
+            result['viewport'].update(pixelWidth=int(surface[1]), pixelHeight=int(surface[2]),
+                                      scale=int(surface[1]) / result['viewport']['width'])
+        else:
+            result[name] = {}
+            for phase, part in [('zoom', rows[1:121]), ('pan', rows[121:161]), ('dragStart', rows[161:162]), ('drag', rows[162:202])]:
+                result[name][phase] = summary([sum(row) for row in part])
+                result[name][phase]['stages'] = {stage: summary([row[i] for row in part])
+                                                for i, stage in enumerate(STAGES)}
+            print(name, 'zoom', result[name]['zoom']['medianMs'],
+                  'pan', result[name]['pan']['medianMs'], 'drag', result[name]['drag']['medianMs'], flush=True)
+    path = args.directory / 'results.json'
+    path.write_text(json.dumps(result, indent=2) + '\n')
+    print(result['gpuParity'])
+    print(path)
+
+
+if __name__ == '__main__':
+    main()

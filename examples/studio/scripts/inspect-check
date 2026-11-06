@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Drive an isolated release Studio through its inspector; no OS clicks or model shortcuts.
+
+Build Studio, ui-inspect-cli and ui-inspect-mcp in release mode first. Artifacts include a
+10-frame empty-marquee mosaic, a whole-app screenshot and the MCP image/timing response.
+Optional --stress adds and exercises the 100k page through the command menu.
+"""
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+def binary(name):
+    paths = list((REPO / 'build/llvm').glob(f'*/release/{name}'))
+    if len(paths) != 1:
+        raise SystemExit(f'Build {name} in release mode or specify its binary path')
+    return paths[0]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--app', type=Path)
+    parser.add_argument('--cli', type=Path)
+    parser.add_argument('--mcp', type=Path)
+    parser.add_argument('--artifacts', type=Path, default=REPO / 'build/native-inspector-check')
+    parser.add_argument('--stress', action='store_true')
+    args = parser.parse_args()
+    app = args.app or binary('silk-studio-native-app')
+    cli = args.cli or binary('ui-inspect-cli')
+    mcp = args.mcp or binary('ui-inspect-mcp')
+    artifacts = args.artifacts.resolve()
+    artifacts.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='silk-inspect-', dir='/tmp') as directory:
+        root = Path(directory)
+        address = root / 'ui.sock'
+        with (artifacts / 'app.log').open('w') as log:
+            process = subprocess.Popen([str(app), '--inspect', str(root / 'test.silkdesign')],
+                cwd=REPO, env=dict(os.environ, SILK_UI_INSPECT=str(address)), stdout=log, stderr=log)
+        capture = None
+        try:
+            def ask(cmd, **members):
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(30)
+                    client.connect(str(address))
+                    client.sendall(json.dumps(dict(cmd=cmd, **members)).encode() + b'\n')
+                    chunks = []
+                    while True:
+                        chunk = client.recv(65536)
+                        if not chunk:
+                            raise AssertionError(f'{cmd}: connection closed before the reply line')
+                        chunks.append(chunk)
+                        if b'\n' in chunk:
+                            break
+                reply = json.loads(b''.join(chunks))
+                assert reply.get('ok'), reply
+                return reply
+
+            deadline = time.monotonic() + 30
+            while True:
+                assert process.poll() is None, (artifacts / 'app.log').read_text()
+                try:
+                    ready = ask('hello')
+                    assert ready['frame'] > 0, 'Inspector exposed a tree before its initial layout'
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    assert time.monotonic() < deadline, 'Inspector did not start'
+                    time.sleep(.05)
+
+            def point(phase, x, y):
+                return ask('pointer', phase=phase, x=x, y=y)
+
+            def click(name):
+                return ask('click', role='button', name=name, exact=True)
+
+            point('down', 250, 100)
+            with (artifacts / 'sequence.txt').open('w') as output:
+                capture = subprocess.Popen([str(cli), '--connect', str(address), 'capture',
+                    str(artifacts / 'marquee.png'), '--count', '10', '--interval', '100',
+                    '--columns', '5', '--tile-width', '480', '--test-id', 'canvas'],
+                    cwd=REPO, stdout=output, stderr=subprocess.STDOUT)
+            frames = []
+            for index in range(10):
+                point('move', 310 + index * 55, 125 + index * 2)
+                frames.append(ask('hello')['frame'])
+                assert ask('query', role='textbox', label='Layer name')['count'] == 0, 'Expected an empty marquee'
+                time.sleep(.1)
+            point('up', 805, 143)
+            assert capture.wait(timeout=45) == 0, (artifacts / 'sequence.txt').read_text()
+            assert all(b > a for a, b in zip(frames, frames[1:])), frames
+            assert ask('hello')['frame'] > frames[-1], 'Release did not repaint'
+            print('PASS: empty marquee advances on all ten moves and clears on release', flush=True)
+
+            # Held Space pans through the normal key/pointer dispatcher; restore the camera.
+            ask('key', phase='down', key=' ', code='Space')
+            point('down', 500, 140)
+            point('move', 570, 160)
+            point('up', 570, 160)
+            ask('key', phase='up', key=' ', code='Space')
+            click('Fit')
+            click('Rectangle')
+            point('down', 450, 300)
+            point('move', 560, 380)
+            point('up', 560, 380)
+            original = ask('snapshot', role='textbox', label='Width')['text']
+            ask('click', role='textbox', label='Width')
+            modifier = 'meta' if os.uname().sysname == 'Darwin' else 'control'
+            ask('press', key='a', code='KeyA', modifiers=[modifier])
+            ask('type', text='240')
+            ask('press', key='Enter')
+            assert '"240"' in ask('snapshot', role='textbox', label='Width')['text']
+            click('Undo')
+            assert original == ask('snapshot', role='textbox', label='Width')['text']
+            print('PASS: held Space, creation, focused text entry, commit and undo', flush=True)
+
+            handles = ask('query', label='Resize handle', exact=True)['nodes']
+            corner = max(handles, key=lambda n: n['x'] + n['y'])
+            x, y = corner['x'] + corner['width']*.5, corner['y'] + corner['height']*.5
+            point('down', x, y)
+            with (artifacts / 'resize-sequence.txt').open('w') as output:
+                capture = subprocess.Popen([str(cli), '--connect', str(address), 'capture',
+                    str(artifacts / 'resize.png'), '--count', '10', '--interval', '100',
+                    '--columns', '5', '--tile-width', '480', '--test-id', 'canvas'],
+                    cwd=REPO, stdout=output, stderr=subprocess.STDOUT)
+            for index in range(10):
+                point('move', x + (index+1)*8, y + (index+1)*5)
+                time.sleep(.1)
+            point('up', x+80, y+50)
+            assert capture.wait(timeout=45) == 0
+            assert original != ask('snapshot', role='textbox', label='Width')['text']
+            click('Undo')
+            assert original == ask('snapshot', role='textbox', label='Width')['text']
+            print('PASS: resize handles, ten-frame capture, and undo through real input', flush=True)
+            shot = ask('screenshot')
+            (artifacts / 'studio.png').write_bytes(base64.b64decode(shot['png']))
+            call = dict(jsonrpc='2.0', id=1, method='tools/call', params=dict(name='ui_capture',
+                arguments=dict(count=3, intervalMs=100, columns=3, tileWidth=320, testId='canvas')))
+            result = subprocess.run([str(mcp), '--connect', str(address)], input=json.dumps(call)+'\n',
+                text=True, capture_output=True, timeout=45, cwd=REPO, check=True)
+            response = json.loads(result.stdout)['result']
+            assert not response['isError'], response
+            content = response['content']
+            assert content[0]['type'] == 'image' and content[0]['mimeType'] == 'image/png'
+            png = base64.b64decode(content[0]['data'])
+            assert struct.unpack('>I', png[16:20])[0] == (320 + 8) * 3 + 8
+            (artifacts / 'mcp-mosaic.png').write_bytes(png)
+            (artifacts / 'mcp-timings.txt').write_text(content[1]['text'])
+            print('PASS: MCP returns an actual PNG mosaic and sample timing metadata', flush=True)
+
+            if args.stress:
+                click('Commands')
+                click('Add 100k rectangles')
+                ask('press', key='Escape')
+                click('Select')
+                point('down', 250, 100)
+                previous = ask('hello')['frame']
+                for x, y in [(500, 350), (700, 600), (1050, 850), (260, 110), (275, 115)]:
+                    point('move', x, y)
+                    now = ask('hello')['frame']
+                    assert now > previous, '100k marquee stopped updating'
+                    previous = now
+                point('up', 275, 115)
+                print('PASS: 100k page marquee, including the transition back to empty', flush=True)
+            (artifacts / 'frames.json').write_text(json.dumps(frames))
+            print(f'Artifacts: {artifacts}', flush=True)
+        finally:
+            if capture is not None and capture.poll() is None:
+                capture.terminate()
+                capture.wait(timeout=5)
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+if __name__ == '__main__':
+    main()
