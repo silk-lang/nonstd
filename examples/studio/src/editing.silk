@@ -1,0 +1,1230 @@
+//! Selection, gestures, history, geometry and commands shared by native input and tests.
+import model { Studio, Element, Snapshot, Page, Pointer }
+import samples
+import format
+import silk.collections.list { List }
+import silk.text.string { String }
+import silk.num.f32
+import silk.num.usize
+import silk.num.u32
+import silk.num.u64
+import ui_tree.input { MOD_SHIFT, MOD_CONTROL, MOD_META, MOD_ALT }
+
+pub fn selectedAncestor(m: &Studio, e: Element) -> bool {
+  if e.selected {
+    return true
+  }
+  let mut parent = e.parent
+  let mut depth: u32 = 0
+  while parent != 0 && depth < 64 {
+    let at = m.index(parent)
+    if at == usize.MAX {
+      return false
+    }
+    let p = m.elements.get(at)
+    if p.selected {
+      return true
+    }
+    parent = p.parent
+    depth = depth + 1
+  }
+  return false
+}
+
+/// The outermost selected ancestor, so a subtree is transformed exactly once.
+pub fn selectionRoot(m: &Studio, e: Element) -> u32 {
+  let mut root = if e.selected {
+    e.id
+  } else {
+    0
+  }
+  let mut parent = e.parent
+  let mut depth: u32 = 0
+  while parent != 0 && depth < 64 {
+    let index = m.index(parent)
+    if index == usize.MAX {
+      break
+    }
+    let p = m.elements.get(index)
+    if p.selected {
+      root = p.id
+    }
+    parent = p.parent
+    depth = depth + 1
+  }
+  return root
+}
+
+/// Opacity inherited through frames and groups, matching the browser editor.
+pub fn opacity(m: &Studio, e: Element) -> f32 {
+  let mut value = e.shape.opacity
+  let mut parent = e.parent
+  let mut depth: u32 = 0
+  while parent != 0 && depth < 64 {
+    let index = m.index(parent)
+    if index == usize.MAX {
+      break
+    }
+    let p = m.elements.get(index)
+    value = value * p.shape.opacity
+    parent = p.parent
+    depth = depth + 1
+  }
+  return value
+}
+
+pub fn flag(m: &Studio, e: Element, bits: u32) -> bool {
+  if (e.shape.flags & bits) != 0 {
+    return true
+  }
+  let mut parent = e.parent
+  let mut depth: u32 = 0
+  while parent != 0 && depth < 64 {
+    let at = m.index(parent)
+    if at == usize.MAX {
+      return false
+    }
+    let p = m.elements.get(at)
+    if (p.shape.flags & bits) != 0 {
+      return true
+    }
+    parent = p.parent
+    depth = depth + 1
+  }
+  return false
+}
+
+pub fn undo(m: &mut Studio, redo: bool) -> () {
+  if m.gesture != 0 {
+    cancel(&mut m)
+    return ()
+  }
+  let count = if redo {
+    m.future.length()
+  } else {
+    m.past.length()
+  }
+  if count == 0 {
+    return ()
+  }
+  let current = m.snapshot()
+  let old = if redo {
+    m.future.remove(count - 1)
+  } else {
+    m.past.remove(count - 1)
+  }
+  if redo {
+    m.heap.alloc(m.past.append(move current))
+  } else {
+    m.heap.alloc(m.future.append(move current))
+  }
+  m.elements = move old.elements
+  m.pages = move old.pages
+  m.page = old.page
+  m.title = old.title
+  m.changed()
+}
+
+pub fn cancel(m: &mut Studio) -> () {
+  m.hasGuideX = false
+  m.hasGuideY = false
+  if m.gesture != 0 && m.gesture != 5 {
+    m.elements = if m.duplicated {
+      Intrinsic.replace(m.beforeDuplicate, List<Element>.make())
+    } else {
+      Intrinsic.replace(m.before, List<Element>.make())
+    }
+    m.before = List<Element>.make()
+    m.reindex()
+    m.recount()
+  }
+  if m.gesture != 5 {
+    m.geometryRevision = m.geometryRevision + 1
+  }
+  m.duplicated = false
+  m.beforeDuplicate.clear()
+  m.gesture = 0
+  m.menu = 0
+  m.editing = 0
+  m.paintRevision = m.paintRevision + 1
+}
+
+pub fn wheel(m: &mut Studio, x: f32, y: f32, dx: f32, dy: f32, zoom: bool) -> () {
+  if zoom {
+    let px = x - m.canvasLeft()
+    let py = y - m.canvasTop()
+    let wx = m.cameraX + px / m.zoom
+    let wy = m.cameraY + py / m.zoom
+    let factor = f32.max(0.5, f32.min(2.0, 1.0 - dy * 0.004))
+    m.zoom = f32.max(0.02, f32.min(64.0, m.zoom * factor))
+    m.cameraX = wx - px / m.zoom
+    m.cameraY = wy - py / m.zoom
+  } else {
+    m.cameraX = m.cameraX + dx / m.zoom
+    m.cameraY = m.cameraY + dy / m.zoom
+  }
+  m.paintRevision = m.paintRevision + 1
+}
+
+pub fn bounds(m: &Studio) -> [f32; 4] {
+  if m.selectionBoundsRevision == m.geometryRevision {
+    return m.selectionBounds
+  }
+  let mut b: [f32; 4] = [1000000.0, 1000000.0, -1000000.0, -1000000.0]
+  let es = m.elements.asSlice()
+  let mut i: usize = 0
+  while i < es.length {
+    let e = es[i]
+    if e.page == m.page && e.selected {
+      b[0] = f32.min(b[0], e.shape.x)
+      b[1] = f32.min(b[1], e.shape.y)
+      b[2] = f32.max(b[2], e.shape.x + e.shape.width)
+      b[3] = f32.max(b[3], e.shape.y + e.shape.height)
+    }
+    i = i + 1
+  }
+  return b
+}
+
+fn hit(m: &Studio, x: f32, y: f32) -> u32 {
+  let es = m.elements.asSlice()
+  let mut i = es.length
+  while i > 0 {
+    i = i - 1
+    let e = es[i]
+    if e.page == m.page && !flag(&m.*, e, 3) && e.shape.contains(x, y) {
+      return e.id
+    }
+  }
+  return 0
+}
+
+pub fn down(m: &mut Studio, p: Pointer) -> () {
+  m.menu = 0
+  m.editing = 0
+  let x = m.cameraX + (p.x - m.canvasLeft()) / m.zoom
+  let y = m.cameraY + (p.y - m.canvasTop()) / m.zoom
+  m.startX = x
+  m.startY = y
+  m.currentX = x
+  m.currentY = y
+  m.startCameraX = m.cameraX
+  m.startCameraY = m.cameraY
+  m.duplicated = false
+  m.beforeDuplicate.clear()
+  if m.tool == 5 || p.pan || m.space {
+    m.before.clear()
+    m.gesture = 5
+    return ()
+  }
+  m.before = m.copyElements()
+  if m.tool >= 1 && m.tool <= 4 {
+    m.clearSelection()
+    let kind: u32 = if m.tool == 1 {
+      3
+    } else if m.tool == 2 {
+      0
+    } else if m.tool == 3 {
+      1
+    } else {
+      2
+    }
+    let label = if kind == 2 {
+      "Your text"
+    } else if kind == 3 {
+      "Frame"
+    } else if kind == 1 {
+      "Ellipse"
+    } else {
+      "Rectangle"
+    }
+    let id = m.add(
+      kind,
+      label,
+      x,
+      y,
+      1.0,
+      1.0,
+      if kind == 3 {
+        0xfafaf6ff
+      } else {
+        0x789367ff
+      },
+    )
+    m.select(id, false)
+    m.gesture = 3
+    if kind == 2 {
+      let at = m.index(id)
+      let value1: f32 = 180.0
+      let index1 = at
+      let mut item1 = m.elements.get(index1)
+      item1.shape.width = value1
+      m.elements.set(index1, item1)
+
+      let value2: f32 = 48.0
+      let index2 = at
+      let mut item2 = m.elements.get(index2)
+      item2.shape.height = value2
+      m.elements.set(index2, item2)
+
+      m.editing = id
+    }
+    return ()
+  }
+  if m.selected > 0 {
+    let b = bounds(&m.*)
+    let r = 7.0 / m.zoom
+    let handles: [[f32; 2]; 8] = [
+      [b[0], b[1]],
+      [(b[0] + b[2]) * 0.5, b[1]],
+      [b[2], b[1]],
+      [b[2], (b[1] + b[3]) * 0.5],
+      [b[2], b[3]],
+      [(b[0] + b[2]) * 0.5, b[3]],
+      [b[0], b[3]],
+      [b[0], (b[1] + b[3]) * 0.5],
+    ]
+    let mut k: usize = 0
+    while k < 8 {
+      if f32.abs(x - handles[k][0]) < r && f32.abs(y - handles[k][1]) < r {
+        m.gesture = 2
+        m.handle = usize.toU32(k)
+        return ()
+      }
+      k = k + 1
+    }
+  }
+  let id = hit(&m.*, x, y)
+  if id != 0 {
+    let at = m.index(id)
+    if p.double && m.elements.get(at).kind == 2 {
+      m.select(id, false)
+      m.editing = id
+      m.before.clear()
+      return ()
+    }
+    if !m.elements.get(at).selected || p.shift {
+      m.select(id, p.shift)
+    }
+    if p.alt {
+      m.beforeDuplicate = Intrinsic.replace(m.before, List<Element>.make())
+      m.duplicated = true
+      duplicate(&mut m, false)
+      m.before = m.copyElements()
+    }
+    m.gesture = 1
+  } else {
+    if !p.shift {
+      m.clearSelection()
+    }
+    m.gesture = 4
+  }
+  m.paintRevision = m.paintRevision + 1
+}
+
+pub fn drag(m: &mut Studio, p: Pointer) -> () {
+  if m.gesture == 0 {
+    return ()
+  }
+  let x = m.cameraX + (p.x - m.canvasLeft()) / m.zoom
+  let y = m.cameraY + (p.y - m.canvasTop()) / m.zoom
+  m.currentX = x
+  m.currentY = y
+  let mut dx = x - m.startX
+  let mut dy = y - m.startY
+  if m.gesture == 5 {
+    m.cameraX = m.cameraX - dx
+    m.cameraY = m.cameraY - dy
+    m.paintRevision = m.paintRevision + 1
+    return ()
+  }
+  if p.shift && m.gesture == 1 {
+    if f32.abs(dx) > f32.abs(dy) {
+      dy = 0.0
+    } else {
+      dx = 0.0
+    }
+  }
+  m.hasGuideX = false
+  m.hasGuideY = false
+  if m.snap && !p.alt && m.gesture == 1 {
+    let base = boundsBefore(&m.*)
+    let sx: [f32; 3] = [base[0], (base[0] + base[2]) * 0.5, base[2]]
+    let sy: [f32; 3] = [base[1], (base[1] + base[3]) * 0.5, base[3]]
+    let originalX = dx
+    let originalY = dy
+    let mut bestX = 5.0 / m.zoom
+    let mut bestY = bestX
+    let mut i: usize = 0
+    while i < m.before.length() {
+      let e = m.before.get(i)
+      if e.page == m.page && !selectedAncestor(&m.*, e) && !flag(&m.*, e, 1) {
+        let n = e.shape
+        let tx: [f32; 3] = [n.x, n.x + n.width * 0.5, n.x + n.width]
+        let ty: [f32; 3] = [n.y, n.y + n.height * 0.5, n.y + n.height]
+        let mut target: usize = 0
+        while target < 3 {
+          let mut source: usize = 0
+          while source < 3 {
+            let x = tx[target] - sx[source] - originalX
+            let y = ty[target] - sy[source] - originalY
+            if f32.abs(x) < bestX {
+              bestX = f32.abs(x)
+              dx = originalX + x
+              m.guideX = tx[target]
+              m.hasGuideX = true
+            }
+            if f32.abs(y) < bestY {
+              bestY = f32.abs(y)
+              dy = originalY + y
+              m.guideY = ty[target]
+              m.hasGuideY = true
+            }
+            source = source + 1
+          }
+          target = target + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  if m.gesture == 3 {
+    let at = m.index(m.primary)
+    if at != usize.MAX && m.elements.get(at).kind != 2 {
+      if p.shift {
+        let size = f32.max(f32.abs(dx), f32.abs(dy))
+        dx = if dx < 0.0 {
+          -size
+        } else {
+          size
+        }
+        dy = if dy < 0.0 {
+          -size
+        } else {
+          size
+        }
+      }
+      let n = &mut m.elements.asMutSlice()[at].shape
+      n.x = f32.min(m.startX, m.startX + dx)
+      n.y = f32.min(m.startY, m.startY + dy)
+      n.width = f32.max(1.0, f32.abs(dx))
+      n.height = f32.max(1.0, f32.abs(dy))
+    }
+  } else if m.gesture == 4 {
+    let l = f32.min(x, m.startX)
+    let t = f32.min(y, m.startY)
+    let r = f32.max(x, m.startX)
+    let b = f32.max(y, m.startY)
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if e.page == m.page {
+        let yes = !flag(&m.*, e, 3) && e.kind != 3 && e.kind != 4 && e.shape.x <= r
+          && e.shape.y <= b
+          && e.shape.x + e.shape.width >= l
+          && e.shape.y + e.shape.height >= t
+        let value3 = yes || (p.shift && i < m.before.length() && m.before.get(i).selected)
+        let index3 = i
+        let mut item3 = m.elements.get(index3)
+        item3.selected = value3
+        m.elements.set(index3, item3)
+      }
+      i = i + 1
+    }
+    m.recount()
+  } else {
+    let b = boundsBefore(&m.*)
+    let mut l = b[0]
+    let mut t = b[1]
+    let mut r = b[2]
+    let mut bottom = b[3]
+    if m.gesture == 2 {
+      if m.handle == 0 || m.handle == 6 || m.handle == 7 {
+        l = f32.min(r - 1.0, l + dx)
+      }
+      if m.handle <= 2 {
+        t = f32.min(bottom - 1.0, t + dy)
+      }
+      if m.handle >= 2 && m.handle <= 4 {
+        r = f32.max(l + 1.0, r + dx)
+      }
+      if m.handle >= 4 && m.handle <= 6 {
+        bottom = f32.max(t + 1.0, bottom + dy)
+      }
+      if p.shift {
+        let ratio = (b[2] - b[0]) / f32.max(b[3] - b[1], 1.0)
+        bottom = t + (r - l) / ratio
+      }
+    }
+    let mut i: usize = 0
+    while i < m.elements.length() && i < m.before.length() {
+      let e = m.elements.get(i)
+      let old = m.before.get(i)
+      if e.page == m.page && selectedAncestor(&m.*, e) && !flag(&m.*, e, 2)
+        && !(m.gesture == 2 && m.selected == 1 && m.primary != e.id
+          && m.elements.get(m.index(m.primary)).kind == 3) {
+        let n = &mut m.elements.asMutSlice()[i].shape
+        if m.gesture == 1 {
+          n.x = old.shape.x + dx
+          n.y = old.shape.y + dy
+        } else {
+          let sx = (r - l) / f32.max(b[2] - b[0], 1.0)
+          let sy = (bottom - t) / f32.max(b[3] - b[1], 1.0)
+          n.x = l + (old.shape.x - b[0]) * sx
+          n.y = t + (old.shape.y - b[1]) * sy
+          n.width = f32.max(0.1, old.shape.width * sx)
+          n.height = f32.max(0.1, old.shape.height * sy)
+        }
+      }
+      i = i + 1
+    }
+  }
+  if m.gesture <= 3 {
+    m.geometryRevision = m.geometryRevision + 1
+  }
+  m.paintRevision = m.paintRevision + 1
+}
+
+fn boundsBefore(m: &Studio) -> [f32; 4] {
+  let mut b: [f32; 4] = [1000000.0, 1000000.0, -1000000.0, -1000000.0]
+  let mut i: usize = 0
+  while i < m.before.length() {
+    let e = m.before.get(i)
+    if e.selected && e.page == m.page {
+      b[0] = f32.min(b[0], e.shape.x)
+      b[1] = f32.min(b[1], e.shape.y)
+      b[2] = f32.max(b[2], e.shape.x + e.shape.width)
+      b[3] = f32.max(b[3], e.shape.y + e.shape.height)
+    }
+    i = i + 1
+  }
+  return b
+}
+
+pub fn up(m: &mut Studio, p: Pointer) -> () {
+  m.hasGuideX = false
+  m.hasGuideY = false
+  if m.gesture == 0 {
+    return ()
+  }
+  drag(&mut m, p)
+  if m.gesture <= 3
+    && (m.gesture == 3 || m.duplicated || m.currentX != m.startX || m.currentY != m.startY) {
+    let mut pages = List<Page>.make()
+    m.heap.alloc(pages.appendSlice(m.pages.asSlice()))
+    let state = Snapshot {
+      elements: if m.duplicated {
+        Intrinsic.replace(m.beforeDuplicate, List<Element>.make())
+      } else {
+        Intrinsic.replace(m.before, List<Element>.make())
+      },
+      pages: move pages,
+      page: m.page,
+      title: m.title,
+    }
+    m.before = List<Element>.make()
+    while m.past.length() >= 50
+      || (m.past.length() > 1 && m.past.length() * m.elements.length() > 500000) {
+      drop m.past.remove(0)
+    }
+    m.heap.alloc(m.past.append(move state))
+    m.future.clear()
+    m.changed()
+  } else {
+    m.before.clear()
+  }
+  m.before.clear()
+  m.beforeDuplicate.clear()
+  m.duplicated = false
+  m.gesture = 0
+  m.tool = 0
+}
+
+fn duplicate(m: &mut Studio, offset: bool) -> () {
+  let count = m.elements.length()
+  let mut copies = List<Element>.make()
+  let base = m.nextId
+  let mut mapping = List<u32>.make()
+  m.heap.alloc(mapping.reserve(u32.toUsize(base)))
+  let mut j: u32 = 0
+  while j < base {
+    m.heap.alloc(mapping.append(0))
+    j = j + 1
+  }
+  let mut i: usize = 0
+  while i < count {
+    let e = m.elements.get(i)
+    if selectedAncestor(&m.*, e) && e.page == m.page {
+      let mut copy = e
+      copy.id = m.nextId
+      m.nextId = m.nextId + 1
+      mapping.set(u32.toUsize(e.id), copy.id)
+      if offset {
+        copy.shape.x = copy.shape.x + 24.0
+        copy.shape.y = copy.shape.y + 24.0
+      }
+      m.heap.alloc(copies.append(copy))
+    }
+    i = i + 1
+  }
+  m.clearSelection()
+  i = 0
+  while i < copies.length() {
+    let mut e = copies.get(i)
+    if e.parent != 0 && u32.toUsize(e.parent) < mapping.length() {
+      let mapped = mapping.get(u32.toUsize(e.parent))
+      if mapped != 0 {
+        e.parent = mapped
+      }
+    }
+    m.heap.alloc(m.elements.append(e))
+    i = i + 1
+  }
+  m.reindex()
+  m.recount()
+}
+
+/// Commits the active field before a file operation or window close.
+pub fn commitDraft(m: &mut Studio) -> () {
+  if m.draftField != 0 {
+    let key = m.draftField
+    let value = Intrinsic.replace(m.draft, String.make())
+    m.draftField = 0
+    field(&mut m, key, String.view(&value))
+  }
+}
+
+pub fn action(m: &mut Studio, code: u32) -> () {
+  if code == 12 || code == 13 || code == 14 || code == 15 || code == 36 || code == 37 {
+    commitDraft(&mut m)
+  }
+  let wasMenu = m.menu != 0
+  if wasMenu {
+    m.focusAction = m.menu + 15
+  }
+  m.menu = 0
+  if code == 35 && wasMenu {
+    return ()
+  }
+  if code == 40 {
+    m.focusAction = 40
+    m.panels = !m.panels
+    m.geometryRevision = m.geometryRevision + 1
+    m.paintRevision = m.paintRevision + 1
+    return ()
+  }
+  if code == 41 {
+    action(&mut m, 4)
+    action(&mut m, 2)
+    return ()
+  }
+  if code == 0 || code == 1 {
+    undo(&mut m, code == 1)
+    return ()
+  }
+  if code == 7 || code == 8 {
+    m.fit(code == 8)
+    m.paintRevision = m.paintRevision + 1
+    return ()
+  }
+  if code == 38 || code == 39 {
+    let centerX = m.canvasLeft() + (m.canvasWidth()) * 0.5
+    let centerY = m.canvasTop() + (m.canvasHeight()) * 0.5
+    wheel(
+      &mut m,
+      centerX,
+      centerY,
+      0.0,
+      if code == 38 {
+        50.0
+      } else {
+        -62.5
+      },
+      true,
+    )
+    return ()
+  }
+  if code == 9 {
+    m.zoom = 1.0
+    m.paintRevision = m.paintRevision + 1
+    return ()
+  }
+  if code == 12 {
+    m.exportRequested = 5
+    return ()
+  }
+  if code == 36 || code == 37 {
+    m.exportRequested = code - 33
+    return ()
+  }
+  if code == 13 {
+    m.saveRequested = true
+    return ()
+  }
+  if code == 14 || code == 15 {
+    m.exportRequested = code - 13
+    return ()
+  }
+  if code == 16 || code == 17 || code == 18 {
+    m.focusAction = 0
+    m.commandSearch = String.make()
+    m.menu = code - 15
+    return ()
+  }
+  if code == 19 {
+    m.grid = !m.grid
+    m.paintRevision = m.paintRevision + 1
+    return ()
+  }
+  if code == 20 {
+    m.snap = !m.snap
+    return ()
+  }
+  if code == 35 {
+    cancel(&mut m)
+    m.clearSelection()
+    return ()
+  }
+  if code == 6 {
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      let value4 = e.page == m.page && !flag(&m.*, e, 3)
+      let index4 = i
+      let mut item4 = m.elements.get(index4)
+      item4.selected = value4
+      m.elements.set(index4, item4)
+
+      i = i + 1
+    }
+    m.recount()
+    m.paintRevision = m.paintRevision + 1
+    return ()
+  }
+  if code == 4 {
+    m.clipboard.clear()
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if e.page == m.page && selectedAncestor(&m.*, e) {
+        m.heap.alloc(m.clipboard.append(e))
+      }
+      i = i + 1
+    }
+    return ()
+  }
+  m.checkpoint()
+  if code == 2 {
+    let mut kept = List<Element>.make()
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if e.page != m.page || !selectedAncestor(&m.*, e) || flag(&m.*, e, 2) {
+        m.heap.alloc(kept.append(e))
+      }
+      i = i + 1
+    }
+    m.elements = move kept
+  } else if code == 3 {
+    duplicate(&mut m, true)
+  } else if code == 5 {
+    m.clearSelection()
+    let mut mapping = List<u32>.make()
+    let count = m.nextId
+    let mut j: u32 = 0
+    while j < count {
+      m.heap.alloc(mapping.append(0))
+      j = j + 1
+    }
+    let mut i: usize = 0
+    while i < m.clipboard.length() {
+      let old = m.clipboard.get(i)
+      mapping.set(u32.toUsize(old.id), m.nextId)
+      m.nextId = m.nextId + 1
+      i = i + 1
+    }
+    i = 0
+    while i < m.clipboard.length() {
+      let mut e = m.clipboard.get(i)
+      e.id = mapping.get(u32.toUsize(e.id))
+      e.parent = if e.parent != 0 {
+        mapping.get(u32.toUsize(e.parent))
+      } else {
+        0
+      }
+      e.page = m.page
+      e.selected = e.parent == 0
+      e.shape.x = e.shape.x + 24.0
+      e.shape.y = e.shape.y + 24.0
+      m.heap.alloc(m.elements.append(e))
+      i = i + 1
+    }
+  } else if code == 10 {
+    let id = m.nextId
+    m.nextId = id + 1
+    let name = m.intern("Untitled page")
+    m.heap.alloc(m.pages.append(Page { id: id, name: name }))
+    m.page = id
+    m.clearSelection()
+    m.cameraX = -80.0
+    m.cameraY = -80.0
+    m.zoom = 1.0
+  } else if code == 11 && m.pages.length() > 1 {
+    let mut i: usize = 0
+    while i < m.pages.length() {
+      if m.pages.get(i).id == m.page {
+        drop m.pages.remove(i)
+        break
+      }
+      i = i + 1
+    }
+    let mut retained = List<Element>.make()
+    i = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if e.page != m.page {
+        m.heap.alloc(retained.append(e))
+      }
+      i = i + 1
+    }
+    m.elements = move retained
+    m.page = m.pages.get(0).id
+    m.fit(false)
+  } else if code == 31 {
+    samples.mosaic(&mut m)
+    m.fit(false)
+  } else if code == 42 {
+    samples.challenge(&mut m)
+    m.fit(false)
+  } else if code == 32 {
+    samples.effects(&mut m)
+    m.fit(false)
+  } else if code == 33 || code == 34 {
+    let bit: u32 = if code == 33 {
+      1
+    } else {
+      2
+    }
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      if m.elements.get(i).selected {
+        let value5 = m.elements.get(i).shape.flags ^ bit
+        let index5 = i
+        let mut item5 = m.elements.get(index5)
+        item5.shape.flags = value5
+        m.elements.set(index5, item5)
+      }
+      i = i + 1
+    }
+  } else if code >= 25 && code <= 30 {
+    align(&mut m, code)
+  } else if code == 21 && m.selected > 0 {
+    let b = bounds(&m.*)
+    let mut roots = List<u32>.make()
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if e.page == m.page && selectionRoot(&m.*, e) == e.id {
+        m.heap.alloc(roots.append(e.id))
+      }
+      i = i + 1
+    }
+    let id = m.add(4, "Group", b[0], b[1], b[2] - b[0], b[3] - b[1], 0)
+    i = 0
+    while i < roots.length() {
+      let at = m.index(roots.get(i))
+      let mut e = m.elements.get(at)
+      e.parent = id
+      m.elements.set(at, e)
+      i = i + 1
+    }
+    m.select(id, false)
+  } else if code == 22 {
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      let at = m.index(e.parent)
+      if at != usize.MAX && m.elements.get(at).selected && m.elements.get(at).kind == 4 {
+        let value7 = m.elements.get(at).parent
+        let index7 = i
+        let mut item7 = m.elements.get(index7)
+        item7.parent = value7
+        m.elements.set(index7, item7)
+
+        let value8 = true
+        let index8 = i
+        let mut item8 = m.elements.get(index8)
+        item8.selected = value8
+        m.elements.set(index8, item8)
+      }
+      i = i + 1
+    }
+    let mut retained = List<Element>.make()
+    i = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if !(e.selected && e.kind == 4) {
+        m.heap.alloc(retained.append(e))
+      }
+      i = i + 1
+    }
+    m.elements = move retained
+  } else if code == 23 || code == 24 {
+    let mut chosen = List<Element>.make()
+    let mut rest = List<Element>.make()
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if selectedAncestor(&m.*, e) {
+        m.heap.alloc(chosen.append(e))
+      } else {
+        m.heap.alloc(rest.append(e))
+      }
+      i = i + 1
+    }
+    if code == 23 {
+      m.heap.alloc(rest.appendSlice(chosen.asSlice()))
+      m.elements = move rest
+    } else {
+      m.heap.alloc(chosen.appendSlice(rest.asSlice()))
+      m.elements = move chosen
+    }
+  }
+  m.changed()
+}
+
+fn align(m: &mut Studio, code: u32) -> () {
+  let b = bounds(&m.*)
+  let old = m.copyElements()
+  let mut roots = List<u32>.make()
+  let mut i: usize = 0
+  while i < m.elements.length() {
+    let root = selectionRoot(&m.*, m.elements.get(i))
+    m.heap.alloc(roots.append(root))
+    i = i + 1
+  }
+  i = 0
+  while i < m.elements.length() {
+    let e = m.elements.get(i)
+    let root = roots.get(i)
+    if root != 0 && !flag(&m.*, e, 2) {
+      let parent = old.get(m.index(root)).shape
+      let mut dx: f32 = 0.0
+      let mut dy: f32 = 0.0
+      if code == 25 {
+        dx = b[0] - parent.x
+      } else if code == 26 {
+        dx = (b[0] + b[2] - parent.width) * 0.5 - parent.x
+      } else if code == 27 {
+        dx = b[2] - parent.width - parent.x
+      } else if code == 28 {
+        dy = b[1] - parent.y
+      } else if code == 29 {
+        dy = (b[1] + b[3] - parent.height) * 0.5 - parent.y
+      } else {
+        dy = b[3] - parent.height - parent.y
+      }
+      let mut moved = e
+      moved.shape.x = old.get(i).shape.x + dx
+      moved.shape.y = old.get(i).shape.y + dy
+      m.elements.set(i, moved)
+    }
+    i = i + 1
+  }
+}
+
+fn geometryField(m: &mut Studio, field: u32, value: f32) -> () {
+  let old = m.copyElements()
+  let mut i: usize = 0
+  while i < m.elements.length() {
+    let e = m.elements.get(i)
+    let rootId = selectionRoot(&m.*, e)
+    if rootId != 0 && !flag(&m.*, e, 2) {
+      let root = old.get(m.index(rootId))
+      let mut changed = e
+      if field == 1 {
+        changed.shape.x = old.get(i).shape.x + value - root.shape.x
+      } else if field == 2 {
+        changed.shape.y = old.get(i).shape.y + value - root.shape.y
+      } else if rootId == e.id {
+        if field == 3 {
+          changed.shape.width = f32.max(0.1, value)
+        } else {
+          changed.shape.height = f32.max(0.1, value)
+        }
+      } else if root.kind == 4 {
+        if field == 3 {
+          let ratio = f32.max(0.1, value) / root.shape.width
+          changed.shape.x = root.shape.x + (old.get(i).shape.x - root.shape.x) * ratio
+          changed.shape.width = old.get(i).shape.width * ratio
+        } else {
+          let ratio = f32.max(0.1, value) / root.shape.height
+          changed.shape.y = root.shape.y + (old.get(i).shape.y - root.shape.y) * ratio
+          changed.shape.height = old.get(i).shape.height * ratio
+        }
+      }
+      m.elements.set(i, changed)
+    }
+    i = i + 1
+  }
+}
+
+pub fn field(m: &mut Studio, field: u32, value: string) -> () {
+  if field == 31 {
+    let trimmed = String.trim(value)
+    let bytes = String.utf8Bytes(trimmed)
+    let numeric = if bytes.length > 0 && bytes[bytes.length - 1] == 37 {
+      String.slice(trimmed, 0, bytes.length - 1)
+    } else {
+      trimmed
+    }
+    let zoom = format.number(numeric) / 100.0
+    if zoom == zoom && zoom > 0.0 {
+      let next = f32.max(0.02, f32.min(256.0, zoom))
+      m.cameraX = m.cameraX + m.canvasWidth() * (1.0 / m.zoom - 1.0 / next) * 0.5
+      m.cameraY = m.cameraY + m.canvasHeight() * (1.0 / m.zoom - 1.0 / next) * 0.5
+      m.zoom = next
+      m.paintRevision = m.paintRevision + 1
+    }
+    return ()
+  }
+  if field == 18 {
+    m.checkpoint()
+    m.title = m.intern(value)
+    m.changed()
+    return ()
+  }
+  if field == 19 {
+    m.checkpoint()
+    let name = m.intern(value)
+    let mut i: usize = 0
+    while i < m.pages.length() {
+      if m.pages.get(i).id == m.page {
+        let value9 = name
+        let index9 = i
+        let mut item9 = m.pages.get(index9)
+        item9.name = value9
+        m.pages.set(index9, item9)
+      }
+      i = i + 1
+    }
+    m.changed()
+    return ()
+  }
+  if m.selected == 0 {
+    return ()
+  }
+  let number = format.number(value)
+  let colorText = if String.byteLength(value) == 6 || String.byteLength(value) == 8 {
+    let mut prefixed = m.heap.alloc(String.copy("#"))
+    m.heap.alloc(prefixed.append(value))
+    move prefixed
+  } else {
+    m.heap.alloc(String.copy(value))
+  }
+  let color = format.color(String.view(&colorText))
+  if field != 14 && field != 17 && field != 5 && field != 9 && field != 10 && field != 26
+    && number != number {
+    return ()
+  }
+  if (field == 5 || field == 9 || field == 10 || field == 26)
+    && !format.validColor(String.view(&colorText)) {
+    return ()
+  }
+  m.checkpoint()
+  if field >= 1 && field <= 4 {
+    geometryField(&mut m, field, number)
+    m.changed()
+    return ()
+  }
+  let text = if field == 14 || field == 17 {
+    m.intern(value)
+  } else {
+    0
+  }
+  let mut i: usize = 0
+  while i < m.elements.length() {
+    let e = m.elements.get(i)
+    if e.selected && !flag(&m.*, e, 2) {
+      let textLength = String.byteLength(m.string(e.text))
+      let n = &mut m.elements.asMutSlice()[i]
+
+      if n.kind == 2 && (field == 14 || field == 15 || field == 16 || field == 30) {
+        n.autoSize = true
+      }
+      if field == 1 {
+        n.shape.x = number
+      } else if field == 2 {
+        n.shape.y = number
+      } else if field == 3 {
+        n.shape.width = f32.max(0.1, number)
+      } else if field == 4 {
+        n.shape.height = f32.max(0.1, number)
+      } else if field == 5 {
+        n.shape.fill = color
+        n.shape.fill2 = color
+      } else if field == 6 {
+        n.shape.opacity = f32.max(0.0, f32.min(1.0, number / 100.0))
+      } else if field == 7 {
+        n.shape.radius = f32.max(0.0, number)
+      } else if field == 8 {
+        n.shape.borderWidth = f32.max(0.0, number)
+      } else if field == 9 {
+        n.shape.border = color
+      } else if field == 10 {
+        n.shape.shadow = color
+      } else if field == 11 {
+        n.shape.blur = f32.max(0.0, number)
+      } else if field == 12 {
+        n.shape.shadowX = number
+      } else if field == 13 {
+        n.shape.shadowY = number
+      } else if field == 14 {
+        n.text = text
+        n.name = text
+      } else if field == 15 {
+        n.fontSize = f32.max(1.0, f32.min(512.0, number))
+        n.shape.height = n.fontSize * 1.5
+        n.shape.width = f32.max(n.fontSize, usize.toF32(textLength) * n.fontSize * 0.55)
+      } else if field == 16 {
+        n.fontWeight = f32.toU32(f32.max(100.0, f32.min(900.0, number)))
+      } else if field == 17 {
+        n.name = text
+      } else if field == 20 {
+        n.shape.effects.blur = f32.max(0.0, f32.min(1000.0, number))
+      } else if field == 21 && n.kind != 2 {
+        n.shape.effects.backdropBlur = f32.max(0.0, f32.min(1000.0, number))
+      } else if field == 22 {
+        n.shape.effects.brightness = f32.max(0.0, f32.min(4.0, number / 100.0))
+      } else if field == 23 {
+        n.shape.effects.contrast = f32.max(0.0, f32.min(4.0, number / 100.0))
+      } else if field == 24 {
+        n.shape.effects.saturation = f32.max(0.0, f32.min(4.0, number / 100.0))
+      } else if field == 25 {
+        n.shape.blend = f32.toU8(f32.max(0.0, f32.min(15.0, number)))
+      } else if field == 30 {
+        n.fontFamily = f32.toU32(f32.max(0.0, f32.min(2.0, number)))
+      } else if field == 26 {
+        n.shape.innerShadow = color
+      } else if field == 27 {
+        n.shape.innerBlur = f32.max(0.0, number)
+      } else if field == 28 {
+        n.shape.innerX = number
+      } else if field == 29 {
+        n.shape.innerY = number
+      }
+    }
+    i = i + 1
+  }
+  m.changed()
+}
+
+pub fn key(m: &mut Studio, key: string, mods: u32) -> () {
+  let command = (mods & (MOD_CONTROL | MOD_META)) != 0
+  let shift = (mods & MOD_SHIFT) != 0
+  if key == "Escape" {
+    action(&mut m, 35)
+  } else if m.menu != 0 {
+    return ()
+  } else if key == "Tab" {
+    action(&mut m, 40)
+  } else if key == "?" {
+    action(&mut m, 18)
+  } else if key == "+" || key == "=" {
+    action(&mut m, 39)
+  } else if key == "-" {
+    action(&mut m, 38)
+  } else if command && (key == "x" || key == "X") {
+    action(&mut m, 41)
+  } else if command && (key == "y" || key == "Y") {
+    action(&mut m, 1)
+  } else if command && key == "]" {
+    action(&mut m, 23)
+  } else if command && key == "[" {
+    action(&mut m, 24)
+  } else if key == "Delete" || key == "Backspace" {
+    action(&mut m, 2)
+  } else if command && (key == "z" || key == "Z") {
+    action(
+      &mut m,
+      if shift {
+        1
+      } else {
+        0
+      },
+    )
+  } else if command && (key == "s" || key == "S") {
+    action(
+      &mut m,
+      if shift {
+        37
+      } else {
+        13
+      },
+    )
+  } else if command && key == "o" {
+    action(&mut m, 36)
+  } else if command && key == "a" {
+    action(&mut m, 6)
+  } else if command && key == "d" {
+    action(&mut m, 3)
+  } else if command && key == "c" {
+    action(&mut m, 4)
+  } else if command && key == "v" {
+    action(&mut m, 5)
+  } else if command && (key == "g" || key == "G") {
+    action(
+      &mut m,
+      if shift {
+        22
+      } else {
+        21
+      },
+    )
+  } else if command && key == "k" {
+    action(&mut m, 16)
+  } else if key == "1" && shift {
+    action(&mut m, 7)
+  } else if key == "2" && shift {
+    action(&mut m, 8)
+  } else if key == "0" {
+    action(&mut m, 9)
+  } else if key == "v" {
+    m.tool = 0
+  } else if key == "f" {
+    m.tool = 1
+  } else if key == "r" {
+    m.tool = 2
+  } else if key == "o" {
+    m.tool = 3
+  } else if key == "t" {
+    m.tool = 4
+  } else if key == "h" {
+    m.tool = 5
+  } else if key == "ArrowLeft" || key == "ArrowRight" || key == "ArrowUp" || key == "ArrowDown" {
+    m.checkpoint()
+    let distance: f32 = if shift {
+      10.0
+    } else {
+      1.0
+    }
+    let mut i: usize = 0
+    while i < m.elements.length() {
+      let e = m.elements.get(i)
+      if selectedAncestor(&m.*, e) && !flag(&m.*, e, 2) {
+        let n = &mut m.elements.asMutSlice()[i].shape
+        if key == "ArrowLeft" {
+          n.x = n.x - distance
+        } else if key == "ArrowRight" {
+          n.x = n.x + distance
+        } else if key == "ArrowUp" {
+          n.y = n.y - distance
+        } else {
+          n.y = n.y + distance
+        }
+      }
+      i = i + 1
+    }
+    m.changed()
+  }
+}

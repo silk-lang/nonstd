@@ -96,10 +96,11 @@ def windows_import_library(name):
     raise RuntimeError(f"Cannot find {name}.lib; run from an x64 Visual Studio 2026 developer shell with the Windows SDK")
 
 
-def silk_command(subcommand, manifest, release=False, target=None):
-    """The pinned compiler's command line for `subcommand` on `manifest`, and its environment."""
+def silk_command(subcommand, manifest, release=False, target=None, clang=None):
+    """The pinned compiler's command line for `subcommand` on `manifest`, and its environment.
+    `clang` replaces the pinned LLVM's clang, for a wrapper that adds link flags."""
     compiler_bin = command_path("install-silk")
-    clang = command_path("install-llvm")
+    clang = clang or command_path("install-llvm")
     command = [str(compiler_bin / executable("silkc")), subcommand, "--manifest-path", str(manifest),
                "--stdlib", str(compiler_bin.parent / "lib" / "silk" / "stdlib"), "--clang", str(clang)]
     if target:
@@ -109,13 +110,13 @@ def silk_command(subcommand, manifest, release=False, target=None):
     return command, dict(os.environ, SILK_CLANG=str(clang))
 
 
-def build(package_path, release=False, target=None):
+def build(package_path, release=False, target=None, clang=None):
     """Build the package at `package_path` and return its executable."""
     package_path = Path(package_path).resolve()
     if package_path.is_file():
         package_path = package_path.parent
     name = re.search(r'^name = "([^"]+)"', (package_path / "silk.toml").read_text(encoding="utf-8"), re.M).group(1)
-    command, env = silk_command("build", package_path / "silk.toml", release, target)
+    command, env = silk_command("build", package_path / "silk.toml", release, target, clang)
     subprocess.run(command, cwd=REPO, env=env, check=True)
     wasm = target == "wasm32-unknown-unknown"
     profile = "release" if release else "debug"

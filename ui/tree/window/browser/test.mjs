@@ -5,9 +5,11 @@
 //    read back and compared with the CPU reference of the same frame); `main` must return 0.
 // 2. `/`: the app runs with real input for a while: pointer moves, a click at `--click X,Y`
 //    (CSS pixels), typing and a wheel turn, with no page, console or WebGPU errors.
+// 3. With `--stored KEY`: the app kept text under KEY in localStorage (holding the typed text,
+//    when there is some), and a reload starts from it with no errors.
 //
 //   node ui/tree/window/browser/test.mjs --wasm APP.wasm [--click X,Y] [--type TEXT]
-//        [--size WIDTH,HEIGHT] [--scale N] [--screenshot FILE]
+//        [--size WIDTH,HEIGHT] [--scale N] [--screenshot FILE] [--stored KEY]
 //
 // Never downloads a browser.
 import { createRequire } from 'node:module';
@@ -24,6 +26,7 @@ const scale = Number(option('--scale', '1'));
 const click = option('--click')?.split(',').map(Number);
 const typed = option('--type');
 const screenshot = option('--screenshot');
+const storedKey = option('--stored');
 const require = createRequire(import.meta.url);
 let chromium;
 try { ({ chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')); }
@@ -90,6 +93,25 @@ try {
   console.log(`${errors.length ? 'FAIL' : 'PASS'} input: pointer, click, keys and wheel with no errors`);
   if (errors.length) { console.log(errors.join('\n')); failed = true; }
   if (screenshot) await page.screenshot({ path: screenshot });
+
+  // 3. What the app kept, and a reload that reads it.
+  if (storedKey) {
+    const key = `silk-app:${storedKey}`;
+    const kept = await page.waitForFunction(([key, typed]) => {
+      const value = localStorage.getItem(key);
+      return value && (!typed || value.includes(typed)) ? value.length : 0;
+    }, [key, typed], { timeout: 10000 }).then(handle => handle.jsonValue(), () => 0);
+    console.log(`${kept ? 'PASS' : 'FAIL'} stored: ${kept ? `${kept} characters under ${key}` : `nothing${typed ? ` holding "${typed}"` : ''} under ${key}`}`);
+    if (!kept) failed = true;
+    errors.length = 0;
+    await page.reload();
+    await page.waitForFunction(() => document.querySelector('canvas')?.width > 0 || window.appResult, null, { timeout: 120000 });
+    await page.waitForTimeout(1500);
+    const reloaded = await page.evaluate(() => window.appResult);
+    if (reloaded?.error) errors.push(reloaded.error);
+    console.log(`${errors.length ? 'FAIL' : 'PASS'} reload: the app started from what it kept`);
+    if (errors.length) { console.log(errors.join('\n')); failed = true; }
+  }
 } finally {
   await browser?.close();
   const closed = Promise.withResolvers();

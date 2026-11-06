@@ -1,0 +1,289 @@
+//! Atomic local storage for Studio documents. Invalid imports never replace the open design.
+import font_collection.system as systemFonts
+import font_collection.system { Options as FontOptions }
+import silk.concurrency.thread { Transferable }
+import ui_app_window.background { Background }
+import silk.concurrency.thread_native { SpawnError }
+import font_collection.lib { FontCollection }
+import studio.model { Studio }
+import studio.editing as editing
+import studio.format as format
+import studio.samples as samples
+import silk.json.scanner { JsonError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.text.string { String, InvalidUtf8 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileSystem, FileError, AtomicWriteError, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+
+// The job owns a detached copy allocated on the process heap. No UI state or storage is
+// borrowed from the window thread; the completion flag is protected by its mutex.
+struct SaveJob {
+  document: Studio,
+  path: String
+}
+
+impl Transferable for SaveJob {}
+
+struct PendingSave {
+  task: Background<bool>,
+  revision: u64
+}
+
+pub struct Storage {
+  pub path: String,
+  pub files: MachineFileSystem,
+  pending: Option<PendingSave>
+}
+
+pub struct InvalidFile {}
+
+pub effect fn defaultPath() -> String
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let mut path = String.make()
+  if let Option<Bytes>.Some { value } = run HostInput.variableNamed("HOME") {
+    let home = String.fromUtf8(Bytes.asSlice(&value)) |> Result<string, InvalidUtf8>.unwrapOr("")
+    run path.append(home)
+    run path.append("/")
+  }
+  run path.append(".silk-studio.silkdesign")
+  return move path
+}
+
+impl Storage {
+  pub fn saving(self: &Self) -> bool {
+    return self.pending.isSome()
+  }
+
+  pub effect fn make(path: String) -> Storage
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    return Storage {
+      path: move path,
+      files: run MachineFileSystem.make(),
+      pending: Option<PendingSave>.None,
+    }
+  }
+
+  effect fn read(self: &mut Self, path: string) -> Studio
+    ! FileError | InvalidFile | OutOfMemoryError
+    ? &mut Allocator {
+    let file = run Path.fromBytes(String.utf8Bytes(path))
+    let bytes = run FileSystem.readFile(&file) |> Effect.provideMut<FileSystem>(&mut self.files)
+    let parsed = run Effect.result(format.decode(Bytes.asSlice(&bytes)))
+    return match move parsed {
+      Result<Studio, format.InvalidDocument | JsonError | OutOfMemoryError>.Success {
+        value
+      } => move value
+      Result<Studio, format.InvalidDocument | JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        fail InvalidFile {}
+      }
+    }
+  }
+
+  /// Missing default files start a new sample. Other read errors are returned without writing.
+  pub effect fn initial(self: &mut Self) -> Studio
+    ! FileError | InvalidFile | OutOfMemoryError
+    ? &mut Allocator {
+    let name = run String.copy(String.view(&self.path))
+    let result = run Effect.result(self.read(String.view(&name)))
+    return match move result {
+      Result<Studio, FileError | InvalidFile | OutOfMemoryError>.Success { value } => move value
+      Result<Studio, FileError | InvalidFile | OutOfMemoryError>.Failure {
+        error
+      } => match move error {
+        FileError failure => {
+          if FileSystem.reasonCode(move failure.reason)
+            == FileSystem.reasonCode(FileSystem.notFound()) {
+            let mut m = Studio.make()
+            samples.starter(&mut m)
+            m.fit(false)
+            m.revision = 1
+            m.saveRequested = true
+            return move m
+          }
+          fail InvalidFile {}
+        }
+        InvalidFile failure => {
+          fail move failure
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+  }
+
+  pub effect fn open(self: &mut Self, path: string) -> Option<Studio>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let result = run Effect.result(self.read(path))
+    return match move result {
+      Result<Studio, FileError | InvalidFile | OutOfMemoryError>.Success { value } => {
+        self.path = run String.copy(path)
+        Option<Studio>.some(move value)
+      }
+      Result<Studio, FileError | InvalidFile | OutOfMemoryError>.Failure { error } => {
+        drop error
+        Option<Studio>.None
+      }
+    }
+  }
+
+  effect fn write(self: &mut Self, path: string, bytes: &[u8]) -> ()
+    ! FileError | AtomicWriteError | OutOfMemoryError
+    ? &mut Allocator {
+    let file = run Path.fromBytes(String.utf8Bytes(path))
+    run FileSystem.writeFileAtomic(
+      &file,
+      bytes,
+      FileSystem.replaceExisting(),
+      FileSystem.buffered(),
+    )
+      |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  pub effect fn writeBytes(self: &mut Self, path: string, bytes: &[u8]) -> bool
+    ? &mut Allocator {
+    let result = run Effect.result(self.write(path, bytes))
+    return match move result {
+      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success { value: _ } => true
+      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        false
+      }
+    }
+  }
+
+  /// Collects a completed background write. Waiting is reserved for explicit saves and close.
+  pub fn collect(self: &mut Self, m: &mut Studio, wait: bool) -> bool {
+    let ready = match &self.pending {
+      Option<PendingSave>.Some { value } => wait || value.task.ready()
+      Option<PendingSave>.None => false
+    }
+    if !ready {
+      return false
+    }
+    let pending = Intrinsic.replace(self.pending, Option<PendingSave>.None)
+    if let Option<PendingSave>.Some { value } = move pending {
+      let revision = value.revision
+      let mut pending = move value
+      let ok = pending.task.wait().unwrapOr(false)
+      if ok {
+        m.savedRevision = revision
+      }
+      m.notice = m.heap.alloc(
+        String.copy(
+          if ok {
+            "Saved on this device"
+          } else {
+            "Save failed — check the file permissions"
+          },
+        ),
+      )
+    }
+    return true
+  }
+
+  /// Copies document data once, then encodes and writes it on a native worker thread.
+  pub effect fn autosave(self: &mut Self, m: &mut Studio) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if Option<PendingSave>.isSome(&self.pending) {
+      return ()
+    }
+    let mut document = Studio.make()
+    run document.elements.appendSlice(m.elements.asSlice())
+    run document.pages.appendSlice(m.pages.asSlice())
+    let mut i: usize = 0
+    while i < m.strings.length() {
+      run document.strings.append(run String.copy(String.view(&m.strings.asSlice()[i])))
+      i = i + 1
+    }
+    document.title = m.title
+    document.nextId = m.nextId
+    document.page = m.page
+    let path = run String.copy(String.view(&self.path))
+    let job = SaveJob { document: move document, path: move path }
+    let launched = run Effect.result(
+      Background<bool>.start(
+        fn() -> bool {
+          return writeJob(move job)
+        },
+      ),
+    )
+    match move launched {
+      Result<Background<bool>, SpawnError | OutOfMemoryError>.Success { value: task } => {
+        self.pending = Option<PendingSave>.some(
+          PendingSave { task: move task, revision: m.revision },
+        )
+        m.saveRequested = false
+      }
+      Result<Background<bool>, SpawnError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        m.notice = run String.copy("Could not start autosave. Use Save to retry.")
+        m.saveRequested = false
+      }
+    }
+  }
+
+  pub effect fn save(self: &mut Self, m: &mut Studio) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    editing.commitDraft(&mut m)
+    drop self.collect(&mut m, true)
+    let text = run format.encode(&m.*)
+    let path = run String.copy(String.view(&self.path))
+    let ok = run self.writeBytes(String.view(&path), String.utf8Bytes(String.view(&text)))
+    m.saveRequested = false
+    if ok {
+      m.savedRevision = m.revision
+    }
+    m.notice = run String.copy(
+      if ok {
+        "Saved on this device"
+      } else {
+        "Save failed — check the file permissions"
+      },
+    )
+    return ok
+  }
+}
+
+/// Discovers installed desktop fonts; the initial bundled collection remains a fallback.
+pub effect fn desktopFonts(collection: &mut FontCollection) -> ()
+  ? &mut HostInput | &mut Allocator {
+  drop run Effect.result(systemFonts.load(&mut collection, FontOptions.defaults()))
+}
+
+effect fn writeSnapshotEffect(document: Studio, path: String) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut storage = run Storage.make(move path)
+  let json = run format.encode(&document)
+  let destination = run String.copy(String.view(&storage.path))
+  return run storage.writeBytes(String.view(&destination), String.utf8Bytes(String.view(&json)))
+}
+
+fn writeSnapshot(document: Studio, path: String) -> bool {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(writeSnapshotEffect(move document, move path))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move result {
+    Result<bool, FileError | OutOfMemoryError>.Success { value } => value
+    Result<bool, FileError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      false
+    }
+  }
+}
+
+fn writeJob(job: SaveJob) -> bool {
+  return writeSnapshot(move job.document, move job.path)
+}

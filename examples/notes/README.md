@@ -46,8 +46,9 @@ In a browser tab, with WebGPU and JSPI (Chrome or Edge 137 or later), at http://
 python3 ui/tree/window/scripts/browser serve    # builds examples/notes/browser for wasm32
 ```
 
-The browser build (`examples/notes/browser`) starts from the sample notes and keeps them in
-memory, so a reload starts over.
+The browser build (`examples/notes/browser`) keeps the notes file in the page's localStorage
+(under `silk-app:notes`), so a reload finds the notes again; the first visit starts from the
+sample notes.
 
 To look inside it while it runs, start it with the devtools window next to it:
 
