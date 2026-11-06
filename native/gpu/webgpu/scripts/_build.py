@@ -96,30 +96,33 @@ def windows_import_library(name):
     raise RuntimeError(f"Cannot find {name}.lib; run from an x64 Visual Studio 2026 developer shell with the Windows SDK")
 
 
-def silk_command(subcommand, manifest, release=False, target=None, clang=None):
+def silk_command(subcommand, manifest, release=False, target=None, profile=None):
     """The pinned compiler's command line for `subcommand` on `manifest`, and its environment.
-    `clang` replaces the pinned LLVM's clang, for a wrapper that adds link flags."""
+    `profile` names one of the manifest's profiles, which sets the target and optimization."""
     compiler_bin = command_path("install-silk")
-    clang = clang or command_path("install-llvm")
+    clang = command_path("install-llvm")
     command = [str(compiler_bin / executable("silkc")), subcommand, "--manifest-path", str(manifest),
                "--stdlib", str(compiler_bin.parent / "lib" / "silk" / "stdlib"), "--clang", str(clang)]
-    if target:
+    if profile:
+        command += ["--profile", profile]
+    if target and not profile:
         command += ["--target", target]
-    if release:
+    if release and not profile:
         command.append("--release")
     return command, dict(os.environ, SILK_CLANG=str(clang))
 
 
-def build(package_path, release=False, target=None, clang=None):
-    """Build the package at `package_path` and return its executable."""
+def build(package_path, release=False, target=None, profile=None):
+    """Build the package at `package_path` and return its executable. `profile` names one of its
+    manifest's profiles; `target` then says which target that profile builds for."""
     package_path = Path(package_path).resolve()
     if package_path.is_file():
         package_path = package_path.parent
     name = re.search(r'^name = "([^"]+)"', (package_path / "silk.toml").read_text(encoding="utf-8"), re.M).group(1)
-    command, env = silk_command("build", package_path / "silk.toml", release, target, clang)
+    command, env = silk_command("build", package_path / "silk.toml", release, target, profile)
     subprocess.run(command, cwd=REPO, env=env, check=True)
     wasm = target == "wasm32-unknown-unknown"
-    profile = "release" if release else "debug"
+    profile = profile or ("release" if release else "debug")
     file = name if wasm else executable(name)
     # Workspace members build into the shared output directory; other packages into their own.
     candidates = [path for output in (REPO / "build", package_path / "build")
