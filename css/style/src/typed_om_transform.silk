@@ -1,0 +1,987 @@
+//! CSS Typed OM transform components and lists, backed by the numeric arena and
+//! the existing CSS transform grammar / graphics matrix implementation.
+//! https://drafts.css-houdini.org/css-typed-om-1/ §§4.4, 5.5, 6.6.
+//! Components borrow numeric identities from their caller's NumericStore; lists own
+//! component values and expose mutable borrows for in-place component operations.
+import typed_om_numeric { NumericStore, NumericId, BaseType, UnitValue, Numberish }
+import typed_om_numeric_units { lookup, UnitInfo }
+import cssom_geometry { DOMMatrix }
+import cssom_geometry_parse as parsing
+import cssom_geometry_parse { SkewKind }
+import transform_values { Operation }
+import dimensions { ExprId }
+import dimensions
+import cssom_error { CssomError }
+import tokens { Limits, CssError, equal, insensitive }
+import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import svg_geometry.transforms { Matrix }
+import svg_geometry.transforms as transforms
+import silk.num.f64
+
+pub enum TransformKind {
+  Translate,
+  Rotate,
+  Scale,
+  Skew,
+  SkewX,
+  SkewY,
+  Perspective,
+  Matrix
+}
+
+union Data {
+  Numeric { kind: TransformKind, values: [NumericId; 4] },
+  Perspective { depth: Option<NumericId>, keyword: [u8; 4] },
+  Matrix { value: DOMMatrix },
+}
+
+impl Copy for Data {}
+
+pub struct TransformComponent {
+  data: Data,
+  twoD: bool
+}
+
+impl Copy for TransformComponent {}
+
+fn matches(store: &NumericStore, id: NumericId, base: BaseType, percent: bool) -> bool {
+  return store.typeOf(id).matches(base, percent)
+}
+
+effect fn require(store: &NumericStore, id: NumericId, base: BaseType, percent: bool) -> ()
+  ! CssomError {
+  if !matches(store, id, base, percent) {
+    fail CssomError.TypeError
+  }
+}
+
+effect fn requireNumber(store: &NumericStore, id: NumericId) -> ()
+  ! CssomError {
+  if !store.typeOf(id).isNumber() {
+    fail CssomError.TypeError
+  }
+}
+
+effect fn converted(store: &NumericStore, id: NumericId, unit: &[u8]) -> f64
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let value = run store.to(id, unit)
+  return value.value
+}
+
+impl TransformComponent {
+  pub fn kind(self: &Self) -> TransformKind {
+    return match &self.data {
+      Data.Numeric { kind, values } => kind
+      Data.Perspective { depth, keyword } => TransformKind.Perspective
+      Data.Matrix { value } => TransformKind.Matrix
+    }
+  }
+
+  pub fn is2D(self: &Self) -> bool {
+    return self.twoD
+  }
+
+  pub fn setIs2D(self: &mut Self, value: bool) -> () {
+    let kind = self.kind()
+    if kind != TransformKind.Skew && kind != TransformKind.SkewX && kind != TransformKind.SkewY
+      && kind != TransformKind.Perspective {
+      self.twoD = value
+    }
+  }
+
+  pub effect fn translate(
+    store: &mut NumericStore,
+    x: NumericId,
+    y: NumericId,
+    z: Option<NumericId>,
+  ) -> Self
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    run require(&store.*, x, BaseType.Length, true)
+    run require(&store.*, y, BaseType.Length, true)
+    let mut twoD = false
+    let depth = match &z {
+      Option<NumericId>.Some { value } => {
+        run require(&store.*, value, BaseType.Length, false)
+        value
+      }
+      _ => {
+        twoD = true
+        run store.unit(0.0, b"px")
+      }
+    }
+    return Self {
+      data: Data.Numeric { kind: TransformKind.Translate, values: [x, y, depth, depth] },
+      twoD: twoD,
+    }
+  }
+
+  pub effect fn scale(
+    store: &mut NumericStore,
+    x: NumericId,
+    y: NumericId,
+    z: Option<NumericId>,
+  ) -> Self
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    run requireNumber(&store.*, x)
+    run requireNumber(&store.*, y)
+    let mut twoD = false
+    let depth = match &z {
+      Option<NumericId>.Some { value } => {
+        run requireNumber(&store.*, value)
+        value
+      }
+      _ => {
+        twoD = true
+        run store.unit(1.0, b"number")
+      }
+    }
+    return Self {
+      data: Data.Numeric { kind: TransformKind.Scale, values: [x, y, depth, depth] },
+      twoD: twoD,
+    }
+  }
+
+  pub effect fn scaleNumberish(
+    store: &mut NumericStore,
+    x: Numberish,
+    y: Numberish,
+    z: Option<Numberish>,
+  ) -> Self
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let nx = run store.rectify(x)
+    let ny = run store.rectify(y)
+    let nz = match &z {
+      Option<Numberish>.Some { value } => Option<NumericId>.some(run store.rectify(value))
+      _ => Option<NumericId>.None
+    }
+    return run TransformComponent.scale(&mut store.*, nx, ny, nz)
+  }
+
+  pub effect fn rotate(store: &mut NumericStore, angle: NumericId) -> Self
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    run require(&store.*, angle, BaseType.Angle, false)
+    let zero = run store.unit(0.0, b"number")
+    let one = run store.unit(1.0, b"number")
+    return Self {
+      data: Data.Numeric { kind: TransformKind.Rotate, values: [zero, zero, one, angle] },
+      twoD: true,
+    }
+  }
+
+  pub effect fn rotate3d(
+    store: &NumericStore,
+    x: NumericId,
+    y: NumericId,
+    z: NumericId,
+    angle: NumericId,
+  ) -> Self
+    ! CssomError {
+    run requireNumber(store, x)
+    run requireNumber(store, y)
+    run requireNumber(store, z)
+    run require(store, angle, BaseType.Angle, false)
+    return Self {
+      data: Data.Numeric { kind: TransformKind.Rotate, values: [x, y, z, angle] },
+      twoD: false,
+    }
+  }
+
+  pub effect fn rotateNumberish(
+    store: &mut NumericStore,
+    x: Numberish,
+    y: Numberish,
+    z: Numberish,
+    angle: NumericId,
+  ) -> Self
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let nx = run store.rectify(x)
+    let ny = run store.rectify(y)
+    let nz = run store.rectify(z)
+    return run TransformComponent.rotate3d(&store.*, nx, ny, nz, angle)
+  }
+
+  pub effect fn skew(store: &NumericStore, ax: NumericId, ay: NumericId) -> Self
+    ! CssomError {
+    run require(store, ax, BaseType.Angle, false)
+    run require(store, ay, BaseType.Angle, false)
+    return Self {
+      data: Data.Numeric { kind: TransformKind.Skew, values: [ax, ay, ay, ay] },
+      twoD: true,
+    }
+  }
+
+  pub effect fn skewX(store: &NumericStore, ax: NumericId) -> Self
+    ! CssomError {
+    run require(store, ax, BaseType.Angle, false)
+    return Self {
+      data: Data.Numeric { kind: TransformKind.SkewX, values: [ax, ax, ax, ax] },
+      twoD: true,
+    }
+  }
+
+  pub effect fn skewY(store: &NumericStore, ay: NumericId) -> Self
+    ! CssomError {
+    run require(store, ay, BaseType.Angle, false)
+    return Self {
+      data: Data.Numeric { kind: TransformKind.SkewY, values: [ay, ay, ay, ay] },
+      twoD: true,
+    }
+  }
+
+  pub effect fn perspective(store: &NumericStore, depth: Option<NumericId>) -> Self
+    ! CssomError {
+    match &depth {
+      Option<NumericId>.Some { value } => run require(store, value, BaseType.Length, false)
+      _ => {}
+    }
+    return Self {
+      data: Data.Perspective { depth: depth, keyword: [110, 111, 110, 101] },
+      twoD: false,
+    }
+  }
+
+  pub effect fn perspectiveKeyword(keyword: &[u8]) -> Self
+    ! CssomError {
+    if !insensitive(keyword, b"none") {
+      fail CssomError.TypeError
+    }
+    return Self {
+      data: Data.Perspective {
+        depth: Option<NumericId>.None,
+        keyword: [keyword[0], keyword[1], keyword[2], keyword[3]],
+      },
+      twoD: false,
+    }
+  }
+
+  pub fn matrix(value: DOMMatrix, is2D: Option<bool>) -> Self {
+    let twoD = match &is2D {
+      Option<bool>.Some { value: flag } => flag
+      _ => value.is2D
+    }
+    return Self { data: Data.Matrix { value: value }, twoD: twoD }
+  }
+
+  // Numeric slots are x/y/z/angle for translate/scale/rotate; ax/ay for skew;
+  // ax or ay for skewX/skewY. Unsupported attributes throw rather than alias.
+  pub effect fn numeric(self: &Self, index: usize) -> NumericId
+    ! CssomError {
+    match &self.data {
+      Data.Numeric { kind, values } => {
+        let count: usize = if kind == TransformKind.Rotate {
+          4
+        } else if kind == TransformKind.Translate || kind == TransformKind.Scale {
+          3
+        } else if kind == TransformKind.Skew {
+          2
+        } else {
+          1
+        }
+        if index >= count {
+          fail CssomError.TypeError
+        }
+        return values[index]
+      }
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+  }
+
+  pub effect fn setNumeric(self: &mut Self, store: &NumericStore, index: usize, id: NumericId) -> ()
+    ! CssomError {
+    let previous = run self.numeric(index)
+    match &self.data {
+      Data.Numeric { kind, values } => {
+        if kind == TransformKind.Translate {
+          run require(store, id, BaseType.Length, index < 2)
+        } else if kind == TransformKind.Scale || (kind == TransformKind.Rotate && index < 3) {
+          run requireNumber(store, id)
+        } else {
+          run require(store, id, BaseType.Angle, false)
+        }
+        let mut updated = values
+        updated[index] = id
+        self.data = Data.Numeric { kind: kind, values: updated }
+      }
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+  }
+
+  pub effect fn setNumberish(
+    self: &mut Self,
+    store: &mut NumericStore,
+    index: usize,
+    value: Numberish,
+  ) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if (self.kind() != TransformKind.Scale && self.kind() != TransformKind.Rotate) || index >= 3 {
+      fail CssomError.TypeError
+    }
+    let id = run store.rectify(value)
+    run self.setNumeric(&store.*, index, id)
+  }
+
+  effect fn coordinate(self: &Self, index: usize) -> NumericId
+    ! CssomError {
+    let kind = self.kind()
+    if kind != TransformKind.Translate && kind != TransformKind.Rotate
+      && kind != TransformKind.Scale {
+      fail CssomError.TypeError
+    }
+    return run self.numeric(index)
+  }
+
+  pub effect fn x(self: &Self) -> NumericId
+    ! CssomError {
+    return run self.coordinate(0)
+  }
+
+  pub effect fn y(self: &Self) -> NumericId
+    ! CssomError {
+    return run self.coordinate(1)
+  }
+
+  pub effect fn z(self: &Self) -> NumericId
+    ! CssomError {
+    return run self.coordinate(2)
+  }
+
+  pub effect fn angle(self: &Self) -> NumericId
+    ! CssomError {
+    return run self.numeric(3)
+  }
+
+  pub effect fn ax(self: &Self) -> NumericId
+    ! CssomError {
+    if self.kind() != TransformKind.Skew && self.kind() != TransformKind.SkewX {
+      fail CssomError.TypeError
+    }
+    return run self.numeric(0)
+  }
+
+  pub effect fn ay(self: &Self) -> NumericId
+    ! CssomError {
+    if self.kind() != TransformKind.Skew && self.kind() != TransformKind.SkewY {
+      fail CssomError.TypeError
+    }
+    return run self.numeric(
+      if self.kind() == TransformKind.Skew {
+        1
+      } else {
+        0
+      },
+    )
+  }
+
+  pub effect fn setX(self: &mut Self, store: &NumericStore, value: NumericId) -> ()
+    ! CssomError {
+    let previous = run self.x()
+    run self.setNumeric(store, 0, value)
+  }
+
+  pub effect fn setY(self: &mut Self, store: &NumericStore, value: NumericId) -> ()
+    ! CssomError {
+    let previous = run self.y()
+    run self.setNumeric(store, 1, value)
+  }
+
+  pub effect fn setZ(self: &mut Self, store: &NumericStore, value: NumericId) -> ()
+    ! CssomError {
+    let previous = run self.z()
+    run self.setNumeric(store, 2, value)
+  }
+
+  pub effect fn setAngle(self: &mut Self, store: &NumericStore, value: NumericId) -> ()
+    ! CssomError {
+    run self.setNumeric(store, 3, value)
+  }
+
+  pub effect fn setAx(self: &mut Self, store: &NumericStore, value: NumericId) -> ()
+    ! CssomError {
+    let previous = run self.ax()
+    run self.setNumeric(store, 0, value)
+  }
+
+  pub effect fn setAy(self: &mut Self, store: &NumericStore, value: NumericId) -> ()
+    ! CssomError {
+    let previous = run self.ay()
+    let index: usize = if self.kind() == TransformKind.Skew {
+      1
+    } else {
+      0
+    }
+    run self.setNumeric(store, index, value)
+  }
+
+  pub effect fn length(self: &Self) -> Option<NumericId>
+    ! CssomError {
+    return match &self.data {
+      Data.Perspective { depth, keyword } => depth
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+  }
+
+  pub effect fn lengthKeyword(self: &Self) -> [u8; 4]
+    ! CssomError {
+    return match &self.data {
+      Data.Perspective { depth, keyword } => {
+        if !depth.isNone() {
+          fail CssomError.TypeError
+        }
+        keyword
+      }
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+  }
+
+  pub effect fn setLength(self: &mut Self, store: &NumericStore, depth: Option<NumericId>) -> ()
+    ! CssomError {
+    if self.kind() != TransformKind.Perspective {
+      fail CssomError.TypeError
+    }
+    let next = run TransformComponent.perspective(store, depth)
+    self.data = next.data
+  }
+
+  pub effect fn setLengthKeyword(self: &mut Self, keyword: &[u8]) -> ()
+    ! CssomError {
+    if self.kind() != TransformKind.Perspective {
+      fail CssomError.TypeError
+    }
+    let next = run TransformComponent.perspectiveKeyword(keyword)
+    self.data = next.data
+  }
+
+  pub effect fn matrixValue(self: &Self) -> DOMMatrix
+    ! CssomError {
+    return match &self.data {
+      Data.Matrix { value } => value
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+  }
+
+  pub effect fn setMatrix(self: &mut Self, matrix: DOMMatrix) -> ()
+    ! CssomError {
+    if self.kind() != TransformKind.Matrix {
+      fail CssomError.TypeError
+    }
+    self.data = Data.Matrix { value: matrix }
+  }
+
+  pub effect fn toMatrix(self: &Self, store: &NumericStore) -> DOMMatrix
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let matrix = match &self.data {
+      Data.Matrix { value } => {
+        if self.twoD {
+          let values = value.toFloat64Array()
+          let flat = run DOMMatrix.fromSequence(
+            &[values[0], values[1], values[4], values[5], values[12], values[13]],
+          )
+          flat.matrix
+        } else {
+          value.matrix
+        }
+      }
+      Data.Perspective { depth, keyword } => match &depth {
+        Option<NumericId>.None => transforms.identity()
+        Option<NumericId>.Some { value } => {
+          let distance = run converted(store, value, b"px")
+          if distance == f64.INFINITY {
+            transforms.identity()
+          } else if distance != distance {
+            transforms.fromColumnMajor(&[f64.NAN; 16])
+          } else {
+            match &transforms.perspective(f64.max(0.0, distance)) {
+              Option<Matrix>.Some { value: result } => result
+              _ => {
+                fail CssomError.TypeError
+              }
+            }
+          }
+        }
+      }
+      Data.Numeric { kind, values } => {
+        if kind == TransformKind.Translate {
+          transforms.translation(
+            run converted(store, values[0], b"px"),
+            run converted(store, values[1], b"px"),
+            if self.twoD {
+              0.0
+            } else {
+              run converted(store, values[2], b"px")
+            },
+          )
+        } else if kind == TransformKind.Scale {
+          transforms.scale(
+            run converted(store, values[0], b"number"),
+            run converted(store, values[1], b"number"),
+            if self.twoD {
+              1.0
+            } else {
+              run converted(store, values[2], b"number")
+            },
+          )
+        } else if kind == TransformKind.Rotate {
+          let angle = run converted(store, values[3], b"rad")
+          if self.twoD {
+            transforms.rotation(0.0, 0.0, 1.0, angle)
+          } else {
+            transforms.rotation(
+              run converted(store, values[0], b"number"),
+              run converted(store, values[1], b"number"),
+              run converted(store, values[2], b"number"),
+              angle,
+            )
+          }
+        } else if kind == TransformKind.Skew {
+          transforms.skew(
+            run converted(store, values[0], b"rad"),
+            run converted(store, values[1], b"rad"),
+          )
+        } else if kind == TransformKind.SkewX {
+          transforms.skew(run converted(store, values[0], b"rad"), 0.0)
+        } else {
+          transforms.skew(0.0, run converted(store, values[0], b"rad"))
+        }
+      }
+    }
+    return DOMMatrix.fromMatrix(matrix, self.twoD)
+  }
+
+  pub effect fn serialize(self: &Self, store: &NumericStore) -> Bytes
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Bytes.make()
+    match &self.data {
+      Data.Matrix { value } => {
+        return run value.serialize()
+      }
+      Data.Perspective { depth, keyword } => {
+        run out.append(b"perspective(")
+        match &depth {
+          Option<NumericId>.None => run out.append(&keyword)
+          Option<NumericId>.Some { value } => {
+            // Range comparison needs absolute units; unresolved relative values
+            // also require calc() under Typed OM's ranged-unit serialization.
+            let wrap = match &store.unitValue(value) {
+              Option<UnitValue>.Some { value: unit } => {
+                let absolute = match &lookup(unit.unit) {
+                  Option<UnitInfo>.Some { value: info } => equal(info.canonical, b"px")
+                  _ => false
+                }
+                unit.value < 0.0 || !absolute
+              }
+              _ => false
+            }
+            if wrap {
+              run out.append(b"calc(")
+            }
+            run appendNumeric(&mut out, store, value)
+            if wrap {
+              run out.append(b")")
+            }
+          }
+        }
+      }
+      Data.Numeric { kind, values } => {
+        if kind == TransformKind.Translate || kind == TransformKind.Scale {
+          run out.append(
+            if kind == TransformKind.Translate {
+              if self.twoD {
+                b"translate("
+              } else {
+                b"translate3d("
+              }
+            } else {
+              if self.twoD {
+                b"scale("
+              } else {
+                b"scale3d("
+              }
+            },
+          )
+          run appendNumeric(&mut out, store, values[0])
+          if !self.twoD || kind != TransformKind.Scale || !store.equals(values[0], &[values[1]]) {
+            run out.append(b", ")
+            run appendNumeric(&mut out, store, values[1])
+          }
+          if !self.twoD {
+            run out.append(b", ")
+            run appendNumeric(&mut out, store, values[2])
+          }
+        } else if kind == TransformKind.Rotate {
+          run out.append(
+            if self.twoD {
+              b"rotate("
+            } else {
+              b"rotate3d("
+            },
+          )
+          if !self.twoD {
+            run appendNumeric(&mut out, store, values[0])
+            run out.append(b", ")
+            run appendNumeric(&mut out, store, values[1])
+            run out.append(b", ")
+            run appendNumeric(&mut out, store, values[2])
+            run out.append(b",")
+          }
+          run appendNumeric(&mut out, store, values[3])
+        } else {
+          run out.append(
+            if kind == TransformKind.Skew {
+              b"skew("
+            } else if kind == TransformKind.SkewX {
+              b"skewX("
+            } else {
+              b"skewY("
+            },
+          )
+          run appendNumeric(&mut out, store, values[0])
+          if kind == TransformKind.Skew {
+            let zero = match &store.unitValue(values[1]) {
+              Option<UnitValue>.Some { value } => value.value == 0.0
+              _ => false
+            }
+            if !zero {
+              run out.append(b", ")
+              run appendNumeric(&mut out, store, values[1])
+            }
+          }
+        }
+      }
+    }
+    run out.append(b")")
+    return move out
+  }
+
+  pub effect fn cloneFrom(self: &Self, target: &mut NumericStore, source: &NumericStore) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let data = match &self.data {
+      Data.Matrix { value } => Data.Matrix { value: value }
+      Data.Perspective { depth, keyword } => Data.Perspective {
+        depth: match &depth {
+          Option<NumericId>.Some { value } => Option<NumericId>.some(
+            run target.cloneFrom(source, value),
+          )
+          _ => Option<NumericId>.None
+        },
+        keyword: keyword,
+      }
+      Data.Numeric { kind, values } => {
+        let count: usize = if kind == TransformKind.Rotate {
+          4
+        } else if kind == TransformKind.Translate || kind == TransformKind.Scale {
+          3
+        } else if kind == TransformKind.Skew {
+          2
+        } else {
+          1
+        }
+        let first = run target.cloneFrom(source, values[0])
+        let mut copied = [first; 4]
+        let mut i: usize = 1
+        while i < count {
+          copied[i] = run target.cloneFrom(source, values[i])
+          i = i + 1
+        }
+        Data.Numeric { kind: kind, values: copied }
+      }
+    }
+    return Self { data: data, twoD: self.twoD }
+  }
+}
+
+effect fn appendNumeric(out: &mut Bytes, store: &NumericStore, id: NumericId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = run store.serialize(id)
+  run out.append(text.asSlice())
+}
+
+pub struct TransformValue {
+  components: List<TransformComponent>,
+  source: Option<Bytes>,
+}
+
+impl TransformValue {
+  pub effect fn make(components: &[TransformComponent]) -> Self
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if components.length == 0 {
+      fail CssomError.TypeError
+    }
+    let mut values = List<TransformComponent>.make()
+    run values.appendSlice(components)
+    return Self { components: move values, source: Option<Bytes>.None }
+  }
+
+  pub fn length(self: &Self) -> usize {
+    return self.components.length()
+  }
+
+  pub fn asSlice(self: &Self) -> &[TransformComponent] {
+    return self.components.asSlice()
+  }
+
+  pub fn get(self: &Self, index: usize) -> Option<TransformComponent> {
+    if index >= self.length() {
+      return Option<TransformComponent>.None
+    }
+    return Option<TransformComponent>.some(self.components.asSlice()[index])
+  }
+
+  pub effect fn component<'a>(self: &'a Self, index: usize) -> &'a TransformComponent
+    ! CssomError {
+    if index >= self.length() {
+      fail CssomError.IndexSizeError
+    }
+    return &self.components.asSlice()[index]
+  }
+
+  pub effect fn componentMut<'a>(self: &'a mut Self, index: usize) -> &'a mut TransformComponent
+    ! CssomError {
+    if index >= self.length() {
+      fail CssomError.IndexSizeError
+    }
+    return &mut self.components.asMutSlice()[index]
+  }
+
+  pub effect fn set(self: &mut Self, index: usize, component: TransformComponent) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if index > self.length() {
+      fail CssomError.RangeError
+    }
+    if index == self.length() {
+      run self.components.append(component)
+    } else {
+      let mut values = self.components.asMutSlice()
+      values[index] = component
+    }
+  }
+
+  pub fn is2D(self: &Self) -> bool {
+    let mut i: usize = 0
+    while i < self.length() {
+      if !self.components.asSlice()[i].is2D() {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  pub effect fn toMatrix(self: &Self, store: &NumericStore) -> DOMMatrix
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = DOMMatrix.identity()
+    let mut i: usize = 0
+    while i < self.length() {
+      result.multiplySelf(run self.components.asSlice()[i].toMatrix(store))
+      i = i + 1
+    }
+    return result
+  }
+
+  pub effect fn serialize(self: &Self, store: &NumericStore) -> Bytes
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    match &self.source {
+      Option<Bytes>.Some { value } => {
+        return run Bytes.copy(value.asSlice())
+      }
+      _ => {
+        return run self.serializeComponents(store)
+      }
+    }
+  }
+
+  pub effect fn serializeComponents(self: &Self, store: &NumericStore) -> Bytes
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Bytes.make()
+    let mut i: usize = 0
+    while i < self.length() {
+      if i > 0 {
+        run out.append(b" ")
+      }
+      let component = run self.components.asSlice()[i].serialize(store)
+      run out.append(component.asSlice())
+      i = i + 1
+    }
+    return move out
+  }
+
+  pub effect fn cloneFrom(self: &Self, target: &mut NumericStore, source: &NumericStore) -> Self
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut values = List<TransformComponent>.make()
+    let mut i: usize = 0
+    while i < self.length() {
+      run values.append(run self.components.asSlice()[i].cloneFrom(&mut target.*, source))
+      i = i + 1
+    }
+    let origin = match &self.source {
+      Option<Bytes>.Some { value } => Option<Bytes>.some(run Bytes.copy(value.asSlice()))
+      _ => Option<Bytes>.None
+    }
+    return Self { components: move values, source: move origin }
+  }
+
+  pub effect fn parse(store: &mut NumericStore, text: &[u8], limits: &Limits) -> Self
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = run TransformValue.parseReified(&mut store.*, text, limits)
+    result.source = Option<Bytes>.some(run Bytes.copy(text))
+    return move result
+  }
+
+  pub effect fn parseReified(store: &mut NumericStore, text: &[u8], limits: &Limits) -> Self
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let parsed = run parsing.syntax(text, limits)
+
+    // 'none' is a CSSKeywordValue, never an empty CSSTransformValue.
+    if parsed.none {
+      fail CssomError.TypeError
+    }
+    let mut components = List<TransformComponent>.make()
+    let mut i: usize = 0
+    while i < parsed.operations.length() {
+      let component = run reifyOperation(
+        &mut store.*,
+        &parsed.numerics,
+        &parsed.operations.asSlice()[i],
+        parsed.skewKinds.asSlice()[i],
+        limits,
+      )
+      run components.append(component)
+      i = i + 1
+    }
+    return Self { components: move components, source: Option<Bytes>.None }
+  }
+}
+
+effect fn reifyOperation(
+  store: &mut NumericStore,
+  source: &dimensions.Store,
+  operation: &Operation,
+  skew: SkewKind,
+  limits: &Limits,
+) -> TransformComponent
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  return match &operation.* {
+    Operation.Matrix2 { components } => {
+      let mut values = [0.0; 6]
+      let mut i: usize = 0
+      while i < 6 {
+        let numeric = run parsing.reify(&mut store.*, source, components[i], limits)
+        values[i] = run converted(&store.*, numeric, b"number")
+        i = i + 1
+      }
+      TransformComponent.matrix(run DOMMatrix.fromSequence(&values), Option<bool>.None)
+    }
+    Operation.Matrix3 { components } => {
+      let mut values = [0.0; 16]
+      let mut i: usize = 0
+      while i < 16 {
+        let numeric = run parsing.reify(&mut store.*, source, components[i], limits)
+        values[i] = run converted(&store.*, numeric, b"number")
+        i = i + 1
+      }
+      TransformComponent.matrix(run DOMMatrix.fromSequence(&values), Option<bool>.None)
+    }
+    Operation.Translate { x, y, z, threeD } => {
+      let nx = run parsing.reify(&mut store.*, source, x, limits)
+      let ny = run parsing.reify(&mut store.*, source, y, limits)
+      let nz = if threeD {
+        Option<NumericId>.some(run parsing.reify(&mut store.*, source, z, limits))
+      } else {
+        Option<NumericId>.None
+      }
+      run TransformComponent.translate(&mut store.*, nx, ny, nz)
+    }
+    Operation.Scale { x, y, z, threeD } => {
+      let nx = run reifyScale(&mut store.*, source, x, limits)
+      let ny = run reifyScale(&mut store.*, source, y, limits)
+      let nz = if threeD {
+        Option<NumericId>.some(run reifyScale(&mut store.*, source, z, limits))
+      } else {
+        Option<NumericId>.None
+      }
+      run TransformComponent.scale(&mut store.*, nx, ny, nz)
+    }
+    Operation.Rotate { x, y, z, angle, threeD } => {
+      let na = run parsing.reify(&mut store.*, source, angle, limits)
+      if threeD {
+        let nx = run parsing.reify(&mut store.*, source, x, limits)
+        let ny = run parsing.reify(&mut store.*, source, y, limits)
+        let nz = run parsing.reify(&mut store.*, source, z, limits)
+        run TransformComponent.rotate3d(&store.*, nx, ny, nz, na)
+      } else {
+        run TransformComponent.rotate(&mut store.*, na)
+      }
+    }
+    Operation.Skew { x, y } => {
+      if skew == SkewKind.X {
+        let nx = run parsing.reify(&mut store.*, source, x, limits)
+        run TransformComponent.skewX(&store.*, nx)
+      } else if skew == SkewKind.Y {
+        let ny = run parsing.reify(&mut store.*, source, y, limits)
+        run TransformComponent.skewY(&store.*, ny)
+      } else {
+        let nx = run parsing.reify(&mut store.*, source, x, limits)
+        let ny = run parsing.reify(&mut store.*, source, y, limits)
+        run TransformComponent.skew(&store.*, nx, ny)
+      }
+    }
+    Operation.Perspective { depth } => {
+      let value = match &depth {
+        Option<ExprId>.Some { value: id } => Option<NumericId>.some(
+          run parsing.reify(&mut store.*, source, id, limits),
+        )
+        _ => Option<NumericId>.None
+      }
+      run TransformComponent.perspective(&store.*, value)
+    }
+  }
+}
+
+effect fn reifyScale(
+  store: &mut NumericStore,
+  source: &dimensions.Store,
+  id: ExprId,
+  limits: &Limits,
+) -> NumericId
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let numeric = run parsing.reify(&mut store.*, source, id, limits)
+  if store.typeOf(numeric).isPercent() {
+    let percent = run converted(&store.*, numeric, b"percent")
+    return run store.unit(percent / 100.0, b"number")
+  }
+  return numeric
+}

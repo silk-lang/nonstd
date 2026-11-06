@@ -1,0 +1,920 @@
+//! CSSOM §2.1 and §5.2; CSS Syntax §9 token round-tripping.
+import tokens { TokenBuffer, TokenRange, Kind }
+import tokens
+import input { Input, TokenView }
+import selectors { NamespaceBinding }
+import selectors
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.format { Format }
+import silk.text.utf8_decoder { Utf8Decoder, Utf8Step }
+import silk.num.u8
+import silk.num.u32
+import silk.num.f64
+
+// All text arguments are UTF-8, as are the decoded text spans in TokenBuffer.
+effect fn codePoint(out: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let hex = b"0123456789abcdef"
+  let mut digits: [u8; 8] = [0; 8]
+  let mut n: usize = 8
+  let mut remaining = value
+  while true {
+    n = n - 1
+    digits[n] = hex[u32.toUsize(remaining % 16)]
+    remaining = remaining / 16
+    if remaining == 0 {
+      break
+    }
+  }
+  run out.append(b"\\")
+  run out.append(Slice.view<u8>(&digits, n, 8 - n))
+  run out.append(b" ")
+}
+
+effect fn name(out: &mut Bytes, text: &[u8], initial: bool, lowercase: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < text.length {
+    let mut c = text[at]
+    if c >= 128 {
+      let mut decoder = Utf8Decoder.make()
+      let mut value: u32 = 65533
+      while at < text.length {
+        let step = decoder.step(text[at], at)
+        at = at + 1
+        let complete = match &step {
+          Utf8Step.Scalar { value: decoded } => {
+            value = decoded
+            true
+          }
+          Utf8Step.Invalid { offset } => true
+          Utf8Step.NeedMore => false
+        }
+        if complete {
+          break
+        }
+      }
+      if !tokens.nonAsciiIdentifier(value) {
+        run out.append(b"\\")
+      }
+      run scalar(&mut out.*, value)
+      continue
+    }
+    if lowercase && c >= 65 && c <= 90 {
+      c = c + 32
+    }
+    if c == 0 {
+      run out.append(b"\xef\xbf\xbd")
+    } else if c < 32 || c == 127
+      || (initial && c >= 48 && c <= 57 && (at == 0 || (at == 1 && text[0] == 45))) {
+      run codePoint(&mut out.*, u8.toU32(c))
+    } else if initial && at == 0 && c == 45 && text.length == 1 {
+      run out.append(b"\\-")
+    } else {
+      if !(c == 45 || c == 95 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+        || (c >= 97 && c <= 122)) {
+        run out.append(b"\\")
+      }
+      run out.append(&[c])
+    }
+    at = at + 1
+  }
+}
+
+pub effect fn identifier(text: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run name(&mut out, text, true, false)
+  return move out
+}
+
+/// CSS.escape is exactly CSSOM's identifier serialization, not URL escaping.
+pub effect fn escape(text: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run identifier(text)
+}
+
+effect fn quoted(out: &mut Bytes, text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(b"\"")
+  let mut at: usize = 0
+  while at < text.length {
+    let c = text[at]
+    if c == 0 {
+      run out.append(b"\xef\xbf\xbd")
+    } else if c < 32 || c == 127 {
+      run codePoint(&mut out.*, u8.toU32(c))
+    } else {
+      if c == 34 || c == 92 {
+        run out.append(b"\\")
+      }
+      run out.append(&[c])
+    }
+    at = at + 1
+  }
+  run out.append(b"\"")
+}
+
+pub effect fn string(text: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run quoted(&mut out, text)
+  return move out
+}
+
+pub effect fn url(text: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run out.append(b"url(")
+  run quoted(&mut out, text)
+  run out.append(b")")
+  return move out
+}
+
+// Fixed f64 output is at most 309 integral digits, sign, point and six decimals.
+// The ambient writer cannot fail: it only copies into this bounded stack buffer.
+struct NumberWriter {
+  bytes: [u8; 384],
+  length: usize
+}
+
+impl Writer for NumberWriter {
+  effect fn writeAll(self: &mut Self, value: &[u8]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut at: usize = 0
+    while at < value.length {
+      self.bytes[self.length] = value[at]
+      self.length = self.length + 1
+      at = at + 1
+    }
+  }
+
+  effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer {}
+}
+
+/// Serializes a finite CSS numeric value without exponent notation and with at most
+/// six decimal places (CSSOM §6.7.2). Negative zero serializes as zero.
+pub effect fn appendNumber(out: &mut Bytes, value: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut writer = NumberWriter { bytes: [0; 384], length: 0 }
+  let mut options = Format.defaultOptions()
+  options.precision = Option<usize>.Some { value: 6 }
+  let formatted = run Format.displayWith(&value, move options)
+    |> Effect.provideMut<Writer>(&mut writer)
+    |> Effect.result
+  drop formatted
+  let mut end = writer.length
+  if f64.isFinite(value) {
+    while end > 0 && writer.bytes[end - 1] == 48 {
+      end = end - 1
+    }
+    if end > 0 && writer.bytes[end - 1] == 46 {
+      end = end - 1
+    }
+    if end == 2 && writer.bytes[0] == 45 && writer.bytes[1] == 48 {
+      run out.append(b"0")
+      return
+    }
+  }
+  run out.append(Slice.view<u8>(&writer.bytes, 0, end))
+}
+
+pub effect fn number(value: f64) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run appendNumber(&mut out, value)
+  return move out
+}
+
+effect fn numericToken(out: &mut Bytes, value: f64, integer: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // Overflowed numeric tokens retain their numeric category, not an Infinity ident.
+  if f64.isInfinite(value) {
+    if value < 0.0 {
+      run out.append(b"-")
+    }
+    if integer {
+      let mut i: usize = 0
+      while i < 400 {
+        run out.append(b"9")
+        i = i + 1
+      }
+    } else {
+      run out.append(b"1e999")
+    }
+    return
+  }
+  let normalized = if value == 0.0 {
+    0.0
+  } else {
+    value
+  }
+  let mut writer = NumberWriter { bytes: [0; 384], length: 0 }
+  let mut options = Format.defaultOptions()
+  if integer {
+    options.precision = Option<usize>.Some { value: 0 }
+  }
+  let formatted = run Format.displayWith(&normalized, move options)
+    |> Effect.provideMut<Writer>(&mut writer)
+    |> Effect.result
+  drop formatted
+  run out.append(Slice.view<u8>(&writer.bytes, 0, writer.length))
+  if !integer {
+    let mut fractional = false
+    let mut at: usize = 0
+    while at < writer.length {
+      if writer.bytes[at] == 46 || writer.bytes[at] == 101 || writer.bytes[at] == 69 {
+        fractional = true
+      }
+      at = at + 1
+    }
+    if !fractional {
+      run out.append(b".0")
+    }
+  }
+}
+
+fn delimiter(kind: &Kind, wanted: u32) -> bool {
+  return match &kind.* {
+    Kind.Delim { scalar } => scalar == wanted
+    _ => false
+  }
+}
+
+fn separating(left: &Kind, right: &Kind) -> bool {
+  let ident = match &right.* {
+    Kind.Ident { text } => true
+    Kind.Function { name } => true
+    Kind.Url { text } => true
+    Kind.BadUrl => true
+    Kind.Cdc => true
+    _ => false
+  }
+  let numeric = match &right.* {
+    Kind.Number { value, integer } => true
+    Kind.Percentage { value, integer } => true
+    Kind.Dimension { value, integer, unit } => true
+    _ => false
+  }
+  let hyphen = delimiter(right, 45)
+  return match &left.* {
+    Kind.Ident { text } => ident || numeric || hyphen
+      || match &right.* {
+        Kind.OpenParen => true
+        _ => false
+      }
+    Kind.AtKeyword { name } => ident || numeric || hyphen
+    Kind.Hash { text, identifier } => ident || numeric || hyphen
+    Kind.Dimension { value, integer, unit } => ident || numeric || hyphen
+    Kind.Number { value, integer } => ident || numeric || delimiter(right, 37)
+    Kind.Delim { scalar } => if scalar == 35 || scalar == 45 {
+      ident || numeric || hyphen
+    } else if scalar == 64 {
+      ident || hyphen
+    } else if scalar == 46 || scalar == 43 {
+      numeric
+    } else {
+      scalar == 47 && delimiter(right, 42)
+    }
+    _ => false
+  }
+}
+
+effect fn scalar(out: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value < 128 {
+    run out.append(&[u32.toU8(value)])
+  } else if value < 2048 {
+    run out.append(&[u32.toU8(192 + value / 64), u32.toU8(128 + value % 64)])
+  } else if value < 65536 {
+    run out.append(
+      &[u32.toU8(224 + value / 4096), u32.toU8(128 + value / 64 % 64), u32.toU8(128 + value % 64)],
+    )
+  } else {
+    run out.append(
+      &[
+        u32.toU8(240 + value / 262144),
+        u32.toU8(128 + value / 4096 % 64),
+        u32.toU8(128 + value / 64 % 64),
+        u32.toU8(128 + value % 64),
+      ],
+    )
+  }
+}
+
+effect fn tokenKind(out: &mut Bytes, buffer: &TokenBuffer, kind: &Kind) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &kind.* {
+    Kind.Whitespace => {
+      run out.append(b" ")
+    }
+    Kind.Ident { text } => {
+      run name(&mut out.*, buffer.text(text), true, false)
+    }
+    Kind.Function { name: text } => {
+      run name(&mut out.*, buffer.text(text), true, false)
+      run out.append(b"(")
+    }
+    Kind.AtKeyword { name: text } => {
+      run out.append(b"@")
+      run name(&mut out.*, buffer.text(text), true, false)
+    }
+    Kind.Hash { text, identifier: id } => {
+      run out.append(b"#")
+      run name(&mut out.*, buffer.text(text), id, false)
+    }
+    Kind.String { text } => {
+      run quoted(&mut out.*, buffer.text(text))
+    }
+    Kind.BadString => {
+      run out.append(b"\"\n")
+    }
+    Kind.Url { text } => {
+      // Quoting here would turn one URL token into function/string/close tokens.
+      run out.append(b"url(")
+      let value = buffer.text(text)
+      let mut i: usize = 0
+      while i < value.length {
+        let c = value[i]
+        if c == 0 {
+          run out.append(b"\xef\xbf\xbd")
+        } else if c <= 32 || c == 127 {
+          run codePoint(&mut out.*, u8.toU32(c))
+        } else {
+          if c == 34 || c == 39 || c == 40 || c == 41 || c == 92 {
+            run out.append(b"\\")
+          }
+          run out.append(&[c])
+        }
+        i = i + 1
+      }
+      run out.append(b")")
+    }
+    Kind.BadUrl => {
+      run out.append(b"url(\\\n)")
+    }
+    Kind.Number { value, integer } => {
+      run numericToken(&mut out.*, value, integer)
+    }
+    Kind.Percentage { value, integer } => {
+      run numericToken(&mut out.*, value, integer)
+      run out.append(b"%")
+    }
+    Kind.Dimension { value, integer, unit } => {
+      run numericToken(&mut out.*, value, integer)
+      let text = buffer.text(unit)
+      if text.length > 1 && (text[0] == 101 || text[0] == 69)
+        && ((text[1] >= 48 && text[1] <= 57)
+          || (text.length > 2 && (text[1] == 45 || text[1] == 43) && text[2] >= 48
+            && text[2] <= 57)) {
+        run codePoint(&mut out.*, u8.toU32(text[0]))
+        run name(&mut out.*, Slice.view<u8>(text, 1, text.length - 1), false, false)
+      } else {
+        run name(&mut out.*, text, true, false)
+      }
+    }
+    Kind.Delim { scalar: value } => {
+      if value == 92 {
+        run out.append(b"\\\n")
+      } else {
+        run scalar(&mut out.*, value)
+      }
+    }
+    Kind.Colon => {
+      run out.append(b":")
+    }
+    Kind.Semicolon => {
+      run out.append(b";")
+    }
+    Kind.Comma => {
+      run out.append(b",")
+    }
+    Kind.OpenParen => {
+      run out.append(b"(")
+    }
+    Kind.CloseParen => {
+      run out.append(b")")
+    }
+    Kind.OpenSquare => {
+      run out.append(b"[")
+    }
+    Kind.CloseSquare => {
+      run out.append(b"]")
+    }
+    Kind.OpenBrace => {
+      run out.append(b"{")
+    }
+    Kind.CloseBrace => {
+      run out.append(b"}")
+    }
+    Kind.Cdo => {
+      run out.append(b"<!--")
+    }
+    Kind.Cdc => {
+      run out.append(b"-->")
+    }
+    Kind.Eof => {}
+  }
+}
+
+effect fn token(out: &mut Bytes, buffer: &TokenBuffer, at: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tokenKind(&mut out.*, buffer, &buffer.tokens.asSlice()[at].kind)
+}
+
+fn whitespace(kind: &Kind) -> bool {
+  return match &kind.* {
+    Kind.Whitespace => true
+    _ => false
+  }
+}
+
+effect fn appendComponents(out: &mut Bytes, buffer: &TokenBuffer, range: TokenRange) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let source = Input.Contiguous { buffer: buffer, range: range }
+  run appendInput(&mut out.*, &source)
+}
+
+/// Serializes raw component tokens without losing identifier case, numeric flags,
+/// URL tokens, or separators. Grammar-specific canonicalization belongs to callers.
+pub effect fn components(buffer: &TokenBuffer, range: TokenRange) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run appendComponents(&mut out, buffer, range)
+  return move out
+}
+
+effect fn appendInput(out: &mut Bytes, source: &Input) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut previous = Kind.Eof
+  let mut beforePrevious = Kind.Eof
+  let mut at: usize = 0
+  while at < source.length() {
+    let current = source.at(at)
+    match &current {
+      Option<TokenView>.Some { value } => {
+        let cdo = delimiter(&beforePrevious, 60) && delimiter(&previous, 33)
+          && match &value.token.kind {
+            Kind.Ident { text } => {
+              let name = value.text(text)
+              name.length >= 2 && name[0] == 45 && name[1] == 45
+            }
+            _ => false
+          }
+        if cdo || separating(&previous, &value.token.kind) {
+          run out.append(b"/**/")
+        }
+        if !(whitespace(&previous) && whitespace(&value.token.kind)) {
+          run tokenKind(&mut out.*, value.buffer, &value.token.kind)
+        }
+        beforePrevious = previous
+        previous = value.token.kind
+      }
+      _ => {}
+    }
+    at = at + 1
+  }
+}
+
+/// Serializes a var()-expanded token stream directly across its source buffers.
+pub effect fn componentsInput(source: &Input) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run appendInput(&mut out, source)
+  return move out
+}
+
+fn skipSpace(buffer: &TokenBuffer, start: usize, end: usize) -> usize {
+  let mut at = start
+  while at < end && whitespace(&buffer.tokens.asSlice()[at].kind) {
+    at = at + 1
+  }
+  return at
+}
+
+fn trimmed(buffer: &TokenBuffer, range: TokenRange) -> TokenRange {
+  let start = skipSpace(buffer, range.start, range.end)
+  let mut end = range.end
+  while end > start && whitespace(&buffer.tokens.asSlice()[end - 1].kind) {
+    end = end - 1
+  }
+  return TokenRange { start: start, end: end }
+}
+
+fn word(buffer: &TokenBuffer, at: usize) -> &[u8] {
+  return match &buffer.tokens.asSlice()[at].kind {
+    Kind.Ident { text } => buffer.text(text)
+    Kind.Function { name } => buffer.text(name)
+    Kind.String { text } => buffer.text(text)
+    _ => b""
+  }
+}
+
+fn isIdent(buffer: &TokenBuffer, at: usize) -> bool {
+  return match &buffer.tokens.asSlice()[at].kind {
+    Kind.Ident { text } => true
+    _ => false
+  }
+}
+
+// Return the binding index rather than borrowing through a temporary Option.
+fn binding(buffer: &TokenBuffer, namespaces: &[NamespaceBinding], prefix: &[u8]) -> usize {
+  let mut i = namespaces.length
+  while i > 0 {
+    i = i - 1
+    if tokens.equal(buffer.text(namespaces[i].prefix), prefix) {
+      return i
+    }
+  }
+  return namespaces.length
+}
+
+effect fn typeSelector(
+  out: &mut Bytes,
+  buffer: &TokenBuffer,
+  start: usize,
+  end: usize,
+  namespaces: &[NamespaceBinding],
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let ts = buffer.tokens.asSlice()
+  let mut local = start
+  let mut explicit = false
+  let mut any = false
+  let mut empty = false
+  let mut prefix = Slice.view<u8>(buffer.source(), 0, 0)
+  if delimiter(&ts[start].kind, 124) {
+    explicit = true
+    empty = true
+    local = start + 1
+  } else if start + 1 < end && delimiter(&ts[start + 1].kind, 124)
+    && !(start + 2 < end && delimiter(&ts[start + 2].kind, 124)) {
+    explicit = true
+    any = delimiter(&ts[start].kind, 42)
+    prefix = word(buffer, start)
+    local = start + 2
+  }
+  if local >= end {
+    return start
+  }
+  let universal = delimiter(&ts[local].kind, 42)
+  if !universal && !isIdent(buffer, local) {
+    return start
+  }
+  let defaultIndex = binding(buffer, namespaces, b"")
+  let prefixIndex = binding(buffer, namespaces, prefix)
+  let mut omitPrefix = !explicit
+  if explicit && !any && !empty && prefixIndex < namespaces.length {
+    let uri = buffer.text(namespaces[prefixIndex].uri)
+    empty = uri.length == 0
+    omitPrefix = !empty && defaultIndex < namespaces.length
+      && tokens.equal(uri, buffer.text(namespaces[defaultIndex].uri))
+  }
+  if any && defaultIndex == namespaces.length {
+    omitPrefix = true
+  }
+  let next = local + 1
+  let hasSuffix = next < end
+    && match &ts[next].kind {
+      Kind.Hash { text, identifier } => true
+      Kind.OpenSquare => true
+      Kind.Colon => true
+      Kind.Delim { scalar } => scalar == 46
+      _ => false
+    }
+  if universal && hasSuffix && omitPrefix {
+    return next
+  }
+  if !omitPrefix {
+    if any {
+      run out.append(b"*")
+    } else if !empty {
+      run name(&mut out.*, prefix, true, false)
+    }
+    run out.append(b"|")
+  }
+  if universal {
+    run out.append(b"*")
+  } else {
+    run name(&mut out.*, word(buffer, local), true, false)
+  }
+  return next
+}
+
+effect fn attribute(
+  out: &mut Bytes,
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  namespaces: &[NamespaceBinding],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let ts = buffer.tokens.asSlice()
+  let mut at = skipSpace(buffer, range.start, range.end)
+  run out.append(b"[")
+  if at < range.end && delimiter(&ts[at].kind, 124) {
+    // Null attribute namespaces never need an explicit prefix.
+    at = at + 1
+  } else if at + 2 < range.end && delimiter(&ts[at + 1].kind, 124)
+    && !delimiter(&ts[at + 2].kind, 61) {
+    let prefix = word(buffer, at)
+    let index = binding(buffer, namespaces, prefix)
+    if delimiter(&ts[at].kind, 42) {
+      run out.append(b"*|")
+    } else if index == namespaces.length || buffer.text(namespaces[index].uri).length != 0 {
+      run name(&mut out.*, prefix, true, false)
+      run out.append(b"|")
+    }
+    at = at + 2
+  }
+  if at < range.end {
+    run name(&mut out.*, word(buffer, at), true, false)
+    at = skipSpace(buffer, at + 1, range.end)
+  }
+  if at < range.end {
+    while at < range.end {
+      let equals = delimiter(&ts[at].kind, 61)
+      run token(&mut out.*, buffer, at)
+      at = at + 1
+      if equals {
+        break
+      }
+    }
+    at = skipSpace(buffer, at, range.end)
+    if at < range.end {
+      run quoted(&mut out.*, word(buffer, at))
+      at = skipSpace(buffer, at + 1, range.end)
+    }
+    if at < range.end {
+      run out.append(b" ")
+      run name(&mut out.*, word(buffer, at), true, true)
+    }
+  }
+  run out.append(b"]")
+}
+
+effect fn nth(
+  out: &mut Bytes,
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  namespaces: &[NamespaceBinding],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut of = range.start
+  while of < range.end {
+    if isIdent(buffer, of) && tokens.insensitive(word(buffer, of), b"of") {
+      break
+    }
+    of = of + 1
+  }
+  let formula = selectors.nthFormula(buffer, TokenRange { start: range.start, end: of })
+
+  // The caller validates selectors; Formula is the same parser that validation uses.
+  if formula.a == 0.0 {
+    run appendNumber(&mut out.*, formula.b)
+  } else {
+    if formula.a == -1.0 {
+      run out.append(b"-")
+    } else if formula.a != 1.0 {
+      run appendNumber(&mut out.*, formula.a)
+    }
+    run out.append(b"n")
+    if formula.b > 0.0 {
+      run out.append(b"+")
+    }
+    if formula.b != 0.0 {
+      run appendNumber(&mut out.*, formula.b)
+    }
+  }
+  if of < range.end {
+    run out.append(b" of ")
+    run appendSelector(&mut out.*, buffer, TokenRange { start: of + 1, end: range.end }, namespaces)
+  }
+}
+
+effect fn arguments(
+  out: &mut Bytes,
+  buffer: &TokenBuffer,
+  function: &[u8],
+  input: TokenRange,
+  namespaces: &[NamespaceBinding],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let range = trimmed(buffer, input)
+  if tokens.insensitive(function, b"nth-child") || tokens.insensitive(function, b"nth-last-child")
+    || tokens.insensitive(function, b"nth-of-type")
+    || tokens.insensitive(function, b"nth-last-of-type")
+    || tokens.insensitive(function, b"nth-col")
+    || tokens.insensitive(function, b"nth-last-col") {
+    run nth(&mut out.*, buffer, range, namespaces)
+  } else if tokens.insensitive(function, b"is") || tokens.insensitive(function, b"where")
+    || tokens.insensitive(function, b"not")
+    || tokens.insensitive(function, b"has")
+    || tokens.insensitive(function, b"host")
+    || tokens.insensitive(function, b"host-context")
+    || tokens.insensitive(function, b"slotted") {
+    run appendSelector(&mut out.*, buffer, range, namespaces)
+  } else if tokens.insensitive(function, b"lang") {
+    let mut at = range.start
+    let mut first = true
+    while at < range.end {
+      match &buffer.tokens.asSlice()[at].kind {
+        Kind.Ident { text } => {
+          if !first {
+            run out.append(b", ")
+          }
+          run quoted(&mut out.*, buffer.text(text))
+          first = false
+        }
+        Kind.String { text } => {
+          if !first {
+            run out.append(b", ")
+          }
+          run quoted(&mut out.*, buffer.text(text))
+          first = false
+        }
+        _ => {}
+      }
+      at = at + 1
+    }
+  } else if tokens.insensitive(function, b"dir") && range.start < range.end {
+    run name(&mut out.*, word(buffer, range.start), true, true)
+  } else {
+    run appendComponents(&mut out.*, buffer, range)
+  }
+}
+
+effect fn appendSelector(
+  out: &mut Bytes,
+  buffer: &TokenBuffer,
+  input: TokenRange,
+  namespaces: &[NamespaceBinding],
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let range = trimmed(buffer, input)
+  let ts = buffer.tokens.asSlice()
+  let mut at = range.start
+  let mut compoundStart = true
+  let mut pendingSpace = false
+  while at < range.end {
+    if whitespace(&ts[at].kind) {
+      pendingSpace = !compoundStart
+      at = at + 1
+      continue
+    }
+    let comma = match &ts[at].kind {
+      Kind.Comma => true
+      _ => false
+    }
+    let column = delimiter(&ts[at].kind, 124) && at + 1 < range.end
+      && delimiter(&ts[at + 1].kind, 124)
+    let combinator = delimiter(&ts[at].kind, 62) || delimiter(&ts[at].kind, 43)
+      || delimiter(&ts[at].kind, 126)
+      || column
+    if comma || combinator {
+      if comma {
+        run out.append(b", ")
+      } else {
+        if !compoundStart {
+          run out.append(b" ")
+        }
+        run token(&mut out.*, buffer, at)
+        if column
+          || (delimiter(&ts[at].kind, 62) && at + 1 < range.end
+            && delimiter(&ts[at + 1].kind, 62)) {
+          at = at + 1
+          run token(&mut out.*, buffer, at)
+        }
+        run out.append(b" ")
+      }
+      pendingSpace = false
+      compoundStart = true
+      at = at + 1
+      continue
+    }
+    if pendingSpace {
+      run out.append(b" ")
+      compoundStart = true
+      pendingSpace = false
+    }
+    if compoundStart {
+      let next = run typeSelector(&mut out.*, buffer, at, range.end, namespaces)
+      compoundStart = false
+      if next > at {
+        at = next
+        continue
+      }
+    }
+    match &ts[at].kind {
+      Kind.OpenSquare => {
+        let close = if ts[at].matching < range.end {
+          ts[at].matching
+        } else {
+          range.end
+        }
+        run attribute(&mut out.*, buffer, TokenRange { start: at + 1, end: close }, namespaces)
+        at = close
+      }
+      Kind.Colon => {
+        at = at + 1
+        let mut element = false
+        if at < range.end
+          && match &ts[at].kind {
+            Kind.Colon => true
+            _ => false
+          } {
+          element = true
+          at = at + 1
+        }
+        if at < range.end {
+          let text = word(buffer, at)
+          if tokens.insensitive(text, b"before") || tokens.insensitive(text, b"after")
+            || tokens.insensitive(text, b"first-line")
+            || tokens.insensitive(text, b"first-letter") {
+            element = true
+          }
+          run out.append(
+            if element {
+              b"::"
+            } else {
+              b":"
+            },
+          )
+          run name(&mut out.*, text, true, true)
+          match &ts[at].kind {
+            Kind.Function { name: function } => {
+              let close = if ts[at].matching < range.end {
+                ts[at].matching
+              } else {
+                range.end
+              }
+              run out.append(b"(")
+              run arguments(
+                &mut out.*,
+                buffer,
+                buffer.text(function),
+                TokenRange { start: at + 1, end: close },
+                namespaces,
+              )
+              run out.append(b")")
+              at = close
+            }
+            _ => {}
+          }
+        }
+      }
+      _ => {
+        run token(&mut out.*, buffer, at)
+      }
+    }
+    at = at + 1
+  }
+}
+
+/// Serializes a validated selector list with the namespace environment that was
+/// used to parse it. Bindings and tokens address the same buffer text arena.
+pub effect fn selectorTextWithNamespaces(
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  namespaces: &[NamespaceBinding],
+) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run appendSelector(&mut out, buffer, range, namespaces)
+  return move out
+}
+
+/// Context-free selector serialization preserves explicit named prefixes.
+pub effect fn selectorText(buffer: &TokenBuffer, range: TokenRange) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run selectorTextWithNamespaces(buffer, range, &[])
+}

@@ -31,6 +31,9 @@ depends on a GPU, so it builds for wasm32 too.
   `pushLayer`/`pushIsolatedLayer`/`pushEffectLayer`/`popLayer`, `replay`, `finish`, and per-layer `batches`.
 - `path_cache`: `PathCache` rasterizes `vector` paths (fills and strokes) into a scene and keeps
   their coverage across frames.
+- `scroll`: retained scroll groups and placements shared by CPU/GPU rendering. Offsets and
+  sticky constraints preserve fractional device pixels; geometry and hit testing must not
+  round them before composition.
 - `cpu`: `CpuRenderer` and `AtlasPixels` (CPU copies of atlas textures).
 
 ## A frame
@@ -107,6 +110,10 @@ content mask, without caching.
 
 A `PathSprite`'s strips are banded in 4-row bands starting at the sprite's `y`, which can be any
 integer: a GPU renderer offsets the bands rather than aligning them to multiples of 4.
+
+Scroll placement rounds only a `PathSprite`'s integer coverage origin to the nearest pixel.
+Its paint bounds and content mask retain the group's fractional placement; other scene
+primitives also retain fractional coordinates.
 
 ## CPU renderer
 

@@ -1,0 +1,301 @@
+//! Shared CSS transform grammar adapter; no independent transform parser or algebra.
+import transform_values { Operation, TransformValue }
+import transform_values
+import dimensions { ExprId, Expr, Unit, Operation as NumericOperation, Store as DimensionStore }
+import dimensions
+import cssom_numeric_serialization
+import typed_om_numeric { NumericStore, NumericId, UnitValue }
+import typed_om_numeric_units { lookup, UnitInfo }
+import silk.core.effect { Effect }
+import cssom_error { CssomError }
+import tokens { Limits, CssError, Kind }
+import tokens
+import lexer
+import input { Input }
+import value_cursor { Cursor }
+import properties { Property }
+import svg_geometry.transforms { Matrix }
+import svg_geometry.transforms as transforms
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub enum SkewKind {
+  Both,
+  X,
+  Y
+}
+
+pub struct ParsedSyntax {
+  pub numerics: dimensions.Store<'static>,
+  pub operations: List<Operation>,
+  pub skewKinds: List<SkewKind>,
+  pub none: bool,
+}
+
+pub struct ParsedMatrix {
+  pub matrix: Matrix,
+  pub is2D: bool
+}
+
+pub effect fn syntax(text: &[u8], limits: &Limits) -> ParsedSyntax
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run lexer.tokenize(text, limits)
+  let input = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+  let mut cursor = Cursor.make(&input)
+  let mut numerics = DimensionStore.make()
+  let parsed = run transform_values.parse(
+    &mut numerics,
+    Property.Transform,
+    &input,
+    &mut cursor,
+    false,
+  )
+  if !cursor.done(&input) {
+    fail CssomError.SyntaxError
+  }
+  let mut skewKinds = List<SkewKind>.make()
+  let mut i: usize = 0
+  while i < buffer.tokens.length() {
+    let token = buffer.tokens.asSlice()[i]
+    match &token.kind {
+      Kind.Function { name } => {
+        let kind = if tokens.insensitive(buffer.text(name), b"skewX") {
+          SkewKind.X
+        } else if tokens.insensitive(buffer.text(name), b"skewY") {
+          SkewKind.Y
+        } else {
+          SkewKind.Both
+        }
+        run skewKinds.append(kind)
+        i = token.matching
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  match move parsed {
+    Option<TransformValue>.Some { value } => match move value {
+      TransformValue.None => {
+        return ParsedSyntax {
+          numerics: move numerics,
+          operations: List<Operation>.make(),
+          skewKinds: move skewKinds,
+          none: true,
+        }
+      }
+      TransformValue.List { operations } => {
+        return ParsedSyntax {
+          numerics: move numerics,
+          operations: move operations,
+          skewKinds: move skewKinds,
+          none: false,
+        }
+      }
+      _ => {
+        fail CssomError.SyntaxError
+      }
+    }
+    _ => {
+      fail CssomError.SyntaxError
+    }
+  }
+}
+
+pub effect fn reify(
+  store: &mut NumericStore,
+  source: &dimensions.Store,
+  id: ExprId,
+  limits: &Limits,
+) -> NumericId
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  return match &source.get(id).* {
+    Expr.Literal { value, unit } => {
+      let name = if unit == Unit.Number {
+        b"number"
+      } else if unit == Unit.Percent {
+        b"percent"
+      } else {
+        cssom_numeric_serialization.unitName(unit)
+      }
+      let info = match &lookup(name) {
+        Option<UnitInfo>.Some { value: found } => found
+        _ => {
+          fail CssomError.TypeError
+        }
+      }
+      run store.literal(value, info)
+    }
+    Expr.Calc { value } => {
+      let inner = run reify(&mut store.*, source, value, limits)
+      match &store.unitValue(inner) {
+        Option<UnitValue>.Some { value: literal } => run store.mathSum(&[inner])
+        _ => inner
+      }
+    }
+    Expr.PercentContext { value, percentage } => run reify(&mut store.*, source, value, limits)
+    Expr.Binary { operation, left, right } => {
+      let a = run reify(&mut store.*, source, left, limits)
+      let b = run reify(&mut store.*, source, right, limits)
+      match operation {
+        NumericOperation.Add => run store.mathSum(&[a, b])
+        NumericOperation.Subtract => {
+          let negated = run store.mathNegate(b)
+          run store.mathSum(&[a, negated])
+        }
+        NumericOperation.Multiply => run store.mathProduct(&[a, b])
+        NumericOperation.Divide => {
+          let inverted = run store.mathInvert(b)
+          run store.mathProduct(&[a, inverted])
+        }
+        NumericOperation.Min => run store.mathMin(&[a, b])
+        NumericOperation.Max => run store.mathMax(&[a, b])
+      }
+    }
+  }
+}
+
+effect fn value(
+  store: &mut NumericStore,
+  source: &dimensions.Store,
+  id: ExprId,
+  unit: &[u8],
+  limits: &Limits,
+) -> f64
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let numeric = run reify(&mut store.*, source, id, limits)
+  let converted = run store.to(numeric, unit)
+  return converted.value
+}
+
+effect fn parseImpl(text: &[u8], limits: &Limits) -> ParsedMatrix
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  if text.length == 0 {
+    return ParsedMatrix { matrix: transforms.identity(), is2D: true }
+  }
+  let source = run syntax(text, limits)
+  let mut store = NumericStore.make()
+  let mut result = transforms.identity()
+  let mut twoD = true
+  let mut i: usize = 0
+  while i < source.operations.length() {
+    let operation = &source.operations.asSlice()[i]
+    let next = match &operation.* {
+      Operation.Matrix2 { components } => {
+        let mut values = [0.0; 16]
+        values[10] = 1.0
+        values[15] = 1.0
+        let indices: [usize; 6] = [0, 1, 4, 5, 12, 13]
+        let mut j: usize = 0
+        while j < 6 {
+          values[indices[j]] = run value(
+            &mut store,
+            &source.numerics,
+            components[j],
+            b"number",
+            limits,
+          )
+          j = j + 1
+        }
+        transforms.fromColumnMajor(&values)
+      }
+      Operation.Matrix3 { components } => {
+        twoD = false
+        let mut values = [0.0; 16]
+        let mut j: usize = 0
+        while j < 16 {
+          values[j] = run value(&mut store, &source.numerics, components[j], b"number", limits)
+          j = j + 1
+        }
+        transforms.fromColumnMajor(&values)
+      }
+      Operation.Translate { x, y, z, threeD } => {
+        twoD = twoD && !threeD
+        transforms.translation(
+          run value(&mut store, &source.numerics, x, b"px", limits),
+          run value(&mut store, &source.numerics, y, b"px", limits),
+          run value(&mut store, &source.numerics, z, b"px", limits),
+        )
+      }
+      Operation.Scale { x, y, z, threeD } => {
+        twoD = twoD && !threeD
+        transforms.scale(
+          run scaleValue(&mut store, &source.numerics, x, limits),
+          run scaleValue(&mut store, &source.numerics, y, limits),
+          run scaleValue(&mut store, &source.numerics, z, limits),
+        )
+      }
+      Operation.Rotate { x, y, z, angle, threeD } => {
+        twoD = twoD && !threeD
+        transforms.rotation(
+          run value(&mut store, &source.numerics, x, b"number", limits),
+          run value(&mut store, &source.numerics, y, b"number", limits),
+          run value(&mut store, &source.numerics, z, b"number", limits),
+          run value(&mut store, &source.numerics, angle, b"rad", limits),
+        )
+      }
+      Operation.Skew { x, y } => transforms.skew(
+        run value(&mut store, &source.numerics, x, b"rad", limits),
+        run value(&mut store, &source.numerics, y, b"rad", limits),
+      )
+      Operation.Perspective { depth } => {
+        twoD = false
+        match &depth {
+          Option<ExprId>.None => transforms.identity()
+          Option<ExprId>.Some { value: id } => {
+            let distance = run value(&mut store, &source.numerics, id, b"px", limits)
+            match &transforms.perspective(distance) {
+              Option<Matrix>.Some { value: matrix } => matrix
+              _ => {
+                fail CssomError.SyntaxError
+              }
+            }
+          }
+        }
+      }
+    }
+    result = transforms.multiply(&result, &next)
+    i = i + 1
+  }
+  return ParsedMatrix { matrix: result, is2D: twoD }
+}
+
+pub effect fn scaleValue(
+  store: &mut NumericStore,
+  source: &dimensions.Store,
+  id: ExprId,
+  limits: &Limits,
+) -> f64
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let numeric = run reify(&mut store.*, source, id, limits)
+  let kind = store.typeOf(numeric)
+  let converted = run store.to(
+    numeric,
+    if kind.isPercent() {
+      b"percent"
+    } else {
+      b"number"
+    },
+  )
+  return if kind.isPercent() {
+    converted.value / 100.0
+  } else {
+    converted.value
+  }
+}
+
+effect fn invalidMatrix(error: CssomError) -> ParsedMatrix
+  ! CssomError {
+  fail CssomError.SyntaxError
+}
+
+pub effect fn parse(text: &[u8], limits: &Limits) -> ParsedMatrix
+  ! CssomError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<CssomError>(parseImpl(text, limits), invalidMatrix)
+}

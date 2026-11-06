@@ -1,0 +1,362 @@
+//! CSSOM document/shadow-root collections. Host node/document identities are opaque.
+//! Handles remain live when sheets are inserted, removed, replaced, or adopted.
+import cssom_stylesheet { StyleSheet, NO_SHEET, NO_RULE, NO_HOST }
+import cssom_error { CssomError }
+import tokens { equal }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+pub const NO_ROOT: usize = usize.MAX
+
+struct Root {
+  document: usize,
+  associated: List<usize>,
+  adopted: List<usize>,
+  preferred: Bytes,
+  last: Option<Bytes>,
+}
+
+pub enum CollectionKind {
+  Associated,
+  Adopted,
+  Final,
+}
+
+/// A live collection identity, not a snapshot of its contents.
+pub struct StyleSheetList {
+  pub root: usize,
+  pub kind: CollectionKind,
+}
+
+impl Copy for StyleSheetList {}
+
+impl StyleSheetList {
+  pub fn length(self: &Self, documents: &Documents) -> usize {
+    if self.root >= documents.roots.length() {
+      return 0
+    }
+    let root = &documents.roots.asSlice()[self.root]
+    return match self.kind {
+      CollectionKind.Associated => root.associated.length()
+      CollectionKind.Adopted => root.adopted.length()
+      CollectionKind.Final => root.associated.length() + root.adopted.length()
+    }
+  }
+
+  pub fn item(self: &Self, documents: &Documents, index: usize) -> Option<usize> {
+    if self.root >= documents.roots.length() {
+      return Option<usize>.None
+    }
+    let root = &documents.roots.asSlice()[self.root]
+    let mut at = index
+    if self.kind != CollectionKind.Adopted {
+      if at < root.associated.length() {
+        return Option<usize>.some(root.associated.asSlice()[at])
+      }
+      if self.kind == CollectionKind.Associated {
+        return Option<usize>.None
+      }
+      at = at - root.associated.length()
+    }
+    if at < root.adopted.length() {
+      return Option<usize>.some(root.adopted.asSlice()[at])
+    }
+    return Option<usize>.None
+  }
+}
+
+/// Owns sheet identities shared by document and shadow-root collections.
+/// A sheet is retained after removal so previously returned handles remain valid.
+pub struct Documents {
+  roots: List<Root>,
+  sheets: List<StyleSheet>,
+  associations: List<usize>,
+}
+
+impl Documents {
+  pub fn make() -> Documents {
+    return Documents {
+      roots: List<Root>.make(),
+      sheets: List<StyleSheet>.make(),
+      associations: List<usize>.make(),
+    }
+  }
+
+  /// `document` is the host's node-document identity, shared by all its shadow roots.
+  pub effect fn createRoot(self: &mut Self, document: usize) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.roots.length()
+    run self.roots.append(
+      Root {
+        document: document,
+        associated: List<usize>.make(),
+        adopted: List<usize>.make(),
+        preferred: Bytes.make(),
+        last: Option<Bytes>.None,
+      },
+    )
+    return id
+  }
+
+  pub effect fn createSheet(self: &mut Self, constructed: bool, document: usize) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.sheets.length()
+    let mut sheet = StyleSheet.make(id, constructed)
+    if constructed {
+      sheet.constructorDocument = document
+    }
+    run self.sheets.reserve(1)
+    run self.associations.reserve(1)
+    run self.sheets.append(move sheet)
+    run self.associations.append(NO_ROOT)
+    return id
+  }
+
+  pub fn sheet(self: &Self, id: usize) -> Option<&StyleSheet> {
+    if id >= self.sheets.length() {
+      return Option<&StyleSheet>.None
+    }
+    return Option<&StyleSheet>.some(&self.sheets.asSlice()[id])
+  }
+
+  pub fn sheetMut(self: &mut Self, id: usize) -> Option<&mut StyleSheet> {
+    if id >= self.sheets.length() {
+      return Option<&mut StyleSheet>.None
+    }
+    return Option<&mut StyleSheet>.some(&mut self.sheets.asMutSlice()[id])
+  }
+
+  pub fn styleSheets(self: &Self, root: usize) -> StyleSheetList {
+    return StyleSheetList { root: root, kind: CollectionKind.Associated }
+  }
+
+  pub fn adoptedStyleSheets(self: &Self, root: usize) -> StyleSheetList {
+    return StyleSheetList { root: root, kind: CollectionKind.Adopted }
+  }
+
+  pub fn finalStyleSheets(self: &Self, root: usize) -> StyleSheetList {
+    return StyleSheetList { root: root, kind: CollectionKind.Final }
+  }
+
+  /// Returns the LinkStyle association, independently of disabled/origin-clean state.
+  pub fn associatedSheet(self: &Self, root: usize, ownerNode: usize) -> Option<usize> {
+    if root >= self.roots.length() || ownerNode == NO_HOST {
+      return Option<usize>.None
+    }
+    let ids = self.roots.asSlice()[root].associated.asSlice()
+    let mut i: usize = 0
+    while i < ids.length {
+      if self.sheets.asSlice()[ids[i]].ownerNode == ownerNode {
+        return Option<usize>.some(ids[i])
+      }
+      i = i + 1
+    }
+    return Option<usize>.None
+  }
+
+  /// Host supplies HTTP-header order followed by tree order through `index`.
+  /// A sheet must be detached before association with a different root.
+  pub effect fn addSheet(self: &mut Self, root: usize, sheet: usize, index: usize) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if root >= self.roots.length() || sheet >= self.sheets.length() {
+      fail CssomError.NotFoundError
+    }
+    if self.sheets.asSlice()[sheet].constructed || self.associations.asSlice()[sheet] != NO_ROOT {
+      fail CssomError.NotAllowedError
+    }
+    if index > self.roots.asSlice()[root].associated.length() {
+      fail CssomError.IndexSizeError
+    }
+    let disabled = self.sheets.asSlice()[sheet].disabled
+    let title = Bytes.asSlice(&self.sheets.asSlice()[sheet].title)
+    let changesPreferred = !disabled && title.length != 0 && !self.sheets.asSlice()[sheet].alternate
+      && Bytes.length(&self.roots.asSlice()[root].preferred) == 0
+    let preferred = if changesPreferred {
+      run Bytes.copy(title)
+    } else {
+      Bytes.make()
+    }
+    run self.roots.asMutSlice()[root].associated.insert(index, sheet)
+    let mut associations = self.associations.asMutSlice()
+    associations[sheet] = root
+    drop associations
+    if disabled {
+      return
+    }
+    if changesPreferred {
+      let mut roots = self.roots.asMutSlice()
+      roots[root].preferred = move preferred
+      drop roots
+      if match &self.roots.asSlice()[root].last {
+        Option<Bytes>.None => true
+        _ => false
+      } {
+        enable(
+          &mut self.sheets,
+          &self.roots.asSlice()[root],
+          Bytes.asSlice(&self.roots.asSlice()[root].preferred),
+        )
+      }
+    }
+    let selected = match &self.roots.asSlice()[root].last {
+      Option<Bytes>.Some { value } => equal(
+        Bytes.asSlice(&value),
+        Bytes.asSlice(&self.sheets.asSlice()[sheet].title),
+      )
+      _ => equal(
+        Bytes.asSlice(&self.roots.asSlice()[root].preferred),
+        Bytes.asSlice(&self.sheets.asSlice()[sheet].title),
+      )
+    }
+    let titled = Bytes.length(&self.sheets.asSlice()[sheet].title) != 0
+    let mut sheets = self.sheets.asMutSlice()
+    sheets[sheet].disabled = titled && !selected
+  }
+
+  pub effect fn removeSheet(self: &mut Self, root: usize, sheet: usize) -> ()
+    ! CssomError {
+    if root >= self.roots.length() || sheet >= self.sheets.length()
+      || self.associations.asSlice()[sheet] != root {
+      fail CssomError.NotFoundError
+    }
+    let mut index: usize = 0
+    while index < self.roots.asSlice()[root].associated.length() {
+      if self.roots.asSlice()[root].associated.asSlice()[index] == sheet {
+        let _removed = self.roots.asMutSlice()[root].associated.remove(index)
+        break
+      }
+      index = index + 1
+    }
+    let mut associations = self.associations.asMutSlice()
+    associations[sheet] = NO_ROOT
+    drop associations
+    let target = &mut self.sheets.asMutSlice()[sheet]
+    target.parentStyleSheet = NO_SHEET
+    target.ownerNode = NO_HOST
+    target.ownerRule = NO_RULE
+  }
+
+  /// Replaces the adopted array atomically; duplicate sheets are intentionally retained.
+  pub effect fn setAdoptedStyleSheets(self: &mut Self, root: usize, sheets: &[usize]) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if root >= self.roots.length() {
+      fail CssomError.NotFoundError
+    }
+    let mut i: usize = 0
+    while i < sheets.length {
+      run self.validateAdoption(root, sheets[i])
+      i = i + 1
+    }
+    let mut ids = run List<usize>.makeWithCapacity(sheets.length)
+    run ids.appendSlice(sheets)
+    let mut roots = self.roots.asMutSlice()
+    roots[root].adopted = move ids
+  }
+
+  pub effect fn setAdoptedSheet(self: &mut Self, root: usize, index: usize, sheet: usize) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.validateAdoption(root, sheet)
+    let count = self.roots.asSlice()[root].adopted.length()
+    if index > count {
+      fail CssomError.IndexSizeError
+    }
+    if index == count {
+      run self.roots.asMutSlice()[root].adopted.append(sheet)
+    } else {
+      let mut ids = self.roots.asMutSlice()[root].adopted.asMutSlice()
+      ids[index] = sheet
+    }
+  }
+
+  pub effect fn removeAdoptedSheet(self: &mut Self, root: usize, index: usize) -> ()
+    ! CssomError {
+    if root >= self.roots.length() {
+      fail CssomError.NotFoundError
+    }
+    if index >= self.roots.asSlice()[root].adopted.length() {
+      fail CssomError.IndexSizeError
+    }
+    let _removed = self.roots.asMutSlice()[root].adopted.remove(index)
+  }
+
+  effect fn validateAdoption(self: &Self, root: usize, sheet: usize) -> ()
+    ! CssomError {
+    if root >= self.roots.length() || sheet >= self.sheets.length() {
+      fail CssomError.NotFoundError
+    }
+    let target = &self.sheets.asSlice()[sheet]
+    if !target.constructed || target.constructorDocument != self.roots.asSlice()[root].document {
+      fail CssomError.NotAllowedError
+    }
+  }
+
+  pub fn preferredSet(self: &Self, root: usize) -> &[u8] {
+    if root >= self.roots.length() {
+      return b""
+    }
+    return Bytes.asSlice(&self.roots.asSlice()[root].preferred)
+  }
+
+  pub effect fn changePreferredSet(self: &mut Self, root: usize, name: &[u8]) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if root >= self.roots.length() {
+      fail CssomError.NotFoundError
+    }
+    if equal(Bytes.asSlice(&self.roots.asSlice()[root].preferred), name) {
+      return
+    }
+    let preferred = run Bytes.copy(name)
+    let mut roots = self.roots.asMutSlice()
+    roots[root].preferred = move preferred
+    drop roots
+    if match &self.roots.asSlice()[root].last {
+      Option<Bytes>.None => true
+      _ => false
+    } {
+      enable(&mut self.sheets, &self.roots.asSlice()[root], name)
+    }
+  }
+
+  pub effect fn enableSet(self: &mut Self, root: usize, name: &[u8]) -> ()
+    ! CssomError {
+    if root >= self.roots.length() {
+      fail CssomError.NotFoundError
+    }
+    enable(&mut self.sheets, &self.roots.asSlice()[root], name)
+  }
+
+  pub effect fn selectSet(self: &mut Self, root: usize, name: &[u8]) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if root >= self.roots.length() {
+      fail CssomError.NotFoundError
+    }
+    let last = run Bytes.copy(name)
+    enable(&mut self.sheets, &self.roots.asSlice()[root], name)
+    let mut roots = self.roots.asMutSlice()
+    roots[root].last = Option<Bytes>.some(move last)
+  }
+}
+
+fn enable(sheets: &mut List<StyleSheet>, root: &Root, name: &[u8]) -> () {
+  let ids = root.associated.asSlice()
+  let mut i: usize = 0
+  while i < ids.length {
+    let sheet = &mut sheets.asMutSlice()[ids[i]]
+    let title = Bytes.asSlice(&sheet.title)
+    if title.length != 0 {
+      sheet.disabled = name.length == 0 || !equal(title, name)
+    }
+    i = i + 1
+  }
+}

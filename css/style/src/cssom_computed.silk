@@ -1,0 +1,569 @@
+//! Live CSSOM resolved declarations over immutable computed styles and explicit host layout facts.
+import computed { Engine, StyleId, ComputedValue }
+import values { Value }
+import text_values { Atom, Keyword }
+import properties { Property }
+import properties
+import cssom_shorthand
+import cssom_value_serialization
+import cssom_complex_serialization
+import svg_geometry.geometry { Rect }
+import svg_geometry.geometry
+import cssom_serialization as serialization
+import cssom_error { CssomError }
+import declaration_values
+import selectors { SelectorList }
+import selectors
+import lexer
+import tokens { BufferView, TokenRange, Kind, Limits, CssError }
+import tokens
+import input { Input, TokenRef }
+import variables { ScopeId }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+/// Used CSS pixel lengths, supplied only after layout. None never guesses a used value.
+/// The host determines applicability (including SVG and non-replaced inline boxes).
+pub struct Layout {
+  pub hasBox: bool,
+  pub widthApplies: bool,
+  pub heightApplies: bool,
+  pub inlineSizeApplies: bool,
+  pub lineHeightApplies: bool,
+  pub transformApplies: bool,
+  /// The actual reference box selected by transform-box, in CSS pixels.
+  pub transformReference: Option<Rect>,
+  pub width: Option<f64>,
+  pub height: Option<f64>,
+  pub inlineSize: Option<f64>,
+  pub lineHeight: Option<f64>,
+}
+
+impl Copy for Layout {}
+
+impl Layout {
+  pub fn unavailable() -> Layout {
+    return Layout {
+      hasBox: false,
+      widthApplies: false,
+      heightApplies: false,
+      inlineSizeApplies: false,
+      lineHeightApplies: false,
+      transformApplies: false,
+      transformReference: Option<Rect>.None,
+      width: Option<f64>.None,
+      height: Option<f64>.None,
+      inlineSize: Option<f64>.None,
+      lineHeight: Option<f64>.None,
+    }
+  }
+}
+
+/// A fresh binding must be supplied after style/layout or document eligibility changes.
+/// pseudo is the handle's normalized pseudo identity, not the original input spelling.
+pub struct Binding<'a> {
+  pub element: usize,
+  pub pseudo: &'a [u8],
+  pub style: Option<StyleId>,
+  pub connected: bool,
+  pub inFlatTree: bool,
+  pub renderedBrowsingContext: bool,
+  pub layout: Layout,
+}
+
+/// Retains identity, never a copied declaration or a stale StyleId/engine reference.
+pub struct ComputedStyle {
+  elementId: usize,
+  pseudoIdentity: Bytes,
+  valid: bool,
+  longhands: [Property; 172],
+  longhandCount: usize,
+}
+
+fn before(a: &[u8], b: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] {
+      return a[i] < b[i]
+    }
+    i = i + 1
+  }
+  return a.length < b.length
+}
+
+effect fn copied(text: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  run out.append(text)
+  return move out
+}
+
+fn normalLineHeight(engine: &Engine, entry: ComputedValue) -> bool {
+  return match &engine.values.get(entry.value).* {
+    Value.Text { value } => {
+      if value.items.length() != 1 {
+        return false
+      }
+      match &value.items.asSlice()[0].atom {
+        Atom.Keyword { value: keyword } => keyword == Keyword.Normal
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+
+fn missing(value: Option<f64>) -> bool {
+  return match &value {
+    Option<f64>.Some { value: number } => false
+    _ => true
+  }
+}
+
+impl ComputedStyle {
+  pub effect fn make(element: usize, pseudo: &[u8], limits: &Limits) -> ComputedStyle
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = ComputedStyle {
+      elementId: element,
+      pseudoIdentity: Bytes.make(),
+      valid: pseudo.length == 0,
+      longhands: [Property.Color; 172],
+      longhandCount: 0,
+    }
+
+    // Sort the fixed supported catalog once per handle, not on each live query.
+    let catalog = properties.all()
+    let mut i: usize = 0
+    while i < catalog.length {
+      let property = catalog[i]
+      if properties.longhandCount(property) == 1 {
+        let mut at = result.longhandCount
+        while at > 0
+          && before(properties.name(property), properties.name(result.longhands[at - 1])) {
+          result.longhands[at] = result.longhands[at - 1]
+          at = at - 1
+        }
+        result.longhands[at] = property
+        result.longhandCount = result.longhandCount + 1
+      }
+      i = i + 1
+    }
+    if pseudo.length == 0 {
+      return move result
+    }
+    let buffer = run lexer.tokenize(pseudo, limits)
+    let range = buffer.all()
+    if range.end < 2 {
+      return move result
+    }
+    match &buffer.tokens.asSlice()[0].kind {
+      Kind.Colon => {}
+      _ => {
+        return move result
+      }
+    }
+    let doubled = match &buffer.tokens.asSlice()[1].kind {
+      Kind.Colon => true
+      _ => false
+    }
+    let at: usize = if doubled {
+      2
+    } else {
+      1
+    }
+    if at >= range.end {
+      return move result
+    }
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Ident { text } => {
+        if at + 1 != range.end {
+          return move result
+        }
+        let name = buffer.text(text)
+        if !doubled && !tokens.insensitive(name, b"before") && !tokens.insensitive(name, b"after")
+          && !tokens.insensitive(name, b"first-line")
+          && !tokens.insensitive(name, b"first-letter") {
+          return move result
+        }
+      }
+      Kind.Function { name } => {
+        // Of the implemented functional pseudo-elements only highlight is queryable.
+        if !doubled || !tokens.insensitive(buffer.text(name), b"highlight") {
+          return move result
+        }
+        let close = buffer.tokens.asSlice()[at].matching
+        if close + 1 != range.end {
+          return move result
+        }
+      }
+      _ => {
+        return move result
+      }
+    }
+    let parsed = run selectors.parse(&buffer, range, &[], limits)
+    match &parsed {
+      Option<SelectorList>.Some { value } => {
+        result.pseudoIdentity = run serialization.selectorText(&buffer, range)
+        result.valid = true
+      }
+      _ => {}
+    }
+    return move result
+  }
+
+  pub fn element(self: &ComputedStyle) -> usize {
+    return self.elementId
+  }
+
+  pub fn pseudo(self: &ComputedStyle) -> &[u8] {
+    return Bytes.asSlice(&self.pseudoIdentity)
+  }
+
+  pub fn validPseudo(self: &ComputedStyle) -> bool {
+    return self.valid
+  }
+
+  pub fn isReadOnly(self: &ComputedStyle) -> bool {
+    return true
+  }
+
+  pub fn computedFlag(self: &ComputedStyle) -> bool {
+    return true
+  }
+
+  pub fn parentRule(self: &ComputedStyle) -> usize {
+    return usize.MAX
+  }
+
+  pub fn cssText(self: &ComputedStyle) -> &[u8] {
+    return b""
+  }
+
+  pub fn getPropertyPriority(self: &ComputedStyle, name: &[u8]) -> &[u8] {
+    return b""
+  }
+
+  fn current(self: &ComputedStyle, binding: &Binding, engine: &Engine) -> Option<StyleId> {
+    if !self.valid || binding.element != self.elementId
+      || !tokens.equal(binding.pseudo, self.pseudo())
+      || !binding.connected
+      || !binding.inFlatTree
+      || !binding.renderedBrowsingContext {
+      return Option<StyleId>.None
+    }
+    match &binding.style {
+      Option<StyleId>.Some { value } => {
+        match &engine.scope(value) {
+          Option<ScopeId>.Some { value: scope } => {
+            return Option<StyleId>.some(value)
+          }
+          _ => {}
+        }
+      }
+      _ => {}
+    }
+    return Option<StyleId>.None
+  }
+
+  pub effect fn length(
+    self: &ComputedStyle,
+    binding: &Binding,
+    engine: &Engine,
+    buffers: BufferView,
+    limits: &Limits,
+  ) -> usize
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let style = match &self.current(binding, engine) {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        return 0
+      }
+    }
+    let scope = match &engine.scope(style) {
+      Option<ScopeId>.Some { value } => value
+      _ => {
+        return 0
+      }
+    }
+    let custom = run engine.variables.computedEntries(buffers, scope, limits)
+    return self.longhandCount + custom.length()
+  }
+
+  pub effect fn item(
+    self: &ComputedStyle,
+    binding: &Binding,
+    engine: &Engine,
+    buffers: BufferView,
+    index: usize,
+    limits: &Limits,
+  ) -> Bytes
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let style = match &self.current(binding, engine) {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        return Bytes.make()
+      }
+    }
+    if index < self.longhandCount {
+      return run copied(properties.name(self.longhands[index]))
+    }
+    let scope = match &engine.scope(style) {
+      Option<ScopeId>.Some { value } => value
+      _ => {
+        return Bytes.make()
+      }
+    }
+    let custom = run engine.variables.computedEntries(buffers, scope, limits)
+    let at = index - self.longhandCount
+    if at >= custom.length() {
+      return Bytes.make()
+    }
+    let name = custom.asSlice()[at].name
+    return run copied(buffers.one(name.buffer)[0].text(name.span))
+  }
+
+  effect fn longhand(
+    self: &ComputedStyle,
+    binding: &Binding,
+    engine: &Engine,
+    style: StyleId,
+    property: Property,
+  ) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let entry = match &engine.get(style, property) {
+      Option<ComputedValue>.Some { value } => value
+      _ => {
+        return Bytes.make()
+      }
+    }
+    let layout = binding.layout
+    if layout.hasBox && layout.transformApplies {
+      match &layout.transformReference {
+        Option<Rect>.Some { value: reference } => {
+          match &engine.values.get(entry.value).* {
+            Value.Transform { value } => {
+              let resolved = if property == Property.Transform {
+                run cssom_complex_serialization.resolvedTransform(&engine.values, &value, reference)
+              } else if property == Property.TransformOrigin
+                || property == Property.PerspectiveOrigin {
+                run cssom_complex_serialization.resolvedOrigin(&engine.values, &value, reference)
+              } else {
+                Option<Bytes>.None
+              }
+              match move resolved {
+                Option<Bytes>.Some { value: text } => {
+                  return move text
+                }
+                _ => {}
+              }
+            }
+            _ => {}
+          }
+        }
+        _ => {}
+      }
+    }
+    let used = if !layout.hasBox {
+      Option<f64>.None
+    } else {
+      match property {
+        Property.Width => if layout.widthApplies {
+          layout.width
+        } else {
+          Option<f64>.None
+        }
+        Property.Height => if layout.heightApplies {
+          layout.height
+        } else {
+          Option<f64>.None
+        }
+        Property.InlineSize => if layout.inlineSizeApplies {
+          layout.inlineSize
+        } else {
+          Option<f64>.None
+        }
+        Property.LineHeight => {
+          if layout.lineHeightApplies && !normalLineHeight(engine, entry) {
+            layout.lineHeight
+          } else {
+            Option<f64>.None
+          }
+        }
+        _ => Option<f64>.None
+      }
+    }
+    match &used {
+      Option<f64>.Some { value } => {
+        let mut resolved = run serialization.number(value)
+        run resolved.append(b"px")
+        return move resolved
+      }
+      _ => {
+        return run cssom_value_serialization.computedValue(
+          &engine.values,
+          entry.value,
+          entry.sourceProperty,
+          properties.canonical(property),
+        )
+      }
+    }
+  }
+
+  /// False means getPropertyValue deliberately falls back to computed data, not a
+  /// complete CSSOM resolved value. A DOM binding must obtain these layout facts
+  /// before presenting the result as getComputedStyle.
+  pub fn layoutComplete(
+    self: &ComputedStyle,
+    binding: &Binding,
+    engine: &Engine,
+    name: &[u8],
+  ) -> bool {
+    if !binding.layout.hasBox {
+      return true
+    }
+    let style = match &self.current(binding, engine) {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        return true
+      }
+    }
+    let property = match &properties.lookup(name) {
+      Option<Property>.Some { value } => value
+      _ => {
+        return true
+      }
+    }
+    let layout = binding.layout
+    let mut i: usize = 0
+    while i < properties.longhandCount(property) {
+      let target = properties.longhandAt(property, i)
+      if target == Property.Width && layout.widthApplies && missing(layout.width) {
+        return false
+      }
+      if target == Property.Height && layout.heightApplies && missing(layout.height) {
+        return false
+      }
+      if target == Property.InlineSize && layout.inlineSizeApplies && missing(layout.inlineSize) {
+        return false
+      }
+      if target == Property.LineHeight && layout.lineHeightApplies && missing(layout.lineHeight) {
+        match &engine.get(style, target) {
+          Option<ComputedValue>.Some { value } => {
+            if !normalLineHeight(engine, value) {
+              return false
+            }
+          }
+          _ => {}
+        }
+      }
+      if layout.transformApplies
+        && (target == Property.Transform || target == Property.TransformOrigin
+          || target == Property.PerspectiveOrigin) {
+        match &layout.transformReference {
+          Option<Rect>.Some { value } => {
+            if !geometry.isValidRect(value) {
+              return false
+            }
+          }
+          _ => {
+            return false
+          }
+        }
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  pub effect fn getPropertyValue(
+    self: &ComputedStyle,
+    binding: &Binding,
+    engine: &Engine,
+    buffers: BufferView,
+    name: &[u8],
+  ) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let style = match &self.current(binding, engine) {
+      Option<StyleId>.Some { value } => value
+      _ => {
+        return Bytes.make()
+      }
+    }
+    if declaration_values.customName(name) {
+      let scope = match &engine.scope(style) {
+        Option<ScopeId>.Some { value } => value
+        _ => {
+          return Bytes.make()
+        }
+      }
+      let range = match &engine.variables.lookupText(buffers, scope, name) {
+        Option<TokenRange>.Some { value } => value
+        _ => {
+          return Bytes.make()
+        }
+      }
+      let input = Input.Expanded {
+        buffers: buffers,
+        references: Slice.view<TokenRef>(
+          engine.variables.references(),
+          range.start,
+          range.end - range.start,
+        ),
+      }
+      return run serialization.componentsInput(&input)
+    }
+    let property = match &properties.lookup(name) {
+      Option<Property>.Some { value } => value
+      _ => {
+        return Bytes.make()
+      }
+    }
+    let count = properties.longhandCount(property)
+    if count == 1 {
+      return run self.longhand(binding, engine, style, property)
+    }
+    let mut values = run List<Bytes>.makeWithCapacity(count)
+    let mut i: usize = 0
+    while i < count {
+      let text = run self.longhand(binding, engine, style, properties.longhandAt(property, i))
+      if Bytes.asSlice(&text).length == 0 {
+        return Bytes.make()
+      }
+      run values.append(move text)
+      i = i + 1
+    }
+    return run cssom_shorthand.serialize(property, values.asSlice())
+  }
+
+  pub effect fn setProperty(
+    self: &ComputedStyle,
+    name: &[u8],
+    value: &[u8],
+    priority: &[u8],
+    limits: &Limits,
+  ) -> ()
+    ! CssomError {
+    fail CssomError.NoModificationAllowedError
+  }
+
+  pub effect fn removeProperty(self: &ComputedStyle, name: &[u8]) -> Bytes
+    ! CssomError {
+    fail CssomError.NoModificationAllowedError
+  }
+
+  pub effect fn setCssText(self: &ComputedStyle, text: &[u8], limits: &Limits) -> ()
+    ! CssomError {
+    fail CssomError.NoModificationAllowedError
+  }
+}
