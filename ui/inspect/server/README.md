@@ -27,6 +27,8 @@ is removed when nothing answers on it.
 The server is polled from the window loop. It serves at most one waiting request per poll,
 then yields to native input and timers. Screenshot rendering is synchronous; connected socket
 reads/writes have bounded deadlines. Waiting for future clients never blocks the frame loop.
+The poll clock probes socket readiness without waiting and advances to its deadline when nothing
+is ready, preserving this behavior with Silk's `MonotonicClock.waitReady` interface.
 
 ```silk
 let mut inspector = run Inspector.start(InspectorOptions.make())
