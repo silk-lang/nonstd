@@ -151,10 +151,25 @@ Native window hosts settle virtual lists automatically. Custom hosts should call
 layout settlement to eight passes and leaves `tree.needsFrame()` set if more work
 remains. Use the fully mounted mode when the entire tree must remain available.
 
+## The Scroll Lab in the browser
+
+The same document, drawn by Silk, also runs in a browser tab: `wasm` (`silk-scroll-demo-wasm`)
+builds it for wasm32, with the document itself in the `document` library
+(`silk-scroll-document`) that the native app uses too. It needs WebGPU and JSPI (Chrome or
+Edge 137 or later):
+
+```sh
+python3 ui/tree/window/scripts/browser serve examples/scroll-demo/wasm   # http://127.0.0.1:8050/
+```
+
+It opens 100 virtualized sections. The browser has no platform thread and no compositor
+scroll, so wheel scrolling goes through the tree on the one thread; the benchmark and the exit
+test stay native. Add `?check` to the address for the same check as `--check`.
+
 ## Browser baseline
 
 Serve the repository root (`python3 -m http.server 8079`) and open
-`http://localhost:8079/ui/app/scroll-demo/browser/`. It uses the same bundled fonts,
+`http://localhost:8079/examples/scroll-demo/browser/`. It uses the same bundled fonts,
 photos, paragraphs, section variants, and dimensions. Select content visibility or
 fully mounted mode. The browser fixture exposes `setup(count, mode)` and
 `measure(steps)` for repeatable measurements; results remain in `window.result`.

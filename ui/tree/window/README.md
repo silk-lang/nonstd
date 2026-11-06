@@ -36,7 +36,9 @@ From the repository root:
 
     python3 ui/tree/window/scripts/browser serve                       # the notes app
     python3 ui/tree/window/scripts/browser serve ui/tree/window/demo   # the counter above
-    python3 ui/tree/window/scripts/browser test examples/notes/browser
+    python3 ui/tree/window/scripts/browser serve examples/studio/browser
+    python3 ui/tree/window/scripts/browser serve examples/scroll-demo/wasm
+    python3 ui/tree/window/scripts/browser test examples/notes/browser -- --stored notes
 
 `serve` builds the package for `wasm32-unknown-unknown` (release unless `--debug`) and prints
 the page's address, by default http://127.0.0.1:8050/. It needs WebGPU and WebAssembly JSPI:
@@ -56,6 +58,10 @@ How it differs from a native window:
 - **The program brings its fonts and data.** There are no system fonts and no files; pass a
   bundled collection (for example `ui_fixtures.fixtures.fonts()`) to `runWindow`. The
   inspector is always off.
+- **Text the app keeps goes to localStorage.** `browser.store(key, text)` keeps it and
+  `browser.stored(key)` reads it back on the next visit (both do nothing natively). The page
+  puts `silk-app:` before each key, and gives the app no storage in check mode, so a check
+  always starts from nothing.
 - **`main` takes no arguments.** Read `browser.checkRequested()` for `?check`, and print with
   `console.StderrWriter`: standard error natively, the browser console in the page.
 - **Two modules in the program's own package.** A dependency exports no wasm symbols, so the
