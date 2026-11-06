@@ -47,11 +47,11 @@ The Silk and LLVM installers are shared at the repository root (`scripts/install
 Silk fetches into `~/.silk/archives`; `native/gpu/webgpu/scripts/install-webgpu` installs the same
 release for the C benchmark baseline and the Windows DLL wrapper (`scripts/prepare-windows`).
 
-- `install-silk` pins **0.1.0-dev.51+9643805617be**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the native seed on every invocation (a target missing from the seed relies on the archive checksum; dev.45 and dev.46 published one for x86-64 Linux only). It prints the compiler's **bin directory**.
+- `install-silk` pins **0.1.0-dev.55+b55efdf130d5**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the native seed on every invocation (a target missing from the seed relies on the archive checksum; dev.45 and dev.46 published one for x86-64 Linux only). It prints the compiler's **bin directory**.
 - `install-webgpu` pins Dawn's Release archives and prints the **installation root**. macOS has `lib/libwebgpu_dawn.a`; Linux has `lib64/libwebgpu_dawn.a`; Windows has `lib/webgpu_dawn.lib`.
 - `install-llvm` accepts a working absolute `SILK_CLANG` pointing to LLVM 22, or discovers Homebrew LLVM / `clang-22`; otherwise it downloads checksum-pinned **LLVM 22.1.8**. It prints the **absolute clang executable path**. Published LLVM archives are large (Linux x86_64: 1,938,859,476 bytes); preinstall LLVM 22 for a short cold gate. The full downloaded distribution includes resource headers and `wasm-ld`; a supplied system toolchain must also provide `wasm-ld` for browser builds.
 
-| Native host | Silk dev.51 release | Dawn release | Current prerequisite |
+| Native host | Silk dev.55 release | Dawn release | Current prerequisite |
 | --- | --- | --- | --- |
 | macOS arm64 | Available | Available | macOS 26+, LLVM 22 and Apple SDK |
 | macOS x86_64 | Not published | Available | Published native Silk compiler required |
