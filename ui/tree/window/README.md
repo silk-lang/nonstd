@@ -62,6 +62,9 @@ How it differs from a native window:
   `browser.stored(key)` reads it back on the next visit (both do nothing natively). The page
   puts `silk-app:` before each key, and gives the app no storage in check mode, so a check
   always starts from nothing.
+- **An 8 MiB stack.** The compiler links wasm with a 1 MiB stack, which deep layouts overflow
+  (the trap reads "memory access out of bounds"), so `scripts/browser` links through a clang
+  wrapper that asks for 8 MiB, what a native thread gets.
 - **`main` takes no arguments.** Read `browser.checkRequested()` for `?check`, and print with
   `console.StderrWriter`: standard error natively, the browser console in the page.
 - **Two modules in the program's own package.** A dependency exports no wasm symbols, so the
