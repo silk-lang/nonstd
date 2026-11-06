@@ -1,0 +1,430 @@
+//! CSSOM §6.1.2 and §6.4 algorithms, including stable retained native handles.
+import cssom_stylesheet { StyleSheet, RuleList, CssRuleKind, NO_RULE, NO_SHEET }
+import cssom_stylesheet
+import cssom_error { CssomError }
+import tokens { Limits, CssError, equal }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+fn item(list: RuleList, sheet: &StyleSheet, index: usize) -> usize {
+  return match list.item(sheet, index) {
+    Option<usize>.Some { value } => value
+    _ => NO_RULE
+  }
+}
+
+fn insertionError(
+  result: &Result<usize, CssomError | CssError | OutOfMemoryError>,
+  expected: CssomError,
+) -> bool {
+  return match &result.* {
+    Result<usize, CssomError | CssError | OutOfMemoryError>.Failure { error } => match &error {
+      CssomError value => value == expected
+      _ => false
+    }
+    _ => false
+  }
+}
+
+// https://drafts.csswg.org/cssom/#dom-cssstylesheet-insertrule
+// Sheet security, modification lock, Syntax parsing, then generic insertion bounds.
+test effect fn stylesheetInsertionExceptionPrecedence() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(3, true)
+  run sheet.beginReplace()
+  sheet.originClean = false
+  let security = run Effect.result(
+    sheet.insertRule(b"broken", 99, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&security, CssomError.SecurityError),
+    "security precedes modification, syntax and bounds",
+  )
+  sheet.originClean = true
+  let locked = run Effect.result(
+    sheet.insertRule(b"broken", 99, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&locked, CssomError.NotAllowedError),
+    "modification lock precedes syntax and bounds",
+  )
+  sheet.cancelReplace()
+  let syntax = run Effect.result(
+    sheet.insertRule(b"broken", 99, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&syntax, CssomError.SyntaxError),
+    "Syntax parse precedes sheet insertion bounds",
+  )
+  let bounds = run Effect.result(
+    sheet.insertRule(b"a {}", 99, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&bounds, CssomError.IndexSizeError),
+    "valid Syntax rule reaches index validation",
+  )
+  let imported = run Effect.result(
+    sheet.insertRule(b"@import 'a';", 99, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&imported, CssomError.SyntaxError),
+    "constructed import restriction precedes insertion bounds",
+  )
+}
+
+// https://drafts.csswg.org/css-syntax/#parse-a-rule
+test effect fn stylesheetRequiresExactlyOneCompleteRule() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(0, false)
+  let trailing = run Effect.result(
+    sheet.insertRule(b"a {} trailing", 0, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&trailing, CssomError.SyntaxError),
+    "discarded trailing qualified prelude is still a syntax error",
+  )
+  let multiple = run Effect.result(
+    sheet.insertRule(b"a {} b {}", 0, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(insertionError(&multiple, CssomError.SyntaxError), "two rules are rejected")
+  let semicolon = run Effect.result(
+    sheet.insertRule(b"a {};", 0, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&semicolon, CssomError.SyntaxError),
+    "trailing semicolon is not whitespace",
+  )
+  let inserted = run sheet.insertRule(b" /**/ a { color: red } /**/ ", 0, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let list = run sheet.cssRules()
+  run Testing.expect(
+    inserted == 0 && list.length(&sheet) == 1,
+    "comments and surrounding whitespace are permitted",
+  )
+}
+
+// https://drafts.csswg.org/cssom/#remove-a-css-rule
+test effect fn stylesheetRetainsDetachedRuleIdentityAndLiveLists() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(7, false)
+  let live = run sheet.cssRules()
+  let first = run sheet.insertRule(b"@media screen { a { color: red } }", 0, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let parent = item(live, &sheet, 0)
+  let children = sheet.rulesFor(parent)
+  let child = item(children, &sheet, 0)
+  run Testing.expect(
+    live.length(&sheet) == 1 && children.length(&sheet) == 1,
+    "retained list handles observe insertion",
+  )
+  run sheet.deleteRule(0)
+  run Testing.expect(
+    live.length(&sheet) == 0 && children.length(&sheet) == 1,
+    "deletion unlinks root but retains detached subtree",
+  )
+  run Testing.expect(
+    match sheet.rule(parent) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.parentRule == NO_RULE
+        && value.parentStyleSheet == NO_SHEET
+      _ => false
+    },
+    "retained deleted rule has null parents",
+  )
+  run Testing.expect(
+    match sheet.rule(child) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.parentRule == parent
+        && value.parentStyleSheet == NO_SHEET
+        && value.style.parentRule() == child
+      _ => false
+    },
+    "detached descendants retain parent rule and declaration ownership but lose parent sheet",
+  )
+  let second = run sheet.insertRule(b"b {}", 0, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(item(live, &sheet, 0) != parent, "deleted rule identities are never reused")
+  let detached = run sheet.insertGroupingRule(parent, b"c {}", 1, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    children.length(&sheet) == 2,
+    "retained detached grouping rule remains mutable",
+  )
+}
+
+// https://drafts.csswg.org/cssom/#insert-a-css-rule
+test effect fn stylesheetHierarchyNamespaceAndGroupingErrors() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(9, false)
+  let first = run sheet.insertRule(b"a {}", 0, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let imported = run Effect.result(
+    sheet.insertRule(b"@import 'x';", 1, &limits) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&imported, CssomError.HierarchyRequestError),
+    "imports cannot follow style rules",
+  )
+  let namespaceAfter = run Effect.result(
+    sheet.insertRule(b"@namespace 'urn:x';", 1, &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&namespaceAfter, CssomError.HierarchyRequestError),
+    "namespace hierarchy violation precedes invalid state",
+  )
+  let namespaceBefore = run Effect.result(
+    sheet.insertRule(b"@namespace 'urn:x';", 0, &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&namespaceBefore, CssomError.InvalidStateError),
+    "namespace insertion into sheet containing style rules is invalid state",
+  )
+  let group = run sheet.insertRule(b"@media screen {}", 1, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let list = run sheet.cssRules()
+  let parent = item(list, &sheet, 1)
+  let indexFirst = run Effect.result(
+    sheet.insertGroupingRule(parent, b"broken", 3, &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&indexFirst, CssomError.IndexSizeError),
+    "group insertion validates bounds before parsing",
+  )
+  let nestedImport = run Effect.result(
+    sheet.insertGroupingRule(parent, b"@import 'x';", 0, &limits)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    insertionError(&nestedImport, CssomError.HierarchyRequestError),
+    "imports cannot be nested",
+  )
+}
+
+// https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync
+test effect fn constructedReplacementTransactionAndImportRemoval() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(5, true)
+  let live = run sheet.cssRules()
+  run sheet.replaceSync(b"@import 'a'; a {}", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let retained = item(live, &sheet, 0)
+  run Testing.expect(live.length(&sheet) == 1, "constructed replacement discards imports")
+  run sheet.beginReplace()
+  run Testing.expect(
+    live.length(&sheet) == 1 && sheet.modificationPending(),
+    "replacement does not eagerly empty old live list",
+  )
+  run sheet.finishReplace(b"b {} c {}", &limits) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    live.length(&sheet) == 2 && !sheet.modificationPending(),
+    "async host completion atomically replaces list and unlocks",
+  )
+  run Testing.expect(
+    match sheet.rule(retained) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.parentStyleSheet == NO_SHEET
+      _ => false
+    },
+    "replacement detaches retained old objects",
+  )
+  let before = item(live, &sheet, 0)
+  let mut bounded = Limits.make()
+  bounded.maxInputBytes = 1
+  run sheet.beginReplace()
+  let failure = run Effect.result(
+    sheet.finishReplace(b"d {}", &bounded) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(
+    match &failure {
+      Result<(), CssomError | CssError | OutOfMemoryError>.Failure { error } => true
+      _ => false
+    },
+    "resource failure is not swallowed",
+  )
+  run Testing.expect(
+    !sheet.modificationPending() && item(live, &sheet, 0) == before,
+    "failed replacement unlocks and preserves prior list identities",
+  )
+}
+
+test effect fn selectorSetterNoopAndNamespaceContext() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(0, false)
+  run sheet.load(b"@namespace svg 'urn:svg'; svg|rect { color: red }", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let live = run sheet.cssRules()
+  run Testing.expect(
+    live.length(&sheet) == 2,
+    "namespace bindings are applied while loading following selectors",
+  )
+  let id = item(live, &sheet, 1)
+  let original = run sheet.cssText(id) |> Effect.provideMut<Allocator>(&mut allocator)
+  run sheet.setSelectorText(id, b"unknown|rect", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let invalid = run sheet.cssText(id) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(original.asSlice(), invalid.asSlice()),
+    "unknown namespace selector assignment silently keeps old selector",
+  )
+  match move sheet.ruleMut(id) {
+    Option<&mut cssom_stylesheet.CssRule>.Some { value } => value.setCssText(b"invalid")
+    _ => {}
+  }
+  let unchanged = run sheet.cssText(id) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(original.asSlice(), unchanged.asSlice()),
+    "CSSRule cssText setter is a specified no-op",
+  )
+  run sheet.setSelectorText(id, b"svg|circle", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let changed = run sheet.cssText(id) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !equal(original.asSlice(), changed.asSlice()),
+    "valid selector setter uses sheet namespace bindings",
+  )
+}
+
+test effect fn nestedRulesAndDeprecatedApis() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(0, false)
+  let inserted = run sheet.insertRule(
+    b"a { color: red; & > b { color: blue } color: green; }",
+    0,
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let live = run sheet.cssRules()
+  let parent = item(live, &sheet, 0)
+  let children = sheet.rulesFor(parent)
+  run Testing.expect(
+    children.length(&sheet) == 2,
+    "nested style and subsequent nested declaration rule keep source ordering",
+  )
+  let nested = item(children, &sheet, 1)
+  run Testing.expect(
+    match sheet.rule(nested) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.kind
+        == CssRuleKind.NestedDeclarations
+      _ => false
+    },
+    "post-rule declaration run becomes CSSNestedDeclarations",
+  )
+  let legacy = run sheet.addRule(b"b", b"color: red", 1, &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    legacy == -1 && live.length(&sheet) == 2,
+    "deprecated addRule returns minus one and inserts real rule",
+  )
+  run sheet.removeRule(1)
+  run Testing.expect(live.length(&sheet) == 1, "deprecated removeRule performs normal deletion")
+}
+
+// https://drafts.csswg.org/css-animations-1/#interface-csskeyframesrule
+test effect fn keyframeObjectsAndLastMatchingSelection() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(1, false)
+  run sheet.load(
+    b"@keyframes spin { from { color: red !important; opacity: 0 } 0% { opacity: 1 } 25%, 75% { opacity: .5 } }",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let parent = item(run sheet.cssRules(), &sheet, 0)
+  let list = sheet.rulesFor(parent)
+  run Testing.expect(
+    list.length(&sheet) == 3,
+    "keyframe block contains distinct stable rule objects",
+  )
+  let last = run sheet.findKeyframeRule(parent, b"from", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match last {
+      Option<usize>.Some { value } => value == item(list, &sheet, 1)
+      _ => false
+    },
+    "from and zero percent match the last duplicate",
+  )
+  let missing = run sheet.findKeyframeRule(parent, b"75%", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(missing.isNone(), "findRule requires the entire ordered selector list")
+  let first = item(list, &sheet, 0)
+  run Testing.expect(
+    match sheet.rule(first) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.style.length() == 1
+        && equal(value.selectorText(), b"0%")
+      _ => false
+    },
+    "keyframes drop important declarations and normalize from to zero percent",
+  )
+  run sheet.deleteKeyframeRule(parent, b"0%", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    list.length(&sheet) == 2 && item(list, &sheet, 0) == first,
+    "deleteRule deletes only the last matching duplicate",
+  )
+  run sheet.appendKeyframeRule(parent, b"to { opacity: 1 }", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run sheet.appendKeyframeRule(parent, b"200% { opacity: 1 }", &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    list.length(&sheet) == 3,
+    "appendRule accepts valid rule and silently ignores invalid percentage",
+  )
+}
+
+test effect fn ruleKindsAndConditionalImportSerialization() -> ()
+  ! AssertionError<'static> | CssomError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let mut sheet = StyleSheet.make(2, false)
+  run sheet.load(
+    b"@import 'theme.css' layer(theme) supports(color: red) screen; @layer theme { @supports (color: red) { a {} } } @page :left { color: red; @top-left { color: blue } color: green }",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let roots = run sheet.cssRules()
+  run Testing.expect(roots.length(&sheet) == 3, "import, layer and page kinds are retained")
+  let imported = item(roots, &sheet, 0)
+  let text = run sheet.cssText(imported) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match sheet.rule(imported) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.hasLayer
+        && equal(value.layerName.asSlice(), b"theme")
+        && value.supportsText.length() != 0
+      _ => false
+    },
+    "conditional import keeps layer and supports metadata distinct from media",
+  )
+  let page = item(roots, &sheet, 2)
+  let margins = sheet.rulesFor(page)
+  run Testing.expect(
+    margins.length(&sheet) == 1,
+    "page declaration prefixes do not swallow margin at-rules",
+  )
+  run Testing.expect(
+    match sheet.rule(item(margins, &sheet, 0)) {
+      Option<&cssom_stylesheet.CssRule>.Some { value } => value.kind == CssRuleKind.Margin
+        && value.parentRule == page
+      _ => false
+    },
+    "margin objects retain the actual page parent identity",
+  )
+}

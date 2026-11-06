@@ -1,0 +1,1499 @@
+//! CSSOM View window state. All measurements are host snapshots in CSS pixels.
+//! Requests remain pending until the host acknowledges actual work; event queues
+//! preserve first-enqueue order and deduplicate by target and event type.
+import cssom_error { CssomError }
+import cssom_view { ScrollBehavior }
+import cssom_view
+import cssom_media { MediaList }
+import input { Input }
+import lexer
+import media_features { Environment }
+import media_queries
+import tokens { Limits, CssError, TokenBuffer }
+import tokens
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+
+pub enum ViewTargetKind {
+  Window,
+  Document,
+  Element,
+  VisualViewport
+}
+
+pub struct ViewTarget {
+  pub kind: ViewTargetKind,
+  pub id: usize
+}
+
+impl Copy for ViewTarget {}
+
+fn sameTarget(a: ViewTarget, b: ViewTarget) -> bool {
+  return a.kind == b.kind && a.id == b.id
+}
+
+pub enum ViewEventKind {
+  Resize,
+  Scroll,
+  ScrollEnd
+}
+
+pub struct ViewEvent {
+  pub target: ViewTarget,
+  pub kind: ViewEventKind,
+  pub bubbles: bool
+}
+
+impl Copy for ViewEvent {}
+
+pub enum ScrollResult {
+  Pending,
+  Completed,
+  Interrupted
+}
+
+pub struct ScrollRequest {
+  pub id: usize,
+  pub target: ViewTarget,
+  pub left: f64,
+  pub top: f64,
+  pub behavior: ScrollBehavior,
+}
+
+impl Copy for ScrollRequest {}
+
+struct ScrollOperation {
+  request: ScrollRequest,
+  result: ScrollResult,
+  x: f64,
+  y: f64,
+  changed: bool,
+}
+
+impl Copy for ScrollOperation {}
+
+pub struct ScrollState {
+  operations: List<ScrollOperation>,
+  eventQueue: List<ViewEvent>,
+  nextId: usize,
+}
+
+impl ScrollState {
+  pub fn make() -> Self {
+    return Self {
+      operations: List<ScrollOperation>.make(),
+      eventQueue: List<ViewEvent>.make(),
+      nextId: 0,
+    }
+  }
+
+  fn index(self: &Self, id: usize) -> usize {
+    let mut at: usize = 0
+    while at < self.operations.length() {
+      if self.operations.asSlice()[at].request.id == id {
+        return at
+      }
+      at = at + 1
+    }
+    return at
+  }
+
+  pub effect fn enqueue(self: &mut Self, target: ViewTarget, kind: ViewEventKind) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut at: usize = 0
+    while at < self.eventQueue.length() {
+      let event = self.eventQueue.asSlice()[at]
+      if sameTarget(event.target, target) && event.kind == kind {
+        return
+      }
+      at = at + 1
+    }
+    run self.eventQueue.append(
+      ViewEvent {
+        target: target,
+        kind: kind,
+        bubbles: target.kind == ViewTargetKind.Document && kind != ViewEventKind.Resize,
+      },
+    )
+  }
+
+  pub effect fn begin(
+    self: &mut Self,
+    target: ViewTarget,
+    currentX: f64,
+    currentY: f64,
+    left: f64,
+    top: f64,
+    behavior: ScrollBehavior,
+    computedSmooth: bool,
+    honorsSmooth: bool,
+  ) -> ScrollRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.operations.reserve(1)
+    let mut at: usize = 0
+    while at < self.operations.length() {
+      let mut operation = &mut self.operations.asMutSlice()[at]
+      if sameTarget(operation.request.target, target) && operation.result == ScrollResult.Pending {
+        operation.result = ScrollResult.Interrupted
+      }
+      at = at + 1
+    }
+    let smooth = honorsSmooth
+      && (behavior == ScrollBehavior.Smooth || (behavior == ScrollBehavior.Auto && computedSmooth))
+    let request = ScrollRequest {
+      id: self.nextId,
+      target: target,
+      left: cssom_view.normalizeScroll(left),
+      top: cssom_view.normalizeScroll(top),
+      behavior: if smooth {
+        ScrollBehavior.Smooth
+      } else {
+        ScrollBehavior.Instant
+      },
+    }
+    run self.operations.append(
+      ScrollOperation {
+        request: request,
+        result: ScrollResult.Pending,
+        x: currentX,
+        y: currentY,
+        changed: false,
+      },
+    )
+    self.nextId = self.nextId + 1
+    return request
+  }
+
+  pub fn result(self: &Self, id: usize) -> Option<ScrollResult> {
+    let at = self.index(id)
+    if at == self.operations.length() {
+      return Option<ScrollResult>.None
+    }
+    return Option<ScrollResult>.some(self.operations.asSlice()[at].result)
+  }
+
+  pub fn pending(self: &Self, id: usize) -> bool {
+    return match self.result(id) {
+      Option<ScrollResult>.Some { value } => value == ScrollResult.Pending
+      _ => false
+    }
+  }
+
+  pub fn interruptTarget(self: &mut Self, target: ViewTarget) -> () {
+    let mut at: usize = 0
+    while at < self.operations.length() {
+      let mut operation = &mut self.operations.asMutSlice()[at]
+      if operation.result == ScrollResult.Pending && sameTarget(operation.request.target, target) {
+        operation.result = ScrollResult.Interrupted
+      }
+      at = at + 1
+    }
+  }
+
+  pub fn interruptAll(self: &mut Self) -> () {
+    let mut at: usize = 0
+    while at < self.operations.length() {
+      if self.operations.asSlice()[at].result == ScrollResult.Pending {
+        let mut items = self.operations.asMutSlice()
+        items[at].result = ScrollResult.Interrupted
+      }
+      at = at + 1
+    }
+  }
+
+  pub effect fn update(self: &mut Self, id: usize, x: f64, y: f64) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.index(id)
+    if at == self.operations.length() {
+      fail CssomError.NotFoundError
+    }
+    let operation = self.operations.asSlice()[at]
+    if operation.result != ScrollResult.Pending {
+      fail CssomError.InvalidStateError
+    }
+    if !f64.isFinite(x) || !f64.isFinite(y) {
+      fail CssomError.TypeError
+    }
+    if operation.x == x && operation.y == y {
+      return
+    }
+    run self.enqueue(operation.request.target, ViewEventKind.Scroll)
+    let mut entry = &mut self.operations.asMutSlice()[at]
+    entry.x = x
+    entry.y = y
+    entry.changed = true
+  }
+
+  // Host completion includes animation/snap translations and release of gesture keys/pointers.
+  pub effect fn complete(
+    self: &mut Self,
+    id: usize,
+    pendingUpdates: bool,
+    gestureActive: bool,
+  ) -> bool
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.index(id)
+    if at == self.operations.length() {
+      fail CssomError.NotFoundError
+    }
+    let operation = self.operations.asSlice()[at]
+    if operation.result != ScrollResult.Pending {
+      return false
+    }
+    if pendingUpdates || gestureActive {
+      return false
+    }
+    if operation.changed {
+      run self.enqueue(operation.request.target, ViewEventKind.ScrollEnd)
+    }
+    let mut items = self.operations.asMutSlice()
+    items[at].result = ScrollResult.Completed
+    return true
+  }
+
+  pub effect fn interrupt(self: &mut Self, id: usize) -> ()
+    ! CssomError {
+    let at = self.index(id)
+    if at == self.operations.length() {
+      fail CssomError.NotFoundError
+    }
+    if self.operations.asSlice()[at].result == ScrollResult.Pending {
+      let mut items = self.operations.asMutSlice()
+      items[at].result = ScrollResult.Interrupted
+    }
+  }
+
+  pub effect fn release(self: &mut Self, id: usize) -> ()
+    ! CssomError {
+    let at = self.index(id)
+    if at == self.operations.length() {
+      fail CssomError.NotFoundError
+    }
+    if self.operations.asSlice()[at].result == ScrollResult.Pending {
+      fail CssomError.InvalidStateError
+    }
+    drop self.operations.remove(at)
+  }
+
+  pub fn events<'a>(self: &'a Self) -> &'a [ViewEvent] {
+    return self.eventQueue.asSlice()
+  }
+
+  pub fn clearEvents(self: &mut Self) -> () {
+    self.eventQueue.truncate(0)
+  }
+}
+
+// A viewport/scrollIntoView promise waits for every constituent operation, even
+// when one was interrupted before another one finished.
+pub effect fn combinedScrollResult(state: &ScrollState, ids: &[usize]) -> ScrollResult
+  ! CssomError {
+  let mut interrupted = false
+  let mut pending = false
+  let mut at: usize = 0
+  while at < ids.length {
+    match state.result(ids[at]) {
+      Option<ScrollResult>.Some { value } => {
+        if value == ScrollResult.Pending {
+          pending = true
+        }
+        if value == ScrollResult.Interrupted {
+          interrupted = true
+        }
+      }
+      _ => {
+        fail CssomError.NotFoundError
+      }
+    }
+    at = at + 1
+  }
+  if pending {
+    return ScrollResult.Pending
+  }
+  return if interrupted {
+    ScrollResult.Interrupted
+  } else {
+    ScrollResult.Completed
+  }
+}
+
+pub struct Screen {
+  pub availWidth: i32,
+  pub availHeight: i32,
+  pub width: i32,
+  pub height: i32,
+  pub outputColorBits: Option<u32>,
+  pub mediaColorBits: u32,
+}
+
+impl Copy for Screen {}
+
+impl Screen {
+  pub fn colorDepth(self: &Self) -> u32 {
+    let bits = match self.outputColorBits {
+      Option<u32>.Some { value } => value
+      _ => 24
+    }
+    let minimum = self.mediaColorBits * 3
+    return if bits < minimum {
+      minimum
+    } else {
+      bits
+    }
+  }
+
+  pub fn pixelDepth(self: &Self) -> u32 {
+    return self.colorDepth()
+  }
+}
+
+pub struct VisualViewport {
+  pub fullyActive: bool,
+  pub hasOutputDevice: bool,
+  pub layoutOffsetX: f64,
+  pub layoutOffsetY: f64,
+  pub documentOffsetX: f64,
+  pub documentOffsetY: f64,
+  // Host excludes rendered classic scrollbars fixed to the visual viewport.
+  pub viewportWidth: f64,
+  pub viewportHeight: f64,
+  pub scaleFactor: f64,
+}
+
+impl Copy for VisualViewport {}
+
+impl VisualViewport {
+  pub fn offsetLeft(self: &Self) -> f64 {
+    return if self.fullyActive {
+      self.layoutOffsetX
+    } else {
+      0.0
+    }
+  }
+
+  pub fn offsetTop(self: &Self) -> f64 {
+    return if self.fullyActive {
+      self.layoutOffsetY
+    } else {
+      0.0
+    }
+  }
+
+  pub fn pageLeft(self: &Self) -> f64 {
+    return if self.fullyActive {
+      self.documentOffsetX
+    } else {
+      0.0
+    }
+  }
+
+  pub fn pageTop(self: &Self) -> f64 {
+    return if self.fullyActive {
+      self.documentOffsetY
+    } else {
+      0.0
+    }
+  }
+
+  pub fn width(self: &Self) -> f64 {
+    return if self.fullyActive {
+      self.viewportWidth
+    } else {
+      0.0
+    }
+  }
+
+  pub fn height(self: &Self) -> f64 {
+    return if self.fullyActive {
+      self.viewportHeight
+    } else {
+      0.0
+    }
+  }
+
+  pub fn scale(self: &Self) -> f64 {
+    if !self.fullyActive {
+      return 0.0
+    }
+    return if self.hasOutputDevice {
+      self.scaleFactor
+    } else {
+      1.0
+    }
+  }
+}
+
+pub struct WindowViewport {
+  pub width: f64,
+  pub height: f64,
+  pub scrollportWidth: f64,
+  pub scrollportHeight: f64,
+  pub scrollingAreaWidth: f64,
+  pub scrollingAreaHeight: f64,
+  pub scrollX: f64,
+  pub scrollY: f64,
+  pub overflowLeftward: bool,
+  pub overflowUpward: bool,
+  pub ongoingSmoothScroll: bool,
+}
+
+impl Copy for WindowViewport {}
+
+pub struct WindowDisplay {
+  pub screenX: f64,
+  pub screenY: f64,
+  pub outerWidth: f64,
+  pub outerHeight: f64,
+  // CSS pixel size at current page zoom divided by device pixel size (not pinch zoom).
+  pub devicePixelRatio: f64,
+}
+
+impl Copy for WindowDisplay {}
+
+pub struct Window {
+  pub document: usize,
+  pub screen: Screen,
+  pub viewport: Option<WindowViewport>,
+  pub display: Option<WindowDisplay>,
+  pub visualViewportState: Option<VisualViewport>,
+}
+
+impl Copy for Window {}
+
+impl Window {
+  pub fn visualViewport(self: &Self) -> Option<VisualViewport> {
+    match self.visualViewportState {
+      Option<VisualViewport>.Some { value } => {
+        if value.fullyActive {
+          return Option<VisualViewport>.some(value)
+        }
+      }
+      _ => {}
+    }
+    return Option<VisualViewport>.None
+  }
+
+  pub fn innerWidth(self: &Self) -> f64 {
+    return match self.viewport {
+      Option<WindowViewport>.Some { value } => value.width
+      _ => 0.0
+    }
+  }
+
+  pub fn innerHeight(self: &Self) -> f64 {
+    return match self.viewport {
+      Option<WindowViewport>.Some { value } => value.height
+      _ => 0.0
+    }
+  }
+
+  pub fn scrollX(self: &Self) -> f64 {
+    return match self.viewport {
+      Option<WindowViewport>.Some { value } => value.scrollX
+      _ => 0.0
+    }
+  }
+
+  pub fn scrollY(self: &Self) -> f64 {
+    return match self.viewport {
+      Option<WindowViewport>.Some { value } => value.scrollY
+      _ => 0.0
+    }
+  }
+
+  pub fn pageXOffset(self: &Self) -> f64 {
+    return self.scrollX()
+  }
+
+  pub fn pageYOffset(self: &Self) -> f64 {
+    return self.scrollY()
+  }
+
+  pub fn screenX(self: &Self) -> f64 {
+    return match self.display {
+      Option<WindowDisplay>.Some { value } => value.screenX
+      _ => 0.0
+    }
+  }
+
+  pub fn screenY(self: &Self) -> f64 {
+    return match self.display {
+      Option<WindowDisplay>.Some { value } => value.screenY
+      _ => 0.0
+    }
+  }
+
+  pub fn screenLeft(self: &Self) -> f64 {
+    return self.screenX()
+  }
+
+  pub fn screenTop(self: &Self) -> f64 {
+    return self.screenY()
+  }
+
+  pub fn outerWidth(self: &Self) -> f64 {
+    return match self.display {
+      Option<WindowDisplay>.Some { value } => value.outerWidth
+      _ => 0.0
+    }
+  }
+
+  pub fn outerHeight(self: &Self) -> f64 {
+    return match self.display {
+      Option<WindowDisplay>.Some { value } => value.outerHeight
+      _ => 0.0
+    }
+  }
+
+  pub fn devicePixelRatio(self: &Self) -> f64 {
+    return match self.display {
+      Option<WindowDisplay>.Some { value } => value.devicePixelRatio
+      _ => 1.0
+    }
+  }
+}
+
+pub struct ScrollToOptions {
+  pub left: Option<f64>,
+  pub top: Option<f64>,
+  pub behavior: ScrollBehavior
+}
+
+impl Copy for ScrollToOptions {}
+
+impl ScrollToOptions {
+  pub fn make() -> Self {
+    return Self { left: Option<f64>.None, top: Option<f64>.None, behavior: ScrollBehavior.Auto }
+  }
+}
+
+pub struct ViewportScrollPlan {
+  pub layoutX: f64,
+  pub layoutY: f64,
+  pub visualX: f64,
+  pub visualY: f64,
+  pub behavior: ScrollBehavior,
+  pub noOp: bool,
+}
+
+impl Copy for ViewportScrollPlan {}
+
+fn scrollAxis(value: f64, port: f64, area: f64, reverse: bool) -> f64 {
+  return if reverse {
+    f64.min(0.0, f64.max(value, port - area))
+  } else {
+    f64.max(0.0, f64.min(value, area - port))
+  }
+}
+
+// Layout must be submitted before visual to preserve viewport scroll event ordering.
+pub fn planViewportScroll(
+  window: &Window,
+  options: ScrollToOptions,
+  relative: bool,
+) -> ViewportScrollPlan {
+  let mut result = ViewportScrollPlan {
+    layoutX: 0.0,
+    layoutY: 0.0,
+    visualX: 0.0,
+    visualY: 0.0,
+    behavior: options.behavior,
+    noOp: true,
+  }
+  let port = match window.viewport {
+    Option<WindowViewport>.Some { value } => value
+    _ => {
+      return result
+    }
+  }
+  let rawX = match options.left {
+    Option<f64>.Some { value } => value
+    _ => if relative {
+      0.0
+    } else {
+      port.scrollX
+    }
+  }
+  let rawY = match options.top {
+    Option<f64>.Some { value } => value
+    _ => if relative {
+      0.0
+    } else {
+      port.scrollY
+    }
+  }
+  let requestedX = cssom_view.normalizeScroll(rawX)
+    + if relative {
+      port.scrollX
+    } else {
+      0.0
+    }
+  let requestedY = cssom_view.normalizeScroll(rawY)
+    + if relative {
+      port.scrollY
+    } else {
+      0.0
+    }
+  let x = scrollAxis(
+    requestedX,
+    port.scrollportWidth,
+    port.scrollingAreaWidth,
+    port.overflowLeftward,
+  )
+  let y = scrollAxis(
+    requestedY,
+    port.scrollportHeight,
+    port.scrollingAreaHeight,
+    port.overflowUpward,
+  )
+  result.noOp = x == port.scrollX && y == port.scrollY && !port.ongoingSmoothScroll
+  result.layoutX = x
+  result.layoutY = y
+  match window.visualViewport() {
+    Option<VisualViewport>.Some { value } => {
+      let dx = x - value.pageLeft()
+      let dy = y - value.pageTop()
+      result.visualX = f64.min(
+        port.scrollportWidth - value.width(),
+        f64.max(0.0, value.offsetLeft() + dx),
+      )
+      result.visualY = f64.min(
+        port.scrollportHeight - value.height(),
+        f64.max(0.0, value.offsetTop() + dy),
+      )
+      result.layoutX = port.scrollX + dx - (result.visualX - value.offsetLeft())
+      result.layoutY = port.scrollY + dy - (result.visualY - value.offsetTop())
+    }
+    _ => {}
+  }
+  return result
+}
+
+pub struct ViewportScrollRequest {
+  pub layout: Option<ScrollRequest>,
+  pub visual: Option<ScrollRequest>,
+}
+
+impl Copy for ViewportScrollRequest {}
+
+impl ViewportScrollRequest {
+  pub effect fn result(self: &Self, state: &ScrollState) -> ScrollResult
+    ! CssomError {
+    let mut ids: [usize; 2] = [0, 0]
+    let mut count: usize = 0
+    match self.layout {
+      Option<ScrollRequest>.Some { value } => {
+        ids[count] = value.id
+        count = count + 1
+      }
+      _ => {}
+    }
+    match self.visual {
+      Option<ScrollRequest>.Some { value } => {
+        ids[count] = value.id
+        count = count + 1
+      }
+      _ => {}
+    }
+    if count == 2 {
+      return run combinedScrollResult(state, &ids)
+    }
+    if count == 1 {
+      return run combinedScrollResult(state, &[ids[0]])
+    }
+    return ScrollResult.Completed
+  }
+}
+
+impl Window {
+  pub effect fn scroll(
+    self: &Self,
+    state: &mut ScrollState,
+    options: ScrollToOptions,
+    computedSmooth: bool,
+    honorsSmooth: bool,
+  ) -> ViewportScrollRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.requestScroll(&mut state.*, options, false, computedSmooth, honorsSmooth)
+  }
+
+  pub effect fn scrollTo(
+    self: &Self,
+    state: &mut ScrollState,
+    options: ScrollToOptions,
+    computedSmooth: bool,
+    honorsSmooth: bool,
+  ) -> ViewportScrollRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.requestScroll(&mut state.*, options, false, computedSmooth, honorsSmooth)
+  }
+
+  pub effect fn scrollBy(
+    self: &Self,
+    state: &mut ScrollState,
+    options: ScrollToOptions,
+    computedSmooth: bool,
+    honorsSmooth: bool,
+  ) -> ViewportScrollRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.requestScroll(&mut state.*, options, true, computedSmooth, honorsSmooth)
+  }
+
+  effect fn requestScroll(
+    self: &Self,
+    state: &mut ScrollState,
+    options: ScrollToOptions,
+    relative: bool,
+    computedSmooth: bool,
+    honorsSmooth: bool,
+  ) -> ViewportScrollRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let plan = planViewportScroll(&self.*, options, relative)
+    let mut request = ViewportScrollRequest {
+      layout: Option<ScrollRequest>.None,
+      visual: Option<ScrollRequest>.None,
+    }
+    if plan.noOp {
+      return request
+    }
+    let port = match self.viewport {
+      Option<WindowViewport>.Some { value } => value
+      _ => {
+        return request
+      }
+    }
+    run state.operations.reserve(2)
+    request.layout = Option<ScrollRequest>.some(
+      run state.begin(
+        ViewTarget { kind: ViewTargetKind.Document, id: self.document },
+        port.scrollX,
+        port.scrollY,
+        plan.layoutX,
+        plan.layoutY,
+        options.behavior,
+        computedSmooth,
+        honorsSmooth,
+      ),
+    )
+    match self.visualViewport() {
+      Option<VisualViewport>.Some { value } => {
+        request.visual = Option<ScrollRequest>.some(
+          run state.begin(
+            ViewTarget { kind: ViewTargetKind.VisualViewport, id: self.document },
+            value.offsetLeft(),
+            value.offsetTop(),
+            plan.visualX,
+            plan.visualY,
+            options.behavior,
+            computedSmooth,
+            honorsSmooth,
+          ),
+        )
+      }
+      _ => {}
+    }
+    return request
+  }
+}
+
+pub struct MouseDispatchCoordinates {
+  pub pageX: f64,
+  pub pageY: f64,
+  // Actual target padding coordinates with target/ancestor transforms ignored.
+  pub offsetX: f64,
+  pub offsetY: f64,
+}
+
+impl Copy for MouseDispatchCoordinates {}
+
+pub struct MouseEvent {
+  pub screenX: f64,
+  pub screenY: f64,
+  pub clientX: f64,
+  pub clientY: f64,
+  pub dispatch: Option<MouseDispatchCoordinates>,
+}
+
+impl Copy for MouseEvent {}
+
+impl MouseEvent {
+  pub fn x(self: &Self) -> f64 {
+    return self.clientX
+  }
+
+  pub fn y(self: &Self) -> f64 {
+    return self.clientY
+  }
+
+  pub fn pageX(self: &Self, windowScrollX: f64) -> f64 {
+    return match self.dispatch {
+      Option<MouseDispatchCoordinates>.Some { value } => value.pageX
+      _ => windowScrollX + self.clientX
+    }
+  }
+
+  pub fn pageY(self: &Self, windowScrollY: f64) -> f64 {
+    return match self.dispatch {
+      Option<MouseDispatchCoordinates>.Some { value } => value.pageY
+      _ => windowScrollY + self.clientY
+    }
+  }
+
+  pub fn offsetX(self: &Self, windowScrollX: f64) -> f64 {
+    return match self.dispatch {
+      Option<MouseDispatchCoordinates>.Some { value } => value.offsetX
+      _ => self.pageX(windowScrollX)
+    }
+  }
+
+  pub fn offsetY(self: &Self, windowScrollY: f64) -> f64 {
+    return match self.dispatch {
+      Option<MouseDispatchCoordinates>.Some { value } => value.offsetY
+      _ => self.pageY(windowScrollY)
+    }
+  }
+}
+
+pub effect fn runResizeSteps(previous: &Window, current: &Window, events: &mut ScrollState) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if previous.innerWidth() != current.innerWidth()
+    || previous.innerHeight() != current.innerHeight() {
+    run events.enqueue(
+      ViewTarget { kind: ViewTargetKind.Window, id: current.document },
+      ViewEventKind.Resize,
+    )
+  }
+  match current.visualViewport() {
+    Option<VisualViewport>.Some { value } => {
+      let changed = match previous.visualViewport() {
+        Option<VisualViewport>.Some { value: old } => old.width() != value.width()
+          || old.height() != value.height()
+          || old.scale() != value.scale()
+        _ => true
+      }
+      if changed {
+        run events.enqueue(
+          ViewTarget { kind: ViewTargetKind.VisualViewport, id: current.document },
+          ViewEventKind.Resize,
+        )
+      }
+    }
+    _ => {}
+  }
+}
+
+pub struct MediaQueryListener {
+  pub eventType: Bytes,
+  pub callback: usize,
+  pub capture: bool,
+  pub handler: bool,
+}
+
+pub struct MediaQueryList {
+  pub document: usize,
+  mediaText: Bytes,
+  query: TokenBuffer,
+  reportedMatches: bool,
+  registrations: List<MediaQueryListener>,
+}
+
+impl MediaQueryList {
+  pub effect fn make(
+    document: usize,
+    text: &[u8],
+    environment: &Environment,
+    limits: &Limits,
+  ) -> Self
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let parsed = run MediaList.parse(text, limits)
+    let media = run parsed.mediaText()
+    let query = run lexer.tokenize(Bytes.asSlice(&media), limits)
+    let input = Input.Contiguous { buffer: &query, range: query.all() }
+    let matches = run media_queries.matches(&input, environment, limits)
+    return Self {
+      document: document,
+      mediaText: move media,
+      query: move query,
+      reportedMatches: matches,
+      registrations: List<MediaQueryListener>.make(),
+    }
+  }
+
+  pub fn media<'a>(self: &'a Self) -> &'a [u8] {
+    return Bytes.asSlice(&self.mediaText)
+  }
+
+  // Reading matches uses current host state; it does not consume the next change event.
+  pub effect fn matches(self: &Self, environment: &Environment, limits: &Limits) -> bool
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let input = Input.Contiguous { buffer: &self.query, range: self.query.all() }
+    return run media_queries.matches(&input, environment, limits)
+  }
+
+  // Callback identities belong to the host event runtime. Legacy listeners use
+  // the same registration list as ordinary change listeners (capture=false).
+  pub effect fn addListener(self: &mut Self, callback: Option<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.addEventListener(b"change", callback, false)
+  }
+
+  pub fn removeListener(self: &mut Self, callback: Option<usize>) -> () {
+    self.removeEventListener(b"change", callback, false)
+  }
+
+  pub effect fn addEventListener(
+    self: &mut Self,
+    eventType: &[u8],
+    callback: Option<usize>,
+    capture: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = match callback {
+      Option<usize>.Some { value } => value
+      _ => {
+        return
+      }
+    }
+    let mut at: usize = 0
+    while at < self.registrations.length() {
+      let listener = &self.registrations.asSlice()[at]
+      if !listener.handler && listener.callback == id && listener.capture == capture
+        && tokens.equal(Bytes.asSlice(&listener.eventType), eventType) {
+        return
+      }
+      at = at + 1
+    }
+    run self.registrations.append(
+      MediaQueryListener {
+        eventType: run Bytes.copy(eventType),
+        callback: id,
+        capture: capture,
+        handler: false,
+      },
+    )
+  }
+
+  pub fn removeEventListener(
+    self: &mut Self,
+    eventType: &[u8],
+    callback: Option<usize>,
+    capture: bool,
+  ) -> () {
+    let id = match callback {
+      Option<usize>.Some { value } => value
+      _ => {
+        return
+      }
+    }
+    let mut at: usize = 0
+    while at < self.registrations.length() {
+      let listener = &self.registrations.asSlice()[at]
+      let matches = !listener.handler && listener.callback == id && listener.capture == capture
+        && tokens.equal(Bytes.asSlice(&listener.eventType), eventType)
+      if matches {
+        drop self.registrations.remove(at)
+        return
+      }
+      at = at + 1
+    }
+  }
+
+  pub fn onchange(self: &Self) -> Option<usize> {
+    let mut at: usize = 0
+    while at < self.registrations.length() {
+      let listener = &self.registrations.asSlice()[at]
+      if listener.handler {
+        return Option<usize>.some(listener.callback)
+      }
+      at = at + 1
+    }
+    return Option<usize>.None
+  }
+
+  pub effect fn setOnchange(self: &mut Self, callback: Option<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut at: usize = 0
+    while at < self.registrations.length() {
+      if self.registrations.asSlice()[at].handler {
+        match callback {
+          Option<usize>.Some { value } => {
+            let mut items = self.registrations.asMutSlice()
+            items[at].callback = value
+          }
+          _ => {
+            drop self.registrations.remove(at)
+          }
+        }
+        return
+      }
+      at = at + 1
+    }
+    match callback {
+      Option<usize>.Some { value } => {
+        run self.registrations.append(
+          MediaQueryListener {
+            eventType: run Bytes.copy(b"change"),
+            callback: value,
+            capture: false,
+            handler: true,
+          },
+        )
+      }
+      _ => {}
+    }
+  }
+
+  // Host dispatch walks this ordered list using event type/capture and callback
+  // identities. Replacing onchange retains its position; clearing it removes it.
+  pub fn listeners<'a>(self: &'a Self) -> &'a [MediaQueryListener] {
+    return self.registrations.asSlice()
+  }
+}
+
+pub struct MediaQueryListEvent {
+  pub target: usize,
+  pub media: Bytes,
+  pub matches: bool,
+  pub isTrusted: bool,
+}
+
+impl MediaQueryListEvent {
+  pub fn make() -> Self {
+    return Self { target: 0, media: Bytes.make(), matches: false, isTrusted: false }
+  }
+}
+
+pub struct MediaQueryLists {
+  lists: List<MediaQueryList>
+}
+
+impl MediaQueryLists {
+  pub fn make() -> Self {
+    return Self { lists: List<MediaQueryList>.make() }
+  }
+
+  pub effect fn matchMedia(
+    self: &mut Self,
+    document: usize,
+    text: &[u8],
+    environment: &Environment,
+    limits: &Limits,
+  ) -> usize
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let list = run MediaQueryList.make(document, text, environment, limits)
+    let id = self.lists.length()
+    run self.lists.append(move list)
+    return id
+  }
+
+  pub fn get<'a>(self: &'a Self, id: usize) -> Option<&'a MediaQueryList> {
+    if id >= self.lists.length() {
+      return Option<&'a MediaQueryList>.None
+    }
+    return Option<&'a MediaQueryList>.some(&self.lists.asSlice()[id])
+  }
+
+  pub fn getMut<'a>(self: &'a mut Self, id: usize) -> Option<&'a mut MediaQueryList> {
+    if id >= self.lists.length() {
+      return Option<&'a mut MediaQueryList>.None
+    }
+    return Option<&'a mut MediaQueryList>.some(&mut self.lists.asMutSlice()[id])
+  }
+
+  // Build the entire report before changing the baseline so allocation failure
+  // cannot swallow notifications. Creation order is list order, not listener order.
+  pub effect fn reportChanges(
+    self: &mut Self,
+    document: usize,
+    environment: &Environment,
+    limits: &Limits,
+  ) -> List<MediaQueryListEvent>
+    ! CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut events = List<MediaQueryListEvent>.make()
+    let mut at: usize = 0
+    while at < self.lists.length() {
+      let list = &self.lists.asSlice()[at]
+      if list.document == document {
+        let matches = run list.matches(environment, limits)
+        if matches != list.reportedMatches {
+          run events.append(
+            MediaQueryListEvent {
+              target: at,
+              media: run Bytes.copy(list.media()),
+              matches: matches,
+              isTrusted: true,
+            },
+          )
+        }
+      }
+      at = at + 1
+    }
+    at = 0
+    while at < events.length() {
+      let event = &events.asSlice()[at]
+      let mut items = self.lists.asMutSlice()
+      items[event.target].reportedMatches = event.matches
+      at = at + 1
+    }
+    return move events
+  }
+}
+
+pub struct BrowsingContextPolicy {
+  pub scriptCreatedAuxiliary: bool,
+  pub pictureInPicture: bool,
+  pub transientActivation: bool,
+  pub allowMove: bool,
+  pub allowResize: bool,
+}
+
+impl Copy for BrowsingContextPolicy {}
+
+pub enum WindowRequestKind {
+  MoveTo,
+  MoveBy,
+  ResizeTo,
+  ResizeBy,
+  OpenFeatures
+}
+
+pub enum WindowRequestResult {
+  Pending,
+  Applied,
+  Ignored,
+  Failed
+}
+
+pub struct WindowFeatures {
+  pub left: Option<f64>,
+  pub top: Option<f64>,
+  pub width: Option<f64>,
+  pub height: Option<f64>,
+}
+
+impl Copy for WindowFeatures {}
+
+impl WindowFeatures {
+  pub fn make() -> Self {
+    return Self {
+      left: Option<f64>.None,
+      top: Option<f64>.None,
+      width: Option<f64>.None,
+      height: Option<f64>.None,
+    }
+  }
+}
+
+pub struct WindowFeature<'a> {
+  pub name: &'a [u8],
+  pub value: &'a [u8]
+}
+
+// HTML integer parsing used by CSSOM View's already-tokenized open features.
+// Leading ASCII whitespace and one sign are accepted; trailing text is ignored.
+pub fn parseFeatureInteger(text: &[u8]) -> f64 {
+  let mut at: usize = 0
+  while at < text.length
+    && (text[at] == 9 || text[at] == 10 || text[at] == 12 || text[at] == 13 || text[at] == 32) {
+    at = at + 1
+  }
+  let mut negative = false
+  if at < text.length && (text[at] == 43 || text[at] == 45) {
+    negative = text[at] == 45
+    at = at + 1
+  }
+  let mut value = 0.0
+  while at < text.length && text[at] >= 48 && text[at] <= 57 {
+    value = value * 10.0 + u8.toF64(text[at] - 48)
+    at = at + 1
+  }
+  return if negative {
+    -value
+  } else {
+    value
+  }
+}
+
+pub fn parseWindowFeatures<'a>(features: &[WindowFeature<'a>]) -> WindowFeatures {
+  let mut result = WindowFeatures.make()
+  let mut at: usize = 0
+  while at < features.length {
+    let feature = &features[at]
+    let value = parseFeatureInteger(feature.value)
+    if tokens.equal(feature.name, b"left") {
+      result.left = Option<f64>.some(value)
+    }
+    if tokens.equal(feature.name, b"top") {
+      result.top = Option<f64>.some(value)
+    }
+    if tokens.equal(feature.name, b"width") {
+      result.width = if value == 0.0 {
+        Option<f64>.None
+      } else {
+        Option<f64>.some(value)
+      }
+    }
+    if tokens.equal(feature.name, b"height") {
+      result.height = if value == 0.0 {
+        Option<f64>.None
+      } else {
+        Option<f64>.some(value)
+      }
+    }
+    at = at + 1
+  }
+  return result
+}
+
+pub struct WindowRequest {
+  pub id: usize,
+  pub context: usize,
+  pub kind: WindowRequestKind,
+  pub features: WindowFeatures,
+  pub result: WindowRequestResult,
+  pub actual: Option<WindowDisplay>,
+}
+
+impl Copy for WindowRequest {}
+
+pub struct WindowRequests {
+  requests: List<WindowRequest>,
+  nextId: usize
+}
+
+impl WindowRequests {
+  pub fn make() -> Self {
+    return Self { requests: List<WindowRequest>.make(), nextId: 0 }
+  }
+
+  fn index(self: &Self, id: usize) -> usize {
+    let mut at: usize = 0
+    while at < self.requests.length() {
+      if self.requests.asSlice()[at].id == id {
+        return at
+      }
+      at = at + 1
+    }
+    return at
+  }
+
+  pub fn get(self: &Self, id: usize) -> Option<WindowRequest> {
+    let at = self.index(id)
+    if at == self.requests.length() {
+      return Option<WindowRequest>.None
+    }
+    return Option<WindowRequest>.some(self.requests.asSlice()[at])
+  }
+
+  effect fn append(
+    self: &mut Self,
+    context: usize,
+    kind: WindowRequestKind,
+    features: WindowFeatures,
+    ignored: bool,
+  ) -> WindowRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let request = WindowRequest {
+      id: self.nextId,
+      context: context,
+      kind: kind,
+      features: features,
+      result: if ignored {
+        WindowRequestResult.Ignored
+      } else {
+        WindowRequestResult.Pending
+      },
+      actual: Option<WindowDisplay>.None,
+    }
+    run self.requests.append(request)
+    self.nextId = self.nextId + 1
+    return request
+  }
+
+  pub effect fn moveTo(
+    self: &mut Self,
+    context: usize,
+    policy: &BrowsingContextPolicy,
+    x: i32,
+    y: i32,
+  ) -> WindowRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.moveWindow(context, policy, x, y, false)
+  }
+
+  pub effect fn moveBy(
+    self: &mut Self,
+    context: usize,
+    policy: &BrowsingContextPolicy,
+    x: i32,
+    y: i32,
+  ) -> WindowRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.moveWindow(context, policy, x, y, true)
+  }
+
+  effect fn moveWindow(
+    self: &mut Self,
+    context: usize,
+    policy: &BrowsingContextPolicy,
+    x: i32,
+    y: i32,
+    relative: bool,
+  ) -> WindowRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut features = WindowFeatures.make()
+    features.left = Option<f64>.some(i32.toF64(x))
+    features.top = Option<f64>.some(i32.toF64(y))
+    return run self.append(
+      context,
+      if relative {
+        WindowRequestKind.MoveBy
+      } else {
+        WindowRequestKind.MoveTo
+      },
+      features,
+      !policy.allowMove || !policy.scriptCreatedAuxiliary || policy.pictureInPicture,
+    )
+  }
+
+  pub effect fn resizeTo(
+    self: &mut Self,
+    context: usize,
+    policy: &mut BrowsingContextPolicy,
+    width: i32,
+    height: i32,
+  ) -> WindowRequest
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.resizeWindow(context, &mut policy.*, width, height, false)
+  }
+
+  pub effect fn resizeBy(
+    self: &mut Self,
+    context: usize,
+    policy: &mut BrowsingContextPolicy,
+    x: i32,
+    y: i32,
+  ) -> WindowRequest
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.resizeWindow(context, &mut policy.*, x, y, true)
+  }
+
+  effect fn resizeWindow(
+    self: &mut Self,
+    context: usize,
+    policy: &mut BrowsingContextPolicy,
+    width: i32,
+    height: i32,
+    relative: bool,
+  ) -> WindowRequest
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let ignored = !policy.allowResize || !policy.scriptCreatedAuxiliary
+    if !ignored && policy.pictureInPicture && !policy.transientActivation {
+      fail CssomError.NotAllowedError
+    }
+    let mut features = WindowFeatures.make()
+    features.width = Option<f64>.some(i32.toF64(width))
+    features.height = Option<f64>.some(i32.toF64(height))
+    let request = run self.append(
+      context,
+      if relative {
+        WindowRequestKind.ResizeBy
+      } else {
+        WindowRequestKind.ResizeTo
+      },
+      features,
+      ignored,
+    )
+    if !ignored && policy.pictureInPicture {
+      policy.transientActivation = false
+    }
+    return request
+  }
+
+  // The HTML host creates/selects the browsing context and tokenizes features.
+  // This request implements CSSOM View's positioning/sizing stage, not HTML navigation.
+  pub effect fn setUpBrowsingContextFeatures<'a>(
+    self: &mut Self,
+    context: usize,
+    features: &[WindowFeature<'a>],
+  ) -> WindowRequest
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.append(
+      context,
+      WindowRequestKind.OpenFeatures,
+      parseWindowFeatures(features),
+      false,
+    )
+  }
+
+  // Only the platform can decide optional clamping/ignoring and provide actual geometry.
+  pub effect fn complete(
+    self: &mut Self,
+    id: usize,
+    result: WindowRequestResult,
+    actual: Option<WindowDisplay>,
+  ) -> ()
+    ! CssomError {
+    let at = self.index(id)
+    if at == self.requests.length() {
+      fail CssomError.NotFoundError
+    }
+    if self.requests.asSlice()[at].result != WindowRequestResult.Pending
+      || result == WindowRequestResult.Pending {
+      fail CssomError.InvalidStateError
+    }
+    if result == WindowRequestResult.Applied {
+      match actual {
+        Option<WindowDisplay>.Some { value } => {}
+        _ => {
+          fail CssomError.InvalidStateError
+        }
+      }
+    }
+    let mut entry = &mut self.requests.asMutSlice()[at]
+    entry.result = result
+    entry.actual = actual
+  }
+
+  pub effect fn release(self: &mut Self, id: usize) -> ()
+    ! CssomError {
+    let at = self.index(id)
+    if at == self.requests.length() {
+      fail CssomError.NotFoundError
+    }
+    if self.requests.asSlice()[at].result == WindowRequestResult.Pending {
+      fail CssomError.InvalidStateError
+    }
+    drop self.requests.remove(at)
+  }
+}

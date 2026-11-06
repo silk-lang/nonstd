@@ -1,0 +1,310 @@
+//! Normative fixtures: CSSOM §2.1/§5.2/§6.7.2 and CSS Syntax §9/§9.1.
+import cssom_serialization as serialization
+import lexer
+import tokens { TokenBuffer, TokenRange, Kind, Span, Buffers, Limits, CssError, equal }
+import selectors { NamespaceBinding }
+import input { Input, TokenRef }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+// https://drafts.csswg.org/cssom/#serialize-an-identifier
+// https://drafts.csswg.org/cssom/#the-css.escape()-method
+test effect fn identifierAndEscape() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let control = run serialization.identifier(&[0, 1, 31, 127])
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(control.asSlice(), b"\xef\xbf\xbd\\1 \\1f \\7f "),
+    "null replacement and minimal lowercase code point escapes",
+  )
+  let leading = run serialization.escape(b"0a") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(equal(leading.asSlice(), b"\\30 a"), "leading digit escapes with a terminator")
+  let negative = run serialization.identifier(b"-9") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(equal(negative.asSlice(), b"-\\39 "), "second digit after hyphen escapes")
+  let hyphen = run serialization.identifier(b"-") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(equal(hyphen.asSlice(), b"\\-"), "single hyphen escapes")
+  let ordinary = run serialization.identifier(b"--A_9\xc3\xa9\xf0\x9f\x98\x80 .#\\")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(ordinary.asSlice(), b"--A_9\xc3\xa9\xf0\x9f\x98\x80\\ \\.\\#\\\\"),
+    "Unicode and identifier case survive while punctuation escapes",
+  )
+  let excluded = run serialization.identifier(b"\xc2\x85\xc2\xa0\xe2\x80\xae")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(excluded.asSlice(), b"\\\xc2\x85\\\xc2\xa0\\\xe2\x80\xae"),
+    "non-identifier Unicode scalars are escaped as whole characters",
+  )
+  let empty = run serialization.escape(b"") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(empty.length() == 0, "empty identifier stays empty")
+}
+
+test effect fn stringsAndUrls() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let text = run serialization.string(&[0, 10, 13, 34, 39, 92, 127])
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(text.asSlice(), b"\"\xef\xbf\xbd\\a \\d \\\"'\\\\\\7f \""),
+    "strings quote double quotes, backslashes and controls but not apostrophes",
+  )
+  let link = run serialization.url(b"a b\"c") |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(equal(link.asSlice(), b"url(\"a b\\\"c\")"), "CSSOM URL uses a quoted string")
+}
+
+effect fn componentCase(source: &[u8], expected: &[u8]) -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run lexer.tokenize(source, &Limits.make())
+  let text = run serialization.components(&buffer, buffer.all())
+  run Testing.expect(equal(text.asSlice(), expected), "component canonical spelling")
+}
+
+test effect fn componentSeparatorsAndNumericFlags() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run componentCase(
+    b"foo/**/bar 1/**/px 1/**/% @/**/foo #/**/x -/**/- ./**/2 +/**/3 //**/*",
+    b"foo/**/bar 1/**/px 1/**/% @/**/foo #/**/x -/**/- ./**/2 +/**/3 //**/*",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run componentCase(
+    b"+001 01.00 1e2 -0.0 01.0PX 1\\65 3 1\\65 -3",
+    b"1 1.0 100.0 0.0 1.0PX 1\\65 3 1\\65 -3",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run componentCase(
+    b"#123 #\\31 ab FOO( A , 'b' ) url(a\\ b) url(\"a b\")",
+    b"#123 #\\31 ab FOO( A , \"b\" ) url(a\\20 b) url(\"a b\")",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run componentCase(b"\t a\n\n b\t", b" a b ") |> Effect.provideMut<Allocator>(&mut allocator)
+  run componentCase(b"<!/**/--", b"<!/**/--") |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn sameToken(a: &TokenBuffer, ai: usize, b: &TokenBuffer, bi: usize) -> bool {
+  let left = &a.tokens.asSlice()[ai].kind
+  let right = &b.tokens.asSlice()[bi].kind
+  return match &left.* {
+    Kind.Ident { text: x } => match &right.* {
+      Kind.Ident { text: y } => equal(a.text(x), b.text(y))
+      _ => false
+    }
+    Kind.Function { name: x } => match &right.* {
+      Kind.Function { name: y } => equal(a.text(x), b.text(y))
+      _ => false
+    }
+    Kind.Hash { text: x, identifier: xi } => match &right.* {
+      Kind.Hash { text: y, identifier: yi } => xi == yi && equal(a.text(x), b.text(y))
+      _ => false
+    }
+    Kind.Number { value: x, integer: xi } => match &right.* {
+      Kind.Number { value: y, integer: yi } => x == y && xi == yi
+      _ => false
+    }
+    Kind.Dimension { value: x, integer: xi, unit: xu } => match &right.* {
+      Kind.Dimension { value: y, integer: yi, unit: yu } => x == y && xi == yi
+        && equal(a.text(xu), b.text(yu))
+      _ => false
+    }
+    Kind.Url { text: x } => match &right.* {
+      Kind.Url { text: y } => equal(a.text(x), b.text(y))
+      _ => false
+    }
+    Kind.String { text: x } => match &right.* {
+      Kind.String { text: y } => equal(a.text(x), b.text(y))
+      _ => false
+    }
+    Kind.Whitespace => match &right.* {
+      Kind.Whitespace => true
+      _ => false
+    }
+    Kind.CloseParen => match &right.* {
+      Kind.CloseParen => true
+      _ => false
+    }
+    Kind.BadUrl => match &right.* {
+      Kind.BadUrl => true
+      _ => false
+    }
+    Kind.BadString => match &right.* {
+      Kind.BadString => true
+      _ => false
+    }
+    Kind.Delim { scalar: x } => match &right.* {
+      Kind.Delim { scalar: y } => x == y
+      _ => false
+    }
+    Kind.Eof => match &right.* {
+      Kind.Eof => true
+      _ => false
+    }
+    _ => false
+  }
+}
+
+test effect fn componentsRoundTripTokenKinds() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let limits = Limits.make()
+  let before = run lexer.tokenize(
+    b"foo/**/bar #123 #\\31 ab 01.0 1\\65 3 url(a\\ b) url(\"x\") FOO(1) url(a b) 'bad\n \\\n x",
+    &limits,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let serialized = run serialization.components(&before, before.all())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let after = run lexer.tokenize(serialized.asSlice(), &limits)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    before.tokens.length() == after.tokens.length(),
+    "roundtrip retains token count",
+  )
+  let mut at: usize = 0
+  while at < before.tokens.length() {
+    run Testing.expect(
+      sameToken(&before, at, &after, at),
+      "roundtrip retains decoded token value and type flags",
+    )
+    at = at + 1
+  }
+}
+
+test effect fn canonicalNumbers() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let a = run serialization.number(1.2300001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let b = run serialization.number(-0.0000001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run serialization.number(100000000000000000000.0)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let d = run serialization.number(0.000001) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(a.asSlice(), b"1.23") && equal(b.asSlice(), b"0"),
+    "maximum six decimals with trailing zero and negative-zero removal",
+  )
+  run Testing.expect(
+    equal(c.asSlice(), b"100000000000000000000") && equal(d.asSlice(), b"0.000001"),
+    "no scientific notation",
+  )
+}
+
+effect fn selectorCase(source: &[u8], expected: &[u8]) -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run lexer.tokenize(source, &Limits.make())
+  let text = run serialization.selectorText(&buffer, buffer.all())
+  run Testing.expect(equal(text.asSlice(), expected), "CSSOM selector canonical spelling")
+}
+
+test effect fn selectorsAttributesNamespacesAndPseudos() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selectorCase(
+    b"  *.X>svg|A [ |href = foo I ],*|*.Y:BEFORE ",
+    b".X > svg|A [href=\"foo\" i], .Y::before",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run selectorCase(
+    b"[ns|a ~= 'x'][*|b^=Y s]:LANG(en, 'fr'):DIR(RTL)",
+    b"[ns|a~=\"x\"][*|b^=\"Y\" s]:lang(\"en\", \"fr\"):dir(rtl)",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run selectorCase(
+    b":IS(A>B,*.C):not([x=y]):HAS(>A,+B)::SLOTTED( *.Z )",
+    b":is(A > B, .C):not([x=\"y\"]):has(> A, + B)::slotted(.Z)",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run selectorCase(b"#\\31 a.\\+a", b"#\\31 a.\\+a") |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn selectorsAnPlusB() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selectorCase(
+    b":nth-child(ODD of *.A,B>C):nth-last-child(even):nth-of-type(+n - 2):nth-last-of-type(-n+3)",
+    b":nth-child(2n+1 of .A, B > C):nth-last-child(2n):nth-of-type(n-2):nth-last-of-type(-n+3)",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run selectorCase(
+    b":nth-child(0n + 3):nth-child(1n+0):nth-child(2n- 4):nth-child(+004)",
+    b":nth-child(3):nth-child(n):nth-child(2n-4):nth-child(4)",
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn selectorsNamespaceEnvironment() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let buffer = run lexer.tokenize(b"ns|*.X, ns|E, [ns|a=v]", &Limits.make())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let ns = Span { start: 0, end: 2 }
+  let empty = Span { start: 0, end: 0 }
+  let bindings = [
+    NamespaceBinding { prefix: ns, uri: ns },
+    NamespaceBinding { prefix: empty, uri: ns },
+  ]
+  let text = run serialization.selectorTextWithNamespaces(&buffer, buffer.all(), &bindings)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(text.asSlice(), b".X, E, [ns|a=\"v\"]"),
+    "default namespace omission does not apply to attributes",
+  )
+  let nullBindings = [NamespaceBinding { prefix: ns, uri: empty }]
+  let nullText = run serialization.selectorTextWithNamespaces(&buffer, buffer.all(), &nullBindings)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(nullText.asSlice(), b"|*.X, |E, [a=\"v\"]"),
+    "null namespace preserves type constraint but removes attribute prefix",
+  )
+}
+
+test effect fn expandedComponentsSeparateAcrossBuffers() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut buffers = Buffers.make()
+  let a = run lexer.tokenize(b"12", &Limits.make()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let b = run lexer.tokenize(b"px", &Limits.make()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run buffers.append(move a) |> Effect.provideMut<Allocator>(&mut allocator)
+  run buffers.append(move b) |> Effect.provideMut<Allocator>(&mut allocator)
+  let references = [TokenRef { buffer: 0, token: 0 }, TokenRef { buffer: 1, token: 0 }]
+  let input = Input.Expanded { buffers: buffers.view(), references: &references }
+  let text = run serialization.componentsInput(&input)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    equal(text.asSlice(), b"12/**/px"),
+    "expanded references serialize without merging into a dimension",
+  )
+}
+
+test effect fn lexerExcludedUnicodeAndEscapes() -> ()
+  ! AssertionError<'static> | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let raw = run lexer.tokenize(b"\xc2\xa0\xe2\x80\xae", &Limits.make())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &raw.tokens.asSlice()[0].kind {
+      Kind.Delim { scalar } => scalar == 160
+      _ => false
+    },
+    "NBSP is not a raw identifier code point",
+  )
+  run Testing.expect(
+    match &raw.tokens.asSlice()[1].kind {
+      Kind.Delim { scalar } => scalar == 8238
+      _ => false
+    },
+    "direction override is not a raw identifier code point",
+  )
+  let escaped = run lexer.tokenize(b"\\a0 \\202e ", &Limits.make())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    match &escaped.tokens.asSlice()[0].kind {
+      Kind.Ident { text } => equal(escaped.text(text), b"\xc2\xa0\xe2\x80\xae")
+      _ => false
+    },
+    "excluded scalars remain legal when escaped",
+  )
+}

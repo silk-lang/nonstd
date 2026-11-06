@@ -1,0 +1,350 @@
+//! CSSOM View GeometryUtils over borrowed native layout facts, in CSS pixels.
+//! Node and document identities are host-owned; no secondary layout tree is retained.
+import cssom_error { CssomError }
+import cssom_geometry { DOMPoint, DOMRect, DOMQuad, DOMMatrix }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+pub const NO_GEOMETRY_NODE: usize = usize.MAX
+
+pub enum GeometryNodeKind {
+  Document,
+  Element,
+  Text,
+  PseudoElement
+}
+
+pub enum CSSBoxType {
+  Margin,
+  Border,
+  Padding,
+  Content
+}
+
+pub struct BoxQuadOptions {
+  pub box: CSSBoxType,
+  pub relativeTo: usize,
+}
+
+impl Copy for BoxQuadOptions {}
+
+impl BoxQuadOptions {
+  pub fn make() -> Self {
+    return Self { box: CSSBoxType.Border, relativeTo: NO_GEOMETRY_NODE }
+  }
+}
+
+pub struct ConvertCoordinateOptions {
+  pub fromBox: CSSBoxType,
+  pub toBox: CSSBoxType,
+}
+
+impl Copy for ConvertCoordinateOptions {}
+
+impl ConvertCoordinateOptions {
+  pub fn make() -> Self {
+    return Self { fromBox: CSSBoxType.Border, toBox: CSSBoxType.Border }
+  }
+}
+
+/// One actual coordinate-hierarchy edge, including used transform-origin in transform.
+/// Translation(offset - scroll) is applied after transform. Scroll is the displacement
+/// that affects this node, not necessarily the parent's raw scroll position (fixed and
+/// sticky positioning follow their used containing-block rules). Terminal documents have an
+/// identity step; embedded documents may link to their actual embedding coordinate node.
+pub struct GeometryStep {
+  pub parent: usize,
+  pub transform: DOMMatrix,
+  pub offsetX: f64,
+  pub offsetY: f64,
+  pub scrollX: f64,
+  pub scrollY: f64,
+}
+
+impl Copy for GeometryStep {}
+
+impl GeometryStep {
+  pub fn identity(parent: usize) -> Self {
+    return Self {
+      parent: parent,
+      transform: DOMMatrix.identity(),
+      offsetX: 0.0,
+      offsetY: 0.0,
+      scrollX: 0.0,
+      scrollY: 0.0,
+    }
+  }
+}
+
+/// Element/pseudo rectangles use this fragment's border origin; offset places that
+/// origin in the node's local border coordinate space. Text border is instead the
+/// Range client rectangle in its document viewport; the other text fields are ignored.
+pub struct GeometryFragment {
+  pub border: DOMRect,
+  pub margin: DOMRect,
+  pub padding: DOMRect,
+  pub content: DOMRect,
+  pub offsetX: f64,
+  pub offsetY: f64,
+}
+
+impl Copy for GeometryFragment {}
+
+impl GeometryFragment {
+  pub fn rect(self: &Self, box: CSSBoxType) -> DOMRect {
+    return match box {
+      CSSBoxType.Margin => self.margin
+      CSSBoxType.Border => self.border
+      CSSBoxType.Padding => self.padding
+      CSSBoxType.Content => self.content
+    }
+  }
+}
+
+/// All methods borrow a stable layout snapshot. Links are acyclic, identities are
+/// valid, and document(node) returns the associated document (including pseudo owners).
+/// Fragment enumeration is flat-tree order, or Range content order for Text. Pseudo
+/// nodes expose their own generated fragments, never their originating element's boxes.
+/// Zero fragments means no box; viewport is the real layout viewport excluding scrollbars.
+/// sameOrigin compares origins, including opaque identity, not origin-domain relaxation.
+pub interface GeometryHost {
+  fn kind(self: &Self, node: usize) -> GeometryNodeKind
+
+  fn document(self: &Self, node: usize) -> usize
+
+  fn containerDocument(self: &Self, document: usize) -> usize
+
+  fn sameOrigin(self: &Self, first: usize, second: usize) -> bool
+
+  fn step(self: &Self, node: usize) -> GeometryStep
+
+  fn fragmentCount(self: &Self, node: usize) -> usize
+
+  fn fragment(self: &Self, node: usize, index: usize) -> GeometryFragment
+
+  fn viewport(self: &Self, document: usize) -> DOMRect
+}
+
+fn documentDepth<H: GeometryHost>(host: &H, document: usize) -> usize {
+  let mut current = document
+  let mut depth: usize = 0
+  while current != NO_GEOMETRY_NODE {
+    depth = depth + 1
+    current = GeometryHost.containerDocument(host, current)
+  }
+  return depth
+}
+
+/// Shortest prefixes through the nearest common container document, without allocating
+/// ancestor lists. Unrelated trees compare only the two associated documents.
+pub effect fn checkDocuments<H: GeometryHost>(host: &H, node: usize, from: usize) -> ()
+  ! CssomError {
+  let document = GeometryHost.document(host, node)
+  let source = GeometryHost.document(host, from)
+  let mut left = document
+  let mut right = source
+  let mut leftDepth = documentDepth(host, left)
+  let mut rightDepth = documentDepth(host, right)
+  while leftDepth > rightDepth {
+    left = GeometryHost.containerDocument(host, left)
+    leftDepth = leftDepth - 1
+  }
+  while rightDepth > leftDepth {
+    right = GeometryHost.containerDocument(host, right)
+    rightDepth = rightDepth - 1
+  }
+  while left != right {
+    left = GeometryHost.containerDocument(host, left)
+    right = GeometryHost.containerDocument(host, right)
+  }
+  if left == NO_GEOMETRY_NODE {
+    if !GeometryHost.sameOrigin(host, document, source) {
+      fail CssomError.SecurityError
+    }
+    return
+  }
+  let common = left
+  let mut current = document
+  while current != NO_GEOMETRY_NODE {
+    if !GeometryHost.sameOrigin(host, document, current) {
+      fail CssomError.SecurityError
+    }
+    if current == common {
+      break
+    }
+    current = GeometryHost.containerDocument(host, current)
+  }
+  current = source
+  while current != NO_GEOMETRY_NODE {
+    if !GeometryHost.sameOrigin(host, document, current) {
+      fail CssomError.SecurityError
+    }
+    if current == common {
+      break
+    }
+    current = GeometryHost.containerDocument(host, current)
+  }
+}
+
+pub fn completeTransform<H: GeometryHost>(host: &H, node: usize, ancestor: usize) -> DOMMatrix {
+  let mut current = node
+  let mut result = DOMMatrix.identity()
+  while current != NO_GEOMETRY_NODE && current != ancestor {
+    let step = GeometryHost.step(host, current)
+    result = step.transform.multiply(result)
+    result = DOMMatrix.identity().translate(
+      step.offsetX - step.scrollX,
+      step.offsetY - step.scrollY,
+      0.0,
+    ).multiply(result)
+    current = step.parent
+  }
+  return result
+}
+
+fn boxOrigin<H: GeometryHost>(host: &H, node: usize, box: CSSBoxType) -> DOMPoint {
+  let kind = GeometryHost.kind(host, node)
+  if kind == GeometryNodeKind.Document || kind == GeometryNodeKind.Text || box == CSSBoxType.Border
+    || GeometryHost.fragmentCount(host, node) == 0 {
+    return DOMPoint { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+  }
+  let fragment = GeometryHost.fragment(host, node, 0)
+  let rect = fragment.rect(box)
+  return DOMPoint { x: rect.x - fragment.border.x, y: rect.y - fragment.border.y, z: 0.0, w: 1.0 }
+}
+
+struct Conversion {
+  matrix: DOMMatrix,
+  fromOrigin: DOMPoint,
+  toOrigin: DOMPoint,
+}
+
+impl Conversion {
+  fn point(self: &Self, point: DOMPoint) -> DOMPoint {
+    let transformed = self.matrix.transformPoint(
+      DOMPoint { x: point.x + self.fromOrigin.x, y: point.y + self.fromOrigin.y, z: 0.0, w: 1.0 },
+    )
+    return DOMPoint {
+      x: transformed.x / transformed.w - self.toOrigin.x,
+      y: transformed.y / transformed.w - self.toOrigin.y,
+      z: 0.0,
+      w: 1.0,
+    }
+  }
+
+  fn quad(self: &Self, quad: DOMQuad) -> DOMQuad {
+    return DOMQuad {
+      p1: self.point(quad.p1),
+      p2: self.point(quad.p2),
+      p3: self.point(quad.p3),
+      p4: self.point(quad.p4),
+    }
+  }
+}
+
+effect fn conversion<H: GeometryHost>(
+  host: &H,
+  node: usize,
+  from: usize,
+  options: ConvertCoordinateOptions,
+) -> Conversion
+  ! CssomError {
+  run checkDocuments(host, node, from)
+  let target = completeTransform(host, node, NO_GEOMETRY_NODE)
+  let source = completeTransform(host, from, NO_GEOMETRY_NODE)
+  return Conversion {
+    matrix: target.inverse().multiply(source),
+    fromOrigin: boxOrigin(host, from, options.fromBox),
+    toOrigin: boxOrigin(host, node, options.toBox),
+  }
+}
+
+/// z/w input members are ignored; output is projected to z=0, w=1. Singular target
+/// transforms propagate DOMMatrix inverse NaNs, the specification's undefined case.
+pub effect fn convertPointFromNode<H: GeometryHost>(
+  host: &H,
+  node: usize,
+  point: DOMPoint,
+  from: usize,
+  options: ConvertCoordinateOptions,
+) -> DOMPoint
+  ! CssomError {
+  let operation = run conversion(host, node, from, options)
+  return operation.point(point)
+}
+
+pub effect fn convertQuadFromNode<H: GeometryHost>(
+  host: &H,
+  node: usize,
+  quad: DOMQuad,
+  from: usize,
+  options: ConvertCoordinateOptions,
+) -> DOMQuad
+  ! CssomError {
+  let operation = run conversion(host, node, from, options)
+  return operation.quad(quad)
+}
+
+pub effect fn convertRectFromNode<H: GeometryHost>(
+  host: &H,
+  node: usize,
+  rect: DOMRect,
+  from: usize,
+  options: ConvertCoordinateOptions,
+) -> DOMQuad
+  ! CssomError {
+  return run convertQuadFromNode(host, node, DOMQuad.fromRect(rect), from, options)
+}
+
+pub effect fn getBoxQuads<H: GeometryHost>(host: &H, node: usize, options: BoxQuadOptions) -> List<
+  DOMQuad
+>
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let document = GeometryHost.document(host, node)
+  let relative = if options.relativeTo == NO_GEOMETRY_NODE {
+    document
+  } else {
+    options.relativeTo
+  }
+  let kind = GeometryHost.kind(host, node)
+  let mut result = List<DOMQuad>.make()
+  if kind == GeometryNodeKind.Document {
+    let viewport = GeometryHost.viewport(host, document)
+    let rect = DOMRect.make(0.0, 0.0, viewport.width, viewport.height)
+    run result.append(
+      run convertRectFromNode(host, relative, rect, document, ConvertCoordinateOptions.make()),
+    )
+    return move result
+  }
+  let count = GeometryHost.fragmentCount(host, node)
+
+  // No conversion occurs for boxless nodes, even with a cross-origin relativeTo.
+  if count == 0 {
+    return move result
+  }
+  let from = if kind == GeometryNodeKind.Text {
+    document
+  } else {
+    node
+  }
+  let operation = run conversion(host, relative, from, ConvertCoordinateOptions.make())
+  let mut index: usize = 0
+  while index < count {
+    let fragment = GeometryHost.fragment(host, node, index)
+    let mut rect = if kind == GeometryNodeKind.Text {
+      fragment.border
+    } else {
+      fragment.rect(options.box)
+    }
+    if kind != GeometryNodeKind.Text {
+      rect.x = rect.x + fragment.offsetX
+      rect.y = rect.y + fragment.offsetY
+    }
+    run result.append(operation.quad(DOMQuad.fromRect(rect)))
+    index = index + 1
+  }
+  return move result
+}

@@ -6,6 +6,10 @@ import virtual_list as virtual
 import anchoring
 import anchoring { Anchored }
 import inspect
+import cssom_view
+import cssom_view { ScrollAnimation }
+import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
+import svg_css.cssom_error { CssomError }
 import mutation {
   Mutation,
   NodeKind,
@@ -101,6 +105,8 @@ pub union TreeError {
   Layout,
   /// Virtual list configuration or bindings are invalid.
   BadVirtualList { pub index: usize, pub id: u32 },
+  /// A CSSOM View scroll scheduler operation failed.
+  View { pub error: CssomError },
 }
 
 impl Copy for TreeError {}
@@ -119,6 +125,10 @@ effect fn layoutFailed<E>(error: E) -> never
   ! TreeError {
   drop error
   fail TreeError.Layout
+}
+
+effect fn viewFailed(error: CssomError) -> never ! TreeError {
+  fail TreeError.View { error: error }
 }
 
 fn defaultDisplay(kind: NodeKind) -> Display {
@@ -252,6 +262,9 @@ pub struct UiTree<'a> {
   pub pointerInside: bool,
   /// Nodes to scroll into view at the next frame, as (slot, id) pairs.
   pub reveal: List<u64>,
+  /// CSSOM scroll completion/events and the animations driven by the real frame clock.
+  pub viewScrollState: ScrollState,
+  pub viewScrollAnimations: List<ScrollAnimation>,
   /// Whether a mutation was applied since the last frame.
   applied: bool,
   pub layoutObserversDirty: bool,
@@ -340,6 +353,8 @@ impl<'a> UiTree<'a> {
       pointerY: 0.0,
       pointerInside: false,
       reveal: List<u64>.make(),
+      viewScrollState: ScrollState.make(),
+      viewScrollAnimations: List<ScrollAnimation>.make(),
       applied: false,
       layoutObserversDirty: false,
       paintDirty: false,
@@ -641,10 +656,13 @@ impl<'a> UiTree<'a> {
       }
       Mutation.ScrollTo { id, x, y } => {
         let slot = run self.require(index, id)
+        self.viewScrollState.interruptTarget(ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) })
         run interact.scrollTo(&mut self, slot, x, y)
       }
       Mutation.ScrollIntoView { id } => {
         let slot = run self.require(index, id)
+        self.viewScrollState.interruptAll()
+        self.viewScrollAnimations.clear()
         run self.reveal.append(interact.pair(slot, id))
       }
       Mutation.SetGrid { id, value } => {
@@ -1083,6 +1101,16 @@ impl<'a> UiTree<'a> {
   pub effect fn dispatch(self: &mut Self, input: Input) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let interruptsScroll = match &input {
+      Input.Wheel { x, y, deltaX, deltaY, modifiers } => true
+      Input.PointerDown { x, y, button, modifiers, clickCount } => true
+      Input.KeyDown { key, code, modifiers, repeat } => true
+      _ => false
+    }
+    if interruptsScroll {
+      self.viewScrollState.interruptAll()
+      self.viewScrollAnimations.clear()
+    }
     run interact.dispatch(&mut self, move input)
   }
 
@@ -1112,6 +1140,7 @@ impl<'a> UiTree<'a> {
     if slot == NONE {
       return ()
     }
+    self.viewScrollState.interruptTarget(ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) })
     run interact.scrolledElsewhere(&mut self, slot, x, y)
   }
 
@@ -1346,6 +1375,10 @@ impl<'a> UiTree<'a> {
     }
     let node = self.node(slot)
     let mut computed = Computed.inheriting(inherited)
+    // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
+    if parent != NONE {
+      computed.pointerEvents = self.node(parent).computed.pointerEvents
+    }
     computed.display = defaultDisplay(node.kind)
     if node.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
@@ -1407,6 +1440,7 @@ impl<'a> UiTree<'a> {
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.paintDirty || self.scrolled
+      || cssom_view.scrollAnimating(self)
       || self.layout.revision() != self.laidOutRevision
       || self.layout.scrollRevision() != self.laidOutScrolls
       || self.reveal.length() != 0
@@ -1436,6 +1470,7 @@ impl<'a> UiTree<'a> {
     run self.resolveStyles()
     run virtual.prepare(&mut self)
     run self.layoutFrame()
+    run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
     if run interact.settleScrolls(&mut self) {
       run self.layoutFrame()
       drop run interact.settleScrolls(&mut self)
@@ -1759,7 +1794,6 @@ impl<'a> UiTree<'a> {
       index,
       self.input.width,
       self.input.height,
-      self.input.scale,
     )
   }
 

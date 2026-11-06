@@ -1,0 +1,644 @@
+//! Descriptor grammars for font-face, page and page-margin CSSOM declaration blocks.
+import cssom_font_source
+import cssom_unicode_range
+import cssom_content
+import cssom_serialization
+import cssom_numeric_serialization
+import cssom_value_serialization
+import properties { Property }
+import properties
+import values { Store, Mode, ValueId }
+import values
+import dimensions { Dimension, Expr, ExprId, Store as NumericStore }
+import dimensions
+import input { Input }
+import value_cursor { Cursor }
+import tokens { TokenBuffer, TokenRange, Kind, Limits, CssError, insensitive }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub enum Context {
+  Style,
+  FontFace,
+  Page,
+  Margin
+}
+
+pub struct Descriptor {
+  pub name: &'static [u8],
+  pub value: Bytes,
+}
+
+fn fontName(input: &[u8]) -> &'static [u8] {
+  let names = [
+    b"font-family",
+    b"src",
+    b"font-style",
+    b"font-weight",
+    b"font-width",
+    b"unicode-range",
+    b"font-feature-settings",
+    b"font-variation-settings",
+    b"font-language-override",
+    b"font-named-instance",
+    b"font-display",
+    b"ascent-override",
+    b"descent-override",
+    b"line-gap-override",
+    b"size-adjust",
+  ]
+  let mut i: usize = 0
+  while i < names.length {
+    if insensitive(input, names[i]) {
+      return names[i]
+    }
+    i = i + 1
+  }
+  if insensitive(input, b"font-stretch") {
+    return b"font-width"
+  }
+  return b""
+}
+
+pub fn name(context: Context, input: &[u8]) -> &'static [u8] {
+  if context == Context.FontFace {
+    return fontName(input)
+  }
+  if context == Context.Style {
+    return b""
+  }
+  let names = [
+    b"margin",
+    b"margin-top",
+    b"margin-right",
+    b"margin-bottom",
+    b"margin-left",
+    b"padding",
+    b"padding-top",
+    b"padding-right",
+    b"padding-bottom",
+    b"padding-left",
+    b"background-color",
+    b"content",
+  ]
+  let mut i: usize = 0
+  while i < names.length {
+    if insensitive(input, names[i]) {
+      return names[i]
+    }
+    i = i + 1
+  }
+  if context == Context.Page {
+    let page = [b"size", b"marks", b"bleed", b"page-orientation", b"page-margin-safety"]
+    i = 0
+    while i < page.length {
+      if insensitive(input, page[i]) {
+        return page[i]
+      }
+      i = i + 1
+    }
+  }
+  return match &properties.lookup(input) {
+    Option<Property>.Some { value } => properties.name(properties.canonical(value))
+    _ => b""
+  }
+}
+
+pub fn longhandCount(context: Context, input: &[u8]) -> usize {
+  let canonical = name(context, input)
+  if canonical.length == 0 {
+    return 0
+  }
+  if context == Context.FontFace {
+    return 1
+  }
+  if insensitive(canonical, b"margin") || insensitive(canonical, b"padding") {
+    return 4
+  }
+  return match &properties.lookup(canonical) {
+    Option<Property>.Some { value } => properties.longhandCount(value)
+    _ => 1
+  }
+}
+
+pub fn longhandAt(context: Context, input: &[u8], index: usize) -> &'static [u8] {
+  let canonical = name(context, input)
+  if context != Context.FontFace {
+    if insensitive(canonical, b"margin") {
+      let names = [b"margin-top", b"margin-right", b"margin-bottom", b"margin-left"]
+      return if index < 4 {
+        names[index]
+      } else {
+        b""
+      }
+    }
+    if insensitive(canonical, b"padding") {
+      let names = [b"padding-top", b"padding-right", b"padding-bottom", b"padding-left"]
+      return if index < 4 {
+        names[index]
+      } else {
+        b""
+      }
+    }
+    match &properties.lookup(canonical) {
+      Option<Property>.Some { value } => {
+        return if index < properties.longhandCount(value) {
+          properties.name(properties.longhandAt(value, index))
+        } else {
+          b""
+        }
+      }
+      _ => {}
+    }
+  }
+  return if index == 0 {
+    canonical
+  } else {
+    b""
+  }
+}
+
+fn skip(buffer: &TokenBuffer, start: usize, end: usize) -> usize {
+  let mut at = start
+  while at < end
+    && match &buffer.tokens.asSlice()[at].kind {
+      Kind.Whitespace => true
+      _ => false
+    } {
+    at = at + 1
+  }
+  return at
+}
+
+fn keyword<'a>(buffer: &TokenBuffer, range: TokenRange, choices: &[&'a [u8]]) -> &'a [u8] {
+  let at = skip(buffer, range.start, range.end)
+  if at == range.end || skip(buffer, at + 1, range.end) != range.end {
+    return b""
+  }
+  match &buffer.tokens.asSlice()[at].kind {
+    Kind.Ident { text } => {
+      let mut i: usize = 0
+      while i < choices.length {
+        if insensitive(buffer.text(text), choices[i]) {
+          return choices[i]
+        }
+        i = i + 1
+      }
+    }
+    _ => {}
+  }
+  return b""
+}
+
+effect fn typed(property: Property, buffer: &TokenBuffer, range: TokenRange) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut store = Store.make()
+  let input = Input.Contiguous { buffer: buffer, range: range }
+  let parsed = run values.parse(&mut store, property, &input, Mode.Css)
+  return match &parsed {
+    Option<ValueId>.Some { value } => Option<Bytes>.some(
+      run cssom_value_serialization.value(&store, value, property, property),
+    )
+    _ => Option<Bytes>.None
+  }
+}
+
+effect fn numericList(
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  dimension: Dimension,
+  minimum: usize,
+  maximum: usize,
+  nonnegative: bool,
+  allowAuto: bool,
+) -> List<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Bytes>.make()
+  let input = Input.Contiguous { buffer: buffer, range: range }
+  let mut cursor = Cursor.make(&input)
+  let mut store = NumericStore.make()
+  while !cursor.done(&input) && out.length() < maximum {
+    if allowAuto && cursor.ident(&input, b"auto") {
+      run out.append(run Bytes.copy(b"auto"))
+    } else {
+      let parsed = run dimensions.parse(&mut store, &input, &mut cursor, dimension, false)
+      match &parsed {
+        Option<ExprId>.Some { value } => {
+          if nonnegative
+            && match &store.get(value).* {
+              Expr.Literal { value: number, unit } => number < 0.0
+              _ => false
+            } {
+            return List<Bytes>.make()
+          }
+          run out.append(run cssom_numeric_serialization.expression(&store, value))
+        }
+        _ => {
+          return List<Bytes>.make()
+        }
+      }
+    }
+  }
+  if !cursor.done(&input) || out.length() < minimum {
+    return List<Bytes>.make()
+  }
+  return move out
+}
+
+effect fn joined(values: &[Bytes]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = Bytes.make()
+  let mut i: usize = 0
+  while i < values.length {
+    if i != 0 {
+      run Bytes.append(&mut out, b" ")
+    }
+    run Bytes.append(&mut out, Bytes.asSlice(&values[i]))
+    i = i + 1
+  }
+  return move out
+}
+
+effect fn fontRange(descriptor: &[u8], buffer: &TokenBuffer, range: TokenRange) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let single = keyword(buffer, range, &[b"auto"])
+  if single.length != 0 {
+    return Option<Bytes>.some(run Bytes.copy(single))
+  }
+  if insensitive(descriptor, b"font-style") {
+    let basic = keyword(buffer, range, &[b"normal", b"italic", b"left", b"right", b"oblique"])
+    if basic.length != 0 {
+      return Option<Bytes>.some(run Bytes.copy(basic))
+    }
+    let first = skip(buffer, range.start, range.end)
+    if first >= range.end
+      || !match &buffer.tokens.asSlice()[first].kind {
+        Kind.Ident { text } => insensitive(buffer.text(text), b"oblique")
+        _ => false
+      } {
+      return Option<Bytes>.None
+    }
+    let input = Input.Contiguous {
+      buffer: buffer,
+      range: TokenRange { start: first + 1, end: range.end },
+    }
+    let mut cursor = Cursor.make(&input)
+    let mut store = NumericStore.make()
+    let mut out = run Bytes.copy(b"oblique")
+    let mut count: usize = 0
+    while !cursor.done(&input) && count < 2 {
+      match &run dimensions.parse(&mut store, &input, &mut cursor, Dimension.Angle, false) {
+        Option<ExprId>.Some { value } => {
+          let angle = dimensions.evaluate(&store, value, 0.0)
+          if angle < -90.0 || angle > 90.0 {
+            return Option<Bytes>.None
+          }
+          run Bytes.append(&mut out, b" ")
+          run cssom_numeric_serialization.appendExpression(&mut out, &store, value)
+        }
+        _ => {
+          return Option<Bytes>.None
+        }
+      }
+      count = count + 1
+    }
+    if !cursor.done(&input) || count == 0 {
+      return Option<Bytes>.None
+    }
+    return Option<Bytes>.some(move out)
+  }
+  let property = if insensitive(descriptor, b"font-weight") {
+    Property.FontWeight
+  } else {
+    Property.FontWidth
+  }
+  let mut at = skip(buffer, range.start, range.end)
+  let mut out = Bytes.make()
+  let mut count: usize = 0
+  while at < range.end && count < 2 {
+    let token = &buffer.tokens.asSlice()[at]
+    let end = if token.matching > at && token.matching < range.end {
+      token.matching + 1
+    } else {
+      at + 1
+    }
+    if property == Property.FontWeight
+      && match &token.kind {
+        Kind.Ident { text } => insensitive(buffer.text(text), b"bolder")
+          || insensitive(buffer.text(text), b"lighter")
+        _ => false
+      } {
+      return Option<Bytes>.None
+    }
+    match move run typed(property, buffer, TokenRange { start: at, end: end }) {
+      Option<Bytes>.Some { value } => {
+        if count != 0 {
+          run Bytes.append(&mut out, b" ")
+        }
+        run Bytes.append(&mut out, Bytes.asSlice(&value))
+      }
+      _ => {
+        return Option<Bytes>.None
+      }
+    }
+    count = count + 1
+    at = skip(buffer, end, range.end)
+  }
+  if at != range.end || count == 0 {
+    return Option<Bytes>.None
+  }
+  return Option<Bytes>.some(move out)
+}
+
+effect fn fontValue(descriptor: &[u8], buffer: &TokenBuffer, range: TokenRange) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if insensitive(descriptor, b"src") {
+    return run cssom_font_source.parse(buffer, range)
+  }
+  if insensitive(descriptor, b"unicode-range") {
+    return run cssom_unicode_range.parse(buffer, range)
+  }
+  if insensitive(descriptor, b"font-family") {
+    return match move run cssom_font_source.family(buffer, range) {
+      Option<Bytes>.Some { value } => Option<Bytes>.some(
+        run cssom_serialization.string(Bytes.asSlice(&value)),
+      )
+      _ => Option<Bytes>.None
+    }
+  }
+  if insensitive(descriptor, b"font-style") || insensitive(descriptor, b"font-weight")
+    || insensitive(descriptor, b"font-width") {
+    return run fontRange(descriptor, buffer, range)
+  }
+  if insensitive(descriptor, b"font-display") {
+    let value = keyword(buffer, range, &[b"auto", b"block", b"swap", b"fallback", b"optional"])
+    return if value.length != 0 {
+      Option<Bytes>.some(run Bytes.copy(value))
+    } else {
+      Option<Bytes>.None
+    }
+  }
+  if insensitive(descriptor, b"font-named-instance") {
+    let value = keyword(buffer, range, &[b"auto"])
+    if value.length != 0 {
+      return Option<Bytes>.some(run Bytes.copy(value))
+    }
+    let at = skip(buffer, range.start, range.end)
+    if at < range.end && skip(buffer, at + 1, range.end) == range.end {
+      match &buffer.tokens.asSlice()[at].kind {
+        Kind.String { text } => {
+          return Option<Bytes>.some(run cssom_serialization.string(buffer.text(text)))
+        }
+        _ => {}
+      }
+    }
+    return Option<Bytes>.None
+  }
+  if insensitive(descriptor, b"ascent-override") || insensitive(descriptor, b"descent-override")
+    || insensitive(descriptor, b"line-gap-override")
+    || insensitive(descriptor, b"size-adjust") {
+    let normal = keyword(buffer, range, &[b"normal"])
+    if normal.length != 0 && !insensitive(descriptor, b"size-adjust") {
+      return Option<Bytes>.some(run Bytes.copy(normal))
+    }
+    let mut parsed = run numericList(buffer, range, Dimension.Percentage, 1, 1, true, false)
+    if parsed.length() == 0 {
+      return Option<Bytes>.None
+    }
+    return Option<Bytes>.some(parsed.remove(0))
+  }
+  let property = match &properties.lookup(descriptor) {
+    Option<Property>.Some { value } => value
+    _ => {
+      return Option<Bytes>.None
+    }
+  }
+  return run typed(property, buffer, range)
+}
+
+effect fn pageSize(buffer: &TokenBuffer, range: TokenRange) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let auto = keyword(buffer, range, &[b"auto"])
+  if auto.length != 0 {
+    return Option<Bytes>.some(run Bytes.copy(auto))
+  }
+  let mut at = skip(buffer, range.start, range.end)
+  let mut size: &[u8] = b""
+  let mut orientation: &[u8] = b""
+  let mut named = true
+  while at < range.end {
+    let one = TokenRange { start: at, end: at + 1 }
+    let paper = keyword(
+      buffer,
+      one,
+      &[b"a5", b"a4", b"a3", b"b5", b"b4", b"jis-b5", b"jis-b4", b"letter", b"legal", b"ledger"],
+    )
+    let direction = keyword(buffer, one, &[b"portrait", b"landscape"])
+    if paper.length != 0 && size.length == 0 {
+      size = paper
+    } else if direction.length != 0 && orientation.length == 0 {
+      orientation = direction
+    } else {
+      named = false
+      break
+    }
+    at = skip(buffer, at + 1, range.end)
+  }
+  if named && (size.length != 0 || orientation.length != 0) {
+    let mut out = run Bytes.copy(size)
+    if orientation.length != 0 {
+      if size.length != 0 {
+        run Bytes.append(&mut out, b" ")
+      }
+      run Bytes.append(&mut out, orientation)
+    }
+    return Option<Bytes>.some(move out)
+  }
+  let parsed = run numericList(buffer, range, Dimension.Length, 1, 2, true, false)
+  if parsed.length() == 0 {
+    return Option<Bytes>.None
+  }
+  return Option<Bytes>.some(run joined(parsed.asSlice()))
+}
+
+pub effect fn parse(
+  context: Context,
+  inputName: &[u8],
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  limits: &Limits,
+) -> List<Descriptor>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Descriptor>.make()
+  let descriptor = name(context, inputName)
+  if descriptor.length == 0 || range.start >= range.end || range.end > buffer.all().end {
+    return move out
+  }
+  let wide = keyword(buffer, range, &[b"initial", b"inherit", b"unset", b"revert", b"revert-layer"])
+  if context == Context.FontFace {
+    if wide.length != 0 {
+      return move out
+    }
+    match move run fontValue(descriptor, buffer, range) {
+      Option<Bytes>.Some { value } => {
+        run out.append(Descriptor { name: descriptor, value: move value })
+      }
+      _ => {}
+    }
+    return move out
+  }
+  if wide.length != 0 {
+    let count = longhandCount(context, descriptor)
+    let mut i: usize = 0
+    while i < count {
+      run out.append(
+        Descriptor { name: longhandAt(context, descriptor, i), value: run Bytes.copy(wide) },
+      )
+      i = i + 1
+    }
+    return move out
+  }
+  let margin = insensitive(descriptor, b"margin") || insensitive(descriptor, b"margin-top")
+    || insensitive(descriptor, b"margin-right")
+    || insensitive(descriptor, b"margin-bottom")
+    || insensitive(descriptor, b"margin-left")
+  let padding = insensitive(descriptor, b"padding") || insensitive(descriptor, b"padding-top")
+    || insensitive(descriptor, b"padding-right")
+    || insensitive(descriptor, b"padding-bottom")
+    || insensitive(descriptor, b"padding-left")
+  if margin || padding {
+    let count = longhandCount(context, descriptor)
+    let parsed = run numericList(
+      buffer,
+      range,
+      Dimension.LengthPercentage,
+      1,
+      count,
+      padding,
+      margin,
+    )
+    if parsed.length() == 0 {
+      return move out
+    }
+    let mut i: usize = 0
+    while i < count {
+      let index: usize = if i < parsed.length() {
+        i
+      } else if i == 2 {
+        0
+      } else if parsed.length() > 1 {
+        1
+      } else {
+        0
+      }
+      run out.append(
+        Descriptor {
+          name: longhandAt(context, descriptor, i),
+          value: run Bytes.copy(Bytes.asSlice(&parsed.asSlice()[index])),
+        },
+      )
+      i = i + 1
+    }
+    return move out
+  }
+  let mut special = Option<Bytes>.None
+  if insensitive(descriptor, b"size") {
+    special = run pageSize(buffer, range)
+  } else if insensitive(descriptor, b"bleed") {
+    let mut parsed = run numericList(buffer, range, Dimension.Length, 1, 1, false, true)
+    if parsed.length() != 0 {
+      special = Option<Bytes>.some(parsed.remove(0))
+    }
+  } else if insensitive(descriptor, b"page-orientation") {
+    let value = keyword(buffer, range, &[b"upright", b"rotate-left", b"rotate-right"])
+    if value.length != 0 {
+      special = Option<Bytes>.some(run Bytes.copy(value))
+    }
+  } else if insensitive(descriptor, b"page-margin-safety") {
+    let value = keyword(buffer, range, &[b"none", b"clamp", b"add"])
+    if value.length != 0 {
+      special = Option<Bytes>.some(run Bytes.copy(value))
+    }
+  } else if insensitive(descriptor, b"marks") {
+    let none = keyword(buffer, range, &[b"none"])
+    if none.length != 0 {
+      special = Option<Bytes>.some(run Bytes.copy(none))
+    } else {
+      let mut crop = false
+      let mut cross = false
+      let mut valid = true
+      let mut at = skip(buffer, range.start, range.end)
+      while at < range.end {
+        let one = TokenRange { start: at, end: at + 1 }
+        if !crop && keyword(buffer, one, &[b"crop"]).length != 0 {
+          crop = true
+        } else if !cross && keyword(buffer, one, &[b"cross"]).length != 0 {
+          cross = true
+        } else {
+          valid = false
+        }
+        at = skip(buffer, at + 1, range.end)
+      }
+      if valid && (crop || cross) {
+        special = Option<Bytes>.some(
+          run Bytes.copy(
+            if crop && cross {
+              b"crop cross"
+            } else if crop {
+              b"crop"
+            } else {
+              b"cross"
+            },
+          ),
+        )
+      }
+    }
+  } else if insensitive(descriptor, b"background-color") {
+    special = run typed(Property.Color, buffer, range)
+  } else if insensitive(descriptor, b"content") {
+    special = run cssom_content.parse(buffer, range)
+  } else {
+    let property = match &properties.lookup(descriptor) {
+      Option<Property>.Some { value } => properties.canonical(value)
+      _ => {
+        return move out
+      }
+    }
+    let mut store = Store.make()
+    let input = Input.Contiguous { buffer: buffer, range: range }
+    let parsed = run values.parse(&mut store, property, &input, Mode.Css)
+    match &parsed {
+      Option<ValueId>.Some { value } => {
+        let mut i: usize = 0
+        while i < properties.longhandCount(property) {
+          let target = properties.longhandAt(property, i)
+          run out.append(
+            Descriptor {
+              name: properties.name(target),
+              value: run cssom_value_serialization.value(&store, value, property, target),
+            },
+          )
+          i = i + 1
+        }
+      }
+      _ => {}
+    }
+    return move out
+  }
+  match move special {
+    Option<Bytes>.Some { value } => {
+      run out.append(Descriptor { name: descriptor, value: move value })
+    }
+    _ => {}
+  }
+  return move out
+}
