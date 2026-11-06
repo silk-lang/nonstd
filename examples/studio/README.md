@@ -37,6 +37,20 @@ open 'build/Silk Studio.app'
 The local development bundle is unsigned. Its binary links only to macOS system
 libraries/frameworks; it does not depend on a running compiler or this checkout.
 
+## In the browser
+
+`examples/studio/browser` (`silk-studio-browser`) is the same editor built for wasm32, in a
+browser tab with WebGPU and JSPI (Chrome or Edge 137 or later):
+
+```sh
+python3 ui/tree/window/scripts/browser serve examples/studio/browser   # http://127.0.0.1:8050/
+```
+
+It keeps the document in the page's localStorage (under `silk-app:studio`), so a reload finds it
+again; the first visit opens the starter design. There are no native menus or file dialogs:
+opening, saving as and exporting files are the desktop app's, and the fonts are the bundled Noto
+families. Add `?check` to the address for the same check as `--check`.
+
 ## Editing
 
 The native shell follows the browser Studio's panel dimensions, compact typography,
