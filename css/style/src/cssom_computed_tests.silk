@@ -1,0 +1,514 @@
+//! CSSOM §7.2 and §9 against real computed.Engine builds, not host-only mock values.
+import cssom_computed { ComputedStyle, Binding, Layout }
+import typed_om_computed { ComputedStyleMap }
+import typed_om { StyleValues, StyleValue }
+import cssom_error { CssomError }
+import computed { Engine, HostContext, StyleId, ComputedError }
+import cascade { Declaration, Candidate, Priority, Origin }
+import cascade
+import properties { Property }
+import values { ValueId, Mode }
+import values
+import dimensions { Context }
+import colors { Color, Context as ColorContext }
+import text_values { TextValue }
+import tokens { Buffers, Limits, CssError }
+import tokens
+import lexer
+import syntax
+import variables
+import input { Input }
+import svg_geometry.geometry { Rect }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+struct Fixture {
+  engine: Engine<'static>,
+  buffers: Buffers<'static>,
+  family: ValueId,
+}
+
+effect fn fixture() -> Fixture
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut buffers = Buffers.make()
+  let closing = run variables.appendClosingBuffer(&mut buffers)
+  let mut engine = run Engine.make(closing)
+  let buffer = run lexer.tokenize(b"serif", &Limits.make())
+  let input = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+  let parsed = run values.parse(&mut engine.values, Property.FontFamily, &input, Mode.Css)
+  let family = match &parsed {
+    Option<ValueId>.Some { value } => value
+    _ => {
+      fail ComputedError { property: Property.FontFamily }
+    }
+  }
+  return Fixture { engine: move engine, buffers: move buffers, family: family }
+}
+
+effect fn build(f: &mut Fixture, css: &[u8], parent: Option<StyleId>) -> StyleId
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(css, &limits)
+  let parsed = run syntax.parseDeclarations(&buffer, buffer.all(), &limits)
+  let source = f.buffers.length()
+  run f.buffers.append(move buffer)
+  let mut declarations = List<Declaration>.make()
+  let mut candidates = List<Candidate>.make()
+  let mut i: usize = 0
+  while i < parsed.length() {
+    let compiled = run cascade.compile(
+      &mut f.engine.values,
+      f.buffers.view(),
+      source,
+      &parsed.asSlice()[i],
+      &limits,
+    )
+    match &compiled {
+      Option<Declaration>.Some { value } => {
+        let index = declarations.length()
+        run declarations.append(value)
+        run candidates.append(
+          Candidate { declaration: index, priority: Priority.make(Origin.Author, i) },
+        )
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  let fonts = [
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+    TextValue.make(Property.Font),
+  ]
+  let host = HostContext {
+    dimensions: Context.make(200.0, 100.0, 16.0),
+    colors: ColorContext.make(Color.srgb(0.0, 0.0, 0.0, 1.0), [Color.srgb(0.0, 0.0, 0.0, 1.0); 19]),
+    systemFonts: &fonts,
+    fontFamily: f.family,
+    revision: 0,
+  }
+  return run f.engine.build(
+    f.buffers.view(),
+    declarations.asSlice(),
+    candidates.asSlice(),
+    parent,
+    &host,
+    &limits,
+  )
+}
+
+fn binding(style: StyleId) -> Binding<'static> {
+  return Binding {
+    element: 7,
+    pseudo: b"",
+    style: Option<StyleId>.some(style),
+    connected: true,
+    inFlatTree: true,
+    renderedBrowsingContext: true,
+    layout: Layout.unavailable(),
+  }
+}
+
+effect fn equals(
+  handle: &ComputedStyle,
+  current: &Binding,
+  f: &Fixture,
+  name: &[u8],
+  expected: &[u8],
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = run handle.getPropertyValue(current, &f.engine, f.buffers.view(), name)
+  return tokens.equal(Bytes.asSlice(&text), expected)
+}
+
+effect fn liveQueries() -> bool
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut f = run fixture()
+  let style = run build(
+    &mut f,
+    b"width:25%; opacity:.25; white-space:preserve nowrap; --a:Red; --b:var(--a); --empty:;",
+    Option<StyleId>.None,
+  )
+  let handle = run ComputedStyle.make(7, b"", &Limits.make())
+  let mut current = binding(style)
+  if !(run equals(&handle, &current, &f, b"WIDTH", b"25%"))
+    || !(run equals(&handle, &current, &f, b"opacity", b"0.25"))
+    || !(run equals(&handle, &current, &f, b"white-space-collapse", b"preserve"))
+    || !(run equals(&handle, &current, &f, b"text-wrap-mode", b"nowrap"))
+    || !(run equals(&handle, &current, &f, b"overflow", b"visible"))
+    || !(run equals(&handle, &current, &f, b"--b", b"Red"))
+    || !(run equals(&handle, &current, &f, b"--B", b"")) {
+    return false
+  }
+  let count = run handle.length(&current, &f.engine, f.buffers.view(), &Limits.make())
+  let mut previous = Bytes.make()
+  let mut custom: usize = 0
+  let mut i: usize = 0
+  while i < count {
+    let name = run handle.item(&current, &f.engine, f.buffers.view(), i, &Limits.make())
+    let text = Bytes.asSlice(&name)
+    if text.length > 1 && text[0] == 45 && text[1] == 45 {
+      custom = custom + 1
+    } else {
+      if custom != 0 || !lexical(Bytes.asSlice(&previous), text) {
+        return false
+      }
+      previous = move name
+    }
+    i = i + 1
+  }
+  if custom != 3 {
+    return false
+  }
+  let beyond = run handle.item(&current, &f.engine, f.buffers.view(), count, &Limits.make())
+  if Bytes.asSlice(&beyond).length != 0 {
+    return false
+  }
+  let child = run build(
+    &mut f,
+    b"width:10px; opacity:.75; --a:var(--a)",
+    Option<StyleId>.some(style),
+  )
+  current.style = Option<StyleId>.some(child)
+  if !(run equals(&handle, &current, &f, b"width", b"10px"))
+    || !(run equals(&handle, &current, &f, b"opacity", b"0.75"))
+    || !(run equals(&handle, &current, &f, b"--a", b""))
+    || !(run equals(&handle, &current, &f, b"--b", b"Red")) {
+    return false
+  }
+  if (run handle.length(&current, &f.engine, f.buffers.view(), &Limits.make())) != count - 1 {
+    return false
+  }
+  current.connected = false
+  if (run handle.length(&current, &f.engine, f.buffers.view(), &Limits.make())) != 0
+    || !(run equals(&handle, &current, &f, b"width", b"")) {
+    return false
+  }
+  current.connected = true
+  current.inFlatTree = false
+  if !run equals(&handle, &current, &f, b"width", b"") {
+    return false
+  }
+  current.inFlatTree = true
+  current.renderedBrowsingContext = false
+  if !run equals(&handle, &current, &f, b"width", b"") {
+    return false
+  }
+  current.renderedBrowsingContext = true
+  if !run equals(&handle, &current, &f, b"width", b"10px") {
+    return false
+  }
+  current.element = 8
+  return run equals(&handle, &current, &f, b"width", b"")
+}
+
+fn lexical(a: &[u8], b: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] {
+      return a[i] < b[i]
+    }
+    i = i + 1
+  }
+  return a.length < b.length
+}
+
+effect fn resolvedQueries() -> bool
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut f = run fixture()
+  let style = run build(
+    &mut f,
+    b"width:25%;height:40%;inline-size:50%;font-size:10px;line-height:2",
+    Option<StyleId>.None,
+  )
+  let handle = run ComputedStyle.make(7, b"", &Limits.make())
+  let mut current = binding(style)
+  if !(run equals(&handle, &current, &f, b"width", b"25%"))
+    || !(run equals(&handle, &current, &f, b"height", b"40%"))
+    || !(run equals(&handle, &current, &f, b"inline-size", b"50%"))
+    || !(run equals(&handle, &current, &f, b"line-height", b"2")) {
+    return false
+  }
+  current.layout = Layout {
+    hasBox: true,
+    widthApplies: true,
+    heightApplies: true,
+    inlineSizeApplies: true,
+    lineHeightApplies: true,
+    transformApplies: false,
+    transformReference: Option<Rect>.None,
+    width: Option<f64>.some(50.0),
+    height: Option<f64>.some(40.0),
+    inlineSize: Option<f64>.some(100.0),
+    lineHeight: Option<f64>.some(20.0),
+  }
+  if !handle.layoutComplete(&current, &f.engine, b"width")
+    || !handle.layoutComplete(&current, &f.engine, b"line-height") {
+    return false
+  }
+  if !(run equals(&handle, &current, &f, b"width", b"50px"))
+    || !(run equals(&handle, &current, &f, b"height", b"40px"))
+    || !(run equals(&handle, &current, &f, b"inline-size", b"100px"))
+    || !(run equals(&handle, &current, &f, b"line-height", b"20px")) {
+    return false
+  }
+  current.layout.widthApplies = false
+  current.layout.height = Option<f64>.None
+  if handle.layoutComplete(&current, &f.engine, b"height") {
+    return false
+  }
+  if !(run equals(&handle, &current, &f, b"width", b"25%"))
+    || !(run equals(&handle, &current, &f, b"height", b"40%")) {
+    return false
+  }
+  current.layout.hasBox = false
+  if !(run equals(&handle, &current, &f, b"inline-size", b"50%"))
+    || !(run equals(&handle, &current, &f, b"line-height", b"2")) {
+    return false
+  }
+  let normal = run build(
+    &mut f,
+    b"line-height:normal;width:calc(2px + 3px);font-size:calc(2px + 3px)",
+    Option<StyleId>.None,
+  )
+  current.style = Option<StyleId>.some(normal)
+  current.layout.hasBox = true
+  return (run equals(&handle, &current, &f, b"line-height", b"normal"))
+    && (run equals(&handle, &current, &f, b"width", b"5px"))
+    && (run equals(&handle, &current, &f, b"font-size", b"5px"))
+}
+
+effect fn transformsAndAnimation() -> bool
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut f = run fixture()
+  let style = run build(
+    &mut f,
+    b"transform:translate(25%,50%) scale(2); transform-origin:25% 75%; perspective-origin:right bottom; animation:slide 2s ease-in 1s 3 reverse both paused",
+    Option<StyleId>.None,
+  )
+  let handle = run ComputedStyle.make(7, b"", &Limits.make())
+  let mut current = binding(style)
+  current.layout.hasBox = true
+  current.layout.transformApplies = true
+  current.layout.transformReference = Option<Rect>.some(Rect.new(0.0, 0.0, 200.0, 100.0))
+  if !(run equals(&handle, &current, &f, b"transform", b"matrix(2, 0, 0, 2, 50, 50)"))
+    || !(run equals(&handle, &current, &f, b"transform-origin", b"50px 75px"))
+    || !(run equals(&handle, &current, &f, b"perspective-origin", b"200px 100px"))
+    || !(run equals(&handle, &current, &f, b"animation-name", b"slide"))
+    || !(run equals(&handle, &current, &f, b"animation-duration", b"2s"))
+    || !(run equals(&handle, &current, &f, b"animation-timing-function", b"ease-in"))
+    || !(run equals(&handle, &current, &f, b"animation-delay", b"1s"))
+    || !(run equals(&handle, &current, &f, b"animation-iteration-count", b"3"))
+    || !(run equals(&handle, &current, &f, b"animation-direction", b"reverse"))
+    || !(run equals(&handle, &current, &f, b"animation-fill-mode", b"both"))
+    || !(run equals(&handle, &current, &f, b"animation-play-state", b"paused")) {
+    return false
+  }
+  current.layout.transformReference = Option<Rect>.some(Rect.new(0.0, 0.0, 400.0, 200.0))
+  if !run equals(&handle, &current, &f, b"transform", b"matrix(2, 0, 0, 2, 100, 100)") {
+    return false
+  }
+  let three = run build(&mut f, b"transform:translateZ(5px)", Option<StyleId>.None)
+  current.style = Option<StyleId>.some(three)
+  return run equals(
+    &handle,
+    &current,
+    &f,
+    b"transform",
+    b"matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 5, 1)",
+  )
+}
+
+effect fn pseudoAndReadonly() -> bool
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let mut f = run fixture()
+  let style = run build(&mut f, b"opacity:.5", Option<StyleId>.None)
+  let handle = run ComputedStyle.make(7, b":BEFORE", &limits)
+  if !handle.validPseudo() || !tokens.equal(handle.pseudo(), b"::before") {
+    return false
+  }
+  let mut current = binding(style)
+  current.pseudo = b"::before"
+  if !run equals(&handle, &current, &f, b"opacity", b"0.5") {
+    return false
+  }
+  let bad: [&[u8]; 6] = [
+    b"::part(foo)",
+    b"::slotted(*)",
+    b":hover",
+    b"::unknown",
+    b"::before,::after",
+    b"::before:hover",
+  ]
+  let mut i: usize = 0
+  while i < bad.length {
+    let invalid = run ComputedStyle.make(7, bad[i], &limits)
+    if invalid.validPseudo() || !(run equals(&invalid, &current, &f, b"opacity", b"")) {
+      return false
+    }
+    i = i + 1
+  }
+  let set = run Effect.result(handle.setProperty(b"", b"", b"bad-priority", &limits))
+  let remove = run Effect.result(handle.removeProperty(b"unknown"))
+  let css = run Effect.result(handle.setCssText(b"", &limits))
+  return handle.isReadOnly() && handle.computedFlag() && handle.cssText().length == 0
+    && handle.getPropertyPriority(b"opacity").length == 0
+    && match &set {
+      Result<(), CssomError>.Failure { error } => error == CssomError.NoModificationAllowedError
+      _ => false
+    }
+    && match &remove {
+      Result<Bytes, CssomError>.Failure { error } => error == CssomError.NoModificationAllowedError
+      _ => false
+    }
+    && match &css {
+      Result<(), CssomError>.Failure { error } => error == CssomError.NoModificationAllowedError
+      _ => false
+    }
+}
+
+test effect fn computedCssomLiveEngineBindingsAndCustomInheritance() -> ()
+  ! AssertionError<'static> | CssError | ComputedError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run liveQueries() |> Effect.provideMut<Allocator>(&mut allocator),
+    "a persistent handle observes current styles and eligibility; sorted longhands precede valid inherited custom properties",
+  )
+}
+
+test effect fn computedCssomUsesOnlyApplicableHostLayoutFacts() -> ()
+  ! AssertionError<'static> | CssError | ComputedError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run resolvedQueries() |> Effect.provideMut<Allocator>(&mut allocator),
+    "resolved lengths use actual layout only; unavailable/nonapplicable/no-box values stay computed and normal line-height stays normal",
+  )
+}
+
+test effect fn computedCssomPseudoIdentityAndUnconditionalReadonly() -> ()
+  ! AssertionError<'static> | CssError | ComputedError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run pseudoAndReadonly() |> Effect.provideMut<Allocator>(&mut allocator),
+    "legacy pseudos normalize; invalid/part/slotted are empty; every setter throws before checking arguments",
+  )
+}
+
+test effect fn computedCssomResolvedTransformMatricesAndAnimationProjection() -> ()
+  ! AssertionError<'static> | CssError | ComputedError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run transformsAndAnimation() |> Effect.provideMut<Allocator>(&mut allocator),
+    "actual reference boxes resolve transform matrices and origins; animation shorthand projects each computed longhand",
+  )
+}
+
+effect fn animationOrdering() -> bool
+  ! CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut f = run fixture()
+  let handle = run ComputedStyle.make(7, b"", &Limits.make())
+  let before = run build(
+    &mut f,
+    b"animation-duration:9s; animation:spin 2s; animation-name:none",
+    Option<StyleId>.None,
+  )
+  let mut current = binding(before)
+  if !(run equals(&handle, &current, &f, b"animation-duration", b"2s"))
+    || !(run equals(&handle, &current, &f, b"animation-name", b"none")) {
+    return false
+  }
+  let after = run build(
+    &mut f,
+    b"animation:spin 2s; animation-duration:9s; animation:spin -1s",
+    Option<StyleId>.None,
+  )
+  current.style = Option<StyleId>.some(after)
+  if !(run equals(&handle, &current, &f, b"animation-duration", b"9s"))
+    || !(run equals(&handle, &current, &f, b"animation-name", b"spin")) {
+    return false
+  }
+  let reset = run build(&mut f, b"animation:spin 2s; all:initial", Option<StyleId>.None)
+  current.style = Option<StyleId>.some(reset)
+  return (run equals(&handle, &current, &f, b"animation-duration", b"0s"))
+    && (run equals(&handle, &current, &f, b"animation-name", b"none"))
+}
+
+test effect fn animationShorthandLonghandOrderingAndReset() -> ()
+  ! AssertionError<'static> | CssError | ComputedError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run animationOrdering() |> Effect.provideMut<Allocator>(&mut allocator),
+    "animation participates in the ordinary cascade; invalid shorthand cannot replace valid longhands and all resets them",
+  )
+}
+
+effect fn typedComputedValues() -> bool
+  ! CssomError | CssError | ComputedError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let mut f = run fixture()
+  let style = run build(&mut f, b"width:25%; --z:1px; --A:2px", Option<StyleId>.None)
+  let mut current = binding(style)
+  current.layout.hasBox = true
+  current.layout.widthApplies = true
+  current.layout.width = Option<f64>.some(50.0)
+  let resolved = run ComputedStyle.make(7, b"", &limits)
+  if !(run equals(&resolved, &current, &f, b"width", b"50px")) {
+    return false
+  }
+  let map = ComputedStyleMap.make(7)
+  let mut values = StyleValues.make()
+  let value = run map.get(&current, &f.engine, f.buffers.view(), &mut values, b"width", &limits)
+  match &value {
+    Option<StyleValue>.Some { value: typed } => {
+      let text = run typed.serialize(&values)
+      if !tokens.equal(Bytes.asSlice(&text), b"25%") {
+        return false
+      }
+    }
+    _ => {
+      return false
+    }
+  }
+  let keys = run map.keys(&current, &f.engine, f.buffers.view(), &limits)
+  if !tokens.equal(Bytes.asSlice(&keys.asSlice()[keys.length() - 2]), b"--A")
+    || !tokens.equal(Bytes.asSlice(&keys.asSlice()[keys.length() - 1]), b"--z") {
+    return false
+  }
+  let next = run build(&mut f, b"width:10px", Option<StyleId>.None)
+  current.style = Option<StyleId>.some(next)
+  let changed = run map.get(&current, &f.engine, f.buffers.view(), &mut values, b"width", &limits)
+  return match &changed {
+    Option<StyleValue>.Some { value: typed } => {
+      let text = run typed.serialize(&values)
+      tokens.equal(Bytes.asSlice(&text), b"10px")
+    }
+    _ => false
+  }
+}
+
+test effect fn computedTypedMapRemainsLiveWithoutResolvingPercentagesAgainstLayout() -> ()
+  ! AssertionError<'static> | CssomError | CssError | ComputedError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run Testing.expect(
+    run typedComputedValues() |> Effect.provideMut<Allocator>(&mut allocator),
+    "computed Typed OM retains percentages, sorts custom names, and observes current style bindings",
+  )
+}

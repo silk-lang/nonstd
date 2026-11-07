@@ -1,0 +1,320 @@
+//! Mutable Typed OM token fragments and variable references, sharing the CSS tokenizer.
+import tokens { TokenBuffer, TokenRange, Kind, Limits, CssError }
+import tokens
+import lexer
+import cssom_serialization
+import cssom_error { CssomError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub struct UnparsedId {
+  pub index: usize
+}
+
+impl Copy for UnparsedId {}
+
+pub struct VariableId {
+  pub index: usize
+}
+
+impl Copy for VariableId {}
+
+pub union Segment {
+  Text { pub text: Bytes },
+  Variable { pub id: VariableId },
+}
+
+pub struct KeywordValue {
+  text: Bytes
+}
+
+impl KeywordValue {
+  pub effect fn make(value: &[u8]) -> KeywordValue
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if value.length == 0 {
+      fail CssomError.TypeError
+    }
+    return KeywordValue { text: run Bytes.copy(value) }
+  }
+
+  pub fn value(self: &Self) -> &[u8] {
+    return Bytes.asSlice(&self.text)
+  }
+
+  pub effect fn setValue(self: &mut Self, value: &[u8]) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if value.length == 0 {
+      fail CssomError.TypeError
+    }
+    self.text = run Bytes.copy(value)
+  }
+
+  pub effect fn serialize(self: &Self) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.copy(Bytes.asSlice(&self.text))
+  }
+}
+
+struct Unparsed {
+  segments: List<Segment>
+}
+
+struct Variable {
+  name: Bytes,
+  fallback: Option<UnparsedId>
+}
+
+struct Frame {
+  value: UnparsedId,
+  index: usize,
+  closeVariable: bool
+}
+
+impl Copy for Frame {}
+
+/// A custom property name string is deliberately not parsed as an identifier (Typed OM §3).
+pub fn customPropertyName(value: &[u8]) -> bool {
+  return value.length >= 2 && value[0] == 45 && value[1] == 45
+}
+
+/// Stable handles retain shared fallback identity through later indexed mutations.
+pub struct UnparsedStore {
+  values: List<Unparsed>,
+  variables: List<Variable>
+}
+
+impl UnparsedStore {
+  pub fn make() -> UnparsedStore {
+    return UnparsedStore { values: List<Unparsed>.make(), variables: List<Variable>.make() }
+  }
+
+  pub effect fn create(self: &mut Self, segments: List<Segment>) -> UnparsedId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = UnparsedId { index: self.values.length() }
+    run self.values.append(Unparsed { segments: move segments })
+    return id
+  }
+
+  pub effect fn text(self: &mut Self, text: &[u8]) -> UnparsedId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut segments = List<Segment>.make()
+    run segments.append(Segment.Text { text: run Bytes.copy(text) })
+    return run self.create(move segments)
+  }
+
+  pub fn length(self: &Self, id: UnparsedId) -> usize {
+    return self.values.asSlice()[id.index].segments.length()
+  }
+
+  pub fn get(self: &Self, id: UnparsedId, index: usize) -> Option<&Segment> {
+    let segments = self.values.asSlice()[id.index].segments.asSlice()
+    if index >= segments.length {
+      return Option<&Segment>.None
+    }
+    return Option<&Segment>.some(&segments[index])
+  }
+
+  pub effect fn set(self: &mut Self, id: UnparsedId, index: usize, segment: Segment) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let entries = self.values.asMutSlice()
+    let segments = &mut entries[id.index].segments
+    if index > segments.length() {
+      fail CssomError.RangeError
+    }
+    if index == segments.length() {
+      run segments.append(move segment)
+    } else {
+      let items = segments.asMutSlice()
+      items[index] = move segment
+    }
+  }
+
+  pub effect fn variable(self: &mut Self, name: &[u8], fallback: Option<UnparsedId>) -> VariableId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if !customPropertyName(name) {
+      fail CssomError.TypeError
+    }
+    let id = VariableId { index: self.variables.length() }
+    run self.variables.append(Variable { name: run Bytes.copy(name), fallback: fallback })
+    return id
+  }
+
+  pub fn variableName(self: &Self, id: VariableId) -> &[u8] {
+    return Bytes.asSlice(&self.variables.asSlice()[id.index].name)
+  }
+
+  pub fn fallback(self: &Self, id: VariableId) -> Option<UnparsedId> {
+    return self.variables.asSlice()[id.index].fallback
+  }
+
+  pub effect fn setVariable(self: &mut Self, id: VariableId, name: &[u8]) -> ()
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if !customPropertyName(name) {
+      fail CssomError.TypeError
+    }
+    let copy = run Bytes.copy(name)
+    let entries = self.variables.asMutSlice()
+    entries[id.index].name = move copy
+  }
+
+  pub effect fn parse(self: &mut Self, text: &[u8], limits: &Limits) -> UnparsedId
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let buffer = run lexer.tokenize(text, limits)
+    return run self.reify(&buffer, buffer.all())
+  }
+
+  /// Reifies every nested var() while coalescing the intervening serialized token runs.
+  pub effect fn reify(self: &mut Self, buffer: &TokenBuffer, range: TokenRange) -> UnparsedId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut segments = List<Segment>.make()
+    let mut start = range.start
+    let mut at = range.start
+    while at < range.end {
+      let token = buffer.tokens.asSlice()[at]
+      let variable = match &token.kind {
+        Kind.Function { name } => tokens.insensitive(buffer.text(name), b"var")
+        _ => false
+      }
+      if !variable {
+        at = at + 1
+        continue
+      }
+      if at > start {
+        run segments.append(
+          Segment.Text {
+            text: run cssom_serialization.components(buffer, TokenRange { start: start, end: at }),
+          },
+        )
+      }
+      let end = if token.matching < range.end {
+        token.matching
+      } else {
+        range.end
+      }
+      let mut nameAt = at + 1
+      while nameAt < end && whitespace(&buffer.tokens.asSlice()[nameAt].kind) {
+        nameAt = nameAt + 1
+      }
+      if nameAt == end {
+        fail CssomError.TypeError
+      }
+      let name = match &buffer.tokens.asSlice()[nameAt].kind {
+        Kind.Ident { text } => buffer.text(text)
+        _ => {
+          fail CssomError.TypeError
+        }
+      }
+      if !customPropertyName(name) || name.length == 2 {
+        fail CssomError.TypeError
+      }
+      let mut after = nameAt + 1
+      while after < end && whitespace(&buffer.tokens.asSlice()[after].kind) {
+        after = after + 1
+      }
+      let mut fallback = Option<UnparsedId>.None
+      if after < end {
+        if !match &buffer.tokens.asSlice()[after].kind {
+          Kind.Comma => true
+          _ => false
+        } {
+          fail CssomError.TypeError
+        }
+        fallback = Option<UnparsedId>.some(
+          run self.reify(buffer, TokenRange { start: after + 1, end: end }),
+        )
+      }
+      let escaped = run cssom_serialization.identifier(name)
+      let reference = run self.variable(Bytes.asSlice(&escaped), fallback)
+      run segments.append(Segment.Variable { id: reference })
+      at = if end < range.end {
+        end + 1
+      } else {
+        end
+      }
+      start = at
+    }
+    if start < range.end {
+      run segments.append(
+        Segment.Text {
+          text: run cssom_serialization.components(
+            buffer,
+            TokenRange { start: start, end: range.end },
+          ),
+        },
+      )
+    }
+    return run self.create(move segments)
+  }
+
+  pub effect fn serialize(self: &Self, id: UnparsedId) -> Bytes
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Bytes.make()
+    let mut stack = List<Frame>.make()
+    run stack.append(Frame { value: id, index: 0, closeVariable: false })
+    while stack.length() != 0 {
+      let top = stack.length() - 1
+      let frame = stack.get(top)
+      let segments = self.values.asSlice()[frame.value.index].segments.asSlice()
+      if frame.index == segments.length {
+        if frame.closeVariable {
+          run out.append(b")")
+        }
+        stack.truncate(top)
+        continue
+      }
+      stack.set(
+        top,
+        Frame { value: frame.value, index: frame.index + 1, closeVariable: frame.closeVariable },
+      )
+      match &segments[frame.index] {
+        Segment.Text { text } => {
+          run out.append(Bytes.asSlice(&text))
+        }
+        Segment.Variable { id: reference } => {
+          let variable = &self.variables.asSlice()[reference.index]
+          run out.append(b"var(")
+          run out.append(Bytes.asSlice(&variable.name))
+          match &variable.fallback {
+            Option<UnparsedId>.Some { value } => {
+              // Indexed mutation can make a cycle. Report recursion failure without overflowing the native stack.
+              let mut active: usize = 0
+              while active < stack.length() {
+                if stack.get(active).value.index == value.index {
+                  fail CssomError.RangeError
+                }
+                active = active + 1
+              }
+              run out.append(b", ")
+              run stack.append(Frame { value: value, index: 0, closeVariable: true })
+            }
+            _ => {
+              run out.append(b")")
+            }
+          }
+        }
+      }
+    }
+    return move out
+  }
+}
+
+fn whitespace(kind: &Kind) -> bool {
+  return match &kind.* {
+    Kind.Whitespace => true
+    _ => false
+  }
+}

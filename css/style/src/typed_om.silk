@@ -1,0 +1,359 @@
+//! Typed CSS values over the existing declaration parser, numeric arena and transform engine.
+import cssom_declaration { StyleDeclaration }
+import cssom_error { CssomError }
+import typed_om_numeric { NumericStore, NumericId }
+import typed_om_transform { TransformValue }
+import typed_om_color { CSSColorValue }
+import typed_om_unparsed { UnparsedStore, UnparsedId, KeywordValue, customPropertyName }
+import properties { Property }
+import properties
+import tokens { TokenBuffer, TokenRange, Kind, Limits, CssError }
+import tokens
+import lexer
+import cssom_serialization
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// CSSImageValue is intentionally opaque in Typed OM Level 1. URLs retain specified-value scope.
+pub struct ImageValue {
+  text: Bytes
+}
+
+impl ImageValue {
+  pub effect fn serialize(self: &Self) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Bytes.copy(Bytes.asSlice(&self.text))
+  }
+}
+
+pub union Value {
+  Keyword { pub value: KeywordValue },
+  Numeric { pub id: NumericId },
+  Unparsed { pub id: UnparsedId },
+  Transform { pub value: TransformValue },
+  Color { pub value: CSSColorValue },
+  Image { pub value: ImageValue },
+  Direct { pub property: Bytes, pub text: Bytes },
+}
+
+pub struct StyleValue {
+  pub value: Value,
+  original: Option<Bytes>,
+}
+
+impl StyleValue {
+  pub fn constructed(value: Value) -> StyleValue {
+    return StyleValue { value: move value, original: Option<Bytes>.None }
+  }
+
+  pub fn associatedProperty(self: &Self) -> Option<&[u8]> {
+    return match &self.value {
+      Value.Direct { property, text } => Option<&[u8]>.some(Bytes.asSlice(&property))
+      _ => Option<&[u8]>.None
+    }
+  }
+
+  pub fn unparsed(self: &Self) -> bool {
+    return match &self.value {
+      Value.Unparsed { id } => true
+      _ => false
+    }
+  }
+
+  pub effect fn serialize(self: &Self, store: &StyleValues) -> Bytes
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    match &self.original {
+      Option<Bytes>.Some { value: text } => {
+        return run Bytes.copy(Bytes.asSlice(&text))
+      }
+      _ => {}
+    }
+    return run self.internalText(store)
+  }
+
+  /// Setters consume internal values, not parse-origin stringification caches.
+  pub effect fn internalText(self: &Self, store: &StyleValues) -> Bytes
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &self.value {
+      Value.Keyword { value } => run value.serialize()
+      Value.Numeric { id } => run store.numeric.serialize(id)
+      Value.Unparsed { id } => run store.unparsed.serialize(id)
+      Value.Transform { value } => run value.serializeComponents(&store.numeric)
+      Value.Color { value } => run value.serialize(&store.numeric)
+      Value.Image { value } => run value.serialize()
+      Value.Direct { property, text } => run Bytes.copy(Bytes.asSlice(&text))
+    }
+  }
+}
+
+/// These arenas preserve shared numeric and var() fallback identities; values do not own copies.
+pub struct StyleValues {
+  pub numeric: NumericStore,
+  pub unparsed: UnparsedStore,
+}
+
+impl StyleValues {
+  pub fn make() -> StyleValues {
+    return StyleValues { numeric: NumericStore.make(), unparsed: UnparsedStore.make() }
+  }
+
+  pub effect fn parse(self: &mut Self, property: &[u8], text: &[u8], limits: &Limits) -> StyleValue
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut values = run self.parseAll(property, text, limits)
+    if values.length() == 0 {
+      fail CssomError.TypeError
+    }
+    return values.remove(0)
+  }
+
+  pub effect fn parseAll(self: &mut Self, property: &[u8], text: &[u8], limits: &Limits) -> List<
+    StyleValue
+  >
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let name = run propertyName(property)
+    let mut parsed = StyleDeclaration.make()
+    run parsed.setTypedProperty(Bytes.asSlice(&name), text, limits)
+    return run self.reifyAll(Bytes.asSlice(&name), text, true, limits)
+  }
+
+  /// Reads a validated CSSOM value. The source declaration/engine remains authoritative.
+  pub effect fn reifyAll(
+    self: &mut Self,
+    property: &[u8],
+    text: &[u8],
+    parsedOrigin: bool,
+    limits: &Limits,
+  ) -> List<StyleValue>
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let buffer = run lexer.tokenize(text, limits)
+    let all = buffer.all()
+    let mut out = List<StyleValue>.make()
+    if customPropertyName(property) || containsVariables(&buffer, all) {
+      let id = run self.unparsed.reify(&buffer, all)
+      let mut value = StyleValue.constructed(Value.Unparsed { id: id })
+      if parsedOrigin {
+        value.original = Option<Bytes>.some(run Bytes.copy(text))
+      }
+      run out.append(move value)
+      return move out
+    }
+    let split = listValued(property)
+    let mut start = all.start
+    let mut at = start
+    while at <= all.end {
+      let boundary = at == all.end
+        || (split
+          && match &buffer.tokens.asSlice()[at].kind {
+            Kind.Comma => true
+            _ => false
+          })
+      if boundary {
+        let range = trim(&buffer, TokenRange { start: start, end: at })
+        if range.start == range.end {
+          fail CssomError.TypeError
+        }
+        let original = source(&buffer, range)
+        let mut value = run self.reifyOne(property, &buffer, range, limits)
+        if parsedOrigin {
+          value.original = Option<Bytes>.some(run Bytes.copy(original))
+        }
+        run out.append(move value)
+        start = at + 1
+      }
+      if at == all.end {
+        break
+      }
+      let token = buffer.tokens.asSlice()[at]
+      at = if token.matching > at && token.matching < all.end {
+        token.matching + 1
+      } else {
+        at + 1
+      }
+    }
+    return move out
+  }
+
+  effect fn reifyOne(
+    self: &mut Self,
+    property: &[u8],
+    buffer: &TokenBuffer,
+    range: TokenRange,
+    limits: &Limits,
+  ) -> StyleValue
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let text = source(buffer, range)
+    let known = match &properties.lookup(property) {
+      Option<Property>.Some { value } => properties.canonical(value)
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+    let one = range.end == range.start + 1
+    let keyword = if one {
+      match &buffer.tokens.asSlice()[range.start].kind {
+        Kind.Ident { text: ident } => buffer.text(ident)
+        _ => b""
+      }
+    } else {
+      b""
+    }
+    let wide = tokens.insensitive(keyword, b"initial") || tokens.insensitive(keyword, b"inherit")
+      || tokens.insensitive(keyword, b"unset")
+      || tokens.insensitive(keyword, b"revert")
+      || tokens.insensitive(keyword, b"revert-layer")
+    if wide {
+      return StyleValue.constructed(Value.Keyword { value: run KeywordValue.make(keyword) })
+    }
+    let direct = known == Property.Font || known == Property.FontFamily
+      || known == Property.FontVariant
+      || known == Property.Overflow
+      || known == Property.Color && !tokens.insensitive(keyword, b"currentcolor")
+      || (properties.longhandCount(known) > 1 && known != Property.WhiteSpace)
+      || known == Property.FontPalette && keyword.length != 0
+        && !tokens.insensitive(keyword, b"normal")
+        && !tokens.insensitive(keyword, b"light")
+        && !tokens.insensitive(keyword, b"dark")
+    if direct {
+      return run directValue(property, text)
+    }
+    if keyword.length != 0 {
+      return StyleValue.constructed(Value.Keyword { value: run KeywordValue.make(keyword) })
+    }
+    if known == Property.Transform {
+      return StyleValue.constructed(
+        Value.Transform { value: run TransformValue.parseReified(&mut self.numeric, text, limits) },
+      )
+    }
+    if known == Property.MaskImage || known == Property.MaskBorderSource {
+      return StyleValue.constructed(
+        Value.Image { value: ImageValue { text: run Bytes.copy(text) } },
+      )
+    }
+    let numeric = match &buffer.tokens.asSlice()[range.start].kind {
+      Kind.Number { value, integer } => one
+      Kind.Percentage { value, integer } => one
+      Kind.Dimension { value, integer, unit } => one
+      Kind.Function { name } => buffer.tokens.asSlice()[range.start].matching == range.end - 1
+        && (tokens.insensitive(buffer.text(name), b"calc")
+          || tokens.insensitive(buffer.text(name), b"min")
+          || tokens.insensitive(buffer.text(name), b"max")
+          || tokens.insensitive(buffer.text(name), b"clamp"))
+      _ => false
+    }
+    if numeric {
+      return StyleValue.constructed(
+        Value.Numeric { id: run self.numeric.parseCanonical(text, limits) },
+      )
+    }
+    return run directValue(property, text)
+  }
+}
+
+effect fn directValue(property: &[u8], text: &[u8]) -> StyleValue
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return StyleValue.constructed(
+    Value.Direct { property: run Bytes.copy(property), text: run Bytes.copy(text) },
+  )
+}
+
+pub effect fn propertyName(property: &[u8]) -> Bytes
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  if customPropertyName(property) {
+    return run Bytes.copy(property)
+  }
+  return match &properties.lookup(property) {
+    Option<Property>.Some { value } => run Bytes.copy(properties.name(properties.canonical(value)))
+    _ => {
+      fail CssomError.TypeError
+    }
+  }
+}
+
+/// Parallel comma-separated property iterations, not components within one value (e.g. dashes).
+pub fn listValued(property: &[u8]) -> bool {
+  return match &properties.lookup(property) {
+    Option<Property>.Some { value } => match properties.canonical(value) {
+      Property.Animation => true
+      Property.AnimationName => true
+      Property.AnimationDuration => true
+      Property.AnimationDelay => true
+      Property.AnimationTimingFunction => true
+      Property.AnimationIterationCount => true
+      Property.AnimationDirection => true
+      Property.AnimationFillMode => true
+      Property.AnimationPlayState => true
+      Property.BackgroundBlendMode => true
+      Property.Mask => true
+      Property.MaskImage => true
+      Property.MaskMode => true
+      Property.MaskRepeat => true
+      Property.MaskPosition => true
+      Property.MaskClip => true
+      Property.MaskOrigin => true
+      Property.MaskSize => true
+      Property.MaskComposite => true
+      Property.FontFamily => true
+      Property.TextShadow => true
+      _ => false
+    }
+    _ => false
+  }
+}
+
+pub fn containsVariables(buffer: &TokenBuffer, range: TokenRange) -> bool {
+  let mut at = range.start
+  while at < range.end {
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Function { name } => {
+        if tokens.insensitive(buffer.text(name), b"var") {
+          return true
+        }
+      }
+      _ => {}
+    }
+    at = at + 1
+  }
+  return false
+}
+
+fn trim(buffer: &TokenBuffer, range: TokenRange) -> TokenRange {
+  let mut start = range.start
+  let mut end = range.end
+  while start < end
+    && match &buffer.tokens.asSlice()[start].kind {
+      Kind.Whitespace => true
+      _ => false
+    } {
+    start = start + 1
+  }
+  while end > start
+    && match &buffer.tokens.asSlice()[end - 1].kind {
+      Kind.Whitespace => true
+      _ => false
+    } {
+    end = end - 1
+  }
+  return TokenRange { start: start, end: end }
+}
+
+fn source(buffer: &TokenBuffer, range: TokenRange) -> &[u8] {
+  if range.start == range.end {
+    return b""
+  }
+  let tokens = buffer.tokens.asSlice()
+  let start = tokens[range.start].source.start
+  let end = tokens[range.end - 1].source.end
+  return Slice.view<u8>(buffer.source(), start, end - start)
+}

@@ -1,5 +1,8 @@
-//! Static XML selectors. The owned AST keeps spans into its immutable TokenBuffer.
-//! Normative grammar and specificity: pinned Selectors 4 #grammar / #specificity-rules.
+//! Shared Selectors 4 grammar for static XML matching and CSSOM validation.
+//! Pseudo-elements validate but never match ElementTree nodes. Nesting 1 is
+//! validation-only: resolving & requires a parent selector and its specificity.
+//! Pseudo suffix/argument grammar: https://drafts.csswg.org/selectors-4/#pseudo-elements
+//! https://drafts.csswg.org/css-pseudo-4/ and https://drafts.csswg.org/css-shadow-1/
 import silk.simd.u8x16
 import silk.simd.mask16
 import tokens { Span, TokenRange, TokenBuffer, Kind, Limits, CssError, CssErrorKind }
@@ -191,6 +194,20 @@ pub struct SelectorList {
   arms: List<Arm>,
   head: usize,
   maxDepth: usize,
+  validationOnly: bool,
+}
+
+// Parsing context only. CSSOM validation must not expose a matching AST or pretend
+// that an unresolved nesting selector has a context-independent specificity.
+enum PseudoElement {
+  None,
+  Other,
+  Generated,
+  FirstLetter,
+  TreeAbiding,
+  ElementBacked,
+  Slotted,
+  SearchText,
 }
 
 /// A necessary subject condition, not a substitute for matching the complete selector.
@@ -229,6 +246,7 @@ impl SelectorList {
       arms: move arms,
       head: self.head,
       maxDepth: self.maxDepth,
+      validationOnly: self.validationOnly,
     }
   }
 
@@ -500,6 +518,37 @@ pub effect fn parse(
 ) -> Option<SelectorList>
   ! CssError | OutOfMemoryError
   ? &mut Allocator {
+  return run parseWithMode(buffer, range, namespaces, limits, false, false)
+}
+
+// Nesting 1: & is legal outside nesting too; relative selector lists require a
+// nested style rule. No specificity is returned without the parent selector.
+pub effect fn validateCssom(
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  namespaces: &[NamespaceBinding],
+  limits: &Limits,
+  nested: bool,
+) -> bool
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = run parseWithMode(buffer, range, namespaces, limits, true, nested)
+  return match &parsed {
+    Option<SelectorList>.Some { value } => true
+    _ => false
+  }
+}
+
+effect fn parseWithMode(
+  buffer: &TokenBuffer,
+  range: TokenRange,
+  namespaces: &[NamespaceBinding],
+  limits: &Limits,
+  validationOnly: bool,
+  nested: bool,
+) -> Option<SelectorList>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
   if range.start > range.end || range.end > buffer.tokens.length() {
     return Option<SelectorList>.None
   }
@@ -512,6 +561,7 @@ pub effect fn parse(
     arms: List<Arm>.make(),
     head: NONE,
     maxDepth: limits.maxDepth,
+    validationOnly: validationOnly,
   }
   let parsed = run parseList(
     &mut ast,
@@ -521,10 +571,11 @@ pub effect fn parse(
     limits,
     0,
     false,
+    nested,
     false,
     false,
     false,
-    false,
+    PseudoElement.None,
   )
   if !parsed.valid {
     return Option<SelectorList>.None
@@ -545,6 +596,7 @@ effect fn parseList(
   insideHas: bool,
   subjectExempt: bool,
   compoundOnly: bool,
+  suffix: PseudoElement,
 ) -> Parsed
   ! CssError | OutOfMemoryError
   ? &mut Allocator {
@@ -568,6 +620,7 @@ effect fn parseList(
         insideHas,
         subjectExempt,
         compoundOnly,
+        suffix,
       )
       if !parsed.valid {
         if !forgiving {
@@ -655,6 +708,7 @@ effect fn parseArm(
   insideHas: bool,
   subjectExempt: bool,
   compoundOnly: bool,
+  suffix: PseudoElement,
 ) -> Parsed
   ! CssError | OutOfMemoryError
   ? &mut Allocator {
@@ -675,13 +729,16 @@ effect fn parseArm(
   }
   let mut specificity = zero()
   let mut count: usize = 0
-  let mut pseudoElement = false
+  let mut pseudoElement = suffix
   while at < range.end {
     count = count + 1
     if depth + count >= limits.maxDepth {
       fail CssError { kind: CssErrorKind.NestingLimit, offset: at }
     }
     let name = qualifiedName(buffer, at, range.end, bindings, false)
+    if suffix != PseudoElement.None && name.valid {
+      return rejected()
+    }
     let compound = ast.compounds.length()
     run ast.compounds.append(
       Compound {
@@ -708,8 +765,13 @@ effect fn parseArm(
     }
     while at < range.end && !whitespace(buffer, at, range.end)
       && combinator(buffer, at, range.end) == Combinator.None {
-      if pseudoElement {
-        return rejected()
+      if pseudoElement != PseudoElement.None {
+        match &buffer.tokens.asSlice()[at].kind {
+          Kind.Colon => {}
+          _ => {
+            return rejected()
+          }
+        }
       }
       match &buffer.tokens.asSlice()[at].kind {
         Kind.Hash { text, identifier } => {
@@ -721,6 +783,11 @@ effect fn parseArm(
           at = at + 1
         }
         Kind.Delim { scalar } => {
+          if scalar == 38 && ast.validationOnly {
+            run appendSimple(&mut ast.*, compound, Test.State { pseudo: Pseudo.Never })
+            at = at + 1
+            continue
+          }
           if scalar != 46 || at + 1 >= range.end {
             return rejected()
           }
@@ -775,19 +842,18 @@ effect fn parseArm(
           match &buffer.tokens.asSlice()[at].kind {
             Kind.Ident { text } => {
               let word = buffer.text(text)
-              let generated = tokens.insensitive(word, b"before")
-                || tokens.insensitive(word, b"after")
-                || tokens.insensitive(word, b"first-line")
-                || tokens.insensitive(word, b"first-letter")
-              if generated {
-                if depth != 0 || relative || insideHas {
+              let generated = legacyPseudoElement(word)
+              if doubled || generated {
+                let kind = pseudoElementKind(word)
+                if depth != 0 || insideHas || compoundOnly
+                  || !allowedPseudoElement(pseudoElement, kind, word) {
                   return rejected()
                 }
-                pseudoElement = true
+                pseudoElement = kind
                 specificity.types = specificity.types + 1
                 run appendSimple(&mut ast.*, compound, Test.State { pseudo: Pseudo.Never })
               } else {
-                if doubled {
+                if !allowedPseudoClass(pseudoElement, word, false) {
                   return rejected()
                 }
                 let state = pseudo(word)
@@ -804,7 +870,7 @@ effect fn parseArm(
               at = at + 1
             }
             Kind.Function { name: functionName } => {
-              if doubled {
+              if !doubled && !allowedPseudoClass(pseudoElement, buffer.text(functionName), true) {
                 return rejected()
               }
               let close = buffer.tokens.asSlice()[at].matching
@@ -812,22 +878,55 @@ effect fn parseArm(
                 || (close == range.end && !implicitEnd(buffer, close, range.end)) {
                 return rejected()
               }
-              let functional = run parseFunction(
-                &mut ast.*,
-                compound,
-                buffer,
-                functionName,
-                TokenRange { start: at + 1, end: close },
-                bindings,
-                limits,
-                depth + count,
-                insideHas,
-                compoundOnly,
-              )
-              if !functional.valid {
-                return rejected()
+              if doubled {
+                let word = buffer.text(functionName)
+                let kind = if tokens.insensitive(word, b"part") {
+                  PseudoElement.ElementBacked
+                } else if tokens.insensitive(word, b"slotted") {
+                  PseudoElement.Slotted
+                } else if tokens.insensitive(word, b"highlight") {
+                  PseudoElement.Other
+                } else {
+                  PseudoElement.None
+                }
+                if depth != 0 || insideHas || compoundOnly
+                  || !allowedPseudoElement(pseudoElement, kind, word) {
+                  return rejected()
+                }
+                let functional = run parsePseudoElementFunction(
+                  &mut ast.*,
+                  buffer,
+                  functionName,
+                  TokenRange { start: at + 1, end: close },
+                  bindings,
+                  limits,
+                  depth + count,
+                )
+                if !functional.valid {
+                  return rejected()
+                }
+                specificity = add(specificity, functional.specificity)
+                pseudoElement = kind
+                run appendSimple(&mut ast.*, compound, Test.State { pseudo: Pseudo.Never })
+              } else {
+                let functional = run parseFunction(
+                  &mut ast.*,
+                  compound,
+                  buffer,
+                  functionName,
+                  TokenRange { start: at + 1, end: close },
+                  bindings,
+                  limits,
+                  depth + count,
+                  insideHas,
+                  compoundOnly,
+                  pseudoElement,
+                )
+                if !functional.valid {
+                  return rejected()
+                }
+                specificity = add(specificity, functional.specificity)
               }
-              specificity = add(specificity, functional.specificity)
               at = if close < range.end {
                 close + 1
               } else {
@@ -860,7 +959,7 @@ effect fn parseArm(
     if compoundOnly {
       return rejected()
     }
-    if pseudoElement {
+    if pseudoElement != PseudoElement.None {
       return rejected()
     }
     relation = combinator(buffer, next, range.end)
@@ -1025,6 +1124,160 @@ effect fn parseAttribute(
   return true
 }
 
+fn legacyPseudoElement(word: &[u8]) -> bool {
+  return tokens.insensitive(word, b"before") || tokens.insensitive(word, b"after")
+    || tokens.insensitive(word, b"first-line")
+    || tokens.insensitive(word, b"first-letter")
+}
+
+fn pseudoElementKind(word: &[u8]) -> PseudoElement {
+  if tokens.insensitive(word, b"before") || tokens.insensitive(word, b"after") {
+    return PseudoElement.Generated
+  }
+  if tokens.insensitive(word, b"first-letter") {
+    return PseudoElement.FirstLetter
+  }
+  if tokens.insensitive(word, b"marker") || tokens.insensitive(word, b"placeholder")
+    || tokens.insensitive(word, b"backdrop")
+    || tokens.insensitive(word, b"interest-button") {
+    return PseudoElement.TreeAbiding
+  }
+  if tokens.insensitive(word, b"file-selector-button")
+    || tokens.insensitive(word, b"details-content") {
+    return PseudoElement.ElementBacked
+  }
+  if tokens.insensitive(word, b"search-text") {
+    return PseudoElement.SearchText
+  }
+  if tokens.insensitive(word, b"first-line") || tokens.insensitive(word, b"selection")
+    || tokens.insensitive(word, b"target-text")
+    || tokens.insensitive(word, b"spelling-error")
+    || tokens.insensitive(word, b"grammar-error")
+    || tokens.insensitive(word, b"prefix")
+    || tokens.insensitive(word, b"suffix") {
+    return PseudoElement.Other
+  }
+  return PseudoElement.None
+}
+
+fn allowedPseudoElement(previous: PseudoElement, next: PseudoElement, word: &[u8]) -> bool {
+  if next == PseudoElement.None {
+    return false
+  }
+  if tokens.insensitive(word, b"prefix") || tokens.insensitive(word, b"suffix") {
+    return previous == PseudoElement.FirstLetter
+  }
+  if previous == PseudoElement.None || previous == PseudoElement.ElementBacked {
+    return true
+  }
+  if previous == PseudoElement.Generated {
+    return tokens.insensitive(word, b"marker")
+  }
+  return previous == PseudoElement.Slotted
+    && (next == PseudoElement.Generated || next == PseudoElement.TreeAbiding
+      || next == PseudoElement.ElementBacked)
+}
+
+fn allowedPseudoClass(previous: PseudoElement, word: &[u8], functional: bool) -> bool {
+  if previous == PseudoElement.None || previous == PseudoElement.ElementBacked {
+    return true
+  }
+  if functional {
+    return tokens.insensitive(word, b"is") || tokens.insensitive(word, b"where")
+      || tokens.insensitive(word, b"not")
+  }
+  return tokens.insensitive(word, b"hover") || tokens.insensitive(word, b"active")
+    || tokens.insensitive(word, b"focus")
+    || tokens.insensitive(word, b"focus-visible")
+    || tokens.insensitive(word, b"focus-within")
+    || (previous == PseudoElement.SearchText && tokens.insensitive(word, b"current"))
+}
+
+fn customIdentifier(word: &[u8]) -> bool {
+  return !tokens.insensitive(word, b"initial") && !tokens.insensitive(word, b"inherit")
+    && !tokens.insensitive(word, b"unset")
+    && !tokens.insensitive(word, b"revert")
+    && !tokens.insensitive(word, b"revert-layer")
+    && !tokens.insensitive(word, b"default")
+}
+
+effect fn parsePseudoElementFunction(
+  ast: &mut SelectorList,
+  buffer: &TokenBuffer,
+  name: Span,
+  range: TokenRange,
+  bindings: &[NamespaceBinding],
+  limits: &Limits,
+  depth: usize,
+) -> Parsed
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let word = buffer.text(name)
+  let mut specificity = Specificity { ids: 0, classes: 0, types: 1 }
+  if tokens.insensitive(word, b"slotted") {
+    let parsed = run parseList(
+      &mut ast.*,
+      buffer,
+      range,
+      bindings,
+      limits,
+      depth,
+      false,
+      false,
+      false,
+      false,
+      true,
+      PseudoElement.None,
+    )
+    if !parsed.valid || parsed.head == NONE || ast.arms.asSlice()[parsed.head].next != NONE {
+      return rejected()
+    }
+    specificity = add(specificity, parsed.specificity)
+  } else if tokens.insensitive(word, b"part") {
+    let mut at = spaces(buffer, range.start, range.end)
+    if at == range.end {
+      return rejected()
+    }
+    while at < range.end {
+      match &buffer.tokens.asSlice()[at].kind {
+        Kind.Ident { text } => {}
+        _ => {
+          return rejected()
+        }
+      }
+      let next = spaces(buffer, at + 1, range.end)
+      if next < range.end && next == at + 1 {
+        return rejected()
+      }
+      at = next
+    }
+  } else if tokens.insensitive(word, b"highlight") {
+    let at = spaces(buffer, range.start, range.end)
+    if at == range.end || spaces(buffer, at + 1, range.end) != range.end {
+      return rejected()
+    }
+    match &buffer.tokens.asSlice()[at].kind {
+      Kind.Ident { text } => {
+        if !customIdentifier(buffer.text(text)) {
+          return rejected()
+        }
+      }
+      Kind.Delim { scalar } => {
+        if scalar != 42 {
+          return rejected()
+        }
+        specificity = zero()
+      }
+      _ => {
+        return rejected()
+      }
+    }
+  } else {
+    return rejected()
+  }
+  return Parsed { valid: true, head: NONE, specificity: specificity }
+}
+
 fn pseudo(word: &[u8]) -> Option<Pseudo> {
   if tokens.insensitive(word, b"host") {
     return Option<Pseudo>.Some { value: Pseudo.Host }
@@ -1070,7 +1323,23 @@ fn pseudo(word: &[u8]) -> Option<Pseudo> {
     || tokens.insensitive(word, b"enabled")
     || tokens.insensitive(word, b"disabled")
     || tokens.insensitive(word, b"checked")
-    || tokens.insensitive(word, b"indeterminate") {
+    || tokens.insensitive(word, b"indeterminate")
+    || tokens.insensitive(word, b"unchecked")
+    || tokens.insensitive(word, b"read-only")
+    || tokens.insensitive(word, b"read-write")
+    || tokens.insensitive(word, b"placeholder-shown")
+    || tokens.insensitive(word, b"default")
+    || tokens.insensitive(word, b"valid")
+    || tokens.insensitive(word, b"invalid")
+    || tokens.insensitive(word, b"in-range")
+    || tokens.insensitive(word, b"out-of-range")
+    || tokens.insensitive(word, b"required")
+    || tokens.insensitive(word, b"optional")
+    || tokens.insensitive(word, b"user-valid")
+    || tokens.insensitive(word, b"user-invalid")
+    || tokens.insensitive(word, b"autofill")
+    || tokens.insensitive(word, b"-webkit-autofill")
+    || tokens.insensitive(word, b"current") {
     return Option<Pseudo>.Some { value: Pseudo.Never }
   }
   return Option<Pseudo>.None
@@ -1087,6 +1356,7 @@ effect fn parseFunction(
   depth: usize,
   insideHas: bool,
   compoundOnly: bool,
+  suffix: PseudoElement,
 ) -> Parsed
   ! CssError | OutOfMemoryError
   ? &mut Allocator {
@@ -1110,6 +1380,7 @@ effect fn parseFunction(
       insideHas,
       false,
       true,
+      PseudoElement.None,
     )
     if !parsed.valid || parsed.head == NONE || ast.arms.asSlice()[parsed.head].next != NONE {
       return rejected()
@@ -1147,7 +1418,12 @@ effect fn parseFunction(
       has,
       insideHas || has,
       !has,
-      compoundOnly && !has,
+      (compoundOnly && !has) || (suffix != PseudoElement.None && !has),
+      if has {
+        PseudoElement.None
+      } else {
+        suffix
+      },
     )
     if !parsed.valid {
       return rejected()
@@ -1174,6 +1450,19 @@ effect fn parseFunction(
       } else {
         parsed.specificity
       },
+    }
+  }
+  if tokens.insensitive(word, b"dir") {
+    let at = spaces(buffer, range.start, range.end)
+    if (!ident(buffer, at, range.end, b"ltr") && !ident(buffer, at, range.end, b"rtl"))
+      || spaces(buffer, at + 1, range.end) != range.end {
+      return rejected()
+    }
+    run appendSimple(&mut ast.*, compound, Test.State { pseudo: Pseudo.Never })
+    return Parsed {
+      valid: true,
+      head: NONE,
+      specificity: Specificity { ids: 0, classes: 1, types: 0 },
     }
   }
   if tokens.insensitive(word, b"lang") {
@@ -1245,6 +1534,7 @@ effect fn parseFunction(
         insideHas,
         false,
         false,
+        PseudoElement.None,
       )
       if !parsed.valid {
         return rejected()
@@ -1268,10 +1558,10 @@ effect fn parseFunction(
   return rejected()
 }
 
-struct Formula {
-  valid: bool,
-  a: f64,
-  b: f64
+pub struct Formula {
+  pub valid: bool,
+  pub a: f64,
+  pub b: f64
 }
 
 impl Copy for Formula {}
@@ -1310,7 +1600,7 @@ fn unsignedInteger(buffer: &TokenBuffer, at: usize, end: usize) -> Option<f64> {
   }
 }
 
-fn nthFormula(buffer: &TokenBuffer, range: TokenRange) -> Formula {
+pub fn nthFormula(buffer: &TokenBuffer, range: TokenRange) -> Formula {
   let mut at = spaces(buffer, range.start, range.end)
   let mut end = range.end
   while end > at && whitespace(buffer, end - 1, end) {

@@ -1,0 +1,554 @@
+//! CSS Typed OM numeric objects. Arena handles preserve authored operation identity.
+pub import typed_om_numeric_types { NumericType, BaseType }
+import typed_om_numeric_types { combine }
+import typed_om_numeric_units { lookup, UnitInfo }
+import typed_om_numeric_parse as parsing
+import typed_om_numeric_sum as sums
+import typed_om_numeric_serialization as serialization
+import cssom_error { CssomError }
+import tokens { Limits, CssError, equal }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+
+pub struct NumericId {
+  pub index: usize
+}
+
+impl Copy for NumericId {}
+
+pub struct UnitValue {
+  pub value: f64,
+  pub unit: &'static [u8]
+}
+
+impl Copy for UnitValue {}
+
+pub enum NumericOperator {
+  Unit,
+  Sum,
+  Product,
+  Negate,
+  Invert,
+  Min,
+  Max,
+  Clamp
+}
+
+pub union Numberish {
+  Number { pub value: f64 },
+  Numeric { pub value: NumericId },
+}
+
+impl Copy for Numberish {}
+
+struct Node {
+  operator: NumericOperator,
+  value: UnitValue,
+  numericType: NumericType,
+  start: usize,
+  length: usize,
+}
+
+impl Copy for Node {}
+
+struct Origin {
+  id: NumericId,
+  text: Bytes,
+  valid: bool
+}
+
+pub struct NumericStore {
+  nodes: List<Node>,
+  edges: List<NumericId>,
+  origins: List<Origin>
+}
+
+impl NumericStore {
+  pub fn make() -> Self {
+    return Self {
+      nodes: List<Node>.make(),
+      edges: List<NumericId>.make(),
+      origins: List<Origin>.make(),
+    }
+  }
+
+  pub fn length(self: &Self) -> usize {
+    return self.nodes.length()
+  }
+
+  pub fn typeOf(self: &Self, id: NumericId) -> NumericType {
+    return self.nodes.asSlice()[id.index].numericType
+  }
+
+  pub fn operator(self: &Self, id: NumericId) -> NumericOperator {
+    return self.nodes.asSlice()[id.index].operator
+  }
+
+  pub fn children(self: &Self, id: NumericId) -> &[NumericId] {
+    let node = self.nodes.asSlice()[id.index]
+    return Slice.view<NumericId>(self.edges.asSlice(), node.start, node.length)
+  }
+
+  pub fn unitValue(self: &Self, id: NumericId) -> Option<UnitValue> {
+    let node = self.nodes.asSlice()[id.index]
+    if node.operator != NumericOperator.Unit {
+      return Option<UnitValue>.None
+    }
+    return Option<UnitValue>.some(node.value)
+  }
+
+  pub effect fn unit(self: &mut Self, value: f64, unit: &[u8]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let info = match &lookup(unit) {
+      Option<UnitInfo>.Some { value: found } => found
+      _ => {
+        fail CssomError.TypeError
+      }
+    }
+    if !f64.isFinite(value) {
+      fail CssomError.TypeError
+    }
+    return run self.literal(value, info)
+  }
+
+  // Parsing math constants and arithmetic can produce non-finite IEEE values.
+  pub effect fn literal(self: &mut Self, value: f64, info: UnitInfo) -> NumericId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = NumericId { index: self.nodes.length() }
+    run self.nodes.append(
+      Node {
+        operator: NumericOperator.Unit,
+        value: UnitValue { value: value, unit: info.name },
+        numericType: info.numericType,
+        start: 0,
+        length: 0,
+      },
+    )
+    return id
+  }
+
+  pub effect fn setUnitValue(self: &mut Self, id: NumericId, value: f64) -> ()
+    ! CssomError {
+    if self.operator(id) != NumericOperator.Unit || !f64.isFinite(value) {
+      fail CssomError.TypeError
+    }
+    let nodes = self.nodes.asMutSlice()
+    nodes[id.index].value.value = value
+    let mut i: usize = 0
+    while i < self.origins.length() {
+      if self.contains(self.origins.asSlice()[i].id, id) {
+        let origins = self.origins.asMutSlice()
+        origins[i].valid = false
+      }
+      i = i + 1
+    }
+  }
+
+  pub effect fn rectify(self: &mut Self, value: Numberish) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &value {
+      Numberish.Number { value: number } => run self.unit(number, b"number")
+      Numberish.Numeric { value: id } => id
+    }
+  }
+
+  pub effect fn construct(
+    self: &mut Self,
+    operator: NumericOperator,
+    values: &[NumericId],
+  ) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if values.length == 0 {
+      fail CssomError.SyntaxError
+    }
+    if operator == NumericOperator.Unit {
+      fail CssomError.TypeError
+    }
+    if (operator == NumericOperator.Negate || operator == NumericOperator.Invert)
+      && values.length != 1 {
+      fail CssomError.TypeError
+    }
+    if operator == NumericOperator.Clamp && values.length != 3 {
+      fail CssomError.TypeError
+    }
+    let mut numericType = self.typeOf(values[0])
+    let mut i: usize = 1
+    while i < values.length {
+      numericType = run combine(
+        numericType,
+        self.typeOf(values[i]),
+        operator == NumericOperator.Product,
+      )
+      i = i + 1
+    }
+    if operator == NumericOperator.Invert {
+      numericType = numericType.inverted()
+    }
+    let start = self.edges.length()
+    run self.edges.appendSlice(values)
+    let id = NumericId { index: self.nodes.length() }
+    run self.nodes.append(
+      Node {
+        operator: operator,
+        value: UnitValue { value: 0.0, unit: b"number" },
+        numericType: numericType,
+        start: start,
+        length: values.length,
+      },
+    )
+    return id
+  }
+
+  pub effect fn mathSum(self: &mut Self, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Sum, values)
+  }
+
+  pub effect fn mathProduct(self: &mut Self, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Product, values)
+  }
+
+  pub effect fn mathMin(self: &mut Self, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Min, values)
+  }
+
+  pub effect fn mathMax(self: &mut Self, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Max, values)
+  }
+
+  pub effect fn mathNegate(self: &mut Self, value: NumericId) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Negate, &[value])
+  }
+
+  pub effect fn mathInvert(self: &mut Self, value: NumericId) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Invert, &[value])
+  }
+
+  pub effect fn mathClamp(
+    self: &mut Self,
+    lower: NumericId,
+    value: NumericId,
+    upper: NumericId,
+  ) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.construct(NumericOperator.Clamp, &[lower, value, upper])
+  }
+
+  pub effect fn negate(self: &mut Self, id: NumericId) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.operator(id) == NumericOperator.Negate {
+      return self.children(id)[0]
+    }
+    match &self.unitValue(id) {
+      Option<UnitValue>.Some { value } => {
+        let info = match &lookup(value.unit) {
+          Option<UnitInfo>.Some { value: found } => found
+          _ => {
+            fail CssomError.TypeError
+          }
+        }
+        return run self.literal(-value.value, info)
+      }
+      _ => {
+        return run self.mathNegate(id)
+      }
+    }
+  }
+
+  pub effect fn invert(self: &mut Self, id: NumericId) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.operator(id) == NumericOperator.Invert {
+      return self.children(id)[0]
+    }
+    match &self.unitValue(id) {
+      Option<UnitValue>.Some { value } => {
+        if equal(value.unit, b"number") {
+          if value.value == 0.0 {
+            fail CssomError.RangeError
+          }
+          let info = match &lookup(b"number") {
+            Option<UnitInfo>.Some { value: found } => found
+            _ => {
+              fail CssomError.TypeError
+            }
+          }
+          return run self.literal(1.0 / value.value, info)
+        }
+      }
+      _ => {}
+    }
+    return run self.mathInvert(id)
+  }
+
+  effect fn arithmetic(
+    self: &mut Self,
+    id: NumericId,
+    values: &[NumericId],
+    operator: NumericOperator,
+    inverse: bool,
+  ) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut args = List<NumericId>.make()
+    if self.operator(id) == operator {
+      run args.appendSlice(self.children(id))
+    } else {
+      run args.append(id)
+    }
+    let mut i: usize = 0
+    while i < values.length {
+      let next = if inverse {
+        if operator == NumericOperator.Sum {
+          run self.negate(values[i])
+        } else {
+          run self.invert(values[i])
+        }
+      } else {
+        values[i]
+      }
+      run args.append(next)
+      i = i + 1
+    }
+    let mut simple = true
+    let mut result: f64 = 0.0
+    let mut unit: &'static [u8] = b"number"
+    let mut dimensions: usize = 0
+    i = 0
+    while i < args.length() {
+      match &self.unitValue(args.asSlice()[i]) {
+        Option<UnitValue>.Some { value } => {
+          if operator == NumericOperator.Product {
+            if !equal(value.unit, b"number") {
+              dimensions = dimensions + 1
+              unit = value.unit
+            }
+            result = if i == 0 {
+              value.value
+            } else {
+              result * value.value
+            }
+          } else {
+            if i == 0 {
+              unit = value.unit
+              result = value.value
+            } else {
+              if !equal(unit, value.unit) {
+                simple = false
+              }
+              if operator == NumericOperator.Sum {
+                result = result + value.value
+              } else if operator == NumericOperator.Min {
+                result = sums.minimum(result, value.value)
+              } else {
+                result = sums.maximum(result, value.value)
+              }
+            }
+          }
+        }
+        _ => {
+          simple = false
+        }
+      }
+      i = i + 1
+    }
+    if simple && dimensions <= 1 {
+      let info = match &lookup(unit) {
+        Option<UnitInfo>.Some { value: found } => found
+        _ => {
+          fail CssomError.TypeError
+        }
+      }
+      return run self.literal(result, info)
+    }
+    return run self.construct(operator, args.asSlice())
+  }
+
+  pub effect fn add(self: &mut Self, id: NumericId, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.arithmetic(id, values, NumericOperator.Sum, false)
+  }
+
+  pub effect fn sub(self: &mut Self, id: NumericId, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.arithmetic(id, values, NumericOperator.Sum, true)
+  }
+
+  pub effect fn mul(self: &mut Self, id: NumericId, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.arithmetic(id, values, NumericOperator.Product, false)
+  }
+
+  pub effect fn div(self: &mut Self, id: NumericId, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.arithmetic(id, values, NumericOperator.Product, true)
+  }
+
+  pub effect fn min(self: &mut Self, id: NumericId, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.arithmetic(id, values, NumericOperator.Min, false)
+  }
+
+  pub effect fn max(self: &mut Self, id: NumericId, values: &[NumericId]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.arithmetic(id, values, NumericOperator.Max, false)
+  }
+
+  pub fn equalValue(self: &Self, left: NumericId, right: NumericId) -> bool {
+    let a = self.nodes.asSlice()[left.index]
+    let b = self.nodes.asSlice()[right.index]
+    if a.operator != b.operator || a.length != b.length {
+      return false
+    }
+    if a.operator == NumericOperator.Unit {
+      return a.value.value == b.value.value && equal(a.value.unit, b.value.unit)
+    }
+    let mut i: usize = 0
+    while i < a.length {
+      if !self.equalValue(self.edges.asSlice()[a.start + i], self.edges.asSlice()[b.start + i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  pub fn equals(self: &Self, id: NumericId, values: &[NumericId]) -> bool {
+    let mut i: usize = 0
+    while i < values.length {
+      if !self.equalValue(id, values[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  pub effect fn cloneFrom(self: &mut Self, source: &Self, id: NumericId) -> NumericId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let original = source.nodes.asSlice()[id.index]
+    let mut args = List<NumericId>.make()
+    let mut i: usize = 0
+    while i < original.length {
+      let child = run self.cloneFrom(source, source.edges.asSlice()[original.start + i])
+      run args.append(child)
+      i = i + 1
+    }
+    let mut node = original
+    node.start = self.edges.length()
+    run self.edges.appendSlice(args.asSlice())
+    let result = NumericId { index: self.nodes.length() }
+    run self.nodes.append(node)
+    let mut originIndex: usize = 0
+    while originIndex < source.origins.length() {
+      let origin = &source.origins.asSlice()[originIndex]
+      if origin.valid && origin.id.index == id.index {
+        let mut text = Bytes.make()
+        run text.append(origin.text.asSlice())
+        run self.origins.append(Origin { id: result, text: move text, valid: true })
+        break
+      }
+      originIndex = originIndex + 1
+    }
+    return result
+  }
+
+  pub effect fn parse(self: &mut Self, text: &[u8], limits: &Limits) -> NumericId
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    let id = run parsing.parse(&mut self.*, text, limits)
+    let mut original = Bytes.make()
+    run original.append(text)
+    run self.origins.append(Origin { id: id, text: move original, valid: true })
+    return id
+  }
+
+  pub effect fn parseCanonical(self: &mut Self, text: &[u8], limits: &Limits) -> NumericId
+    ! CssomError | CssError | OutOfMemoryError
+    ? &mut Allocator {
+    return run parsing.parse(&mut self.*, text, limits)
+  }
+
+  pub fn clearOrigin(self: &mut Self, id: NumericId) -> () {
+    let mut i: usize = 0
+    while i < self.origins.length() {
+      if self.origins.asSlice()[i].id.index == id.index {
+        let origins = self.origins.asMutSlice()
+        origins[i].valid = false
+      }
+      i = i + 1
+    }
+  }
+
+  fn contains(self: &Self, root: NumericId, id: NumericId) -> bool {
+    if root.index == id.index {
+      return true
+    }
+    let children = self.children(root)
+    let mut i: usize = 0
+    while i < children.length {
+      if self.contains(children[i], id) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub effect fn serialize(self: &Self, id: NumericId) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.origins.length() {
+      let origin = &self.origins.asSlice()[i]
+      if origin.valid && origin.id.index == id.index {
+        let mut result = Bytes.make()
+        run result.append(origin.text.asSlice())
+        return move result
+      }
+      i = i + 1
+    }
+    return run serialization.serialize(self, id)
+  }
+
+  pub effect fn to(self: &Self, id: NumericId, unit: &[u8]) -> UnitValue
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run sums.to(self, id, unit)
+  }
+
+  pub effect fn toSum(self: &mut Self, id: NumericId, units: &[&[u8]]) -> NumericId
+    ! CssomError | OutOfMemoryError
+    ? &mut Allocator {
+    return run sums.toSum(&mut self.*, id, units)
+  }
+}

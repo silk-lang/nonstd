@@ -143,9 +143,9 @@ input against the last frame's layout, and the changes show at the next frame
 (`tree.needsFrame()` says whether one is due).
 
 - **Hit testing** walks the fragments topmost first (later siblings and children paint on top),
-  skips descendants outside a clipping box's padding box, and skips nodes with
-  `pointer-events: none` (not inherited) or `visibility: hidden`. Text is never a target: its
-  element is, as in the DOM. `tree.hitTest(x, y)` answers the same question for clients.
+  applies overflow clipping per axis against the padding box, and skips nodes with
+  `pointer-events: none` (not inherited by native `Style`) or `visibility: hidden`. Text is never
+  a target: its element is, as in the DOM. `tree.hitTest(x, y)` and CSSOM View use the same walk.
 - **Hover and active.** The hit node and its ancestors are hovered; pressing the primary button
   makes the pressed node and its ancestors active. Their `Hover` and `Active` looks apply, and
   enter and leave records go to listeners (leave deepest first, enter outermost first). Hover
@@ -166,15 +166,39 @@ input against the last frame's layout, and the changes show at the next frame
   checkbox, radio, switch, menu item, tab or option queue a click with click count 0.
 - **Scrolling.** Boxes with `overflow: auto` or `scroll` on an axis scroll with the wheel. Each
   axis of a wheel delta goes to the nearest container that can still move that way, and the
-  rest goes outwards, so nested scroll boxes work. `hidden` scrolls only by mutation:
-  `ScrollTo` (clamped at the next frame) and `ScrollIntoView` (the least scroll that shows the
-  node, through every container around it). Offsets reach css-layout, which moves the
-  fragments; `tree.scrollOffset(id)`, `info` and `describe` report them, and listeners get
-  `Scroll` records with the new offset. Scroll containers with something to scroll draw
-  overlay thumbs that take no space and can be dragged.
+  rest goes outwards, so nested scroll boxes work. `hidden` allows programmatic scrolling:
+  `ScrollTo` (clamped at the next frame), `ScrollIntoView`, and the `cssom_view` scroll APIs.
+  Nearest alignment leaves an oversized target alone when it already covers the scrollport.
+  Fractional scroll offsets move scene groups, hit targets, and geometry queries together
+  without requiring relayout. `tree.scrollOffset(id)`, `info`, and `describe` report them,
+  and listeners get `Scroll` records with the new offset. Scroll containers with something
+  to scroll draw overlay thumbs that take no space and can be dragged.
 - **Records** for pointer down, up, move, click, wheel and keys are queued when the target or any
   node on its path listens (they bubble, client side). Enter, leave, focus, blur and scroll are
   queued only for a target that listens itself.
+
+## CSSOM View
+
+`ui_tree.cssom_view` adapts the shared `css/style` View algorithms to this tree:
+
+- `elementFromPoint` and `elementsFromPoint` use the input hit traversal, including actual
+  clipping, sticky offsets, and pointer-event eligibility. Viewport/root fallback is applied
+  by the View API rather than changing input dispatch.
+- `getClientRects` and `getBoundingClientRect` report rendered border-box fragments in CSS
+  pixels; anonymous input/text internals are not extra element boxes.
+- `NativeGeometry` supplies box quads and coordinate conversion from actual layout.
+- Client, scroll, and offset metrics use the layout and scroll ranges already used by input.
+- Caret and range geometry use shaped glyph positions; returned DOM text offsets are UTF-16,
+  not the UTF-8 byte offsets used by the editing implementation.
+- `scroll`, `scrollTo`, `scrollBy`, and `scrollIntoView` support immediate and smooth requests.
+  The tree owns pending requests and completion/interruption state. Feed monotonically
+  increasing `FrameInput.time` and keep drawing while `needsFrame()` is true; smooth movement
+  uses a 250 ms ease-out. Wheel, pointer-down, and key-down input interrupt pending motion.
+
+Call geometry APIs after current layout has been produced. This adapter does not add a CSS
+parser-to-`Style` bridge, browser browsing contexts, general element transforms, or
+`content-visibility` to the renderer. Unsupported host features are not represented by
+fabricated geometry.
 
 ## Text editing
 
@@ -293,6 +317,8 @@ python3 ui/tree/demo/scripts/demo [check]
 - `scripts/test-browser` builds `browser/` for wasm32 and draws the trees with ui_renderer on
   `navigator.gpu` in the installed Chromium, RGBA8 and BGRA8, against the CPU reference of the
   same frame, with examples/graphics-demo's limits (max 96, at most 0.2% of channels over 8, mean 0.25).
+  The inbox receives a fractional `60.25px` wheel scroll before rendering, exercising retained
+  scroll placement through the input/hit-testing path.
   On SwiftShader both trees stay under a mean of 0.07; the largest difference (75) is on the
   edge of the form's link underline.
 
@@ -326,7 +352,7 @@ the wasm build draw the same bytes.
 `demo/` (`scripts/demo --editor` for the editor fixture, the place to try an input method)
 is the inbox in a native window (native/platform/window, ui_renderer on Dawn) and a tiny client:
 it reads the records and answers with mutations (New appends a row and scrolls it into view,
-Archive removes the focused row). `scripts/demo check` scripts a hover, a wheel and a Tab, reads
-the surface back and compares it with the CPU reference, on X11 and Wayland under Xvfb and
-Weston with lavapipe.
+Archive removes the focused row). `scripts/demo check` scripts a hover, a fractional wheel
+scroll, and a Tab, then reads the surface back and compares it with the CPU reference,
+on X11 and Wayland under Xvfb and Weston with lavapipe.
 
