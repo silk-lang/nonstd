@@ -10,8 +10,8 @@ Packages are grouped into layers in [`layers.toml`](layers.toml). A package may 
 own layer or a lower one, and layers of the same rank may not depend on each other, so each layer
 could later move to a repository of its own. `python3 scripts/check-layers` reports violations,
 and CI fails on them. Top-level folders follow the layers: `native` (GPU and windows), `graphics`,
-`fonts`, `css`, `svg`, `ui` and `examples`, plus the standalone `packages/cli`, `text/xml`, `db`
-and `crdt`. Inside a library, helpers live in `tests`, `bench` and `tools/<name>`.
+`fonts`, `css`, `svg`, `ui` and `examples`, plus the standalone `text/xml`, `db` and
+`crdt`. Inside a library, helpers live in `tests`, `bench` and `tools/<name>`.
 
 ## Libraries
 
@@ -25,11 +25,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 
 | Path | Package | What it is | Helpers |
 | --- | --- | --- | --- |
-| [`packages/cli`](packages/cli) | `cli` | Declarative command-line parsing, planned during compilation |  |
 | [`text/xml`](text/xml) | `text-xml` | A namespace-aware, non-validating XML 1.0 parser | `conformance` |
-| [`examples/git`](examples/git) | `git` | | |
-| [`examples/greet`](examples/greet) | `greet` | | |
-| [`examples/serve`](examples/serve) | `serve` | | |
 
 ### data
 
@@ -126,9 +122,10 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 
 <!-- package-index:end -->
 
-`text/xml` and `packages/cli` are headed for the standard library. The Unicode library that
-lived in `text/ucd` is now part of the standard library as `silk.text`. Programs that use `cli`
-are in [`examples`](examples).
+`text/xml` is headed for the standard library. The command-line library that lived in
+`packages/cli` is now part of the standard library as `silk.cli`; its `greet`, `git` and
+`serve` examples moved to the Silk repository as `examples/cli-*`. The Unicode library that
+lived in `text/ucd` is now part of the standard library as `silk.text`.
 
 ## Working in the workspace
 
@@ -190,8 +187,6 @@ Commands run from the root unless a README says otherwise:
 
 ```sh
 silk build --package svg-cli
-silk test --manifest-path packages/cli/silk.toml --root src/tests.silk
-silk run --manifest-path examples/greet/silk.toml -- --name Julia --times 2
 ```
 
 Each area has its own gate script and CI workflow, for example
