@@ -90,7 +90,8 @@ grouped flags) for complete programs.
 - `Opt.about("help")` or `Opt.plain()` starts the description of a field; `Opt.short`, `Opt.long`,
   `Opt.required`, `Opt.choice`, `Opt.env`, `Opt.default`, and `Opt.check` add to it.
   `Command.option` reads the field as a named option, `Command.arg` as a positional argument, and
-  `Command.subcommand` as a subcommand. For a union, these name the fields of any of its variants,
+  `Command.subcommand` as a subcommand. A field whose description gives no help text shows the
+  first line of its `///` comment instead. For a union, these name the fields of any of its variants,
   and `Command.variant` gives a variant its help text.
 - A field the command line does not give takes its `Opt.env` variable, then its `Opt.default`,
   then the empty value of its type (`ArgValue.initial`: empty text, zero, `false`, `none`, or an
