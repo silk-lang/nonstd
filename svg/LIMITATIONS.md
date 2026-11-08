@@ -1,6 +1,6 @@
 # SVG implementation limitations
 
-Current workspace toolchain: Silk `0.1.0-dev.58+9840d5811e54`. No compiler or stdlib patches. Versioned observations below retain the toolchain used for their original reports.
+Current workspace toolchain: Silk `0.1.0-dev.61+91f335268900`. No compiler or stdlib patches. Versioned observations below retain the toolchain used for their original reports.
 This file records implementation workarounds, not the unimplemented SVG coverage
 listed in [SPECIFICATIONS.md](SPECIFICATIONS.md).
 
