@@ -1,0 +1,384 @@
+//! Composed counters: keyed child Blocks, service-backed construction and parent requests.
+//!
+//! The parent stores child models and addresses. Its implementation holds one binding
+//! to a replaceable counter implementation. Commands load initial values after creation;
+//! removed children reject late results. The same model runs in a Story or native runtime.
+import ui_app.block { Block, BlockContext, Layer }
+import ui_app.binding { Binding, Children, Routed, Address }
+import ui_app.app { Perform, Subscriptions }
+import ui_app.ui { Ui }
+import ui_app.update as Update
+import silk.core.ownership { Copy }
+
+/// Counter application state, independent of its implementation.
+pub struct Counter {
+  /// The currently displayed value.
+  pub count: i64,
+  /// The value observed immediately before the most recent change.
+  pub previous: i64,
+}
+
+impl Copy for Counter {}
+
+/// Local counter events and command results.
+pub union CounterMessage {
+  /// The increment button was clicked.
+  Increment,
+  /// The initial command completed.
+  Loaded { pub count: i64 },
+  /// The child's timer fired.
+  Tick,
+}
+
+/// Parent requests and notifications, separate from local counter events.
+pub union CounterInput {
+  /// Clears the counter.
+  RequestedClear,
+  /// Replaces the displayed value with a parent-provided value.
+  InformedOfValue { pub count: i64 },
+}
+
+/// A notification emitted when the displayed count changes.
+pub struct CounterOutput {
+  /// The new count.
+  pub count: i64,
+}
+
+/// Deferred work that loads a counter's initial value.
+pub struct CounterCommand {
+  /// The value to deliver after initialization.
+  pub count: i64,
+}
+
+impl Perform<CounterMessage, never ? never> for CounterCommand {
+  effect fn perform(self: Self) -> CounterMessage {
+    return CounterMessage.Loaded { count: self.count }
+  }
+}
+
+/// The complete public counter contract used by parent implementations.
+pub type CounterBlock = Block<
+  Counter,
+  CounterMessage,
+  CounterInput,
+  CounterOutput,
+  CounterCommand,
+  i64
+>
+
+/// A counter binding using any implementation of `CounterBlock`.
+pub type CounterBinding<B> = Binding<
+  B,
+  Counter,
+  CounterMessage,
+  CounterInput,
+  CounterOutput,
+  CounterCommand,
+  i64
+>
+
+/// Construction-time settings supplied by the host or a test.
+pub service CounterSettings {
+  /// Returns the increment amount used by newly constructed implementations.
+  effect fn step() -> i64 ? &CounterSettings
+}
+
+/// The production counter implementation, containing configuration rather than model state.
+pub struct CounterImplementation {
+  /// The amount added by each increment or timer event.
+  pub step: i64,
+}
+
+/// A construction Layer that reads counter settings from a Silk service.
+pub struct CounterLayer {}
+
+impl Layer<CounterImplementation, never ? &CounterSettings> for CounterLayer {
+  effect fn build(self: Self) -> CounterImplementation
+    ? &CounterSettings {
+    return CounterImplementation { step: run CounterSettings.step() }
+  }
+}
+
+impl CounterBlock for CounterImplementation {
+  fn init(self: &Self, args: i64, cx: &mut BlockContext<CounterCommand, CounterOutput>) -> Counter {
+    cx.command(CounterCommand { count: args })
+    return Counter { count: 0, previous: 0 }
+  }
+
+  fn update(
+    self: &Self,
+    model: &mut Counter,
+    message: CounterMessage,
+    cx: &mut BlockContext<CounterCommand, CounterOutput>,
+  ) -> () {
+    Update.observe(
+      &mut model,
+      &message,
+      &mut cx,
+      |state| state.count,
+      |state, event, outputs| {
+        match &event.* {
+          CounterMessage.Increment => {
+            state.count = state.count + self.step
+          }
+          CounterMessage.Loaded { count } => {
+            state.count = count
+          }
+          CounterMessage.Tick => {
+            state.count = state.count + self.step
+          }
+        }
+      },
+      |before, state, event, outputs| {
+        if before != state.count {
+          state.previous = before
+          outputs.emit(CounterOutput { count: state.count })
+        }
+      },
+    )
+  }
+
+  fn receive(
+    self: &Self,
+    model: &mut Counter,
+    message: CounterInput,
+    cx: &mut BlockContext<CounterCommand, CounterOutput>,
+  ) -> () {
+    let before = model.count
+    match move message {
+      CounterInput.RequestedClear => {
+        model.count = 0
+      }
+      CounterInput.InformedOfValue { count } => {
+        model.count = count
+      }
+    }
+    if before != model.count {
+      model.previous = before
+      cx.emit(CounterOutput { count: model.count })
+    }
+  }
+
+  fn view(self: &Self, model: &Counter, ui: &mut Ui<CounterMessage>) -> () {
+    ui.row(
+      |ui| {
+        ui.gap(8.0)
+        ui.number(model.count)
+        ui.button("Increment", || CounterMessage.Increment)
+      },
+    )
+  }
+
+  fn subscriptions(self: &Self, model: &Counter, subs: &mut Subscriptions<CounterMessage>) -> () {
+    subs.every(1, 1.0, |time| CounterMessage.Tick)
+  }
+}
+
+/// State for a collection of independently addressed counters.
+pub struct Counters {
+  /// Children in their current view order.
+  pub children: Children<Counter>,
+  /// The next stable child key.
+  pub nextKey: u64,
+  /// The number of child change notifications folded into this parent.
+  pub notifications: u64,
+}
+
+/// Parent local events, including child message envelopes.
+pub union Message {
+  /// Appends a counter with an initial value of ten.
+  Add,
+  /// Removes the child with the supplied stable key.
+  Remove { pub key: u64 },
+  /// Delivers a local child event or command result.
+  Child { pub message: Routed<CounterMessage> },
+  /// Requests that one live child clear its model.
+  Clear { pub address: Address },
+}
+
+/// Requests accepted by a counters collection from its own parent.
+pub union InMessage {
+  /// Clears every present child through its public input channel.
+  RequestedClearAll,
+}
+
+/// A parent command that retains the child occurrence through execution.
+pub struct Command {
+  /// The child command and the occurrence that produced it.
+  pub child: Routed<CounterCommand>,
+}
+
+impl Perform<Message, never ? never> for Command {
+  effect fn perform(self: Self) -> Message {
+    return Message.Child {
+      message: run Perform<Routed<CounterMessage>, never, never>.perform(move self.child),
+    }
+  }
+}
+
+/// The public contract of the composed parent.
+pub type CountersBlock = Block<Counters, Message, InMessage, never, Command, ()>
+
+/// A parent implementation whose child implementation is selected at construction.
+pub struct CountersImplementation<B> {
+  /// The child relationship shared by every counter occurrence.
+  pub counter: CounterBinding<B>,
+}
+
+impl<B: CounterBlock> CountersBlock for CountersImplementation<B> {
+  fn init(self: &Self, args: (), cx: &mut BlockContext<Command, never>) -> Counters {
+    let mut model = Counters { children: Children<Counter>.make(), nextKey: 2, notifications: 0 }
+    let mut notifications: u64 = 0
+    drop self.counter.append(
+      &mut model.children,
+      1,
+      10,
+      &mut cx,
+      |command| Command { child: move command },
+      |out, target| {
+        notifications = notifications + 1
+      },
+    )
+    model.notifications = notifications
+    return move model
+  }
+
+  fn update(
+    self: &Self,
+    model: &mut Counters,
+    message: Message,
+    cx: &mut BlockContext<Command, never>,
+  ) -> () {
+    let mut notifications: u64 = 0
+    match move message {
+      Message.Add => {
+        let key = model.nextKey
+        model.nextKey = model.nextKey + 1
+        drop self.counter.append(
+          &mut model.children,
+          key,
+          10,
+          &mut cx,
+          |command| Command { child: move command },
+          |out, target| {
+            notifications = notifications + 1
+          },
+        )
+      }
+      Message.Remove { key } => {
+        drop model.children.remove(key)
+      }
+      Message.Child { message: child } => {
+        drop self.counter.messageIn(
+          &mut model.children,
+          move child,
+          &mut cx,
+          |command| Command { child: move command },
+          |out, target| {
+            notifications = notifications + 1
+          },
+        )
+      }
+      Message.Clear { address } => {
+        drop self.counter.receiveIn(
+          &mut model.children,
+          Routed<CounterInput> { address: address, value: CounterInput.RequestedClear },
+          &mut cx,
+          |command| Command { child: move command },
+          |out, target| {
+            notifications = notifications + 1
+          },
+        )
+      }
+    }
+    model.notifications = model.notifications + notifications
+  }
+
+  fn receive(
+    self: &Self,
+    model: &mut Counters,
+    message: InMessage,
+    cx: &mut BlockContext<Command, never>,
+  ) -> () {
+    match move message {
+      InMessage.RequestedClearAll => {
+        let mut i: usize = 0
+        while i < model.children.length() {
+          let address = model.children.asSlice()[i].address
+          self.update(&mut model, Message.Clear { address: address }, &mut cx)
+          i = i + 1
+        }
+      }
+    }
+  }
+
+  fn view(self: &Self, model: &Counters, ui: &mut Ui<Message>) -> () {
+    ui.column(
+      |ui| {
+        ui.gap(8.0)
+        ui.button("Add counter", || Message.Add)
+        ui.each(
+          model.children.asSlice(),
+          |child| child.address.generation,
+          |ui, child| {
+            ui.column(
+              |ui| {
+                self.counter.view(
+                  &child.model,
+                  &mut ui,
+                  |message| Message.Child {
+                    message: Routed<CounterMessage> { address: child.address, value: move message },
+                  },
+                )
+                ui.button("Clear", || Message.Clear { address: child.address })
+                ui.button("Remove", || Message.Remove { key: child.address.key })
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
+  fn subscriptions(self: &Self, model: &Counters, subs: &mut Subscriptions<Message>) -> () {
+    let children = model.children.asSlice()
+    let mut i: usize = 0
+    while i < children.length {
+      let child = &children[i]
+      self.counter.subscriptions(
+        &child.model,
+        &mut subs,
+        |key| child.address.generation,
+        |message| Message.Child {
+          message: Routed<CounterMessage> { address: child.address, value: move message },
+        },
+      )
+      i = i + 1
+    }
+  }
+}
+
+/// Constructs a parent and its child binding using the host's counter-settings service.
+pub struct CountersLayer {}
+
+impl Layer<
+  CountersImplementation<CounterImplementation>,
+  never
+  ? &CounterSettings
+> for CountersLayer {
+  effect fn build(self: Self) -> CountersImplementation<CounterImplementation>
+    ? &CounterSettings {
+    let counter = run Layer<CounterImplementation, never, &CounterSettings>.build(CounterLayer {})
+    return CountersImplementation<CounterImplementation> {
+      counter: Binding<
+        CounterImplementation,
+        Counter,
+        CounterMessage,
+        CounterInput,
+        CounterOutput,
+        CounterCommand,
+        i64
+      >.make(1, move counter),
+    }
+  }
+}

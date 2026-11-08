@@ -1,0 +1,187 @@
+//! Typed UI Blocks with separate models, implementations and parent messages.
+//!
+//! A `Block` implements one public contract. Construct implementations with Silk
+//! effects, then pass them to `Instance` or `Binding`. Models own application state;
+//! implementations own shared dependencies. Updates collect commands and outgoing
+//! messages in `BlockContext`. Commands run after the complete parent transition.
+import app { App, Context, Subscriptions }
+import ui { Ui }
+import runtime { Runtime }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// The public contract of an independently implemented UI Block.
+///
+/// `S` is the model, `M` the local message, `I` the parent message, `O` the outgoing
+/// message, `C` the command, and `A` the initialization arguments. Use `never` for
+/// absent message channels. Implementations must keep application state in `S`.
+/// Use exhaustive matches for `M` and `I`; effects belong in construction or commands.
+pub interface Block<S, M, I, O, C, A> {
+  /// Creates a model and records its initial commands and outgoing messages.
+  fn init(self: &Self, args: A, cx: &mut BlockContext<C, O>) -> S
+
+  /// Applies a local event or completed command to the model.
+  fn update(self: &Self, model: &mut S, message: M, cx: &mut BlockContext<C, O>) -> ()
+
+  /// Applies a request or notification from the parent, separately from local events.
+  fn receive(self: &Self, model: &mut S, message: I, cx: &mut BlockContext<C, O>) -> ()
+
+  /// Describes the model's UI for rendering and event delivery.
+  fn view(self: &Self, model: &S, ui: &mut Ui<M>) -> ()
+
+  /// Describes active subscriptions; the default has no subscriptions.
+  fn subscriptions(self: &Self, model: &S, subs: &mut Subscriptions<M>) -> () {
+    return ()
+  }
+}
+
+/// Effectful construction of a Block implementation with typed errors and services.
+///
+/// Build child implementations here and inject their bindings into the parent.
+/// Silk's `Effect.provide` and `Effect.provideMut` select service providers. Owned
+/// implementation resources follow Silk ownership and are dropped with the instance.
+/// Construction does not initialize any application model.
+pub interface Layer<B, E, ? R> {
+  /// Acquires an implementation using the services in `R`, or fails with `E`.
+  effect fn build(self: Self) -> B ! E ? R
+}
+
+/// Commands and parent notifications produced by a Block transition.
+///
+/// Commands and outgoing messages each retain insertion order. Bindings transfer
+/// commands first and then fold outgoing messages into the parent transition.
+/// Outgoing messages from a root remain available on its instance.
+pub struct BlockContext<C, O> {
+  /// Deferred commands and allocation for the current transition.
+  pub commands: Context<C>,
+  /// Outgoing messages for the parent to fold after the child transition.
+  pub outgoing: List<O>,
+}
+
+impl<C, O> BlockContext<C, O> {
+  /// Creates empty command and outgoing-message queues.
+  pub fn make() -> BlockContext<C, O> {
+    return BlockContext<C, O> { commands: Context<C>.make(), outgoing: List<O>.make() }
+  }
+
+  /// Appends work for execution after the complete parent transition.
+  pub fn command(self: &mut Self, command: C) -> () {
+    self.commands.command(move command)
+  }
+
+  /// Appends a notification for the parent without re-entering its update.
+  pub fn emit(self: &mut Self, message: O) -> () {
+    self.commands.alloc(self.outgoing.append(move message))
+  }
+
+  /// Runs allocating work; traps if the process heap is exhausted.
+  pub fn alloc<T>(self: &mut Self, work: once Effect<T ! OutOfMemoryError ? &mut Allocator>) -> T {
+    return self.commands.alloc(move work)
+  }
+
+  /// Transfers commands in order, then folds each outgoing message into the parent context.
+  /// Existing parent outputs precede the transferred outputs. Neither callback is stored.
+  pub fn forward<PC, PO>(
+    self: &mut Self,
+    parent: &mut BlockContext<PC, PO>,
+    command: fn(C) -> PC,
+    mut outgoing: mut fn(O, &mut BlockContext<PC, PO>) -> (),
+  ) -> () {
+    while self.commands.commands.length() != 0 {
+      parent.command(command(self.commands.commands.remove(0)))
+    }
+    while self.outgoing.length() != 0 {
+      outgoing(self.outgoing.remove(0), &mut parent)
+    }
+  }
+}
+
+/// A constructed implementation and its initialized model, usable as an ordinary `App`.
+///
+/// `pending` retains initialization and directly delivered transition outputs.
+/// `intoRuntime` transfers initialization commands into the runtime's queue.
+/// Root outgoing messages remain in `pending.outgoing` for the host to take.
+pub struct Instance<B, S, M, I, O, C, A> {
+  /// The implementation, separate from application state.
+  pub implementation: B,
+  /// The complete application model.
+  pub model: S,
+  /// Commands and outgoing messages not yet taken by a runtime or parent.
+  pub pending: BlockContext<C, O>,
+}
+
+impl<B: Block<S, M, I, O, C, A>, S, M, I, O, C, A> Instance<B, S, M, I, O, C, A> {
+  /// Initializes a model once with the supplied implementation and arguments.
+  pub fn make(implementation: B, args: A) -> Instance<B, S, M, I, O, C, A> {
+    let mut pending = BlockContext<C, O>.make()
+    let model = Block<S, M, I, O, C, A>.init(&implementation, move args, &mut pending)
+    return Instance<B, S, M, I, O, C, A> {
+      implementation: move implementation,
+      model: move model,
+      pending: move pending,
+    }
+  }
+
+  /// Applies a local message and retains all outputs, without executing commands.
+  pub fn message(self: &mut Self, message: M) -> () {
+    Block<S, M, I, O, C, A>.update(
+      &self.implementation,
+      &mut self.model,
+      move message,
+      &mut self.pending,
+    )
+  }
+
+  /// Applies a parent message and retains all outputs, without executing commands.
+  pub fn receive(self: &mut Self, message: I) -> () {
+    Block<S, M, I, O, C, A>.receive(
+      &self.implementation,
+      &mut self.model,
+      move message,
+      &mut self.pending,
+    )
+  }
+
+  /// Creates an ordinary runtime and transfers all pending commands to it.
+  /// Call `drain` after `start` to execute initialization commands before input.
+  pub fn intoRuntime(self: Self) -> Runtime<Instance<B, S, M, I, O, C, A>, M, C> {
+    let mut runtime = Runtime<Instance<B, S, M, I, O, C, A>, M, C>.make(move self)
+    while runtime.model.pending.commands.commands.length() != 0 {
+      runtime.context.command(runtime.model.pending.commands.commands.remove(0))
+    }
+    return move runtime
+  }
+}
+
+impl<B: Block<S, M, I, O, C, A>, S, M, I, O, C, A> App<M, C> for Instance<B, S, M, I, O, C, A> {
+  /// Describes the current Block model through its constructed implementation.
+  fn view(self: &Self, ui: &mut Ui<M>) -> () {
+    Block<S, M, I, O, C, A>.view(&self.implementation, &self.model, &mut ui)
+  }
+
+  /// Applies a local message and transfers its pending commands to the runtime.
+  fn update(self: &mut Self, message: M, cx: &mut Context<C>) -> () {
+    self.message(move message)
+    while self.pending.commands.commands.length() != 0 {
+      cx.command(self.pending.commands.commands.remove(0))
+    }
+  }
+
+  /// Collects the subscriptions requested by the current Block model.
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<M>) -> () {
+    Block<S, M, I, O, C, A>.subscriptions(&self.implementation, &self.model, &mut subs)
+  }
+}
+
+/// Constructs an implementation through a Layer and initializes its model once.
+/// Construction failures leave no initialized instance; owned resources are dropped.
+pub effect fn build<B: Block<S, M, I, O, C, A>, S, M, I, O, C, A, L: Layer<B, E, R>, E, ? R>(
+  layer: L,
+  args: A,
+) -> Instance<B, S, M, I, O, C, A>
+  ! E
+  ? R {
+  let implementation = run Layer<B, E, R>.build(move layer)
+  return Instance<B, S, M, I, O, C, A>.make(move implementation, move args)
+}
