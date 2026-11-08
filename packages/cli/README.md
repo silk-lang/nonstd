@@ -74,8 +74,8 @@ impl CommandLine for RemoteAction {}
 
 See [`examples/greet`](../../examples/greet/src/main.silk),
 [`examples/git`](../../examples/git/src/main.silk) (subcommands and completions), and
-[`examples/serve`](../../examples/serve/src/main.silk) (choices, environment variables, grouped
-flags) for complete programs.
+[`examples/serve`](../../examples/serve/src/main.silk) (choices, checks, environment variables,
+grouped flags) for complete programs.
 
 ## What it supports
 
@@ -88,15 +88,18 @@ flags) for complete programs.
 - `--name value`, `--name=value`, `-n value`, `-n5`, flags, grouped one-letter flags such as
   `-vq`, positional arguments, and `--`.
 - `Opt.about("help")` or `Opt.plain()` starts the description of a field; `Opt.short`, `Opt.long`,
-  `Opt.required`, `Opt.choice`, `Opt.env`, and `Opt.default` add to it. `Command.option` reads the
-  field as a named option, `Command.arg` as a positional argument, and `Command.subcommand` as a
-  subcommand. For a union, these name the fields of any of its variants, and `Command.variant`
-  gives a variant its help text.
+  `Opt.required`, `Opt.choice`, `Opt.env`, `Opt.default`, and `Opt.check` add to it.
+  `Command.option` reads the field as a named option, `Command.arg` as a positional argument, and
+  `Command.subcommand` as a subcommand. For a union, these name the fields of any of its variants,
+  and `Command.variant` gives a variant its help text.
 - A field the command line does not give takes its `Opt.env` variable, then its `Opt.default`,
   then the empty value of its type (`ArgValue.initial`: empty text, zero, `false`, `none`, or an
   empty list). `Opt.required` makes a value mandatory instead.
 - Choices: `Opt.choice("json") |> Opt.choice("text")` limits a value to those words, and the help
   text lists them.
+- Checks: `Opt.check<u16>(nonzero)` takes an ordinary `fn(&u16) -> bool` that a value must pass,
+  or the command line is refused with an invalid value. The parser calls it directly, as if the
+  check were written by hand.
 - Environment fallbacks: `Opt.env("PORT")` reads `PORT` when the command line does not give
   `--port`. A flag is set unless its variable is empty, `0`, or `false`. `Cli.fromHost` reads the
   variables, and `Cli.parseWith` takes them as a slice of `Variable` (handy in tests).
