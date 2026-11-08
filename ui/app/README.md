@@ -25,6 +25,14 @@ Packages:
   with native controls and repeatable CPU benchmarks of the shared libraries.
 - `ui/app/tests`: unit tests and the golden scenes.
 
+## Block composition
+
+Use [Blocks](BLOCKS.md) to give a UI feature its own model, local messages, parent requests,
+outgoing notifications, commands, and replaceable implementation. Silk Layers construct child
+bindings through effect services. Keyed children retain initialization commands and reject stale
+command results after replacement. Ordered update combinators and a deterministic Story runner
+support composition and testing. The [counters example](examples/src/blocks.silk) exercises this API.
+
 ## An app
 
 ```silk
@@ -177,8 +185,8 @@ real window on X11 and Wayland, clicks Add and compares a frame.
 - `runWindow` performs commands synchronously. For native workers, use deferred commands and
   `ui-app-window.commands.Commands`, or compose `Background` jobs in `WindowContent`. See the
   [native primitives guide](window/README.md). There is no automatic cancellation by command key.
-- There is no `ui.map` for embedding a child app with its own message type, and no custom
-  subscription kind.
+- There is no custom subscription kind. `Ui.map` and `Subscriptions.map` embed child
+  messages; child subscription keys must be unique across the application.
 - Style and attribute calls a `lazy` body makes on its parent are not kept when the region is
   reused; open a node inside `lazy` instead.
 - A `lazy` region that opened an overlay is not reused.

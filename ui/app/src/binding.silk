@@ -1,0 +1,298 @@
+//! Child Block construction and routing for fields, optional fields and keyed children.
+//!
+//! A `Binding` holds the child implementation. Parent models own child models.
+//! Required fields use `create`, `message` and `receive`; optional fields use
+//! `initIfMissing` and the same operations after matching `Some`. `Children`
+//! supplies keyed storage with occurrence identities that reject stale deliveries.
+import block { Block, BlockContext }
+import app { Perform, Subscriptions }
+import ui { Ui }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.u64
+
+/// A particular lifetime of a keyed child within one binding.
+/// Keys can be reused after removal; generations cannot be reused in the same collection.
+pub struct Address {
+  /// The child relationship selected by the parent.
+  pub binding: u64,
+  /// The parent's stable item key.
+  pub key: u64,
+  /// The occurrence number assigned at creation.
+  pub generation: u64,
+}
+
+impl Copy for Address {}
+
+impl Address {
+  /// Returns whether both addresses identify the same occurrence.
+  pub fn same(self: &Self, other: Address) -> bool {
+    return self.binding == other.binding && self.key == other.key
+      && self.generation == other.generation
+  }
+}
+
+/// A message or command directed at one occurrence of a keyed child.
+pub struct Routed<T> {
+  /// The occurrence that must still exist when this value is delivered.
+  pub address: Address,
+  /// The owned message or command.
+  pub value: T,
+}
+
+impl<M, C: Perform<M, E, R>, E, ? R> Perform<Routed<M>, E, R> for Routed<C> {
+  /// Performs a child command and retains its occurrence address on the result.
+  effect fn perform(self: Self) -> Routed<M>
+    ! E
+    ? R {
+    return Routed<M> { address: self.address, value: run Perform<M, E, R>.perform(move self.value) }
+  }
+}
+
+/// One initialized child model and its occurrence address.
+pub struct Child<S> {
+  /// The immutable routing identity assigned by `Children`.
+  pub address: Address,
+  /// The application-owned state of this child.
+  pub model: S,
+}
+
+/// Ordered keyed child models, with generation-safe message delivery.
+///
+/// Keep this collection for the lifetime of the parent; replacing it resets its
+/// generation counter. Keys must be unique. Removal drops the model, but does not
+/// cancel commands already running. Their results are rejected by address checks.
+pub struct Children<S> {
+  items: List<Child<S>>,
+  nextGeneration: u64,
+}
+
+impl<S> Children<S> {
+  /// Creates an empty collection whose first occurrence has generation one.
+  pub fn make() -> Children<S> {
+    return Children<S> { items: List<Child<S>>.make(), nextGeneration: 1 }
+  }
+
+  /// Returns the children in view order without copying their models.
+  pub fn asSlice(self: &Self) -> &[Child<S>] {
+    return self.items.asSlice()
+  }
+
+  /// Returns the number of present children.
+  pub fn length(self: &Self) -> usize {
+    return self.items.length()
+  }
+
+  /// Returns a live child's address, or `None` when the key is absent.
+  pub fn address(self: &Self, key: u64) -> Option<Address> {
+    let mut i: usize = 0
+    while i < self.items.length() {
+      if self.items.asSlice()[i].address.key == key {
+        return Option<Address>.Some { value: self.items.asSlice()[i].address }
+      }
+      i = i + 1
+    }
+    return Option<Address>.None
+  }
+
+  /// Removes and returns the child with `key`; returns `None` when absent.
+  pub fn remove(self: &mut Self, key: u64) -> Option<Child<S>> {
+    let mut i: usize = 0
+    while i < self.items.length() {
+      if self.items.asSlice()[i].address.key == key {
+        return Option<Child<S>>.Some { value: self.items.remove(i) }
+      }
+      i = i + 1
+    }
+    return Option<Child<S>>.None
+  }
+
+  /// Borrows a matching occurrence for one operation; returns false for stale addresses.
+  /// The callback can mutate its model but cannot change its address.
+  pub fn withMut(self: &mut Self, address: Address, body: once fn(&mut S) -> ()) -> bool {
+    let mut i: usize = 0
+    while i < self.items.length() {
+      if self.items.asSlice()[i].address.same(address) {
+        body(&mut self.items.asMutSlice()[i].model)
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+}
+
+/// A child implementation bound to a named relationship in its parent.
+///
+/// `id` distinguishes sibling relationships for keyed routing. Use a stable unique
+/// value in each parent. This value does not add a view node or namespace anchor keys.
+pub struct Binding<B, S, M, I, O, C, A> {
+  /// The stable identity of this relationship in its parent.
+  pub id: u64,
+  /// The separately constructed child implementation.
+  pub implementation: B,
+}
+
+impl<B: Block<S, M, I, O, C, A>, S, M, I, O, C, A> Binding<B, S, M, I, O, C, A> {
+  /// Binds a constructed implementation without initializing a model.
+  pub fn make(id: u64, implementation: B) -> Binding<B, S, M, I, O, C, A> {
+    return Binding<B, S, M, I, O, C, A> { id: id, implementation: move implementation }
+  }
+
+  /// Creates a required child and preserves its initialization outputs in `cx`.
+  pub fn create(self: &Self, args: A, cx: &mut BlockContext<C, O>) -> S {
+    return Block<S, M, I, O, C, A>.init(&self.implementation, move args, &mut cx)
+  }
+
+  /// Initializes an absent optional child, preserving all outputs; returns whether created.
+  /// An already present child is unchanged and `args` is dropped without initialization.
+  pub fn initIfMissing(
+    self: &Self,
+    child: &mut Option<S>,
+    args: A,
+    cx: &mut BlockContext<C, O>,
+  ) -> bool {
+    if child.isSome() {
+      return false
+    }
+    child.* = Option<S>.Some { value: self.create(move args, &mut cx) }
+    return true
+  }
+
+  /// Delivers a local child message and records its commands and outgoing messages.
+  pub fn message(self: &Self, model: &mut S, message: M, cx: &mut BlockContext<C, O>) -> () {
+    Block<S, M, I, O, C, A>.update(&self.implementation, &mut model, move message, &mut cx)
+  }
+
+  /// Delivers a parent request or notification through the child's separate input channel.
+  pub fn receive(self: &Self, model: &mut S, message: I, cx: &mut BlockContext<C, O>) -> () {
+    Block<S, M, I, O, C, A>.receive(&self.implementation, &mut model, move message, &mut cx)
+  }
+
+  /// Embeds a child view and maps its messages into the parent's message type.
+  pub fn view<P>(self: &Self, model: &S, ui: &mut Ui<P>, wrap: fn(M) -> P) -> () {
+    ui.map(wrap, |child| Block<S, M, I, O, C, A>.view(&self.implementation, &model, &mut child))
+  }
+
+  /// Embeds child subscriptions using explicit globally unique subscription keys.
+  pub fn subscriptions<P>(
+    self: &Self,
+    model: &S,
+    subs: &mut Subscriptions<P>,
+    key: fn(u64) -> u64,
+    wrap: fn(M) -> P,
+  ) -> () {
+    subs.map(
+      key,
+      wrap,
+      |child| Block<S, M, I, O, C, A>.subscriptions(&self.implementation, &model, &mut child),
+    )
+  }
+
+  /// Appends a new keyed child and routes its initialization outputs to the parent.
+  ///
+  /// Returns `None` for duplicate keys without calling `init`. Traps if the collection
+  /// exhausts its 64-bit generation counter. Commands retain the new occurrence address.
+  pub fn append<PC, PO>(
+    self: &Self,
+    children: &mut Children<S>,
+    key: u64,
+    args: A,
+    parent: &mut BlockContext<PC, PO>,
+    command: fn(Routed<C>) -> PC,
+    mut outgoing: mut fn(Routed<O>, &mut BlockContext<PC, PO>) -> (),
+  ) -> Option<Address> {
+    if children.address(key).isSome() {
+      return Option<Address>.None
+    }
+    if children.nextGeneration == u64.MAX {
+      Intrinsic.trap("ui-app: child generations exhausted")
+    }
+    let address = Address { binding: self.id, key: key, generation: children.nextGeneration }
+    children.nextGeneration = children.nextGeneration + 1
+    let mut cx = BlockContext<C, O>.make()
+    let model = self.create(move args, &mut cx)
+    cx.alloc(children.items.append(Child<S> { address: address, model: move model }))
+    self.forward(
+      address,
+      &mut cx,
+      &mut parent,
+      command,
+      |message, target| outgoing(move message, &mut target),
+    )
+    return Option<Address>.Some { value: address }
+  }
+
+  /// Delivers a local event only if its binding, key and generation are still present.
+  /// Returns false and drops the message without producing outputs for a stale address.
+  pub fn messageIn<PC, PO>(
+    self: &Self,
+    children: &mut Children<S>,
+    message: Routed<M>,
+    parent: &mut BlockContext<PC, PO>,
+    command: fn(Routed<C>) -> PC,
+    mut outgoing: mut fn(Routed<O>, &mut BlockContext<PC, PO>) -> (),
+  ) -> bool {
+    let address = message.address
+    if address.binding != self.id {
+      return false
+    }
+    let mut cx = BlockContext<C, O>.make()
+    let found = children.withMut(
+      address,
+      |model| self.message(&mut model, move message.value, &mut cx),
+    )
+    self.forward(
+      address,
+      &mut cx,
+      &mut parent,
+      command,
+      |message, target| outgoing(move message, &mut target),
+    )
+    return found
+  }
+
+  /// Delivers a parent request to one live occurrence and forwards all outputs.
+  pub fn receiveIn<PC, PO>(
+    self: &Self,
+    children: &mut Children<S>,
+    message: Routed<I>,
+    parent: &mut BlockContext<PC, PO>,
+    command: fn(Routed<C>) -> PC,
+    mut outgoing: mut fn(Routed<O>, &mut BlockContext<PC, PO>) -> (),
+  ) -> bool {
+    let address = message.address
+    if address.binding != self.id {
+      return false
+    }
+    let mut cx = BlockContext<C, O>.make()
+    let found = children.withMut(
+      address,
+      |model| self.receive(&mut model, move message.value, &mut cx),
+    )
+    self.forward(
+      address,
+      &mut cx,
+      &mut parent,
+      command,
+      |message, target| outgoing(move message, &mut target),
+    )
+    return found
+  }
+
+  fn forward<PC, PO>(
+    self: &Self,
+    address: Address,
+    cx: &mut BlockContext<C, O>,
+    parent: &mut BlockContext<PC, PO>,
+    command: fn(Routed<C>) -> PC,
+    mut outgoing: mut fn(Routed<O>, &mut BlockContext<PC, PO>) -> (),
+  ) -> () {
+    cx.forward(
+      &mut parent,
+      |value| command(Routed<C> { address: address, value: move value }),
+      |value, target| outgoing(Routed<O> { address: address, value: move value }, &mut target),
+    )
+  }
+}

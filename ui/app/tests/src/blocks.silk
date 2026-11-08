@@ -1,0 +1,715 @@
+//! Behavioral contracts for Block construction, composition, routing and simulation.
+import ui_app.block { Block, BlockContext, Instance, Layer }
+import ui_app.binding { Binding, Children, Routed, Address }
+import ui_app.story { Story, StoryError }
+import ui_app.update as Update
+import ui_app.ui { Ui, Reply }
+import ui_app.app { App, Context, NoCommand, Perform }
+import ui_app.runtime { Runtime, drain, tick }
+import ui_app.harness { click }
+import ui_app_examples.blocks {
+  Counter,
+  CounterMessage,
+  CounterInput,
+  CounterOutput,
+  CounterCommand,
+  CounterSettings,
+  CounterImplementation,
+  CounterBlock,
+  Counters,
+  Message,
+  InMessage,
+  Command,
+  CountersImplementation,
+  CountersLayer
+}
+import ui_fixtures.fixtures as Fixtures
+import ui_tree.lib { UiTree, TreeError, FrameInput, EventKind }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+struct Settings {
+  step: i64
+}
+
+impl CounterSettings for Settings {
+  effect fn step(self: &Self) -> i64 {
+    return self.step
+  }
+}
+
+type CounterStory = Story<
+  CounterImplementation,
+  Counter,
+  CounterMessage,
+  CounterInput,
+  CounterOutput,
+  CounterCommand,
+  i64
+>
+
+type Parent = CountersImplementation<CounterImplementation>
+
+type ParentStory = Story<Parent, Counters, Message, InMessage, never, Command, ()>
+
+fn counterCommandSame(left: &CounterCommand, right: &CounterCommand) -> bool {
+  return left.count == right.count
+}
+
+fn parentCommandSame(left: &Command, right: &Command) -> bool {
+  return left.child.address.same(right.child.address)
+    && left.child.value.count == right.child.value.count
+}
+
+fn resolveParent(command: Command) -> Message {
+  return Message.Child {
+    message: Routed<CounterMessage> {
+      address: command.child.address,
+      value: CounterMessage.Loaded { count: command.child.value.count },
+    },
+  }
+}
+
+test effect fn layersChildDeliveryAndImmutableStoryObservations() -> ()
+  ! AssertionError<'static> | StoryError {
+  let settings = Settings { step: 3 }
+  let mut story = run Story<Parent, Counters, Message, InMessage, never, Command, ()>.fromLayer(
+    CountersLayer {},
+    (),
+  )
+    |> Effect.provide<CounterSettings>(&settings)
+  let address = story.instance.model.children.asSlice()[0].address
+  let expected = [
+    Command {
+      child: Routed<CounterCommand> { address: address, value: CounterCommand { count: 10 } },
+    },
+  ]
+  run story.expectExactInOrder(&expected, parentCommandSame)
+  run Testing.expect(story.resolve(resolveParent), "initial child command is retained")
+  let before = story.model(|model| model.children.asSlice()[0].model)
+  story.messageIn(
+    CounterMessage.Increment,
+    |message| Message.Child {
+      message: Routed<CounterMessage> { address: address, value: move message },
+    },
+  )
+  run Testing.expect(before.count == 10, "owned observation remains unchanged")
+  run Testing.expect(
+    story.instance.model.children.asSlice()[0].model.count == 13,
+    "provided step changes child behavior",
+  )
+  run Testing.expect(
+    story.instance.model.children.asSlice()[0].model.previous == 10,
+    "observer sees pre-update model",
+  )
+  run Testing.expect(
+    story.instance.model.notifications == 2,
+    "child outputs fold through the parent",
+  )
+  story.receive(InMessage.RequestedClearAll)
+  run Testing.expect(
+    story.instance.model.children.asSlice()[0].model.count == 0,
+    "formal parent request reaches child",
+  )
+  drop run story.finish()
+}
+
+test effect fn storyChecksExactOrderAndRejectsUnhandledCommands() -> ()
+  ! AssertionError<'static> | StoryError {
+  let mut story = Story<
+    CounterImplementation,
+    Counter,
+    CounterMessage,
+    CounterInput,
+    CounterOutput,
+    CounterCommand,
+    i64
+  >.make(CounterImplementation { step: 1 }, 10)
+  story.instance.pending.command(CounterCommand { count: 20 })
+  let wrong = [CounterCommand { count: 20 }, CounterCommand { count: 10 }]
+  let order = run Effect.result(story.expectExactInOrder(&wrong, counterCommandSame))
+  run Testing.expect(
+    match move order {
+      Result<(), StoryError>.Failure { error: StoryError.CommandMismatch { index } } => index == 0
+      _ => false
+    },
+    "order mismatch is reported at the first command",
+  )
+  let right = [CounterCommand { count: 10 }, CounterCommand { count: 20 }]
+  run story.expectExactInOrder(&right, counterCommandSame)
+  drop story.takeCommand()
+  let finished = run Effect.result(story.finish())
+  run Testing.expect(
+    match move finished {
+      Result<
+        Instance<
+          CounterImplementation,
+          Counter,
+          CounterMessage,
+          CounterInput,
+          CounterOutput,
+          CounterCommand,
+          i64
+        >,
+        StoryError
+      >.Failure {
+        error: StoryError.PendingCommands { count }
+      } => count == 1
+      _ => false
+    },
+    "finishing requires every pending command to be handled",
+  )
+}
+
+test effect fn keyedChildrenRejectLateResultsAndDuplicateInitialization() -> ()
+  ! AssertionError<'static> {
+  let binding = Binding<
+    CounterImplementation,
+    Counter,
+    CounterMessage,
+    CounterInput,
+    CounterOutput,
+    CounterCommand,
+    i64
+  >.make(7, CounterImplementation { step: 2 })
+  let mut children = Children<Counter>.make()
+  let mut parent = BlockContext<Routed<CounterCommand>, i64>.make()
+  drop binding.append(
+    &mut children,
+    42,
+    10,
+    &mut parent,
+    |command| move command,
+    |out, cx| cx.emit(out.value.count),
+  )
+  let first = children.asSlice()[0].address
+  drop binding.append(
+    &mut children,
+    42,
+    99,
+    &mut parent,
+    |command| move command,
+    |out, cx| cx.emit(out.value.count),
+  )
+  run Testing.expect(
+    children.length() == 1 && parent.commands.commands.length() == 1,
+    "duplicate keys do not initialize or emit commands",
+  )
+  let delayed = parent.commands.commands.remove(0)
+  drop children.remove(42)
+  drop binding.append(
+    &mut children,
+    42,
+    20,
+    &mut parent,
+    |command| move command,
+    |out, cx| cx.emit(out.value.count),
+  )
+  let second = children.asSlice()[0].address
+  run Testing.expect(!first.same(second), "replacement receives a fresh generation")
+  let stale = run Perform<Routed<CounterMessage>, never, never>.perform(move delayed)
+  let accepted = binding.messageIn(
+    &mut children,
+    move stale,
+    &mut parent,
+    |command| move command,
+    |out, cx| cx.emit(out.value.count),
+  )
+  run Testing.expect(
+    !accepted && children.asSlice()[0].model.count == 0 && parent.outgoing.length() == 0,
+    "late command cannot modify the replacement",
+  )
+  let command = parent.commands.commands.remove(0)
+  let current = run Perform<Routed<CounterMessage>, never, never>.perform(move command)
+  run Testing.expect(
+    binding.messageIn(
+      &mut children,
+      move current,
+      &mut parent,
+      |command| move command,
+      |out, cx| cx.emit(out.value.count),
+    ),
+    "current command reaches its child",
+  )
+  run Testing.expect(
+    children.asSlice()[0].model.count == 20 && parent.outgoing.get(0) == 20,
+    "current model and output are preserved",
+  )
+  let wrong = Routed<CounterMessage> {
+    address: Address { binding: 8, key: 42, generation: second.generation },
+    value: CounterMessage.Increment,
+  }
+  run Testing.expect(
+    !binding.messageIn(
+      &mut children,
+      move wrong,
+      &mut parent,
+      |command| move command,
+      |out, cx| cx.emit(out.value.count),
+    ),
+    "another binding cannot target this child",
+  )
+}
+
+test effect fn optionalInitializationAndSeparateInputChannel() -> ()
+  ! AssertionError<'static> {
+  let binding = Binding<
+    CounterImplementation,
+    Counter,
+    CounterMessage,
+    CounterInput,
+    CounterOutput,
+    CounterCommand,
+    i64
+  >.make(1, CounterImplementation { step: 2 })
+  let mut optional = Option<Counter>.None
+  let mut cx = BlockContext<CounterCommand, CounterOutput>.make()
+  run Testing.expect(binding.initIfMissing(&mut optional, 8, &mut cx), "missing child initializes")
+  run Testing.expect(
+    !binding.initIfMissing(&mut optional, 9, &mut cx),
+    "present child is preserved",
+  )
+  run Testing.expect(cx.commands.commands.length() == 1, "initializer command emitted once")
+  let mut model = move optional |> Option<Counter>.unwrapOr(Counter { count: -1, previous: -1 })
+  binding.receive(&mut model, CounterInput.InformedOfValue { count: 12 }, &mut cx)
+  run Testing.expect(
+    model.count == 12 && cx.outgoing.length() == 1,
+    "parent notifications use the input handler",
+  )
+}
+
+struct Value {
+  number: i64,
+  before: i64
+}
+
+fn add(model: &mut Value, message: &String, cx: &mut BlockContext<i64, i64>) -> () {
+  model.number = model.number + 1
+  cx.command(model.number)
+  cx.emit(model.number)
+}
+
+fn double(model: &mut Value, message: &String, cx: &mut BlockContext<i64, i64>) -> () {
+  model.number = model.number * 2
+  cx.command(model.number)
+  cx.emit(model.number)
+}
+
+test effect fn composedUpdatesPreserveOrderOutputsAndOriginalObservation() -> ()
+  ! AssertionError<'static> {
+  let mut model = Value { number: 2, before: -1 }
+  let mut cx = BlockContext<i64, i64>.make()
+  let message = cx.alloc(String.copy("edit"))
+  Update.observe(
+    &mut model,
+    &message,
+    &mut cx,
+    |value| value.number,
+    |value, event, outputs| Update.compose<Value, String, i64, i64>(
+      &mut value,
+      &event,
+      &mut outputs,
+      add,
+      double,
+    ),
+    |before, value, event, outputs| {
+      value.before = before
+    },
+  )
+  run Testing.expect(
+    model.number == 6 && model.before == 2,
+    "ordered steps share the new model and retain the original observation",
+  )
+  run Testing.expect(
+    cx.commands.commands.length() == 2 && cx.commands.commands.get(0) == 3
+      && cx.commands.commands.get(1) == 6,
+    "all commands remain ordered",
+  )
+  run Testing.expect(
+    cx.outgoing.length() == 2 && cx.outgoing.get(0) == 3 && cx.outgoing.get(1) == 6,
+    "all outgoing messages remain ordered",
+  )
+  let steps: [i64; 2] = [1, 2]
+  Update.each(
+    &mut model,
+    &message,
+    &mut cx,
+    &steps,
+    |operation, value, event, outputs| {
+      if operation.* == 1 {
+        add(&mut value, &event, &mut outputs)
+      } else {
+        double(&mut value, &event, &mut outputs)
+      }
+    },
+  )
+  run Testing.expect(model.number == 14, "each executes its full ordered sequence")
+  Update.except(&mut model, &message, &mut cx, |event| true, add)
+  Update.on(&mut model, &message, &mut cx, |event| false, double)
+  run Testing.expect(model.number == 14, "excluded updates do not run")
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 360.0, height: 500.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn runtimeBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let settings = Settings { step: 4 }
+  let story = run Story<Parent, Counters, Message, InMessage, never, Command, ()>.fromLayer(
+    CountersLayer {},
+    (),
+  )
+    |> Effect.provide<CounterSettings>(&settings)
+  let mut runtime = story.instance.intoRuntime()
+  let fonts = run Fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  run runtime.start(&mut tree, 0.0)
+  run drain(&mut runtime, &mut tree)
+  run Testing.expect(
+    runtime.model.model.children.asSlice()[0].model.count == 10,
+    "initial commands run without a queued message",
+  )
+  run Testing.expect(
+    run click(&mut runtime, &mut tree, viewport(), "Increment"),
+    "mapped child button is present",
+  )
+  run Testing.expect(
+    runtime.model.model.children.asSlice()[0].model.count == 14,
+    "native child input reaches parent routing",
+  )
+  drop run click(&mut runtime, &mut tree, viewport(), "Add counter")
+  run Testing.expect(
+    runtime.model.model.children.length() == 2
+      && runtime.model.model.children.asSlice()[1].model.count == 10,
+    "dynamic initialization keeps commands",
+  )
+  run tick(&mut runtime, &mut tree, 1.0, false)
+  run Testing.expect(
+    runtime.model.model.children.asSlice()[0].model.count == 18
+      && runtime.model.model.children.asSlice()[1].model.count == 14,
+    "child subscription keys deliver independently",
+  )
+  drop run click(&mut runtime, &mut tree, viewport(), "Remove")
+  run tick(&mut runtime, &mut tree, 2.0, false)
+  run Testing.expect(
+    runtime.model.model.children.length() == 1
+      && runtime.model.model.children.asSlice()[0].model.count == 18,
+    "removed child stops subscriptions; survivor keeps its timer",
+  )
+}
+
+test effect fn blockRuntimeRoutesNativeEventsCommandsAndSubscriptions() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run runtimeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct AlternativeCounter {}
+
+impl CounterBlock for AlternativeCounter {
+  fn init(self: &Self, args: i64, cx: &mut BlockContext<CounterCommand, CounterOutput>) -> Counter {
+    return Counter { count: args, previous: args }
+  }
+
+  fn update(
+    self: &Self,
+    model: &mut Counter,
+    message: CounterMessage,
+    cx: &mut BlockContext<CounterCommand, CounterOutput>,
+  ) -> () {
+    let implementation = CounterImplementation { step: 100 }
+    CounterBlock.update(&implementation, &mut model, move message, &mut cx)
+  }
+
+  fn receive(
+    self: &Self,
+    model: &mut Counter,
+    message: CounterInput,
+    cx: &mut BlockContext<CounterCommand, CounterOutput>,
+  ) -> () {
+    let implementation = CounterImplementation { step: 100 }
+    CounterBlock.receive(&implementation, &mut model, move message, &mut cx)
+  }
+
+  fn view(self: &Self, model: &Counter, ui: &mut Ui<CounterMessage>) -> () {
+    ui.number(model.count)
+  }
+}
+
+test effect fn parentDependsOnlyOnChildContract() -> ()
+  ! AssertionError<'static> | StoryError {
+  let implementation = CountersImplementation<AlternativeCounter> {
+    counter: Binding<
+      AlternativeCounter,
+      Counter,
+      CounterMessage,
+      CounterInput,
+      CounterOutput,
+      CounterCommand,
+      i64
+    >.make(1, AlternativeCounter {}),
+  }
+  let mut story = Story<
+    CountersImplementation<AlternativeCounter>,
+    Counters,
+    Message,
+    InMessage,
+    never,
+    Command,
+    ()
+  >.make(move implementation, ())
+  let address = story.instance.model.children.asSlice()[0].address
+  story.messageIn(
+    CounterMessage.Increment,
+    |message| Message.Child {
+      message: Routed<CounterMessage> { address: address, value: move message },
+    },
+  )
+  run Testing.expect(
+    story.instance.model.children.asSlice()[0].model.count == 110,
+    "same parent accepts a different implementation of the public contract",
+  )
+  drop run story.finish()
+}
+
+struct BuildFailure {}
+
+struct FailingLayer {}
+
+impl Layer<CounterImplementation, BuildFailure ? never> for FailingLayer {
+  effect fn build(self: Self) -> CounterImplementation
+    ! BuildFailure {
+    fail BuildFailure {}
+  }
+}
+
+test effect fn constructionErrorsStayTyped() -> ()
+  ! AssertionError<'static> {
+  let result = run Effect.result(
+    Story<
+      CounterImplementation,
+      Counter,
+      CounterMessage,
+      CounterInput,
+      CounterOutput,
+      CounterCommand,
+      i64
+    >.fromLayer(FailingLayer {}, 1),
+  )
+  run Testing.expect(
+    match move result {
+      Result<CounterStory, BuildFailure>.Failure { error: _error } => true
+      _ => false
+    },
+    "construction failure is returned before model initialization",
+  )
+}
+
+struct BubbleModel {
+  total: i64,
+  stop: bool
+}
+
+impl App<i64, NoCommand> for BubbleModel {
+  fn view(self: &Self, ui: &mut Ui<i64>) -> () {
+    ui.column(
+      |ui| {
+        ui.onClick(|| 3)
+        ui.map<i32>(
+          |value| if value == 1 {
+            1
+          } else {
+            2
+          },
+          |child| {
+            child.column(
+              |child| {
+                child.onClick(|| 2)
+                child.map<bool>(
+                  |value| 1,
+                  |leaf| {
+                    leaf.box(
+                      |leaf| {
+                        leaf.testId("bubble")
+                        leaf.text("Bubble")
+                        leaf.on(
+                          EventKind.Click,
+                          |event| {
+                            if self.stop {
+                              return Reply<bool>.EmitAndStop { message: true }
+                            }
+                            return Reply<bool>.Emit { message: true }
+                          },
+                        )
+                      },
+                    )
+                  },
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: i64, cx: &mut Context<NoCommand>) -> () {
+    self.total = self.total * 10 + message
+  }
+}
+
+effect fn bubblingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run Fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut runtime = Runtime<BubbleModel, i64, NoCommand>.make(BubbleModel { total: 0, stop: false })
+  run runtime.start(&mut tree, 0.0)
+  drop run click(&mut runtime, &mut tree, viewport(), "bubble")
+  run Testing.expect(
+    runtime.model.total == 123,
+    "nested mappings preserve target-to-root bubbling order",
+  )
+  runtime.model.total = 0
+  runtime.model.stop = true
+  run runtime.render(&mut tree)
+  drop run click(&mut runtime, &mut tree, viewport(), "bubble")
+  run Testing.expect(runtime.model.total == 1, "mapped stop propagation suppresses every ancestor")
+}
+
+test effect fn nestedViewMappingPreservesBubblingAndStops() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run bubblingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct Workspace {
+  counters: Counters
+}
+
+struct WorkspaceMessage {
+  child: Message
+}
+
+struct WorkspaceCommand {
+  child: Command
+}
+
+struct WorkspaceImplementation {
+  counters: Binding<Parent, Counters, Message, InMessage, never, Command, ()>,
+}
+
+impl Block<
+  Workspace,
+  WorkspaceMessage,
+  InMessage,
+  never,
+  WorkspaceCommand,
+  ()
+> for WorkspaceImplementation {
+  fn init(self: &Self, args: (), cx: &mut BlockContext<WorkspaceCommand, never>) -> Workspace {
+    let mut child = BlockContext<Command, never>.make()
+    let model = self.counters.create((), &mut child)
+    child.forward(
+      &mut cx,
+      |command| WorkspaceCommand { child: move command },
+      |out, parent| {
+        drop out
+      },
+    )
+    return Workspace { counters: move model }
+  }
+
+  fn update(
+    self: &Self,
+    model: &mut Workspace,
+    message: WorkspaceMessage,
+    cx: &mut BlockContext<WorkspaceCommand, never>,
+  ) -> () {
+    let mut child = BlockContext<Command, never>.make()
+    self.counters.message(&mut model.counters, move message.child, &mut child)
+    child.forward(
+      &mut cx,
+      |command| WorkspaceCommand { child: move command },
+      |out, parent| {
+        drop out
+      },
+    )
+  }
+
+  fn receive(
+    self: &Self,
+    model: &mut Workspace,
+    message: InMessage,
+    cx: &mut BlockContext<WorkspaceCommand, never>,
+  ) -> () {
+    let mut child = BlockContext<Command, never>.make()
+    self.counters.receive(&mut model.counters, move message, &mut child)
+    child.forward(
+      &mut cx,
+      |command| WorkspaceCommand { child: move command },
+      |out, parent| {
+        drop out
+      },
+    )
+  }
+
+  fn view(self: &Self, model: &Workspace, ui: &mut Ui<WorkspaceMessage>) -> () {
+    self.counters.view(&model.counters, &mut ui, |message| WorkspaceMessage { child: move message })
+  }
+}
+
+test effect fn nestedStoryPathKeepsParentFoldsAndInitializationCommands() -> ()
+  ! AssertionError<'static> | StoryError {
+  let settings = Settings { step: 5 }
+  let parent = run Layer<Parent, never, &CounterSettings>.build(CountersLayer {})
+    |> Effect.provide<CounterSettings>(&settings)
+  let implementation = WorkspaceImplementation {
+    counters: Binding<Parent, Counters, Message, InMessage, never, Command, ()>.make(
+      1,
+      move parent,
+    ),
+  }
+  let mut story = Story<
+    WorkspaceImplementation,
+    Workspace,
+    WorkspaceMessage,
+    InMessage,
+    never,
+    WorkspaceCommand,
+    ()
+  >.make(move implementation, ())
+  run Testing.expect(
+    story.resolve(|command| WorkspaceMessage { child: resolveParent(move command.child) }),
+    "nested child init command survives both parent boundaries",
+  )
+  let address = story.instance.model.counters.children.asSlice()[0].address
+  story.messageIn(
+    CounterMessage.Increment,
+    |message| WorkspaceMessage {
+      child: Message.Child {
+        message: Routed<CounterMessage> { address: address, value: move message },
+      },
+    },
+  )
+  run Testing.expect(
+    story.instance.model.counters.children.asSlice()[0].model.count == 15,
+    "typed nested path reaches the selected grandchild",
+  )
+  run Testing.expect(
+    story.instance.model.counters.notifications == 2,
+    "intermediate parent folds still run",
+  )
+  story.receive(InMessage.RequestedClearAll)
+  run Testing.expect(
+    story.instance.model.counters.children.asSlice()[0].model.count == 0,
+    "parent input crosses both boundaries",
+  )
+  drop run story.finish()
+}
