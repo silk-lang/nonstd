@@ -1,7 +1,7 @@
 # nonstd
 
-The retained Silk application and data workspace: SQLite, CRDTs, example applications and
-Silk Studio. Reusable libraries now live in six independently published repositories:
+The retained Silk application and data workspace: SQLite, CRDTs and example applications.
+Reusable libraries now live in six independently published repositories:
 
 | Repository | Contents |
 | --- | --- |
@@ -12,6 +12,9 @@ Silk Studio. Reusable libraries now live in six independently published reposito
 | [lib-svg](https://github.com/silk-lang/lib-svg) | SVG parsing, display lists, CPU/GPU rendering and tools |
 | [lib-ui](https://github.com/silk-lang/lib-ui) | Retained trees, application framework, components, inspection and shared assets |
 
+The Studio design editor lives in [julia-script/silk-studio](https://github.com/julia-script/silk-studio),
+with its own desktop and browser launch instructions.
+
 XML uses the standard library's `silk.xml`; Unicode and command-line parsing use `silk.text`
 and `silk.cli`. This repository does not retain shadow copies of extracted libraries.
 Nothing here is stable yet.
@@ -19,7 +22,7 @@ Nothing here is stable yet.
 ## Run an application locally
 
 Run these commands from the **nonstd repository root**, not from an application's
-directory. Notes, Studio, Scroll Lab, Showcase and Graphics Demo live here;
+directory. Notes, Scroll Lab, Showcase and Graphics Demo live here;
 the smaller UI library demos live in [lib-ui](https://github.com/silk-lang/lib-ui#run-a-demo-locally).
 You do not need sibling library checkouts or a workspace-wide build to launch an app.
 
@@ -68,7 +71,6 @@ it can take longer than subsequent builds. Closing the window returns to the she
 | Application | Command from this repository root |
 | --- | --- |
 | [Notes](examples/notes) | `node examples/notes/scripts/notes` |
-| [Studio](examples/studio) | `node examples/studio/scripts/studio` |
 | [Scroll Lab](examples/scroll-demo) | `node examples/scroll-demo/scripts/run` |
 | [Showcase](examples/showcase) | `node examples/showcase/scripts/app` |
 | [Graphics Demo](examples/graphics-demo) | `node examples/graphics-demo/scripts/app` |
@@ -175,10 +177,6 @@ All retained packages are indexed, including the deliberate exclusions in `layer
 | [`examples/showcase`](examples/showcase) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack |
 | [`examples/showcase/app`](examples/showcase/app) | `ui-showcase-app` |  |
 | [`examples/showcase/record`](examples/showcase/record) | `ui-showcase-record` |  |
-| [`examples/studio`](examples/studio) | `silk-studio-native` | Silk Studio, a design editor on the UI stack |
-| [`examples/studio/app`](examples/studio/app) | `silk-studio-native-app` |  |
-| [`examples/studio/browser`](examples/studio/browser) | `silk-studio-browser` |  |
-| [`examples/studio/tests`](examples/studio/tests) | `silk-studio-native-tests` |  |
 
 <!-- package-index:end -->
 
@@ -238,7 +236,7 @@ No Python is needed by normal root CI or application launchers.
 
 ## Application and data checks
 
-The retained workflows cover SQLite, CRDTs, graphics-demo, Notes, Scroll Lab, Showcase and Studio.
+The retained workflows cover SQLite, CRDTs, graphics-demo, Notes, Scroll Lab and Showcase.
 Library-only checks now run in their owning repositories. Commands run from this root:
 
 ```sh
@@ -253,9 +251,6 @@ node examples/notes/scripts/devtools-check
 node examples/scroll-demo/scripts/inspect-check
 node examples/showcase/scripts/embed-assets --check
 node examples/showcase/scripts/record --frames-only --fps 10 --seconds 7.7 --scale 1 --debug
-node examples/studio/scripts/test --release
-node examples/studio/scripts/studio check --backend all --release
-node examples/browser test examples/studio/browser -- --size 1280,800 --click 603,723 --stored studio
 ```
 
 Use each application's README for its assets, licensing, interactive launch, recording and
