@@ -53,6 +53,10 @@ automatically (`SILK` overrides the executable). The pinned `silk.exe` launcher 
 `SILK_HOME` in an encoding its compiler's Git cache parser rejects. Direct compiler invocation
 preserves native `SILK_HOME` overrides and the default `USERPROFILE` cache location.
 
+`node scripts/check-format.mjs` checks authored Silk sources and manifests. Generated browser
+exports retain the pinned lib-native generator's bytes and are checked separately by application
+browser tooling.
+
 ## Packages
 
 `node scripts/readme-index` regenerates the index below; CI checks it with `--check`.
