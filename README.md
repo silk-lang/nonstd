@@ -76,6 +76,8 @@ it can take longer than subsequent builds. Closing the window returns to the she
 For Notes in a browser, run `node examples/browser serve examples/notes/browser`, then
 open <http://127.0.0.1:8050/> in Chrome/Edge with WebGPU and JSPI support (137+).
 Keep the server running; Ctrl+C stops it. Serving an app does not require Playwright.
+The browser builder discovers LLVM 22+ (`clang-22` on `PATH`, macOS Homebrew LLVM,
+then `clang` on `PATH`); `SILK_CLANG` is optional when a compatible compiler is found.
 
 Do **not** run `scripts/setup-ci.mjs` for ordinary local startup: it provisions hosted
 CI and cannot configure your parent shell. Commands containing `check` or `test` below

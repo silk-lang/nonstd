@@ -38,7 +38,8 @@ Complete the [local setup](../../README.md#run-an-application-locally) first:
 Run these commands from the **nonstd repository root**, in that same terminal.
 The launcher fetches pinned dependencies; native bridge generation runs through Silk hooks.
 Browser hosts and generated exports resolve from the manifest-pinned `lib-native` checkout,
-not from source library directories. `SILK_CLANG` must point to LLVM 22 for browser linking.
+not from source library directories. Browser builds discover installed LLVM 22+ automatically;
+set `SILK_CLANG` only to override that selection.
 
 ```sh
 node examples/graphics-demo/scripts/app --release
