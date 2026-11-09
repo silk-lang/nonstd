@@ -53,6 +53,13 @@ automatically (`SILK` overrides the executable). The pinned `silk.exe` launcher 
 `SILK_HOME` in an encoding its compiler's Git cache parser rejects. Direct compiler invocation
 preserves native `SILK_HOME` overrides and the default `USERPROFILE` cache location.
 
+Cold Git dependency resolution on Windows remains blocked in this pinned compiler:
+`GitCheckouts.silk` passes extended `\\?\C:\...` paths to Git, whose path validation rejects
+them with `git init failed: ... Invalid argument`. Direct compiler invocation does not fix
+this second issue. Upstream must use command-line paths rather than extended filesystem
+paths for Git arguments. Windows CI remains enabled to expose the failure; do not disable
+Git's NTFS protection to bypass it.
+
 `node scripts/check-format.mjs` checks authored Silk sources and manifests. Generated browser
 exports retain the pinned lib-native generator's bytes and are checked separately by application
 browser tooling.
