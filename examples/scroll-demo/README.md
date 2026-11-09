@@ -13,7 +13,8 @@ of unique image resources.
 
 ## Run
 
-From the repository root, using Node.js and the configured Silk compiler:
+Complete the [local setup](../../README.md#run-an-application-locally) first
+(`silk use`, LLVM 22 and, on macOS, `SDKROOT`), then run from the **nonstd repository root**:
 
 ```sh
 node examples/scroll-demo/scripts/run

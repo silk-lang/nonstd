@@ -16,6 +16,72 @@ XML uses the standard library's `silk.xml`; Unicode and command-line parsing use
 and `silk.cli`. This repository does not retain shadow copies of extracted libraries.
 Nothing here is stable yet.
 
+## Run an application locally
+
+Run these commands from the **nonstd repository root**, not from an application's
+directory. Notes, Studio, Scroll Lab, Showcase and Graphics Demo live here;
+the smaller UI library demos live in [lib-ui](https://github.com/silk-lang/lib-ui#run-a-demo-locally).
+You do not need sibling library checkouts or a workspace-wide build to launch an app.
+
+Install the [Silk launcher](https://silklang.org/) first if `silk` is not on `PATH`.
+`silk use` below installs the compiler pinned by this checkout's `silk.toml`;
+`silk update self` only updates the launcher.
+
+### macOS
+
+Requires Apple Silicon macOS 26+, Node.js 22+, Xcode with the macOS SDK, and LLVM 22.
+Apple's `/usr/bin/clang` is not LLVM 22. With Homebrew LLVM 22 installed at its usual path:
+
+```sh
+silk use
+export SILK_CLANG=/opt/homebrew/opt/llvm/bin/clang
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+"$SILK_CLANG" --version # must report clang 22
+node examples/notes/scripts/notes
+```
+
+If LLVM 22 is installed elsewhere, change `SILK_CLANG` to its absolute executable path.
+Keep these exports in the same terminal in which you run the app.
+
+### Linux
+
+Use Node.js 22+, LLVM 22, a graphical desktop, and the X11, xkbcommon, Wayland and
+wayland-protocols development packages. On Debian/Ubuntu these are `libx11-dev`,
+`libxkbcommon-dev`, `libwayland-dev` and `wayland-protocols`.
+
+```sh
+silk use
+export SILK_CLANG="$(command -v clang-22)"
+"$SILK_CLANG" --version
+node examples/notes/scripts/notes
+```
+
+For Windows, complete [Windows preparation](#windows), then run
+`node examples/notes/scripts/notes` in the same developer PowerShell.
+
+### Choose an app
+
+Each launcher builds just the selected application and opens its window. The first build
+downloads the manifest-pinned dependencies and prepares native libraries through Silk hooks;
+it can take longer than subsequent builds. Closing the window returns to the shell.
+
+| Application | Command from this repository root |
+| --- | --- |
+| [Notes](examples/notes) | `node examples/notes/scripts/notes` |
+| [Studio](examples/studio) | `node examples/studio/scripts/studio` |
+| [Scroll Lab](examples/scroll-demo) | `node examples/scroll-demo/scripts/run` |
+| [Showcase](examples/showcase) | `node examples/showcase/scripts/app` |
+| [Graphics Demo](examples/graphics-demo) | `node examples/graphics-demo/scripts/app` |
+
+For Notes in a browser, run `node examples/browser serve examples/notes/browser`, then
+open <http://127.0.0.1:8050/> in Chrome/Edge with WebGPU and JSPI support (137+).
+Keep the server running; Ctrl+C stops it. Serving an app does not require Playwright.
+
+Do **not** run `scripts/setup-ci.mjs` for ordinary local startup: it provisions hosted
+CI and cannot configure your parent shell. Commands containing `check` or `test` below
+are automated verification, not interactive launch commands. Most app directories contain
+library packages; use the launchers above rather than `silk run` on those directories.
+
 ## Dependencies and layers
 
 Local dependencies stay within `db`, `crdt` and `examples`. [`layers.toml`](layers.toml)

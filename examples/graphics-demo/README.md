@@ -33,10 +33,10 @@ and the browser (`navigator.gpu` on a canvas).
 
 ## Run
 
-Use Node.js, Silk and LLVM 22 from the repository setup instructions. Put Silk on `PATH`
-and set `SILK_CLANG` to LLVM 22 `clang`; `node scripts/setup-ci.mjs` provisions dependencies
-but does not change a local parent shell. Fetch dependencies with `silk check --manifest-path examples/graphics-demo/app/silk.toml`.
-Native bridge generation runs through Silk manifest hooks.
+Complete the [local setup](../../README.md#run-an-application-locally) first:
+`silk use`, LLVM 22 through `SILK_CLANG`, and on macOS an exported `SDKROOT`.
+Run these commands from the **nonstd repository root**, in that same terminal.
+The launcher fetches pinned dependencies; native bridge generation runs through Silk hooks.
 Browser hosts and generated exports resolve from the manifest-pinned `lib-native` checkout,
 not from source library directories. `SILK_CLANG` must point to LLVM 22 for browser linking.
 

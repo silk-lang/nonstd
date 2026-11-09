@@ -8,8 +8,8 @@ WebGPU/Dawn. The compiled app needs no browser, webview, JavaScript runtime or s
 
 ## Run
 
-From the repository root, with Node.js 22 or newer, the pinned Silk compiler on
-`PATH`, and LLVM 22 configured through `SILK_CLANG`:
+Complete the [local setup](../../README.md#run-an-application-locally) first
+(`silk use`, LLVM 22 and, on macOS, `SDKROOT`), then run from the **nonstd repository root**:
 
 ```sh
 node examples/studio/scripts/studio --release

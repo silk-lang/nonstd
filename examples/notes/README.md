@@ -20,19 +20,17 @@ Packages:
 
 ## Running it
 
-Use Node.js, Silk and LLVM 22 from the repository setup instructions. Put Silk on
-`PATH` and set `SILK_CLANG` to the LLVM 22 `clang` executable; provisioning does not
-change a local parent shell's environment.
+Complete the [local setup](../../README.md#run-an-application-locally) first:
+`silk use`, LLVM 22 through `SILK_CLANG`, and on macOS an exported `SDKROOT`.
+Run the commands below from the **nonstd repository root**, in that same terminal.
+The launcher builds the app and fetches its pinned dependencies; CI provisioning is not needed.
 
 ```sh
-node scripts/setup-ci.mjs                         # provisions pinned native dependencies
-silk check --manifest-path examples/notes/app/silk.toml # fetch manifest-pinned Git dependencies
 node examples/notes/scripts/notes                 # debug build, notes in ~/.silk-notes.json
 node examples/notes/scripts/notes --release --file my-notes.json
 ```
 
-On Linux it needs `libx11-dev libxkbcommon-dev libwayland-dev` (see
-[examples/graphics-demo](../graphics-demo)); on macOS and Windows nothing extra. The first run starts
+Platform prerequisites are listed in the root setup instructions. The first run starts
 with a few sample notes. Edits are saved a second after they happen, or at once with Ctrl+S
 (Cmd+S on macOS); the file is replaced atomically, so a crash never leaves half a file. A file
 that is not a notes file is left alone: the app says so and exits.

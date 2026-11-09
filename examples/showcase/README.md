@@ -27,8 +27,9 @@ come from the pinned `lib-ui` dependency. Everything on screen goes through the 
 
 ## Run it
 
-With Node.js and Silk installed, in a window (Metal on macOS, D3D12 on Windows, Vulkan on Linux),
-from the repository root:
+Complete the [local setup](../../README.md#run-an-application-locally) first
+(`silk use`, LLVM 22 and, on macOS, `SDKROOT`), then run from the **nonstd repository root**.
+The native window uses Metal on macOS, D3D12 on Windows and Vulkan on Linux:
 
 ```sh
 examples/showcase/scripts/app --release
