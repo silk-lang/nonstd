@@ -64,10 +64,12 @@ Shared cache is left out.
 
 ## Platforms
 
-macOS, Linux and Windows. On Windows, run `python scripts/prepare-windows` once from an x64 Visual
-Studio developer shell: SQLite needs the Windows SDK headers, which Silk does not pass to Clang, so
-that script builds SQLite and the shim into a library (`db/sqlite/scripts/windows`) and points the
-`sqlite` archive at it. The browser is not supported.
+macOS, Linux and Windows. On Windows, run `pwsh -File scripts/prepare-windows.ps1` once
+from an x64 Visual Studio 2026 developer shell with LLVM 22 and the Windows SDK.
+The pinned lib-native prepares its GPU/window overrides; `db/sqlite/scripts/windows.ps1`
+builds the manifest-pinned SQLite amalgamation and shim with the same feature defines,
+copies the CRT import libraries, and updates only `native.override.sqlite`. Other repositories'
+global overrides and unrelated SQLite keys are preserved. The browser is not supported.
 
 ## Tests
 

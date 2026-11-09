@@ -1,24 +1,24 @@
 # Silk Studio — native
 
-A desktop version of the Studio design editor, written in Silk. `ui/app` owns the
-application model and messages, `ui/components` builds the controls, `ui/tree`
-handles layout and text input, and `native/platform/window` supplies the native window,
-menus, clipboard, input method, and file dialogs. Canvas layers use the shared
-`graphics/editor.Document` and `graphics/ui_renderer` on WebGPU/Dawn. No browser,
-webview, JavaScript runtime, or server is required.
+A desktop version of the Studio design editor, written in Silk. The pinned
+`lib-ui` packages own the application model, controls, layout and text input;
+`lib-native` supplies the native window, menus, clipboard, input method and file
+dialogs. Canvas layers use the shared `lib-graphics` editor and renderer on
+WebGPU/Dawn. The compiled app needs no browser, webview, JavaScript runtime or server.
 
 ## Run
 
-From the repository root, with Python 3.11 or newer:
+From the repository root, with Node.js 22 or newer, the pinned Silk compiler on
+`PATH`, and LLVM 22 configured through `SILK_CLANG`:
 
 ```sh
-python3 examples/studio/scripts/studio --release
-python3 examples/studio/scripts/studio --release --file ~/Design.silkdesign
+node examples/studio/scripts/studio --release
+node examples/studio/scripts/studio --release --file ~/Design.silkdesign
 ```
 
-The runner uses the repository's pinned Silk compiler, LLVM, and Dawn installers.
+The Node runner invokes Silk directly; package manifests provide native dependencies.
 On macOS the window bridge requires macOS 14 or newer. Native platform dependencies
-on Linux/Windows are the same as `native/platform/window` and `examples/graphics-demo`; this port
+on Linux/Windows are the same as pinned `lib-native` and `examples/graphics-demo`; this port
 was written on macOS arm64; the `check` run (a scripted click and Tab, read back and
 compared with the CPU reference) also passes in X11 windows on Linux lavapipe.
 
@@ -30,12 +30,15 @@ the scene the app hands over. GPU-retained overview images (see
 To build a self-contained macOS application, including fallback fonts:
 
 ```sh
-python3 examples/studio/scripts/studio --release --bundle
+node examples/studio/scripts/studio --release --bundle
 open 'build/Silk Studio.app'
 ```
 
 The local development bundle is unsigned. Its binary links only to macOS system
 libraries/frameworks; it does not depend on a running compiler or this checkout.
+The licensed Noto Serif/Mono fallback subsets and their OFL are kept in
+`assets/fonts` and staged under `Contents/Resources/examples/studio/assets/fonts`.
+The launcher changes to Resources so the same runtime paths work in the bundle.
 
 ## In the browser
 
@@ -43,8 +46,12 @@ libraries/frameworks; it does not depend on a running compiler or this checkout.
 browser tab with WebGPU and JSPI (Chrome or Edge 137 or later):
 
 ```sh
-python3 ui/tree/window/scripts/browser serve examples/studio/browser   # http://127.0.0.1:8050/
+node examples/browser serve examples/studio/browser   # http://127.0.0.1:8050/
 ```
+
+The shared browser runner uses the published `lib-ui` browser payload and resolves
+WebGPU exports/runtime assets from the pinned `lib-native` Git cache, not sibling
+checkouts or deleted source trees. It preserves the 8 MiB wasm linker stack.
 
 It keeps the document in the page's localStorage (under `silk-app:studio`), so a reload finds it
 again; the first visit opens the starter design. There are no native menus or file dialogs:
@@ -95,11 +102,11 @@ reliably. SVG text metrics depend on fonts in the viewer.
 ## Validation
 
 ```sh
-python3 examples/studio/scripts/test --release
-python3 examples/studio/scripts/studio check --release
+node examples/studio/scripts/test --release
+node examples/studio/scripts/studio check --release
 # After building ui-inspect-cli and ui-inspect-mcp in release mode:
-python3 examples/studio/scripts/inspect-check --stress
-python3 examples/studio/scripts/parity-check
+node examples/studio/scripts/inspect-check --stress
+node examples/studio/scripts/parity-check
 ```
 
 The parity check opens an isolated copy of the browser starter at 1440×960 and
@@ -107,12 +114,23 @@ The parity check opens an isolated copy of the browser starter at 1440×960 and
 semantic snapshots to `build/native-parity`. See [PARITY.md](PARITY.md) for the
 comparison contract and platform differences.
 
+All checks avoid the default user design: the window check uses an in-memory
+starter; inspector/parity checks create and clean up fresh temporary documents;
+camera checks use an in-memory workload or read `--file` without saving. Native
+checks open real windows except `studio check` on Linux, which starts Xvfb and
+headless Weston (`--backend x11|wayland|all`) and defaults to lavapipe. Inspector
+checks require a working display. To check the bundled launcher safely, pass
+`--app "$PWD/build/Silk Studio.app/Contents/MacOS/SilkStudio"` to `parity-check`.
+Do not use an ordinary launch without `--file` as a smoke test.
+
 The contract executable tests pointer-driven creation, native inspector input,
 undo/redo, subtree transforms, Alt-drag/cancel, validated file round trips, selected
 PNG/SVG exports, high-zoom vector text, cache reset, and 100k-element edits. It also
 prints CPU timings for selection, UI layout, and scene construction. These are not
-GPU timings or display FPS. The macOS test runner works around a dev.47 compiler
-libSystem stub that omits math symbols used by the headless CPU renderer.
+GPU timings or display FPS. The macOS test runner retains the SDK-link workaround
+for compiler libSystem stubs that omit CPU-renderer math symbols. It requires an
+absolute LLVM 22 `SILK_CLANG` path, wraps link invocations only, and removes its
+temporary wrapper after the run.
 
 The window check scripts real UI input, reads the GPU surface, compares it with
 the CPU rendering of the same scene, and writes `/tmp/silk-studio-native-check.png`.
@@ -121,7 +139,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the measured workload and limits.
 The optional local UI inspector is off in release builds unless explicitly enabled:
 
 ```sh
-SILK_UI_INSPECT=/tmp/silk-studio.sock python3 examples/studio/scripts/studio --release --inspect
+SILK_UI_INSPECT=/tmp/silk-studio.sock node examples/studio/scripts/studio --release --inspect
 ```
 
 For reproducible window sizes, the executable accepts `--width=1440 --height=960`.
@@ -130,8 +148,8 @@ Inspector screenshots include the complete canvas and controls. `--test-id canva
 the canvas; `capture sequence.png --count 10 --interval 100` returns a contact sheet with
 actual times and frame numbers. `pointer --phase down/move/up --x X --y Y` and
 `key KEY --phase down/up` feed the same UI dispatcher and application event pump as window
-input. Compound clicks process each event before the next. See the
-[CLI](../../../ui/inspect/cli/README.md) and [MCP tools](../../../ui/inspect/mcp/README.md).
+input. Compound clicks process each event before the next. See the pinned
+`lib-ui` repository's `inspect/cli` and `inspect/mcp` documentation.
 
 Marquee movement requests a frame even when the selected IDs do not change. The canvas
 revision participates in invalidation independently of the control tree. This covers empty
@@ -167,10 +185,11 @@ one shared source image, not 100,000 unrelated photos. Labels use 196 word pairs
 from the tweet in Arial, Georgia and Courier New, with the normal native fallbacks.
 
 The screenshot is embedded unchanged in the executable and SVG exports. Its ICC
-profile is converted to sRGB for the native atlas. `scripts/embed-tweet` regenerates
-the embedded asset from `assets/tweet-challenge.png`. Native `.silkdesign` files
-preserve the browser's `image` and normalized `imageCrop` fields, including crop
-coordinates precise enough to survive a round trip to the same source pixels.
+profile is converted to sRGB for the native atlas. The optional, self-contained
+Python 3 generator `python3 examples/studio/scripts/embed-tweet` regenerates the
+embedded asset from `assets/tweet-challenge.png`; normal builds and checks do not
+use Python. Native `.silkdesign` files preserve the browser's `image` and normalized
+`imageCrop` fields, including coordinates precise enough for source-pixel round trips.
 
 Repeated labels share measurements and raster tiles by text, font, weight, color
 and dimensions. Small labels start with a bounded 4× density cache and use power-of-two raster
@@ -194,17 +213,20 @@ batch compatible image crops and reuse image texture bindings within each pass.
 Run the release contracts and the real-event inspector checks without a recording:
 
 ```sh
-python3 examples/studio/scripts/test --release
-python3 examples/studio/scripts/studio --release --build-only
-python3 examples/studio/scripts/challenge-check --leave-open
+node examples/studio/scripts/test --release
+node examples/studio/scripts/studio --release --build-only
+node examples/studio/scripts/challenge-check --leave-open
 ```
 
 The headless workload reports input, model, UI layout and scene composition CPU
 time, excluding GPU work. The inspector test reports request-to-composed-frame
 latency, including IPC and host scheduling. Neither measurement is presentation
 FPS. It exercises fit-all through roughly 180% zoom and back twice, panning,
-marquee redraw, direct canvas text editing and undo. Its isolated design, log and
-JSON report live in `/tmp/silk-native-tweet`; the default user document is untouched.
+marquee redraw, direct canvas text editing and undo. Logs, PID and JSON report live
+in `/tmp/silk-native-tweet` (or `--directory`). Each run uses a fresh temporary
+design; `document-path` records its location. Without `--leave-open`, the app exits
+and that temporary session is removed. With it, the detached app and isolated
+document remain available for inspection. The default user document is untouched.
 
 ## Native camera performance and rendering regressions
 
@@ -217,7 +239,7 @@ retained document and update the visible labels rather than rebuilding every lay
 After building the release app:
 
 ```sh
-python3 examples/studio/scripts/camera-check
+node examples/studio/scripts/camera-check
 ```
 
 This runs 120 zoom inputs, 40 wheel pans, and a 40-movement hand drag through the native UI dispatcher with

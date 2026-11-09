@@ -2,8 +2,7 @@
 // owns the canvas and its input, native/gpu/webgpu's WebGPUHost maps WebGPU onto navigator.gpu, and
 // this file ticks the module whenever either host has news, and on every animation frame.
 //
-// Served from the repository root (scripts/browser does that), so the hosts load from their
-// own packages.
+// The app server maps host URLs to the manifest-pinned lib-native checkout.
 import { WindowHost } from '/native/platform/window/browser/window-host.js';
 import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
 

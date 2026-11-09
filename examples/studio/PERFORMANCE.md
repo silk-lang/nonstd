@@ -4,7 +4,7 @@ Measured on an Apple M1 Max, macOS arm64, with the repository's Silk
 `0.1.0-dev.47+d5e63a44393e`, LLVM 22.1.8, release optimization. Run:
 
 ```sh
-python3 examples/studio/scripts/test --release
+node examples/studio/scripts/test --release
 ```
 
 The page contains 100,000 independent rectangles arranged as the supplied image,
@@ -42,8 +42,9 @@ not a GPU speed measurement.
 ## Image/text camera workload after glyph-cache and native rendering fixes
 
 Measured on the same Apple M1 Max at 1440×960 logical pixels, 2× scale, in a
-release build. Run `python3 examples/studio/scripts/camera-check` after
-building the app. Raw stage summaries are in [benchmarks/camera.json](benchmarks/camera.json).
+release build. Run `node examples/studio/scripts/camera-check` after
+building the app with `node examples/studio/scripts/studio --release --build-only`.
+Raw stage summaries are in [benchmarks/camera.json](benchmarks/camera.json).
 
 The benchmark creates 100k image/text cards in memory, then dispatches 120 zoom
 steps and 40 overview pan steps through the native UI event path. It compares the
@@ -51,6 +52,11 @@ ordinary renderer with GPU-retained overview geometry in the same executable.
 The creation frame is excluded. These are frame submission wall times, including
 surface waits; they are not GPU timestamp measurements or display FPS. This is
 not a new browser-versus-native measurement.
+
+The Node runner preserves all 203-frame assertions, the zoom/pan/drag partitions,
+per-stage median/p95/max summaries and retained/ordinary GPU parity assertion.
+Its default workload never reads or saves a user document. `--file` benchmarks an
+existing document without saving changes; `--directory` selects the log/report directory.
 
 | Native path | Zoom median | Overview pan median |
 | --- | ---: | ---: |

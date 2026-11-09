@@ -1,67 +1,58 @@
-#!/usr/bin/env python3
-"""Check that every package depends only on its own layer or lower ones (see layers.toml)."""
-import argparse
-from pathlib import Path, PurePosixPath
-import posixpath
-import sys
-import tomllib
+#!/usr/bin/env node
+import { existsSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { root } from './internal.mjs';
+import { dependencies, section, stringField, text } from './manifest.mjs';
+import { repositoryPins, repositoryRoot, repositories } from './dependency-root.mjs';
+import { workspace } from './workspace.mjs';
 
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def load_layers():
-    data = tomllib.loads((ROOT / "layers.toml").read_text(encoding="utf-8"))
-    prefixes = []
-    for layer in data["layer"]:
-        for path in layer["paths"]:
-            prefixes.append((path, layer["name"], layer["rank"]))
-    prefixes.sort(key=lambda item: len(item[0]), reverse=True)
-    return prefixes
-
-
-def layer_of(path, prefixes):
-    for prefix, name, rank in prefixes:
-        if path == prefix or path.startswith(prefix + "/"):
-            return name, rank
-    return None
-
-
-def packages():
-    members = tomllib.loads((ROOT / "silk.toml").read_text(encoding="utf-8"))["workspace"]["members"]
-    excluded = tomllib.loads((ROOT / "layers.toml").read_text(encoding="utf-8")).get("excluded", {})
-    for member in sorted(set(members) | set(excluded)):
-        manifest = tomllib.loads((ROOT / member / "silk.toml").read_text(encoding="utf-8"))
-        deps = []
-        for entry in manifest.get("dependencies", {}).values():
-            if isinstance(entry, dict) and "path" in entry and "git" not in entry:
-                deps.append(posixpath.normpath(posixpath.join(member, entry["path"])))
-        yield member, deps
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report-only", action="store_true",
-                        help="Print violations but exit 0")
-    args = parser.parse_args()
-    prefixes = load_layers()
-    problems = []
-    for member, deps in packages():
-        own = layer_of(member, prefixes)
-        if own is None:
-            problems.append(f"{member}: not in any layer of layers.toml")
-            continue
-        for dep in deps:
-            other = layer_of(dep, prefixes)
-            if other is None:
-                problems.append(f"{member} -> {dep}: dependency is not in any layer")
-            elif other[0] != own[0] and other[1] >= own[1]:
-                problems.append(f"{member} ({own[0]}) -> {dep} ({other[0]}): "
-                                "depends on a layer that is not lower")
-    for problem in problems:
-        print(problem)
-    print(f"{len(problems)} layer violation(s)")
-    return 0 if args.report_only or not problems else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if (process.argv.length !== 2) throw new Error('Usage: node scripts/check-layers');
+const { excluded, members, packages, layerOf } = workspace();
+const listed = new Set([...members, ...excluded.keys()]);
+if (members.length !== new Set(members).size) throw new Error('Duplicate workspace members');
+for (const member of members) if (excluded.has(member)) throw new Error(`${member}: both included and excluded`);
+for (const entry of packages) if (!listed.delete(entry.path)) throw new Error(`${entry.path}: unlisted retained package`);
+if (listed.size) throw new Error(`Missing or obsolete workspace packages: ${[...listed].join(', ')}`);
+const pins = repositoryPins();
+const visited = new Set();
+const named = new Map();
+function visit(manifest, ownerRoot, local) {
+  if (visited.has(manifest)) return;
+  visited.add(manifest);
+  const source = text(manifest);
+  const name = stringField(section(source, 'package'), 'name');
+  if (!name) throw new Error(`${manifest}: missing package name`);
+  if (named.has(name) && named.get(name) !== manifest) throw new Error(`Duplicate physical package ${name}: ${named.get(name)} and ${manifest}`);
+  named.set(name, manifest);
+  const member = relative(root, dirname(manifest)).replaceAll('\\', '/');
+  const ownLayer = local ? layerOf(member) : null;
+  if (local && !ownLayer) throw new Error(`${member}: not assigned a layer`);
+  for (const dep of dependencies(source)) {
+    let destination, destinationRoot, destinationLocal;
+    if (dep.git) {
+      const repo = dep.git.match(/^https:\/\/github\.com\/silk-lang\/(lib-[a-z]+)\.git$/)?.[1];
+      if (!repositories.includes(repo) || !/^[0-9a-f]{40}$/.test(dep.rev ?? '') || !dep.path || !dep.package) throw new Error(`${manifest}: noncanonical Git dependency ${dep.alias}`);
+      if (pins.get(repo) !== dep.rev) throw new Error(`${manifest}: ${repo}@${dep.rev} disagrees with retained pin ${pins.get(repo)}`);
+      destinationRoot = repositoryRoot(repo);
+      destination = resolve(destinationRoot, dep.path, 'silk.toml');
+      destinationLocal = false;
+    } else {
+      if (!dep.path) throw new Error(`${manifest}: dependency ${dep.alias} is not an explicit path or Git dependency`);
+      destinationRoot = ownerRoot;
+      destination = resolve(dirname(manifest), dep.path, 'silk.toml');
+      destinationLocal = local;
+    }
+    const within = relative(destinationRoot, destination);
+    if (within.startsWith('..') || isAbsolute(within)) throw new Error(`${manifest}: dependency ${dep.alias} escapes its repository`);
+    if (!existsSync(destination)) throw new Error(`${manifest}: missing ${destination}`);
+    if (destinationLocal) {
+      const path = relative(root, dirname(destination)).replaceAll('\\', '/');
+      const other = layerOf(path);
+      if (!other || (other.name !== ownLayer.name && other.rank >= ownLayer.rank)) throw new Error(`${member} -> ${path}: obsolete path or upward layer dependency`);
+    }
+    if (dep.package && stringField(section(text(destination), 'package'), 'name') !== dep.package) throw new Error(`${manifest}: package mismatch for ${dep.alias}`);
+    visit(destination, destinationRoot, destinationLocal);
+  }
+}
+for (const entry of packages) visit(entry.manifest, root, true);
+console.log(`Checked ${packages.length} retained packages, ${visited.size} reachable packages, and ${pins.size} coherent repository pins`);

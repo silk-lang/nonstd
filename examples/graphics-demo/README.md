@@ -4,9 +4,9 @@ The integration demo of the UI drawing layer. One window draws everything phases
 with no elements or layout: positions are computed by hand in `src/demo.silk`.
 
 - An Oklab gradient background and rounded cards with soft drop shadows and borders.
-- Text through [`fonts/raster`](../../fonts/raster): two Noto Sans faces, lines shaped once by the
+- Text through [`fonts/raster`](https://github.com/silk-lang/lib-fonts/tree/main/fonts/raster): two Noto Sans faces, lines shaped once by the
   line cache, glyph tiles from the glyph cache, straight and wavy underlines.
-- Icons from SVG through [`ui/sprites`](../../ui/sprites), with hover highlights in the top bar.
+- Icons from SVG through [`ui/sprites`](https://github.com/silk-lang/lib-ui/tree/main/ui/sprites), with hover highlights in the top bar.
 - An animated SVG (`assets/icons/orbit.svg`: SMIL `animate`, `animateMotion`,
   `animateTransform` and a CSS `@keyframes` halo) rasterized each frame at the frame's time.
 - A chart drawn as `vector` paths through the path cache, with an animated marker.
@@ -17,7 +17,7 @@ with no elements or layout: positions are computed by hand in `src/demo.silk`.
   textures, primitives).
 
 The same `Demo` paints into a `ui_scene.Scene` for three hosts: the CPU reference renderer, the
-native window app (Dawn on Metal, D3D12 or Vulkan through [`native/platform/window`](../../native/platform/window))
+native window app (Dawn on Metal, D3D12 or Vulkan through [`native/platform/window`](https://github.com/silk-lang/lib-native/tree/main/native/platform/window))
 and the browser (`navigator.gpu` on a canvas).
 
 ## Packages
@@ -33,17 +33,21 @@ and the browser (`navigator.gpu` on a canvas).
 
 ## Run
 
-Native, in a window (the bridge for this OS is built first; see the native/platform/window README for
-its prerequisites):
+Use Node.js, Silk and LLVM 22 from the repository setup instructions. Put Silk on `PATH`
+and set `SILK_CLANG` to LLVM 22 `clang`; `node scripts/setup-ci.mjs` provisions dependencies
+but does not change a local parent shell. Fetch dependencies with `silk check --workspace`.
+Native bridge generation runs through Silk manifest hooks.
+Browser hosts and generated exports resolve from the manifest-pinned `lib-native` checkout,
+not from source library directories. `SILK_CLANG` must point to LLVM 22 for browser linking.
 
 ```sh
-examples/graphics-demo/scripts/app --release
+node examples/graphics-demo/scripts/app --release
 ```
 
 In a browser with WebGPU, at http://127.0.0.1:8040/:
 
 ```sh
-examples/graphics-demo/scripts/browser serve
+node examples/graphics-demo/scripts/browser serve
 ```
 
 Move the pointer over the buttons and photos, click a photo to toggle its heart, scroll the grid
@@ -60,9 +64,9 @@ build/llvm/<target>/release/graphics-demo-screenshot build/demo.png 1024 720 2 0
 ## Tests
 
 ```sh
-examples/graphics-demo/scripts/check                         # generated modules, packages, goldens, GPU vs CPU
-examples/graphics-demo/scripts/app check --backend all       # the app in a window, read back and compared
-examples/graphics-demo/scripts/browser test                  # the page in Chromium: check and interaction runs
+node examples/graphics-demo/scripts/check                    # generated payloads, packages, goldens, GPU vs CPU
+node examples/graphics-demo/scripts/app check --backend all  # the app in a window, read back and compared
+node examples/graphics-demo/scripts/browser test             # the page in Chromium: check and interaction runs
 ```
 
 - **Goldens.** Three frames (`desktop` at 1x, `retina` at 2x with hover and a favorite,
@@ -86,5 +90,5 @@ CI runs all of it on Linux (lavapipe), in Chromium, and in real windows on macOS
 
 ## Assets
 
-The fonts, icons and photos come from [ui-assets](../../ui/assets), which the UI fixtures and
+The fonts, icons and photos come from [ui-assets](https://github.com/silk-lang/lib-ui/tree/main/ui/assets), which the UI fixtures and
 demos share.

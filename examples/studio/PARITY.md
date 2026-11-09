@@ -1,7 +1,7 @@
 # Native Studio parity contract
 
-Reference: the browser Studio in `graphics/editor/app` on the browser feature
-branch. Compare the same version-1 document, viewport (1440×960 and 1000×700),
+Reference: the browser Studio now packaged in `examples/studio/browser`.
+Compare the same version-1 document, viewport (1440×960 and 1000×700),
 camera, selection and interaction state. `tests/explorations.silkdesign` is the
 browser's actual starter document. Platform window decorations and native file
 pickers are platform adaptations. Cloud work remains excluded.
@@ -34,7 +34,12 @@ Visual comparison: same browser starter, fitted camera and matching 1440×960 an
 1000×700 logical viewports. Reviewed page, shape, typography, command palette,
 shortcuts, file menu, color picker, scrolled effect sections, multiple selection,
 hidden panels and empty search. Native captures and semantic snapshots are
-reproducible with scripts/parity-check under build/native-parity.
+reproducible with `node examples/studio/scripts/parity-check` under `build/native-parity`.
+The Node runner copies the fixture into a fresh temporary document for each
+viewport, sends the same inspector input, retains screenshots/semantic snapshots,
+and terminates the app before removing the temporary document. Use
+`--app "$PWD/build/Silk Studio.app/Contents/MacOS/SilkStudio"` to exercise the
+packaged launcher and its resource paths without opening a user design.
 
 The native app now shares the browser composition, panel breakpoints, toolbar,
 property sections, spacing, fitted text dimensions/baselines, page/frame labels,

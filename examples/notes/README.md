@@ -1,7 +1,7 @@
 # Notes
 
 The example app of the Silk UI stack: a notes app in a native window, built with
-[ui-app](../../ui/app) and [ui-components](../../ui/components) on the retained [ui-tree](../../ui/tree). It is
+[ui-app](https://github.com/silk-lang/lib-ui/tree/main/ui/app) and [ui-components](https://github.com/silk-lang/lib-ui/tree/main/ui/components) on the retained [ui-tree](https://github.com/silk-lang/lib-ui/tree/main/ui/tree). It is
 small enough to read in one sitting and does what a real app does: it loads and saves a file,
 filters and sorts a list, edits text, asks before deleting, has keyboard shortcuts and a dark
 theme, and can be inspected and driven by tests, the devtools window and agents.
@@ -20,10 +20,15 @@ Packages:
 
 ## Running it
 
+Use Node.js, Silk and LLVM 22 from the repository setup instructions. Put Silk on
+`PATH` and set `SILK_CLANG` to the LLVM 22 `clang` executable; provisioning does not
+change a local parent shell's environment.
+
 ```sh
-python3 scripts/install-silk && python3 scripts/install-llvm   # once, see the repository README
-examples/notes/scripts/notes                       # debug build, notes in ~/.silk-notes.json
-examples/notes/scripts/notes --release --file my-notes.json
+node scripts/setup-ci.mjs                         # provisions pinned native dependencies
+silk check --workspace                            # fetch manifest-pinned Git dependencies
+node examples/notes/scripts/notes                 # debug build, notes in ~/.silk-notes.json
+node examples/notes/scripts/notes --release --file my-notes.json
 ```
 
 On Linux it needs `libx11-dev libxkbcommon-dev libwayland-dev` (see
@@ -43,7 +48,7 @@ that is not a notes file is left alone: the app says so and exits.
 In a browser tab, with WebGPU and JSPI (Chrome or Edge 137 or later), at http://127.0.0.1:8050/:
 
 ```sh
-python3 ui/tree/window/scripts/browser serve    # builds examples/notes/browser for wasm32
+node examples/browser serve examples/notes/browser
 ```
 
 The browser build (`examples/notes/browser`) keeps the notes file in the page's localStorage
@@ -53,11 +58,15 @@ sample notes.
 To look inside it while it runs, start it with the devtools window next to it:
 
 ```sh
-ui/inspect/devtools/scripts/devtools notes
+node examples/notes/scripts/devtools
 ```
 
+The devtools launcher uses `.cache/ui-devtools/notes.json`, not your default notes file.
+Pass `--file FILE` to inspect another notes file. The check keeps screenshots in
+`.cache/ui-devtools/` and isolates its notes in a temporary directory.
+
 `ui-inspect-cli` and `ui-inspect-mcp` reach it the same way (debug build, `SILK_UI_INSPECT`
-set): see [ui/inspect/server](../../ui/inspect/server).
+set): see [ui/inspect/server](https://github.com/silk-lang/lib-ui/tree/main/ui/inspect/server).
 
 ## How it is built
 
@@ -106,9 +115,10 @@ too.
 ```sh
 silk test --manifest-path examples/notes/tests/silk.toml --root src/tests.silk
 silk build --manifest-path examples/notes/tests/silk.toml
-examples/notes/tests/build/llvm/x86_64-unknown-linux-gnu/debug/ui-notes-tests examples/notes/tests/goldens
-examples/notes/scripts/notes check                # the app in X11 and Wayland windows (Linux)
-ui/inspect/devtools/scripts/devtools check  # the devtools window inspecting the app
+build/llvm/<target>/debug/ui-notes-tests examples/notes/tests/goldens
+node examples/notes/scripts/notes check           # X11 and Wayland windows on Linux
+node examples/notes/scripts/devtools-check        # inspector, styles, events, saving and screenshots
+node examples/browser test examples/notes/browser
 ```
 
 The tests drive the app through the tree's real input path with the ui-app harness (clicks by
@@ -117,8 +127,10 @@ and what the store received: start-up and list keys, a new note typed and autosa
 JSON is read back), search with Enter and Escape, pinning and both sort orders, duplicate, delete
 with its dialog (Cancel, Escape, Delete, deleting everything), dark mode and failing saves, and a
 keyboard-only run. The goldens are five scenes: the start, a new note being typed, a search, the
-delete dialog, and dark mode with the Note menu open. CI runs all of it in `ui-notes.yml`, and
-the devtools exit test in `ui-inspect.yml`.
+delete dialog, and dark mode with the Note menu open. CI runs all of it in `ui-notes.yml`.
+The devtools check uses a fresh temporary notes file and removes it afterward; it never opens
+the default notes file. Browser hosts and devtools come from the manifest-pinned `lib-ui`
+checkout under `$SILK_HOME/git` (default `~/.silk/git`).
 
 ## What it found
 

@@ -1,136 +1,94 @@
-#!/usr/bin/env python3
-"""The UI threading exit test: scrolling stays at display rate while the app is slow.
-
-Builds the release scroll demo and runs it with an `update` that sleeps 200 ms each pass, once
-with every section mounted (default 10,000) and once virtualized, where sections mount as they
-come into view. A driver thread in the app sends a wheel step every 8 ms for 3 seconds through
-the platform thread, where OS input arrives, counts the frames the render thread presents and
-how many of them the app painted, then clicks Reverse and waits for the app to repaint. Each
-mode runs once more with an update that does not sleep, as the baseline of what this machine's
-GPU can present.
-
-It passes when the slow run's gaps between frames stay short (p95 at most --max-p95 ms or
-within a quarter, plus 2 ms, of the baseline's; the longest likewise against --max-gap ms), when the app
-keeps painting while the compositor scrolls, and when it answers the click. With one thread the
-gaps would be at least the 200 ms update.
-
-On Linux it runs under Xvfb (X11) and a headless Weston (Wayland), as
-native/platform/window/scripts/linux does, with lavapipe when VK_ICD_FILENAMES is not set; on
-macOS and Windows it opens a real window.
-"""
-import argparse
-import os
-from pathlib import Path
-import re
-import runpy
-import subprocess
-import sys
-import tempfile
-
-PACKAGE = Path(__file__).resolve().parents[1]
-REPO = PACKAGE.parents[1]
-WINDOW = REPO / 'native/platform/window/scripts'
-sys.path.insert(0, str(REPO / 'native/gpu/webgpu/scripts'))
-from _build import build  # noqa: E402
-
-EXIT_SCROLL = 3.0  # seconds the driver scrolls, as in src/main.silk
-LAVAPIPE = Path('/usr/share/vulkan/icd.d/lvp_icd.json')
-RESULT = re.compile(r'exit-test: steps=(\d+) frames=(\d+) fps=([\d.]+) gap-p95-ms=([\d.e+-]+) '
-                    r'gap-max-ms=([\d.e+-]+) painted=(\d+) click=(\w+)')
-
-
-def result(log):
-    text = log.read_text(errors='replace') if log.exists() else ''
-    found = RESULT.search(text)
-    if not found:
-        sys.stderr.write(text[-4000:])
-        return None
-    return dict(steps=int(found[1]), frames=int(found[2]), fps=float(found[3]),
-                p95=float(found[4]), longest=float(found[5]), painted=int(found[6]),
-                clicked=found[7] == 'ok')
-
-
-def describe(run):
-    return (f'{run["frames"]} frames for {run["steps"]} wheel steps ({run["fps"]:.0f} fps), '
-            f'gap p95 {run["p95"]:.1f} ms, longest {run["longest"]:.1f} ms; the app painted '
-            f'{run["painted"]} of them and {"answered" if run["clicked"] else "did not answer"} a click')
-
-
-def judge(name, slow, fast, args):
-    if not slow or not fast:
-        print(f'--- {name}: failed, no result', flush=True)
-        return 1
-    limit = max(args.max_p95, fast['p95'] * 1.25 + 2.0)
-    # The app paints about once per slow update while the compositor scrolls; at least a third
-    # of that shows it keeps up (new sections mount, the scrolled-to content draws).
-    least = max(2, int(EXIT_SCROLL * 1000 / max(args.slow_update, 1) / 3))
-    longest = max(args.max_gap, fast['longest'] * 1.25 + 2.0)
-    ok = (slow['frames'] > 0 and slow['p95'] <= limit and slow['longest'] <= longest
-          and slow['painted'] >= least and fast['painted'] >= least
-          and slow['clicked'] and fast['clicked'])
-    print(f'--- {name}: baseline (update does not sleep): {describe(fast)}', flush=True)
-    print(f'--- {name}: update sleeps {args.slow_update} ms: {describe(slow)}', flush=True)
-    print(f'--- {name}: {"passed" if ok else "failed"} (limits: p95 {limit:.1f} ms, longest '
-          f'{longest:.1f} ms, the app paints at least {least} frames and answers the click)', flush=True)
-    return 0 if ok else 1
-
-
-MODES = {
-    # Every section mounted: the most to scroll.
-    'mounted': lambda args: [f'--sections={args.sections}', '--fully-mounted'],
-    # The demo's default: sections mount as they come into view, so the app must keep up.
-    'virtualized': lambda args: ['--sections=100'],
-}
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--backend', choices=['x11', 'wayland', 'all'], default='all')
-    parser.add_argument('--mode', choices=[*MODES, 'all'], default='all')
-    parser.add_argument('--sections', type=int, default=10000)
-    parser.add_argument('--slow-update', type=int, default=200)
-    parser.add_argument('--max-p95', type=float, default=25.0)
-    parser.add_argument('--max-gap', type=float, default=50.0)
-    parser.add_argument('--binary', type=Path, help='skip building')
-    args = parser.parse_args()
-    program = args.binary.resolve() if args.binary else build(PACKAGE, release=True)
-    modes = list(MODES) if args.mode == 'all' else [args.mode]
-    env = dict(os.environ)
-    with tempfile.TemporaryDirectory(prefix='scroll-exit-') as temporary:
-        directory = Path(temporary)
-        if sys.platform.startswith('linux'):
-            if 'VK_ICD_FILENAMES' not in env and LAVAPIPE.exists():
-                env['VK_ICD_FILENAMES'] = str(LAVAPIPE)
-            env['SILK_WINDOW_SCALE'] = env.get('SILK_WINDOW_SCALE', '1')
-            linux = runpy.run_path(str(WINDOW / 'linux'))
-            backends = ['x11', 'wayland'] if args.backend == 'all' else [args.backend]
-        else:
-            backends = [sys.platform]
-        status = 0
-        for name in backends:
-            for mode in modes:
-                label = f'{name} {mode}'
-                print(f'--- {label}', flush=True)
-                runs = {}
-                code = 0
-                for slow in (0, args.slow_update):
-                    flags = [*MODES[mode](args), f'--slow-update={slow}', '--exit-test']
-                    log = directory / f'{name}-{mode}-{slow}.log'
-                    if sys.platform.startswith('linux'):
-                        # The runners start the program without arguments; a wrapper adds them.
-                        wrapper = directory / f'{name}-{mode}-{slow}.sh'
-                        wrapper.write_text(f'#!/bin/sh\ncd "{REPO}"\nexec "{program}" {" ".join(flags)} 2>"{log}"\n')
-                        wrapper.chmod(0o755)
-                        runner = linux['run_under_x11'] if name == 'x11' else linux['run_under_wayland']
-                        code = runner(wrapper, env) or code
-                    else:
-                        with log.open('w') as output:
-                            code = subprocess.run([str(program), *flags], cwd=REPO, env=env, stderr=output,
-                                                  timeout=600).returncode or code
-                    runs[slow] = result(log)
-                status = judge(label, runs[args.slow_update], runs[0], args) or code or status
-        return status
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+#!/usr/bin/env node
+// Check compositor pacing, concurrent painting, and click handling during slow updates.
+(async () => {
+  const { build, root } = await import('../../../scripts/internal.mjs');
+  const { withDisplay } = await import('../../internal.mjs');
+  const { spawnSync } = await import('node:child_process');
+  const { closeSync, mkdtempSync, openSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const { parseArgs } = await import('node:util');
+  const { values } = parseArgs({ options: {
+    backend: { type: 'string', default: 'all' }, mode: { type: 'string', default: 'all' },
+    sections: { type: 'string', default: '10000' }, 'slow-update': { type: 'string', default: '200' },
+    'max-p95': { type: 'string', default: '25' }, 'max-gap': { type: 'string', default: '50' },
+    binary: { type: 'string' }, help: { type: 'boolean', short: 'h' },
+  } });
+  if (values.help) {
+    console.log(`Usage: examples/scroll-demo/scripts/exit-test [OPTIONS]
+  --backend x11|wayland|all   Linux display backend (default: all)
+  --mode mounted|virtualized|all (default: all)
+  --sections N              Fully mounted section count (default: 10000)
+  --slow-update MS          Slow update sleep (default: 200)
+  --max-p95 MS              Minimum p95 gap limit (default: 25)
+  --max-gap MS              Minimum longest gap limit (default: 50)
+  --binary PATH             Skip the release build
+Runs each mode with fast and slow updates, scrolling for three seconds, then clicking
+Reverse. Limits also allow baseline * 1.25 + 2 ms. Requires painting during scrolling
+and a click response. Linux uses Xvfb/Weston when installed, otherwise the session's
+display; macOS and Windows open a real window.`);
+    return;
+  }
+  if (!['x11', 'wayland', 'all'].includes(values.backend)) throw new Error('backend must be x11, wayland, or all');
+  if (!['mounted', 'virtualized', 'all'].includes(values.mode)) throw new Error('mode must be mounted, virtualized, or all');
+  for (const key of ['sections', 'slow-update', 'max-p95', 'max-gap']) {
+    const text = values[key];
+    values[key] = Number(text);
+    if (!text.trim() || !Number.isFinite(values[key]) || (['sections', 'slow-update'].includes(key) && !Number.isInteger(values[key]))) {
+      throw new Error(`--${key} requires a ${['sections', 'slow-update'].includes(key) ? 'whole ' : ''}number`);
+    }
+  }
+  const binary = values.binary ? resolve(values.binary) : build(join(root, 'examples/scroll-demo'), { release: true });
+  const modes = values.mode === 'all' ? ['mounted', 'virtualized'] : [values.mode];
+  const backends = process.platform === 'linux' ? (values.backend === 'all' ? ['x11', 'wayland'] : [values.backend]) : [process.platform];
+  const directory = mkdtempSync(join(tmpdir(), 'scroll-exit-'));
+  const pattern = /exit-test: steps=(\d+) frames=(\d+) fps=([\d.]+) gap-p95-ms=([\d.e+-]+) gap-max-ms=([\d.e+-]+) painted=(\d+) click=(\w+)/;
+  function result(path) {
+    const text = readFileSync(path, 'utf8');
+    const found = pattern.exec(text);
+    if (!found) { process.stderr.write(text.slice(-4000)); return null; }
+    return { steps: Number(found[1]), frames: Number(found[2]), fps: Number(found[3]), p95: Number(found[4]), longest: Number(found[5]), painted: Number(found[6]), clicked: found[7] === 'ok' };
+  }
+  function describe(run) {
+    return `${run.frames} frames for ${run.steps} wheel steps (${run.fps.toFixed(0)} fps), gap p95 ${run.p95.toFixed(1)} ms, longest ${run.longest.toFixed(1)} ms; the app painted ${run.painted} of them and ${run.clicked ? 'answered' : 'did not answer'} a click`;
+  }
+  function judge(name, slow, fast) {
+    if (!slow || !fast) { console.log(`--- ${name}: failed, no result`); return 1; }
+    const limit = Math.max(values['max-p95'], fast.p95 * 1.25 + 2);
+    const longest = Math.max(values['max-gap'], fast.longest * 1.25 + 2);
+    const least = Math.max(2, Math.trunc(3000 / Math.max(values['slow-update'], 1) / 3));
+    const ok = slow.frames > 0 && slow.p95 <= limit && slow.longest <= longest && slow.painted >= least && fast.painted >= least && slow.clicked && fast.clicked;
+    console.log(`--- ${name}: baseline (update does not sleep): ${describe(fast)}`);
+    console.log(`--- ${name}: update sleeps ${values['slow-update']} ms: ${describe(slow)}`);
+    console.log(`--- ${name}: ${ok ? 'passed' : 'failed'} (limits: p95 ${limit.toFixed(1)} ms, longest ${longest.toFixed(1)} ms, the app paints at least ${least} frames and answers the click)`);
+    return ok ? 0 : 1;
+  }
+  let status = 0;
+  try {
+    for (const backend of backends) {
+      for (const mode of modes) {
+        const label = `${backend} ${mode}`;
+        console.log(`--- ${label}`);
+        const runs = new Map();
+        let code = 0;
+        for (const slow of [0, values['slow-update']]) {
+          const flags = mode === 'mounted' ? [`--sections=${values.sections}`, '--fully-mounted'] : ['--sections=100'];
+          flags.push(`--slow-update=${slow}`, '--exit-test');
+          const logPath = join(directory, `${backend}-${mode}-${slow}.log`);
+          const log = openSync(logPath, 'w');
+          try {
+            const current = await withDisplay(backend, process.env, env => {
+              const child = spawnSync(binary, flags, { cwd: root, env, stdio: ['inherit', 'inherit', log], timeout: process.platform === 'linux' ? 120000 : 600000 });
+              if (child.error) throw child.error;
+              return child.status ?? 1;
+            });
+            code = current || code;
+          } finally { closeSync(log); }
+          runs.set(slow, result(logPath));
+        }
+        status = judge(label, runs.get(values['slow-update']), runs.get(0)) || code || status;
+      }
+    }
+    process.exitCode = status;
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+})().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -1,76 +1,111 @@
-#!/usr/bin/env python3
-"""Measure ordinary UI-tree scrolling. Build the release demo with scripts/run first."""
-import argparse
-import datetime
-import json
-import hashlib
-from pathlib import Path
-import platform
-import re
-import statistics
-import subprocess
-
-REPO = Path(__file__).resolve().parents[3]
-ROW = re.compile(r'scroll-ms: input=(\S+) frame=(\S+) y=(\S+) painted=(\S+) replayed=(\S+) glyphs=(\S+) layoutSkipped=(\S+)')
-
-
-def stats(values):
-    values = sorted(values)
-    return dict(medianMs=statistics.median(values), p95Ms=values[int((len(values)-1)*.95)], maxMs=max(values))
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--sizes', nargs='+', type=int, default=[100, 1000])
-    parser.add_argument('--fully-mounted', action='store_true')
-    parser.add_argument('--phases', action='store_true', help='Resolve layout separately before painting; use to diagnose, not for the normal baseline')
-    parser.add_argument('--timeout', type=int, default=600)
-    parser.add_argument('--steps', type=int, default=120)
-    parser.add_argument('--directory', type=Path, default=REPO / 'build/scroll-lab')
-    args = parser.parse_args()
-    if args.steps < 2 or args.steps > 1000 or any(n < 1 or n > 10000 for n in args.sizes):
-        parser.error('sizes must be 1..10000 and steps 2..1000')
-    candidates = list((REPO/'build/llvm').glob('*/release/silk-scroll-demo'))
-    if len(candidates) != 1:
-        parser.error('Build the release demo first')
-    args.directory.mkdir(parents=True, exist_ok=True)
-    result = dict(date=datetime.datetime.now(datetime.timezone.utc).isoformat(), machine=platform.machine(),
-        viewport=dict(width=1280,height=900,scale=2),
-        revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
-        dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=REPO, text=True).strip()),
-        binarySha256=hashlib.sha256(candidates[0].read_bytes()).hexdigest(),
-        metric='CPU wheel dispatch/runtime pump and UI-tree frame (layout/paint); excludes GPU, native accessibility, and presentation',
-        phases=args.phases,
-        document='Fully mounted' if args.fully_mounted else 'Library-virtualized variable-height mixed-content sections', cases=[])
-    for size in args.sizes:
-        log = args.directory / f'{size}.log'
-        with log.open('w') as out:
-            subprocess.run([str(candidates[0]),'--benchmark',f'--sections={size}',f'--steps={args.steps}'] + (['--phases'] if args.phases else []) + (['--fully-mounted'] if args.fully_mounted else []),
-                cwd=REPO,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=args.timeout)
-        text = log.read_text()
-        rows = ROW.findall(text)
-        assert len(rows) == args.steps, (size, len(rows), text[-1000:])
-        mount = re.search(r'mount-ms: (\S+) nodes=(\S+) fragments=(\S+)',text)
-        case=dict(sections=size,nodes=int(mount[2]),fragments=int(mount[3]),mountMs=float(mount[1]),
-            samples=len(rows),input=stats([float(r[0]) for r in rows]),
-            frame=stats([float(r[1]) for r in rows]),
-            total=stats([float(r[0])+float(r[1]) for r in rows]),
-            paintedFragmentsMax=max(int(r[3]) for r in rows),layoutSkippedFrames=sum(r[6]=='true' for r in rows))
-        mount_phases = re.search(r'mount-phases-ms: build=(\S+) firstFrame=(\S+)', text)
-        if mount_phases:
-            case.update(buildMs=float(mount_phases[1]), firstFrameMs=float(mount_phases[2]))
-        phases = re.findall(r'phase-ms: layout=(\S+) remainingFrame=(\S+) fullLayouts=(\S+)', text)
-        if phases:
-            case.update(layout=stats([float(p[0]) for p in phases]), remainingFrame=stats([float(p[1]) for p in phases]), fullLayoutsMax=max(int(p[2]) for p in phases))
-        full_layouts = re.findall(r'layoutSkipped=\S+ fullLayouts=(\d+)', text)
-        if full_layouts:
-            case['fullLayoutsMax'] = max(int(n) for n in full_layouts)
-        case['glyphsMax'] = max(int(r[5]) for r in rows)
-        result['cases'].append(case)
-        (args.directory/'results.json').write_text(json.dumps(result,indent=2)+'\n')
-        print(json.dumps(case),flush=True)
-    print(args.directory/'results.json')
-
-
-if __name__ == '__main__':
-    main()
+#!/usr/bin/env node
+// Measure ordinary UI-tree scrolling; build the release demo with scripts/run first.
+(async () => {
+  const { root, run } = await import('../../../scripts/internal.mjs');
+  const assert = (await import('node:assert/strict')).default;
+  const { createHash } = await import('node:crypto');
+  const { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } = await import('node:fs');
+  const { machine } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const { parseArgs } = await import('node:util');
+  // Node's parser handles repeated values; normalize argparse's --sizes N N syntax.
+  const argv = process.argv.slice(2);
+  const normalized = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] !== '--sizes') { normalized.push(argv[i]); continue; }
+    let count = 0;
+    while (i + 1 < argv.length && !argv[i + 1].startsWith('--') && argv[i + 1] !== '-h') {
+      normalized.push(`--sizes=${argv[++i]}`);
+      count++;
+    }
+    if (!count) throw new Error('--sizes requires at least one size');
+  }
+  const { values } = parseArgs({ args: normalized, options: {
+    sizes: { type: 'string', multiple: true, default: ['100', '1000'] },
+    'fully-mounted': { type: 'boolean', default: false }, phases: { type: 'boolean', default: false },
+    timeout: { type: 'string', default: '600' }, steps: { type: 'string', default: '120' },
+    directory: { type: 'string', default: join(root, 'build/scroll-lab') },
+    help: { type: 'boolean', short: 'h' },
+  } });
+  if (values.help) {
+    console.log(`Usage: examples/scroll-demo/scripts/measure [--sizes N ...] [--fully-mounted]
+       [--phases] [--timeout SECONDS] [--steps N] [--directory PATH]
+Build the release demo with scripts/run --build-only first. Defaults: sizes 100 1000,
+120 steps, 600-second timeout, build/scroll-lab. --phases resolves layout separately
+before painting: use it to diagnose, not for the normal baseline.`);
+    return;
+  }
+  function integer(text, name) {
+    if (!/^[+-]?\d+$/.test(text) || !Number.isSafeInteger(Number(text))) throw new Error(`${name} requires an integer`);
+    return Number(text);
+  }
+  const sizes = values.sizes.map(value => integer(value, '--sizes'));
+  const steps = integer(values.steps, '--steps');
+  const timeout = integer(values.timeout, '--timeout');
+  if (steps < 2 || steps > 1000 || sizes.some(size => size < 1 || size > 10000)) {
+    throw new Error('sizes must be 1..10000 and steps 2..1000');
+  }
+  const llvm = join(root, 'build/llvm');
+  const filename = process.platform === 'win32' ? 'silk-scroll-demo.exe' : 'silk-scroll-demo';
+  const candidates = existsSync(llvm) ? readdirSync(llvm, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => join(llvm, entry.name, 'release', filename))
+    .filter(path => existsSync(path)) : [];
+  if (candidates.length !== 1) throw new Error('Build the release demo first (exactly one target artifact is required)');
+  const binary = candidates[0];
+  const directory = resolve(values.directory);
+  mkdirSync(directory, { recursive: true });
+  function git(args) {
+    return run('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).stdout.trim();
+  }
+  const result = {
+    date: new Date().toISOString(), machine: machine(), viewport: { width: 1280, height: 900, scale: 2 },
+    revision: git(['rev-parse', 'HEAD']), dirty: Boolean(git(['status', '--porcelain'])),
+    binarySha256: createHash('sha256').update(readFileSync(binary)).digest('hex'),
+    metric: 'CPU wheel dispatch/runtime pump and UI-tree frame (layout/paint); excludes GPU, native accessibility, and presentation',
+    phases: values.phases,
+    document: values['fully-mounted'] ? 'Fully mounted' : 'Library-virtualized variable-height mixed-content sections', cases: [],
+  };
+  function stats(values) {
+    values.sort((a, b) => a - b);
+    const middle = Math.floor(values.length / 2);
+    return { medianMs: values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2,
+      p95Ms: values[Math.floor((values.length - 1) * .95)], maxMs: values.at(-1) };
+  }
+  const row = /scroll-ms: input=(\S+) frame=(\S+) y=(\S+) painted=(\S+) replayed=(\S+) glyphs=(\S+) layoutSkipped=(\S+)/g;
+  for (const size of sizes) {
+    const logPath = join(directory, `${size}.log`);
+    const log = openSync(logPath, 'w');
+    const flags = ['--benchmark', `--sections=${size}`, `--steps=${steps}`];
+    if (values.phases) flags.push('--phases');
+    if (values['fully-mounted']) flags.push('--fully-mounted');
+    try { run(binary, flags, { cwd: root, stdio: ['inherit', log, log], timeout: Math.max(1, timeout * 1000) }); }
+    finally { closeSync(log); }
+    const text = readFileSync(logPath, 'utf8');
+    const rows = [...text.matchAll(row)];
+    assert.equal(rows.length, steps, `${size} sections: ${rows.length} samples\n${text.slice(-1000)}`);
+    const mount = /mount-ms: (\S+) nodes=(\S+) fragments=(\S+)/.exec(text);
+    assert.ok(mount, `missing mount metrics\n${text.slice(-1000)}`);
+    const entry = {
+      sections: size, nodes: Number(mount[2]), fragments: Number(mount[3]), mountMs: Number(mount[1]),
+      samples: rows.length, input: stats(rows.map(row => Number(row[1]))), frame: stats(rows.map(row => Number(row[2]))),
+      total: stats(rows.map(row => Number(row[1]) + Number(row[2]))),
+      paintedFragmentsMax: Math.max(...rows.map(row => Number(row[4]))),
+      layoutSkippedFrames: rows.filter(row => row[7] === 'true').length,
+    };
+    const mountPhases = /mount-phases-ms: build=(\S+) firstFrame=(\S+)/.exec(text);
+    if (mountPhases) Object.assign(entry, { buildMs: Number(mountPhases[1]), firstFrameMs: Number(mountPhases[2]) });
+    const phases = [...text.matchAll(/phase-ms: layout=(\S+) remainingFrame=(\S+) fullLayouts=(\S+)/g)];
+    if (phases.length) Object.assign(entry, {
+      layout: stats(phases.map(phase => Number(phase[1]))), remainingFrame: stats(phases.map(phase => Number(phase[2]))),
+      fullLayoutsMax: Math.max(...phases.map(phase => Number(phase[3]))),
+    });
+    const fullLayouts = [...text.matchAll(/layoutSkipped=\S+ fullLayouts=(\d+)/g)];
+    if (fullLayouts.length) entry.fullLayoutsMax = Math.max(...fullLayouts.map(match => Number(match[1])));
+    entry.glyphsMax = Math.max(...rows.map(row => Number(row[6])));
+    result.cases.push(entry);
+    writeFileSync(join(directory, 'results.json'), `${JSON.stringify(result, null, 2)}\n`);
+    console.log(JSON.stringify(entry));
+  }
+  console.log(join(directory, 'results.json'));
+})().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -13,14 +13,18 @@ of unique image resources.
 
 ## Run
 
-From the repository root, using Python 3.11 or newer:
+From the repository root, using Node.js and the configured Silk compiler:
 
 ```sh
-python3 examples/scroll-demo/scripts/run
-python3 examples/scroll-demo/scripts/run --sections=10000 --profile
-python3 examples/scroll-demo/scripts/run --sections=1000 --fully-mounted
-python3 examples/scroll-demo/scripts/run --bundle  # macOS
+node examples/scroll-demo/scripts/run
+node examples/scroll-demo/scripts/run --sections=10000 --profile
+node examples/scroll-demo/scripts/run --sections=1000 --fully-mounted
+node examples/scroll-demo/scripts/run --bundle  # macOS
 ```
+
+`run` builds release by default; `--debug` selects debug, `--build-only` prints
+the artifact path without launching, and remaining options go to the app.
+`--bundle` stages the executable atomically into the macOS bundle and does not launch it.
 
 The default is 100 sections. Buttons select 100, 1,000, or 10,000 sections and toggle
 images. Use the wheel/trackpad or **Auto scroll**; **Reverse** changes the direction.
@@ -44,13 +48,13 @@ proxy, not GPU completion timestamps or proof that every frame reached the displ
 Start a debug build with the inspector enabled:
 
 ```sh
-SILK_UI_INSPECT=1 python3 examples/scroll-demo/scripts/run --debug
+SILK_UI_INSPECT=/tmp/scroll-lab.sock node examples/scroll-demo/scripts/run --debug
 ```
 
 From another terminal in the same repository checkout, open the devtools window:
 
 ```sh
-python3 ui/inspect/devtools/scripts/devtools --connect 1
+node "$(node scripts/dependency-root.mjs lib-ui)/ui/inspect/devtools/scripts/devtools" run --connect /tmp/scroll-lab.sock
 ```
 
 The demo prints `ui-inspect: listening on ...` when ready. Inspection is disabled
@@ -58,7 +62,7 @@ in release builds and when `SILK_UI_INSPECT` is unset. The element tree shows th
 currently mounted virtual rows. To check socket discovery and a real button click:
 
 ```sh
-python3 examples/scroll-demo/scripts/inspect-check
+node examples/scroll-demo/scripts/inspect-check
 ```
 
 This macOS/Linux smoke test builds the debug app, starts it on an isolated socket,
@@ -71,12 +75,12 @@ Build once, then run the same document headlessly through the real wheel dispatc
 runtime event pump, layout engine, text system, and painter:
 
 ```sh
-python3 examples/scroll-demo/scripts/run --build-only
-python3 examples/scroll-demo/scripts/measure --sizes 100 1000 10000
-python3 examples/scroll-demo/scripts/measure --sizes 100 1000 --fully-mounted
-python3 examples/scroll-demo/scripts/measure --sizes 100 1000 --steps 8 --phases \
+node examples/scroll-demo/scripts/run --build-only
+node examples/scroll-demo/scripts/measure --sizes 100 1000 10000
+node examples/scroll-demo/scripts/measure --sizes 100 1000 --fully-mounted
+node examples/scroll-demo/scripts/measure --sizes 100 1000 --steps 8 --phases \
   --directory build/scroll-lab-phases
-python3 examples/scroll-demo/scripts/measure --sizes 10000 --steps 4 --timeout 600 \
+node examples/scroll-demo/scripts/measure --sizes 10000 --steps 4 --timeout 600 \
   --directory build/scroll-lab-10000
 ```
 
@@ -94,6 +98,12 @@ node/fragment counts, paint counts, and layout-skipped counts. CPU results exclu
 native accessibility, the event loop, GPU work, and presentation. A 16.7 ms CPU result
 alone does not establish 60 FPS.
 
+The measurement command reuses the single release artifact under `build/llvm`;
+it never rebuilds. Defaults are sizes 100 and 1,000, 120 steps, a 600-second
+timeout per case, and output directory `build/scroll-lab`. Sizes must be 1–10,000
+and steps 2–1,000. Summaries include the Git revision, dirty flag, and binary SHA-256;
+each completed case updates `results.json`.
+
 Paint and layout counters describe the last settling pass; elapsed time includes
 all passes. A frame can update scroll geometry without a full layout.
 
@@ -106,8 +116,8 @@ construction from the first frame.
 ## Check rendering
 
 ```sh
-python3 examples/scroll-demo/scripts/run --sections=100 --check
-python3 examples/scroll-demo/scripts/run --check-grow
+node examples/scroll-demo/scripts/run --sections=100 --check
+node examples/scroll-demo/scripts/run --check-grow
 ```
 
 The native check clicks **Reverse**, verifies **Forward** appears, scrolls the document,
@@ -119,6 +129,29 @@ verifies that the model reached 1,000 sections, then checks the scrolled renderi
 This exercises document growth through the app, including native accessibility.
 
 See [measurements](measurements/README.md) for the initial findings and captured runs.
+
+## Check scrolling during slow updates
+
+```sh
+node examples/scroll-demo/scripts/exit-test
+node examples/scroll-demo/scripts/exit-test --backend x11 --mode virtualized
+```
+
+This builds release unless `--binary PATH` is supplied. It runs mounted and
+virtualized modes with fast updates and with `--slow-update 200` milliseconds,
+scrolling for three seconds and then clicking Reverse. The mounted case uses
+`--sections 10000` by default; the virtualized case uses 100 sections.
+`--mode mounted|virtualized|all` selects cases. On Linux,
+`--backend x11|wayland|all` selects Xvfb/headless Weston, falling back to the
+session display when unavailable. Lavapipe is selected when installed and
+`VK_ICD_FILENAMES` is unset; `SILK_WINDOW_SCALE` defaults to 1.
+Other platforms open real windows.
+
+The slow run must present frames, keep painting, and answer the click; the
+baseline must also paint and answer. Gap limits are the greater of `--max-p95 25`
+and baseline p95 × 1.25 + 2 ms, and the greater of `--max-gap 50` and baseline
+maximum × 1.25 + 2 ms. Each run must paint at least one third of the expected
+slow updates during scrolling (minimum two). Any failed case makes the command fail.
 
 ## Library API
 
@@ -144,7 +177,8 @@ column; put decoration and spacing in the item body instead.
 
 `ui-app` only builds keyed nodes for the requested range and forwards configuration
 and item bindings. Direct tree clients can use the same functionality without the
-framework; see [the tree protocol](../../ui/tree/README.md#virtual-scrolling).
+framework; see `ui/tree/README.md` (Virtual scrolling) in the pinned `lib-ui`
+checkout printed by `node scripts/dependency-root.mjs lib-ui`.
 
 Native window hosts settle virtual lists automatically. Custom hosts should call
 `runtime.frame` instead of `tree.frame`, and continue to pump input events. It limits
@@ -159,7 +193,7 @@ builds it for wasm32, with the document itself in the `document` library
 Edge 137 or later):
 
 ```sh
-python3 ui/tree/window/scripts/browser serve examples/scroll-demo/wasm   # http://127.0.0.1:8050/
+node examples/browser serve examples/scroll-demo/wasm   # http://127.0.0.1:8050/
 ```
 
 It opens 100 virtualized sections. The browser has no platform thread and no compositor
@@ -168,9 +202,12 @@ test stay native. Add `?check` to the address for the same check as `--check`.
 
 ## Browser baseline
 
-Serve the repository root (`python3 -m http.server 8079`) and open
-`http://localhost:8079/examples/scroll-demo/browser/`. It uses the same bundled fonts,
-photos, paragraphs, section variants, and dimensions. Select content visibility or
+Run `node examples/scroll-demo/scripts/serve` and open
+`http://127.0.0.1:8079/` (`--port PORT` selects another port). The server resolves
+fonts and photos from the pinned `lib-ui` Git cache using
+`scripts/dependency-root.mjs`, not a sibling checkout or a local `ui` source tree.
+It uses the same bundled fonts, photos, paragraphs, section variants, and dimensions.
+Select content visibility or
 fully mounted mode. The browser fixture exposes `setup(count, mode)` and
 `measure(steps)` for repeatable measurements; results remain in `window.result`.
 `measurePaced(10000, 5000)` runs for ten seconds at the native automatic speed.

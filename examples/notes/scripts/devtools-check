@@ -1,0 +1,117 @@
+#!/usr/bin/env node
+// Real Notes + published devtools integration. All persistence lives in a fresh temporary directory.
+(async () => {
+  const { spawn, spawnSync } = await import('node:child_process');
+  const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { setTimeout: delay } = await import('node:timers/promises');
+  const { build, root } = await import('../../../scripts/internal.mjs');
+  const { repositoryRoot } = await import('../../../scripts/dependency-root.mjs');
+  const { withDisplay } = await import('../../internal.mjs');
+  const notes = build('examples/notes/app');
+  const ui = repositoryRoot('lib-ui');
+  const devtools = build(join(ui, 'ui/inspect/devtools/app'));
+  const cli = build(join(ui, 'ui/inspect/cli'));
+  const work = mkdtempSync(join(tmpdir(), 'silk-notes-devtools-'));
+  const store = join(work, 'notes.json');
+  const artifacts = join(root, '.cache/ui-devtools');
+  mkdirSync(artifacts, { recursive: true });
+  const shots = [join(artifacts, 'devtools.png'), join(artifacts, 'notes.png')];
+  for (const shot of shots) rmSync(shot, { force: true });
+  const env = { ...process.env, SILK_WINDOW_SCALE: process.env.SILK_WINDOW_SCALE ?? '1' };
+  delete env.SILK_UI_INSPECT;
+  delete env.SILK_WINDOW_FIBER;
+  const lavapipe = '/usr/share/vulkan/icd.d/lvp_icd.json';
+  if (process.platform === 'linux' && !env.VK_ICD_FILENAMES && existsSync(lavapipe)) env.VK_ICD_FILENAMES = lavapipe;
+  const failures = [];
+  function expect(condition, what) {
+    console.log(`${condition ? 'ok  ' : 'FAIL'} ${what}`);
+    if (!condition) failures.push(what);
+  }
+  function reply(result) { try { return JSON.parse(result.stdout); } catch { return {}; } }
+  async function program(name, args, socket, childEnv) {
+    const processEnv = { ...childEnv, SILK_UI_INSPECT: socket };
+    const child = spawn(args[0], args.slice(1), { cwd: root, env: processEnv, stdio: 'inherit' });
+    let failure;
+    child.on('error', error => { failure = error; });
+    const closed = new Promise(resolve => child.once('close', resolve));
+    const command = (...args) => {
+      const result = spawnSync(cli, ['--connect', socket, ...args], { cwd: root, env: processEnv, encoding: 'utf8', timeout: 60000 });
+      if (result.error) throw result.error;
+      if (result.stderr?.trim()) console.error(result.stderr.trim());
+      return result;
+    };
+    const stop = async () => {
+      if (child.exitCode === null) child.kill('SIGTERM');
+      const timer = setTimeout(() => child.kill('SIGKILL'), 10000);
+      try { await closed; } finally { clearTimeout(timer); }
+    };
+    try {
+      const deadline = Date.now() + 120000;
+      for (;;) {
+        if (failure) throw failure;
+        const hello = command('hello');
+        if (hello.status === 0) { console.log(`${name}: ${hello.stdout.trim()}`); break; }
+        if (child.exitCode !== null || Date.now() >= deadline) throw new Error(`${name} did not start serving the inspector`);
+        await delay(200);
+      }
+      return { command, stop };
+    } catch (error) { await stop(); throw error; }
+  }
+  try {
+    await withDisplay('x11', env, async childEnv => {
+      const socket = join(work, 'notes.sock');
+      const app = await program('notes', [notes, store], socket, childEnv);
+      let tools;
+      try {
+        tools = await program('devtools', [devtools, '--connect', socket], join(work, 'devtools.sock'), childEnv);
+        const nodes = reply(app.command('query', '--role', 'button', '--name', 'New note', '--exact')).nodes ?? [];
+        expect(nodes.length === 1, 'the notes app has a New note button');
+        const button = nodes[0]?.id ?? 0;
+        const row = `element-${button}`;
+        expect(tools.command('wait', '--test-id', row, '--timeout', '20000').status === 0, 'the devtools list the New note button element');
+        const snap = tools.command('snapshot');
+        expect(snap.stdout.includes('label="button \\"New note\\""'), 'its row is labelled by role and name');
+        expect(!snap.stdout.includes('cannot reach'), 'the status line shows no error');
+        expect(tools.command('click', '--test-id', row).status === 0, 'click the row in the devtools window');
+        let lit = [];
+        for (const deadline = Date.now() + 15000; Date.now() < deadline;) {
+          lit = reply(app.command('hello')).highlight ?? [];
+          if (lit.length === 1 && lit[0] === button) break;
+          await delay(100);
+        }
+        expect(lit.length === 1 && lit[0] === button, 'the notes app highlights the New note button');
+        const title = tools.command('wait', '--test-id', 'detail-title', '--timeout', '10000');
+        expect(title.status === 0, 'the styles panel shows the node');
+        const styles = tools.command('snapshot', '--node', String(reply(title).node?.id ?? 0));
+        expect(styles.stdout.includes('"button \\"New note\\""'), 'titled button New note');
+        const panel = tools.command('snapshot', '--test-id', 'panel');
+        expect(panel.stdout.includes('"  padding-left"') && panel.stdout.includes('": 8px;"'), 'with padding-left: 8px');
+        expect(tools.command('click', '--role', 'button', '--name', 'Box model', '--exact').status === 0, 'open the box model tab');
+        expect(tools.command('wait', '--test-id', 'content', '--timeout', '10000').status === 0, 'the box model is drawn');
+        const boxes = tools.command('snapshot', '--test-id', 'box-model');
+        expect(boxes.stdout.includes('testId="padding"') && boxes.stdout.includes('"8"'), 'with the padding widths');
+        expect(app.command('click', '--role', 'button', '--name', 'New note', '--exact').status === 0, 'click New note in the notes app');
+        expect(tools.command('click', '--role', 'button', '--name', 'Events', '--exact').status === 0, 'open the events tab');
+        expect(tools.command('wait', '--test-id', 'event-log', '--timeout', '10000').status === 0, 'the event log has records');
+        const log = tools.command('snapshot', '--test-id', 'event-log');
+        expect(log.stdout.includes('"click"') && log.stdout.includes('"button \\"New note\\""'), 'the click on New note is in the log');
+        expect(tools.command('wait', '--text', '5 notes', '--timeout', '10000').status === 0, 'the element tree shows the new count');
+        let saved = {};
+        for (const deadline = Date.now() + 15000; Date.now() < deadline;) {
+          try { saved = JSON.parse(readFileSync(store, 'utf8')); } catch {}
+          if (saved.notes?.length === 5) break;
+          await delay(200);
+        }
+        expect(saved.notes?.length === 5, 'the notes file has the new note');
+        for (const [target, shot] of [[tools, shots[0]], [app, shots[1]]]) {
+          const result = target.command('screenshot', shot);
+          expect(result.status === 0 && existsSync(shot) && readFileSync(shot).subarray(0, 4).equals(Buffer.from([137, 80, 78, 71])), `screenshot: ${shot}`);
+        }
+      } finally { try { await tools?.stop(); } finally { await app.stop(); } }
+    });
+    if (failures.length) throw new Error(`${failures.length} devtools checks failed`);
+    console.log(`Notes devtools checks passed; screenshots in ${artifacts} (temporary store cleaned up)`);
+  } finally { rmSync(work, { recursive: true, force: true }); }
+})().catch(error => { console.error(error); process.exitCode = 1; });

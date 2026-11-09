@@ -4,10 +4,11 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { repositoryRoot } from '../../../scripts/dependency-root.mjs';
 
 const web = dirname(fileURLToPath(import.meta.url));
-const repo = resolve(web, '../../..');
-const roots = [resolve(repo, 'native/platform/window/browser'), resolve(repo, 'native/gpu/webgpu/browser')];
+const native = repositoryRoot('lib-native');
+const roots = [resolve(native, 'native/platform/window/browser'), resolve(native, 'native/gpu/webgpu/browser')];
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.ts': 'text/javascript', '.wasm': 'application/wasm' };
 
 export async function serve(wasmPath, port = 0) {
@@ -21,7 +22,7 @@ export async function serve(wasmPath, port = 0) {
       else if (pathname === '/favicon.ico') { response.writeHead(204); response.end(); return; }
       else if (pathname === '/demo.wasm') { response.writeHead(200, { 'content-type': types['.wasm'] }); response.end(wasm); return; }
       else {
-        const candidate = resolve(repo, '.' + pathname);
+        const candidate = resolve(native, '.' + pathname);
         if (roots.some(root => candidate.startsWith(root + sep)) && ['.js', '.ts'].includes(extname(candidate))) file = candidate;
       }
       if (!file) { response.writeHead(404); response.end(); return; }

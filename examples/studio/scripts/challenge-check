@@ -1,152 +1,108 @@
-#!/usr/bin/env python3
-"""Exercise the 100k tweet cards through native user-event dispatch. No recording.
-
-Build with scripts/studio --release --build-only first. Reports inspector request-to-
-composed-frame latency, NOT presentation FPS. The headless tests separately time CPU work.
-An isolated document is used, leaving the user's default design untouched.
-"""
-import argparse
-import json
-import os
-from pathlib import Path
-import socket
-import subprocess
-import time
-
-REPO = Path(__file__).resolve().parents[3]
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--directory', type=Path, default=Path('/tmp/silk-native-tweet'))
-    parser.add_argument('--leave-open', action='store_true')
-    args = parser.parse_args()
-    directory = args.directory.resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    address = directory / 'ui.sock'
-    candidates = list((REPO / 'build/llvm').glob('*/release/silk-studio-native-app'))
-    if len(candidates) != 1:
-        raise SystemExit('Build a release native app first')
-    binary = candidates[0]
-    with (directory / 'app.log').open('w') as log:
-        process = subprocess.Popen([str(binary), '--inspect', str(directory / 'challenge.silkdesign')],
-            cwd=REPO, env=dict(os.environ, SILK_UI_INSPECT=str(address)), stdout=log, stderr=log,
-            start_new_session=True)
-    (directory / 'pid').write_text(str(process.pid))
-
-    def ask(cmd, **members):
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(120)
-            client.connect(str(address))
-            client.sendall(json.dumps(dict(cmd=cmd, **members)).encode() + b'\n')
-            data = b''
-            while b'\n' not in data:
-                chunk = client.recv(1048576)
-                if not chunk:
-                    raise AssertionError(f'{cmd}: app closed the connection; see {directory / "app.log"}')
-                data += chunk
-        reply = json.loads(data)
-        assert reply.get('ok'), reply
-        return reply
-
-    def click(name, role='button'):
-        return ask('click', role=role, name=name, exact=True)
-
-    def edit(name, value):
-        click(name, 'textbox')
-        ask('press', key='a', code='KeyA', modifiers=['meta' if os.uname().sysname == 'Darwin' else 'control'])
-        if value:
-            ask('type', text=value)
-        else:
-            ask('press', key='Backspace')
-        ask('press', key='Enter')
-
-    def summary(samples):
-        ordered = sorted(samples)
-        return dict(samples=len(samples), medianMs=ordered[len(ordered)//2],
-            p95Ms=ordered[int((len(ordered)-1)*.95)], maxMs=max(ordered))
-
-    try:
-        deadline = time.monotonic() + 30
-        while True:
-            assert process.poll() is None, (directory / 'app.log').read_text()
-            try:
-                ready = ask('hello')
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                assert time.monotonic() < deadline, 'Inspector did not start'
-                time.sleep(.05)
-        click('Commands')
-        started = time.perf_counter()
-        edit('Search commands', 'Add 100k image + text cards')
-        ask('hello')
-        result = dict(description='100k editable groups, 100k image crops, 100k labels; one source image; three fonts',
-            creationOrOpenMs=(time.perf_counter()-started)*1000, scale=ready['scale'],
-            metric='Inspector event through composed-frame acknowledgment, including IPC; not presentation FPS')
-        print('PASS: challenge page opens', flush=True)
-        for trial in ['coldZoom', 'warmZoom']:
-            click('Fit')
-            samples = []
-            previous = ask('hello')['frame']
-            for index in range(120):
-                start = time.perf_counter()
-                ask('scroll', x=740, y=550, dx=0, dy=-17.5 if index < 60 else 16.35514, modifiers=['control'])
-                frame = ask('hello')['frame']
-                assert frame > previous, 'Zoom did not compose a new frame'
-                previous = frame
-                samples.append((time.perf_counter()-start)*1000)
-            result[trial] = summary(samples)
-            print(trial, result[trial], flush=True)
-        click('Fit')
-        samples = []
-        for index in range(40):
-            start = time.perf_counter()
-            ask('scroll', x=740, y=550, dx=6 if index < 20 else -6, dy=0)
-            ask('hello')
-            samples.append((time.perf_counter()-start)*1000)
-        result['pan'] = summary(samples)
-        # Empty-space start, then span real cards. Every movement must compose, even
-        # when the selected set is unchanged.
-        click('Fit')
-        ask('pointer', phase='down', x=225, y=850)
-        previous = ask('hello')['frame']
-        for index in range(20):
-            ask('pointer', phase='move', x=300+index*35, y=800-index*10)
-            frame = ask('hello')['frame']
-            assert frame > previous, 'Marquee froze'
-            previous = frame
-        ask('pointer', phase='up', x=965, y=610)
-        ask('press', key='Escape')
-        edit('Find a layer', 'Label')
-        targets = ask('query', role='button', name='Label', exact=True, limit=1)['nodes']
-        assert targets, 'No independently selectable label'
-        ask('click', node=targets[0]['id'])
-        click('Commands')
-        edit('Search commands', 'Zoom to selection')
-        ask('hello')
-        # The selected label is centered by zoom-to-selection. Double click uses
-        # the same pointer path as a user's action, then type into the canvas input.
-        handles = ask('query', label='Resize handle', exact=True)['nodes']
-        x = (min(h['x'] for h in handles) + max(h['x'] for h in handles)) / 2 + 4
-        y = (min(h['y'] for h in handles) + max(h['y'] for h in handles)) / 2 + 4
-        ask('click', x=x, y=y, count=2)
-        assert ask('query', role='textbox', label='Edit text', exact=True)['count'] == 1
-        edit('Edit text', 'Native zoom test')
-        assert 'Native zoom test' in ask('snapshot', role='textbox', label='Text')['text']
-        click('Undo')
-        assert 'Native zoom test' not in ask('snapshot', role='textbox', label='Text')['text']
-        edit('Find a layer', '')
-        ask('press', key='Escape')
-        click('Fit')
-        result['interactionChecks'] = ['zoom', 'pan', 'marquee redraw', 'direct text entry', 'undo']
-        (directory / 'results.json').write_text(json.dumps(result, indent=2)+'\n')
-        print('PASS: native zoom, pan, marquee, direct text edit and undo', flush=True)
-        print(directory / 'results.json')
-    finally:
-        if not args.leave_open:
-            process.terminate()
-            process.wait(timeout=10)
-
-
-if __name__ == '__main__':
-    main()
+#!/usr/bin/env node
+(async () => {
+  const { assert, fs, path, root, options, binary, launch, stop, inspector, ready, temporary, primary, summary } = await import('./internal.mjs');
+  const { values: args } = options('Exercise 100k tweet cards through native user-event dispatch, without recording.\nBuild Studio --release --build-only first. Uses a fresh isolated document.\nMeasures request-to-composed-frame latency, NOT presentation FPS.', {
+    directory: { type: 'string', default: '/tmp/silk-native-tweet' }, 'leave-open': { type: 'boolean' },
+  });
+  const directory = path.resolve(args.directory);
+  fs.mkdirSync(directory, { recursive: true });
+  const program = binary('silk-studio-native-app');
+  const session = temporary('silk-native-tweet-');
+  const address = path.join(session, 'ui.sock');
+  const document = path.join(session, 'challenge.silkdesign');
+  const log = path.join(directory, 'app.log');
+  let child;
+  try {
+    child = launch(program, ['--inspect', document], log, { env: { ...process.env, SILK_UI_INSPECT: address }, detached: true });
+    if (child.pid !== undefined) fs.writeFileSync(path.join(directory, 'pid'), String(child.pid));
+    fs.writeFileSync(path.join(directory, 'document-path'), document + '\n');
+    const ask = inspector(address, 120000);
+    const click = (name, role = 'button') => ask('click', { role, name, exact: true });
+    const edit = async (name, value) => {
+      await click(name, 'textbox');
+      await ask('press', { key: 'a', code: 'KeyA', modifiers: [primary] });
+      if (value) await ask('type', { text: value });
+      else await ask('press', { key: 'Backspace' });
+      await ask('press', { key: 'Enter' });
+    };
+    const initial = await ready(child, ask, log);
+    await click('Commands');
+    const started = performance.now();
+    await edit('Search commands', 'Add 100k image + text cards');
+    await ask('hello');
+    const result = {
+      description: '100k editable groups, 100k image crops, 100k labels; one source image; three fonts',
+      creationOrOpenMs: performance.now() - started, scale: initial.scale,
+      metric: 'Inspector event through composed-frame acknowledgment, including IPC; not presentation FPS',
+    };
+    console.log('PASS: challenge page opens');
+    for (const trial of ['coldZoom', 'warmZoom']) {
+      await click('Fit');
+      const samples = [];
+      let previous = (await ask('hello')).frame;
+      for (let index = 0; index < 120; index++) {
+        const start = performance.now();
+        await ask('scroll', { x: 740, y: 550, dx: 0, dy: index < 60 ? -17.5 : 16.35514, modifiers: ['control'] });
+        const frame = (await ask('hello')).frame;
+        assert.ok(frame > previous, 'Zoom did not compose a new frame');
+        previous = frame;
+        samples.push(performance.now() - start);
+      }
+      result[trial] = summary(samples, { upperMedian: true });
+      console.log(trial, result[trial]);
+    }
+    await click('Fit');
+    const samples = [];
+    for (let index = 0; index < 40; index++) {
+      const start = performance.now();
+      await ask('scroll', { x: 740, y: 550, dx: index < 20 ? 6 : -6, dy: 0 });
+      await ask('hello');
+      samples.push(performance.now() - start);
+    }
+    result.pan = summary(samples, { upperMedian: true });
+    // Empty-space start, then span cards: even unchanged selection must repaint.
+    await click('Fit');
+    await ask('pointer', { phase: 'down', x: 225, y: 850 });
+    let previous = (await ask('hello')).frame;
+    for (let index = 0; index < 20; index++) {
+      await ask('pointer', { phase: 'move', x: 300 + index * 35, y: 800 - index * 10 });
+      const frame = (await ask('hello')).frame;
+      assert.ok(frame > previous, 'Marquee froze');
+      previous = frame;
+    }
+    await ask('pointer', { phase: 'up', x: 965, y: 610 });
+    await ask('press', { key: 'Escape' });
+    await edit('Find a layer', 'Label');
+    const targets = (await ask('query', { role: 'button', name: 'Label', exact: true, limit: 1 })).nodes;
+    assert.ok(targets.length, 'No independently selectable label');
+    await ask('click', { node: targets[0].id });
+    await click('Commands');
+    await edit('Search commands', 'Zoom to selection');
+    await ask('hello');
+    const handles = (await ask('query', { label: 'Resize handle', exact: true })).nodes;
+    assert.ok(handles.length, 'No resize handles');
+    const x = (Math.min(...handles.map(h => h.x)) + Math.max(...handles.map(h => h.x))) / 2 + 4;
+    const y = (Math.min(...handles.map(h => h.y)) + Math.max(...handles.map(h => h.y))) / 2 + 4;
+    await ask('click', { x, y, count: 2 });
+    assert.equal((await ask('query', { role: 'textbox', label: 'Edit text', exact: true })).count, 1);
+    await edit('Edit text', 'Native zoom test');
+    assert.ok((await ask('snapshot', { role: 'textbox', label: 'Text' })).text.includes('Native zoom test'));
+    await click('Undo');
+    assert.ok(!(await ask('snapshot', { role: 'textbox', label: 'Text' })).text.includes('Native zoom test'));
+    await edit('Find a layer', '');
+    await ask('press', { key: 'Escape' });
+    await click('Fit');
+    result.interactionChecks = ['zoom', 'pan', 'marquee redraw', 'direct text entry', 'undo'];
+    fs.writeFileSync(path.join(directory, 'results.json'), JSON.stringify(result, null, 2) + '\n');
+    console.log('PASS: native zoom, pan, marquee, direct text edit and undo');
+    console.log(path.join(directory, 'results.json'));
+  } finally {
+    if (args['leave-open'] && child && !child.failure && child.exitCode === null && child.signalCode === null) {
+      child.unref();
+      console.log(`Isolated document retained: ${document}`);
+    } else {
+      await stop(child, 10000);
+      fs.rmSync(session, { recursive: true, force: true });
+    }
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
