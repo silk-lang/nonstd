@@ -52,7 +52,7 @@ test('ZIP traversal and checksum mismatches fail before extraction', () => tempo
   assert.throws(() => install({ ...asset, sha256: '0'.repeat(64) }, join(directory, 'bad-hash'), 'escape'), /SHA-256 mismatch/);
 }));
 test('manifest reader keeps dependency tables separate from package and workspace fields', () => {
-  const source = '[package]\nname = "test"\n[dependencies]\nui = { git = "https://github.com/silk-lang/lib-ui.git", rev = "' + 'a'.repeat(40) + '", path = "ui/tree", package = "ui-tree" }\n[workspace]\nmembers = [\n "db/sqlite", # retained\n "crdt/core",\n]\n';
+  const source = '[package]\nname = "test"\n[dependencies]\nui = { git = "https://github.com/silk-lang/lib-ui.git", rev = "' + 'a'.repeat(40) + '", path = "modules/tree", package = "ui-tree" }\n[workspace]\nmembers = [\n "db/sqlite", # retained\n "crdt/core",\n]\n';
   assert.equal(dependencies(source)[0].package, 'ui-tree');
   assert.deepEqual(stringArray(section(source, 'workspace'), 'members'), ['db/sqlite', 'crdt/core']);
   assert.throws(() => dependencies('[dependencies.ui]\npath = "../ui"\n'), /inline dependency/);

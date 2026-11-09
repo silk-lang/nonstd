@@ -54,7 +54,7 @@ SILK_UI_INSPECT=/tmp/scroll-lab.sock node examples/scroll-demo/scripts/run --deb
 From another terminal in the same repository checkout, open the devtools window:
 
 ```sh
-node "$(node scripts/dependency-root.mjs lib-ui)/ui/inspect/devtools/scripts/devtools" run --connect /tmp/scroll-lab.sock
+node "$(node scripts/dependency-root.mjs lib-ui)/modules/inspect/devtools/scripts/devtools" run --connect /tmp/scroll-lab.sock
 ```
 
 The demo prints `ui-inspect: listening on ...` when ready. Inspection is disabled
@@ -177,7 +177,7 @@ column; put decoration and spacing in the item body instead.
 
 `ui-app` only builds keyed nodes for the requested range and forwards configuration
 and item bindings. Direct tree clients can use the same functionality without the
-framework; see `ui/tree/README.md` (Virtual scrolling) in the pinned `lib-ui`
+framework; see `modules/tree/README.md` (Virtual scrolling) in the pinned `lib-ui`
 checkout printed by `node scripts/dependency-root.mjs lib-ui`.
 
 Native window hosts settle virtual lists automatically. Custom hosts should call

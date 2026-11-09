@@ -8,7 +8,7 @@ import { repositoryRoot } from '../../../scripts/dependency-root.mjs';
 
 const web = dirname(fileURLToPath(import.meta.url));
 const native = repositoryRoot('lib-native');
-const roots = [resolve(native, 'native/platform/window/browser'), resolve(native, 'native/gpu/webgpu/browser')];
+const roots = [resolve(native, 'modules/platform/window/browser'), resolve(native, 'modules/gpu/webgpu/browser')];
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.ts': 'text/javascript', '.wasm': 'application/wasm' };
 
 export async function serve(wasmPath, port = 0) {
@@ -21,8 +21,8 @@ export async function serve(wasmPath, port = 0) {
       else if (pathname === '/demo.js') file = resolve(web, 'demo.js');
       else if (pathname === '/favicon.ico') { response.writeHead(204); response.end(); return; }
       else if (pathname === '/demo.wasm') { response.writeHead(200, { 'content-type': types['.wasm'] }); response.end(wasm); return; }
-      else {
-        const candidate = resolve(native, '.' + pathname);
+      else if (pathname.startsWith('/native/')) {
+        const candidate = resolve(native, 'modules', pathname.slice('/native/'.length));
         if (roots.some(root => candidate.startsWith(root + sep)) && ['.js', '.ts'].includes(extname(candidate))) file = candidate;
       }
       if (!file) { response.writeHead(404); response.end(); return; }

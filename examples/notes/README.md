@@ -1,7 +1,7 @@
 # Notes
 
 The example app of the Silk UI stack: a notes app in a native window, built with
-[ui-app](https://github.com/silk-lang/lib-ui/tree/main/ui/app) and [ui-components](https://github.com/silk-lang/lib-ui/tree/main/ui/components) on the retained [ui-tree](https://github.com/silk-lang/lib-ui/tree/main/ui/tree). It is
+[ui-app](https://github.com/silk-lang/lib-ui/tree/main/modules/app) and [ui-components](https://github.com/silk-lang/lib-ui/tree/main/modules/components) on the retained [ui-tree](https://github.com/silk-lang/lib-ui/tree/main/modules/tree). It is
 small enough to read in one sitting and does what a real app does: it loads and saves a file,
 filters and sorts a list, edits text, asks before deleting, has keyboard shortcuts and a dark
 theme, and can be inspected and driven by tests, the devtools window and agents.
@@ -66,7 +66,7 @@ Pass `--file FILE` to inspect another notes file. The check keeps screenshots in
 `.cache/ui-devtools/` and isolates its notes in a temporary directory.
 
 `ui-inspect-cli` and `ui-inspect-mcp` reach it the same way (debug build, `SILK_UI_INSPECT`
-set): see [ui/inspect/server](https://github.com/silk-lang/lib-ui/tree/main/ui/inspect/server).
+set): see [modules/inspect/server](https://github.com/silk-lang/lib-ui/tree/main/modules/inspect/server).
 
 ## How it is built
 

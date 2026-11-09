@@ -30,6 +30,11 @@ Neither sibling paths nor Git dependencies on nonstd are supported. Silk resolve
 runtime assets under `$SILK_HOME/git/<revision>` (default `~/.silk/git/<revision>`);
 `node scripts/dependency-root.mjs lib-ui` prints the pinned payload directory after fetching.
 
+Each library repository keeps its packages under `modules/`; dependency `path` entries are
+relative to that repository, such as `modules/tree` in lib-ui. Package names are unchanged.
+Browser URL prefixes such as `/ui/` and `/native/` remain distinct and map to each repository's
+`modules/` directory rather than sharing one HTTP namespace.
+
 Upgrade pins from the bottom up: native, graphics, CSS/fonts, SVG, then UI, and finally all
 retained callers here. Every direct and transitive reference to a repository must agree on its
 revision. Silk rejects duplicate named packages from separate physical checkouts.

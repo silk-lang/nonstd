@@ -4,9 +4,9 @@ The integration demo of the UI drawing layer. One window draws everything phases
 with no elements or layout: positions are computed by hand in `src/demo.silk`.
 
 - An Oklab gradient background and rounded cards with soft drop shadows and borders.
-- Text through [`fonts/raster`](https://github.com/silk-lang/lib-fonts/tree/main/fonts/raster): two Noto Sans faces, lines shaped once by the
+- Text through [`modules/raster`](https://github.com/silk-lang/lib-fonts/tree/main/modules/raster): two Noto Sans faces, lines shaped once by the
   line cache, glyph tiles from the glyph cache, straight and wavy underlines.
-- Icons from SVG through [`ui/sprites`](https://github.com/silk-lang/lib-ui/tree/main/ui/sprites), with hover highlights in the top bar.
+- Icons from SVG through [`modules/sprites`](https://github.com/silk-lang/lib-ui/tree/main/modules/sprites), with hover highlights in the top bar.
 - An animated SVG (`assets/icons/orbit.svg`: SMIL `animate`, `animateMotion`,
   `animateTransform` and a CSS `@keyframes` halo) rasterized each frame at the frame's time.
 - A chart drawn as `vector` paths through the path cache, with an animated marker.
@@ -17,7 +17,7 @@ with no elements or layout: positions are computed by hand in `src/demo.silk`.
   textures, primitives).
 
 The same `Demo` paints into a `ui_scene.Scene` for three hosts: the CPU reference renderer, the
-native window app (Dawn on Metal, D3D12 or Vulkan through [`native/platform/window`](https://github.com/silk-lang/lib-native/tree/main/native/platform/window))
+native window app (Dawn on Metal, D3D12 or Vulkan through [`modules/platform/window`](https://github.com/silk-lang/lib-native/tree/main/modules/platform/window))
 and the browser (`navigator.gpu` on a canvas).
 
 ## Packages
@@ -90,5 +90,5 @@ CI runs all of it on Linux (lavapipe), in Chromium, and in real windows on macOS
 
 ## Assets
 
-The fonts, icons and photos come from [ui-assets](https://github.com/silk-lang/lib-ui/tree/main/ui/assets), which the UI fixtures and
+The fonts, icons and photos come from [ui-assets](https://github.com/silk-lang/lib-ui/tree/main/modules/assets), which the UI fixtures and
 demos share.
