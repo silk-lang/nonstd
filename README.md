@@ -48,17 +48,11 @@ runs package checks in parallel. The current Silk Git checkout implementation ca
 populating one cache directory, reporting missing commits or Git files even when the pin is
 valid. Do not work around this with changed pins or retries.
 
-On Windows use the installed `silkc.exe` for direct commands; repository runners do this
-automatically (`SILK` overrides the executable). The pinned `silk.exe` launcher exports
-`SILK_HOME` in an encoding its compiler's Git cache parser rejects. Direct compiler invocation
-preserves native `SILK_HOME` overrides and the default `USERPROFILE` cache location.
-
-Cold Git dependency resolution on Windows remains blocked in this pinned compiler:
-`GitCheckouts.silk` passes extended `\\?\C:\...` paths to Git, whose path validation rejects
-them with `git init failed: ... Invalid argument`. Direct compiler invocation does not fix
-this second issue. Upstream must use command-line paths rather than extended filesystem
-paths for Git arguments. Windows CI remains enabled to expose the failure; do not disable
-Git's NTFS protection to bypass it.
+Silk **0.1.0-dev.63+657e3c900f65** fixes Windows Git command paths and the launcher's
+`SILK_HOME` representation ([silk#3025](https://github.com/silk-lang/silk/issues/3025)).
+Repository runners use `silk` on every platform (`SILK` overrides the executable); no direct
+`silkc.exe` bypass or relaxed Git NTFS protection is required. Windows CI resolves the pinned
+Git graph from a fresh runner through the launcher before building the workspace.
 
 `node scripts/check-format.mjs` checks authored Silk sources and manifests. Generated browser
 exports retain the pinned lib-native generator's bytes and are checked separately by application
