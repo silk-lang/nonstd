@@ -37,14 +37,21 @@ revision. Silk rejects duplicate named packages from separate physical checkouts
 canonical Git entries, package names and the complete reachable dependency graph. Fetch first:
 
 ```sh
+silk check --manifest-path examples/graphics-demo/app/silk.toml
 silk check --workspace
 node scripts/check-layers
 ```
 
-**Cold-cache limitation:** serialize the first dependency fetch for each revision before starting
-parallel builds that share `SILK_HOME`. The current Silk Git checkout implementation can race
-while populating one cache directory; concurrent first fetches can report a missing commit even
-when the pin is valid. Do not work around this with changed pins or retries.
+**Cold-cache limitation:** warm dependencies with the single-manifest check above before
+workspace checks or parallel builds that share `SILK_HOME`. `silk check --workspace` itself
+runs package checks in parallel. The current Silk Git checkout implementation can race while
+populating one cache directory, reporting missing commits or Git files even when the pin is
+valid. Do not work around this with changed pins or retries.
+
+On Windows use the installed `silkc.exe` for direct commands; repository runners do this
+automatically (`SILK` overrides the executable). The pinned `silk.exe` launcher exports
+`SILK_HOME` in an encoding its compiler's Git cache parser rejects. Direct compiler invocation
+preserves native `SILK_HOME` overrides and the default `USERPROFILE` cache location.
 
 ## Packages
 
@@ -108,7 +115,8 @@ lib-native checkout. On macOS use Apple Silicon macOS 26+ with the Xcode/macOS S
 # Optional checksum-verified compiler bootstrap (requires curl and tar):
 export PATH="$(node scripts/install-silk.mjs):$PATH"
 export SILK_CLANG=/path/to/llvm22/bin/clang
-silk check --workspace          # first Git fetch, run serially
+silk check --manifest-path examples/graphics-demo/app/silk.toml # first Git fetch
+silk check --workspace
 silk build --workspace
 silk build --workspace --release
 node scripts/check             # included package unit-test roots, with per-package logs

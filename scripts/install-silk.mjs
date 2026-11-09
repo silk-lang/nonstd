@@ -19,11 +19,12 @@ export function install(asset, destination, required) {
     run('curl', ['--fail', '--location', '--silent', '--show-error', '--output', archive, asset.url], { stdio: ['ignore', 'ignore', 'inherit'] });
     if (digest(archive) !== asset.sha256) throw new Error(`SHA-256 mismatch: ${asset.url}`);
     const unzip = archive.endsWith('.zip') && process.platform === 'linux';
-    const members = run(unzip ? 'unzip' : 'tar', unzip ? ['-Z1', archive] : ['-tf', archive], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).stdout.split(/\r?\n/).filter(Boolean);
+    const tar = process.platform === 'win32' ? join(process.env.SystemRoot, 'System32', 'tar.exe') : 'tar';
+    const members = run(unzip ? 'unzip' : tar, unzip ? ['-Z1', archive] : ['-tf', archive], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }).stdout.split(/\r?\n/).filter(Boolean);
     if (members.some(name => /^[\\/]|^[A-Za-z]:/.test(name) || name.replaceAll('\\', '/').split('/').includes('..'))) throw new Error('Unsafe archive member');
     const staging = join(temporary, 'unpacked');
     mkdirSync(staging);
-    run(unzip ? 'unzip' : 'tar', unzip ? ['-q', archive, '-d', staging] : ['-xf', archive, '-C', staging], { stdio: ['ignore', 'ignore', 'inherit'] });
+    run(unzip ? 'unzip' : tar, unzip ? ['-q', archive, '-d', staging] : ['-xf', archive, '-C', staging], { stdio: ['ignore', 'ignore', 'inherit'] });
     const entries = readdirSync(staging, { withFileTypes: true });
     const tree = asset.strip_root === false ? staging : entries.length === 1 && entries[0].isDirectory() ? join(staging, entries[0].name) : null;
     if (!tree || !existsSync(join(tree, required))) throw new Error('Release has unexpected layout');

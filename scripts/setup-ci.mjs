@@ -10,8 +10,8 @@ for (const option of options) if (!['--browser', '--linux-gpu'].includes(option)
 const bin = installSilk();
 process.env.PATH = bin + delimiter + process.env.PATH;
 if (process.env.GITHUB_PATH) appendFileSync(process.env.GITHUB_PATH, bin + '\n');
-// Silk resolves Git payloads while checking. Complete the first fetch before parallel work.
-run('silk', ['check', '--workspace']);
+// Workspace checks run in parallel; one application manifest warms all six Git repositories first.
+run('silk', ['check', '--manifest-path', join(root, 'examples/graphics-demo/app/silk.toml')]);
 const native = repositoryRoot('lib-native');
 const lock = JSON.parse(readFileSync(join(root, 'toolchains.lock.json'), 'utf8'));
 const nativeLock = JSON.parse(readFileSync(join(native, 'toolchains.lock.json'), 'utf8'));

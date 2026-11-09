@@ -26,7 +26,7 @@ change a local parent shell's environment.
 
 ```sh
 node scripts/setup-ci.mjs                         # provisions pinned native dependencies
-silk check --workspace                            # fetch manifest-pinned Git dependencies
+silk check --manifest-path examples/notes/app/silk.toml # fetch manifest-pinned Git dependencies
 node examples/notes/scripts/notes                 # debug build, notes in ~/.silk-notes.json
 node examples/notes/scripts/notes --release --file my-notes.json
 ```

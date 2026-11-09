@@ -28,7 +28,7 @@ export function repositoryRoot(name) {
   const revision = repositoryPins().get(name);
   if (!revision) throw new Error(`No pinned ${name} dependency in retained manifests`);
   const checkout = resolve(process.env.SILK_HOME || join(homedir(), '.silk'), 'git', revision);
-  if (!existsSync(join(checkout, 'silk.toml'))) throw new Error(`Missing ${name} at ${checkout}; fetch dependencies with silk check --workspace first`);
+  if (!existsSync(join(checkout, 'silk.toml'))) throw new Error(`Missing ${name} at ${checkout}; fetch dependencies with silk check --manifest-path examples/graphics-demo/app/silk.toml first`);
   return checkout;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

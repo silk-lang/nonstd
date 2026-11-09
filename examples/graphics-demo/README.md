@@ -35,7 +35,7 @@ and the browser (`navigator.gpu` on a canvas).
 
 Use Node.js, Silk and LLVM 22 from the repository setup instructions. Put Silk on `PATH`
 and set `SILK_CLANG` to LLVM 22 `clang`; `node scripts/setup-ci.mjs` provisions dependencies
-but does not change a local parent shell. Fetch dependencies with `silk check --workspace`.
+but does not change a local parent shell. Fetch dependencies with `silk check --manifest-path examples/graphics-demo/app/silk.toml`.
 Native bridge generation runs through Silk manifest hooks.
 Browser hosts and generated exports resolve from the manifest-pinned `lib-native` checkout,
 not from source library directories. `SILK_CLANG` must point to LLVM 22 for browser linking.

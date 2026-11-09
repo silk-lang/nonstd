@@ -7,6 +7,7 @@ import { repositoryRoot } from './dependency-root.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export function run(command, args = [], options = {}) {
+  if (command === 'silk') command = process.env.SILK || (process.platform === 'win32' ? 'silkc' : 'silk');
   const result = spawnSync(command, args.map(String), { cwd: root, stdio: 'inherit', ...options });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${command} exited ${result.status ?? result.signal}`);

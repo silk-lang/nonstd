@@ -9,7 +9,8 @@ Set-StrictMode -Version Latest
 $Root = Split-Path -Parent $PSScriptRoot
 Push-Location $Root
 try {
-    & silk check --workspace
+    $Silk = if ($env:SILK) { $env:SILK } else { 'silkc' }
+    & $Silk check --manifest-path (Join-Path $Root 'examples/graphics-demo/app/silk.toml')
     if ($LASTEXITCODE -ne 0) { throw 'Silk dependency fetch/check failed.' }
     $Native = & node (Join-Path $PSScriptRoot 'dependency-root.mjs') lib-native
     if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve pinned lib-native checkout.' }
