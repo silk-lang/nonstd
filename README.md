@@ -51,6 +51,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`native/gpu/webgpu`](native/gpu/webgpu) | `gpu-webgpu` | WebGPU through Dawn natively and navigator.gpu in browsers, with one API | `bench`, `examples`, `examples-window`, `tests/native` |
 | [`native/gpu/webgpu/sys`](native/gpu/webgpu/sys) | `gpu-webgpu-sys` | The raw WebGPU C ABI under gpu-webgpu | `abi` |
 | [`native/platform/window`](native/platform/window) | `platform-window` | Native windows, input, IME, menus, dialogs and display-paced frames | `examples/demo`, `tests/browser`, `tests/linux`, `tests/macos`, `tests/smoke`, `tests/windows` |
+| [`native/terminal/ghostty`](native/terminal/ghostty) | `terminal-ghostty` | Owned libghostty-vt terminals, keyboard and paste encoding, styled snapshots and text export (not a workspace member, see layers.toml) |  |
 
 ### graphics
 
@@ -123,6 +124,7 @@ helper (tests, benchmarks, command-line tools, demos) and is listed next to its 
 | [`examples/scroll-demo`](examples/scroll-demo) | `silk-scroll-demo` | Fieldnotes Scroll Lab, a native scrolling stress demo built on ui-app | `document`, `wasm` |
 | [`examples/showcase`](examples/showcase) | `ui-showcase` | Silk Loom, a showcase of the drawing layer and the UI stack | `app`, `record` |
 | [`examples/studio`](examples/studio) | `silk-studio-native` | Silk Studio, a design editor on the UI stack | `app`, `browser`, `tests` |
+| [`examples/terminal-demo`](examples/terminal-demo) | `terminal-demo` | A native PTY terminal using libghostty-vt and Silk's UI (not a workspace member, see layers.toml) |  |
 
 <!-- package-index:end -->
 

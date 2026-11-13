@@ -1,0 +1,183 @@
+//! A real child exercises PTY I/O, size propagation and exit; UI events exercise direct typing.
+import pty { Pty, PtyError }
+import session { Session }
+import terminal_app { TerminalApp, Message, Action }
+import ghostty.terminal { Terminal, GhosttyError }
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime, resize }
+import ui_app.harness { typeText, press }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput }
+import ui_fixtures.fixtures as fixtures
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+type Failure = GhosttyError | PtyError | TreeError | OutOfMemoryError | AssertionError<'static>
+
+fn contains(text: string, wanted: string) -> bool {
+  let a = String.utf8Bytes(text)
+  let b = String.utf8Bytes(wanted)
+  let mut i: usize = 0
+  while i + b.length <= a.length {
+    let mut j: usize = 0
+    while j < b.length && a[i + j] == b[j] {
+      j = j + 1
+    }
+    if j == b.length {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn awaitText(session: &mut Session, wanted: string) -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut count: u32 = 0
+  while count < 3000 {
+    drop run session.poll()
+    let text = run session.terminal.plainText()
+    if contains(text.view(), wanted) {
+      return ()
+    }
+    run MonotonicClock.waitFor(1000000)
+    count = count + 1
+  }
+  run Testing.expect(false, "PTY output arrived before timeout")
+}
+
+effect fn ptyBody() -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut session = Session {
+    terminal: run Terminal.make(80, 24),
+    pty: run Pty.command(
+      80,
+      24,
+      "stty -echo; printf 'READY\\n'; read line; stty size; printf '\\033[32m%s\\033[0m\\n' \"$line\"; exit 7",
+    ),
+    exitCode: -1,
+  }
+  run awaitText(&mut session, "READY")
+  drop run session.apply(Action.Resize { columns: 91, rows: 31 })
+  drop run session.apply(Action.Text { value: run String.copy("roundtrip") })
+  drop run session.apply(Action.Key { value: run String.copy("Enter"), modifiers: 0 })
+  run awaitText(&mut session, "roundtrip")
+  let text = run session.terminal.plainText()
+  run Testing.expect(contains(text.view(), "31 91"), "TIOCSWINSZ reaches the child")
+  let mut i: u32 = 0
+  while session.exitCode < 0 && i < 1000 {
+    drop run session.poll()
+    run MonotonicClock.waitFor(1000000)
+    i = i + 1
+  }
+  run Testing.expect(session.exitCode == 7, "exit status is collected without losing final output")
+}
+
+effect fn uiBody() -> ()
+  ! Failure
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run batch.fontFamily(2, "Noto Sans, monospace")
+  run tree.apply(run batch.take())
+  let mut terminal = run Terminal.make(96, 27)
+  let mut app = Runtime<TerminalApp, Message, NoCommand>.make(
+    TerminalApp.make(run terminal.snapshot()),
+  )
+  run app.start(&mut tree, 0.0)
+  let viewport = FrameInput { width: 1000.0, height: 680.0, scale: 1.0, time: 0.0 }
+  run typeText(&mut app, &mut tree, viewport, "hello")
+  run typeText(&mut app, &mut tree, viewport, "!")
+  run press(&mut app, &mut tree, viewport, "Enter", 0)
+  run press(&mut app, &mut tree, viewport, "c", 2)
+  run Testing.expect(
+    app.model.pending.length() == 4,
+    "direct typing and control keys are queued once",
+  )
+  let first = app.model.pending.remove(0)
+  run Testing.expect(
+    match move first {
+      Action.Text { value } => value.view() == "hello"
+      _ => false
+    },
+    "committed text reaches the session",
+  )
+  let second = app.model.pending.remove(0)
+  run Testing.expect(
+    match move second {
+      Action.Text { value } => value.view() == "!"
+      _ => false
+    },
+    "input receiver resets without replaying previous characters",
+  )
+  app.model.pending.clear()
+  run resize(&mut app, &mut tree, 840.0, 520.0)
+  let dimensions = app.model.pending.remove(0)
+  run Testing.expect(
+    match move dimensions {
+      Action.Resize { columns, rows } => columns == 80 && rows == 20
+      _ => false
+    },
+    "window size maps to terminal rows and columns",
+  )
+}
+
+test effect fn realPtyResizeOutputAndExit() -> ()
+  ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  run ptyBody()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+test effect fn terminalInputAndResizeEvents() -> ()
+  ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run uiBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn terminalProtocolsBody() -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut query = Session {
+    terminal: run Terminal.make(80, 24),
+    pty: run Pty.command(
+      80,
+      24,
+      "stty -echo -icanon min 1 time 0; printf '\\033[6n'; dd bs=1 count=6 >/dev/null 2>&1; printf '\\r\\nREPLY_OK\\r\\n'",
+    ),
+    exitCode: -1,
+  }
+  run awaitText(&mut query, "REPLY_OK")
+  let mut interrupt = Session {
+    terminal: run Terminal.make(80, 24),
+    pty: run Pty.command(80, 24, "printf 'INTERRUPT_READY\\r\\n'; exec sleep 30"),
+    exitCode: -1,
+  }
+  run awaitText(&mut interrupt, "INTERRUPT_READY")
+  drop run interrupt.apply(Action.Key { value: run String.copy("c"), modifiers: 2 })
+  let mut i: u32 = 0
+  while interrupt.exitCode < 0 && i < 3000 {
+    drop run interrupt.poll()
+    run MonotonicClock.waitFor(1000000)
+    i = i + 1
+  }
+  run Testing.expect(interrupt.exitCode == 130, "Ctrl-C interrupts the foreground PTY process")
+}
+
+test effect fn repliesAndForegroundInterrupt() -> ()
+  ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  run terminalProtocolsBody()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

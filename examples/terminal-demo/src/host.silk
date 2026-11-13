@@ -1,0 +1,223 @@
+//! The native host polls the PTY without blocking the UI and owns its lifetime.
+import session { Session, SessionError }
+import pty { PtyError }
+import ghostty.terminal { GhosttyError }
+import terminal_app { TerminalApp, Message, Action }
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime, drain }
+import ui_app_window.lib { WindowContent, HostPlatform }
+import ui_tree.lib { UiTree, TreeError }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import window.platform { Platform }
+import window.event { Event, ScrollDelta, Key }
+import window.types { WindowError, WindowId }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.text.string { String }
+
+pub struct TerminalHost {
+  pub session: Session,
+  pub failed: bool,
+  suppressText: bool
+}
+
+impl TerminalHost {
+  pub fn make(session: Session) -> TerminalHost {
+    return TerminalHost { session: move session, failed: false, suppressText: false }
+  }
+
+  effect fn capture(self: &mut Self, app: &mut Runtime<TerminalApp, Message, NoCommand>) -> ()
+    ! GhosttyError {
+    app.send(
+      Message.Frame {
+        snapshot: run self.session.terminal.snapshot(),
+        exitCode: self.session.exitCode,
+      },
+    )
+  }
+
+  fn report(
+    self: &mut Self,
+    app: &mut Runtime<TerminalApp, Message, NoCommand>,
+    error: SessionError,
+  ) -> () {
+    let code = match move error {
+      GhosttyError e => e.code
+      PtyError e => e.code
+    }
+    self.failed = true
+    app.send(Message.Failure { code: code })
+  }
+
+  effect fn refresh(
+    self: &mut Self,
+    app: &mut Runtime<TerminalApp, Message, NoCommand>,
+    force: bool,
+  ) -> bool
+    ! SessionError {
+    let changed = run self.session.poll()
+    if changed || force {
+      run self.capture(&mut app)
+    }
+    return changed || force
+  }
+}
+
+impl WindowContent<TerminalApp, Message, NoCommand> for TerminalHost {
+  fn wakeAfter(self: &Self) -> Option<f64> {
+    return if self.failed || self.session.pty.finished() {
+      Option<f64>.None
+    } else {
+      Option<f64>.Some { value: 0.016 }
+    }
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    app: &mut Runtime<TerminalApp, Message, NoCommand>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.failed {
+      return false
+    }
+    let result = run Effect.result(self.refresh(&mut app, false))
+    let changed = match move result {
+      Result<bool, SessionError>.Success { value } => value
+      Result<bool, SessionError>.Failure { error } => {
+        self.report(&mut app, move error)
+        true
+      }
+    }
+    if changed {
+      run drain(&mut app, &mut tree)
+    }
+    return changed
+  }
+
+  effect fn update(
+    self: &mut Self,
+    app: &mut Runtime<TerminalApp, Message, NoCommand>,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.failed {
+      app.model.pending.clear()
+      return false
+    }
+    let mut changed = false
+    while app.model.pending.length() != 0 {
+      let action = app.model.pending.remove(0)
+      if let Action.Paste = &action {
+        if let Option<String>.Some { value } = run Platform.readClipboard(&mut platform) {
+          // OOM remains a host failure; native transport and emulator errors become visible status.
+          let result = run Effect.result(self.session.paste(value.view()))
+          match move result {
+            Result<(), SessionError | OutOfMemoryError>.Success { value: _value } => {
+              changed = true
+            }
+            Result<(), SessionError | OutOfMemoryError>.Failure { error } => match move error {
+              OutOfMemoryError e => {
+                fail move e
+              }
+              GhosttyError e => {
+                self.report(&mut app, move e)
+              }
+              PtyError e => {
+                self.report(&mut app, move e)
+              }
+            }
+          }
+        }
+      } else {
+        let result = run Effect.result(self.session.apply(move action))
+        match move result {
+          Result<bool, SessionError>.Success { value } => {
+            changed = changed || value
+          }
+          Result<bool, SessionError>.Failure { error } => {
+            self.report(&mut app, move error)
+          }
+        }
+      }
+      if self.failed {
+        break
+      }
+    }
+    if changed && !self.failed {
+      let result = run Effect.result(self.refresh(&mut app, true))
+      if let Result<bool, SessionError>.Failure { error } = move result {
+        self.report(&mut app, move error)
+      }
+    }
+    if changed || self.failed {
+      run drain(&mut app, &mut tree)
+    }
+    return changed || self.failed
+  }
+
+  effect fn event(
+    self: &mut Self,
+    app: &mut Runtime<TerminalApp, Message, NoCommand>,
+    tree: &mut UiTree<'_>,
+    event: &Event,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() != "darwin" {
+      // An Alt character may also produce TextInput. Encode the shortcut only once.
+      if let Event.KeyDown { key, modifiers, imeHandled, .. } = &event.* {
+        self.suppressText = false
+        if !imeHandled && modifiers.alt && !modifiers.meta {
+          if let Key.Character { text } = &key {
+            self.suppressText = true
+            app.send(
+              Message.Action {
+                action: Action.Key {
+                  value: run String.copy(text.view()),
+                  modifiers: modifiers.bits(),
+                },
+              },
+            )
+            run drain(&mut app, &mut tree)
+            return true
+          }
+        }
+      }
+      if let Event.TextInput { .. } = &event.* {
+        if self.suppressText {
+          self.suppressText = false
+          return true
+        }
+      }
+    }
+    if let Event.Scroll { delta, .. } = &event.* {
+      let amount = match delta {
+        ScrollDelta.Lines { delta: vector } => vector.y
+        ScrollDelta.Points { delta: vector } => vector.y / 22.0
+      }
+      if amount != 0.0 {
+        let rows = f64.toI64(
+          if amount > 0.0 {
+            f64.max(1.0, amount)
+          } else {
+            f64.min(-1.0, amount)
+          },
+        )
+        app.send(Message.Action { action: Action.Scroll { rows: -rows } })
+        run drain(&mut app, &mut tree)
+      }
+      return true
+    }
+    return false
+  }
+}

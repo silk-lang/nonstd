@@ -1,0 +1,158 @@
+//! Integration tests against the actual pinned native library.
+import silk.collections.slice { Slice }
+import terminal { Terminal, Snapshot, Cell, GhosttyError, BOLD, INVERSE }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+type Failure = GhosttyError | AssertionError<'static>
+
+fn at<'a>(snapshot: &'a Snapshot, x: u32, y: u32) -> Cell<'a> {
+  return match snapshot.cell(x, y) {
+    Option<Cell<'a>>.Some { value } => value
+    Option<Cell<'a>>.None => Intrinsic.trap("test coordinate outside frame")
+  }
+}
+
+test effect fn streamingUnicodeAndStyle() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(20, 4)
+  terminal.write(b"\x1b[1;38;2;10;")
+  terminal.write(b"20;30m\xc3")
+  terminal.write(b"\xa9\x1b[0me\xcc\x81")
+  terminal.writeText("界")
+  let frame = run terminal.snapshot()
+  let first = at(&frame, 0, 0)
+  run Testing.expect(first.text == "é" && first.foreground == 0x0a141e, "split UTF-8 and RGB SGR")
+  run Testing.expect((first.flags & BOLD) != 0, "bold is retained")
+  run Testing.expect(at(&frame, 1, 0).text == "é", "full combining grapheme")
+  run Testing.expect(
+    at(&frame, 2, 0).width == 2 && at(&frame, 3, 0).width == 0,
+    "wide glyph and spacer",
+  )
+  run Testing.expect(frame.cursor().column == 4, "cursor advances by cell width")
+  run Testing.expect(!terminal.hasProcessingError(), "valid input has no processing error")
+}
+
+test effect fn snapshotsOutliveTerminalAndMutations() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(8, 2)
+  terminal.write(b"before")
+  let before = run terminal.snapshot()
+  terminal.write(b"\r\x1b[2Kafter")
+  let after = run terminal.snapshot()
+  drop terminal
+  run Testing.expect(at(&before, 0, 0).text == "b", "previous snapshot survives writes and free")
+  run Testing.expect(at(&after, 0, 0).text == "a", "new snapshot sees replacement")
+  run Testing.expect(
+    before.cell(8, 0).isNone() && before.cell(0, 2).isNone(),
+    "checked coordinates",
+  )
+}
+
+test effect fn alternateScreenResizeAndReset() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(10, 3)
+  terminal.write(b"main\x1b[?1049h\x1b[H\x1b[7mALT\x1b[?25l")
+  let alternate = run terminal.snapshot()
+  run Testing.expect(at(&alternate, 0, 0).text == "A", "alternate screen")
+  run Testing.expect((at(&alternate, 0, 0).flags & INVERSE) != 0, "inverse flag")
+  run Testing.expect(!alternate.cursor().visible, "hidden cursor")
+  terminal.write(b"\x1b[?1049l")
+  run terminal.resize(16, 4, 9, 20)
+  let main = run terminal.snapshot()
+  run Testing.expect(main.columns() == 16 && main.rows() == 4, "resize dimensions")
+  run Testing.expect(at(&main, 0, 0).text == "m", "primary contents restored")
+  terminal.reset()
+  let empty = run terminal.snapshot()
+  run Testing.expect(
+    empty.columns() == 16 && at(&empty, 0, 0).text == "",
+    "reset clears and keeps size",
+  )
+}
+
+test effect fn scrollbackAndInvalidSizes() -> ()
+  ! Failure {
+  let invalid = run Effect.result(Terminal.make(0, 2))
+  run Testing.expect(
+    match move invalid {
+      Result<Terminal, GhosttyError>.Failure { error } => error.code == -2
+      Result<Terminal, GhosttyError>.Success { value } => {
+        drop value
+        false
+      }
+    },
+    "zero size rejected",
+  )
+  let mut terminal = run Terminal.make(8, 2)
+  terminal.write(b"one\r\ntwo\r\nthree")
+  run terminal.scroll(-100)
+  let top = run terminal.snapshot()
+  run Testing.expect(at(&top, 0, 0).text == "o", "scrollback viewport")
+  run terminal.scrollToBottom()
+  let bottom = run terminal.snapshot()
+  run Testing.expect(at(&bottom, 0, 0).text == "t", "live viewport")
+  let resized = run Effect.result(terminal.resize(0, 4, 0, 0))
+  run Testing.expect(
+    match move resized {
+      Result<(), GhosttyError>.Failure { error } => error.code == -2
+      Result<(), GhosttyError>.Success { value: _value } => false
+    },
+    "invalid resize rejected",
+  )
+  let unchanged = run terminal.snapshot()
+  run Testing.expect(unchanged.columns() == 8, "failed resize preserves dimensions")
+}
+
+test effect fn plainTextDropsAnsi() -> ()
+  ! Failure | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut terminal = run Terminal.make(20, 3)
+  terminal.write(b"Hello, \x1b[32mworld\x1b[0m!")
+  let text = run terminal.plainText() |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(text.view() == "Hello, world!", "formatter emits plain text without escapes")
+}
+
+fn bytesEqual(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+test effect fn inputModesRepliesAndPaste() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(80, 24)
+  let mut buffer: [u8; 128] = [0; 128]
+  let ctrl = run terminal.encodeKey("c", 2, &mut buffer)
+  run Testing.expect(ctrl == 1 && buffer[0] == 3, "Ctrl-C is ETX")
+  let enter = run terminal.encodeKey("Enter", 0, &mut buffer)
+  run Testing.expect(enter == 1 && buffer[0] == 13, "Enter is CR")
+  let arrow = run terminal.encodeKey("ArrowUp", 0, &mut buffer)
+  run Testing.expect(arrow == 3 && buffer[1] == 91, "normal cursor key uses CSI")
+  terminal.write(b"\x1b[?1h")
+  let application = run terminal.encodeKey("ArrowUp", 0, &mut buffer)
+  run Testing.expect(application == 3 && buffer[1] == 79, "application cursor key uses SS3")
+  terminal.write(b"\x1b[4;5H\x1b[6n")
+  let reply = run terminal.readReplies(&mut buffer)
+  run Testing.expect(
+    bytesEqual(Slice.view(&buffer, 0, reply), b"\x1b[4;5R"),
+    "DSR response is queued",
+  )
+  run Testing.expect((run terminal.readReplies(&mut buffer)) == 0, "reply queue drains once")
+  terminal.write(b"\x1b[?2004h")
+  let paste = run terminal.encodePaste("a\nb", &mut buffer)
+  run Testing.expect(
+    bytesEqual(Slice.view(&buffer, 0, paste), b"\x1b[200~a\nb\x1b[201~"),
+    "paste respects bracketed mode",
+  )
+}

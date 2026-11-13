@@ -1,0 +1,122 @@
+//! Connects a nonblocking PTY to Ghostty. A bounded amount of output is consumed per UI tick.
+import pty { Pty, PtyError }
+import ghostty.terminal { Terminal, GhosttyError }
+import terminal_app { Action }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub type SessionError = GhosttyError | PtyError
+
+pub struct Session {
+  pub terminal: Terminal,
+  pub pty: Pty,
+  pub exitCode: i32,
+}
+
+impl Session {
+  pub effect fn make(check: bool) -> Session
+    ! SessionError {
+    let mut terminal = run Terminal.make(96, 27)
+    terminal.write(b"\x1b]10;#c9d1d9\x07\x1b]11;#10151d\x07")
+    let pty = if check {
+      run Pty.command(
+        96,
+        27,
+        "printf '\\033[1;32mSilk terminal\\033[0m\\r\\nPTY rendering check\\r\\n'; exec /bin/sh",
+      )
+    } else {
+      run Pty.shell(96, 27)
+    }
+    return Session { terminal: move terminal, pty: move pty, exitCode: -1 }
+  }
+
+  /// Drain at most 128 KiB this tick so sustained output cannot starve native input.
+  pub effect fn poll(self: &mut Self) -> bool
+    ! SessionError {
+    let mut changed = false
+    let mut buffer: [u8; 16384] = [0; 16384]
+    let mut reads: u32 = 0
+    while reads < 8 {
+      let count = run self.pty.read(&mut buffer)
+      if count == 0 {
+        break
+      }
+      self.terminal.write(Slice.view(&buffer, 0, count))
+      changed = true
+      reads = reads + 1
+    }
+    let status = self.pty.status()
+
+    // Protocol replies must go back to the program, never be echoed into the emulator.
+    while true {
+      let count = run self.terminal.readReplies(&mut buffer)
+      if count == 0 {
+        break
+      }
+      if status < 0 {
+        run self.pty.write(Slice.view(&buffer, 0, count))
+      }
+    }
+    if status != self.exitCode {
+      self.exitCode = status
+      changed = true
+    }
+    if self.terminal.hasProcessingError() {
+      fail GhosttyError { code: -1 }
+    }
+    return changed
+  }
+
+  pub effect fn apply(self: &mut Self, action: Action) -> bool
+    ! SessionError {
+    match move action {
+      Action.Text { value } => {
+        if self.exitCode >= 0 {
+          return false
+        }
+        run self.terminal.scrollToBottom()
+        run self.pty.write(String.utf8Bytes(value.view()))
+        return true
+      }
+      Action.Key { value, modifiers } => {
+        if self.exitCode >= 0 {
+          return false
+        }
+        run self.terminal.scrollToBottom()
+        let mut output: [u8; 128] = [0; 128]
+        let count = run self.terminal.encodeKey(value.view(), modifiers, &mut output)
+        run self.pty.write(Slice.view(&output, 0, count))
+        return true
+      }
+      Action.Resize { columns, rows } => {
+        run self.terminal.resize(columns, rows, 10, 22)
+        if self.exitCode < 0 {
+          run self.pty.resize(columns, rows)
+        }
+        return true
+      }
+      Action.Scroll { rows } => {
+        run self.terminal.scroll(rows)
+        return true
+      }
+      Action.Paste => {
+        return false
+      }
+    }
+    return false
+  }
+
+  pub effect fn paste(self: &mut Self, text: string) -> ()
+    ! SessionError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.exitCode >= 0 {
+      return ()
+    }
+    run self.terminal.scrollToBottom()
+    let mut output = run Bytes.zeroed(String.byteLength(text) + 12)
+    let count = run self.terminal.encodePaste(text, output.asMutSlice())
+    run self.pty.write(Slice.view(output.asSlice(), 0, count))
+  }
+}

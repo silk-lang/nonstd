@@ -1,0 +1,179 @@
+//! A native terminal connected to the user's shell through a PTY.
+import terminal_app { TerminalApp, Message }
+import session { Session }
+import host { TerminalHost }
+import pty { PtyError }
+import ui_app.app { NoCommand }
+import ghostty.terminal { GhosttyError }
+import ui_app.runtime { Runtime }
+import ui_app_window.lib { Launched, RunOptions, launch, runWindowHosted, startInspector }
+import ui_inspect_server.lib { InspectorOptions }
+import ui_fixtures.fixtures as fixtures
+import font_collection.system as systemFonts
+import font_collection.system { Options as FontOptions }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.system.host_input_native { OsHostInput }
+import ui_tree.lib { TreeError, Batch }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import window.types { WindowError }
+import webgpu.runtime { GpuError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn checkMode() -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  let mut i: usize = 1
+  while i < count {
+    if let Option<Bytes>.Some { value } = run HostInput.argument(i) {
+      if same(Bytes.asSlice(&value), b"--check") {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn program(check: bool, platform: Option<Launched>) -> i32
+  ! WindowError
+    | GpuError
+    | TreeError
+    | AtlasError
+    | GeometryError
+    | OutOfMemoryError
+    | GhosttyError
+    | PtyError
+    | HostInputError
+  ? &mut Allocator {
+  let mut collection = run fixtures.fonts()
+  if !check {
+    let environment = run unsafe NativeHostInput.environmentSnapshot()
+    let mut inputs = OsHostInput.make(move environment)
+    drop run systemFonts.load(&mut collection, FontOptions.defaults())
+      |> Effect.provideMut<HostInput>(&mut inputs)
+  }
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run batch.fontFamily(2, "Menlo, DejaVu Sans Mono, Noto Sans Mono, monospace")
+  let mut session = run Session.make(check)
+
+  // A deterministic screen for the GPU comparison; the PTY integration has its own tests.
+  if check {
+    session.terminal.write(b"\x1b[1;32mSilk terminal\x1b[0m\r\nNative terminal renderer\r\n$ ")
+  }
+  let model = TerminalApp.make(run session.terminal.snapshot())
+  let mut app = Runtime<TerminalApp, Message, NoCommand>.make(move model)
+  let mut host = TerminalHost.make(move session)
+  let options = RunOptions {
+    title: "Terminal",
+    width: 1000.0,
+    height: 680.0,
+    check: check,
+    checkClick: "terminal-screen",
+    checkExpect: "terminal-input",
+    lowestLatency: false,
+    platform: move platform,
+  }
+
+  // Debug builds with SILK_UI_INSPECT set serve the inspector (ui/inspect/server), so
+  // ui-inspect-cli, ui-inspect-mcp and the devtools window can inspect and drive the terminal.
+  let inspector = run startInspector(InspectorOptions.make())
+  return run runWindowHosted(
+    &mut app,
+    &collection,
+    run batch.take(),
+    move options,
+    move inspector,
+    &mut host,
+  )
+}
+
+effect fn windowFailed(error: WindowError) -> i32 {
+  drop error
+  StderrWriter.print("terminal-demo: could not open a window (no display server?)\n", &())
+  return 2
+}
+
+effect fn gpuFailed(error: GpuError) -> i32 {
+  StderrWriter.print("terminal-demo: GPU error {}\n", &.(error.code))
+  return 2
+}
+
+effect fn ptyFailed(error: PtyError) -> i32 {
+  StderrWriter.print("terminal-demo: PTY error (errno {})\n", &.(error.code))
+  return 2
+}
+
+effect fn ghosttyFailed(error: GhosttyError) -> i32 {
+  StderrWriter.print("terminal-demo: libghostty error {}\n", &.(error.code))
+  return 2
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("terminal-demo: failed (terminal, tree, atlas, geometry or allocation)\n", &())
+  return 2
+}
+
+effect fn noCheck<E>(error: E) -> bool {
+  drop error
+  return false
+}
+
+/// The app, on the UI thread `launch` made.
+fn runApp(check: bool, platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    Effect.catch<GpuError>(
+      Effect.catch<WindowError>(
+        Effect.catch<GhosttyError>(
+          Effect.catch<PtyError>(program(check, move platform), ptyFailed),
+          ghosttyFailed,
+        ),
+        windowFailed,
+      ),
+      gpuFailed,
+    ),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let check = run Effect.catchAll(checkMode(), noCheck)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // The main thread keeps the OS event loop; the app runs on its own thread.
+  return run Effect.catchAll(
+    launch(
+      fn(platform: Option<Launched>) -> i32 {
+        return runApp(check, move platform)
+      },
+    ),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
